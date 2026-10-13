@@ -115,12 +115,13 @@ def _qa_intent() -> dict:
             "step": D("0.001"), "min_qty": D("0.001"), "instrument": "BTC", "leverage": None, "atr_pct": None}
 
 
-def test_a_crashed_strategys_resting_entry_is_asked_to_cancel_and_its_restart_stays_blocked_until_the_venue_settles_it(
+def test_a_crashed_strategys_resting_entry_is_cancelled_by_the_supervisor_and_released_at_its_restart(
         tmp_path, store, monkeypatch):  # noqa: F811
-    """ORPHAN-GUARD og2 + og3 through the paper engine (HoE 13 Oct, the pair): the process dies with a gated entry
-    resting; the supervisor marks it down and asks the cancel; the restart answers it "not found" (its sandbox ended
-    with the process), which releases nothing (Advisor 13 Oct 17:00 UK): the reservation is held and the strategy's
-    entries blocked, however long the journal stays silent, until the venue's lookup settles it."""
+    """ORPHAN-GUARD og2 + og3 through the paper engine (HoE 13 Oct, the pair; Advisor 13 Oct 17:30 UK): the process
+    dies with a gated entry resting in its in-process venue; the supervisor marks it down and asks the cancel, which
+    nothing answers while it is down (the strategy blocked, the reservation held); the restart, a live process,
+    settles it as the venue's confirmed end: the cancel applied, the order ended and the reservation released as
+    'cancel', journalled with the owner_down event and the journal's fill total."""
     from sleeve_fund.paper import orphan_guard as og
 
     paper, held = _gated(store), {}
@@ -141,18 +142,16 @@ def test_a_crashed_strategys_resting_entry_is_asked_to_cancel_and_its_restart_st
     down = M(STD_T0, 3).to_pydatetime()
     og.owner_down(paper, NAME, down, "crash, exit code 1")
     assert og.supervisor_pass(paper, down + timedelta(seconds=5)) == [oid]  # og2: asked within the 60 s
-    assert og.resting_block(paper, NAME, down + timedelta(seconds=5))
-
-    run(tmp_path, paper, Plan(t0=STD_T0 + pd.Timedelta(minutes=5), minutes=2, tag="r"), monkeypatch)
-    assert og.down_since(paper, NAME) is None  # the restart marked it up
-    (c,) = paper.open_cancels(NAME)
-    assert c["order_id"] == oid and c["not_found_at"] is not None  # answered "not found": unconfirmed
-    assert not [o for o in _orders(paper) if o["intent"] == "entry" and o["order_id"] != oid]  # blocked meanwhile
-
-    for m in (9, 30, 120):  # silence never releases it
+    for m in (4, 30, 120):  # nothing answers while it is down: held and blocked, however long
         og.supervisor_pass(paper, M(STD_T0, m).to_pydatetime())
-    assert [c["order_id"] for c in paper.open_cancels(NAME)] == [oid]
     assert og.resting_block(paper, NAME, M(STD_T0, 120).to_pydatetime())
-    # The restart ends paper's orders that went with its sandbox (runtime.on_start, m8-9), which releases this one's
-    # reservation as 'cancel'; the cancel itself waits for the Advisor's ruling on a dead sandbox's lookup.
+    assert [r.release_reason for r in _decisions(paper) if r.id == held["rid"]] == [None]
+
+    run(tmp_path, paper, Plan(t0=STD_T0 + pd.Timedelta(minutes=121), minutes=2, tag="r"), monkeypatch)
+    assert og.down_since(paper, NAME) is None and not paper.open_cancels(NAME)
+    assert {o["order_id"]: o for o in _orders(paper)}[oid]["status"] == "canceled"
     assert [r.release_reason for r in _decisions(paper) if r.id == held["rid"]] == ["cancel"]
+    (told,) = [e["message"] for e in _events(paper) if e["kind"] == "sandbox_ended"]
+    (gone,) = [e for e in _events(paper) if e["kind"] == "owner_down"]
+    assert f"sandbox ended with owner_down (event {gone['id']}); journal fills 0" in told
+    assert og.resting_block(paper, NAME, M(STD_T0, 124).to_pydatetime()) is None

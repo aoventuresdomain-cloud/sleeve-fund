@@ -121,3 +121,80 @@ def test_og1_after_a_refused_expiry_the_entries_rest_good_till_cancelled_and_say
                            clock=SimpleNamespace(timestamp_ns=lambda: int(CLOSE.timestamp() * 1e9)))
     tif, expires, note = LongFlatStrategy._resting_entry_terms(fake)
     assert tif.name == "GTC" and expires is None and "backstop" in note and "GTD time too early" in note
+
+
+@pytest.fixture
+def jstore():
+    from test_gate_ledger import _store, _strategies
+
+    s = _store()
+    _strategies(s)
+    return s
+
+
+def _reason(store, rid):
+    from sqlalchemy import select
+
+    from sleeve_fund.store import gate_reservations_t
+
+    with store.engine.connect() as c:
+        return c.execute(select(gate_reservations_t.c.release_reason)
+                         .where(gate_reservations_t.c.decision_id == rid)).scalar()
+
+
+@pytest.mark.parametrize("filled_after_down", [False, True])
+def test_og3_a_sandbox_restart_keeps_what_filled_before_the_crash_and_releases_only_the_rest(
+        jstore, filled_after_down):
+    """Advisor 13 Oct 17:30 UK, pin 2: part filled before its process died, the entry keeps that fill (its bar not yet
+    closed); the restart ends it with its sandbox and releases only the unfilled remainder as 'cancel'. Filled after
+    the owner went down instead (a fill the dead sandbox journalled on its way out), it is closed (og5)."""
+    from sleeve_fund.paper import orphan_guard as og
+
+    rid = og.qa_resting_entry(jstore, "a", "o-rest", CLOSE)
+    down = CLOSE + timedelta(minutes=10)
+    at = down + (timedelta(seconds=1) if filled_after_down else -timedelta(minutes=1))
+    jstore.book_fill("a", side="BUY", qty=0.04, price=60000.0, fee=0.1, order_id="o-rest", trade_id="t1", ts=at)
+    og.owner_down(jstore, "a", down, "crash")
+    og.supervisor_pass(jstore, down + timedelta(seconds=5))
+    og.restart_reconcile(jstore, "a", down + timedelta(minutes=2), venue_open=[], in_process="sandbox")
+    assert _reason(jstore, rid) == "cancel" and not jstore.open_cancels("a")
+    assert sum(float(f["qty"]) for f in jstore.fills("a")) == pytest.approx(0.04)
+    closes = [o for o in jstore.orders("a") if o["order_id"] != "o-rest"]
+    assert [(c["side"], float(c["qty"])) for c in closes] == ([("SELL", 0.04)] if filled_after_down else [])
+    assert "journal fills 0.04" in jstore.events("a", limit=100)[0]["message"] or any(
+        "journal fills 0.04" in e["message"] for e in jstore.events("a", limit=100) if e["kind"] == "sandbox_ended")
+
+
+def test_og3_a_venue_outside_the_process_stays_blocked_at_restart_until_its_own_lookup_answers(jstore):
+    """Advisor 13 Oct 17:30 UK, pin 3 (condition 2): the same crash on a venue that isn't the in-process sandbox
+    (testnet, live): the restart's "not found" releases nothing; only the venue's lookup does."""
+    from sleeve_fund.paper import orphan_guard as og
+    from sleeve_fund.paper.runtime import entry_blocked
+
+    rid = og.qa_resting_entry(jstore, "a", "o-rest", CLOSE)
+    down = CLOSE + timedelta(minutes=10)
+    og.owner_down(jstore, "a", down, "crash")
+    og.supervisor_pass(jstore, down + timedelta(seconds=5))
+    now = down + timedelta(minutes=2)
+    og.restart_reconcile(jstore, "a", now, venue_open=[], in_process=None)
+    for m in range(3, 60, 5):
+        og.supervisor_pass(jstore, down + timedelta(minutes=m))
+    assert _reason(jstore, rid) is None and [c["order_id"] for c in jstore.open_cancels("a")] == ["o-rest"]
+    assert entry_blocked(jstore, "a", down + timedelta(minutes=60))[0]
+    og.venue_lookup(jstore, "o-rest", terminal="canceled", fills=[], at=down + timedelta(minutes=61))
+    assert _reason(jstore, rid) == "cancel" and not entry_blocked(jstore, "a", down + timedelta(minutes=62))[0]
+
+
+def test_in_process_kind_is_read_from_the_venues_type_never_a_setting():
+    """Advisor 13 Oct 17:30 UK, condition 1: only the paper node's Sandbox client or a replay's BacktestEngine count;
+    anything else (a testnet or live client, a config naming a sandbox) is outside the process."""
+    from types import SimpleNamespace
+
+    from nautilus_trader.adapters.sandbox import SandboxExecutionClientFactory
+    from nautilus_trader.backtest import BacktestEngine, BacktestEngineConfig
+
+    from sleeve_fund.paper.orphan_guard import in_process_kind
+
+    assert in_process_kind(SandboxExecutionClientFactory()) == "sandbox"
+    assert in_process_kind(BacktestEngine(BacktestEngineConfig())) == "backtest"
+    assert in_process_kind(SimpleNamespace(kind="sandbox")) is None and in_process_kind("sandbox") is None

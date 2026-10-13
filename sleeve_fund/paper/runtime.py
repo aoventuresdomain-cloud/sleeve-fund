@@ -422,6 +422,9 @@ class SleeveRuntime:
         # The paper engine keeps fills in memory, so a restart rebuilds the book from the journal.
         self.book = self.store.journal_book(sleeve_name, sleeve.starting_balance)
         self.last_reconciled = None
+        # The kind of venue that ran inside this process (orphan_guard.in_process_kind: "sandbox", "backtest"), set
+        # from its type by whatever builds the node; None for a venue outside it, whose orders a restart never ends.
+        self.in_process_venue: str | None = None
         self._day = None
         self._day_open = None
         self._last_equity = None
@@ -506,13 +509,16 @@ class SleeveRuntime:
             self.store.event(self.name, "info", "restart", "restarted while paused", ts=self.now())
         else:
             self._set("running", "")
-        if not self.backtest:
+        if not self.backtest and self.in_process_venue is not None:
             # Paper's venue is simulated in the process, so orders still working when it stopped went
-            # with it; without this they would read "Working" for ever (review round 8, m8-9).
+            # with it; without this they would read "Working" for ever (review round 8, m8-9). Only where the
+            # venue's type says it ran in the process (Advisor 13 Oct 17:35 UK): never on testnet or live.
+            down = self.store.last_event(self.name, ("owner_down",))
+            seen = f" (owner_down event {down['id']})" if down is not None else ""
             for o in self.store.orders(self.name, statuses=OPEN_ORDER_STATUSES, limit=1000):
                 self.store.update_order(o["order_id"], status="canceled",
                                         message="cancelled when the strategy restarted: paper's simulated venue "
-                                                "went with the process that sent it")
+                                                f"({self.in_process_venue}) went with the process that sent it{seen}")
         self._owed_flatten = self._interrupted_flatten()
         if self.book["fills"]:
             self.store.event(self.name, "info", "restore",

@@ -213,6 +213,11 @@ def build_node(sleeve: SleeveConfig, log_level: str = "INFO", runtime: SleeveRun
             balances = [Money(book["cash"], Currency.from_str(quote_code))]
             if book["qty"] > 0:
                 balances.append(Money(book["qty"], Currency.from_str(base_code)))
+    exec_factory = SandboxExecutionClientFactory()
+    if runtime is not None:  # its type, not a setting, says the venue runs inside this process (orphan_guard)
+        from sleeve_fund.paper.orphan_guard import in_process_kind
+
+        runtime.in_process_venue = in_process_kind(exec_factory)
     node = (
         LiveNode.builder(f"PAPER-{tag}", TraderId.from_str(f"PAPER-{tag[:20]}"), Environment.SANDBOX)
         .with_logging(LoggerConfig(stdout_level=getattr(LogLevel, log_level)))
@@ -222,7 +227,7 @@ def build_node(sleeve: SleeveConfig, log_level: str = "INFO", runtime: SleeveRun
         .add_data_client("HUB" if hub is not None else None, data_factory, data_config)
         .add_simulated_exec_client(
             profile.name,
-            SandboxExecutionClientFactory(),
+            exec_factory,
             SandboxExecutionClientConfig(
                 venue=venue,
                 starting_balances=balances,

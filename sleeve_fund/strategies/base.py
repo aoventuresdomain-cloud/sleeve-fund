@@ -3004,9 +3004,9 @@ class LongFlatStrategy(Strategy):
                                    now=_utc(self.clock.timestamp_ns()), min_lead=lead or timedelta(0))
 
     def _reconcile_resting(self) -> None:
-        """ORPHAN-GUARD og3 at a paper start: every gated entry the journal still has open from before is asked to
-        cancel, the venue's open ones sent their cancel, the rest answered "not found" (a sandbox's orders end with its
-        process); entries stay blocked (CHOKE: Resting entry) until each is confirmed. Its owner is marked up again."""
+        """ORPHAN-GUARD og3 at a paper start: the gated entries the journal still has open from before are settled
+        (orphan_guard.restart_reconcile): ended with the process before this one where the venue ran in it, asked to
+        cancel where the venue still has them, else held, blocking new entries, until the venue settles them."""
         if self._paper_gated() is None:
             return
         from sleeve_fund.paper.orphan_guard import restart_reconcile
@@ -3014,7 +3014,8 @@ class LongFlatStrategy(Strategy):
         rt = self.runtime
         venue_open = [str(o.client_order_id) for o in self.cache.orders_open(strategy_id=self.strategy_id)]
         restart_reconcile(rt.store, rt.name, _utc(self.clock.timestamp_ns()), venue_open,
-                          send=lambda oid: self.cancel_order(self.cache.order(ClientOrderId(oid))))
+                          send=lambda oid: self.cancel_order(self.cache.order(ClientOrderId(oid))),
+                          in_process=getattr(rt, "in_process_venue", None))
 
     def _paper_gated(self):
         """Paper with the portfolio gate in force (Store.portfolio_gate): the paper GateFn, made once; else None (a
