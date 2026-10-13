@@ -51,6 +51,7 @@ def xf(done: str):
 
 PERP = {"market": "perp", "allow_short": True}
 LEVERAGE = {"conservative": 1, "balanced": 2, "aggressive": 3}
+SHARE = {"conservative": 0.33, "balanced": 0.5, "aggressive": 0.5}  # risk.PROFILES' stop_to_liquidation
 REPO = Path(__file__).resolve().parents[1]
 
 
@@ -414,11 +415,12 @@ def _restart(tmp_path, profile, side, legs, stop_params=None, start_px=ENTRY):
     return store, [o for o in orders if o["order_id"] != "carried"], [f for f in fills if f["order_id"] != "carried"]
 
 
-def _safety_level(side, lev, mark=ENTRY):
-    """R-S3/R-S4: half the REMAINING distance from the mark to the isolated liquidation price (a 1x long has none:
-    half way to zero)."""
-    liq = 0.0 if (side > 0 and lev == 1) else ENTRY * (1 - side / lev) / (1 - side * MM)
-    level = mark + 0.5 * (liq - mark)
+def _safety_level(side, lev, mark=ENTRY, share=0.5):
+    """R-S3/R-S4: half the REMAINING distance from the mark to the isolated liquidation price, or the profile's
+    share of it if tighter (Advisor 19:15 UK, 13 Oct: a third, conservative); a 1x long has none: half way to zero."""
+    none = side > 0 and lev == 1
+    liq = 0.0 if none else ENTRY * (1 - side / lev) / (1 - side * MM)
+    level = mark + (0.5 if none else min(0.5, share)) * (liq - mark)
     assert min(mark, liq) < level < max(mark, liq)  # always between the mark and liquidation
     return level
 
@@ -439,9 +441,21 @@ def test_a_restart_without_a_restorable_stop_places_a_safety_stop_half_way_to_li
     # The move runs over 5 minutes, inside the 15 bars the ATR stop needs: only a safety stop can act.
     store, orders, fills = _restart(tmp_path, profile, side, [(3, 0.0), (5, move), (4, 0.0)])
     _, exit_fill = _closes(orders, fills, side)
-    level = _safety_level(side, LEVERAGE[profile])
+    level = _safety_level(side, LEVERAGE[profile], share=SHARE[profile])
     assert exit_fill["price"] == pytest.approx(level, rel=0.01), (exit_fill["price"], level)
     assert not [o for o in orders if o["intent"] == "entry"]
+
+
+def test_a_conservative_shorts_safety_stop_sits_a_third_of_the_way_to_liquidation_not_half(tmp_path):
+    """Advisor 19:15 UK, 13 Oct: the restart safety stop takes the tighter of half the remaining way and the profile's
+    cap, as every other stop on margin does (STOP-LOOSEN-1). A 1x short from 60,000: liquidation about 119,403, so a
+    third of the way is about 79,603, not half way at 89,701."""
+    store, orders, fills = _restart(tmp_path, "conservative", -1, [(3, 0.0), (5, 0.60), (4, 0.0)])
+    _, exit_fill = _closes(orders, fills, -1)
+    third, half = _safety_level(-1, 1, share=0.33), _safety_level(-1, 1)
+    assert exit_fill["price"] == pytest.approx(third, rel=0.01) and exit_fill["price"] < half - 5_000
+    assert [e for e in store.events(next(iter(store.sleeves())).name, limit=500)
+            if e["kind"] == "incident" and "33% of the way" in e["message"]]
 
 
 def test_a_long_entered_at_60000_and_restarted_at_42000_gets_its_safety_stop_from_the_mark(tmp_path):

@@ -149,6 +149,18 @@ def check_funding_schedule(s: Sleeve) -> None:
         raise ValueError(why)
 
 
+RESTING_OFF = ("its entries would rest at the venue as post-only limits (maker-first execution), and paper sends no "
+               "resting entry until the orphan guard is in, which cancels one its process can no longer watch: set "
+               "its execution to market to run it")
+
+
+def check_resting_entries(s: Sleeve) -> None:
+    """RESTING-OFF (HoE, Advisor 13 Oct): raises ValueError for a Strategy whose entries would rest at the venue
+    (maker_wait_minutes set), until ORPHAN-GUARD lands. Market entries are unaffected; a backtest never comes here."""
+    if (s.params or {}).get("maker_wait_minutes"):
+        raise ValueError(RESTING_OFF)
+
+
 class Supervisor:
     def __init__(self, store: Store, python: str = sys.executable, clear_path: str | None = None) -> None:
         self.store = float_view(store)  # its figures are floats: the journal's exact ones (DA-9) read as floats
@@ -184,6 +196,7 @@ class Supervisor:
             check_perp_sizing(s.strategy, s.params)
             check_perp_stop(s.strategy, s.params, s.risk_profile)
             check_funding_schedule(s)
+            check_resting_entries(s)
         except ValueError as exc:
             if any(c["command"] == "flatten" for c in self.store.pending_commands(name)):
                 self.store.event(name, "warning", "start_refused", f"Started only to sell its position: {exc}. The "
@@ -414,7 +427,10 @@ class Supervisor:
         else:
             self._flatten_told.clear()
             self._halt_tells.clear()
-        sweep(led, now, self._order_live, self._cancel_order, is_acked=self._order_acked)
+        # No cancel yet (None): the owner cancels its own entries at its next bar close, and the supervisor's cancel of
+        # a dead owner's orders is ORPHAN-GUARD og2 on the DA's 0015. Past the TTL, an unacked order's reservation is
+        # kept and alerted on as not cancelled, never released blind.
+        sweep(led, now, self._order_live, None, is_acked=self._order_acked)
 
     def _halt_every_strategy(self, why: str, now: datetime) -> None:
         """A portfolio halt (15% under the reference): every strategy holding anything is flattened through its exit
@@ -460,10 +476,6 @@ class Supervisor:
     def _order_acked(self, order_id: str) -> bool:
         """Whether the venue has acked the order (resting or part filled): its reservation then lives with it."""
         return self.ledger.order_status(order_id) in ("accepted", "partially_filled")
-
-    def _cancel_order(self, order_id: str) -> None:
-        raise NotImplementedError("asking a strategy's process to cancel one order comes with the paper gate (P2-1b "
-                                  "W2)")
 
     def check_keys(self) -> None:
         """Tell the dashboard which live accounts have their venue's key on this server (presence only)."""
