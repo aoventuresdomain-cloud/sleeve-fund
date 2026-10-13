@@ -3015,7 +3015,8 @@ class LongFlatStrategy(Strategy):
         venue_open = [str(o.client_order_id) for o in self.cache.orders_open(strategy_id=self.strategy_id)]
         restart_reconcile(rt.store, rt.name, _utc(self.clock.timestamp_ns()), venue_open,
                           send=lambda oid: self.cancel_order(self.cache.order(ClientOrderId(oid))),
-                          in_process=getattr(rt, "in_process_venue", None))
+                          in_process=getattr(rt, "in_process_venue", None),
+                          sole_instance=getattr(rt, "sole_instance", None))
 
     def _paper_gated(self):
         """Paper with the portfolio gate in force (Store.portfolio_gate): the paper GateFn, made once; else None (a

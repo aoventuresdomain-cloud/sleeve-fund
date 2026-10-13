@@ -425,6 +425,8 @@ class SleeveRuntime:
         # The kind of venue that ran inside this process (orphan_guard.in_process_kind: "sandbox", "backtest"), set
         # from its type by whatever builds the node; None for a venue outside it, whose orders a restart never ends.
         self.in_process_venue: str | None = None
+        # Whether this process holds the strategy's single-instance lock (orphan_guard.instance_lock); None: not taken.
+        self.sole_instance: bool | None = None
         self._day = None
         self._day_open = None
         self._last_equity = None

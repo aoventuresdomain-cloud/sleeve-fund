@@ -198,3 +198,34 @@ def test_in_process_kind_is_read_from_the_venues_type_never_a_setting():
     assert in_process_kind(SandboxExecutionClientFactory()) == "sandbox"
     assert in_process_kind(BacktestEngine(BacktestEngineConfig())) == "backtest"
     assert in_process_kind(SimpleNamespace(kind="sandbox")) is None and in_process_kind("sandbox") is None
+
+
+@pytest.mark.parametrize("lock_free", [True, False])
+def test_og3_with_no_owner_down_a_restart_releases_only_once_its_lock_proves_the_old_process_gone(
+        jstore, tmp_path, lock_free):
+    """Advisor 13 Oct 17:55 UK: the supervisor restarted too, so no owner_down was journalled. A free single-instance
+    lock proves the process before this one, and its sandbox, are gone: released. Held (an orphan process a deploy
+    left running, whose sandbox could still fill): nothing released, entries blocked, one alert."""
+    from sleeve_fund.paper import orphan_guard as og
+    from sleeve_fund.paper.runtime import entry_blocked
+
+    rid = og.qa_resting_entry(jstore, "a", "o-rest", CLOSE)
+    old = og.instance_lock("a", tmp_path)  # the process before this one
+    if lock_free:
+        old.close()  # it is gone: the OS dropped its lock
+    mine = og.instance_lock("a", tmp_path)
+    assert (mine is not None) is lock_free
+    now = CLOSE + timedelta(minutes=20)
+    for s in (0, 30):
+        og.restart_reconcile(jstore, "a", now + timedelta(seconds=s), venue_open=[], in_process="sandbox",
+                             sole_instance=mine is not None)
+    told = [e for e in jstore.events("a", limit=100) if e["kind"] == "previous_process_unconfirmed"]
+    if lock_free:
+        assert _reason(jstore, rid) == "cancel" and not told
+        assert not entry_blocked(jstore, "a", now + timedelta(minutes=1))[0]
+    else:
+        assert _reason(jstore, rid) is None and len(told) == 1
+        assert entry_blocked(jstore, "a", now + timedelta(minutes=1))[0]
+    for fh in (old, mine):
+        if fh is not None:
+            fh.close()

@@ -61,7 +61,7 @@ def is_overdue(decision_close: datetime, bar: timedelta, now: datetime) -> bool:
 
 OWNER_DOWN, OWNER_UP = "owner_down", "owner_up"
 ORPHANED, ORPHAN_CANCEL, ORPHAN_CLOSED = "resting_entry_orphaned", "orphan_cancel", "orphan_fill_closed"
-SANDBOX_ENDED = "sandbox_ended"
+SANDBOX_ENDED, PREVIOUS_UNCONFIRMED = "sandbox_ended", "previous_process_unconfirmed"
 DEAD_OWNER_CANCEL_WITHIN = timedelta(seconds=60)  # og2: a dead owner's resting entries are asked to cancel within this
 
 
@@ -140,8 +140,27 @@ def in_process_kind(venue) -> str | None:
     return None
 
 
+def instance_lock(name: str, root=None):
+    """The strategy's single-instance lock (Advisor 13 Oct 17:55 UK): an exclusive, non-blocking flock on
+    <root>/<name>.lock (root: SLEEVE_LOCK_DIR, else data/locks), held by the returned open file for as long as the
+    process keeps it, and dropped by the OS when the process dies. None when another live process holds it."""
+    import fcntl
+    import os
+    from pathlib import Path
+
+    root = Path(root or os.environ.get("SLEEVE_LOCK_DIR", Path(__file__).resolve().parents[2] / "data" / "locks"))
+    root.mkdir(parents=True, exist_ok=True)
+    fh = open(root / f"{name}.lock", "a+")  # noqa: SIM115 - held open for the process's life
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fh.close()
+        return None
+    return fh
+
+
 def restart_reconcile(store, name: str, now: datetime, venue_open: list[str], send=None,
-                      in_process: str | None = None) -> list[str]:
+                      in_process: str | None = None, sole_instance: bool | None = None) -> list[str]:
     """og3: before a restarted process's first new entry, every gated entry the venue still has open for it is asked to
     cancel (journaled, idempotent); entries stay blocked (resting_block) until each cancel is confirmed. send(order_id)
     sends the cancel to the venue. Returns the ids asked.
@@ -151,14 +170,31 @@ def restart_reconcile(store, name: str, now: datetime, venue_open: list[str], se
     the journal's fills its whole fill history. Every gated entry it left (open, or with its cancel open) is settled
     now: what filled is kept, or closed if it filled after its bar's close or its owner went down (og5), and the rest
     released as 'cancel'. Outside the process (None: testnet, live) a cancel the venue doesn't find stays open, and
-    the strategy blocked, until the venue's own lookup settles it (venue_lookup)."""
+    the strategy blocked, until the venue's own lookup settles it (venue_lookup).
+
+    sole_instance: this process holds the strategy's single-instance lock (instance_lock). With no owner_down journalled
+    (the supervisor restarted too), only that proves the process before this one, and its sandbox, are gone (Advisor
+    13 Oct 17:55 UK); without it nothing is released, each leftover is asked to cancel (so entries stay blocked) and
+    it alerts once."""
     if in_process is not None:
         left = {r["order_id"] for r in gated_open(store, name)} | {c["order_id"] for c in store.open_cancels(name)}
         left -= set(venue_open)
         if left:
             down = store.last_event(name, (OWNER_DOWN, OWNER_UP))
+            if (down is None or down["kind"] != OWNER_DOWN) and sole_instance is not True:
+                # The supervisor didn't see it go, and nothing proves it went: it may still run, and its sandbox fill.
+                asking = {c["order_id"] for c in store.open_cancels(name)}
+                for oid in sorted(left - asking):
+                    store.request_cancel(name, oid, "the process before this one may still be running")
+                told = store.last_event(name, (PREVIOUS_UNCONFIRMED, OWNER_UP))
+                if told is None or told["kind"] != PREVIOUS_UNCONFIRMED:  # once while it lasts
+                    store.event(name, "error", PREVIOUS_UNCONFIRMED, f"{len(left)} resting entr"
+                                f"{'y' if len(left) == 1 else 'ies'} left from before can't be released: the process "
+                                "before this one isn't confirmed gone (its lock is held or unknown); entries stay "
+                                "blocked until a person checks", ts=now)
+                return []
             if down is None or down["kind"] != OWNER_DOWN:  # the supervisor didn't see it go (it restarted too)
-                owner_down(store, name, now, "restart: the process before this one is gone")
+                owner_down(store, name, now, "restart: the process before this one is gone (its lock is free)")
                 down = store.last_event(name, (OWNER_DOWN,))
             for oid in sorted(left):
                 sandbox_ended(store, name, oid, down, now)
