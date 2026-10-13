@@ -38,6 +38,7 @@ from sleeve_fund.store import (
     events_t,
     gate_decisions_t,
     gate_reservations_t,
+    orders_t,
     portfolio_profile_t,
     portfolio_state_t,
     sleeves_t,
@@ -134,7 +135,8 @@ class DbLedger:
         """The lock's or the fill's transaction when inside one, else a transaction of its own. audit: a failed entry
         check's error row or alert. Inside a fill's transaction (using(), never the lock) only a failed check writes
         those, so on Postgres they take their own transaction and outlive a fill that rolls back (CR F219-5). SQLite
-        shares one connection, so there they join it."""
+        shares one connection, so there they join it. That own transaction can't see rows the fill's hasn't committed:
+        a strategy created inside it would fail the audit row's lookup (CR F228-1; strategies are created at setup)."""
         loc = self._local
         conn = getattr(loc, "conn", None)
         if conn is not None and not (audit and self._pg and not getattr(loc, "locked", None)):
@@ -329,6 +331,24 @@ class DbLedger:
             row["profile_version"] = conn.execute(select(func.max(portfolio_profile_t.c.version))).scalar()
             if conn.execute(update(t).where(t.c.id == 1).values(**row)).rowcount == 0:
                 conn.execute(insert(t), [{"id": 1, **row}])
+
+    def ensure_state(self) -> None:
+        """Write the state row (never marked: entries blocked as stale) if there is none. The portfolio gate is in
+        force from then on (runtime.portfolio_block)."""
+        t = portfolio_state_t
+        with self.lock():
+            if self._local.conn.execute(select(t.c.id).where(t.c.id == 1)).first() is None:
+                self.set_state(PortfolioState())
+
+    def last_book_mark(self) -> datetime | None:
+        """When the newest book_marks row was written (the supervisor writes one a minute, read back across restarts)."""
+        with self._tx() as conn:
+            return _aware(conn.execute(select(func.max(book_marks_t.c.ts))).scalar())
+
+    def order_status(self, order_id: str) -> str | None:
+        """An order row's status, in the lock's or fill's transaction when inside one."""
+        with self._tx() as conn:
+            return conn.execute(select(orders_t.c.status).where(orders_t.c.order_id == order_id)).scalar()
 
     def alert(self, kind: str, message: str, at: datetime) -> None:
         with self._tx(audit=True) as conn:

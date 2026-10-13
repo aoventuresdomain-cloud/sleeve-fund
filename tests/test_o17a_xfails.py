@@ -112,6 +112,8 @@ def _no_1m_lifted(monkeypatch):
         monkeypatch.setattr(study.StudyResult, "not_judged", property(_not_judged))
 
 REASON = "QA O17a: not built yet (Advisor 17:52)"
+# Seconds between trades in the long episode runs (CI-TRIM): well inside UNSEEN_GAP_NS (15 s), never on it (HoQA).
+STEP10 = 10
 REASON_EPISODE = "O17a-EPISODE follow-up (Advisor 06:28/06:30 episode rulings; HoE 06:30): not in #163"
 xfail = pytest.mark.xfail(strict=True, reason=REASON)
 
@@ -858,7 +860,9 @@ def test_a_simulated_perp_keeps_the_flat_fallback():
 #    The collector's pass runs at a simulated time `at`: its clock is history._now() (funding.stale's `now` too), and
 #    the events it writes are stamped `at`. Each pass is a fresh hub process as far as the daily alert cap (_warned)
 #    goes, so "once" must come from the journal, not from memory. Paper runs use 5-second trades unless the cell is
-#    about trades more than 15 s apart (#146's unseen-trade deferral, UNSEEN_GAP_NS).
+#    about trades more than 15 s apart (#146's unseen-trade deferral, UNSEEN_GAP_NS). The long episode runs use
+#    10-second trades (STEP10): no gap with margin, every settlement and entry on its grid, so marks and charges are
+#    the same and the run is half the work (CI-TRIM).
 # ---------------------------------------------------------------------------------------------------------------
 
 TAG = f"[{PAIR}]"
@@ -1132,7 +1136,7 @@ def test_a_paper_restart_mid_episode_keeps_it_open_and_alerts_once(tmp_path, mon
     _fresh_hub(monkeypatch)
     store = _restartable_journal()
     params = win(("2025-10-03 07:52", "2025-10-05 00:00", 1))
-    run = dict(rates=RATES8, store=store, name="w",
+    run = dict(rates=RATES8, store=store, name="w", step=STEP10,
                published={"2025-10-03 08:00": "2025-10-03 17:00", "2025-10-03 16:00": NEVER})
     _hub_during(monkeypatch, binance, store, ["2025-10-03 08:30", "2025-10-03 16:30"])
     paper(tmp_path, monkeypatch, binance, params, "2025-10-03 07:50", 8 * 60 + 55, **run)  # stops at 16:45
@@ -1452,10 +1456,11 @@ def test_c_step_after_as_wide_reverses_both_in_the_backtest(binance, side):
         shown
 
 
-def _gap_paper(tmp_path, monkeypatch, binance, store, rates, start, minutes, side=1, opens=None, published=None):
+def _gap_paper(tmp_path, monkeypatch, binance, store, rates, start, minutes, side=1, opens=None, published=None,
+               step=5):
     opens = opens or utc(start) + pd.Timedelta(minutes=2)
     return paper(tmp_path, monkeypatch, binance, win((opens, "2025-10-05 00:00", side)), start, minutes,
-                 rates=rates, store=store, published=published)
+                 rates=rates, store=store, published=published, step=step)
 
 
 @pytest.mark.parametrize("side", [1, -1], ids=["long", "short"])
@@ -1527,7 +1532,7 @@ def test_paper_c_step_after_as_wide_reverses_both(tmp_path, monkeypatch, binance
     store = journal()
     rates = {**HISTORY, "2025-10-03 04:00": 0.0001, "2025-10-03 08:00": 0.0002, "2025-10-03 16:00": 0.0002,
              "2025-10-04 00:00": 0.0001}
-    out = _gap_paper(tmp_path, monkeypatch, binance, store, rates, "2025-10-03 07:50", 1010)
+    out = _gap_paper(tmp_path, monkeypatch, binance, store, rates, "2025-10-03 07:50", 1010, step=STEP10)
     for t in ("2025-10-03 12:00", "2025-10-03 20:00"):
         _built_missing(store, t)
         (m,) = _missing_of(store, t)
@@ -1573,7 +1578,7 @@ def test_paper_the_04_00_branch_reverses_16_00_and_00_00_when_04_00_lands(tmp_pa
     row, net zero, both alerts closed then, not before."""
     store = journal()
     out = _gap_paper(tmp_path, monkeypatch, binance, store, {**SHORTENED, "2025-10-04 04:00": 0.0001},
-                     "2025-10-03 11:50", 1010)
+                     "2025-10-03 11:50", 1010, step=STEP10)
     for t in ("2025-10-03 16:00", "2025-10-04 00:00"):
         _built_missing(store, t)
         (m,) = _missing_of(store, t)
@@ -1607,7 +1612,7 @@ def test_a_restart_after_a_reversal_does_not_refund_the_settlement_twice(tmp_pat
     params = win(("2025-10-03 07:52", "2025-10-05 00:00", 1))
     rates = {**HISTORY, "2025-10-03 04:00": 0.0001, "2025-10-03 08:00": 0.0002, "2025-10-03 16:00": 0.0002,
              "2025-10-04 04:00": 0.0001}
-    run = dict(rates=rates, store=store, name="w")
+    run = dict(rates=rates, store=store, name="w", step=STEP10)
     first = _rows(paper(tmp_path, monkeypatch, binance, params, "2025-10-03 07:50", 20 * 60 + 55, **run))  # to 04:45
     want = [("2025-10-03 08:00", S_), ("2025-10-03 12:00", B_), ("2025-10-03 12:00", R_), ("2025-10-03 16:00", S_),
             ("2025-10-03 20:00", B_), ("2025-10-03 20:00", R_), ("2025-10-04 00:00", B_), ("2025-10-04 04:00", S_)]
@@ -1825,15 +1830,44 @@ EP_MISSING = "2025-10-04 00:00"
 _FROM_ANY = re.compile(r"from \d{4}-\d\d-\d\d \d\d:\d\d UTC")
 
 
+_SHARED_RUNS: dict = {}  # key -> (out, store, what the journal held): the last run, for the next cell asking for it
+
+
+def _journal_held(store):
+    return len(store.events(None, limit=5000)), len(store.funding("w")), len(store.equity_series("w"))
+
+
+def _shared_run(key, run):
+    """run() -> (out, store), shared with the next call for the same key (CI-TRIM) while the journal still holds exactly
+    what that run left: a journal() reset, or any other run in between, empties or changes it, and run() runs anew.
+    `key` must name every input that shapes the run; a cell that patches anything first must not share. Each caller
+    gets its own copy of `out`; the store is shared, so the callers only read it (events, funding rows, journal_state)."""
+    import copy
+
+    hit = _SHARED_RUNS.pop(key, None)
+    if hit is None or _journal_held(hit[1]) != hit[2]:
+        _SHARED_RUNS.clear()
+        out, store = run()
+        hit = (out, store, _journal_held(store))
+    _SHARED_RUNS[key] = hit
+    return copy.deepcopy(hit[0]), hit[1]
+
+
 def _episode_run(tmp_path, monkeypatch, binance, until, published=None):
     """The 9c scenario as paper, held from 07:52, run from 3 Oct 07:50 to `until`; `published` gives 4 Oct 00:00 a
     late publication time (its rate is then the venue's). Checks the money rows the episode rulings stand on (built on
-    #163: 12:00 and 20:00 each one baseline and one reversal, 00:00 its baseline, not reversed)."""
+    #163: 12:00 and 20:00 each one baseline and one reversal, 00:00 its baseline, not reversed). Shared with the next
+    cell asking for the same `until` and `published` (_shared_run); no caller patches anything first."""
+    return _shared_run(("episode", until, repr(published)),
+                       lambda: _run_episode(tmp_path, monkeypatch, binance, until, published))
+
+
+def _run_episode(tmp_path, monkeypatch, binance, until, published):
     store = journal()
     minutes = int((utc(until) - utc("2025-10-03 07:50")).total_seconds() // 60)
     rates = {**EP_RATES, **({EP_MISSING: 0.0001} if published else {})}
     out = paper(tmp_path, monkeypatch, binance, win(("2025-10-03 07:52", "2025-10-06 00:00", 1)), "2025-10-03 07:50",
-                minutes, rates=rates, store=store, published=published)
+                minutes, rates=rates, store=store, published=published, step=STEP10)
     rows = _rows(out)
     for t in EP_REVERSED:
         assert sorted(k for ts, k, _ in rows if ts == utc(t)) == [B_, R_], \
@@ -1842,6 +1876,35 @@ def _episode_run(tmp_path, monkeypatch, binance, until, published=None):
     assert B_ in at00 and R_ not in at00, f"setup: 00:00 charged the baseline, not reversed {_rshow(rows)}"
     _built_missing(store, EP_MISSING)
     return out, store
+
+
+def test_a_shared_episode_run_is_reused_only_for_the_same_inputs_and_an_untouched_journal(tmp_path):
+    """CI-TRIM (HoQA): _shared_run hands the same run to the next caller with the same key, a fresh run for another
+    key (another `published`), and a fresh run once the journal no longer holds what the run left (a journal() reset
+    or another cell's rows); each caller gets its own `out`."""
+    runs = []
+
+    def run(tag):
+        def go():
+            store = journal()
+            store.event("w", "info", "qa_cache", tag)
+            runs.append(tag)
+            return {"tag": tag, "rows": [tag]}, store
+        return go
+
+    _SHARED_RUNS.clear()
+    a1, s1 = _shared_run(("episode", "05:00", "None"), run("a"))
+    a1["rows"].append("changed by a caller")
+    a2, s2 = _shared_run(("episode", "05:00", "None"), run("a-again"))
+    assert runs == ["a"] and s2 is s1 and a2 == {"tag": "a", "rows": ["a"]}, (runs, a2)
+    b, sb = _shared_run(("episode", "05:00", repr({EP_MISSING: "2025-10-04 06:00"})), run("b"))
+    assert runs == ["a", "b"] and b["tag"] == "b", runs
+    # Another cell's run in between: on Postgres its journal() empties the tables and it writes its own rows; either
+    # way the shared journal no longer holds what run b left.
+    sb.event("w", "info", "qa_cache", "another cell")
+    b2, _ = _shared_run(("episode", "05:00", repr({EP_MISSING: "2025-10-04 06:00"})), run("b-after-reset"))
+    assert runs == ["a", "b", "b-after-reset"] and b2["tag"] == "b-after-reset", runs
+    _SHARED_RUNS.clear()
 
 
 def _stamp_at(text: str, t) -> int:
@@ -1949,6 +2012,25 @@ def test_the_episode_closes_when_the_missing_settlement_is_backfilled(tmp_path, 
     _texts_ok(store)
 
 
+@pytest.mark.xfail(strict=True, raises=AssertionError, reason=REASON_EPISODE)
+@pytest.mark.parametrize("case", ["backfilled", "never-published"])
+def test_one_closing_notice_gives_each_settlements_outcome(tmp_path, monkeypatch, binance, case):
+    """Advisor 06:33 (2): ONE closing notice for the episode from 12:00, stating each settlement's outcome: 12:00 and
+    20:00 reclassified; 4 Oct 00:00 backfilled (published at 06:00) or never published (still absent at 5 Oct 00:00)."""
+    if case == "backfilled":
+        _, store = _episode_run(tmp_path, monkeypatch, binance, "2025-10-04 06:40",
+                                published={EP_MISSING: "2025-10-04 06:00"})
+        last = "backfill"
+    else:
+        _, store = _episode_run(tmp_path, monkeypatch, binance, "2025-10-05 00:40")
+        last = "never published"
+    closed = _closing(store)
+    assert len(_cleared(store)) == 1 and len(closed) == 1, \
+        f"one episode, one closing notice: {_show(_events(store, *EPISODE))}"
+    _outcomes_listed(closed[0]["message"], {EP_REVERSED[0]: "reclassif", EP_REVERSED[1]: "reclassif",
+                                            EP_MISSING: last})
+
+
 def test_the_episode_closes_once_the_missing_settlement_is_never_published_and_it_counts_for_g1(
         tmp_path, monkeypatch, binance):
     """Advisor 06:30: 4 Oct 00:00 still absent at 5 Oct 00:00 (due + 24 h; later settlements stored): it is never
@@ -1974,25 +2056,6 @@ def test_the_episode_closes_once_the_missing_settlement_is_never_published_and_i
 
 
 @pytest.mark.xfail(strict=True, raises=AssertionError, reason=REASON_EPISODE)
-@pytest.mark.parametrize("case", ["backfilled", "never-published"])
-def test_one_closing_notice_gives_each_settlements_outcome(tmp_path, monkeypatch, binance, case):
-    """Advisor 06:33 (2): ONE closing notice for the episode from 12:00, stating each settlement's outcome: 12:00 and
-    20:00 reclassified; 4 Oct 00:00 backfilled (published at 06:00) or never published (still absent at 5 Oct 00:00)."""
-    if case == "backfilled":
-        _, store = _episode_run(tmp_path, monkeypatch, binance, "2025-10-04 06:40",
-                                published={EP_MISSING: "2025-10-04 06:00"})
-        last = "backfill"
-    else:
-        _, store = _episode_run(tmp_path, monkeypatch, binance, "2025-10-05 00:40")
-        last = "never published"
-    closed = _closing(store)
-    assert len(_cleared(store)) == 1 and len(closed) == 1, \
-        f"one episode, one closing notice: {_show(_events(store, *EPISODE))}"
-    _outcomes_listed(closed[0]["message"], {EP_REVERSED[0]: "reclassif", EP_REVERSED[1]: "reclassif",
-                                            EP_MISSING: last})
-
-
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=REASON_EPISODE)
 def test_an_episode_whose_settlements_are_all_reclassified_closes_as_such_and_is_kept(tmp_path, monkeypatch, binance):
     """Advisor 06:30 variant: every settlement of the episode is reclassified. As the 9c scenario but 4 Oct 00:00 is
     published on time (the amended (c) sibling, run to 00:40): 12:00 opens the episode at 12:15, 20:00 joins it at
@@ -2001,7 +2064,7 @@ def test_an_episode_whose_settlements_are_all_reclassified_closes_as_such_and_is
     marks stay in the journal, each settlement keeps its baseline and reversal rows, nothing is never published."""
     store = journal()
     out = paper(tmp_path, monkeypatch, binance, win(("2025-10-03 07:52", "2025-10-06 00:00", 1)), "2025-10-03 07:50",
-                1010, rates={**EP_RATES, EP_MISSING: 0.0001}, store=store)
+                1010, rates={**EP_RATES, EP_MISSING: 0.0001}, store=store, step=STEP10)
     rows = _rows(out)
     for t in EP_REVERSED:
         assert sorted(k for ts, k, _ in rows if ts == utc(t)) == [B_, R_], f"setup: {t} {_rshow(rows)}"
