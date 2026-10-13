@@ -122,8 +122,10 @@ def _seed(store: Store, sleeve: str = "da9"):
     for k, a in enumerate(funding):
         store.record_funding(sleeve, qty=Decimal("0.01234567"), price=Decimal("61234.5"), rate=0.0001, amount=a,
                              ts=T0 + timedelta(hours=8 * k))
-    for a in insurance:
-        store.record_insurance(sleeve, price=Decimal("61000"), amount=a, ts=T0 + timedelta(days=1))
+    with store.engine.begin() as c:  # as a journal before 0013 holds it: c1 seeds at the pre-DA-9 schema, unkeyed
+        for a in insurance:
+            c.execute(insert(insurance_t).values(sleeve=sleeve, price=Decimal("61000"), amount=a,
+                                                 ts=T0 + timedelta(days=1)))
     store.record_equity(sleeve, equity=cash, cash=cash, qty=Decimal(0), price=Decimal("61234.5"),
                         benchmark=Decimal("10000"), ts=T0 + timedelta(days=2))
     return cash
@@ -271,7 +273,8 @@ BOUNDARIES = [
     ("record_fill.fee", lambda s, v: s.record_fill("da9", **_fill(fee=v)), fills_t),
     ("record_funding.amount", lambda s, v: s.record_funding("da9", qty=Decimal("0.01"), price=Decimal("60000"),
                                                             rate=0.0001, amount=v, ts=T0), funding_t),
-    ("record_insurance.amount", lambda s, v: s.record_insurance("da9", price=Decimal("60000"), amount=v, ts=T0),
+    ("record_insurance.amount", lambda s, v: s.record_insurance("da9", price=Decimal("60000"), amount=v, ts=T0,
+                                                                order_id="L", trade_id="T"),
      insurance_t),
     ("record_equity.cash", lambda s, v: s.record_equity("da9", equity=Decimal("10000"), cash=v, qty=Decimal(0),
                                                         price=Decimal("60000"), benchmark=Decimal("10000"), ts=T0),
@@ -312,7 +315,7 @@ def test_c6_money_is_quantised_half_even_at_the_column_scale(store, written, exp
     _sleeve(store)
     store.record_fill("da9", **_fill(fee=written))
     store.record_funding("da9", qty=Decimal("0.01"), price=Decimal("60000"), rate=0.0001, amount=written, ts=T0)
-    store.record_insurance("da9", price=Decimal("60000"), amount=written, ts=T0)
+    store.record_insurance("da9", price=Decimal("60000"), amount=written, ts=T0, order_id="L", trade_id="T")
     got = {"fills.fee": store.fills("da9")[0]["fee"], "funding.amount": store.funding("da9")[0]["amount"]}
     assert got == dict.fromkeys(got, expected), got
     # Insurance is rounded up to the cent where it is booked (Advisor 8 Oct 04:10 UK, ruling 3), not to the column

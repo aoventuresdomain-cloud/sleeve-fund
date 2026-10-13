@@ -512,8 +512,8 @@ def history(store: Store, summaries: list[dict], sleeve: str | None = None) -> d
             positions.append(pos)
         perp = markets.is_perp(x["sleeve"].params)
         for t in trips(fills, store.events(name, limit=5000), orders, plans, perp,
-                       store.funding(name, limit=1_000_000) if perp else None,
-                       store.insurance(name) if perp else None):
+                       store.funding(name, limit=None) if perp else None,
+                       store.insurance(name, limit=None) if perp else None):
             t["sleeve"], t["pair"] = name, x["sleeve"].instrument
             closed.append(t)
     closed.sort(key=lambda t: t["closed"] or utcnow(), reverse=True)
@@ -547,7 +547,7 @@ def book_positions(store: Store, summaries: list[dict]) -> dict:
         rows.append({
             **pos,
             "x": x,
-            "perp": perp_view(x, pos, store.funding(name, limit=100_000)) if perp else None,
+            "perp": perp_view(x, pos, store.funding(name, limit=None)) if perp else None,
             "realised": x["pnl"] - x["unrealised"],
             "fees": pos["fees"] if pos["fees"] is not None else x["fees"],
             "flattening": any(c["command"] == "flatten" for c in store.pending_commands(name)),
