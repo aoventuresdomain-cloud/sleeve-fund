@@ -308,6 +308,44 @@ def test_a_restart_carries_a_short_through_a_restore_order(tmp_path):
     assert orders and (orders[0]["side"], orders[0]["intent"]) == ("BUY", "exit")
 
 
+@pytest.mark.parametrize("pending", [True, False])
+def test_a_bar_while_the_restore_order_is_pending_trades_nothing(tmp_path, monkeypatch, pending):
+    """ORPHAN-GUARD evidence (HoE, 13 Oct): after a paper restart the position is put back at the simulated venue
+    by the restore order, and until that fills the strategy decides nothing: no exit, no entry, on any bar or trade.
+    The restore is held unsent here, so the strategy sends no order at all, entry or exit: the trade, bar and tick
+    paths wait on it, and were they to act the engine-vs-journal reconcile halts first (engine flat, journal short).
+    Once it is sent, the same prices exit the carried short and open again."""
+    from sleeve_fund.research.replay import replay
+    from sleeve_fund.store import Store
+    from sleeve_fund.strategies.base import LongFlatStrategy
+    from test_replay import START
+
+    if pending:
+        monkeypatch.setattr(LongFlatStrategy, "_send_restore", lambda self: None)
+    store = Store.in_memory()
+    create = store.create_sleeve
+
+    def create_with_a_short(**kw):
+        s = create(**kw)
+        store.record_fill(kw["name"], side="SELL", qty=0.05, price=61_000.0, fee=1.5, order_id="carried",
+                          trade_id="carried", ts=datetime.fromtimestamp(START / 1e9 - 60, tz=timezone.utc))
+        return s
+
+    store.create_sleeve = create_with_a_short
+    path = tmp_path / "restart.jsonl.gz"
+    book = replay_book([_fill("SELL", 0.05, 61_000.0, 1.5)], 10_000.0)
+    meta = _meta(book["cash"] + book["qty"] * book["entry_px"], {"rise": 0.01, "dip": 0.005, **PERP})
+    meta["sleeve"]["risk_profile"] = "conservative"  # stopless at 1x: free to open again, not exits-only
+    _record(path, meta, [(10, 0.0), (20, -0.012), (20, 0.015), (20, -0.012)])
+    orders, fills = replay(path, with_fills=True, store=store)
+    if pending:
+        assert orders == [] and [f["order_id"] for f in fills] == ["carried"]
+        # held by the restore's own guards, not by the reconcile halt behind them
+        assert "reconcile_mismatch" not in {e["kind"] for e in store.events("ping-pong-test", limit=500)}
+    else:  # the control: the same session trades once the position is back
+        assert [(o["side"], o["intent"]) for o in orders][:2] == [("BUY", "exit"), ("BUY", "entry")]
+
+
 # --- dashboard -------------------------------------------------------------------
 
 
@@ -925,7 +963,10 @@ def test_a_gap_past_bankruptcy_loses_the_margin_and_no_more(prices, instrument):
     margin = qty * entry / 3  # aggressive: 3x
     trips = trades(fills_to_rows(res.fills), True, res.funding, res.insurance)
     x = margin + trips[-1]["fees"]  # X: the margin plus the entry and liquidation fees
-    assert res.equity.min() > 0 and trips[-1]["pnl"] - trips[-1]["funding"] == pytest.approx(-x, abs=0.01)
+    # LIQ-FUND-1 (Advisor 17:45 UK, 13 Oct; HoE-approved expectation change): funding paid since the fill counts inside
+    # the margin, never on top of it, so the price loss plus the funding paid is the margin, to the cent.
+    price_loss = -(trips[-1]["pnl"] - trips[-1]["funding"] + trips[-1]["fees"])
+    assert res.equity.min() > 0 and price_loss - trips[-1]["funding"] == pytest.approx(margin, abs=0.01)
     assert trips[-1]["insurance"] == 0.0
     assert sum(t["pnl"] for t in trips) == pytest.approx(res.equity.iloc[-1] - res.starting_capital, abs=0.05)
     assert "insurance_fund" in {e["kind"] for e in res.journal.events_}
