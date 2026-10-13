@@ -75,3 +75,18 @@ def test_the_store_reads_each_fill_at_8_dp_half_up_on_either_database(tmp_path):
         assert D(str(s.journal_book("s", 1_000)["cash"])) - 1_000 == s.strategy_cash_pnl("s")
     finally:
         metadata.drop_all(eng)
+
+
+@pytest.mark.parametrize("ccy, shown, moved", [("USDT", "0.12345679 USDT", D("0.50000000")), ("USD", "0.12 USD", D("0.50345679"))])
+def test_the_report_shows_a_usdt_fee_at_8_dp_so_the_price_carries_only_the_spread(ccy, shown, moved):
+    """HoE 13 Oct: the report's fee is the journal's (8 dp half up on USDT), so the price moves by the spread alone;
+    USD keeps the cent and the sub-cent goes into the price with the spread, as before."""
+    import pandas as pd
+
+    from sleeve_fund.research.runner import _spread_into_prices
+
+    report = pd.DataFrame({"filled_qty": ["1"], "avg_px": ["100"], "side": ["OrderSide.BUY"],
+                           "commissions": [[f"0.62345679 {ccy}"]]}, index=["E"])
+    out = _spread_into_prices(report, {"E": 0.5}, {"E": 0.123456785})
+    assert out.at["E", "commissions"] == [shown]
+    assert D(out.at["E", "avg_px"]) - 100 == pytest.approx(moved, abs=D("1e-9"))
