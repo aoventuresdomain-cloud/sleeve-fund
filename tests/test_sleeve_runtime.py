@@ -772,3 +772,32 @@ def test_the_daily_pause_is_lifted_by_the_first_tick_after_the_0000_utc_roll(sto
     t[0] += timedelta(minutes=1)
     rt.tick(**flat)
     assert store.sleeve("s1").status == "running"
+
+
+@pytest.mark.parametrize("account", ["paper", "live"])
+def test_f240_1_a_paper_or_live_strategy_never_runs_with_its_halts_off(store, account):
+    """HoE, F240-1: only a backtest's runtime may turn off the drawdown halt and daily-loss pause. A paper or live
+    Strategy refuses the switch, and refuses to start if it is off however it got there. The live case is an account
+    record only: no keys, nothing sent."""
+    _sleeve(store)
+    if account == "live":
+        store.create_account("live-test", "live", venue="BINANCE")
+        store.assign_account("s1", "live-test")
+    rt = SleeveRuntime(store, "s1", tick_seconds=SIX_HOURS)
+    assert rt.halts
+    with pytest.raises(ValueError, match="backtest only"):
+        rt.halts = False
+    assert rt.halts
+    rt._halts = False  # any other route to it
+    status, events = store.sleeve("s1").status, len(store.events("s1", limit=1000))
+    with pytest.raises(RuntimeError, match="won't start"):
+        rt.on_start(0.001)
+    assert (store.sleeve("s1").status, len(store.events("s1", limit=1000))) == (status, events)
+
+
+def test_f240_1_a_backtests_runtime_may_turn_its_halts_off():
+    rt = SleeveRuntime.for_backtest(strategy="buy_and_hold", instrument="BTC/USD", bar_spec="1-DAY-LAST-EXTERNAL",
+                                    starting_balance=10_000, risk_profile="balanced")
+    rt.halts = False
+    rt.on_start(0.001)
+    assert not rt.halts and rt.status == "running"
