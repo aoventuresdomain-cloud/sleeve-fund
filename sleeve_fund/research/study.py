@@ -23,6 +23,7 @@ from sleeve_fund import funding
 from sleeve_fund.instruments import FeeSchedule, pair_of
 from sleeve_fund import markets
 from sleeve_fund.markets import PERP
+from sleeve_fund.research import regime_split
 from sleeve_fund.research.ledger import GAP_STAGE, IdeaLedger, opened_words
 from sleeve_fund.research.random_entry import RandomEntryResult, RandomSideResult, Trade, random_entry, random_side
 from sleeve_fund.research.metrics import (
@@ -174,6 +175,8 @@ class StudyResult:
     breakeven: str = ""  # the chosen settings' break-even fee in words, re-run to verify it (P1-G1)
     # Out-of-sample timing against random entry times, and for strategies that can go short, side against random
     # sides (v2 P1-7, C3 and C3b).
+    # R3: results by regime on the full research period's default-settings run (report only; regime_split).
+    by_regime: list = field(default_factory=list)
     random_entry: RandomEntryResult | None = None
     random_side: RandomSideResult | None = None
     # P1-D13: what the out-of-sample windows and the holdout were matched on (None: their decision bars alone), whether
@@ -912,6 +915,9 @@ def run_study(
     # Every trip pays the taker fee and half the spread each way, as the study's own runs do on market orders.
     # A perpetual's trades and draws are liquidated as the engine books one, at the risk profile's leverage cap.
     leverage = risk_profile_of(risk_profile).max_leverage if risk_profile is not None else None
+    result.by_regime = regime_split.split(
+        trades(fills_to_rows(full_default.fills), full_default.shorts, full_default.funding),
+        research, bench.equity)
     result.random_entry, result.random_side = _benchmarks(
         research, folds, test_bars, float(run_fees.taker), series if series is not None else spread_used,
         full_default.shorts, leverage, market.get("market"))
