@@ -11,7 +11,7 @@ Additive only. Each step is skipped when a Store on the same code built that sha
 every child table's rows survive (pinned in test_migrations).
 
 Revision ID: 0017
-Revises: 0013 (0016 once CASH-4's 0016 and the reserved 0014/0015 are on main)
+Revises: 0014 (0016 once CASH-4's 0016 and the reserved 0015 are on main)
 Create Date: 2026-10-13 16:00:00.000000
 """
 
@@ -20,7 +20,7 @@ import sqlalchemy as sa
 
 
 revision = '0017'
-down_revision = '0013'
+down_revision = '0014'
 branch_labels = None
 depends_on = None
 
