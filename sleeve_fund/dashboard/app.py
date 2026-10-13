@@ -286,7 +286,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         profiles = {x["profile"].name: x["profile"].max_drawdown for x in summaries}
         halt = next(iter(profiles.items())) if len(profiles) == 1 else None
         chart = riskops.drawdown_chart(bookm.book_curve(summaries, frames), halt=halt[1] if halt else None)
-        return page(request, "risk.html", book=book, risk=risk, health=health, chart=chart,
+        return page(request, "risk.html", book=book, risk=risk, health=health, chart=chart, size=riskops.gate_size(st(), book),
                     halt_name=halt[0] if halt else None, stress=riskops.stress_bars(risk["scenarios"]),
                     status=riskops.status_word(riskops.status_items(risk["rows"], health), running),
                     ops=riskops.ops_view(st(), summaries), shell=shell(sleeves), kill=kill,

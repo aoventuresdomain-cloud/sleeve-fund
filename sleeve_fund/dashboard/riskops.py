@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import shutil
+from decimal import Decimal
 from pathlib import Path
 
 import pandas as pd
@@ -65,6 +66,41 @@ def risk_view(store: Store, summaries: list[dict], book: dict) -> dict:
             "down20": next(sc for sc in scenarios if sc["shock"] == -0.20),
             "up20": next(sc for sc in scenarios if sc["shock"] == 0.20),
             "history": store.events_of(BREACH_KINDS, limit=50)}
+
+
+# Total size turns amber from this share of its limit: a display threshold only, as the gate has the one limit
+# (Advisor critique 2, 13 Oct 23:40 UK).
+NEAR_LIMIT = 0.8
+
+
+def gate_size(store: Store, book: dict) -> dict:
+    """The book's total size (long + short) and net, x book, as the portfolio's entry gate reads them (UP-1): the
+    fund's last mark and every position and live reservation it counts (paper.portfolio_gate, decide()'s "gross").
+    Before the supervisor has marked the fund the gate reads nothing (it refuses entries as stale), so the figures
+    are the strategies' own marks, and `source` says so. tone: "" under NEAR_LIMIT of the limit, "warn" from it,
+    "loss" at the limit, where the gate takes nothing more that raises total size. Display only."""
+    from sleeve_fund.paper.portfolio_gate import PaperGate
+    from sleeve_fund.risk import PORTFOLIO
+
+    limit = PORTFOLIO.gross
+    total = net = None
+    try:
+        gate = PaperGate(store)
+        if gate.ledger.state().equity is not None:
+            equity, held = gate.ledger.positions()
+            held = (*held, *(r.holding for r in gate.ledger.reservations()))
+            if equity > 0:
+                total = sum((abs(h.notional) for h in held), Decimal(0)) / equity
+                net = sum((h.notional for h in held), Decimal(0)) / equity
+    except Exception:  # noqa: BLE001 - a book the gate can't read is shown from the strategies' marks
+        total = net = None
+    source = "gate"
+    if total is None:
+        total, net, source = Decimal(repr(book["exposure_pct"])), Decimal(repr(book["net_pct"])), "marks"
+    cap = Decimal(repr(limit))  # compared exactly, as the gate compares (limits.decide)
+    tone = "loss" if total >= cap else "warn" if total >= cap * Decimal(repr(NEAR_LIMIT)) else ""
+    total, net = float(total), float(net)
+    return {"total": total, "net": net, "limit": limit, "tone": tone, "source": source}
 
 
 def most_it_can_lose(x: dict) -> float:
