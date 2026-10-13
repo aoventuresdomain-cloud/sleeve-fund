@@ -8,7 +8,7 @@ runs. Tables are plain and typed so reports and BI tools can query them directly
 
 from __future__ import annotations
 
-from decimal import Decimal
+from decimal import ROUND_CEILING, Decimal
 
 import json
 import math
@@ -62,6 +62,12 @@ COMMANDS = {"pause", "resume", "flatten", RAL, BOOK_RESET}
 # Applied by the supervisor, not the strategy: restart the process so it trades under settings the PM
 # changed (Store.change_settings).
 RELOAD = "reload"
+# The supervisor's cancel of one resting order whose Strategy can no longer manage it (ORPHAN-GUARD, Advisor 8 Oct
+# 06:15 and 06:20 UK). Never the Strategy's: pending_commands leaves it out, and only apply_cancel applies it, when the
+# venue has answered.
+CANCEL = "cancel"
+# Every kind a commands row may hold, which the commands_kind CHECK enforces (migration 0015).
+COMMAND_KINDS = (*sorted(COMMANDS), RELOAD, CANCEL)
 STATUSES = {"starting", "running", "paused", "halted", "stopped", "error"}
 LEVELS = ("info", "warning", "error")
 
@@ -122,6 +128,9 @@ fills_t = Table(
     Index("fills_sleeve_order_trade", "sleeve", "order_id", "trade_id", unique=True),
 )
 
+FUNDING_CHARGE_KINDS = ("settled", "baseline")  # the kinds that charge a settlement: one of them per settlement
+FUNDING_CHARGES = "kind IN ('settled', 'baseline')"
+
 # A perpetual's funding, exchanged at each funding time while a position is held (sleeve_fund.markets):
 # amount is what the strategy received (negative: paid), in the quote currency, booked to cash.
 funding_t = Table(
@@ -139,6 +148,11 @@ funding_t = Table(
     Column("kind", String(16), nullable=False, server_default="settled"),
     CheckConstraint("kind IN ('settled', 'baseline', 'true_up', 'reversal')", name="funding_kind"),
     Index("funding_sleeve_ts", "sleeve", "ts"),
+    # CASH-1: a settlement is charged once (settled or baseline, never both), and reversed or trued up at most once.
+    # The key is the settlement time, so a second process or a restart that forgot it is refused by the database.
+    Index("funding_once", "sleeve", "ts", "kind", unique=True),
+    Index("funding_charged_once", "sleeve", "ts", unique=True, sqlite_where=text(FUNDING_CHARGES),
+          postgresql_where=text(FUNDING_CHARGES)),
 )
 
 # A perpetual's loss past the bankruptcy price, which the venue's insurance fund takes under isolated margin
@@ -151,7 +165,12 @@ insurance_t = Table(
     Column("ts", TS, nullable=False),
     Column("price", EXACT, nullable=False),
     Column("amount", EXACT, nullable=False),
+    # CASH-1: the fill that left the strategy flat below zero; one credit for it. Null on rows before 0013.
+    Column("order_id", String(64)),
+    Column("trade_id", String(64)),
     Index("insurance_sleeve_ts", "sleeve", "ts"),
+    Index("insurance_once", "sleeve", "order_id", "trade_id", unique=True, sqlite_where=text("order_id IS NOT NULL"),
+          postgresql_where=text("order_id IS NOT NULL")),
 )
 
 # The demo mirror (sleeve_fund.mirror): one row per journaled fill it copied, skipped or
@@ -197,6 +216,15 @@ commands_t = Table(
     Column("incident", Integer, ForeignKey("events.id", ondelete="RESTRICT")),
     Index("commands_incident", "incident", unique=True, postgresql_where=text("incident IS NOT NULL"),
           sqlite_where=text("incident IS NOT NULL")),
+    # The one resting order a cancel names (migration 0015). Only a cancel has one, and a cancel always does: NULL never
+    # means "every order".
+    Column("order_id", String(64), ForeignKey("orders.order_id", ondelete="RESTRICT")),
+    CheckConstraint(f"command IN ({', '.join(repr(k) for k in COMMAND_KINDS)})", name="commands_kind"),
+    CheckConstraint(f"(command = '{CANCEL}') = (order_id IS NOT NULL)", name="commands_cancel_order"),
+    # One open cancel per order: a retry, a second sweep or a restart finds the first, never sends a second.
+    Index("commands_cancel_open", "order_id", unique=True,
+          postgresql_where=text(f"command = '{CANCEL}' AND applied_at IS NULL"),
+          sqlite_where=text(f"command = '{CANCEL}' AND applied_at IS NULL")),
 )
 
 decisions_t = Table(
@@ -626,6 +654,8 @@ gate_decisions_t = Table(
     Index("gate_decisions_sleeve_bar_intent_stage", "sleeve_id", "bar_ts", "intent_id", "stage", unique=True,
           sqlite_where=text("outcome <> 'error'"), postgresql_where=text("outcome <> 'error'")),
     Index("gate_decisions_sleeve_decided_at", "sleeve_id", "decided_at"),
+    # An order's decisions, read on every fill and status change of a gated order and by a cancel (migration 0015)
+    Index("gate_decisions_order_id", "order_id"),
 )
 # Headroom held by resting entries: one per approved or trimmed decision, released in the same transaction as the
 # fill, reject or cancel row. Never released blind while its order may still fill (Advisor 20:25 UK).
@@ -1571,13 +1601,42 @@ class Store:
         return replay_book(fills, starting_balance, self.funding_total(sleeve), self.insurance_total(sleeve))
 
     def record_funding(self, sleeve: str, *, qty: float, price: float, rate: float, amount: float,
-                       ts: datetime | None = None, kind: str = "settled") -> None:
+                       ts: datetime | None = None, kind: str = "settled") -> str:
+        """Book a funding movement once (CASH-1): "new" when written; "same" when this settlement already holds it
+        (a second process, a restart); "differs" when it holds another figure, or the other charge kind, which raises
+        an error event and moves nothing. Only "new" moved cash."""
         qty, price, amount = _exact(qty=qty, price=price, amount=amount)
-        with self.engine.begin() as c:
-            c.execute(funding_t.insert().values(sleeve=sleeve, ts=ts or utcnow(), qty=qty, price=price, rate=rate,
-                                                amount=amount, kind=kind))
+        ts = ts or utcnow()
+        key = (funding_t.c.sleeve == sleeve) & (funding_t.c.ts == ts)
+        key &= funding_t.c.kind.in_(FUNDING_CHARGE_KINDS) if kind in FUNDING_CHARGE_KINDS else funding_t.c.kind == kind
+        booked = self._book_once(funding_t, key, dict(sleeve=sleeve, ts=ts, qty=qty, price=price, rate=rate,
+                                                      amount=amount, kind=kind),
+                                 lambda row: row.kind == kind and stored(row.amount) == stored(amount))
+        if booked == "differs":
+            self.event(sleeve, "error", "funding_conflict",
+                       f"Funding for the {ts:%d %b %H:%M} UTC settlement ({kind}, {amount:,.2f}) arrived again with "
+                       "different figures. The booked entry is kept and nothing moved; check the venue's record "
+                       "before trusting this strategy's book", ts=ts)
+        return booked
 
-    def funding(self, sleeve: str, limit: int = 1000) -> list[dict]:
+    def _book_once(self, table, key, values: dict, same) -> str:
+        """Insert `values` unless a row matching `key` exists: "new", "same" (same(row) holds) or "differs". The
+        table's unique index makes a concurrent second writer fail; its retry reads the first writer's row."""
+        for _ in range(2):
+            try:
+                with self.engine.begin() as c:
+                    row = c.execute(select(table).where(key)).first()
+                    if row is not None:
+                        return "same" if same(row) else "differs"
+                    c.execute(insert(table).values(**values))
+                    return "new"
+            except IntegrityError:
+                continue
+        raise RuntimeError(f"a {table.name} row of {values.get('sleeve')} could not be booked or read")
+
+    def funding(self, sleeve: str, limit: int | None = 1000) -> list[dict]:
+        """Newest first: the last `limit` rows, or all of them with limit=None, as a check that must see every
+        settlement reads them (CASH-1)."""
         q = select(funding_t).where(funding_t.c.sleeve == sleeve).order_by(funding_t.c.ts.desc()).limit(limit)
         with self.engine.connect() as c:
             return _rows(c.execute(q))
@@ -1590,10 +1649,30 @@ class Store:
         with self.engine.connect() as c:
             return to_decimal(c.execute(q).scalar() or 0)
 
-    def record_insurance(self, sleeve: str, *, price: float, amount: float, ts: datetime | None = None) -> None:
+    def record_insurance(self, sleeve: str, *, price: float, amount: float, order_id: str | None = None,
+                         trade_id: str | None = None, ts: datetime | None = None) -> str:
+        """Book the insurance fund's credit for the fill (order_id, trade_id) that left the strategy flat below zero,
+        once (CASH-1): "new", "same" or "differs", as record_funding. The engine always names the fill; a row without
+        one (an import, a hand-made journal) is unkeyed, as rows before 0013 are."""
         price, amount = _exact(price=price, amount=amount)
-        with self.engine.begin() as c:
-            c.execute(insurance_t.insert().values(sleeve=sleeve, ts=ts or utcnow(), price=price, amount=amount))
+        # Up to the cent, here in the one write path so no caller can skip it: it exists to bring equity back to zero
+        # or above (Advisor 8 Oct 04:10, ruling 3)
+        amount = amount.quantize(Decimal("0.01"), rounding=ROUND_CEILING)
+        ts = ts or utcnow()
+        if order_id is None:
+            with self.engine.begin() as c:
+                c.execute(insert(insurance_t).values(sleeve=sleeve, ts=ts, price=price, amount=amount))
+            return "new"
+        key = ((insurance_t.c.sleeve == sleeve) & (insurance_t.c.order_id == order_id)
+               & (insurance_t.c.trade_id == trade_id))
+        booked = self._book_once(insurance_t, key, dict(sleeve=sleeve, ts=ts, price=price, amount=amount,
+                                                        order_id=order_id, trade_id=trade_id),
+                                 lambda row: stored(row.amount) == stored(amount))
+        if booked == "differs":
+            self.event(sleeve, "error", "insurance_conflict",
+                       f"The insurance credit for order {order_id} (trade {trade_id}) arrived again as {amount:,.2f}. "
+                       "The booked credit is kept and nothing moved", ts=ts)
+        return booked
 
     def insurance(self, sleeve: str, limit: int = 1000) -> list[dict]:
         q = select(insurance_t).where(insurance_t.c.sleeve == sleeve).order_by(insurance_t.c.ts.desc()).limit(limit)
@@ -2398,7 +2477,11 @@ class Store:
         return next((c for c in self.pending_commands(sleeve) if c["command"] == RELOAD), None)
 
     def pending_commands(self, sleeve: str) -> list[dict]:
-        q = (select(commands_t).where(commands_t.c.sleeve == sleeve, commands_t.c.applied_at.is_(None))
+        """The commands a Strategy's process (and the PM's screens) act on. A cancel is the supervisor's, read with
+        open_cancels: a process never applies one, and drop_pending never lapses one, since the order would be left
+        resting with nobody asking for it to go."""
+        q = (select(commands_t).where(commands_t.c.sleeve == sleeve, commands_t.c.applied_at.is_(None),
+                                      commands_t.c.command != CANCEL)
              .order_by(commands_t.c.id))
         with self.engine.connect() as c:
             return _rows(c.execute(q))
@@ -2415,8 +2498,94 @@ class Store:
         return len(pending)
 
     def mark_applied(self, command_id: int) -> None:
+        """Not for a cancel: apply_cancel applies one, with its order and reservation, when the venue has answered."""
         with self.engine.begin() as c:
-            c.execute(update(commands_t).where(commands_t.c.id == command_id).values(applied_at=utcnow()))
+            c.execute(update(commands_t).where(commands_t.c.id == command_id, commands_t.c.command != CANCEL)
+                      .values(applied_at=utcnow()))
+
+    # --- ORPHAN-GUARD: the supervisor's cancel of a resting order (migration 0015) -----------------------------------
+
+    def request_cancel(self, sleeve: str, order_id: str, reason: str, actor: str = "supervisor") -> int:
+        """Ask for one resting order to be cancelled, journaled before anything is sent. Returns the cancel's id; a
+        cancel already open for this order is returned, never a second one (commands_cancel_open), so a retry, a second
+        sweep or a restart sends nothing new. Refused for an order of another Strategy or one no longer open."""
+        if not reason.strip():
+            raise ValueError("every command needs a reason")
+        with self.engine.begin() as c:
+            order = c.execute(select(orders_t.c.sleeve, orders_t.c.status)
+                              .where(orders_t.c.order_id == order_id)).first()
+            if order is None or order.sleeve != sleeve:
+                raise ValueError(f"no order {order_id!r} for {sleeve}")
+            if (open_id := self._open_cancel(c, order_id)) is not None:
+                return open_id
+            if order.status not in OPEN_ORDER_STATUSES:
+                raise ValueError(f"order {order_id} is {order.status}, not resting: nothing to cancel")
+        try:
+            with self.engine.begin() as c:
+                cid = c.execute(insert(commands_t).values(sleeve=sleeve, command=CANCEL, order_id=order_id,
+                                                          reason=reason.strip(), created_at=utcnow())
+                                ).inserted_primary_key[0]
+        except IntegrityError:  # another caller opened it between our read and our insert
+            with self.engine.connect() as c:
+                if (open_id := self._open_cancel(c, order_id)) is None:
+                    raise
+                return open_id
+        self.decide(actor, CANCEL, f"{reason.strip()} (order {order_id})", sleeve)
+        return cid
+
+    @staticmethod
+    def _open_cancel(c, order_id: str) -> int | None:
+        return c.execute(select(commands_t.c.id).where(commands_t.c.order_id == order_id,
+                                                       commands_t.c.command == CANCEL,
+                                                       commands_t.c.applied_at.is_(None))).scalar()
+
+    def open_cancels(self, sleeve: str | None = None) -> list[dict]:
+        """Cancels sent or to send whose venue answer hasn't come: the supervisor's to work, oldest first."""
+        q = select(commands_t).where(commands_t.c.command == CANCEL, commands_t.c.applied_at.is_(None))
+        if sleeve is not None:
+            q = q.where(commands_t.c.sleeve == sleeve)
+        with self.engine.connect() as c:
+            return _rows(c.execute(q.order_by(commands_t.c.id)))
+
+    def apply_cancel(self, command_id: int, outcome: str) -> str:
+        """The venue's answer to a cancel, in one transaction. outcome "cancelled" (confirmed) or "not_found".
+
+        "Not found" is not proof of a cancel (Advisor 8 Oct 06:20 UK): the fill journal is read first, and if the order
+        filled at all, nothing is written and "filled" is returned: the caller books the venue's fills (each reduces
+        the reservation as any fill does), holds them as the holding and closes the orphan (og5), and settles the order's
+        final status from the venue; the cancel stays open until then (open question to PE2, 0015 design).
+        Otherwise the order's open reservation (what no fill used) is released as 'cancel', the order is marked
+        canceled (confirmed) or expired (not found: we never claim a cancel we didn't see), and the command applied:
+        "applied", or "partly_filled" for a confirmed cancel of an order with fills, whose filled part the caller
+        closes (og5). "already" when another got there first, and then nothing at all is written."""
+        if outcome not in ("cancelled", "not_found"):
+            raise ValueError(f"a cancel's outcome is 'cancelled' or 'not_found', not {outcome!r}")
+        now = utcnow()
+        with self.engine.begin() as c:
+            cmd = c.execute(select(commands_t).where(commands_t.c.id == command_id,
+                                                     commands_t.c.command == CANCEL)).first()
+            if cmd is None:
+                raise ValueError(f"command {command_id} is not a cancel")
+            if cmd.applied_at is not None:
+                return "already"
+            filled = c.execute(select(fills_t.c.id).where(fills_t.c.sleeve == cmd.sleeve,
+                                                          fills_t.c.order_id == cmd.order_id).limit(1)).first()
+            if filled is not None and outcome == "not_found":
+                return "filled"
+            took = c.execute(update(commands_t).where(commands_t.c.id == command_id, commands_t.c.applied_at.is_(None))
+                             .values(applied_at=now)).rowcount
+            if not took:
+                return "already"
+            decisions = select(gate_decisions_t.c.id).where(gate_decisions_t.c.order_id == cmd.order_id)
+            c.execute(update(gate_reservations_t).where(gate_reservations_t.c.decision_id.in_(decisions),
+                                                        gate_reservations_t.c.released_at.is_(None))
+                      .values(released_at=now, release_reason="cancel"))
+            c.execute(update(orders_t).where(orders_t.c.order_id == cmd.order_id,
+                                             orders_t.c.status.in_(OPEN_ORDER_STATUSES))
+                      .values(status="canceled" if outcome == "cancelled" else "expired", updated_at=now,
+                              message=f"cancelled by the supervisor: {cmd.reason}" if outcome == "cancelled"
+                              else f"not found at the venue and never filled: {cmd.reason}"))
+        return "applied" if filled is None else "partly_filled"
 
     def decide(self, actor: str, action: str, reason: str, sleeve: str | None = None,
                ts: datetime | None = None) -> None:
