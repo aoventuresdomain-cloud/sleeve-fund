@@ -603,11 +603,11 @@ class SleeveRuntime:
         The process checks the row as Store.command does (ral_refusal; QA-193-F4: a row with no noted incident, from a
         restored backup or a script, is refused, not carried out). The command is marked applied only after
         liquidation_reset is journaled (QA-193-F3): a failure in between leaves it pending and the incident unspent,
-        so the restart takes it again. One journaled but not yet marked (its incident answered by the newest
-        liquidation_reset) is finished on the retry, never journaled twice: the earlier resets lapse (QA F217-1) and
+        so the restart takes it again. One journaled but not yet marked (a liquidation_reset carries its command_id,
+        F217-3) is finished on the retry, never journaled twice: the earlier resets lapse (QA F217-1) and
         a halt still standing is lifted. Any other RAL with nothing to reset is ignored as before, and lapses nothing."""
         liq = liquidation_event(self.store, self.name)
-        if liq is None and self._ral_journaled(cmd):
+        if liq is None and (reset := self.store.reset_for_command(cmd["id"])) is not None:
             # The process died after journaling this reset and before marking it applied: finish it from the journal,
             # never journal it twice or call it ignored. Lift the halt only when it is the liquidation's (its reason,
             # as clearing_action reads it) and no halt has been journaled since the reset (a reconciliation mismatch
@@ -616,7 +616,6 @@ class SleeveRuntime:
             self.peak, self._day_open = equity, equity
             self.wiped_out, self.liquidated = False, None
             if self.status == "halted":
-                reset = self.store.last_event(self.name, (RESET_AFTER_LIQUIDATION,))
                 kept = self._lift_the_liquidations_halt(after_id=reset["id"])
                 self.store.event(self.name, "info", "ral_finished",  # events.kind is String(32)
                                  "reset after liquidation finished after a restart; "
@@ -635,7 +634,7 @@ class SleeveRuntime:
             return
         old = self.peak
         self.store.event(self.name, "info", RESET_AFTER_LIQUIDATION,
-                         ral_words(self.store, self.name, cmd, liq, old, equity), ts=self.now())
+                         ral_words(self.store, self.name, cmd, liq, old, equity), ts=self.now(), command_id=cmd["id"])
         self._lapse_resets_before(cmd)
         self.peak, self._day_open = equity, equity
         self.wiped_out, self.liquidated = False, None
@@ -664,14 +663,6 @@ class SleeveRuntime:
 
     def _status_reason(self) -> str:
         return self.store.sleeve(self.name).status_reason or ""
-
-    def _ral_journaled(self, cmd: dict) -> bool:
-        """True when the newest liquidation_reset answers this command's incident (ral_words names it): the reset was
-        journaled and the process died before marking the command applied."""
-        if cmd.get("incident") is None:
-            return False
-        last = self.store.last_event(self.name, (RESET_AFTER_LIQUIDATION,))
-        return last is not None and f"answering incident #{cmd['incident']} (" in last["message"]
 
     def _lapse_resets_before(self, cmd: dict) -> None:
         for request in self.store.pending_resets():

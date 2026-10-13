@@ -171,3 +171,25 @@ def test_past_the_ttl_an_unacked_order_is_told_once_as_not_cancelled_and_nothing
     assert not _alerts(store, "reservation_cancel_failed") and not _alerts(store, "reservation_cancel_unconfirmed")
     assert not [e for e in _alerts(store, "supervisor_error")]
     assert _res(store, rid).released_at is None
+
+def test_a_halt_tells_a_holder_it_cant_close_at_most_system_flattens_times_then_says_so_once(monkeypatch):
+    """HoQA F229-5: a holder whose flatten never closes it (less than the venue's smallest order, say) is told at most
+    SYSTEM_FLATTENS times this halt, then one alert says the PM must close it; the halt still blocks its entries."""
+    from sleeve_fund import supervisor
+
+    store = _store()
+    _strategies(store)
+    _hold(store, "a")
+    sup = supervisor.Supervisor(store)
+    real, told = store.command, []
+    monkeypatch.setattr(store, "command", lambda name, cmd, *a, **k: told.append((name, cmd)) or real(name, cmd, *a, **k))
+    marks = iter([EQ] + [EQ * D("0.80")] * 100)
+    monkeypatch.setattr(supervisor, "fund_equity", lambda *a, **k: D(next(marks)))
+    for m in range(0, 12):
+        sup.mark_portfolio(T0 + timedelta(minutes=m))
+        for c in store.pending_commands("a"):  # each flatten is taken, and the position stays
+            store.mark_applied(c["id"])
+    assert told.count(("a", "flatten")) == supervisor.SYSTEM_FLATTENS
+    gave_up = [e for e in store.events("a", limit=100) if e["kind"] == "flatten_gave_up"]
+    assert len(gave_up) == 1 and "the PM must close it" in gave_up[0]["message"]
+    assert entry_blocked(store, "a", T0 + timedelta(minutes=12))[0]
