@@ -185,7 +185,8 @@ def create_app(store: Store | None = None) -> FastAPI:
             "attention": sum(1 for x in sleeves if x.status in ("halted", "error")),
             "unhealthy": sum(1 for x in wanted if not (x.heartbeat_at and now - x.heartbeat_at < STALE)),
             # The rail lists every strategy not put away, so each is one click from anywhere.
-            "strategies": [{"name": x.name, "status": x.status} for x in sleeves if x.name not in put_away],
+            "strategies": [{"name": x.name, "status": x.status, "test": bookm.is_test_account(st(), x)}
+                           for x in sleeves if x.name not in put_away],
         }
 
     def page(request: Request, name: str, **ctx) -> HTMLResponse:
@@ -205,10 +206,22 @@ def create_app(store: Store | None = None) -> FastAPI:
         return x
 
     def book_data():
+        """Every strategy in the current book, test accounts included: the kill switch, flatten and reset act on all
+        of them. The figures the PM reads come through shown_book."""
         sleeves = current_sleeves()
         frames = {s.name: bookm.daily(st(), s.name) for s in sleeves}
         summaries = [bookm.sleeve_extras(st(), sleeve_summary(st(), s), frames[s.name]) for s in sleeves]
         return sleeves, frames, summaries
+
+    def shown_book():
+        """The book as the PM's figures show it (CCY-8DP-UI, HoE 13 Oct): strategies on a named test account are left
+        out of the totals and listed apart, as their results are never Strategy evidence. Display only: the engine's
+        and the supervisor's limits and halts count what they count. Returns book_data's three plus the test ones."""
+        sleeves, frames, summaries = book_data()
+        tests = [x for x in summaries if x["test_account"]]
+        out = {x["sleeve"].name for x in tests}
+        return ([s for s in sleeves if s.name not in out], {k: v for k, v in frames.items() if k not in out},
+                [x for x in summaries if not x["test_account"]], tests)
 
     @app.get("/healthz", include_in_schema=False)
     def healthz() -> dict:
@@ -216,7 +229,7 @@ def create_app(store: Store | None = None) -> FastAPI:
 
     @app.get("/", response_class=HTMLResponse)
     def home(request: Request, _: str = Depends(require_pm)):
-        sleeves, frames, summaries = book_data()
+        sleeves, frames, summaries, tests = shown_book()
         put_away = st().archived()
         earlier = st().previous_book()
         names = [s.name for s in sleeves]
@@ -237,10 +250,11 @@ def create_app(store: Store | None = None) -> FastAPI:
                     archived=[x for x in summaries if x["sleeve"].name in put_away],
                     earlier=[st().sleeve(n) for n in earlier], book_start=st().book_start(),
                     earlier_resets=bool(set(earlier) & set(st().reset_runs())),
-                    book=book, alerts=st().alerts(limit=30), shell=shell(sleeves),
+                    book=book, alerts=st().alerts(limit=30), shell=shell(),
                     positions=positions, working=working, holdings=bookm.holdings(positions["rows"], book["equity"]),
                     book_fills=trading.book_fills(st(), sleeves), funding=funding,
-                    fill_count=sum(x["fills"] for x in summaries))
+                    fill_count=sum(x["fills"] for x in summaries), tests=tests,
+                    test_positions=trading.book_positions(st(), tests) if tests else None)
 
     def _recent_json(sleeves, days: int, daily) -> JSONResponse:
         """The last day or week at fine resolution, in the shape the charts read."""
@@ -262,7 +276,7 @@ def create_app(store: Store | None = None) -> FastAPI:
 
     @app.get("/api/book/equity")
     def book_equity_json(days: int | None = None, _: str = Depends(require_pm)):
-        sleeves, frames, summaries = book_data()
+        sleeves, frames, summaries, _tests = shown_book()
         curve = bookm.book_curve(summaries, frames)  # every strategy, as the book figures count it
         if days:
             return _recent_json(sleeves, days, curve)
@@ -276,9 +290,10 @@ def create_app(store: Store | None = None) -> FastAPI:
 
     @app.get("/risk", response_class=HTMLResponse)
     def risk_page(request: Request, _: str = Depends(require_pm)):
-        sleeves, frames, summaries = book_data()
+        _, _, everyone = book_data()
+        kill = _kill_targets(everyone)  # the kill switch acts on every strategy, test accounts included
+        sleeves, frames, summaries, tests = shown_book()
         book = bookm.book_view(st(), summaries, frames)
-        kill = _kill_targets(summaries)
         risk = riskops.risk_view(st(), summaries, book)
         health = riskops.health_view(st(), summaries)
         running = sum(1 for x in summaries if x["sleeve"].status == "running")
@@ -289,7 +304,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         return page(request, "risk.html", book=book, risk=risk, health=health, chart=chart,
                     halt_name=halt[0] if halt else None, stress=riskops.stress_bars(risk["scenarios"]),
                     status=riskops.status_word(riskops.status_items(risk["rows"], health), running),
-                    ops=riskops.ops_view(st(), summaries), shell=shell(sleeves), kill=kill,
+                    ops=riskops.ops_view(st(), summaries), shell=shell(), kill=kill, tests=tests,
                     kill_error=request.query_params.get("kill_error"), killed=request.query_params.get("killed"))
 
     def _kill_targets(summaries) -> dict:
@@ -1231,7 +1246,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         """Performance and the decision log under one period and strategy filter, which the exports follow."""
         q = request.query_params
         now = utcnow()
-        sleeves, frames, summaries = book_data()
+        sleeves, frames, summaries, _tests = shown_book()
         names = [s.name for s in st().sleeves()]
         chosen = q.get("sleeve") if q.get("sleeve") in names else ""
         if chosen and chosen not in frames:  # a strategy an earlier clean slate put away: its own figures
@@ -1275,7 +1290,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         return page(request, "records.html", perf=perf, m=m, w=w, chosen=chosen, sleeves=names,
                     periods=reports.PERIODS, log=log, latest=decisions[:5], total=len(decisions),
                     kind_filters=reports.KIND_FILTERS, kind_counts=kinds, kinds=reports.DECISION_KINDS,
-                    qs=qs, exports=exports, action=dq["action"], shell=shell(sleeves))
+                    qs=qs, exports=exports, action=dq["action"], shell=shell())
 
     @app.get("/exports/{kind}.csv")
     def export_csv(kind: str, sleeve: str = "", _: str = Depends(require_pm)):
