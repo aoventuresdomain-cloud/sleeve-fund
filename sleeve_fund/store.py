@@ -2512,7 +2512,7 @@ class Store:
         with self.engine.connect() as c:
             return _rows(c.execute(q.order_by(commands_t.c.id)))
 
-    def apply_cancel(self, command_id: int, outcome: str) -> str:
+    def apply_cancel(self, command_id: int, outcome: str, at: datetime | None = None) -> str:
         """The venue's answer to a cancel, in one transaction: "cancelled" (confirmed), "not_found" or "filled".
 
         "Not found" is not proof of a cancel (Advisor 8 Oct 06:20 UK), so the fill journal is read first:
@@ -2526,10 +2526,11 @@ class Store:
         "cancelled": the order's open reservation (what no fill used) is released as 'cancel', the order marked
         canceled and the command applied: "applied", or "partly_filled" for an order with fills, whose filled part
         the caller closes (og5).
-        "already" when another got there first, and then nothing at all is written."""
+        "already" when another got there first, and then nothing at all is written. `at`: when the answer came, on
+        the clock confirm_cancels is given (the supervisor's), else now."""
         if outcome not in ("cancelled", "not_found", "filled"):
             raise ValueError(f"a cancel's outcome is 'cancelled', 'not_found' or 'filled', not {outcome!r}")
-        now = utcnow()
+        now = at or utcnow()
         with self.engine.begin() as c:
             cmd = c.execute(select(commands_t).where(commands_t.c.id == command_id,
                                                      commands_t.c.command == CANCEL)).first()
