@@ -11,10 +11,13 @@ import dataclasses
 
 import pandas as pd
 import pytest
-
 import test_hub_146_qa as qa
 from test_hub_146_full_round import _funding_rate_stub
-from test_hub_146_qa import LIQUIDATION_MECHANICS, _probe, flat_prices  # noqa: F401 - _probe registers the probe
+from test_hub_146_qa import (  # noqa: F401 - _probe registers the probe
+    LIQUIDATION_MECHANICS,
+    _probe,
+    flat_prices,
+)
 
 MM = 0.005
 SETTLED = pd.Timestamp("2025-10-03 08:00", tz="UTC")
