@@ -10,6 +10,7 @@ import importlib
 import math
 
 from dataclasses import dataclass, field
+from decimal import ROUND_HALF_UP, Decimal
 
 import numpy as np
 import pandas as pd
@@ -708,10 +709,14 @@ def _spread_into_prices(fills: pd.DataFrame, spread_paid: dict[str, float],
         entry = fills.at[coid, "commissions"]
         moneys = [str(m) for m in (entry if isinstance(entry, (list, tuple)) else [entry])]
         first, ccy = moneys[0].split()
-        fee = round(fee_paid[coid], 2) if fee_paid and coid in fee_paid else round(float(first) - spread, 2)
+        # CASH-3: an 8-place currency shows the fee at 8 dp half up, as the journal books it, so the price carries
+        # only the spread; a currency of fewer places (USD, test only) keeps the cent and its carry.
+        places = 8 if Currency.from_str(ccy).precision >= 8 else 2
+        exact = fee_paid[coid] if fee_paid and coid in fee_paid else float(first) - spread
+        fee = float(Decimal(repr(exact)).quantize(Decimal(1).scaleb(-places), rounding=ROUND_HALF_UP))
         moved = float(first) - fee  # the spread, and whatever rounding left in the charge
         fills.at[coid, "avg_px"] = str(px + moved / qty if buy else px - moved / qty)
-        fills.at[coid, "commissions"] = [f"{fee:.2f} {ccy}", *moneys[1:]]
+        fills.at[coid, "commissions"] = [f"{fee:.{places}f} {ccy}", *moneys[1:]]
     return fills
 
 
