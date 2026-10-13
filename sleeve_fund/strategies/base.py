@@ -3341,8 +3341,10 @@ class LongFlatStrategy(Strategy):
         life of the position, not an entry check (Independent Quant Advisor 17:10 UK, 13 Oct, STOP-LOOSEN-1): the stop
         sits no further than the profile's share (half) of the way from the entry to the CURRENT liquidation price
         (_liq_now). A tighter stop is returned as it is; a looser one is clamped, never flattened. Once funding has
-        carried the liquidation price past the entry, the way is measured from the last close instead."""
-        if frac is None or not self._margin or not self._entry_px:
+        carried the liquidation price past the entry, the way is measured from the last close instead. A restart's
+        safety stop is left as set: it has its own rule, half the REMAINING way from the mark (_place_safety_stop),
+        until the model's own stop is set again."""
+        if frac is None or not self._margin or not self._entry_px or self._safety_stop:
             return frac, None
         _, cash, qty, _ = self._mark()
         liq = self._liq_now(cash, qty) if qty else None
