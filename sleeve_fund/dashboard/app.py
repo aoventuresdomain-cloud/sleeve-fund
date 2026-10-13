@@ -406,8 +406,10 @@ def create_app(store: Store | None = None) -> FastAPI:
             check_hub_bar_spec(cfg.venue, cfg.bar_spec)
             needed = max(REGISTRY[strategy][0].warmup_needed({**_defaults(strategy), **params}, spec_minutes(bar_spec)),
                          exit_warmup(params))
-            for minutes, candles in REGISTRY[strategy][0].slower_needs({**_defaults(strategy), **params}).items():
+            slower = REGISTRY[strategy][0].slower_needs({**_defaults(strategy), **params})
+            for minutes, candles in slower.items():
                 _check_slower_history(cfg.venue, cfg.instrument, minutes, candles)
+            _check_warmup_gaps(cfg.venue, cfg.instrument, cfg.bar_spec, cfg.warmup_bars, slower)
             if any(s.name == name for s in st().sleeves()):
                 raise ValueError(f"a strategy called {name} already exists")
             account = str(form.get("account", "") or "paper")
@@ -690,6 +692,13 @@ def create_app(store: Store | None = None) -> FastAPI:
                     s = st().sleeve(name)
                     check_perp_sizing(s.strategy, s.params)
                     check_perp_stop(s.strategy, s.params, s.risk_profile)
+                    try:
+                        _check_warmup_gaps(_venue_name(s.venue), s.instrument, s.bar_spec, s.warmup_bars,
+                                           REGISTRY[s.strategy][0].slower_needs({**_defaults(s.strategy), **s.params})
+                                           if s.strategy in REGISTRY else {})
+                    except ValueError as exc:  # journaled, so the refusal is on the strategy's record (HoE)
+                        st().event(name, "warning", "start_refused", f"Not started: {exc}")
+                        raise
                     blocked, why = entry_blocked(st(), name, utcnow(), starting=True)  # CHOKE
                     if blocked and not (s.status == "halted" and any(
                             c["command"] in ("resume", "reset_after_liquidation") for c in st().pending_commands(name))):
@@ -1755,6 +1764,39 @@ def _check_slower_history(venue: str, pair: str, minutes: int, candles: int) -> 
                          f"history and the store holds {have:,} for {pair}; load more history first")
 
 
+def _check_warmup_gaps(venue: str, pair: str, bar_spec: str, warmup_bars: int, slower: dict[int, int]) -> None:
+    """START-GAPS (HoE 13 Oct): a start waits while the stored minutes its warm-up reads have gaps, as a backtest
+    does (_check_gaps), since the indicators would step across the hole (QA P1-D8). Only the window the warm-up
+    reads counts (its bars, or its slower candles' look-back, from the store's newest minute back), and only when
+    the store warms it up: bars built from live trades or from the hub, and slower candles. A store too stale to
+    use (paper.node.HISTORY_MAX_LAG) warms up on the venue's own candles instead, so it holds nothing back."""
+    import pandas as pd
+
+    from sleeve_fund.history import HistoryStore
+    from sleeve_fund.paper.node import HISTORY_MAX_LAG, hub_address
+
+    minutes = spec_minutes(bar_spec)
+    stored = bar_spec.endswith("INTERNAL") or hub_address(venue) is not None
+    span = max([warmup_bars * minutes if stored else 0, *(m * n for m, n in slower.items())])
+    if not span:
+        return
+    try:
+        hs = HistoryStore()
+        cov = hs.coverage(venue, pair)
+        if cov is None or pd.Timestamp.now(tz="UTC") - cov.last > HISTORY_MAX_LAG:
+            return
+        since = cov.last - pd.Timedelta(minutes=span)
+        hit = [g for g in hs.gaps(venue, pair) if g[1] >= since]
+    except OSError:  # an unreadable store: the warm-up itself says what failed
+        return
+    if hit:
+        n = len(hit)
+        raise ValueError(f"history: {pair} has {n} gap{'s' if n != 1 else ''} in the stored minutes its warm-up "
+                         f"reads (from {max(since, cov.first):%d %b %H:%M} UTC), the first from {hit[0][0]:%d %b %H:%M}"
+                         f" UTC, so its indicators would start on missing bars; it can start once the history "
+                         "is filled")
+
+
 def _venue_name(value) -> str:
     """A venue picked on a form (any case; blank is the default venue), as its profile names it. Raises
     ValueError on a venue with no profile."""
@@ -2067,6 +2109,7 @@ KIND_WORDS = {"handler_failed": "Strategy error", "maker_fill_above_tape": "Make
               "alert_send_failed": "Couldn't send alert", "alerts_sent": "Alerts sent", "alerts_config": "Alerts set up",
               "backup_problem": "Backup problem", "exits_change": "Exits changed", "settings_applied": "Settings applied",
               "stop_rejected": "Stop refused", "stop_reset": "Stop reset", "exits_applied": "Exits applied", "warmup_short": "Short warm-up",
+              "start_refused": "Start refused",
               "account_move": "Moved account"}
 
 
