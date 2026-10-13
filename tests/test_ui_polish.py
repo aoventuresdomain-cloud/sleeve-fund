@@ -133,3 +133,27 @@ def test_up2_a_spot_position_shows_its_side_leverage_and_exposure(tmp_path, monk
     assert "<dt>Side</dt><dd>Long</dd>" in size
     assert '<dt title="Spot: no leverage">Leverage</dt><dd>1×</dd>' in size
     assert ">Exposure</dt><dd>0.30× equity" in size
+
+
+# --- UP-3: P&L by strategy, biggest contributor first ------------------------------------------------------------------
+
+
+def test_up3_a_bigger_loss_is_listed_above_a_smaller_gain_and_still_reads_as_a_loss(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from sleeve_fund.dashboard import app as app_mod
+    from sleeve_fund.store import Store
+
+    monkeypatch.setenv("DASHBOARD_PASSWORD", "test-pw")
+    store = Store(f"sqlite:///{tmp_path}/m.db")
+    for name, equity in (("small-gain", 10_100.0), ("big-loss", 9_700.0)):
+        store.create_sleeve(name=name, strategy="trend_filter", instrument="BTC/USD", bar_spec="1-HOUR-LAST-INTERNAL",
+                            starting_balance=10_000, params={})
+        store.record_equity(name, equity=equity, cash=equity, qty=0, price=60_000, benchmark=10_000)
+    html = TestClient(app_mod.create_app(store)).get("/", auth=("pm", "test-pw")).text
+    today = html.split('data-period-rows="day"')[1].split("</tbody>")[0]
+    rows = today.split("<tr")[1:]
+    assert "big-loss" in rows[0] and "small-gain" in rows[1]  # by size: -300 before +100
+    assert '<i class="loss" style="right:50%' in rows[0] and "−300.00" in rows[0]  # still a loss, bar to the left
+    assert '<i class="gain" style="left:50%' in rows[1] and "+100.00" in rows[1]
+    assert "Book" in rows[-1] and "−200.00" in rows[-1]  # the rows still add up to Book

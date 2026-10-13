@@ -119,6 +119,8 @@ def create_app(store: Store | None = None) -> FastAPI:
     templates.env.filters["no_venues"] = no_venues  # stored reasons and messages name no venue (QA U18)
     templates.env.filters["pct"] = lambda x: f"{x:+.2%}"
     templates.env.filters["pct0"] = lambda x: f"{x:.0%}"
+    # Biggest contributor first, by size whatever its sign (UP-3): rows keep their sign colour and bar direction.
+    templates.env.filters["by_size"] = lambda rows, field: sorted(rows, key=lambda x: -abs(x[field]))
     templates.env.filters["money"] = lambda x: f"{x:,.2f}"
     # NaN-safe versions for stats that don't exist until a trade has closed.
     templates.env.filters["pctn"] = lambda x: "n/a" if x != x else f"{x:+.1%}"
