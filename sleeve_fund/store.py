@@ -38,6 +38,7 @@ from sqlalchemy import (
     delete,
     event,
     func,
+    inspect,
     insert,
     or_,
     select,
@@ -46,6 +47,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.schema import DropConstraint
 
 from sleeve_fund.exact import EXACT
 from sleeve_fund.money import stored, to_decimal
@@ -202,6 +204,18 @@ events_t = Table(
     Index("events_command_once", "command_id", unique=True, postgresql_where=text("command_id IS NOT NULL"),
           sqlite_where=text("command_id IS NOT NULL")),
 )
+
+
+def _unless_dropping_an_absent_fk(ddl, target, bind, **_kw) -> bool:
+    """drop_all drops a use_alter FK by name before its table, and Postgres refuses a name that isn't there: a
+    database built to a revision before 0014 has events without it. Skip that one drop then; adding it always runs."""
+    if not isinstance(ddl, DropConstraint):
+        return True
+    return any(fk["name"] == target.name for fk in inspect(bind).get_foreign_keys(target.table.name))
+
+
+next(c for c in events_t.foreign_key_constraints if c.name == "events_command_id_fkey").ddl_if(
+    callable_=_unless_dropping_an_absent_fk)
 
 commands_t = Table(
     "commands",

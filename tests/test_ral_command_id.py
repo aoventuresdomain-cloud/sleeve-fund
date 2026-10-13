@@ -151,6 +151,41 @@ def test_0014_on_a_database_at_0013_adds_the_column_and_index(engine):
     assert schema.report(engine)[1] == []
 
 
+def test_drop_all_clears_a_database_built_before_0014(engine):
+    """The harnesses' drop_all on the shared Postgres meets databases another test left at an older revision: events
+    without events_command_id_fkey. Dropping that FK by name must be skipped there, not fail every later test."""
+    from alembic import command
+
+    with engine.begin() as conn:
+        command.upgrade(schema._config(conn), "0013")
+    metadata.drop_all(engine)
+    assert not inspect(engine).has_table("events")
+
+
+def test_the_fk_drop_runs_only_where_the_fk_exists(engine):
+    from sqlalchemy import Column, ForeignKey, Integer, MetaData, Table
+    from sqlalchemy.schema import AddConstraint, DropConstraint
+
+    from sleeve_fund.store import _unless_dropping_an_absent_fk
+
+    # A copy of the FK on its own MetaData: building DropConstraint on the shared one would stop create_all rendering it.
+    m = MetaData()
+    Table("commands", m, Column("id", Integer, primary_key=True))
+    events = Table("events", m, Column("id", Integer, primary_key=True),
+                   Column("command_id", Integer, ForeignKey("commands.id", use_alter=True, name="events_command_id_fkey")))
+    fk = next(iter(events.foreign_key_constraints))
+    with engine.begin() as conn:
+        conn.execute(text("CREATE TABLE events (id INTEGER PRIMARY KEY, command_id INTEGER)"))
+    with engine.connect() as conn:
+        assert not _unless_dropping_an_absent_fk(DropConstraint(fk), fk, conn)
+        assert _unless_dropping_an_absent_fk(AddConstraint(fk), fk, conn)
+    with engine.begin() as conn:
+        conn.execute(text("DROP TABLE events"))
+    metadata.create_all(engine)
+    with engine.connect() as conn:
+        assert _unless_dropping_an_absent_fk(DropConstraint(fk), fk, conn)
+
+
 def _migration_0014():
     import importlib.util
     from pathlib import Path
