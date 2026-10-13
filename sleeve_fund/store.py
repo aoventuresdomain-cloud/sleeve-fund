@@ -20,6 +20,7 @@ from sqlalchemy import (
     JSON,
     BigInteger,
     CheckConstraint,
+    DDL,
     Column,
     Date,
     DateTime,
@@ -509,6 +510,35 @@ trials_t = Table(
     Index("trials_idea_hash", "idea_hash"),
     Index("trials_definition_dataset", "definition_hash", "dataset"),
 )
+# TRIALS-WORM (QD #238, HoE): the register is write-once. A row is never deleted, and an UPDATE may change only status
+# and error (a failed count re-counted); anything else, created_at, definition_hash, settings or the data range above
+# all, is refused by the database itself, so N, the earliest-row rule and the holdout check can't be edited after the
+# fact. Migration 0018 writes the same triggers (spelled out there: a migration is frozen at what it ran).
+TRIALS_FROZEN = ("id", "definition_hash", "idea_hash", "code_version", "definition_name", "family", "settings",
+                 "dataset", "stage", "source", "sharpe", "trades", "oos_trades", "backtest_id", "created_at",
+                 "data_start", "data_end", "kind")
+TRIALS_WORM_PG = (
+    "CREATE OR REPLACE FUNCTION trials_write_once() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+    "IF TG_OP = 'DELETE' THEN RAISE EXCEPTION USING ERRCODE = 'check_violation', "
+    "MESSAGE = 'trials are write-once: ' || OLD.id || ' cannot be deleted'; END IF; "
+    f"IF ({', '.join('NEW.' + c for c in TRIALS_FROZEN)}) IS DISTINCT FROM ({', '.join('OLD.' + c for c in TRIALS_FROZEN)}) "
+    "THEN RAISE EXCEPTION USING ERRCODE = 'check_violation', "
+    "MESSAGE = 'trials are write-once: only status and error of ' || OLD.id || ' may change'; END IF; "
+    "RETURN NEW; END $$",
+    "CREATE TRIGGER trials_write_once BEFORE UPDATE OR DELETE ON trials FOR EACH ROW EXECUTE FUNCTION trials_write_once()",
+)
+TRIALS_WORM_SQLITE = (
+    "CREATE TRIGGER trials_no_delete BEFORE DELETE ON trials BEGIN "
+    "SELECT RAISE(ABORT, 'trials are write-once: a row cannot be deleted'); END",
+    "CREATE TRIGGER trials_no_edit BEFORE UPDATE ON trials WHEN "
+    + " OR ".join(f"NEW.{c} IS NOT OLD.{c}" for c in TRIALS_FROZEN)
+    + " BEGIN SELECT RAISE(ABORT, 'trials are write-once: only status and error may change'); END",
+)
+for _sql in TRIALS_WORM_PG:
+    event.listen(trials_t, "after_create", DDL(_sql).execute_if(dialect="postgresql"))
+for _sql in TRIALS_WORM_SQLITE:
+    event.listen(trials_t, "after_create", DDL(_sql).execute_if(dialect="sqlite"))
+
 # The held-back period each idea has opened (v2 P1-7, C4): one per idea and underlying, at any timeframe or
 # venue, for ever. Append-only, and no strategy column, so a reset never touches it.
 holdout_locks_t = Table(
