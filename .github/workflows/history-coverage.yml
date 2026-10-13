@@ -56,5 +56,5 @@ jobs:
           END: ${{ inputs.end && format('--end {0}', inputs.end) || '' }}
           PAIRS: ${{ inputs.pairs }}
         run: |
-          ssh -i ~/.ssh/id_deploy "$USER_AT@$HOST" \
-            "cd /opt/sleeve-fund && sudo docker compose exec -T hub-$VENUE python -m sleeve_fund.history coverage --venue $VENUE --start $START $END $PAIRS"
+          ssh -i ~/.ssh/id_deploy -o ServerAliveInterval=30 -o ServerAliveCountMax=10 "$USER_AT@$HOST" \
+            "cd /opt/sleeve-fund && sudo docker compose exec -T hub-$VENUE python -u -m sleeve_fund.history coverage --venue $VENUE --start $START $END $PAIRS"
