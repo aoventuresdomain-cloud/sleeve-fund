@@ -92,13 +92,14 @@ def paper_gate(store):
 
 
 def order_reservation(store, order_id: str):
-    """The reservation id the order row carries (W2)."""
-    from sleeve_fund.store import orders_t
+    """The reservation linked to the order (W2). The link is gate_decisions.order_id (DA design; a reservation's id is
+    its decision's), so the order is found from its one decision. Two decisions naming one order raise (13 Oct, QT2)."""
+    from sleeve_fund.store import gate_decisions_t
 
     with store.engine.connect() as c:
         return c.execute(
-            select(orders_t.c.reservation_id).where(orders_t.c.order_id == order_id)
-        ).scalar()
+            select(gate_decisions_t.c.id).where(gate_decisions_t.c.order_id == order_id)
+        ).scalar_one_or_none()
 
 
 def record_entry_order(
@@ -119,10 +120,14 @@ def record_entry_order(
 def cancel_resting_entries_at_bar_close(
     store, strategy: str, bar_close: datetime
 ) -> None:
-    """The strategy's own process at its next bar close: cancel its unfilled resting entry, and the venue confirms."""
+    """The strategy's own process at its next bar close: cancel its unfilled resting entry, and the venue confirms.
+    The cell drives the store side: the entries the engine's bar-close cancel selects (resting_entries) and the venue's
+    confirmed cancel. The engine side (Strategy._cancel_gated_at_close sends the cancel, held and gapped bars included)
+    is pinned in the W2 PR's paper-harness tests, which HoQA checks there (13 Oct, PE2 / CR W2-4)."""
     from sleeve_fund.paper import portfolio_gate
 
-    portfolio_gate.cancel_resting_entries(store, strategy, bar_close)
+    for oid in portfolio_gate.resting_entries(store, strategy, bar_close):
+        store.update_order(oid, status="canceled")
 
 
 # =====================================================================================================================
@@ -302,12 +307,18 @@ def test_w1f_past_the_ttl_a_finished_order_is_released_and_an_unacked_one_has_it
     portfolio_pass(store, T0, EQ)
     led = _ledger(store)
     gone = check_order(
-        led, "a", _buy("0.1"), PORTFOLIO, T0 + timedelta(seconds=1)
+        led, "a", _buy("0.05"), PORTFOLIO, T0 + timedelta(seconds=1)
     ).reservation
     unacked = check_order(
-        led, "b", _buy("0.1"), PORTFOLIO, T0 + timedelta(seconds=2)
+        led, "b", _buy("0.05"), PORTFOLIO, T0 + timedelta(seconds=2)
     ).reservation
-    for rid, oid, status in ((gone, "o-gone", "canceled"), (unacked, "o-sent", None)):
+    # 0.05 each, so the three fit the 0.5x net limit and every one is reserved
+    ended = check_order(
+        led, "c", _buy("0.05"), PORTFOLIO, T0 + timedelta(seconds=3)
+    ).reservation
+    # "gone" is a true orphan: no order row was ever written for it (13 Oct, PE2: with W2, a cancelled order releases
+    # its own reservation as 'cancel', so the sweep's 'ttl' is only for a reservation nothing else will settle).
+    for rid, oid, status in ((ended, "o-ended", "canceled"), (unacked, "o-sent", None)):
         led.attach_order(
             rid, oid
         )  # the harness writes the order row ('submitted'), as the engine's send does
@@ -317,6 +328,7 @@ def test_w1f_past_the_ttl_a_finished_order_is_released_and_an_unacked_one_has_it
     for s in range(0, 15, 5):
         portfolio_pass(store, later + timedelta(seconds=s), EQ)
     assert _res(store, gone).release_reason == "ttl"
+    assert _res(store, ended).released_at is not None  # a finished order's reservation is never left held
     kept = _res(store, unacked)
     assert kept.released_at is None and kept.cancel_sent_at is not None
 
@@ -410,7 +422,8 @@ def test_w2f_an_unfilled_resting_entry_is_cancelled_at_the_next_bar_close_and_it
 ):
     """Advisor 8 Oct 06:10 UK: the strategy's own process cancels it at its next bar close; the confirmed cancel
     releases the reservation as 'cancel'. A partly filled one keeps what filled, and its rest is released."""
-    rid = _approved(store)
+    # a at 0.05 so a + b stay inside the 0.5x net limit and b is approved whole (fixture fix, PE2 13 Oct)
+    rid = _approved(store, qty="0.05")
     store.update_order("o-1", status="accepted")
     rid2 = _approved(store, strategy="b", oid="o-2")
     store.update_order("o-2", status="accepted")
