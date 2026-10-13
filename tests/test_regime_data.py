@@ -239,3 +239,11 @@ def test_the_database_refuses_a_row_that_reads_its_own_day_a_known_state_without
         return  # SQLite checks foreign keys only once DA-5 turns them on; Postgres refuses the member below
     with pytest.raises(IntegrityError):  # not in instruments
         store.record_universe(V, day, CFG, [Member("DOGEUSDT", "DOGE", 1, D(1))], data_through=day - timedelta(days=1))
+
+
+def test_a_pegged_underlying_never_enters_and_the_settings_are_the_advisors():
+    notional = {s: {DAY0 + timedelta(days=i): D(v) for i in range(120)} for s, v in (("USDCUSDT", 999), ("BTCUSDT", 1))}
+    listings = [Listing("USDCUSDT", "USDC", DAY0), Listing("BTCUSDT", "BTC", DAY0)]
+    got = universe(DAY0 + timedelta(days=100), listings, notional, n=2, keep_within=2, min_age_days=0, lag_days=1)
+    assert [m.symbol for m in got] == ["BTCUSDT"]
+    assert regime.SETTINGS == dict(n=20, keep_within=25, min_age_days=60, lag_days=1, min_members=10, min_history=180)

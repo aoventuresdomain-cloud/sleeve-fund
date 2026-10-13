@@ -6,8 +6,8 @@ Point in time throughout: a day's row reads only daily closes up to its `data_th
 (the lag), and the tercile cuts read only rows dated before it. The weight a state maps to is not here: QD's weighting
 reads the state, and an "unknown" state is weight 1.0 there (Advisor spec 4.6).
 
-Settings the Advisor fixes (N, lag, universe hysteresis, minimum listing age, the "unknown" rule) are arguments, never
-defaults, so nothing runs on a guess."""
+Settings the Advisor fixed (N, lag, universe hysteresis, minimum listing age, the "unknown" rule) are arguments; the
+pre-registered values are SETTINGS, which the nightly job passes."""
 
 from __future__ import annotations
 
@@ -21,6 +21,13 @@ LOOKBACKS = (20, 30)  # the spec's 20-day lookback and its one allowed variant
 NOTIONAL_DAYS = 30  # the universe ranks by 30-day quote notional
 CUT_DAYS = 365  # the tercile cuts come from the trailing year of the series
 HYSTERESIS = Decimal("0.03")  # about ±0.03 around each cut
+# Advisor 13 Oct 19:20 UK (pre-registered, advisor-rulings.md): N 20, lag 1 day (ranking and ER alike), keep within
+# N + 5, 60 days listed, the paper perpetual venue as reference, perps only, a member only with every close, unknown
+# below N/2 members or 180 valid ER days. Changing any of them is a new counted mapping in the "regime" family.
+SETTINGS = dict(n=20, keep_within=25, min_age_days=60, lag_days=1, min_members=10, min_history=180)
+# Underlyings pegged to a quote currency: their ER is meaningless, so they never enter the universe (Advisor (a)).
+PEGGED = frozenset({"USDT", "USDC", "FDUSD", "TUSD", "BUSD", "DAI", "USDP", "USDE", "PYUSD", "USD1", "EUR", "EURC",
+                    "EURI", "AEUR", "XUSD", "RLUSD", "USDS", "GUSD"})
 
 
 @dataclass(frozen=True)
@@ -70,7 +77,7 @@ def universe(day: date, listings: list[Listing], day_notional: dict[str, dict[da
              keep_within: int, min_age_days: int, lag_days: int, previous: frozenset[str] = frozenset()) -> list[Member]:
     """The universe for `day`: the top `n` by 30-day quote notional through `day - lag_days`, one contract per
     underlying (its highest-notional one), among contracts listed at least `min_age_days` before then and not delisted
-    by then. Hysteresis: a member of `previous` stays while it ranks within `keep_within` (>= n); the places left go
+    by then, and never one pegged to a quote currency (PEGGED). Hysteresis: a member of `previous` stays while it ranks within `keep_within` (>= n); the places left go
     to the best of the rest. Ranked by notional, ties by symbol, so the order never depends on input order."""
     if not 0 < n <= keep_within:
         raise ValueError(f"need 0 < n <= keep_within, got n={n}, keep_within={keep_within}")
@@ -79,6 +86,8 @@ def universe(day: date, listings: list[Listing], day_notional: dict[str, dict[da
     through = day - timedelta(days=lag_days)
     best: dict[str, tuple[Decimal, str]] = {}
     for x in listings:
+        if x.underlying.upper() in PEGGED:
+            continue
         if x.listed_at > through - timedelta(days=min_age_days):
             continue
         if x.delisted_at is not None and x.delisted_at < through:
