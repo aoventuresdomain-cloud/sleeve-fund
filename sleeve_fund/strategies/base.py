@@ -479,6 +479,15 @@ def handler_error_words(handler: str, exc: BaseException | str) -> str:
     return f"handling {where}: {what or 'no message'}" + (f" ({kind})" if kind else "")
 
 
+def fund_margin(owner, ts, amount: float) -> None:
+    """LIQ-FUND-1: a funding movement settled after the liquidation price was fixed is the position's margin's
+    (_liq_now). One settled before the fill (a late publish, a reversal) was the position's before it, so it doesn't
+    count. A plain function, as the funding writers are, so an engine-like holder without the fields moves nothing."""
+    since = getattr(owner, "_liq_from", None)
+    if getattr(owner, "_liq_px", None) is not None and since is not None and int(pd_ts(ts).value) > since:
+        owner._liq_funded += amount
+
+
 def pd_ts(t):
     import pandas as pd
 
@@ -3311,12 +3320,6 @@ class LongFlatStrategy(Strategy):
         moved = liq + self._liq_funded / denom if denom else liq
         return moved if moved > 0 else None
 
-    def _fund_margin(self, ts, amount: float) -> None:
-        """A funding movement settled after the liquidation price was fixed is the position's margin's (_liq_now).
-        One settled before the fill (a late publish, a reversal) was the position's before it, so it doesn't count."""
-        if self._liq_px is not None and self._liq_from is not None and int(pd_ts(ts).value) > self._liq_from:
-            self._liq_funded += amount
-
     def _liq_from_entry(self, cash: float, qty: float) -> float | None:
         """From the position's average entry as the strategy (and the journal) keep it, never the simulated
         venue's, which after a restart is the restore's price (QA P1-L22)."""
@@ -3715,7 +3718,7 @@ class LongFlatStrategy(Strategy):
                 self.runtime.name, qty=qty, price=px, rate=rate, amount=round(amount, 8), ts=ts, kind=kind) != "new":
             return
         self._cash_adj += amount
-        self._fund_margin(ts, amount)
+        fund_margin(self, ts, amount)
         self.funding_log.append((ts, amount, kind))
         if note:
             self.funding_notes[ts] = note.strip(" ()")  # the snapped record's own stamp, kept for the audit
@@ -3820,7 +3823,7 @@ class LongFlatStrategy(Strategy):
                                     amount=round(-amount, 8), ts=ts, kind="reversal") != "new":
                 continue  # reversed already (CASH-1): one reversal per settlement
             self._cash_adj -= amount
-            self._fund_margin(ts, -amount)
+            fund_margin(self, ts, -amount)
             self.funding_log.append((ts, -amount, "reversal"))
             # Nothing of the strategy's is owed at it now: it leaves the watch, and the hub alone judges the rate (M-1)
             when = pd_ts(ts)
@@ -3984,7 +3987,7 @@ class LongFlatStrategy(Strategy):
                     kind="reversal") != "new":
                 continue  # reversed already (CASH-1)
             self._cash_adj -= amount
-            self._fund_margin(when, -amount)
+            fund_margin(self, when, -amount)
             self.funding_log.append((when, -amount, "reversal"))
             if self.runtime is not None:
                 self.runtime.store.event(self.runtime.name, "info", "funding",

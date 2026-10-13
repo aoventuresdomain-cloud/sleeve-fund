@@ -182,7 +182,7 @@ def _stub(qty: float, fixed: float, funded: float, since: int | None = 0):
     from sleeve_fund.strategies.base import LongFlatStrategy
 
     class S:
-        _liq_now, _fund_margin = LongFlatStrategy._liq_now, LongFlatStrategy._fund_margin
+        _liq_now = LongFlatStrategy._liq_now
         _cfg = SimpleNamespace(perp=SimpleNamespace(maintenance_margin=MM))
 
         def __init__(self):
@@ -210,14 +210,16 @@ def test_the_moved_price_is_where_equity_meets_the_maintenance_margin(qty, fixed
 
 def test_only_funding_settled_after_the_fill_moves_it():
     """A reversal, or a late booking, of a settlement before the fill was the position's before it: not counted."""
+    from sleeve_fund.strategies.base import fund_margin
+
     s = _stub(1.0, 50.0, 0.0, since=int(SETTLED.value))
-    s._fund_margin(SETTLED.to_pydatetime(), -5.0)  # at the fill's instant: the position before it held that settlement
-    s._fund_margin(SETTLED - pd.Timedelta(hours=1), 3.0)
+    fund_margin(s, SETTLED.to_pydatetime(), -5.0)  # at the fill's instant: the position before it held that settlement
+    fund_margin(s, SETTLED - pd.Timedelta(hours=1), 3.0)
     assert s._liq_funded == 0.0
-    s._fund_margin(SETTLED + pd.Timedelta(hours=1), -5.0)
+    fund_margin(s, SETTLED + pd.Timedelta(hours=1), -5.0)
     assert s._liq_funded == -5.0
     s._liq_px = None  # flat: nothing is the margin's
-    s._fund_margin(SETTLED + pd.Timedelta(hours=2), -5.0)
+    fund_margin(s, SETTLED + pd.Timedelta(hours=2), -5.0)
     assert s._liq_funded == -5.0
 
 
