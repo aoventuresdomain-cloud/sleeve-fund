@@ -1577,9 +1577,12 @@ class Store:
             raise ValueError(f"only a true-up moves cash at an arrival time, not a {kind} row")
         key = (funding_t.c.sleeve == sleeve) & (funding_t.c.ts == ts)
         key &= funding_t.c.kind.in_(FUNDING_CHARGE_KINDS) if kind in FUNDING_CHARGE_KINDS else funding_t.c.kind == kind
-        booked = self._book_once(funding_t, key, dict(sleeve=sleeve, ts=ts, qty=qty, price=price, rate=rate,
-                                                      amount=amount, kind=kind, arrived_at=arrived_at),
-                                 lambda row: row.kind == kind and stored(row.amount) == stored(amount))
+        values = dict(sleeve=sleeve, ts=ts, qty=qty, price=price, rate=rate, amount=amount, kind=kind)
+        if arrived_at is not None:  # named only when set, so a journal from before 0016 still takes every other row
+            values["arrived_at"] = arrived_at
+        booked = self._book_once(funding_t, key, values,
+                                 lambda row: row.kind == kind and stored(row.amount) == stored(amount),
+                                 cols=(funding_t.c.kind, funding_t.c.amount))
         if booked == "differs":
             self.event(sleeve, "error", "funding_conflict",
                        f"Funding for the {ts:%d %b %H:%M} UTC settlement ({kind}, {amount:,.2f}) arrived again with "
@@ -1587,13 +1590,14 @@ class Store:
                        "before trusting this strategy's book", ts=ts)
         return booked
 
-    def _book_once(self, table, key, values: dict, same) -> str:
+    def _book_once(self, table, key, values: dict, same, cols=None) -> str:
         """Insert `values` unless a row matching `key` exists: "new", "same" (same(row) holds) or "differs". The
-        table's unique index makes a concurrent second writer fail; its retry reads the first writer's row."""
+        table's unique index makes a concurrent second writer fail; its retry reads the first writer's row. `cols`:
+        the columns same() reads, when not every column (one a later migration adds may not be there yet)."""
         for _ in range(2):
             try:
                 with self.engine.begin() as c:
-                    row = c.execute(select(table).where(key)).first()
+                    row = c.execute((select(*cols) if cols else select(table)).where(key)).first()
                     if row is not None:
                         return "same" if same(row) else "differs"
                     c.execute(insert(table).values(**values))

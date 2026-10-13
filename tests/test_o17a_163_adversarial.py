@@ -101,7 +101,6 @@ def test_paper_a_late_rate_is_charged_the_baseline_adversely_and_the_episode_cle
     assert len(kinds(out["events"], "funding_stale")) == 1 and len(kinds(out["events"], "funding_stale_cleared")) == 1
 
 
-@pytest.mark.xfail(strict=True, reason="O17b (part 3): no journalled true-up yet")
 @pytest.mark.parametrize("side", [1, -1], ids=["long", "short"])
 def test_paper_a_late_rate_is_trued_up_with_the_right_sign(tmp_path, monkeypatch, binance, side):
     """True-up = actual amount - baseline amount. r = +0.03%, b = 0.01%: a long paid b, owes r, so -n(r - b); a short
