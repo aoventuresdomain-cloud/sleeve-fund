@@ -795,15 +795,40 @@ def test_probe_hub_restart_seeded_the_stop_in_the_down_minutes_runs_and_nothing_
     assert START + 10 * M in ts and START + 15 * M in ts  # the minutes after flow: never held for good
 
 
-@pytest.mark.xfail(strict=True, reason="P1-L16 MINOR (#146, adversarial: hub restart with fresh gap state): when "
-                   "the hub doesn't know an instrument's last stored minute (an instrument picked up by discover() "
-                   "after start, or the store unreadable at start), only the stand-in minute is announced and "
-                   "refilled; the minutes the hub was down are never refilled, and on 1m the strategy replays only "
-                   "the bar it decides on, so a stop crossed in them is lost")
+def _gap_for_an_instrument_found_after_start(monkeypatch) -> dict:
+    """The production relay restarted at 00:08:30 with the instrument not known at attach (discover() found it after
+    start, or the store couldn't be read then): it reads the store's last minute (to 00:06) when it first relays it
+    (HUB-RESTART-FILL, P1-L16). The gap it announces at its first bar, the part bar to 00:09."""
+    from types import SimpleNamespace
+
+    from sleeve_fund.hub.relay import HubRelay, HubRelayConfig
+
+    iid = "BTC/USD.KRAKEN"
+    monkeypatch.setattr(HubRelay, "subscribe_trades", lambda self, i: None)
+    monkeypatch.setattr(HubRelay, "subscribe_quotes", lambda self, i: None)
+    monkeypatch.setattr(HubRelay, "cache", SimpleNamespace(instrument=lambda i: None), raising=False)
+    sent = []
+    r = HubRelay(HubRelayConfig())
+    r.attach(SimpleNamespace(publish=sent.append), sink=lambda m: None, pairs={iid: "BTC/USD"},
+             recent=lambda pair, minutes: pd.DataFrame(), seed=lambda i: (START + 6 * M, []),
+             alert=lambda key, message: None)
+    r._refill = r._store = SimpleNamespace(submit=lambda fn, *a: None)
+    r._relay(iid)
+    r._since[iid] = START + 8 * M + 30 * S
+    r._closed(qa.hub_msg(iid, START + 9 * M, SimpleNamespace(open=1.0, high=1.0, low=1.0, close=1.0)))
+    return next(m for m in sent if m["t"] == "gap")
+
+
 @pytest.mark.parametrize("label, perp, profile, side", PROBE_SETUPS, ids=PROBE_IDS)
 def test_l16_hub_restart_unseeded_the_stop_in_the_down_minutes_runs(label, perp, profile, side, monkeypatch):
+    """Was the P1-L16 xfail (an instrument the hub didn't know the last stored minute of at start had only its
+    stand-in minute refilled, so a stop crossed in the minutes it was down was lost). The relay now reads the store
+    when it first relays such an instrument, so it announces the gap from the first missing minute, as seeded: the
+    client gets that schedule and the stop runs. Flipped to a passing pin with HoE approval (HUB-RESTART-FILL)."""
+    gap = _gap_for_an_instrument_found_after_start(monkeypatch)
+    assert (gap["since"], gap["until"]) == (START + 7 * M, START + 9 * M)
     _hb_decoder(monkeypatch)
-    _with(_hub_restart_schedule(False), monkeypatch)
+    _with(_hub_restart_schedule(gap["since"] == START + 7 * M), monkeypatch)
     p = _drop_prices(side)
     run = paper(p, side=side, perp=perp, profile=profile, leave=20, gone=HUB_DOWN_GONE,
                 recover=_no_store(minutes_of(p)))
