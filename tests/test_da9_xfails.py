@@ -313,9 +313,11 @@ def test_c6_money_is_quantised_half_even_at_the_column_scale(store, written, exp
     store.record_fill("da9", **_fill(fee=written))
     store.record_funding("da9", qty=Decimal("0.01"), price=Decimal("60000"), rate=0.0001, amount=written, ts=T0)
     store.record_insurance("da9", price=Decimal("60000"), amount=written, ts=T0)
-    got = {"fills.fee": store.fills("da9")[0]["fee"], "funding.amount": store.funding("da9")[0]["amount"],
-           "insurance.amount": store.insurance("da9")[0]["amount"]}
+    got = {"fills.fee": store.fills("da9")[0]["fee"], "funding.amount": store.funding("da9")[0]["amount"]}
     assert got == dict.fromkeys(got, expected), got
+    # Insurance is rounded up to the cent where it is booked (Advisor 8 Oct 04:10 UK, ruling 3), not to the column
+    insured = store.insurance("da9")[0]["amount"]
+    assert insured == insured.quantize(Decimal("0.01")) and insured >= written, insured
 
 
 GRID = [Decimal("0.123456789012345678"), Decimal("123456789.12345678"), Decimal("0.00000001"),
