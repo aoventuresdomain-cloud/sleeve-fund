@@ -48,8 +48,12 @@ def test_a_new_strategy_is_refused_while_its_warm_up_window_has_a_gap(client, st
     r = _new(c)
     where = r.headers["location"]
     assert r.status_code == 303 and where.startswith("/sleeves/new?")
-    assert "warm-up" in where and "once+the+history+is+filled" in where.replace("%2C", ",")
-    assert f"{start:%d %b %H:%M}".replace(" ", "+").replace(":", "%3A") in where  # names the hole
+    from urllib.parse import parse_qs, urlparse
+
+    error = parse_qs(urlparse(where).query)["error"][0]
+    end = start + pd.Timedelta(minutes=29)
+    assert error == (f"history gaps in warm-up window: BTC/USD {start:%d %b %H:%M}-{end:%H:%M} UTC; "
+                     "it can start once they are filled")  # names the hole, by its missing minutes
     assert [s.name for s in store.sleeves()] == []  # nothing was created
 
 
@@ -62,12 +66,12 @@ def test_a_gap_older_than_the_warm_up_window_holds_nothing_back(client, stored):
     assert store.sleeve("btc-test").warmup_bars * 60 < 50 * 1440  # so the hole really is outside the window
 
 
-def test_a_start_is_refused_and_journaled_while_the_window_has_a_gap_then_starts_once_filled(client, stored):  # noqa: F811
+def test_a_start_is_refused_and_journaled_while_the_window_has_a_gap_and_starts_once_the_hub_refills_it(client, stored):  # noqa: F811
     c, store = client
     hs, bars, hole = stored
     assert _new(c).headers["location"] == "/sleeves/btc-test"  # created on clean history
     c.post("/sleeves/btc-test/command", data={"command": "stop", "reason": "x"}, auth=AUTH, headers=SAME)
-    hole(pd.Timedelta(hours=3))
+    gap = hole(pd.Timedelta(hours=3))
 
     def start():
         return c.post("/sleeves/btc-test/command", data={"command": "start", "reason": "go"}, auth=AUTH,
@@ -75,9 +79,13 @@ def test_a_start_is_refused_and_journaled_while_the_window_has_a_gap_then_starts
 
     assert "command_error=history" in start() and store.sleeve("btc-test").desired_state == "stopped"
     (ev,) = [e for e in store.events("btc-test") if e["kind"] == "start_refused"]
-    assert ev["level"] == "warning" and ev["message"].startswith("Not started: history: BTC/USD has 1 gap in")
+    end = gap + pd.Timedelta(minutes=29)
+    assert ev["level"] == "warning"
+    assert ev["message"] == f"history gaps in warm-up window: BTC/USD {gap:%d %b %H:%M}-{end:%H:%M} UTC"
     assert not store.decisions("btc-test", action="start")  # a refused start is no decision
-    hs.append(VENUE, PAIR, bars, cursor="x")  # the refill closes the hole
+    refill = bars[(bars.index >= gap) & (bars.index < end + pd.Timedelta(minutes=1))]
+    hs.append_bars(VENUE, PAIR, [(t.value, r.open, r.high, r.low, r.close, r.volume) for t, r in refill.iterrows()],
+                   "refill")  # the hub's refill (its write path, stamped at the open) closes the hole
     assert hs.gaps(VENUE, PAIR) == []
     assert "command_error" not in start() and store.sleeve("btc-test").desired_state == "running"
 
