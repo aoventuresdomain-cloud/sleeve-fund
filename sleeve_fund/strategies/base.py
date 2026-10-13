@@ -543,6 +543,10 @@ class LongFlatStrategy(Strategy):
         # LIQ-FUND-1 (Advisor 17:20 UK, 13 Oct): funding taken from, or credited to, that margin since _liq_px was fixed,
         # and the instant (ns) after which a settlement is the position's. _liq_now moves the price by it.
         self._liq_funded, self._liq_from = 0.0, None
+        # STOP-LOOSEN-1 (Advisor 17:10 UK, 13 Oct): whether the open position's stop has been held inside the
+        # half-liquidation cap yet (it alerts once per position), and how many positions were (the tear sheet's count).
+        self._stop_capped = False
+        self.stops_clamped = 0
         self._cash_adj = 0.0
         self._funding_since = None  # the last time funding was settled up to
         # Perp: the position and the last trade price held at each hour's start, as the first event past it
@@ -2552,6 +2556,9 @@ class LongFlatStrategy(Strategy):
         if self._margin:
             if self._restore is None:
                 self._apply_funding(self._last_close)
+                # Funding moves the liquidation price: a stop that never moves is held inside its cap again here.
+                if self._stop_frac is not None and self._hold_stop_capped(self._stop_frac) and self._backtest:
+                    self._rest_exits()
                 self._on_bar_sided(bar)
             return
         raw = self.target_weight(bar)
@@ -3321,6 +3328,57 @@ class LongFlatStrategy(Strategy):
         denom = self._cfg.perp.maintenance_margin * abs(qty) - qty
         moved = liq + self._liq_funded / denom if denom else liq
         return moved if moved > 0 else None
+
+    def _capped_stop(self, frac: float | None) -> tuple[float | None, float | None]:
+        """The stop a margin position may hold for `frac` (a share of the entry, as _stop_frac), and the liquidation
+        price it was held against (None when nothing caps it). The half-liquidation rule is a standing cap for the
+        life of the position, not an entry check (Independent Quant Advisor 17:10 UK, 13 Oct, STOP-LOOSEN-1): the stop
+        sits no further than the profile's share (half) of the way from the entry to the CURRENT liquidation price
+        (_liq_now). A tighter stop is returned as it is; a looser one is clamped, never flattened. Once funding has
+        carried the liquidation price past the entry, the way is measured from the last close instead."""
+        if frac is None or not self._margin or not self._entry_px:
+            return frac, None
+        _, cash, qty, _ = self._mark()
+        liq = self._liq_now(cash, qty) if qty else None
+        if liq is None:
+            return frac, None
+        side = self._entry_side or 1
+        ref = self._entry_px if (self._entry_px - liq) * side > 0 else self._last_close
+        if not ref or (ref - liq) * side <= 0:
+            return frac, None  # the price is through it: the liquidation guard closes the position
+        share = self.runtime.profile.stop_to_liquidation if self.runtime is not None else 0.5
+        cap = side * (1 - (ref - side * share * abs(ref - liq)) / self._entry_px)
+        if frac <= cap or math.isclose(frac, cap, rel_tol=1e-12, abs_tol=1e-15):
+            return frac, None
+        return cap, liq
+
+    def _hold_stop_capped(self, asked: float) -> bool:
+        """Set the stop for `asked`, held inside the half-liquidation cap (_capped_stop). Journals a clamp only when
+        it changes the stop held, so a stop already at the cap writes nothing more, and alerts once per position. True
+        when the stop held changed."""
+        held, liq = self._capped_stop(asked)
+        if held == self._stop_frac:
+            return False
+        self._stop_frac = held
+        if liq is not None:
+            self._stop_clamped(asked, held, liq)
+        return True
+
+    def _stop_clamped(self, asked: float, held: float, liq: float) -> None:
+        side = self._entry_side or 1
+        level, at = (self._entry_px * (1 - side * f) for f in (asked, held))
+        why = (f"Stop held at {at:,.6g}, not {level:,.6g}: no further than half the way to the liquidation price "
+               f"{liq:,.6g} (the {_side_word(side)} position's isolated margin)")
+        first = not self._stop_capped
+        if first:
+            self._stop_capped = True
+            self.stops_clamped += 1
+        if self.runtime is not None:
+            if first:  # once per position: a stop on a slow average would otherwise alert every candle
+                self.runtime.store.event(self.runtime.name, "warning", "stop_clamped_liquidation",
+                                         why + ". Its later clamps are journaled as info.", ts=self.runtime.now())
+            else:
+                self.runtime.store.event(self.runtime.name, "info", "stop_clamped", why, ts=self.runtime.now())
 
     def _liq_from_entry(self, cash: float, qty: float) -> float | None:
         """From the position's average entry as the strategy (and the journal) keep it, never the simulated
@@ -4967,6 +5025,8 @@ class LongFlatStrategy(Strategy):
                                              f"the journal keeps its entry of {self._restore['entry']:,.6g}",
                                              ts=self.runtime.now())
                 self._restore = self._restore_id = None
+                if self._stop_frac is not None:  # the restored stop, held inside the cap from the first price on
+                    self._hold_stop_capped(self._stop_frac)
             return
         if self._restored is not None:
             self._restored_rounding(1 if event.is_buy else -1, event.last_qty.as_double(), event.last_px.as_double())
@@ -5023,6 +5083,8 @@ class LongFlatStrategy(Strategy):
             opening = self._track_entry(sign, event.last_qty.as_decimal(), qty, px)
             if opening:
                 self._set_liq(journal_id, intrabar[0] if intrabar is not None else event.ts_event)
+                if self._stop_frac is not None:  # the fill's own liquidation price can sit nearer than the decision's
+                    self._hold_stop_capped(self._stop_frac)
         else:
             opening = self._entry_side in (0, sign) and sign > 0
             if opening:
@@ -5130,7 +5192,7 @@ class LongFlatStrategy(Strategy):
         if side == 0:
             self._entry_px, self._entry_qty, self._entry_side = None, 0.0, 0
             self._stop_frac = self._tp_frac = self._liq_px = self._liq_from = None
-            self._liq_funded = 0.0
+            self._liq_funded, self._stop_capped = 0.0, False
             self._funding_skip = None
             self._replan_pending = self._plan_entry = None
             return False

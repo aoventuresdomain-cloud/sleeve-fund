@@ -495,15 +495,14 @@ class Rules(LongFlatStrategy):
         if (close - level) * side <= 0:
             kind = next(k for k, v in self._levels.items() if v == level)
             return kind, level
-        frac = side * (1 - level / self._entry_px)
-        if frac != self._stop_frac:
-            self._stop_frac = frac
-            if self._backtest:
-                self._rest_exits()  # moves the resting stop
+        # On margin, held inside half the way to the current liquidation price (STOP-LOOSEN-1): a level that
+        # loosens past it is clamped there, and the clamp journaled.
+        if self._hold_stop_capped(side * (1 - level / self._entry_px)) and self._backtest:
+            self._rest_exits()  # moves the resting stop
         return None
 
     def _rest_exits(self) -> None:
         if self._levels is not None and self._entry_px:  # the levels, not the decision close's share of them
-            self._stop_frac = (self._entry_side or 1) * (1 - self._tightest(self._levels, self._entry_side or 1)
-                                                         / self._entry_px)
+            self._hold_stop_capped((self._entry_side or 1) * (1 - self._tightest(self._levels, self._entry_side or 1)
+                                                              / self._entry_px))
         super()._rest_exits()

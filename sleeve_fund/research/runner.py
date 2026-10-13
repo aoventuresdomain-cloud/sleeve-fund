@@ -81,6 +81,9 @@ class BacktestResult:
     # A perpetual's entries the interim open-risk limit (sleeve_fund.open_risk) would have refused in paper, against
     # this strategy's own equity: a single-strategy backtest counts them and doesn't gate.
     open_risk_binds: int = 0
+    # A perpetual's positions whose stop was held at half the way to the liquidation price at least once, because a
+    # level loosened past it or funding moved the price nearer (STOP-LOOSEN-1).
+    stops_clamped: int = 0
     # The largest open risk one of those entries would have carried, as a share of this strategy's equity.
     open_risk_max: float = 0.0
     # Why paper would refuse to start these settings, when it would (a stopless model above 1x on a perp): the run
@@ -503,6 +506,7 @@ def leg_result(engine: BacktestEngine, leg: Leg) -> BacktestResult:
         first_touch=touched,
         reentries_on_exit_candle=reentries_on_exit_candle(fills, strategy.decisions, plan.bar_minutes),
         open_risk_binds=strategy.open_risk_binds,
+        stops_clamped=strategy.stops_clamped,
         open_risk_max=strategy.open_risk_max,
         paper_refusal=paper_refusal(plan.strategy_name, plan.params, plan.risk_profile),
         portfolio_gate=dict(strategy.portfolio_gate),
