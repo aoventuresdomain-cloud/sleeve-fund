@@ -24,6 +24,7 @@ from sleeve_fund.money import money, scale
 from sleeve_fund.portfolio.gate import Checked, MemoryLedger, check_order, mark_book
 from sleeve_fund.portfolio.holding import Position, holding_for, underlying
 from sleeve_fund.portfolio.limits import Holding, Intent, rejected
+from sleeve_fund.portfolio.regime_weight import Weighting, weighed
 from sleeve_fund.risk import PortfolioProfile
 
 BATCH_DELAY_NS = 1  # the gate pass runs this long after a bar's close: after every venue's bar for that close
@@ -205,6 +206,8 @@ class PortfolioGate:
     # The intent_ids of orders sent outside a bar decision (no `bar`): their bar_ts is only the check time, so the
     # parity report lists them on their own, as it does paper's (P2-7, PE2 FU-1).
     unbarred: set[str] = field(default_factory=set)
+    # P2-5: the regime weight on each new entry, for the counted regime variant only (never in G1); None: unweighted.
+    regime: Weighting | None = None
 
     def mark(self, ts_ns: int) -> str | None:
         """Mark the fund at ts_ns, a close + BATCH_DELAY_NS: "halt" or "pause" when that mark has just set one
@@ -235,6 +238,8 @@ class PortfolioGate:
             order = tagged_intent(intent, now)
             if not isinstance(intent.get("bar"), int):
                 self.unbarred.add(order.intent_id)
+            if self.regime is not None:
+                order = weighed(order, *self.regime.for_order(strategy, intent.get("opens", True), order.bar_ts))
         except Exception as e:  # noqa: BLE001 - an order the gate can't read is never sent
             why = f"Entry rejected: the portfolio check couldn't run ({type(e).__name__}: {e}), so nothing is sent"
             self.ledger.alert("portfolio_check_failed", f"{strategy}: {why}", now)

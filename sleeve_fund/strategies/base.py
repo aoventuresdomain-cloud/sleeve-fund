@@ -3091,7 +3091,7 @@ class LongFlatStrategy(Strategy):
         # leverage (None on spot); and, with no stop, the daily ATR the stopless measure takes.
         intent = {"side": s, "qty": qty, "close": close, "price": fill_price(close, s, self._half_spread()),
                   "stop_frac": self._stop_frac, "what": what, "step": self._lot(), "min_qty": self._min_qty(),
-                  "instrument": self._base_code(),
+                  "instrument": self._base_code(), "opens": self._position_qty() < self._min_qty(),
                   "leverage": (self.runtime.profile.max_leverage if self.runtime is not None else 1.0)
                   if self._margin else None,
                   "atr_pct": None if self._stop_frac else self._entry_atr_pct()}
