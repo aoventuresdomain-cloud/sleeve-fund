@@ -65,6 +65,35 @@ class TrialsRegister:
         return [t for t in self.store.trials(idea_hash) if t["family"] != "benchmark" and t["source"] != "engineering"
                 and t.get("kind", "single") == "single"]
 
+    def preregister(self, *, strategy: str, family: str, settings: dict, setup: dict, dataset: str) -> str:
+        """Register a single setting before its first run on research data (Advisor 13 Oct 18:05, R4): a counted
+        row with no result that has read no bars, so its window is NO_BARS and no holdout reads it as seen; when it
+        was written is its created_at. With the study's setup and dataset it is the run's own variant, so N doesn't
+        grow. Returns its id."""
+        return self.record(definition_hash=legacy_definition_hash(strategy, settings, setup),
+                           idea_hash=legacy_idea_hash(strategy), name=strategy, family=family, settings=settings,
+                           dataset=dataset, stage="in_sample", source="study", sharpe=None, data_start=NO_BARS,
+                           data_end=NO_BARS)
+
+    def no_selection(self, idea_hash: str) -> str | None:
+        """Why the idea family's PBO is "not applicable: no selection", or None when normal PBO applies (Advisor
+        13 Oct 18:05, R4). Every counted row holds the same settings, and the first is either a pre-registration
+        (written before any run, no result, no bars read) or, for a hand-coded Model counted before the ruling,
+        any run. A second setting tried, or a row edited so its settings or its order differ, ends it for the
+        whole family."""
+        rows = self._counted(idea_hash)
+        if not rows:
+            return None
+        settings = {_settings_key(t) for t in rows}
+        if len(settings) != 1:
+            return None
+        first = min(rows, key=lambda t: (_aware(t["created_at"]), t["id"]))
+        if _preregistered(first):
+            return "one pre-registered setting, tried as registered"
+        if _aware(first["created_at"]) < NO_SELECTION_RULING:
+            return "a hand-coded Model with one setting since its first counted run"
+        return None
+
     def counted_ids(self) -> set[str]:
         """The ids of every row that counts (_counted)."""
         return {t["id"] for t in self._counted()}
@@ -219,6 +248,37 @@ def _family(strategy: str) -> str:
     except ValueError:
         return "unknown"
 
+
+
+# A pre-registration's window (DA 13 Oct): a dated range no holdout can overlap, so it reads as no bars read. None
+# would read as undated, which the holdout check treats as having read up to when the row was written. Anything that
+# shows a trial's range shows this one as "registered, no data read", never as 1970.
+NO_BARS = datetime(1970, 1, 1, tzinfo=timezone.utc)
+# The Advisor's ruling on a single setting (13 Oct 2026 18:05 UK): a family first counted before it needs no
+# pre-registration row, only one setting since its first counted run.
+NO_SELECTION_RULING = datetime(2026, 10, 13, 17, 5, tzinfo=timezone.utc)
+
+
+def _aware(ts) -> datetime:
+    ts = pd.Timestamp(ts)
+    return (ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")).to_pydatetime()
+
+
+def _settings_key(t: dict) -> str:
+    """A row's settings as one comparable string; a failed row's are wrapped (failed_row)."""
+    s = json.loads(t["settings"]) if isinstance(t["settings"], str) else t["settings"]
+    if t.get("status") == "failed" and isinstance(s, dict) and set(s) == {"params"}:
+        s = s["params"]
+    return json.dumps(s, sort_keys=True)
+
+
+def _preregistered(t: dict) -> bool:
+    """A pre-registration row (TrialsRegister.preregister): no result, and no bars read."""
+    if t["sharpe"] is not None or t.get("trades") is not None or t["status"] != "ok":
+        return False
+    if t["data_start"] is None or t["data_end"] is None:
+        return False
+    return _aware(t["data_start"]) == _aware(t["data_end"]) == NO_BARS
 
 
 def _variant(t: dict) -> tuple:
