@@ -134,6 +134,21 @@ def gate_intent(d: dict) -> Intent:
     return Intent(name, side, money(d["qty"], "qty"), price, unit.margin, unit.risk, d["step"], d["min_qty"])
 
 
+def tagged_intent(d: dict, now: datetime):
+    """gate_intent's Intent with what the journal keys it on (gate_ledger.TaggedIntent): the strategy's id for it (a
+    fresh one when it has none), its kind (`what`) and the bar it was decided on (`bar`, that bar's close in ns, as
+    paper's journal and the parity report read it; the check time for an order sent outside a bar decision). Paper's
+    gate and the portfolio backtest's both build it here, so they gate the same order the same way (P2-7)."""
+    import uuid
+
+    from sleeve_fund.gate_ledger import TaggedIntent
+
+    order, bar = gate_intent(d), d.get("bar")
+    return TaggedIntent(**{f: getattr(order, f) for f in order.__dataclass_fields__},
+                        intent_id=str(d.get("intent_id") or uuid.uuid4().hex), kind=str(d.get("what") or "entry"),
+                        bar_ts=_utc(int(bar)) if isinstance(bar, int) else now)
+
+
 def _utc(ts_ns: int) -> datetime:
     """ts_ns as a datetime, rounded UP to the microsecond a datetime keeps, so a close + 1 ns stays after the close
     (a gate pass at 00:00 + 1 ns belongs to the new day, never the old one)."""
@@ -214,7 +229,7 @@ class PortfolioGate:
             missing = self.unmeasured() if self.unmeasured is not None else None
             if missing:
                 raise ValueError(f"open risk can't be measured ({missing})")
-            order = gate_intent(intent)
+            order = tagged_intent(intent, now)
         except Exception as e:  # noqa: BLE001 - an order the gate can't read is never sent
             why = f"Entry rejected: the portfolio check couldn't run ({type(e).__name__}: {e}), so nothing is sent"
             self.ledger.alert("portfolio_check_failed", f"{strategy}: {why}", now)

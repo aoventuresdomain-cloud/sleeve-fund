@@ -18,7 +18,6 @@ The Independent Quant Advisor's rulings (8 Oct 03:05 UK) on the run's risk choic
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from datetime import timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -320,9 +319,8 @@ def _result(results, spread, marks, actions, gate, hours, window, profile, unall
               for t, w, why, until in actions
               if w == "pause" and until is not None and until > pd.Timestamp(t, tz="UTC")]
     worst, risk = _intrabar(book, marks, hours, profile, halt_info, pauses)
-    # bar_ts: the deciding bar's close, as the journal keys a paper decision. The pass ran at close + BATCH_DELAY_NS,
-    # which _utc rounded up to the next microsecond; closes fall on whole minutes, so the close is 1 µs earlier.
-    decisions = [{"strategy": r.strategy, "ts": r.at, "bar_ts": r.at - timedelta(microseconds=1),
+    # bar_ts: the deciding bar's close, as paper's journal keys a decision: both gates tag it (tagged_intent).
+    decisions = [{"strategy": r.strategy, "ts": r.at, "bar_ts": r.intent.bar_ts, "kind": r.intent.kind,
                   "outcome": r.decision.outcome, "approved": r.decision.approved_qty,
                   "requested": r.decision.requested_qty, "limit": r.decision.limit_hit, "reason": r.decision.reason,
                   "side": r.intent.side, "price": r.intent.price} for r in gate.ledger.records]

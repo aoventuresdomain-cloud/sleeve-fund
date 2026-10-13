@@ -52,6 +52,7 @@ def test_the_backtests_decision_log_carries_the_deciding_bars_close(run):
         assert d["bar_ts"] == d["ts"] - timedelta(microseconds=1)
         assert pd.Timestamp(d["bar_ts"]) in closes[d["strategy"]]
         assert d["side"] in (1, -1) and d["price"] > 0
+        assert d["kind"] and isinstance(d["kind"], str)
 
 
 def test_a_journal_identical_to_the_backtest_gives_no_mismatches(run):
@@ -153,3 +154,31 @@ def test_a_paper_entry_not_decided_on_a_bar_is_listed_on_its_own_never_a_false_p
     assert [(u.strategy, u.bar_ts) for u in report.unbarred] == [("a", off_bar)]
     assert [m.what for m in compare(from_journal(rows), from_backtest([_b("a", _day(0))])).mismatches] == [
         ("paper only",)]  # without the order rows' word it would be one
+
+
+_ORDER = dict(side=1, qty=D(2), close=D(100), price=D("100.05"), stop_frac=0.02, step=D("0.001"),
+              min_qty=D("0.001"), instrument="XBT", leverage=None, atr_pct=None)
+BAR_NS = int(_day(2).timestamp() * 1e9)
+
+
+def test_the_journal_tag_is_built_from_the_engines_intent_one_way():
+    order = portfolio.gate_intent(_ORDER)
+    tagged = portfolio.tagged_intent({**_ORDER, "intent_id": "a-7", "what": "add", "bar": BAR_NS}, _day(3))
+    assert all(getattr(tagged, f) == getattr(order, f) for f in order.__dataclass_fields__)
+    assert (tagged.intent_id, tagged.kind, tagged.bar_ts) == ("a-7", "add", _day(2))
+    loose = portfolio.tagged_intent(_ORDER, _day(3))  # sent outside a bar decision: keyed on the check time
+    assert (loose.kind, loose.bar_ts) == ("entry", _day(3)) and loose.intent_id
+
+
+def test_paper_and_the_backtest_hand_the_check_the_same_tagged_order(monkeypatch):
+    from sleeve_fund.paper import portfolio_gate as paper
+
+    seen = []
+    monkeypatch.setattr(portfolio, "check_order", lambda ledger, s, order, profile, now: seen.append(order))
+    monkeypatch.setattr(paper, "check_order", lambda ledger, s, order, profile, now: seen.append(order))
+    intent = {**_ORDER, "intent_id": "a-1", "what": "entry", "bar": BAR_NS}
+    portfolio.PortfolioGate(book=lambda ts: (D(20000), ()))("a", intent, BAR_NS + 1)
+    paper_gate = object.__new__(paper.PaperGate)
+    paper_gate.ledger, paper_gate.profile = None, None
+    paper_gate("a", intent, BAR_NS + 1)
+    assert len(seen) == 2 and seen[0] == seen[1] and seen[0].bar_ts == _day(2)
