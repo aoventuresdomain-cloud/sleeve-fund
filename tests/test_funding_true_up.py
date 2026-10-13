@@ -190,3 +190,29 @@ def test_with_no_process_the_supervisor_trues_up_once_the_rate_is_stored(store, 
     (up,) = _rows(store, "true_up")
     assert D(str(up.amount)) == D("-1.20") - D("-1.00") and up.rate == 0.0002
     assert true_up_stopped(store, s, ARRIVED) == 0 and len(_rows(store, "true_up")) == 1  # once
+
+
+def test_the_supervisor_and_a_just_started_process_racing_book_one_true_up(engine, tmp_path):
+    """HoE (CASH-4): once per settlement in the database, not just in code. Two Stores (the supervisor's sweep and a
+    strategy's process just started) true up one settlement at the same moment: one row, one "new", the other "same"."""
+    import threading
+
+    a = Store(engine=engine)
+    a.create_sleeve(name="s", strategy="buy_and_hold", instrument="BTC/USDT-PERP", bar_spec="1-HOUR-LAST-INTERNAL",
+                    starting_balance=1_000)
+    _charge(a)
+    b = Store(engine=make_engine(str(engine.url.render_as_string(hide_password=False))))
+    gate, out = threading.Barrier(2), {}
+
+    def race(who, store):
+        gate.wait()
+        out[who] = store.record_true_up("s", S, rate=0.0002, amount=D("-1.20"), arrived_at=ARRIVED)
+
+    threads = [threading.Thread(target=race, args=w) for w in (("sweep", a), ("process", b))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    b.engine.dispose()
+    assert sorted(v[0] for v in out.values()) == ["new", "same"] and {v[1] for v in out.values()} == {D("-0.20")}
+    assert len(_rows(a, "true_up")) == 1 and a.funding_total("s") == D("-1.20")
