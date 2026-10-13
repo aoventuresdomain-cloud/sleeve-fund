@@ -219,3 +219,43 @@ def test_only_funding_settled_after_the_fill_moves_it():
     s._liq_px = None  # flat: nothing is the margin's
     s._fund_margin(SETTLED + pd.Timedelta(hours=2), -5.0)
     assert s._liq_funded == -5.0
+
+
+@pytest.fixture
+def hourly_guarded(monkeypatch):
+    """Hourly settlements from 07:50 with the aggressive profile's own limits on (8% daily loss, 35% drawdown)."""
+    from sleeve_fund import markets
+
+    monkeypatch.setattr(markets, "LOW_FEE_PERP", dataclasses.replace(markets.LOW_FEE_PERP, funding_hours=tuple(range(24))))
+    monkeypatch.setattr(qa, "START", int(pd.Timestamp("2025-10-03 07:50", tz="UTC").value))
+
+
+
+# The same with the aggressive profile's own limits on (the Advisor's worst case: 3x, held through settlements). Which
+# fires first: a drain past the 8% daily loss pauses it at the settlement, before any liquidation; a drain inside it
+# leaves the position open, and a gap through the moved price then liquidates it there, where the fixed price would
+# only have cut it (inside 7% of it) at the old level.
+@pytest.mark.parametrize("where", ["backtest", "paper"])
+@pytest.mark.parametrize("side", [1, -1], ids=["long", "short"])
+def test_guarded_a_drain_past_the_daily_loss_pauses_it_before_any_liquidation(hourly_guarded, monkeypatch, where,
+                                                                               side):
+    _rate(monkeypatch, 0.10 * side)  # 15% of equity paid at 08:00
+    orders, _, _, funded = _book(where, _prices(side, 0.25 if side > 0 else 0.22), side)
+    assert funded < -800
+    intents = [o["intent"] for o in orders]
+    assert intents == ["entry", "risk_pause"], [(o["intent"], o["reason"]) for o in orders]
+    assert "daily loss" in orders[1]["reason"].lower()
+
+
+@pytest.mark.parametrize("where", ["backtest", "paper"])
+@pytest.mark.parametrize(("side", "depth"), [pytest.param(1, 0.2834, id="long"), pytest.param(-1, 0.282, id="short")])
+def test_guarded_a_drain_inside_the_limits_then_a_gap_liquidates_at_the_moved_price(hourly_guarded, monkeypatch,
+                                                                                     where, side, depth):
+    _rate(monkeypatch, 0.05 * side)  # 7.5% of equity paid at 08:00: inside the 8% daily loss
+    p = _prices(side, depth)
+    orders, fixed, qty, funded = _book(where, p, side)
+    now, gap = moved(fixed, qty, funded), float(p[-1])
+    assert -800 < funded < 0
+    assert (gap - now) * side <= 0 < (gap - fixed) * side, "set-up: the gap is through the moved price only"
+    assert [o["intent"] for o in orders] == ["entry", "liquidation"], [(o["intent"], o["reason"]) for o in orders]
+    assert orders[1]["signal"]["liquidation_px"] == pytest.approx(now, rel=1e-6)
