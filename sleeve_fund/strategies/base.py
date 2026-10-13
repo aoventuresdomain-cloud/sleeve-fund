@@ -2987,6 +2987,14 @@ class LongFlatStrategy(Strategy):
             if sent is not None:
                 sent(trimmed)
 
+        if paper is not None and intent["atr_pct"] is None and not self._stop_frac:
+            # No stop and no daily ATR (a pair with under 14 whole days of history): the entry's risk can't be
+            # measured, so it is refused here as the interim open-risk check refuses it (QA P1-S3), a warning while it
+            # lasts, rather than sent to the gate to fail closed with an error alert on every bar.
+            count("refused")
+            self._note(f"{what}_refused_by_portfolio", f"{what.capitalize()} refused: its open risk can't be measured "
+                       "(no stop, and the daily ATR isn't known)")
+            return
         if paper is not None:
             # The check reads the supervisor's last mark of the fund (never marks it, HoQA w2d) and journals its
             # decision; a refusal's reason is on that row and in the strategy's events.
