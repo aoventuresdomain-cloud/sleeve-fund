@@ -87,6 +87,22 @@ def test_paper_reads_the_daily_atr_from_the_history_store_and_doesnt_cache_a_mis
     assert open_risk.position_risk(1.0, 100.0, atr_pct=atr) == pytest.approx(18.0)  # 3 ATRs, over the 10% floor
 
 
+@pytest.mark.real_daily_atr
+def test_paper_reads_no_daily_atr_when_the_store_has_none_in_the_window(monkeypatch):
+    """W2 e2e: a pair the store holds, but with no bars in the window, reads back as a frame without a time index;
+    that is a miss (None, not cached), never a failed bar."""
+    from sleeve_fund import bars as bar_rule
+
+    class _NoneInWindow:
+        def read(self, venue, pair, minutes, start=None):
+            return pd.DataFrame(columns=bar_rule.COLUMNS)
+
+    monkeypatch.setattr(open_risk, "_ATR_CACHE", {})
+    now = pd.Timestamp.now(tz="UTC").to_pydatetime()
+    assert open_risk.history_atr_pct("BINANCE", "BTC/USDT", now, history=_NoneInWindow()) is None
+    assert open_risk._ATR_CACHE == {}
+
+
 def test_another_strategy_past_its_stop_counts_as_stopless_and_is_named(monkeypatch):
     store = Store.in_memory()
     store.create_sleeve(name="other", strategy="ping_pong", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
@@ -108,6 +124,40 @@ def _meta():
                        "bar_spec": "1-MINUTE-LAST-INTERNAL", "starting_balance": 10_000, "risk_profile": "conservative",
                        "params": {"rise": 0.01, "dip": 0.005, **PERP}, "maker_fee": "0.0002", "taker_fee": "0.0005",
                        "tick_seconds": 30}}
+
+
+def test_a_gated_paper_entry_with_no_stop_and_no_daily_atr_is_refused_as_a_warning_not_an_error(tmp_path, monkeypatch):
+    """W2 e2e: a stopless spot entry on paper with the portfolio gate in force, on a pair the history store can't give
+    14 days for, is refused as unmeasurable once (a warning, as the interim check refuses it), never sent and never
+    an error alert on every bar."""
+    monkeypatch.setattr(open_risk, "history_atr_pct", lambda venue, pair, now, history=None: None)
+    from datetime import timedelta
+    from decimal import Decimal
+
+    from sqlalchemy import select
+
+    from sleeve_fund.gate_ledger import DbLedger
+    from sleeve_fund.portfolio import gate
+    from sleeve_fund.portfolio.gate import PortfolioState
+    from sleeve_fund.store import events_t
+    from test_replay import START
+
+    monkeypatch.setattr(gate, "MARK_STALE", timedelta(days=1))  # one mark covers the replay
+    store = Store.in_memory(portfolio_gate=True)
+    marked, book = pd.Timestamp(START, tz="UTC").to_pydatetime(), Decimal(20_000)
+    DbLedger(store, lambda: None).set_state(PortfolioState(mark_ts=marked, equity=book, hwm=book, day=marked.date(),
+                                                           day_start_equity=book))
+    meta = _meta()
+    meta["sleeve"]["params"] = {"rise": 0.01, "dip": 0.005}  # spot, no stop
+    path = tmp_path / "pp.jsonl.gz"
+    _record(path, meta, [(5, 0.0), (20, 0.015), (20, -0.012), (20, 0.015)])
+    orders, _ = replay(path, with_fills=True, store=store)
+    events = store.events("pp", limit=500)
+    assert [o for o in orders if o["intent"] == "entry"] == []
+    told = [e for e in events if e["kind"] == "entry_refused_by_portfolio"]
+    assert len(told) == 1 and "can't be measured" in told[0]["message"] and told[0]["level"] == "warning", told
+    with store.engine.connect() as c:  # the gate's alerts are the fund's, not the strategy's: none anywhere
+        assert c.execute(select(events_t.c.kind).where(events_t.c.level == "error")).scalars().all() == []
 
 
 @pytest.mark.parametrize("other_qty, refused", [(0.0, False), (0.05, False), (0.15, True)])
