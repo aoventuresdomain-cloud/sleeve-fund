@@ -3853,13 +3853,15 @@ class LongFlatStrategy(Strategy):
 
         def arrived(when) -> bool:
             if when not in asked:
-                asked[when] = self._venue_rate(terms, pair, when) is not None
-            return asked[when]
+                asked[when] = self._venue_rate(terms, pair, when)
+            return asked[when] is not None
 
         if terms is not None:
             self._reverse_unsettled(terms)
         came = {when for when in sorted(self._funding_missing) if arrived(when)}
         self._funding_missing -= came
+        for when in sorted(came):
+            self._true_up(when, asked[when], now)
         try:
             state = funding.journal_state(rt.store, funding.stale_tag(venue, pair))
         except Exception:  # noqa: BLE001 - no database (locally), or a stub inbox: one episode, as before
@@ -3898,6 +3900,28 @@ class LongFlatStrategy(Strategy):
                 rt.store.event(None, "info", "funding_stale_cleared", f"{tag} The settled funding rate for {pair} has "
                                f"arrived from the venue for every settlement missing {funding.from_words(o)}"
                                + (f" ({len(came)} came in now)" if came else ""), ts=rt.now())
+
+    def _true_up(self, when, rate: float, now) -> None:
+        """Paper, CASH-4 (Advisor 8 Oct 04:10, ruling 2): the venue's rate for a settlement charged the baseline has
+        arrived. One journaled true-up of what it settles to less the baseline, on the position and price the
+        baseline was charged on, signed as the cash moves and moving cash now; the baseline is never edited. The
+        journal first and cash only for a movement it took, so a second process or a restart never books it twice."""
+        paid = self._funding_paid.pop(when, None)
+        if paid is None or self.runtime is None:
+            return
+        qty, px, _, _ = paid
+        settled = -float(qty) * float(px) * rate
+        ts = when.to_pydatetime() if hasattr(when, "to_pydatetime") else when
+        booked, up = self.runtime.store.record_true_up(self.runtime.name, ts, rate=rate, amount=round(settled, 8),
+                                                       arrived_at=now)
+        if booked != "new":
+            return
+        self._cash_adj += float(up)
+        self.funding_log.append((now, float(up), "true_up"))
+        self.runtime.store.event(self.runtime.name, "info", "funding_true_up",
+                                 f"Funding trued up: the venue's rate for the {ts:%d %b %Y %H:%M} UTC settlement "
+                                 f"arrived ({rate:.4%}), settling to {settled:+,.2f} against the baseline charged; "
+                                 f"{up:+,.2f} booked now", ts=now)
 
     def _is_settlement(self, terms, when) -> bool:
         """Whether `when` is still one of the venue's settlements as its records now read (markets.settlement_times)."""
@@ -4005,10 +4029,10 @@ class LongFlatStrategy(Strategy):
             ts = pd.Timestamp(row["ts"])
             rows.setdefault(ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC"), []).append(row)
         for ts, booked in rows.items():
-            # A settlement already reversed (its own reversal row, or rows netting to zero) is never watched again,
-            # so a restart can't refund it twice (CR, #163)
+            # A settlement already reversed (its own reversal row, or rows netting to zero) or trued up (CASH-4) is
+            # never watched again, so a restart can't refund or true it up twice (CR, #163)
             amounts = [r.get("amount") for r in booked]
-            if any(r.get("kind") == "reversal" for r in booked) or (
+            if any(r.get("kind") in ("reversal", "true_up") for r in booked) or (
                     None not in amounts and len(amounts) > 1 and abs(sum(amounts)) < 1e-9):
                 continue
             row = next((r for r in booked if r.get("kind") == "baseline"), None)
