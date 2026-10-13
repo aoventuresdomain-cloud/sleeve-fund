@@ -90,3 +90,46 @@ def test_up1_the_risk_header_shows_net_and_total_size_against_its_limit(tmp_path
     assert "Total size (long + short) 1.20x of book, limit 1.5x" in page and "every position and resting entry" in page
     head = page.split('id="strats-h"')[1].split("</div>")[0]
     assert "Gross" not in head and "gross" not in head
+
+
+# --- UP-2: the Position tab's side and leverage, spot and perp ---------------------------------------------------------
+
+
+def _page(tmp_path, monkeypatch, name, params, fills, mark):
+    from fastapi.testclient import TestClient
+
+    from sleeve_fund.dashboard import app as app_mod
+    from sleeve_fund.store import Store
+
+    monkeypatch.setenv("DASHBOARD_PASSWORD", "test-pw")
+    store = Store(f"sqlite:///{tmp_path}/p.db")
+    store.create_sleeve(name=name, strategy="ping_pong", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=10_000, risk_profile="balanced",
+                        params={"rise": 0.01, "dip": 0.005, "stop_loss": 0.02, **params})
+    cash = 10_000.0
+    for n, (side, qty, px) in enumerate(fills):
+        store.record_fill(name, side=side, qty=qty, price=px, fee=0.0, order_id=f"o{n}", trade_id=f"t{n}")
+        cash -= (qty if side == "BUY" else -qty) * px
+    qty = sum(q if s == "BUY" else -q for s, q, _ in fills)
+    store.record_equity(name, equity=cash + qty * mark, cash=cash, qty=qty, price=mark, benchmark=10_000)
+    return TestClient(app_mod.create_app(store)).get(f"/sleeves/{name}", auth=("pm", "test-pw")).text
+
+
+def test_up2_a_perp_reads_its_leverage_in_the_cap_format_and_the_drifted_one_as_effective(tmp_path, monkeypatch):
+    """Long 0.05 at 60,000 at the balanced 2x cap; the price is now 62,100, so notional now over the same margin is
+    2.07x. The Position tab reads "2×" and "effective 2.07×", never "2×" twice; the table's chip is the cap."""
+    html = _page(tmp_path, monkeypatch, "lev-drift", {"market": "perp", "allow_short": True},
+                 [("BUY", 0.05, 60_000.0)], 62_100.0)
+    lev = html.split(">Leverage</dt><dd>")[1].split("</dd>")[0]
+    assert lev == '2× <span class="faint">· effective 2.07×</span>'
+    assert lev.count("2×") == 1 and "2.00×" not in lev
+    assert '<span class="lev">2×</span>' in html  # the positions table: the cap
+    assert "above entry cap because the price moved" not in html  # the note is unchanged: not triggered here
+
+
+def test_up2_a_spot_position_shows_its_side_leverage_and_exposure(tmp_path, monkeypatch):
+    html = _page(tmp_path, monkeypatch, "spot-pos", {}, [("BUY", 0.05, 60_000.0)], 60_000.0)
+    size = html.split("<h3>Size</h3>")[1].split("</dl>")[0]
+    assert "<dt>Side</dt><dd>Long</dd>" in size
+    assert '<dt title="Spot: no leverage">Leverage</dt><dd>1×</dd>' in size
+    assert ">Exposure</dt><dd>0.30× equity" in size

@@ -371,7 +371,9 @@ def test_the_dashboard_shows_a_short(client):  # noqa: F811
     assert "of 0.66× cap" in html and "above entry cap" not in html
     # QA U2, the Advisor's wording: leverage is notional at entry over isolated margin (3,030 / 1,515), exposure
     # the notional at the mark over equity (3,007 / 10,050), so exposure / leverage is the margin's share (15%).
-    assert ">Leverage</dt><dd>2.00×" in html and "0.30× equity <span class=\"faint\">· cap 0.66×" in html
+    # UP-2: the leverage it opened at in the cap format, and the one from the mark (3,007 / 1,515) labelled effective.
+    assert ">Leverage</dt><dd>2× <span class=\"faint\">· effective 1.98×" in html
+    assert "0.30× equity <span class=\"faint\">· cap 0.66×" in html
     assert "Side and leverage" not in html
     assert "Tap a buy or sell arrow" not in html and "TradingView Lightweight Charts" in html  # QA U9: attribution in the rail
     # QA U12: the strategy's Fees and funding hover gives the costs' share of gross P&L, as the Portfolio's does.
@@ -883,7 +885,9 @@ def test_a_perp_shows_leverage_liquidation_and_funding(client):  # noqa: F811
     liq = markets.isolated_liquidation(cash, -0.1, 59_000.0, lev, markets.LOW_FEE_PERP.maintenance_margin)
     assert f"{0.1 * 59_000 / lev:,.2f}" in html  # isolated margin: the notional at entry over the leverage cap
     # QA U2: leverage is the position's own (notional at entry over its margin); exposure is at the mark over equity.
-    assert "Margin" in html and f">Leverage</dt><dd>{lev:.2f}×" in html and "0.59× equity" in html and f"{liq:,.2f}" in html and "above" in html
+    # UP-2: in the cap format, and the one from the mark (5,950 over the same margin) labelled effective.
+    assert "Margin" in html and f">Leverage</dt><dd>{lev:g}× <span class=\"faint\">· effective {lev * 59_500 / 59_000:.2f}×" in html
+    assert "0.59× equity" in html and f"{liq:,.2f}" in html and "above" in html
     assert "+0.59" in html and "+1.19" in html  # last payment and since start
     assert "funding +0.60" in html and "+98.60" in html  # the closed trip, after fees and funding
     # The Overview's position table, leverage in its own column: the isolated position's own (item 7) once
