@@ -9,7 +9,7 @@ Each step is skipped when a Store on the same code built that shape first (creat
 column, its CHECK and NOT NULL through a batch rebuild. Downgrade is refused: an order's venue is never dropped.
 
 Revision ID: 0020
-Revises: 0014
+Revises: 0018
 Create Date: 2026-10-13 19:00:00.000000
 """
 
@@ -18,7 +18,7 @@ import sqlalchemy as sa
 
 
 revision = '0020'
-down_revision = '0014'
+down_revision = '0018'
 branch_labels = None
 depends_on = None
 
