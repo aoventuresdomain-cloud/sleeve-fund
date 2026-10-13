@@ -525,8 +525,8 @@ def run_study(
     ones, each run charging the one in force at each time (SPREAD-PIT); None uses the venue's assumption.
     progress: called with the share of the study's backtests done, 0 to 1.
     idea_hash: the idea family its trials count under, holdout lock included: an optimiser's proposal's own structural
-    idea (candidates.idea_hash), so its runs count towards that idea's budget (CR F236-1). None: the hand-coded
-    model's, by its name."""
+    idea (candidates.idea_hash), so its runs count towards that idea's budget (CR F236-1). None: a rule-builder study's
+    own definition's (CR F236-3), else the hand-coded model's, by its name."""
     from sleeve_fund.venues import VENUES
 
     perpetual = getattr(VENUES.get(str(instrument.id.venue)), "perpetual", False)
@@ -547,6 +547,7 @@ def run_study(
     research = prices.iloc[:-holdout_bars] if holdout_bars else prices
     combos = grid(spec.param_grid)
     default_params = default_params or spec.default_params or (combos[0] if combos else {})
+    idea_hash = idea_of(default_params, idea_hash)
 
     exits = {k: v for k, v in (exits or {}).items() if v is not None}
     from sleeve_fund.venues import VENUES
@@ -1173,6 +1174,17 @@ def _one_way(result: StudyResult, ledger: IdeaLedger, fold_runs: list, bt, minut
     result.spot_check = {"window": window, "seed": seed, "gap": round(gap, 2)}
     if -gap > tolerance:
         result.one_way = "void"
+
+
+def idea_of(params: dict | None, idea_hash: str | None) -> str | None:
+    """The idea family a study counts under when its caller named none: a rule-builder definition's own structural idea
+    (candidates.idea_hash), so unrelated definitions never share the "rules" family's trial count, holdout lock and
+    PBO family, and a parent and its candidates share one (CR F236-3). None for a hand-coded model: its name."""
+    if idea_hash is not None or not isinstance((params or {}).get("definition"), dict):
+        return idea_hash
+    from sleeve_fund.research.candidates import idea_hash as structural
+
+    return structural(params["definition"])
 
 
 def _overfit(grid_returns: dict, grid_settings: list[dict], register, spec: IdeaSpec, research: pd.DataFrame, bt,
