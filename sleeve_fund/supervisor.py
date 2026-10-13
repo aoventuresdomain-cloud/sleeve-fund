@@ -98,39 +98,44 @@ def check_funding_schedule(s: Sleeve) -> None:
 
 
 # CCY-8DP (Advisor 13 Oct 16:15 and 16:25 UK): the journal books each fill's fee and cash leg at 8 dp, so a quote
-# currency the engine holds to fewer places (USD: 2) would book what the venue never charged. Only these named test
-# accounts, (account name, venue), may run on one, with a warning; every other account, a future venue included, is
-# refused. Their results are never Strategy evidence.
-SUB_8DP_TEST_ACCOUNTS = {("paper", "KRAKEN"): "the hub-fed USD test Strategies and the full-stack check"}
+# currency the engine holds to fewer places (USD: 2) would book what the venue never charged. Only the test accounts
+# a venue profile names (VenueProfile.sub_8dp_test_accounts) may run on one, with a warning; every other account, a
+# future venue included, is refused. Their results are never Strategy evidence.
 FILL_PLACES = 8
 
 
-def is_test_currency_account(account: str, venue: str | None) -> bool:
-    """Whether (account, venue) is a named test account allowed under 8 places (SUB_8DP_TEST_ACCOUNTS): its results
-    are never Strategy evidence (CCY-8DP-UI keys the PM's views on this, not on a copy of the list)."""
-    from sleeve_fund.venues import DEFAULT_VENUE
+def _test_account_reason(account: str, venue: str | None) -> str | None:
+    """Why (account, venue) may run under 8 places, from the venue's profile; None when it may not (an unknown venue
+    included)."""
+    from sleeve_fund.venues import DEFAULT_VENUE, VENUES
 
-    return (account, (venue or DEFAULT_VENUE).upper()) in SUB_8DP_TEST_ACCOUNTS
+    profile = VENUES.get((venue or DEFAULT_VENUE).upper())
+    return None if profile is None else profile.sub_8dp_test_accounts.get(account)
+
+
+def is_test_currency_account(account: str, venue: str | None) -> bool:
+    """Whether (account, venue) is a named test account allowed under 8 places: its results are never Strategy
+    evidence (CCY-8DP-UI keys the PM's views on this, not on a copy of the list)."""
+    return _test_account_reason(account, venue) is not None
 
 
 def check_quote_places(s: Sleeve, account: str) -> str | None:
-    """Raises ValueError when the Strategy's quote currency is held to fewer than 8 places on an account not named in
-    SUB_8DP_TEST_ACCOUNTS; returns the warning to log when it is named there; None when the currency holds 8."""
+    """Raises ValueError when the Strategy's quote currency is held to fewer than 8 places on an account its venue
+    doesn't name as a test account; returns the warning to log when it does; None when the currency holds 8. The
+    words name no venue (they reach the PM)."""
     from nautilus_trader.model import Currency
-
-    from sleeve_fund.venues import DEFAULT_VENUE
 
     quote = s.instrument.split("/")[-1].split("-")[0].upper()
     places = Currency.from_str(quote).precision  # as the engine holds it (one it doesn't list it holds to 8)
     if places >= FILL_PLACES:
         return None
-    venue = (getattr(s, "venue", None) or DEFAULT_VENUE).upper()
+    why = _test_account_reason(account, getattr(s, "venue", None))
     held = f"{places} places"
-    if not is_test_currency_account(account, venue):
+    if why is None:
         raise ValueError(f"its quote currency {quote} is held to {held}, and fills are booked to {FILL_PLACES}; only "
-                         f"named test accounts may run on it, and account {account} on {venue} is not one")
+                         f"named test accounts may run on it, and account {account} is not one on this venue")
     return (f"Test account: its quote currency {quote} is held to {held}, under the {FILL_PLACES} fills are booked "
-            f"to, which only {SUB_8DP_TEST_ACCOUNTS[(account, venue)]} may do. Its results are not Strategy evidence")
+            f"to, which only {why} may do. Its results are not Strategy evidence")
 
 
 def true_up_stopped(store: Store, s: Sleeve, now: datetime | None = None) -> int:

@@ -63,6 +63,10 @@ class VenueProfile:
     # rate beyond it is alerted but still charged as it is (Advisor, 6 Oct 2026). The cap that applied at each
     # settlement, kept from the venue, replaces this with DA-11.
     published_funding_caps: dict[str, float] = field(default_factory=dict)
+    # CCY-8DP (Advisor 13 Oct 16:15 and 16:25 UK): account name -> why it may run a Strategy whose quote currency the
+    # engine holds to fewer than the 8 places fills are booked to. Only named test accounts, never Strategy evidence;
+    # every other account on the venue, and every venue without an entry, is refused (supervisor.check_quote_places).
+    sub_8dp_test_accounts: dict[str, str] = field(default_factory=dict)
     # series -> (pair, start in ms) -> up to a page of the venue's snapshots, [(time in ms, *values)], oldest first,
     # one per `stats_minutes`: open interest and the positioning ratios (sleeve_fund.open_interest.SERIES)
     stats_loaders: dict[str, Callable[[str, int], list]] = field(default_factory=dict)
@@ -298,6 +302,7 @@ KRAKEN = register(VenueProfile(
     fees=FeeSchedule(maker=Decimal("0.0040"), taker=Decimal("0.0080")),
     fee_basis="Tier 1, 3 Oct 2026",
     daily_history=_kraken_daily,
+    sub_8dp_test_accounts={"paper": "the hub-fed USD test Strategies and the full-stack check"},
     ohlc_history=_kraken_ohlc,
     list_instruments=kraken_instruments,
     asset_codes=kraken_asset_codes,

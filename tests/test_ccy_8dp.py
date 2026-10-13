@@ -8,7 +8,8 @@ from types import SimpleNamespace
 import pytest
 
 from sleeve_fund.store import Store
-from sleeve_fund.supervisor import SUB_8DP_TEST_ACCOUNTS, Supervisor, check_quote_places, is_test_currency_account
+from sleeve_fund import venues
+from sleeve_fund.supervisor import Supervisor, check_quote_places, is_test_currency_account
 
 
 def _s(instrument, venue="KRAKEN"):
@@ -22,7 +23,8 @@ def test_a_quote_held_to_8_places_passes_on_any_account():
 
 
 def test_a_usd_quote_on_the_named_test_account_runs_with_its_warning():
-    assert ("paper", "KRAKEN") in SUB_8DP_TEST_ACCOUNTS
+    assert set(venues.venue("KRAKEN").sub_8dp_test_accounts) == {"paper"}
+    assert all(not p.sub_8dp_test_accounts for n, p in venues.VENUES.items() if n != "KRAKEN")
     words = check_quote_places(_s("BTC/USD"), "paper")
     assert "not Strategy evidence" in words and "USD is held to 2 places" in words
     assert check_quote_places(_s("SUI/USD", None), "paper")  # the default venue is the hub-fed one
@@ -32,8 +34,9 @@ def test_a_usd_quote_on_the_named_test_account_runs_with_its_warning():
                                             ("paper", "NEWVENUE")],
                          ids=["live", "another-paper-account", "the-paper-venue", "an-unknown-venue"])
 def test_every_other_account_is_refused_with_its_reason(account, venue):
-    with pytest.raises(ValueError, match=f"account {account} on {venue} is not one"):
+    with pytest.raises(ValueError, match=f"account {account} is not one on this venue") as got:
         check_quote_places(_s("BTC/USD", venue), account)
+    assert venue not in str(got.value)  # the words reach the PM: no venue named
 
 
 def test_a_euro_quote_is_held_to_2_places_too_and_refused_off_the_test_account():
