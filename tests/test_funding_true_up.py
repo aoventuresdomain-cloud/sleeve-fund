@@ -102,9 +102,13 @@ def test_only_a_true_up_carries_an_arrival_time_and_the_database_holds_to_it(sto
 
 def test_0016_stops_on_a_true_up_it_cannot_give_an_arrival_and_changes_nothing(engine):
     from alembic import command
+    from alembic.script import ScriptDirectory
 
+    # Start just before 0016, wherever it is chained (it goes after whatever merged first): on SQLite a refused
+    # upgrade can't undo a batch-altered migration that ran earlier in the same upgrade, so none may run here.
+    before = ScriptDirectory.from_config(schema._config(None)).get_revision("0016").down_revision
     with engine.begin() as conn:
-        command.upgrade(schema._config(conn), "0013")
+        command.upgrade(schema._config(conn), before)
     with engine.begin() as conn:
         conn.execute(text("INSERT INTO sleeves (name, strategy, instrument, bar_spec, starting_balance, created_at, "
                           "updated_at, desired_state, status, status_reason, risk_profile, params, warmup_bars) "
@@ -115,7 +119,7 @@ def test_0016_stops_on_a_true_up_it_cannot_give_an_arrival_and_changes_nothing(e
     with pytest.raises(Exception, match="no arrival time"):
         schema.migrate(engine, log=lambda _: None)
     with engine.connect() as conn:
-        assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar() == "0013"
+        assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar() == before
         assert conn.execute(text("SELECT COUNT(*) FROM funding")).scalar() == 1
     assert "arrived_at" not in {c["name"] for c in inspect(engine).get_columns("funding")}
     with engine.begin() as conn:  # leave it migrated, so the teardown drops the whole shape
