@@ -334,3 +334,30 @@ def test_0015_keeps_a_reset_keyed_to_its_command_when_it_rebuilds_commands(engin
         assert conn.execute(text("SELECT command FROM commands WHERE id = :c"), {"c": cid}).scalar() == RAL_KIND
         if engine.dialect.name == "sqlite":
             assert conn.execute(text("PRAGMA foreign_key_check")).fetchall() == []
+
+
+def test_a_reset_is_refused_while_a_cancel_is_open_and_runs_once_the_venue_answers(store):
+    """F241-4 (HoE 13 Oct, after #241): split_run itself refuses a Strategy with an open cancel, in its own
+    transaction, so a cancel requested after the supervisor's check (F241-3) can't move to the archived run and leave
+    the fresh run trading with nothing blocking it. Refused before anything is written."""
+    _resting(store)
+    cid = store.request_cancel("s", "E-1", "owner process down")
+    store.request_reset("s", "Settings changed")
+    req = store.pending_resets()[0]
+    with pytest.raises(ValueError, match="cancel the venue hasn't answered"):
+        store.split_run(req)
+    assert store.archived() == {} and store.pending_resets()[0]["id"] == req["id"]
+    assert _order(store).sleeve == "s" and [c.sleeve for c in _cancel_rows(store)] == ["s"]
+    assert [c["id"] for c in store.open_cancels("s")] == [cid]
+
+    assert store.apply_cancel(cid, "cancelled") == "applied"
+    run = store.split_run(store.pending_resets()[0])
+    assert run in store.archived() and store.open_cancels() == []
+    assert [c.sleeve for c in _cancel_rows(store)] == [run]  # the answered cancel goes with its run
+
+
+def test_another_strategys_open_cancel_does_not_refuse_a_reset(store):
+    _resting(store, sleeve="other")
+    store.request_cancel("other", "E-1", "owner process down")
+    store.request_reset("s", "Settings changed")
+    assert store.split_run(store.pending_resets()[0]) in store.archived()
