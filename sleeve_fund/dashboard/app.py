@@ -696,7 +696,9 @@ def create_app(store: Store | None = None) -> FastAPI:
                     try:
                         defaults = _defaults(s.strategy)
                     except ModuleNotFoundError as exc:
-                        if exc.name != f"sleeve_fund.strategies.{s.strategy}":  # a shipped model that won't load
+                        model = REGISTRY.get(s.strategy, (None,))[0]
+                        if (exc.name != f"sleeve_fund.strategies.{s.strategy}"  # a shipped model that won't load,
+                                or getattr(model, "__module__", None) == exc.name):  # or whose own module failed
                             raise ValueError(f"the {s.strategy} model can't be loaded: {exc}") from exc
                         defaults = {}  # only in REGISTRY (a test harness's model): its own settings are all it has
                     except (ImportError, AttributeError) as exc:

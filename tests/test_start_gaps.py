@@ -128,9 +128,11 @@ def test_a_model_registered_without_a_module_of_its_own_starts_on_its_own_settin
     assert ev["message"].startswith(f"history gaps in warm-up window: BTC/USD {gap:%d %b %H:%M}-")
 
 
-def test_a_shipped_model_that_wont_load_is_refused_with_the_reason(client, stored, monkeypatch):  # noqa: F811
+@pytest.mark.parametrize("missing", ["talib", "sleeve_fund.strategies.trend_filter"])
+def test_a_shipped_model_that_wont_load_is_refused_with_the_reason(client, stored, monkeypatch, missing):  # noqa: F811
     """The fallback above is for a model with no module at all. A shipped model whose module fails to load (a
-    missing dependency, no SPEC) doesn't start on guessed settings: the start is refused and says why."""
+    missing dependency, or its own module, where its class lives) doesn't start on guessed settings: the start is
+    refused and says why (QA sg-qa-1)."""
     from urllib.parse import parse_qs, urlparse
 
     from sleeve_fund.dashboard import app as app_module
@@ -140,11 +142,11 @@ def test_a_shipped_model_that_wont_load_is_refused_with_the_reason(client, store
     c.post("/sleeves/btc-test/command", data={"command": "stop", "reason": "x"}, auth=AUTH, headers=SAME)
 
     def broken(strategy):
-        raise ModuleNotFoundError("No module named 'talib'", name="talib")
+        raise ModuleNotFoundError(f"No module named '{missing}'", name=missing)
 
     monkeypatch.setattr(app_module, "_defaults", broken)
     where = c.post("/sleeves/btc-test/command", data={"command": "start", "reason": "go"}, auth=AUTH, headers=SAME,
                    follow_redirects=False).headers["location"]
     error = parse_qs(urlparse(where).query)["command_error"][0]
-    assert error == "the trend_filter model can't be loaded: No module named 'talib'"
+    assert error == f"the trend_filter model can't be loaded: No module named '{missing}'"
     assert store.sleeve("btc-test").desired_state == "stopped"
