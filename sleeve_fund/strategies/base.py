@@ -2291,7 +2291,7 @@ class LongFlatStrategy(Strategy):
     def _replayed_stop(self, side: int, own: float | None) -> float | None:
         """The stop a replay rests for the position: its own, or the wind-down stop (P2-6), which the replay treats as
         the strategy's own resting stop (Advisor 13 Oct 16:40, MUST), whichever the price reaches first."""
-        wind = self.runtime.wind_stop if self.runtime is not None else None
+        wind = getattr(self.runtime, "wind_stop", None)  # a runtime without the lifecycle (a test stub) has none
         if wind is None or wind[0] != side:
             return own
         if own is None:
@@ -2302,7 +2302,7 @@ class LongFlatStrategy(Strategy):
         """The open position has something a replay can act on: a stop or target, or on a perp its liquidation
         price and the risk guard."""
         return (self._margin or self._stop_frac is not None or bool(self._tp_frac)
-                or (self.runtime is not None and self.runtime.wind_stop is not None))
+                or getattr(self.runtime, "wind_stop", None) is not None)
 
     def _note_trade(self, ts: int) -> None:
         """Paper: a trade at venue time ts. A stretch over UNSEEN_GAP_NS with no trade while in a position is
