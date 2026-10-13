@@ -33,6 +33,7 @@ from nautilus_trader.trading import Strategy
 from sleeve_fund import bars as bar_rule
 from sleeve_fund import markets, open_risk, risk
 from sleeve_fund.data import bar_minutes
+from sleeve_fund import router
 from sleeve_fund.instruments import BOOK_SHARE, lot_decimals, pair_of, taker_slippage, target_fill_px
 from sleeve_fund.margin import entry_liquidation
 from sleeve_fund.paper.runtime import ENTRY_CANCELLED, EXITS_ONLY, RACED_FILL, RESUMABLE, WIPED_OUT, block_codes, liquidation_reason
@@ -975,6 +976,13 @@ class LongFlatStrategy(Strategy):
                                          f"{self._cfg.instrument_id} is not listed on the venue")
             self.stop()
             return
+        if self.runtime is not None and not self._backtest and getattr(self.runtime, "pinned", True):
+            try:  # P2-4: a strategy whose market is on any venue but its own never starts (submit_order checks again)
+                router.check(self.runtime.name, str(self._cfg.instrument_id), self.runtime.venue)
+            except router.VenueMismatch as e:
+                why = f"{self.runtime.name} won't start: its market is on another venue, and it trades on its own only"
+                self.runtime.store.event(self.runtime.name, "error", "venue_mismatch", why, ts=self.runtime.now())
+                raise RuntimeError(f"{why} ({e.reason})") from e
         if self.recorder is not None:
             self.recorder.start(self.instrument)
         if self.runtime is not None and hasattr(self.runtime.store, "set_grid"):
@@ -5393,8 +5401,23 @@ class LongFlatStrategy(Strategy):
 
     def submit_order(self, order, *args, **kwargs) -> None:
         """Nothing reaches the venue before trade_from, whatever sends it (a model's own resting entry too): a study's
-        out-of-sample window starts flat."""
+        out-of-sample window starts flat. Nothing reaches any venue but the strategy's own (router.check)."""
         if self._cfg.trade_from is not None and self.clock.timestamp_ns() < self._cfg.trade_from:
+            self.decisions.pop(str(order.client_order_id), None)
+            return
+        # P2-4: only to the strategy's own venue, whatever sends it. Paper's and live's is the strategy's pin; a
+        # backtest's, or an unpinned strategy's (SleeveRuntime.pinned), is the venue its market was set up on (a portfolio
+        # run's clone standing for its base venue).
+        own = not self._backtest and getattr(self.runtime, "pinned", True)
+        pinned = self.runtime.venue if own else self._cfg.instrument_id.venue.value
+        try:
+            router.check(self.runtime.name if self.runtime is not None else "backtest", str(order.instrument_id), pinned)
+        except router.VenueMismatch as e:
+            self.log.error(e.reason)
+            if self.runtime is not None:
+                self.runtime.on_order_status(str(order.client_order_id), "denied", e.reason)
+                self.runtime.store.event(self.runtime.name, "error", "order_refused_venue", e.reason,
+                                         ts=self.runtime.now())
             self.decisions.pop(str(order.client_order_id), None)
             return
         super().submit_order(order, *args, **kwargs)
