@@ -236,7 +236,7 @@ def run_portfolio(specs: list[LegSpec], profile: PortfolioProfile = PORTFOLIO, u
         check until the figure exists; exits and stops carry on."""
         try:
             gate.mark(hour_ns + BATCH_DELAY_NS)
-        except Exception as e:  # noqa: BLE001 - the run goes on; the gap is reported, never papered over
+        except ValueError as e:  # a figure missing (portfolio_book); the run goes on and the gap is reported
             gate.ledger.alert("portfolio_mark_failed", f"{e}", _utc(hour_ns + BATCH_DELAY_NS))
             return
         marks[hour_ns] = last["book"]
