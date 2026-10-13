@@ -1085,6 +1085,49 @@ def unwritable(path: Path) -> str | None:
         return f"cannot write {path} as uid {os.getuid()} ({owner} is {owned}): {exc!r}"
 
 
+def coverage_line(store: HistoryStore, venue: str, pair: str, start: pd.Timestamp, end: pd.Timestamp,
+                  perpetual: bool) -> str:
+    """One line on whether a test window is covered (Advisor 13 Oct 19:35 UK, PRE): the instrument's stored 1-minute
+    bars over [start, end) (first and last minute held, minutes missing inside the window, the longest run missing)
+    and, on a perpetual, its settled funding (first and last rate kept, holes and possible holes inside the window).
+    COVERED only when every minute and every settlement in the window is held. Read-only."""
+    from sleeve_fund import funding
+
+    parts, whole = [f"{venue} {pair} {start:%Y-%m-%d %H:%M}..{end:%Y-%m-%d %H:%M}:"], True
+    cov = store.coverage(venue, pair)
+    if cov is None:
+        parts.append("1m none stored")
+        whole = False
+    else:
+        lo, hi = max(start, cov.first), min(end - pd.Timedelta(minutes=1), cov.closed or cov.last)
+        inside = [(max(a, start), min(b, end - pd.Timedelta(minutes=1))) for a, b in store.gaps(venue, pair)
+                  if b >= start and a < end]
+        missing = sum(int((b - a) / pd.Timedelta("1min")) + 1 for a, b in inside)
+        before = max(0, int((cov.first - start) / pd.Timedelta("1min")))
+        after = max(0, int((end - pd.Timedelta(minutes=1) - hi) / pd.Timedelta("1min")))
+        longest = max([int((b - a) / pd.Timedelta("1min")) + 1 for a, b in inside] + [0])
+        whole &= missing == 0 and before == 0 and after == 0
+        parts.append(f"1m {lo:%Y-%m-%d %H:%M}..{hi:%Y-%m-%d %H:%M}, missing {missing + before + after} min"
+                     + (f" ({before} before the first stored)" if before else "")
+                     + (f" ({after} after the last closed)" if after else "")
+                     + (f", longest gap {longest} min" if longest else ""))
+    if perpetual:
+        t = funding.rates(venue, pair, store.root).index
+        if not len(t):
+            parts.append("funding none stored")
+            whole = False
+        else:
+            holes, maybe = funding.settled_holes(venue, pair, store.root)
+            within = lambda spans: [g for g in spans if g[1] > start and g[0] < end]  # noqa: E731
+            h, m = within(holes), within(maybe)
+            late, early = t[0] > start + pd.Timedelta(hours=8), t[-1] < end - pd.Timedelta(hours=8)
+            whole &= not (h or m or late or early)
+            parts.append(f"funding {t[0]:%Y-%m-%d %H:%M}..{t[-1]:%Y-%m-%d %H:%M}, {len(h)} hole(s), "
+                         f"{len(m)} possible at an interval change" + (", starts after the window opens" if late else "")
+                         + (", ends before the window closes" if early else ""))
+    return ("COVERED " if whole else "GAPS ") + " ".join(parts)
+
+
 def main(argv: list[str] | None = None) -> int:
     import argparse
     import time
@@ -1110,6 +1153,11 @@ def main(argv: list[str] | None = None) -> int:
     can.add_argument("--dry-run", action="store_true", help="count the minutes it would replace and fill; write nothing")
     rep = sub.add_parser("report", help="what is stored, and any gaps or duplicates")
     rep.add_argument("--venue", default=None)
+    cv = sub.add_parser("coverage", help="one line per instrument: is a test window's 1m data and funding all held")
+    cv.add_argument("pairs", nargs="*", help="instruments (default: core list plus sleeves')")
+    cv.add_argument("--venue", default=None)
+    cv.add_argument("--start", required=True, help="UTC time the window opens, e.g. 2024-01-01")
+    cv.add_argument("--end", default=None, help="UTC time the window closes (default: now, to the minute)")
     exp = sub.add_parser("export", help="one instrument's stored 1-minute candles in a window, as CSV (read-only)")
     exp.add_argument("pair", help="instrument, e.g. BTC/USDT")
     exp.add_argument("--venue", default=None)
@@ -1134,6 +1182,12 @@ def main(argv: list[str] | None = None) -> int:
         except (KeyError, ValueError) as exc:
             print(f"export refused: {exc}", file=sys.stderr)
             return 2
+        return 0
+    if args.cmd == "coverage":  # read-only
+        start = pd.Timestamp(args.start, tz="UTC")
+        end = pd.Timestamp(args.end, tz="UTC") if args.end else pd.Timestamp.now(tz="UTC").floor("min")
+        for pair in args.pairs or [p for p, _ in _pairs_in_use(profile.name)]:
+            print(coverage_line(store, profile.name, pair, start, end, profile.funding_loader is not None))
         return 0
     if args.cmd == "report":
         for v, pair in store.series():

@@ -1,0 +1,60 @@
+name: history-coverage
+# Advisor 13 Oct 19:35 UK (PRE): is every tested instrument's 1-minute data and settled funding held over the test
+# window? Runs python -m sleeve_fund.history coverage inside the venue's hub container on the paper server and prints
+# one line per instrument (COVERED or GAPS). Read-only: it reads the history files and writes nothing. Run it by hand
+# from main. Same secrets and variable as canon, parity and status.
+on:
+  workflow_dispatch:
+    inputs:
+      venue:
+        description: Venue whose stored history to check (lower-case letters only)
+        required: true
+        default: binance
+      start:
+        description: UTC date the test window opens (YYYY-MM-DD)
+        required: true
+      end:
+        description: UTC date the window closes (YYYY-MM-DD); empty for now
+        required: false
+        default: ""
+      pairs:
+        description: Instruments, space-separated, e.g. BTC/USDT ETH/USDT; empty for the core list and every Strategy's
+        required: false
+        default: ""
+jobs:
+  coverage:
+    runs-on: ubuntu-24.04
+    permissions: { contents: read }
+    if: ${{ vars.DEPLOY_ENABLED == 'true' && github.ref == 'refs/heads/main' }}
+    env:
+      USER_AT: ${{ vars.DEPLOY_USER || 'root' }}
+    steps:
+      - name: Check the inputs
+        env:
+          VENUE: ${{ inputs.venue }}
+          START: ${{ inputs.start }}
+          END: ${{ inputs.end }}
+          PAIRS: ${{ inputs.pairs }}
+        run: |
+          [[ "$VENUE" =~ ^[a-z]{1,32}$ ]] || { echo "venue must be lower-case letters only"; exit 1; }
+          [[ "$START" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || { echo "start must be YYYY-MM-DD"; exit 1; }
+          [[ -z "$END" || "$END" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || { echo "end must be YYYY-MM-DD"; exit 1; }
+          [[ -z "$PAIRS" || "$PAIRS" =~ ^[A-Z0-9]{1,16}/[A-Z0-9]{1,16}( [A-Z0-9]{1,16}/[A-Z0-9]{1,16})*$ ]] || { echo "pairs must be like BTC/USDT ETH/USDT"; exit 1; }
+      - name: Configure SSH
+        env:
+          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/id_deploy && chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts
+      - name: Report coverage
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          VENUE: ${{ inputs.venue }}
+          START: ${{ inputs.start }}
+          END: ${{ inputs.end && format('--end {0}', inputs.end) || '' }}
+          PAIRS: ${{ inputs.pairs }}
+        run: |
+          ssh -i ~/.ssh/id_deploy "$USER_AT@$HOST" \
+            "cd /opt/sleeve-fund && sudo docker compose exec -T hub-$VENUE python -m sleeve_fund.history coverage --venue $VENUE --start $START $END $PAIRS"
