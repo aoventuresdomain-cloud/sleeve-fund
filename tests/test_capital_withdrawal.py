@@ -5,6 +5,7 @@ one brought back puts it in again. A flow scales the book's high-water mark, the
 flow. Strategies archived before this landed count as before until the one-off withdraw-archived command takes each out
 with its own flow."""
 
+from dataclasses import replace
 from datetime import timedelta
 from decimal import Decimal as D
 
@@ -240,3 +241,95 @@ def test_w13_withdraw_archived_keys_on_reset_runs_so_never_takes_a_runs_cash_out
     assert supervisor.withdraw_archived(store, "operator", "abc1234") == []
     assert _flows(store) == [] and store.withdrawn() == {}
     assert _four(_mark(store, T0 + timedelta(minutes=3))) == before
+
+
+# --- E1-E4: a withdrawal that empties the book (Advisor 14 Oct 10:00 UK, on QD's proposal) ------------------------------
+
+def test_e1_emptying_the_book_leaves_it_unmarked_and_the_next_capital_starts_it_afresh(store):
+    """Within a cent of 0, with nothing open and nothing that could trade: the state is left unmarked, a poll of the
+    empty book neither marks nor halts it, the next create brings no flow, and its first mark starts the book at it."""
+    _make(store, "a", 10_000)
+    _trade(store, "a", -1_000)
+    _mark(store, T0)
+    store.archive("a")
+    st = _mark(store, T0 + timedelta(minutes=1))
+    assert (st.equity, st.hwm, st.reference(), st.day_start_equity, st.mark_ts) == (None,) * 5 and not st.halted
+    assert store.withdrawn() == {"a": D(9_000)} and supervisor.fund_equity(store) == 0
+    _make(store, "b", 5_000)
+    assert len(_flows(store)) == 1  # b's create on an unmarked book: no flow, the mark reads it
+    assert _four(_mark(store, T0 + timedelta(minutes=2))) == (D(5_000),) * 4
+    assert not _state(store).halted
+
+
+def test_e2_the_journal_keeps_the_old_high_water_mark_reference_and_day_start(store):
+    _make(store, "a", 10_000)
+    _trade(store, "a", 2_000)
+    _mark(store, T0)
+    _trade(store, "a", -300, T0 + timedelta(minutes=1))
+    _mark(store, T0 + timedelta(minutes=1))  # 11,700 against a 12,000 HWM; the day started at 12,000
+    store.archive("a")
+    (flow,) = _flows(store)
+    assert "-11,700.00" in flow and "empties it" in flow
+    assert "high-water mark 12,000.00" in flow and "reference 12,000.00" in flow and "day's start 12,000.00" in flow
+
+
+def test_e3_a_halt_in_force_stays_through_the_empty_book_until_the_pm_resumes(store):
+    _make(store, "a", 10_000)
+    _mark(store, T0)
+    led = DbLedger(store, lambda: ())
+    with led.lock():
+        led.set_state(replace(led.state(), halted="the test's halt"))
+    store.archive("a")
+    st = _mark(store, T0 + timedelta(minutes=1))
+    assert st.equity is None and st.halted == "the test's halt"
+    from sleeve_fund.portfolio.gate import resume_after_halt
+
+    _make(store, "b", 5_000)
+    assert _mark(store, T0 + timedelta(minutes=2)).halted == "the test's halt"  # capital back: still halted
+    assert not resume_after_halt(led).halted  # only the PM's Resume clears it
+    assert _four(_mark(store, T0 + timedelta(minutes=3))) == (D(5_000),) * 4
+
+
+def test_e3b_a_days_pause_keeps_the_book_marked_so_emptying_it_waits_for_midnight(store):
+    """A pause follows a mark (the schema's portfolio_state_marked): the withdrawal is refused, the pause kept."""
+    _make(store, "a", 10_000)
+    _mark(store, T0)
+    led = DbLedger(store, lambda: ())
+    with led.lock():
+        led.set_state(replace(led.state(), paused="the test's pause", paused_until=T0 + timedelta(hours=2)))
+    with pytest.raises(ValueError, match="the day's pause holds until 11:00 UTC"):
+        store.archive("a")
+    st = _state(store)
+    assert st.equity == D(10_000) and st.paused_until == T0 + timedelta(hours=2) and "a" not in store.archived()
+
+
+@pytest.mark.parametrize("why", ["could trade", "holds a position", "below nothing", "an order"])
+def test_e4_a_withdrawal_to_empty_is_refused_while_anything_is_open_and_below_nothing_always(store, why):
+    from sleeve_fund.portfolio.gate import apply_flow
+
+    _make(store, "a", 10_000)
+    _mark(store, T0)
+    led = DbLedger(store, lambda: ())
+    if why == "could trade":
+        store.set_desired_state("a", "running")
+    elif why == "holds a position":
+        store.record_fill("a", side="BUY", qty=0.5, price=1_000.0, fee=0.0, order_id="h", trade_id="h", ts=T0)
+    amount = D("-10000.01") if why == "below nothing" else D(-10_000)
+    with pytest.raises(ValueError, match=why if why != "an order" else "an order still holds room"):
+        if why == "an order":
+            led.reservations = lambda: ["an entry's order, still resting"]  # what the gate holds room for
+            apply_flow(led, amount, lambda: None)
+        else:
+            with store._book_move(lambda: amount, "the test's withdrawal"):
+                pass
+    assert _state(store).equity == D(10_000) and _flows(store) == []
+
+
+def test_e1b_a_residue_under_a_cent_is_empty(store):
+    from sleeve_fund.portfolio.gate import apply_flow
+
+    _make(store, "a", 10_000)
+    _mark(store, T0)
+    led = DbLedger(store, lambda: ())
+    assert apply_flow(led, D("-9999.995"), lambda: None).equity == D(10_000) and _state(store).equity is None
+

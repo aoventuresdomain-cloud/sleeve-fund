@@ -321,14 +321,24 @@ def resume_after_halt(ledger: Ledger) -> PortfolioState:
         return st
 
 
-def apply_flow(ledger: Ledger, amount) -> None:
+EMPTY = Decimal("0.01")  # a book within a cent of nothing after a flow is empty (Advisor 14 Oct 10:00 UK)
+
+
+def apply_flow(ledger: Ledger, amount, idle: Callable[[], str | None] | None = None) -> PortfolioState | None:
     """Capital added (> 0) or withdrawn (< 0), so a deposit isn't a gain and a withdrawal isn't a loss (Advisor 3).
     The book moves by it, and the HWM, the halt's reference and the day's start each scale by (book + amount) / book,
     so the drawdown and the day's change keep their percentages (Advisor MUST, 14 Oct 09:45 UK): a shift by the
     amount would dilute a drawdown on a deposit (90 against 100 is 10% down; 190 against 200, 5%) and deepen it on a
-    withdrawal. Exact, to the column's 18 places. Refused (ValueError) on a book of 0 or less before or after, or one
-    never marked: no ratio then, so the move fails closed; except a deposit into a book at 0 that never had a
-    high-water mark (an empty fund, as a fresh stack marks it), which starts the book at the deposit."""
+    withdrawal. Exact, to the column's 18 places. Refused (ValueError) on a book of 0 or less before, or one never
+    marked: no ratio then, so the move fails closed; except a deposit into a book at 0 that never had a high-water
+    mark (an empty fund, as a fresh stack marks it), which starts the book at the deposit.
+
+    A withdrawal that empties the book (within EMPTY of 0 after it) leaves it unmarked, so the next mark starts it
+    afresh, as a first mark does; only when idle() says nothing is open (no position, no Strategy that could trade:
+    it returns why not, or None), no reservation is held and no day's pause is in force (a pause needs a mark, so
+    the withdrawal waits for 00:00 UTC); otherwise, and below 0, refused. A halt in force stays until the PM resumes
+    it. Returns the state it emptied, for the caller's journal, else
+    None (Advisor 14 Oct 10:00 UK)."""
     amount = money(amount, "amount")
     with ledger.lock():
         st = ledger.state()
@@ -338,10 +348,25 @@ def apply_flow(ledger: Ledger, amount) -> None:
             # high-water mark, so no drawdown to keep, and the book starts at the deposit. A book at 0 below a HWM
             # is a real loss and is still refused below.
             ledger.set_state(replace(st, equity=amount, hwm=amount, halt_reference=None, day_start_equity=amount))
-            return
-        if book is None or book <= 0 or book + amount <= 0:
+            return None
+        if book is None or book <= 0:
             raise ValueError(f"a flow of {amount:,.2f} on a book of {'none' if book is None else f'{book:,.2f}'} "
                              "can't keep the book's percentages: refused")
+        if abs(book + amount) < EMPTY:
+            busy = "no check of what is open was given" if idle is None else idle()
+            if busy is None and ledger.reservations():
+                busy = "an order still holds room in the book"
+            if busy is None and st.paused_until is not None:
+                # a pause follows a mark (portfolio_state_marked), so the day's pause keeps the book marked: emptied
+                # from 00:00 UTC, when it ends (QD, 14 Oct; nothing can trade an empty book meanwhile)
+                busy = f"the day's pause holds until {st.paused_until:%H:%M} UTC"
+            if busy is not None:
+                raise ValueError(f"a flow of {amount:,.2f} would empty the book of {book:,.2f} while {busy}: refused")
+            ledger.set_state(replace(st, equity=None, mark_ts=None, hwm=None, halt_reference=None, day=None,
+                                     day_start_equity=None))
+            return st
+        if book + amount <= 0:
+            raise ValueError(f"a flow of {amount:,.2f} would take the book of {book:,.2f} below nothing: refused")
         with localcontext() as ctx:
             ctx.prec = 2 * PRECISION  # each product is exact before its one rounding to the column's scale
 
@@ -351,6 +376,7 @@ def apply_flow(ledger: Ledger, amount) -> None:
             ledger.set_state(replace(st, equity=book + amount, hwm=scaled(st.hwm),
                                      halt_reference=scaled(st.halt_reference),
                                      day_start_equity=scaled(st.day_start_equity)))
+        return None
 
 
 def sweep(ledger: Ledger, now: datetime, is_live: Callable[[str], bool], cancel: Callable[[str], None] | None,

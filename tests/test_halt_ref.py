@@ -235,14 +235,19 @@ def test_a_deposit_into_a_book_at_0_below_its_hwm_is_refused(store):
 
 
 def test_a_flow_that_leaves_no_book_is_refused_and_the_move_with_it(store):
-    """Every Strategy in the book leaving it: book + flow is 0, so there is no ratio to keep, and the move fails
-    closed (ValueError) with its flow: the account stays as it was and nothing is journaled."""
+    """Every Strategy in the book leaving it: book + flow is 0. While one could still trade, the move fails closed
+    (ValueError) with its flow: the account stays as it was and nothing is journaled. F-C3B-A (Advisor 14 Oct 10:00
+    UK; HoE OK to change this cell): stopped and flat, it empties the book, left unmarked for the next capital."""
     _make(store, "test", 20_000, instrument="BTC/USD", venue="KRAKEN")
     store.assign_account("test", "desk")
     _mark(store, T0)
-    with pytest.raises(ValueError, match="can't keep the book's percentages"):
+    store.set_desired_state("test", "running")
+    with pytest.raises(ValueError, match="would empty the book of 20,000.00 while test could trade"):
         store.assign_account("test", "paper")
     assert store.account_of("test") == "desk" and _flows(store) == [] and _state(store).equity == D(20_000)
+    store.set_desired_state("test", "stopped")
+    store.assign_account("test", "paper")
+    assert store.account_of("test") == "paper" and len(_flows(store)) == 1 and _state(store).equity is None
 
 
 # --- C2, C3: archive and reset move nothing, as fund_equity counts them ------------------------------------------------

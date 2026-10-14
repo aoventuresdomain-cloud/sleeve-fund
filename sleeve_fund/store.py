@@ -937,6 +937,10 @@ def _from_ns(ns: int) -> datetime:
     return _EPOCH + timedelta(microseconds=ns // 1000)
 
 
+def _money2(x) -> str:
+    return "none" if x is None else f"{x:,.2f}"
+
+
 def _aware(ts: datetime | None) -> datetime | None:
     # SQLite hands back naive datetimes; everything we store is UTC.
     if ts is not None and ts.tzinfo is None:
@@ -1154,13 +1158,32 @@ class Store:
             yield c
             if amount:
                 before = led.state().reference()
-                apply_flow(led, amount)
-                after = led.state().reference()
+                emptied = apply_flow(led, amount, self._nothing_open)
+                if emptied is not None:  # the old figures stay in the journal (Advisor 14 Oct 10:00 UK)
+                    tail = (f"which empties it, so the next mark starts it afresh (it was: high-water mark "
+                            f"{_money2(emptied.hwm)}, the halt's reference {_money2(emptied.reference())}, the day's "
+                            f"start {_money2(emptied.day_start_equity)}); a halt in force stays until the PM resumes")
+                else:
+                    tail = (f"and its high-water mark, the halt's reference and the day's start scale with it (the "
+                            f"reference {before:,.2f} -> {led.state().reference():,.2f})")
                 c.execute(insert(events_t).values(
                     sleeve=None, ts=ts or utcnow(), level="info", kind="portfolio_flow",
-                    message=f"{why() if callable(why) else why}: the fund's book moves by {amount:+,.2f} and its "
-                            f"high-water mark, the halt's reference and the day's start scale with it (the reference "
-                            f"{before:,.2f} -> {after:,.2f}), so it isn't a gain or a loss"))
+                    message=f"{why() if callable(why) else why}: the fund's book moves by {amount:+,.2f} {tail}, so "
+                            "it isn't a gain or a loss"))
+
+    def _nothing_open(self) -> str | None:
+        """apply_flow's check before a withdrawal empties the book: why it can't (a Strategy in the book could trade or
+        holds a position), or None."""
+        from sleeve_fund.supervisor import could_trade
+
+        for s in self.sleeves():
+            if is_backtest(s.name) or _outside_book(self, s):
+                continue
+            if could_trade(s):
+                return f"{s.name} could trade"
+            if self.journal_book(s.name, s.starting_balance)["qty"] != 0:
+                return f"{s.name} holds a position"
+        return None
 
     def sleeve(self, name: str) -> Sleeve:
         with self.engine.connect() as c:
