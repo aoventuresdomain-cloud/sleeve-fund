@@ -75,3 +75,34 @@ def test_a_restart_after_the_run_window_opens_nothing():
     assert opened == [], [(o["ts"], o["side"], o["filled_qty"]) for o in opened]
     assert _path(b)[-1] == 0  # flat once the window is over
     assert _path(a)[-1] == 0
+
+
+@pytest.mark.parametrize("code", ["exits_only", "paused", "daily_pause", "halted", "portfolio_halt", "stale_data"])
+def test_once_entries_are_held_only_the_reduce_and_the_close_run(monkeypatch, code):
+    """Design (e), (f), (h): under exits-only, a pause, the daily brake, a halt or stale data, the cycle's reduce
+    steps and closes still run and nothing opens. Held from just after step 0's buy: step 1 sells half, step 2's flip
+    closes the rest and its open (the short) is held, and every later open is held too, so it ends flat."""
+    from sleeve_fund.strategies import REGISTRY
+    from sleeve_fund.strategies.candle_step import CandleStep, CandleStepConfig
+
+    class Held(CandleStep):
+        _q_sent = False
+
+        def entry_sent(self, qty, values):
+            super().entry_sent(qty, values)
+            self._q_sent = True
+            if self.runtime is not None:
+                self.runtime.holds[code] = "held for the cell"
+
+        def _market_seen(self):  # stale data clears on a fresh print: here the feed stays stale once it goes
+            super()._market_seen()
+            if code == "stale_data" and self._q_sent:
+                self.runtime.holds[code] = "last price 400 s old. It clears when data resumes"
+
+    monkeypatch.setitem(REGISTRY, "candle_step", (Held, CandleStepConfig))
+    a, _, _, _ = _ab("candle_step", PARAMS, FLAT, lambda a: _step_close(1))
+    orders = _orders(a)
+    q = D(str(orders[0]["filled_qty"]))
+    assert [(o["side"], D(str(o["filled_qty"])), o["intent"]) for o in orders] == [
+        ("BUY", q, "entry"), ("SELL", q / 2, "exit"), ("SELL", q / 2, "exit")]
+    assert _path(a)[-1] == 0
