@@ -20,7 +20,7 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -31,7 +31,7 @@ from sleeve_fund.money import to_decimal
 from sleeve_fund.gate_ledger import DbLedger
 from sleeve_fund.portfolio.gate import PortfolioState, mark_book, sweep
 from sleeve_fund.portfolio.limits import Book, Holding
-from sleeve_fund.risk import PORTFOLIO
+from sleeve_fund.risk import PORTFOLIO, trading_day
 from sleeve_fund.paper.safety import assert_portfolio_gate, credential_var
 from sleeve_fund.paper.single_lock import EXIT_DUPLICATE
 from sleeve_fund.paper.config import check_hub_bar_spec, load_sleeve, to_store_kwargs
@@ -73,23 +73,35 @@ def fund_equity(store: Store) -> Decimal:
     for s in store.sleeves():
         if is_backtest(s.name) or outside_fund_book(store, s):  # F229-6: a sub-8dp test Strategy isn't the fund's
             continue
-        cash = to_decimal(store.strategy_cash_pnl(s.name), "cash")
-        if s.name in runs:
-            total += cash  # flat when put away (split_run): its capital is its successor's
-            continue
-        total += to_decimal(s.starting_balance, "starting balance") + cash
-        book = store.journal_book(s.name, s.starting_balance)
-        qty = to_decimal(book["qty"], "qty")
-        if qty != 0:
-            last = store.last_equity(s.name)
-            if last is not None and last["price"]:
-                total += qty * to_decimal(last["price"], "mark")
-            elif is_dust(book) and book["entry_px"]:
-                # F229-7: dust no venue takes an order for, never marked, is held at its entry price (under
-                # DUST_NOTIONAL either way) rather than failing the whole fund closed over it
-                total += qty * to_decimal(book["entry_px"], "entry price")
-            else:
-                raise RuntimeError(f"{s.name} holds {qty} with no mark, so the fund can't be marked")
+        total += strategy_equity(store, s, runs)
+    return total
+
+
+def _flowed(st: PortfolioState) -> tuple:
+    """What a flow (portfolio.gate.apply_flow) moves: a change here between reading the book and marking it is one."""
+    return st.equity, st.hwm, st.halt_reference, st.day_start_equity
+
+
+def strategy_equity(store: Store, s, runs: dict | None = None) -> Decimal:
+    """One Strategy's part of fund_equity, wherever it sits: what moves into or out of the book when it does
+    (HALT-REF-1, Store._book_move)."""
+    runs = store.reset_runs() if runs is None else runs
+    cash = to_decimal(store.strategy_cash_pnl(s.name), "cash")
+    if s.name in runs:
+        return cash  # flat when put away (split_run): its capital is its successor's
+    total = to_decimal(s.starting_balance, "starting balance") + cash
+    book = store.journal_book(s.name, s.starting_balance)
+    qty = to_decimal(book["qty"], "qty")
+    if qty != 0:
+        last = store.last_equity(s.name)
+        if last is not None and last["price"]:
+            total += qty * to_decimal(last["price"], "mark")
+        elif is_dust(book) and book["entry_px"]:
+            # F229-7: dust no venue takes an order for, never marked, is held at its entry price (under
+            # DUST_NOTIONAL either way) rather than failing the whole fund closed over it
+            total += qty * to_decimal(book["entry_px"], "entry price")
+        else:
+            raise RuntimeError(f"{s.name} holds {qty} with no mark, so the fund can't be marked")
     return total
 
 
@@ -231,13 +243,14 @@ def _quote_places(s) -> tuple[str, int]:
     return quote, Currency.from_str(quote).precision
 
 
-def outside_fund_book(store: Store, s) -> bool:
+def outside_fund_book(store: Store, s, account: str | None = None) -> bool:
     """F229-6 (HoE 13 Oct 18:12 UK): a Strategy whose quote currency is held under 8 places, on the test account its
     venue names (CCY-8DP), is outside the fund's book. Neither its equity (fund_equity) nor its position (both
     fund_holdings) counts, and its entries don't reserve against the book gate (LongFlatStrategy._paper_gated); its own
-    per-Strategy checks still apply. The one predicate all of those read."""
+    per-Strategy checks still apply. The one predicate all of those read. account: as if it were on this account (a
+    move about to be made), else the one it is on."""
     return (_quote_places(s)[1] < FILL_PLACES
-            and is_test_currency_account(store.account_of(s.name), getattr(s, "venue", None)))
+            and is_test_currency_account(account or store.account_of(s.name), getattr(s, "venue", None)))
 
 
 def check_quote_places(s: Sleeve, account: str) -> str | None:
@@ -520,7 +533,7 @@ class Supervisor:
         now = now or utcnow()
         led = self.ledger
         led.ensure_state()
-        before = led.state()
+        before, behind = led.state(), False
         try:
             equity = fund_equity(self.ledger.store)
         except Exception as exc:  # noqa: BLE001 - no mark: the book goes stale and entries stop (fail closed)
@@ -530,7 +543,12 @@ class Supervisor:
             self._equity_failing = True
         else:
             self._equity_failing = False
-            acted = mark_book(led, equity, now, PORTFOLIO)
+            with led.lock():
+                # HALT-REF-1: a capital move whose flow (Store._book_move) landed while the book was read left that read
+                # behind it, a phantom gain or loss; this mark is skipped and the next one, seconds on, reads it all.
+                behind = _flowed(led.state()) != _flowed(before)
+                acted = None if behind else mark_book(led, equity, now, PORTFOLIO)
+        if not self._equity_failing and not behind:
             st = led.state()
             last = led.last_book_mark()
             minute = now.replace(second=0, microsecond=0)
@@ -799,6 +817,171 @@ def book_figures(store: Store) -> str:
             f"positions {', '.join(held) or 'none'}, first mark {min(firsts).isoformat() if firsts else 'none'}")
 
 
+REBASE_KEY = "HALT-REF-1"
+DUST_SHARE = Decimal("0.001")  # the most dust the re-base takes as flat, a share of the book (Advisor, 09:55 UK)
+
+
+def capital_in(store: Store) -> Decimal:
+    """The capital put into the fund's book: every Strategy's starting balance that fund_equity counts (a reset's run
+    counts only its cash, its successor the capital). What the book is worth with no gain or loss since, the
+    flow-corrected reference the re-base measures the drawdown from (Advisor, 14 Oct 09:10 UK)."""
+    runs = store.reset_runs()
+    return sum((to_decimal(s.starting_balance, "starting balance") for s in store.sleeves()
+                if s.name not in runs and not outside_fund_book(store, s)), Decimal(0))
+
+
+def could_trade(s: Sleeve) -> bool:
+    """What "running" means to the re-base: a Strategy that could open a position once the portfolio's halt clears. One
+    enabled (desired running) can, unless its own status blocks every entry until the PM acts: halted, or paused by
+    the PM (a pause with no end; a day's pause ends at 00:00 UTC). One stopped can't, once its process has gone."""
+    if s.desired_state == "running":
+        return not (s.status == "halted" or (s.status == "paused" and s.paused_until is None))
+    return s.status in ("starting", "running")
+
+
+def rebase_refusals(store: Store) -> list[str]:
+    """Why the HALT-REF-1 re-base can't run now (Advisor conditions, 14 Oct): it has run already; a Strategy could
+    trade (could_trade) or holds a position; or the dashboard's figures don't reconcile with the journal
+    (start_check)."""
+    from sleeve_fund.start_check import FAIL, check_books
+
+    why = []
+    if any(d["reason"].startswith(REBASE_KEY) for d in store.decisions(action="portfolio_rebase", limit=10_000)):
+        why.append(f"the {REBASE_KEY} re-base has run already (decisions log): it runs once")
+    for s in store.sleeves():
+        if could_trade(s):
+            why.append(f"{s.name} could trade once the halt clears ({s.desired_state}, {s.status}): pause it first")
+        book = store.journal_book(s.name, s.starting_balance)
+        if abs(book["qty"]) > 1e-12 and not is_dust(book):  # dust no venue takes an order for is flat (F229-7)
+            why.append(f"{s.name} holds {book['qty']}: the book must be flat")
+    why += [f"the books don't reconcile: {what}" for status, what in check_books(store).lines if status == FAIL]
+    return why
+
+
+def dust_holdings(store: Store) -> list[tuple[str, Decimal, Decimal]]:
+    """Every dust position the re-base counts as flat (Advisor, 09:55 UK): (Strategy, qty, its value at the mark, or at
+    its entry if never marked)."""
+    held = []
+    for s in store.sleeves():
+        book = store.journal_book(s.name, s.starting_balance)
+        if is_dust(book):
+            last = store.last_equity(s.name)
+            px = last["price"] if last is not None and last["price"] else book["entry_px"]
+            qty = to_decimal(book["qty"], "qty")
+            held.append((s.name, qty, qty * to_decimal(px, "mark")))
+    return held
+
+
+def rebase_halt_ref_1(store: Store, actor: str, commit: str, now: datetime | None = None
+                      ) -> tuple[PortfolioState, PortfolioState, str]:
+    """HALT-REF-1's one-off clean-up (Advisor, 14 Oct 09:00 and 09:10 UK): the paper portfolio's state missed every
+    capital flow before they were wired (Strategies created after the first mark, test accounts leaving the book), so
+    its HWM and halt reference sit far above the book and it halted. Run once, by an operator, from the supervisor's
+    command line only (rebase.yml; no dashboard or API path); refused while a Strategy could trade (could_trade) or
+    holds (dust aside), if the books don't reconcile, or if it has run before. It measures the book against the capital
+    put in (capital_in): at the daily pause's 3% or more that is a real drawdown and it refuses, naming it; below, it sets the book, the HWM, the halt's reference and the
+    day's start to the book now and clears the halt and the pause that stale reference set. This is the only place a
+    halt is cleared other than the PM's Resume. One warning event and one decision row carry the old and new figures
+    (the old HWM kept in the record), the drawdown and the commit, in the state row's transaction. Returns (before,
+    after, the journaled words). Raises RuntimeError with every refusal."""
+    from sqlalchemy import insert, select
+
+    from sleeve_fund.store import decisions_t, events_t
+
+    if not actor.strip() or not commit.strip():
+        raise ValueError("an actor and the deployed commit are required")
+    now = now or utcnow()
+    led = DbLedger(store, lambda: (_ for _ in ()).throw(RuntimeError("a re-base runs no entry check")))
+    # Everything is read under the gate's lock (CR R2, R3): no flow, mark or second run can land between the checks,
+    # the book read and the write. Nothing trades meanwhile: every Strategy is flat and can't (the refusals).
+    with led.lock():
+        conn = led._local.conn
+        refusals = rebase_refusals(store)
+        if conn.execute(select(decisions_t.c.id).where(decisions_t.c.action == "portfolio_rebase",
+                                                       decisions_t.c.reason.like(f"{REBASE_KEY}%"))).first():
+            refusals.append(f"the {REBASE_KEY} re-base has run already (decisions log): it runs once")
+        if refusals:
+            raise RuntimeError(f"{REBASE_KEY} re-base refused: " + "; ".join(dict.fromkeys(refusals)))
+        equity, capital = fund_equity(store), capital_in(store)
+        drawdown = max(capital - equity, Decimal(0)) / capital if capital else Decimal(0)
+        if drawdown >= Decimal(str(PORTFOLIO.daily_loss)):
+            raise RuntimeError(f"{REBASE_KEY} re-base refused: the book {equity:,.2f} is {drawdown:.2%} under the "
+                               f"{capital:,.2f} put in, a real drawdown at or over the {PORTFOLIO.daily_loss:.0%} "
+                               "daily pause, which a re-base would hide")
+        dust = dust_holdings(store)
+        notional = sum((abs(v) for _, _, v in dust), Decimal(0))
+        if equity > 0 and notional > equity * DUST_SHARE:
+            raise RuntimeError(f"{REBASE_KEY} re-base refused: dust worth {notional:,.2f} across the book is "
+                               f"{notional / equity:.3%} of it, over the {DUST_SHARE:.1%} the Advisor allows as flat")
+        before = led.state()
+        after = replace(before, equity=equity, mark_ts=now, hwm=equity, halt_reference=None, day=trading_day(now),
+                        day_start_equity=equity, halted=None, paused_until=None, paused=None)
+        led.set_state(after)
+
+        def fig(x):
+            return "none" if x is None else f"{x:,.2f}"
+
+        words = (f"{REBASE_KEY}: portfolio re-based to the true book at commit {commit.strip()}: book {fig(before.equity)}"
+                 f" -> {fig(equity)}, high-water mark {fig(before.hwm)} -> {fig(equity)} (the old one kept here), halt "
+                 f"reference {fig(before.reference())} -> {fig(equity)}, day's start {fig(before.day_start_equity)} -> "
+                 f"{fig(equity)}; {drawdown:.2%} drawdown against the {capital:,.2f} put in; dust counted as flat: "
+                 f"{', '.join(f'{n} {q.normalize():f} worth {v:,.4f}' for n, q, v in dust) or 'none'}; "
+                 f"{'the halt (' + before.halted + ') is cleared' if before.halted else 'no halt'}"
+                 f"{', the day pause is cleared' if before.paused_until else ''}")
+        conn.execute(insert(events_t).values(sleeve=None, ts=now, level="warning", kind="portfolio_rebased",
+                                             message=words))
+        conn.execute(insert(decisions_t).values(ts=now, actor=actor.strip(), action="portfolio_rebase", sleeve=None,
+                                                reason=words))
+    return before, after, words
+
+
+REBASE_PAUSE = f"{REBASE_KEY}: paused for the portfolio re-base; resumed at the first test start"
+
+
+def _rebase_command(store: Store, args) -> int:
+    """The workflow's two runs (rebase.yml): a dry run prints the figures and any refusal and writes nothing. --yes
+    first pauses, by a journaled PM pause command, each Strategy that could trade once the halt clears, waits for its
+    process to apply it, then re-bases and shows the next mark. Refused for any other reason, it pauses nothing; a
+    re-base refused after the pauses leaves them in force (the safe side), for the first test start to resume."""
+    st = DbLedger(store, lambda: ()).state()
+    print(f"now: book {st.equity}, high-water mark {st.hwm}, halt reference {st.reference()}, day's start "
+          f"{st.day_start_equity}, halted {st.halted or 'no'}, paused {st.paused or 'no'}")
+    refusals = rebase_refusals(store)
+    to_pause = [s.name for s in store.sleeves() if could_trade(s)]
+    others = [w for w in refusals if "could trade once the halt clears" not in w]  # what a pause can't answer
+    if not others:
+        print(f"true book (fund equity): {fund_equity(store)}; capital put in: {capital_in(store)}")
+    for why in refusals:
+        print(f"refused: {why}")
+    if not args.yes:
+        print("not written (a dry run)" + (f"; --yes pauses {', '.join(to_pause)} first" if to_pause else ""))
+        return 1 if others else 0
+    if others:
+        print("not written; nothing paused")
+        return 1
+    for name in to_pause:
+        store.command(name, "pause", REBASE_PAUSE, actor=args.actor)
+        print(f"paused: {name}")
+    deadline = time.monotonic() + args.wait
+    while (left := [s.name for s in store.sleeves() if could_trade(s)]) and time.monotonic() < deadline:
+        time.sleep(2)
+    if left:
+        print(f"not written: {', '.join(left)} didn't apply the pause within {args.wait:g} s; the pauses stay")
+        return 1
+    try:
+        _, after, words = rebase_halt_ref_1(store, args.actor, args.commit)
+    except RuntimeError as exc:
+        print(f"{exc}; the pauses stay")
+        return 1
+    print(f"journaled: {words}")
+    # The Advisor's last condition: the next mark's halt and pause checks are clean before any Strategy starts.
+    Supervisor(store).mark_portfolio()
+    st = DbLedger(store, lambda: ()).state()
+    print(f"next mark: book {st.equity}, high-water mark {st.hwm}, halt reference {st.reference()}, day's start "
+          f"{st.day_start_equity}, halted {st.halted or 'no'}, paused {st.paused or 'no'}")
+    return 0 if not st.halted and not st.paused_until else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="python -m sleeve_fund.supervisor")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -807,6 +990,11 @@ def main(argv: list[str] | None = None) -> int:
     cl = sub.add_parser("clear", help="stop and archive every strategy, once per entry in the file")
     cl.add_argument("path")
     sub.add_parser("book", help="print the book's strategies and headline figures")
+    rb = sub.add_parser("rebase", help=f"{REBASE_KEY} only: re-base the paper portfolio's state to the true book, once")
+    rb.add_argument("--actor", required=True, help="who ran it, for the decision log")
+    rb.add_argument("--commit", required=True, help="the deployed commit, for the journal")
+    rb.add_argument("--yes", action="store_true", help="pause what could trade, then write it; else a dry run")
+    rb.add_argument("--wait", type=float, default=120.0, help="seconds to wait for the pauses to apply")
     rn = sub.add_parser("run", help="supervise sleeve processes until stopped")
     rn.add_argument("--clear", help="clean slates file to retry while one waits on a flatten")
     args = ap.parse_args(argv)
@@ -819,6 +1007,8 @@ def main(argv: list[str] | None = None) -> int:
     elif args.cmd == "book":
         print("book:", book_line(store))
         print("book figures:", book_figures(store))
+    elif args.cmd == "rebase":
+        return _rebase_command(store, args)
     else:
         assert_portfolio_gate(store)
         Supervisor(store, clear_path=args.clear).run()

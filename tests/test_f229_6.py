@@ -12,7 +12,7 @@ from sleeve_fund import supervisor
 from sleeve_fund.paper import portfolio_gate
 from sleeve_fund.portfolio.limits import Book, Holding, Intent, decide
 from sleeve_fund.risk import PORTFOLIO
-from sleeve_fund.store import Store
+from sleeve_fund.store import Store, sleeve_archive_t
 
 
 def _store(tmp_path) -> Store:
@@ -238,6 +238,10 @@ def _perp(store, name, inst, venue, qty, *, archive=False):
     if archive:
         store.set_desired_state(name, "stopped")
         store.archive(name)
+        # archive() stamps the wall clock: pin it into this fixture's timeline, before any fixed-time clean slate.
+        with store.engine.begin() as c:
+            c.execute(sleeve_archive_t.update().where(sleeve_archive_t.c.sleeve == name)
+                      .values(archived_at=T_MARK + timedelta(minutes=1)))
 
 
 def _fund(tmp_path, db, test_qty=None):
