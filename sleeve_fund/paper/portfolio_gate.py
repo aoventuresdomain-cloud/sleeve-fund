@@ -51,6 +51,7 @@ def fund_holdings(store: Store, now: datetime | None = None, atr_pct=None) -> tu
 
     # Every Strategy whose journal holds a position counts, whatever its status: one archived while still holding is
     # on the dashboard's book until flat, so it is in the gate's figures too (Advisor 14 Oct 00:15 UK, F229-6).
+    withdrawn = store.withdrawn()
     for s in store.sleeves():
         if outside_fund_book(store, s):  # F229-6: a sub-8dp test Strategy isn't the fund's
             continue
@@ -58,6 +59,9 @@ def fund_holdings(store: Store, now: datetime | None = None, atr_pct=None) -> tu
         qty = to_decimal(book["qty"], "qty")
         if qty == 0:
             continue
+        if s.name in withdrawn and abs(qty) > Decimal("1e-12"):  # F-C3B-A: never counted against a book it left
+            raise ValueError(f"{s.name}'s equity left the fund's book, yet it holds {qty}: every entry is refused "
+                             "until it is resolved")
         last = store.last_equity(s.name)
         mark = to_decimal(last["price"] if last is not None and last["price"] else book["entry_px"], "mark")
         stop = _journal_stop(store, s, float(qty))

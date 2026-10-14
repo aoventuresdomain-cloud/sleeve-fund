@@ -805,6 +805,8 @@ ORDER_STATUSES = ("submitted", "accepted", "partially_filled", "filled", "cancel
                   "triggered")
 FINISHED_ORDER_STATUSES = ("filled", "canceled", "rejected", "denied", "expired", "triggered")
 OPEN_ORDER_STATUSES = ("submitted", "accepted", "partially_filled")
+# F-C3B-A: a Strategy archived while not yet flat waits for its withdrawal; one with nothing to withdraw says so
+WITHDRAWAL_DEFERRED, WITHDRAWAL_NONE = "withdrawal_deferred", "withdrawal_none"
 GATED_INTENTS = ("entry", "rebalance")  # the orders the portfolio gate reserves for (engine OPENING_INTENTS)
 INTENTS = ("entry", "exit", "stop_loss", "take_profit", "risk_halt", "risk_pause", "pm_flatten", "rebalance",
            "liquidation", "liquidation_cut", "wind_down", "wind_down_stop")  # the venue would take it; cut back before it does (String(16))
@@ -1600,17 +1602,32 @@ class Store:
         """F-C3B-A (Advisor 14 Oct 09:45 UK): a Strategy put away for good (archived, retired, or archived by a clean
         slate) takes its whole equity out of the fund's book, as a flow (_book_move), in the same transaction as its
         archive row, which this writes; the caller's own writes go on the connection this yields. One outside the book
-        (a test account, a saved backtest) takes nothing out, as it brought nothing in."""
-        taken: list[Decimal] = []
+        (a test account, a saved backtest) takes nothing out, as it brought nothing in.
 
-        def part() -> Decimal:
-            return Decimal(0) if sleeve in self.withdrawn() else self.in_book_equity(sleeve)
+        Not settled flat yet (withdrawal_blocker: a position, an open order, room an order holds), it takes nothing
+        out now: it stays in the book in full until it is flat (F229-6 C3), journaled as WITHDRAWAL_DEFERRED, and the
+        supervisor's poll withdraws it then, after that poll's mark (Advisor 14 Oct 10:45 UK). A settled equity of 0 or
+        less is never withdrawn: it stays in the book, journaled as WITHDRAWAL_NONE. Each is decided under the gate's
+        lock, so the poll and withdraw-archived racing take it out once."""
+        seen: list[tuple[str, Decimal | str]] = []
+
+        def decide() -> tuple[str, Decimal | str]:
+            if sleeve in self.withdrawn():
+                return "out already", Decimal(0)
+            if self._outside_or_backtest(sleeve):
+                return "out", Decimal(0)  # it brought nothing into the book
+            blocked = self.withdrawal_blocker(sleeve)
+            if blocked is not None:
+                return "deferred", blocked
+            equity = self.in_book_equity(sleeve)
+            return ("out", equity) if equity > 0 else ("none", equity)
 
         def amount() -> Decimal:
-            taken.append(part())
-            return -taken[0]
+            seen.append(decide())
+            kind, value = seen[0]
+            return -value if kind == "out" else Decimal(0)
 
-        with self._book_move(amount, lambda: f"{sleeve} put away ({why}): its equity {taken[0]:,.2f} leaves the "
+        with self._book_move(amount, lambda: f"{sleeve} put away ({why}): its equity {seen[0][1]:,.2f} leaves the "
                                              "fund's book", ts) as c:
             yield c
             # Put away again (archived, then retired; a second archive): already out, so it keeps its row, its
@@ -1618,12 +1635,51 @@ class Store:
             if c.execute(select(sleeve_archive_t.c.sleeve).where(sleeve_archive_t.c.sleeve == sleeve,
                                                                  sleeve_archive_t.c.withdrawn.is_not(None))).first():
                 return
-            out = taken[0] if taken else part()  # nothing marked yet: no flow, but out of the book all the same
-            # An archive from before 0023 (withdraw-archived) keeps when it went: previous_book reads archived_at
-            # against the clean slate's start (DA, 14 Oct). A fresh one is written now.
+            kind, value = seen[0] if seen else decide()  # nothing marked yet: no flow, but decided all the same
+            out = stored(value) if kind == "out" else None
+            # An archive from before 0023 (withdraw-archived), or one waiting to go flat, keeps when it went:
+            # previous_book reads archived_at against the clean slate's start (DA, 14 Oct). A fresh one is written now.
             if not c.execute(update(sleeve_archive_t).where(sleeve_archive_t.c.sleeve == sleeve)
-                             .values(withdrawn=stored(out))).rowcount:
-                c.execute(insert(sleeve_archive_t).values(sleeve=sleeve, archived_at=ts, withdrawn=stored(out)))
+                             .values(withdrawn=out)).rowcount:
+                c.execute(insert(sleeve_archive_t).values(sleeve=sleeve, archived_at=ts, withdrawn=out))
+            if kind == "deferred":
+                c.execute(insert(events_t).values(
+                    sleeve=sleeve, ts=ts, level="info", kind=WITHDRAWAL_DEFERRED,
+                    message=f"{sleeve} put away ({why}) while not yet flat ({value}): it stays in the fund's book in "
+                            "full, exiting but never entering, and its settled equity leaves the book when it is flat"))
+            elif kind == "none":
+                c.execute(insert(events_t).values(
+                    sleeve=sleeve, ts=ts, level="warning", kind=WITHDRAWAL_NONE,
+                    message=f"{sleeve} put away ({why}) with a settled equity of {value:,.2f}: nothing is withdrawn, "
+                            "as a withdrawal is never negative, and it stays in the fund's book at that"))
+
+    def _outside_or_backtest(self, sleeve: str) -> bool:
+        return is_backtest(sleeve) or _outside_book(self, self.sleeve(sleeve))
+
+    def withdrawal_blocker(self, sleeve: str) -> str | None:
+        """Why `sleeve` isn't settled flat for its withdrawal, or None (Advisor 14 Oct 10:45 UK): a position (dust no
+        venue takes an order for counts as flat, as for a retire: lifecycle_flat), an order still open, or room an
+        order still holds in the portfolio gate. Fills, fees and funding are booked with the fill, so a flat journal
+        with no open order has them all."""
+        qty, flat = self.lifecycle_flat(sleeve)
+        if not flat:
+            return f"it holds {qty}"
+        if self.orders(sleeve, statuses=OPEN_ORDER_STATUSES, limit=1):
+            return "an order of it is still open"
+        if any(r.strategy == sleeve for r in self._gate_ledger().reservations()):
+            return "an order of it still holds room in the book"
+        return None
+
+    def withdrawal_pending(self) -> list[str]:
+        """Strategies archived while not flat whose equity waits to leave the book (WITHDRAWAL_DEFERRED, and no
+        WITHDRAWAL_NONE since): the supervisor's poll withdraws each once it is flat. The dashboard shows them as
+        archived, waiting to go flat."""
+        archived, out = self.archived(), self.withdrawn()
+        last: dict[str, tuple] = {}
+        for e in self.events_of((WITHDRAWAL_DEFERRED, WITHDRAWAL_NONE), limit=10_000):  # newest first
+            last.setdefault(e["sleeve"], (e["kind"], e["ts"]))
+        return [n for n, (kind, at) in last.items()
+                if kind == WITHDRAWAL_DEFERRED and n in archived and n not in out and _aware(at) >= archived[n]]
 
     def in_book_equity(self, sleeve: str) -> Decimal:
         """`sleeve`'s equity as the fund's book counts it (supervisor.strategy_equity), or nothing when it sits outside

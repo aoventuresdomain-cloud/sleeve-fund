@@ -304,6 +304,8 @@ class Supervisor:
         self.ledger = DbLedger(store, lambda: (_ for _ in ()).throw(RuntimeError("the supervisor runs no entry check")))
         self._equity_failing = False  # a failed equity read is said once per spell
         self._holdings_failing = False  # so is a failed read of the book's holdings (F-BM-1)
+        self._withdraw_told: dict[str, str] = {}  # a deferred withdrawal's refusal, said once while it lasts
+        self._breach_told: set[str] = set()  # a withdrawn Strategy holding, alerted once per spell (F-C3B-A viii)
         self._flatten_told: dict[str, datetime] = {}  # when each holder was last told to flatten for a portfolio halt
         self._halt_tells: dict[str, int] = {}  # how often, this halt (F229-5: at most SYSTEM_FLATTENS)
 
@@ -591,6 +593,8 @@ class Supervisor:
             if acted == "halt":
                 self._flatten_told.clear()  # a new halt tells every holder at once
                 self._halt_tells.clear()
+            self._withdraw_flat(now)  # after the mark: the flatten's P&L is judged at the book's scale before it
+        self._alert_withdrawn_holders(now)
         st = led.state()
         if st.halted:
             self._halt_every_strategy(st.halted, now)
@@ -601,6 +605,37 @@ class Supervisor:
         # a dead owner's orders is ORPHAN-GUARD og2 on the DA's 0015. Past the TTL, an unacked order's reservation is
         # kept and alerted on as not cancelled, never released blind.
         sweep(led, now, self._order_live, None, is_acked=self._order_acked)
+
+    def _withdraw_flat(self, now: datetime) -> None:
+        """F-C3B-A (Advisor 14 Oct 10:45 UK): each Strategy archived while not flat (Store.withdrawal_pending) whose
+        withdrawal nothing blocks any more has its settled equity taken out of the book, with one journaled flow
+        under the gate's lock (Store._put_away, which withdraw-archived shares, so neither takes it out twice).
+        Called after this poll's mark. A refusal (a book a day's pause keeps marked) is said once and tried again
+        on the next poll; one Strategy's failure never stops the rest."""
+        for name in self.store.withdrawal_pending():
+            if self.store.withdrawal_blocker(name) is not None:
+                continue
+            try:
+                with self.store._put_away(name, now, "flat after it was archived"):
+                    pass
+                self._withdraw_told.pop(name, None)
+            except Exception as exc:  # noqa: BLE001 - kept in the book, tried again next poll
+                if self._withdraw_told.get(name) != str(exc):
+                    self.store.event(name, "warning", "withdrawal_waits", f"{name} is flat, and its equity "
+                                     f"couldn't leave the fund's book yet: {exc}")
+                    self._withdraw_told[name] = str(exc)
+
+    def _alert_withdrawn_holders(self, now: datetime) -> None:
+        """A withdrawn Strategy holding a position is a broken invariant (Advisor 14 Oct 10:45 UK): its exposure
+        would count against a book its equity left. The gate's holdings refuse it (fund_holdings raises, so every
+        entry fails closed); this raises the alert, once per spell."""
+        out = self.store.withdrawn()
+        breach = {s.name for s in self.store.sleeves() if s.name in out
+                  and abs(self.store.journal_book(s.name, s.starting_balance)["qty"]) > 1e-12}
+        for name in sorted(breach - self._breach_told):
+            self.store.event(name, "error", "withdrawn_holds", f"{name}'s equity left the fund's book, yet it holds "
+                             "a position: no Strategy may enter until it is resolved")
+        self._breach_told = breach
 
     def _halt_every_strategy(self, why: str, now: datetime) -> None:
         """A portfolio halt (15% under the reference): every strategy holding anything is flattened through its exit
@@ -967,8 +1002,11 @@ def withdraw_archived(store: Store, actor: str, commit: str) -> list[str]:
 
     if not actor.strip() or not commit.strip():
         raise ValueError("an actor and the deployed commit are required")
-    runs, out = store.reset_runs(), store.withdrawn()
-    due = [n for n in store.archived() if n not in runs and n not in out and not is_backtest(n)]
+    runs, out, waiting = store.reset_runs(), store.withdrawn(), set(store.withdrawal_pending())
+    # One archived while not flat after F-C3B-A waits for the supervisor's poll, which takes it out once it is flat;
+    # flat already, it is taken out here, under the same lock and key, so not twice (Advisor 14 Oct 10:45 UK).
+    due = [n for n in store.archived() if n not in runs and n not in out and not is_backtest(n)
+           and not (n in waiting and store.withdrawal_blocker(n) is not None)]
     held = [f"{n} holds {store.journal_book(n, store.sleeve(n).starting_balance)['qty']}" for n in due
             if abs(store.journal_book(n, store.sleeve(n).starting_balance)["qty"]) > 1e-12]  # as previous_book
     if held:

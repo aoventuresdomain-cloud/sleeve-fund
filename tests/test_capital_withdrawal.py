@@ -376,3 +376,137 @@ def test_e1b_a_residue_under_a_cent_is_empty(store):
     led = DbLedger(store, lambda: ())
     assert apply_flow(led, D("-9999.995"), lambda: None).equity == D(10_000) and _state(store).equity is None
 
+
+
+# --- D1-D8: archived while not flat, withdrawn once flat (Advisor 14 Oct 10:45 UK, option b) -----------------------------
+
+def _open(store, name, qty=0.5, price=1_000.0, ts=T0):
+    store.record_fill(name, side="BUY", qty=qty, price=price, fee=0.0, order_id=f"{name}-in", trade_id=f"{name}-in",
+                      ts=ts)
+    store.record_equity(name, equity=float(store.sleeve(name).starting_balance), cash=0.0, qty=qty, price=price,
+                        benchmark=0.0, ts=ts)
+
+
+def _close(store, name, qty=0.5, price=1_000.0, fee=0.0, ts=T0):
+    store.record_fill(name, side="SELL", qty=qty, price=price, fee=fee, order_id=f"{name}-out",
+                      trade_id=f"{name}-out", ts=ts)
+    _settle(store, name, ts)
+
+
+def _settle(store, name, ts):
+    cash = float(store.journal_book(name, store.sleeve(name).starting_balance)["cash"])
+    store.record_equity(name, equity=cash, cash=cash, qty=0.0, price=1_000.0, benchmark=cash, ts=ts)
+
+
+def _poll(store, now):
+    return _mark(store, now)
+
+
+def test_d1_archiving_a_holder_moves_nothing_and_it_counts_in_full(store):
+    _make(store, "a", 20_000)
+    _make(store, "b", 10_000)
+    _open(store, "b")
+    before = _four(_mark(store, T0))
+    store.archive("b")
+    assert _four(_state(store)) == before and _flows(store) == [] and store.withdrawn() == {}
+    assert store.withdrawal_pending() == ["b"] and "b" in store.archived()
+    assert supervisor.fund_equity(store) == D(30_000)
+    st = _poll(store, T0 + timedelta(minutes=1))  # still holding: the poll takes nothing out
+    assert st.equity == D(30_000) and _flows(store) == [] and store.withdrawal_pending() == ["b"]
+
+
+def test_d2_d5_once_flat_one_withdrawal_of_its_settled_equity_after_the_flattens_loss_is_marked(store):
+    """d2: one flow, the settled 9,950. d5: the poll marks the 50 lost first (29,950 against the 30,000 high-water
+    mark), then scales: had the flow come first, the HWM would read 20,050."""
+    _make(store, "a", 20_000)
+    _make(store, "b", 10_000)
+    _open(store, "b")
+    _mark(store, T0)
+    store.archive("b")
+    _close(store, "b", price=900.0, ts=T0 + timedelta(minutes=1))  # 50 lost on the flatten
+    st = _poll(store, T0 + timedelta(minutes=1))
+    assert store.withdrawn() == {"b": D(9_950)} and store.withdrawal_pending() == []
+    (flow,) = _flows(store)
+    assert "-9,950.00" in flow and "30,000.00 -> 20,033.39" in flow
+    assert st.equity == D(20_000) and st.hwm.quantize(D("0.01")) == D("20033.39")
+    assert float((st.hwm - st.equity) / st.hwm) == pytest.approx(50 / 30_000)
+    _poll(store, T0 + timedelta(minutes=2))
+    assert len(_flows(store)) == 1
+
+
+def test_d3_a_restart_between_going_flat_and_the_poll_withdraws_once(store):
+    _make(store, "a", 20_000)
+    _make(store, "b", 10_000)
+    _open(store, "b")
+    _mark(store, T0)
+    store.archive("b")
+    _close(store, "b", ts=T0 + timedelta(minutes=1))
+    for minute in (1, 2, 3):  # each poll a fresh supervisor, as after a restart
+        _poll(store, T0 + timedelta(minutes=minute))
+    assert len(_flows(store)) == 1 and store.withdrawn() == {"b": D(10_000)}
+
+
+def test_d4_the_poll_racing_withdraw_archived_withdraws_once(store):
+    _make(store, "a", 20_000)
+    _make(store, "b", 10_000)
+    _open(store, "b")
+    _mark(store, T0)
+    store.archive("b")
+    assert supervisor.withdraw_archived(store, "operator", "abc1234") == []  # holding: it waits for the poll
+    _close(store, "b", ts=T0 + timedelta(minutes=1))
+    assert supervisor.withdraw_archived(store, "operator", "abc1234") == ["b"]
+    _poll(store, T0 + timedelta(minutes=1))
+    with store._put_away("b", T0 + timedelta(minutes=2), "the poll, late"):  # the loser of the race, under the lock
+        pass
+    assert len(_flows(store)) == 1 and store.withdrawn() == {"b": D(10_000)}
+
+
+def test_d6_a_settled_equity_of_nothing_or_less_is_never_withdrawn_and_is_journaled(store):
+    _make(store, "a", 20_000)
+    _make(store, "b", 1_000)
+    _open(store, "b", qty=1.0)
+    _mark(store, T0)
+    store.archive("b")
+    _close(store, "b", qty=1.0, price=1.0, fee=5.0, ts=T0 + timedelta(minutes=1))  # 1,000 - 999 - 5: -4
+    st = _poll(store, T0 + timedelta(minutes=1))
+    assert _flows(store) == [] and store.withdrawn() == {} and store.withdrawal_pending() == []
+    said = [e["message"] for e in store.events_of(("withdrawal_none",))]
+    assert len(said) == 1 and "-4.00" in said[0] and "never negative" in said[0]
+    assert st.equity == D(19_996)  # it stays in the book at that
+    _poll(store, T0 + timedelta(minutes=2))
+    assert len(store.events_of(("withdrawal_none",))) == 1
+
+
+def test_d7_emptying_the_book_under_a_pause_waits_for_midnight(store):
+    _make(store, "b", 10_000)
+    _open(store, "b")
+    _mark(store, T0)
+    store.archive("b")
+    led = DbLedger(store, lambda: ())
+    with led.lock():
+        led.set_state(replace(led.state(), paused="the test's pause", paused_until=T0 + timedelta(hours=2)))
+    _close(store, "b", ts=T0 + timedelta(minutes=1))
+    sup = supervisor.Supervisor(store)  # one running supervisor: it says the wait once
+    sup.mark_portfolio(T0 + timedelta(minutes=1))
+    sup.mark_portfolio(T0 + timedelta(minutes=2))
+    assert _flows(store) == [] and store.withdrawal_pending() == ["b"]
+    waits = store.events_of(("withdrawal_waits",))
+    assert len(waits) == 1 and "try again after 12:00 UK (11:00 UTC)" in waits[0]["message"]
+    sup.mark_portfolio(T0 + timedelta(days=1))
+    assert len(_flows(store)) == 1 and _state(store).equity is None and store.withdrawn() == {"b": D(10_000)}
+
+
+def test_d8_a_withdrawn_strategy_holding_blocks_every_entry_and_raises_an_alert(store):
+    from sleeve_fund.paper import portfolio_gate
+
+    _make(store, "a", 20_000)
+    _make(store, "b", 10_000)
+    _mark(store, T0)
+    store.archive("b")
+    _open(store, "b", ts=T0 + timedelta(minutes=1))  # broken invariant: a fill after its equity left
+    with pytest.raises(ValueError, match="every entry is refused"):
+        portfolio_gate.fund_holdings(store, atr_pct=lambda s: 0.02)
+    _poll(store, T0 + timedelta(minutes=1))
+    _poll(store, T0 + timedelta(minutes=2))
+    alerts = store.events_of(("withdrawn_holds",))
+    assert len(alerts) >= 1 and all(e["level"] == "error" for e in alerts)
