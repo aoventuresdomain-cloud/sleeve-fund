@@ -2447,7 +2447,7 @@ class LongFlatStrategy(Strategy):
                 d = self.runtime.profile.min_liquidation_distance
                 venue["liquidation"] = liq
                 guards["liquidation_cut"] = liq / (1 - d) if side > 0 else liq / (1 + d)
-            if qty:
+            if qty and self.runtime.halts:
                 p, day_open = self.runtime.profile, self.runtime._day_open or equity
                 guards["risk_halt"] = (max(self.runtime.peak, equity) * (1 - p.max_drawdown) - cash) / qty
                 guards["risk_pause"] = (day_open * (1 - p.daily_loss) - cash) / qty
@@ -4420,7 +4420,7 @@ class LongFlatStrategy(Strategy):
         if risk.trading_day(now + step) != risk.trading_day(now):
             day_open = equity
         levels = [((peak * (1 - p.max_drawdown) - cash) / qty, "risk_halt"),
-                  ((day_open * (1 - p.daily_loss) - cash) / qty, "risk_pause")]
+                  ((day_open * (1 - p.daily_loss) - cash) / qty, "risk_pause")] if rt.halts else []
         liq = self._liq_now(cash, qty)
         if liq is not None:
             d = p.min_liquidation_distance
@@ -4778,7 +4778,8 @@ class LongFlatStrategy(Strategy):
         if equity <= 0:
             return True
         day_open = self.runtime._day_open or equity
-        if risk.check(self.runtime.profile, equity, max(self.runtime.peak, equity), day_open) is not None:
+        if risk.check(self.runtime.profile, equity, max(self.runtime.peak, equity), day_open,
+                      self.runtime.halts) is not None:
             return True
         liq = self._liq_now(cash, qty)
         return liq is not None and abs(price - liq) / price < self.runtime.profile.min_liquidation_distance

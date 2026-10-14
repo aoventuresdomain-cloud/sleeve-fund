@@ -1,4 +1,6 @@
 {% extends "base.html" %}
+{# Where the header's total size comes from (UP-1). #}
+{% macro size_title(size) %}{% if size.source == 'gate' %}As the entry gate reads the book: every position and resting entry, against the fund's last mark. Amber from {{ '%.1f'|format(size.limit * 0.8) }}x; at {{ '%.1f'|format(size.limit) }}x no entry that adds to it is taken.{% elif size.source == 'unreadable' %}From the strategies' own marks: the entry gate's book couldn't be read just now.{% else %}From the strategies' own marks: the fund has no mark yet, and the entry gate takes no entry until it has one.{% endif %}{% endmacro %}
 {% from "_macros.html" import chip, usage, help, stop_words, trail_words, open_risk_hint, open_risk_text, open_risk_room, spot_risk_text, open_risk_warn, risk_cell, stop_liq %}
 {% from "_reasons.html" import reason_picker %}
 {# A stop in a word or two, for the strategy list's chip; the Limits tab spells it out. #}
@@ -60,7 +62,7 @@
 
 <div class="rh-split">
   <section class="panel flush rh-strats" aria-labelledby="strats-h">
-    <div class="panel-head"><h2 id="strats-h">Strategies</h2><span class="right">Gross {{ book.exposure_pct|pct0 }} · net {{ book.net_pct|abs|pct0 }} {{ 'short' if book.net_exposure < -0.005 else 'long' }}</span></div>
+    <div class="panel-head"><h2 id="strats-h">Strategies</h2><span class="right">Net {{ size.net|abs|pct0 }} {{ 'short' if size.net < -0.00005 else 'long' }} · <span class="{{ size.tone }}" title="{{ size_title(size) }}">Total size (long + short) {{ '%.2f'|format(size.total) }}x of book, limit {{ '%.1f'|format(size.limit) }}x</span></span></div>
     <div class="srow h" aria-hidden="true"><span>Strategy</span><span class="r">Exposure</span><span class="r">Today</span><span>Room before halt</span><span class="r">Stop</span></div>
     {% for r in risk.rows %}{% set x = r.x %}{% set s = x.sleeve %}{% set left = [x.profile.max_drawdown - x.drawdown, 0]|max %}
     <div class="srow">
@@ -92,7 +94,7 @@
 
 <div class="tab-panel" id="tab-limits" role="tabpanel" data-panel="limits">
 <section class="ledger" aria-label="Book risk">
-  <div><div class="k">Largest asset</div><div class="v">{% if risk.largest %}{{ risk.largest.name }} {{ risk.largest.share|pct0 }}{% else %}None{% endif %}</div><div class="s">{% if risk.largest and risk.largest.net != risk.largest.gross %}gross of total capital · net {{ risk.largest.net_share|pct0 }}{% if risk.largest.net < -0.005 %} short{% endif %}{% else %}of total capital{% endif %}</div></div>
+  <div><div class="k">Largest asset</div><div class="v">{% if risk.largest %}{{ risk.largest.name }} {{ risk.largest.share|pct0 }}{% else %}None{% endif %}</div><div class="s">{% if risk.largest and risk.largest.net != risk.largest.gross %}long + short, of total capital · net {{ risk.largest.net_share|pct0 }}{% if risk.largest.net < -0.005 %} short{% endif %}{% else %}of total capital{% endif %}</div></div>
   <div><div class="k">Book drawdown</div><div class="v">{{ book.drawdown|pct1 }}</div><div class="s">worst {{ book.max_drawdown|pct1 }}</div></div>
   <div><div class="k">Volatility</div><div class="v">{{ book.vol|pctn0 }}</div><div class="s">annualised, daily returns</div></div>
   {# The same margin and open risk as the Portfolio's tiles (QA U3): trading.book_positions, added up. #}
