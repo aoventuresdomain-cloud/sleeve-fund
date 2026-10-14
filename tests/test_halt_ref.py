@@ -11,6 +11,7 @@ The paper incident: Strategies created after the first mark raised the high-wate
 accounts later left the book (F229-6) with no flow, so the book read 81.8% under its reference and halted."""
 
 import os
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal as D
 
@@ -172,6 +173,30 @@ def test_a_withdrawal_of_10k_after_a_1k_loss_on_20k_stays_5_percent_down(store):
     assert all(abs(x - D("0.05")) < D("1e-12") for x in _dd(st))
     st = _mark(store, T0 + timedelta(minutes=2))
     assert all(abs(x - D("0.05")) < D("1e-12") for x in _dd(st)) and not st.halted
+
+
+def test_an_empty_fund_marked_at_0_takes_its_first_strategy_as_its_starting_book(store):
+    """A fresh stack's supervisor marks the empty fund at 0 before any Strategy exists: the first create starts the
+    book at its capital (no HWM, so no drawdown to keep) rather than failing closed for ever. The halt that empty mark
+    set (its figures aren't usable) is the gate's own and stays, as before, for the PM's Resume: no flow clears one."""
+    assert _mark(store, T0).equity == D(0)
+    _make(store, "a", 10_000)
+    st = _state(store)
+    assert _four(st) == (D(10_000),) * 4 and "figures aren't usable" in st.halted
+    st = _mark(store, T0 + timedelta(minutes=1))
+    assert _four(st) == (D(10_000),) * 4 and "figures aren't usable" in st.halted
+
+
+def test_a_deposit_into_a_book_at_0_below_its_hwm_is_refused(store):
+    """A book wiped to 0 under a HWM is a real 100% loss: no ratio keeps it, so the deposit fails closed."""
+    _make(store, "a", 10_000)
+    _mark(store, T0)
+    led = DbLedger(store, lambda: ())
+    with led.lock():
+        led.set_state(replace(led.state(), equity=D(0)))
+    with pytest.raises(ValueError, match="can't keep the book's percentages"):
+        _make(store, "b", 5_000)
+    assert "b" not in {s.name for s in store.sleeves()}
 
 
 def test_a_flow_that_leaves_no_book_is_refused_and_the_move_with_it(store):

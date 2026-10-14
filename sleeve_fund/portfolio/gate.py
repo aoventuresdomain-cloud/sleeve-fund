@@ -326,11 +326,18 @@ def apply_flow(ledger: Ledger, amount) -> None:
     so the drawdown and the day's change keep their percentages (Advisor MUST, 14 Oct 09:45 UK): a shift by the
     amount would dilute a drawdown on a deposit (90 against 100 is 10% down; 190 against 200, 5%) and deepen it on a
     withdrawal. Exact, to the column's 18 places. Refused (ValueError) on a book of 0 or less before or after, or one
-    never marked: no ratio then, so the move fails closed."""
+    never marked: no ratio then, so the move fails closed; except a deposit into a book at 0 that never had a
+    high-water mark (an empty fund, as a fresh stack marks it), which starts the book at the deposit."""
     amount = money(amount, "amount")
     with ledger.lock():
         st = ledger.state()
         book = st.equity
+        if book is not None and book == 0 and not st.hwm and amount > 0:
+            # An empty fund's first capital (a fresh stack marks 0 before any Strategy is made): there was never a
+            # high-water mark, so no drawdown to keep, and the book starts at the deposit. A book at 0 below a HWM
+            # is a real loss and is still refused below.
+            ledger.set_state(replace(st, equity=amount, hwm=amount, halt_reference=None, day_start_equity=amount))
+            return
         if book is None or book <= 0 or book + amount <= 0:
             raise ValueError(f"a flow of {amount:,.2f} on a book of {'none' if book is None else f'{book:,.2f}'} "
                              "can't keep the book's percentages: refused")
