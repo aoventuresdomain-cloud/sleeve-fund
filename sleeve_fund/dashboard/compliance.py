@@ -11,7 +11,6 @@ from sleeve_fund import compliance_rules as rules
 from sleeve_fund.dashboard.riskops import NEAR_LIMIT
 from sleeve_fund.store import Store
 
-
 ACTION_WORDS = {"trim": "Refuse or trim", "refuse": "Refuse", "pause_day": "Pause new trades", "halt": "Flatten and halt"}
 
 

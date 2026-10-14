@@ -1698,7 +1698,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                 errors.append("a reason is required")
             if errors:
                 raise ValueError("; ".join(errors))
-            version = st().add_compliance_version(compliance.rows(tests), groups, created_by=actor, note=reason,
+            version = st().add_compliance_version(compliance.rows(tests), groups, created_by="pm", note=reason,
                                                   expected_version=expected)
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from None
