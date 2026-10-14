@@ -43,6 +43,11 @@ LIQ_STUCK_HEAD = "A liquidation order is still working"
 WIPED_OUT = "Position margin lost (liquidated)"  # how a liquidation's halt begins (LongFlatStrategy._margin_lost)
 RESET_AFTER_LIQUIDATION = LIQUIDATION_RESET  # what a reset after liquidation journals (#164)
 EXITS_ONLY = "exits only"  # how the status of a strategy run for its exits only begins (P1-U35)
+# The fill-handler hold (T-FIX8, F-T-2): a fill the Strategy failed to handle leaves its book in doubt, so it opens
+# nothing more until the PM's Resume. Its own flag, journaled as FILL_HOLD and FILL_HOLD_CLEARED; the status shows it
+# only when nothing stricter is in force.
+FILL_HANDLER_PAUSE = "paused: a fill handler failed, so its book is in doubt; resume once it is checked"
+FILL_HOLD, FILL_HOLD_CLEARED = "fill_hold", "fill_hold_cleared"
 
 
 def liquidation_reason(head: str, covered: float) -> str:
@@ -515,6 +520,11 @@ class SleeveRuntime:
         # Why a fill that raced a halt, a liquidation or the daily pause is owed a flatten (the strategy sets it on
         # such a fill; Advisor 23:05, SG7): the block's own flatten covers what filled after it, through the exit path.
         self.raced: str | None = None
+        # F-T-2 (Advisor BGL-PLAN 5): the fill-handler hold, its own flag with no end time (only the PM's Resume
+        # clears it, never the 00:00 roll), kept across a restart by the journal. It never overwrites a stricter state:
+        # halt > stopped > exits-only > daily-loss pause > fill-handler hold > active.
+        last = self.store.last_event(sleeve_name, (FILL_HOLD, FILL_HOLD_CLEARED))
+        self.fill_hold = last is not None and last["kind"] == FILL_HOLD
         self.liq_working_since: datetime | None = None  # when the liquidation order now working was first seen
         self._refused = 0
 
@@ -604,7 +614,7 @@ class SleeveRuntime:
         elif self.status == "paused" and self.paused_until > self.now():
             self.store.event(self.name, "info", "restart", "restarted while paused", ts=self.now())
         else:
-            self._set("running", "")
+            self._running()
         if not self.backtest:
             # Paper's venue is simulated in the process, so orders still working when it stopped went
             # with it; without this they would read "Working" for ever (review round 8, m8-9).
@@ -974,7 +984,7 @@ class SleeveRuntime:
                                                            since=since)
                  if not fold(e["message"]).startswith(LIQUIDATED_WORDS)]
         if fold(why).startswith(LIQUIDATED_WORDS) and not later:
-            self._set("running", "")
+            self._running()
             return None
         return f"the halt stays for its own reason until a Resume: {why}"
 
@@ -1022,9 +1032,11 @@ class SleeveRuntime:
         if not lifecycle.can_open(self.lifecycle):
             return False  # P2-6: winding down or retired; exits never ask
         if self.status == "paused" and self.paused_until and self.paused_until <= self.now():
-            self._set("running", "daily-loss pause expired")
-            self.store.event(self.name, "info", "resume", "daily-loss pause expired; trading again", ts=self.now())
-        return self.status == "running"
+            self._running("daily-loss pause expired")
+            self.store.event(self.name, "info", "resume", "daily-loss pause expired" + (
+                "; the fill-handler hold stays until the PM resumes" if self.fill_hold else "; trading again"),
+                ts=self.now())
+        return self.status == "running" and not self.fill_hold
 
     def position_budget(self, equity: float) -> float:
         return equity * self.cap
@@ -1145,6 +1157,13 @@ class SleeveRuntime:
                 self.store.event(self.name, "error", "risk_halt", breach.reason + "; flattened, PM must resume",
                                  ts=self.now())
                 flatten, self.flatten_why = True, ("risk_halt", f"Risk halt: {breach.reason}")
+            elif breach and breach.action == "pause_day" and self.paused_until is None and self._held_only():
+                # F-T-2: the hold is weaker than a daily-loss pause, which takes the status with its own 00:00 roll.
+                until = datetime.combine(now.date() + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc)
+                self._set("paused", breach.reason, until)
+                self.store.event(self.name, "warning", "risk_pause", breach.reason + "; flattened until the next 00:00 "
+                                 "UTC, and the fill-handler hold stays", ts=self.now())
+                flatten, self.flatten_why = True, ("risk_pause", f"Daily-loss pause: {breach.reason}")
             elif breach and breach.action == "pause_day" and self.paused_until is None:
                 self.store.event(self.name, "warning", "risk_pause",
                                  f"{breach.reason}; flattened while paused, and it stays paused", ts=self.now())
@@ -1171,7 +1190,19 @@ class SleeveRuntime:
                 if not self.wiped_out and (self.status == "halted" or (self.status == "paused" and self.paused_until)):
                     self.peak = self._day_open = equity
                     self._pair_rebase(equity, hwm=True)
+                    self._running()
+                self.store.mark_applied(cmd["id"])
+                continue
+            elif cmd["command"] == "resume" and self.fill_hold:
+                # F-T-2: a Resume while held clears the hold and nothing else; a stricter state under it keeps its own
+                # way out. Journaled as the hold's, not as pm_resume, so the halt's owed flatten and baselines stand.
+                self.fill_hold = False
+                if self.status == "paused" and self.paused_until is None and self._status_reason() == FILL_HANDLER_PAUSE:
                     self._set("running", "")
+                self.store.event(self.name, "info", FILL_HOLD_CLEARED,
+                                 f"fill-handler hold cleared by the PM: {cmd['reason']}"
+                                 + ("" if self.status == "running" else f"; the {self.status} state stays"),
+                                 ts=self.now())
                 self.store.mark_applied(cmd["id"])
                 continue
             elif cmd["command"] == "resume" and self.status == "running":
@@ -1215,7 +1246,7 @@ class SleeveRuntime:
                 if self.paired and self.pair_parent is not None:
                     self.store.set_pair_day(self.pair_parent, risk.trading_day(self.now()), equity, self.now(),
                                             rebase=True)
-                self._set("running", "")
+                self._running()
             self.store.event(self.name, "info", f"pm_{cmd['command']}", cmd["reason"], ts=self.now())
             self.store.mark_applied(cmd["id"])
         # A flatten is owed until the position is closed: one cut short by a restart (sanity S-3), or whose
@@ -1248,6 +1279,8 @@ class SleeveRuntime:
                 flatten, self.flatten_why = True, why
         if not flatten and self.raced is not None:
             held = abs(qty) >= max(self.close_floor, 1e-12)
+            # The halt's and the live daily-loss pause's own rule (SG7); the fill-handler hold only blocks entries and
+            # never sets paused_until, so it never sells a raced fill (F-T-2).
             flattening = self.status == "halted" or (self.status == "paused" and self.paused_until is not None)
             if held and flattening and not busy:
                 kind = "risk_halt" if self.status == "halted" else "risk_pause"
@@ -1376,6 +1409,31 @@ class SleeveRuntime:
         throttles these). Display only, and paper only: a backtest's runtime never writes them."""
         if not self.backtest:
             self.store.set_signal_state(self.name, state, ts=self.now())
+
+    def hold_entries(self) -> None:
+        """The fill-handler hold (F-T-2): set its flag, journaled once; the status shows it only over running, so a
+        halt, a stop, an exits-only start, the PM's pause and a daily-loss pause all stay as they are."""
+        if self.backtest:
+            return
+        if not self.fill_hold:
+            self.fill_hold = True
+            self.store.event(self.name, "error", FILL_HOLD, "new entries held: a fill handler failed, so the book is "
+                             "in doubt; exits still go, and only the PM's Resume clears it", ts=self.now())
+        if self.status == "running":
+            self._set("paused", FILL_HANDLER_PAUSE)
+
+    def _held_only(self) -> bool:
+        """The status is the fill-handler hold's own, nothing stricter."""
+        return (self.fill_hold and self.status == "paused" and self.paused_until is None
+                and self._status_reason() == FILL_HANDLER_PAUSE)
+
+    def _running(self, reason: str = "") -> None:
+        """Back to running, or to the fill-handler hold while it is set: every way out of a stricter state lands on
+        the hold, never past it (F-T-2)."""
+        if self.fill_hold:
+            self._set("paused", FILL_HANDLER_PAUSE)
+        else:
+            self._set("running", reason)
 
     def _set(self, status: str, reason: str, paused_until: datetime | None = None) -> None:
         self.status, self.paused_until = status, paused_until

@@ -36,6 +36,7 @@ from sleeve_fund.data import bar_minutes
 from sleeve_fund import router
 from sleeve_fund.instruments import BOOK_SHARE, lot_decimals, pair_of, taker_slippage, target_fill_px
 from sleeve_fund.margin import entry_liquidation
+from sleeve_fund.paper.runtime import FILL_HANDLER_PAUSE  # noqa: F401  (T-FIX8's name, kept for its callers)
 from sleeve_fund.paper.runtime import ENTRY_CANCELLED, EXITS_ONLY, RACED_FILL, RESUMABLE, WIPED_OUT, block_codes, liquidation_reason
 from sleeve_fund.paper.runtime import WIND_STOP as WIND_STOP_INTENT
 from sleeve_fund.store import DUST, OPEN_ORDER_STATUSES, replay_book
@@ -479,7 +480,6 @@ _HANDLER_WORDS = {"on_trade": "a trade print", "on_quote": "a quote", "on_order_
                   "on_order_modify_rejected": "a resize refused", "on_bar": "a bar", "_on_tick": "the risk check",
                   "_maker_timeout": "a post-only order's wait running out"}
 MAX_KEPT_ERRORS = 100  # handler errors kept with their text; every one is counted
-FILL_HANDLER_PAUSE = "paused: a fill handler failed, so its book is in doubt; resume once it is checked"  # T-FIX8
 
 
 def handler_error_words(handler: str, exc: BaseException | str) -> str:
@@ -832,12 +832,11 @@ class LongFlatStrategy(Strategy):
             except Exception:  # the journal itself failing must not hide the first error
                 pass
         if name == "on_order_filled" and self.runtime is not None and not self.runtime.backtest:
-            # The Advisor's loud failure (T-FIX8): a fill this Strategy failed to handle leaves its book in doubt, so it
-            # opens nothing more until the PM resumes it: the PM's own pause, with no end time (a daily-loss pause's
-            # 00:00 roll never lifts it). Exits, stops and flattens still go; a halt in force stays.
+            # The Advisor's loud failure (T-FIX8, F-T-2): a fill this Strategy failed to handle leaves its book in doubt,
+            # so it opens nothing more until the PM resumes it: the runtime's fill-handler hold, with no end time, which
+            # never overwrites a stricter state. Exits, stops and flattens still go.
             try:
-                if self.runtime.status != "halted":
-                    self.runtime._set("paused", FILL_HANDLER_PAUSE)
+                self.runtime.hold_entries()
             except Exception:  # the journal failing must not hide the first error
                 pass
 
