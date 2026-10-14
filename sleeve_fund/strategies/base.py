@@ -3624,7 +3624,10 @@ class LongFlatStrategy(Strategy):
     def _liq(self, cash: float, qty: float) -> float | None:
         """The open position's liquidation price on isolated margin at the risk profile's leverage cap, the
         same margin the sizing, the dashboard and the demo copy use (markets.isolated_margin): the one set when
-        it was entered (_set_liq), else worked out from its own average entry."""
+        it was entered (_set_liq), else worked out from its own average entry. None on spot: nothing liquidates it
+        (a two-leg Strategy's spot leg runs the guards on every trade and fill too, HoQA P2-8)."""
+        if self._cfg.perp is None:
+            return None
         if qty and self._liq_px is not None:
             return self._liq_px
         return self._liq_from_entry(cash, qty)
@@ -3702,7 +3705,9 @@ class LongFlatStrategy(Strategy):
 
     def _liq_from_entry(self, cash: float, qty: float) -> float | None:
         """From the position's average entry as the strategy (and the journal) keep it, never the simulated
-        venue's, which after a restart is the restore's price (QA P1-L22)."""
+        venue's, which after a restart is the restore's price (QA P1-L22). None on spot."""
+        if self._cfg.perp is None:
+            return None
         lev = LongFlatStrategy._max_leverage(self)
         entry = self._entry_px if self._entry_px else self._net_position()[1]
         return markets.isolated_liquidation(cash, qty, entry, lev, self._cfg.perp.maintenance_margin)

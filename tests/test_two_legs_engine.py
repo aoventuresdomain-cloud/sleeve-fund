@@ -131,6 +131,49 @@ def test_a_second_leg_the_venue_refuses_is_sent_once_more_then_the_first_is_unwo
     assert float(r.follow.fills["filled_qty"].astype(float).iloc[0]) == float(r.follow.fills["filled_qty"].astype(float).iloc[1])
 
 
+@pytest.mark.parametrize("cause", ["halt", "no_coordinator"])
+def test_a_second_leg_isnt_retried_when_a_leg_is_halted_or_the_coordinator_is_gone(monkeypatch, cause):
+    """Advisor leg-2 retry MUST 3: after the second leg's refusal, a halt (or pause, or stale data: all are can_open) on
+    either leg, or the coordinator gone, unwinds the pair instead of retrying."""
+    from sleeve_fund.paper.runtime import SleeveRuntime
+
+    real, refused = LongFlatStrategy.submit_order, []
+    real_can_open = SleeveRuntime.can_open
+
+    def refuse_spot_entries(self, order, *a, **k):
+        coid = str(order.client_order_id)
+        if not isinstance(self, LegFollower) and (self.decisions.get(coid) or {}).get("intent") == "entry":
+            order = self.order_factory.market(instrument_id=order.instrument_id, order_side=OrderSide.SELL,
+                                              quantity=order.quantity, reduce_only=True)
+            self.decisions[str(order.client_order_id)] = self.decisions[coid]
+            refused.append(self)
+        return real(self, order, *a, **k)
+
+    def halted_after_the_refusal(self):
+        return False if refused and cause == "halt" else real_can_open(self)
+
+    if cause == "no_coordinator":
+        from sleeve_fund.strategies import pair as pair_mod
+
+        real_refusal = pair_mod.Pair._retry_refusal
+
+        def coordinator_gone(self, leg):
+            self.lead.pair = None
+            try:
+                return real_refusal(self, leg)
+            finally:
+                self.lead.pair = self
+
+        monkeypatch.setattr(pair_mod.Pair, "_retry_refusal", coordinator_gone)
+    monkeypatch.setattr(LongFlatStrategy, "submit_order", refuse_spot_entries)
+    monkeypatch.setattr(SleeveRuntime, "can_open", halted_after_the_refusal)
+    r = _carry((2, 10))
+    steps = [what for _, what, _ in r.pair_log]
+    assert steps.count("sent") == 2  # the perp, the spot; no retry
+    assert "retry_refused" in steps and BROKEN in steps and steps[-1] == "flat"
+    assert [o["intent"] for o in _orders(r, "follow")] == ["entry", "leg_unwind"]
+
+
 def test_a_stop_resting_on_one_leg_closes_the_other_leg_with_it():
     """The first leg's own stop fills at the venue (no sell-all of its own): the perp leg is closed with it at once,
     and the pair is flat; the stop's side waits for the signal to reset, so the pair isn't reopened in the window."""

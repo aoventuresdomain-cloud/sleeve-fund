@@ -113,3 +113,35 @@ def test_with_a_fresh_journal_the_first_summed_mark_sets_every_figure(store):
     rt.tick(equity=5_000.0, cash=5_000.0, qty=0.0, price=60_000.0, other_equity=4_000.0)
     row = store.pair_state("carry")
     assert (row["state"], row["reference_equity"], row["day_start"]) == ("flat", D(9_000), T.date())
+
+
+def test_a_stale_writer_from_an_earlier_trade_cant_move_a_later_one(store):
+    """DA should-fix 1: trade A ends (legging -> closing -> flat) and trade B starts (flat -> legging); a slow writer
+    still holding A's 'legging' finds the state it expects, but not A's trade, so it moves nothing."""
+    assert store.set_pair_state("carry", expected=None, state="flat", ts=T)
+    for frm, to, trade, prior in (("flat", "legging", "A", None), ("legging", "closing", "A", "A"),
+                                  ("closing", "flat", None, "A"), ("flat", "legging", "B", None)):
+        assert store.set_pair_state("carry", expected=frm, state=to, trade_id=trade,
+                                    deadline=None if to == "flat" else T, ts=T, expected_trade_id=prior)
+    before = store.events("carry", limit=50)
+    assert not store.set_pair_state("carry", expected="legging", state="closing", trade_id="A", deadline=T, ts=T,
+                                    expected_trade_id="A")
+    row = store.pair_state("carry")
+    assert (row["state"], row["trade_id"]) == ("legging", "B") and store.events("carry", limit=50) == before
+
+
+@pytest.mark.parametrize("frm, to", [(None, "legging"), ("flat", "hedged"), ("flat", "closing"), ("flat", "flat"),
+                                     ("hedged", "legging"), ("closing", "legging"), ("closing", "hedged"),
+                                     ("legging", "legging"), ("hedged", "hedged"), ("closing", "closing")])
+def test_a_move_a_pair_never_makes_is_refused_before_anything_is_written(store, frm, to):
+    """DA should-fix 2: only new -> flat, flat -> legging, legging -> hedged | closing | flat, hedged -> closing | flat,
+    closing -> flat."""
+    before = store.events("carry", limit=50)
+    with pytest.raises(ValueError, match="isn't a move"):
+        store.set_pair_state("carry", expected=frm, state=to, trade_id="t", deadline=T, ts=T, expected_trade_id="t")
+    assert store.pair_state("carry") is None and store.events("carry", limit=50) == before
+
+
+def test_a_move_from_a_held_trade_names_it(store):
+    with pytest.raises(ValueError, match="names the trade"):
+        store.set_pair_state("carry", expected="legging", state="closing", trade_id="t", deadline=T, ts=T)

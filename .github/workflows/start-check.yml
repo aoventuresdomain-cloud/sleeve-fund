@@ -1,0 +1,32 @@
+name: start-check
+# START CHECKLIST (2): the paper server's read-only check before Strategy testing starts, and in the final QA round.
+# One page, pass or fail (sleeve_fund/start_check.py): no live key, only paper venues, and every Strategy's dashboard
+# figures match its journal. It runs inside the supervisor container, so it sees that container's environment, and
+# opens the journal read-only. Run it by hand from main; it uses the deploy workflow's secrets (DEPLOY_HOST,
+# DEPLOY_SSH_KEY) and variable DEPLOY_USER, as status.yml does. The log is public: the page names no host, user, key
+# path or database address, and ssh runs quiet so its own messages don't either. The job fails when the check fails.
+on:
+  workflow_dispatch:
+jobs:
+  start-check:
+    runs-on: ubuntu-24.04
+    permissions: { contents: read }
+    if: ${{ vars.DEPLOY_ENABLED == 'true' && github.ref == 'refs/heads/main' }}
+    env:
+      USER_AT: ${{ vars.DEPLOY_USER || 'root' }}
+    steps:
+      - name: Configure SSH
+        env:
+          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/id_deploy && chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts 2>/dev/null
+      - name: Start check
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+        # ssh and docker compose exec pass the check's exit code through: 1 on FAIL fails the job, and 255 is ssh
+        # itself failing (quiet, so it names no host or user; status.yml shows whether the server is up).
+        run: |
+          ssh -o LogLevel=QUIET -i ~/.ssh/id_deploy "$USER_AT@$HOST" 'cd /opt/sleeve-fund && sudo docker compose exec -T supervisor python -m sleeve_fund.start_check'

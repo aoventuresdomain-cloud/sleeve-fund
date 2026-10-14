@@ -161,8 +161,9 @@ def test_up3_a_bigger_loss_is_listed_above_a_smaller_gain_and_still_reads_as_a_l
     monkeypatch.setenv("DASHBOARD_PASSWORD", "test-pw")
     store = Store(f"sqlite:///{tmp_path}/m.db")
     for name, equity in (("small-gain", 10_100.0), ("big-loss", 9_700.0)):
-        store.create_sleeve(name=name, strategy="trend_filter", instrument="BTC/USD", bar_spec="1-HOUR-LAST-INTERNAL",
-                            starting_balance=10_000, params={})
+        # On the Strategy venue, in the fund's book (CCY-8DP-UI: BTC/USD at the default venue is a test account).
+        store.create_sleeve(name=name, strategy="trend_filter", instrument="BTC/USDT", bar_spec="1-HOUR-LAST-INTERNAL",
+                            starting_balance=10_000, params={}, venue="BINANCE")
         store.record_equity(name, equity=equity, cash=equity, qty=0, price=60_000, benchmark=10_000)
     html = TestClient(app_mod.create_app(store)).get("/", auth=("pm", "test-pw")).text
     today = html.split('data-period-rows="day"')[1].split("</tbody>")[0]

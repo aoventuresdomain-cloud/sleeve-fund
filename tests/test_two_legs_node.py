@@ -22,6 +22,7 @@ from sleeve_fund.strategies.pair import LegFollower, Pair
 HUB = ("127.0.0.1", 1)
 LEG_LONG = {"side": 1, "ratio": "1", "leverage": "1"}
 LEG_SHORT = {"side": -1, "ratio": "1", "leverage": "1"}
+SPEC = SimpleNamespace(default_params={})  # the test-only model defined below reads its defaults from its module
 
 
 def _legs(first_params=None, second_params=None, **kw):
@@ -212,6 +213,32 @@ class _Leg:
         return self.price
 
 
+
+def test_a_retry_is_refused_once_the_journal_no_longer_holds_the_trade_legging(tmp_path):
+    """Advisor leg-2 retry MUST 3 (HoQA C13, QT2's lost-coordinator cell): another writer moved the pair's journal row,
+    so this coordinator lost the trade; its second leg is not retried (the pair unwinds instead)."""
+    from datetime import datetime, timezone
+
+    from sleeve_fund.store import Store
+
+    store = Store(f"sqlite:///{tmp_path}/t.db")
+    store.create_two_legs(name="carry", strategy="trend_filter", bar_spec="1-HOUR-LAST-INTERNAL",
+                          starting_balance=10_000,
+                          first={"instrument": "BTC/USD", "params": {}, "venue": "KRAKEN", "side": 1},
+                          second={"instrument": "BTC/USD", "params": {"market": "perp"}, "venue": "KRAKEN",
+                                  "side": -1})
+    now = datetime.now(timezone.utc)
+    store.set_pair_state("carry", expected=None, state="flat", ts=now)
+    store.set_pair_state("carry", expected="flat", state="legging", trade_id="carry-t1", deadline=now, ts=now)
+    p = Pair.__new__(Pair)
+    p.lead, p.follow = SimpleNamespace(runtime=None), SimpleNamespace(runtime=None)
+    p.lead.pair = p.follow.pair = p
+    p._store, p._parent, p.trade_id = store, "carry", "carry-t1"
+    assert Pair._retry_refusal(p, p.follow) is None  # still its trade, legging: the retry may go
+    assert store.set_pair_state("carry", expected="legging", state="flat", ts=now, expected_trade_id="carry-t1")
+    assert "lost the trade" in Pair._retry_refusal(p, p.follow)
+
+
 def test_a_restarted_pair_is_recovered_once_both_legs_are_back_and_priced_and_opens_nothing_before():
     p = Pair.__new__(Pair)
     p.lead, p.follow, p.recovered = _Leg(restore={"qty": 1}), _Leg(price=0.0), False
@@ -262,7 +289,8 @@ def test_a_two_leg_node_runs_on_the_hub_and_a_trade_the_journal_left_legging_wit
                           second={"instrument": "ETH/USDT", "params": {"market": "perp"}, "venue": "BINANCE",
                                   "side": -1})
     now = datetime.now(timezone.utc)
-    assert store.set_pair_state("pairx", expected=None, state="legging", trade_id="pairx-t1",
+    assert store.set_pair_state("pairx", expected=None, state="flat", ts=now)
+    assert store.set_pair_state("pairx", expected="flat", state="legging", trade_id="pairx-t1",
                                 deadline=now - timedelta(seconds=5), ts=now)
     journal = QueuedStore(store)
     lead, follow = (from_store(store.sleeve(n)) for n in ("pairx", "pairx~2"))
@@ -299,3 +327,102 @@ def test_a_two_leg_node_runs_on_the_hub_and_a_trade_the_journal_left_legging_wit
     assert row["state"] == "flat" and row["marked_at"] is not None and row["hwm"] == 10_000  # both legs summed
     assert any(w == "recovered_flat" for _, w, _ in pair.log)
     node.dispose()
+
+
+def test_a_spot_and_perp_pair_judges_its_guards_on_every_spot_trade_and_fill_without_failing(tmp_path, monkeypatch):
+    """HoQA P2-8 (QT2's probe): on the real node, the spot leg of a spot + perp pair runs the guards on each trade print
+    and each fill of either leg (Advisor M5). A spot leg has no liquidation price, so the guard reads none rather than
+    failing on its missing perp terms (which fired handler_failed on every print and fill, leaving the summed halt,
+    pause and ruling B's clamp to the 30-second tick)."""
+    import threading
+    import time
+    from datetime import datetime, timezone
+    from decimal import Decimal as D
+
+    from nautilus_trader.model import OrderSide
+
+    from sleeve_fund.hub.server import Fanout
+    from sleeve_fund.paper.config import from_store
+    from sleeve_fund.paper.queued import QueuedStore
+    from sleeve_fund.paper.runtime import SleeveRuntime
+    from sleeve_fund.store import Store
+    from sleeve_fund.strategies import REGISTRY
+    from sleeve_fund.strategies.base import LongFlatConfig, LongFlatStrategy
+    from sleeve_fund.venues import venue
+    from test_p21b_wiring_qa import portfolio_pass
+
+    sent, started = [], []
+
+    class Driven(LongFlatStrategy):
+        """Never signals on its own; sends one entry through the pair on a quote once the node has settled."""
+
+        def want_long(self, bar):
+            return None
+
+        def explain(self, bar, target):
+            return "driven", {}
+
+        def on_quote(self, quote):
+            super().on_quote(quote)
+            started.append(time.monotonic()) if not started else None
+            if not sent and self._price() > 0 and time.monotonic() - started[0] > 4:
+                sent.append(1)
+                self._send_entry(OrderSide.BUY, D("0.02"), "entry", {"close": self._price()})
+
+    judged = []
+    real_book = LongFlatStrategy._guard_book
+
+    def guard_book(self, *a, **k):
+        judged.append(self.runtime.name)
+        return real_book(self, *a, **k)
+
+    monkeypatch.setitem(REGISTRY, "driven", (Driven, LongFlatConfig))
+    monkeypatch.setattr(LongFlatStrategy, "_entry_atr_pct", lambda self: 0.05)
+    monkeypatch.setattr(LongFlatStrategy, "_guard_book", guard_book)
+    inst = venue("kraken").instrument("BTC", "USDT")
+    insts = {str(inst.id): inst}
+    hub = Fanout("KRAKEN", known=lambda: set(insts), log=lambda *a: None,
+                 instruments=lambda ids: [type(insts[i]).to_dict(insts[i]) for i in ids if i in insts])
+    port = hub.start("127.0.0.1", 0)
+    store = Store(f"sqlite:///{tmp_path}/t.db", portfolio_gate=True)
+    store.create_two_legs(name="carry", strategy="driven", bar_spec="1-MINUTE-LAST-INTERNAL", starting_balance=10_000,
+                          first={"instrument": "BTC/USDT", "params": {}, "venue": "KRAKEN", "side": 1},
+                          second={"instrument": "BTC/USDT", "params": {"market": "perp"}, "venue": "KRAKEN",
+                                  "side": -1})
+    portfolio_pass(store, datetime.now(timezone.utc), D(20_000))
+    journal = QueuedStore(store)
+    lead, follow = (from_store(store.sleeve(n)) for n in ("carry", "carry~2"))
+    node, pair = node_mod.build_two_leg_node(lead, follow, log_level="ERROR", asset_fetch=dict,
+                                             runtimes=(SleeveRuntime(journal, "carry"),
+                                                       SleeveRuntime(journal, "carry~2")),
+                                             hub=("127.0.0.1", port), history=lambda *a, **k: [])
+    prints_after_fill = 25
+
+    def feed():
+        time.sleep(2)
+        for k in range(30 + prints_after_fill):
+            ts = time.time_ns()
+            hub.publish({"t": "quote", "id": "BTC/USDT.KRAKEN", "bid": "60000.00", "ask": "60000.10",
+                         "bid_qty": "5.00000000", "ask_qty": "5.00000000", "ts": ts, "recv": ts})
+            hub.publish({"t": "trade", "id": "BTC/USDT.KRAKEN", "px": "60000.00", "qty": "0.50000000",
+                         "side": "BUYER", "tid": str(k), "ts": ts, "recv": ts})
+            time.sleep(0.2)
+
+    threading.Thread(target=feed, daemon=True).start()
+    handle = node.handle()
+    threading.Timer(15, handle.stop).start()
+    try:
+        node.run()
+    finally:
+        journal.settle(timeout=10)
+        hub.stop()
+    try:
+        for name in ("carry", "carry~2"):
+            assert [o["status"] for o in store.orders(name) if o["intent"] == "entry"] == ["filled"]
+            failed = [e["message"] for e in store.events(name, limit=200) if e["kind"] == "handler_failed"]
+            assert failed == [], failed
+        assert pair.state == "hedged"
+        # Held, the spot leg is judged on its own prints (well over the 30-second tick's once) and on the fills.
+        assert judged.count("carry") >= 10 and judged.count("carry~2") >= 2
+    finally:
+        node.dispose()

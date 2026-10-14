@@ -107,12 +107,13 @@ def test_the_strategys_page_shows_the_pair_state_and_while_opening_its_trade_and
     assert "Two legs · Flat" in html and "done or unwound by" not in html
     assert "Both legs: equity 10,001.00" in html and "The figures below are leg 1's." in html
     deadline = utcnow().replace(hour=7, minute=30, second=15, microsecond=0) + timedelta(days=1)
-    assert store.set_pair_state("carry", expected=None, state="legging", trade_id="T1", deadline=deadline)
+    assert store.set_pair_state("carry", expected=None, state="flat")
+    assert store.set_pair_state("carry", expected="flat", state="legging", trade_id="T1", deadline=deadline)
     html = _get(client, "/sleeves/carry")
     assert "Two legs · Opening" in html
     uk = deadline.astimezone(ZoneInfo("Europe/London")).strftime("%H:%M:%S UK")
     assert f"Opening trade T1: done or unwound by {uk}" in html
-    assert store.set_pair_state("carry", expected="legging", state="hedged", trade_id="T1")
+    assert store.set_pair_state("carry", expected="legging", state="hedged", trade_id="T1", expected_trade_id="T1")
     html = _get(client, "/sleeves/carry")
     assert "Two legs · Hedged" in html and "done or unwound by" not in html
     assert "Two legs, hedged" in _strategies_tab(_get(client, "/"))

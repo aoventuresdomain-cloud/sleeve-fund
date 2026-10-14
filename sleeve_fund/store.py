@@ -720,6 +720,10 @@ def _in(column: str, values: tuple[str, ...]) -> str:
 
 
 PAIR_STATES = ("flat", "legging", "hedged", "closing")
+# The moves a pair makes (DA review 14 Oct 06:09 UK), from None (no row yet). legging -> flat: the first leg was never
+# placed (Pair._send_first), or a restart found both legs flat (Pair.recover); hedged -> flat: that restart case too.
+PAIR_MOVES = {None: ("flat",), "flat": ("legging",), "legging": ("hedged", "closing", "flat"),
+              "hedged": ("closing", "flat"), "closing": ("flat",)}
 PAIR_FIGURES = ("reference_equity", "hwm", "day_start_equity", "day_start")
 PAIR_SHAPE = ("(state = 'flat' AND trade_id IS NULL AND deadline IS NULL) "
               "OR (state = 'hedged' AND trade_id IS NOT NULL AND deadline IS NULL) "
@@ -1402,8 +1406,53 @@ class Store:
                 led.reduce(rid, fill_qty)
             reason = {"filled": "fill", "rejected": "reject", "denied": "reject", "canceled": "cancel",
                       "expired": "cancel"}.get(status)
+            if reason in ("reject", "cancel") and order_id in self._retry_held:
+                reason = None  # a two-leg Strategy's second leg: what is left stays reserved for its retry (hand_on)
             if reason is not None:
                 led.release(rid, reason)
+                self._retry_held.discard(order_id)
+
+    # --- a two-leg Strategy's second-leg retry (P2-8; Advisor 14 Oct 05:12 UK, MUST) ---------------------------------
+    # The second leg's share, reserved with the first leg's by the pair's one check, stays reserved until it fills, the
+    # pair unwinds or the retry deadline passes: a retry draws on what is left and is never checked alone (a spurious
+    # refusal would force the unwind the reservation exists to avoid). The hold is the order's own writer's, in memory:
+    # a restart cancels the order, which then releases it as any other's.
+
+    @property
+    def _retry_held(self) -> set:
+        return self.__dict__.setdefault("_retry_held_orders", set())
+
+    def hold_for_retry(self, order_id: str) -> None:
+        """The order's reject, cancel or expiry keeps what is left of its reservation (its fills still reduce it)."""
+        self._retry_held.add(order_id)
+
+    def hand_on(self, order_id: str) -> tuple[int, Decimal] | None:
+        """What is left of the reservation `order_id` held, now held by no order, for the retry to attach: (its
+        reservation id, remaining quantity), or None when nothing is left (filled, or released)."""
+        d, r = gate_decisions_t, gate_reservations_t
+        with self.engine.begin() as c:
+            row = c.execute(select(r.c.decision_id, r.c.remaining_qty).join(d, d.c.id == r.c.decision_id)
+                            .where(d.c.order_id == order_id, r.c.released_at.is_(None)).with_for_update()).first()
+            if row is None:
+                self._retry_held.discard(order_id)
+                return None
+            c.execute(update(d).where(d.c.id == row.decision_id).values(order_id=None))
+        self._retry_held.discard(order_id)
+        return row.decision_id, to_decimal(row.remaining_qty)
+
+    def release_reservation(self, reservation_id: int, reason: str = "cancel") -> None:
+        """A handed-on reservation no retry took up: back to the book."""
+        self._gate_ledger().release(reservation_id, reason)
+
+    def release_held(self, order_id: str, reason: str = "cancel") -> None:
+        """The pair unwound or its retry deadline passed: what `order_id` still holds goes back to the book."""
+        self._retry_held.discard(order_id)
+        d, r = gate_decisions_t, gate_reservations_t
+        with self.engine.connect() as c:
+            rid = c.execute(select(d.c.id).join(r, r.c.decision_id == d.c.id)
+                            .where(d.c.order_id == order_id, r.c.released_at.is_(None))).scalar()
+        if rid is not None:
+            self.release_reservation(rid, reason)
 
     def _update_order(self, c, order_id: str, *, status: str | None = None, message: str | None = None,
                       fill_qty: float = 0.0, fill_px: float | None = None, fee: float = 0.0,
@@ -1835,10 +1884,17 @@ class Store:
         return rows[0] if rows else None
 
     def set_pair_state(self, parent: str, *, expected: str | None, state: str, trade_id: str | None = None,
-                       deadline: datetime | None = None, ts: datetime | None = None) -> bool:
-        """Move the pair from `expected` (None: it has no row yet) to `state`, with one pair_state event in the same
-        transaction. A compare-and-set: False when the row wasn't in `expected` (another writer moved it first, or it
-        already exists), and nothing is written; re-read and decide again."""
+                       deadline: datetime | None = None, ts: datetime | None = None,
+                       expected_trade_id: str | None = None) -> bool:
+        """Move the pair from `expected` (None: it has no row yet) and `expected_trade_id` (the trade it holds; None
+        when flat) to `state`, with one pair_state event in the same transaction. A compare-and-set on both, so a
+        stale writer from an earlier trade passing through the same state can't move a later one: False when the row
+        wasn't there (another writer moved it first, or it already exists), and nothing is written; re-read and
+        decide again. ValueError for a move a pair never makes (PAIR_MOVES), before anything is written."""
+        if state not in PAIR_MOVES.get(expected, ()):
+            raise ValueError(f"{expected or 'new'} -> {state} isn't a move a two-leg Strategy makes")
+        if expected not in (None, "flat") and expected_trade_id is None:
+            raise ValueError(f"a move from {expected} names the trade it moves (expected_trade_id)")
         ts = ts or utcnow()
         values = dict(state=state, trade_id=trade_id, deadline=deadline, updated_at=ts)
         try:
@@ -1849,8 +1905,10 @@ class Store:
                 if expected is None:
                     c.execute(insert(pair_state_t).values(parent=parent, **values))
                 else:
+                    held = (pair_state_t.c.trade_id.is_(None) if expected_trade_id is None
+                            else pair_state_t.c.trade_id == expected_trade_id)
                     done = c.execute(update(pair_state_t).where(pair_state_t.c.parent == parent,
-                                                                pair_state_t.c.state == expected).values(**values))
+                                                                pair_state_t.c.state == expected, held).values(**values))
                     if done.rowcount != 1:
                         return False
                 c.execute(insert(events_t).values(
