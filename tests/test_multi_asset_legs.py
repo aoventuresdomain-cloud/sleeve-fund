@@ -116,3 +116,26 @@ def test_the_asset_list_is_part_of_the_idea_hash_and_its_order_is_not():
     assert idea_hash(two) != idea_hash(d) and idea_hash(two) != idea_hash(other)
     assert idea_hash(two) == idea_hash({**d, "assets": ["ETH/USDT", "BTC/USDT"]})
     assert idea_hash(d) == idea_hash({**d, "assets": []})  # no list: the hash every single-asset idea has today
+
+
+def test_a_put_away_with_a_leg_held_waits_for_that_leg_then_puts_every_leg_away(tmp_path):
+    """Cell 10 (HoE, spec §10): close now with one leg still holding winds every leg down, due now, so nothing opens;
+    nothing is put away until that leg is flat. Its exit's fill makes it flat and the next check puts every leg away.
+    With every leg flat, close now puts them all away at once (the cell above)."""
+    from decimal import Decimal
+
+    store = _fund(Store(f"sqlite:///{tmp_path}/ma.db"))
+    _make(store)
+    store.record_fill("trend-x~ETH", side="BUY", qty=Decimal("0.5"), price=Decimal(2400), fee=Decimal("0.6"),
+                      order_id="o1", trade_id="t1")
+    store.set_lifecycle("trend-x", "close_now", "pm", "PM's call")
+    assert {store.sleeve(n).lifecycle for n in store.legs("trend-x")} == {"winding_down"}
+    assert all(store.sleeve(n).wind_down_deadline is not None for n in store.legs("trend-x"))  # due now: no entry
+    assert not store.complete_retire("trend-x~SOL")  # a flat leg's process can't put the Strategy away alone
+    assert "trend-x" not in store.archived()
+    store.record_fill("trend-x~ETH", side="SELL", qty=Decimal("0.5"), price=Decimal(2410), fee=Decimal("0.6"),
+                      order_id="o2", trade_id="t2")
+    assert store.complete_retire("trend-x~ETH")
+    assert {store.sleeve(n).lifecycle for n in store.legs("trend-x")} == {"retired"}
+    assert {store.sleeve(n).desired_state for n in store.legs("trend-x")} == {"stopped"}
+    assert set(store.legs("trend-x")) <= set(store.archived())
