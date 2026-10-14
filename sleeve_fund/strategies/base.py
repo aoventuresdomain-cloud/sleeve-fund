@@ -56,6 +56,8 @@ STOP_INTENTS = ("stop_loss", "risk_halt", "risk_pause", "liquidation_cut", "liqu
 MINUTE_NS = 60_000_000_000
 DAY_NS = 86_400_000_000_000
 SAFETY_STOP_SHARE = 0.5  # of the way from the mark to the liquidation price (_safety_stop_on_restore)
+# A liquidation slice's cash true-up (P1-GLC-3) covers the venue's cent rounding of its P&L, no more
+LIQ_TRUE_UP_MAX = 0.01
 # The status reason the supervisor gives a refused start that still holds a position: it runs for its exits only
 # (EXITS_ONLY, from the runtime).
 
@@ -4826,6 +4828,20 @@ class LongFlatStrategy(Strategy):
         self.liquidation_books[coid] = (bankrupt, fees + booked_fee)
         return bankrupt, booked_fee
 
+    def _true_up_liquidation_cash(self, trade_id: str) -> None:
+        """P1-GLC-3 (Advisor 7 Oct: before NIGHTLY-RECON goes live): after each slice of a liquidation booked at the
+        bankruptcy price (_book_liquidation), the account's cash keeps the journal's to the last digit. The simulated
+        venue realises the market-price fill's P&L to the cent, which the float _cash_adj to the bankruptcy price
+        can't see, so the marks drifted up to half a cent per slice from the journal. Only once the slice is journaled
+        (a write still to retry would make the journal the one behind), and only a rounding's worth (under
+        LIQ_TRUE_UP_MAX): anything bigger is a real gap, left for the reconcile and the nightly check to catch."""
+        if not self._liquidation_figures(trade_id)[3]:
+            return
+        rt = self.runtime
+        diff = float(rt.store.journal_book(rt.name, rt.starting_balance)["cash"]) - self._mark()[1]
+        if abs(diff) < LIQ_TRUE_UP_MAX:
+            self._cash_adj += diff
+
     def _liquidation_diagnostic(self) -> None:
         """Once a liquidation has closed the position: where the market took it beside the bankruptcy price it was
         booked at, journaled as a diagnostic only (never P&L): past it, the venue's insurance fund covered the
@@ -5706,6 +5722,8 @@ class LongFlatStrategy(Strategy):
                                  order_id=journal_id, trade_id=str(event.trade_id), ts=at)
             self.runtime.on_timing(journal_id, fill=int(event.ts_init), venue_ts=int(event.ts_event))
             self._flush_rebook(coid, at)
+            if self._margin and self._liq_closing is not None:
+                self._true_up_liquidation_cash(str(event.trade_id))
         if self._margin and opening and intrabar is not None and coid != self._restore_id:
             self._opened_in_bar.append((intrabar, sign * qty))  # charged with the bar's range in on_bar
         if self._margin and self._entry_side == 0:
