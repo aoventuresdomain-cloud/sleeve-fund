@@ -52,3 +52,12 @@ def test_the_check_runs_first_and_the_dry_run_is_the_default():
     line = _step("Lift the identity hold")["run"]
     assert "supervisor resume-identity --actor '$ACTOR' --reason '$REASON' $DRY" in line
     assert "github.ref == 'refs/heads/main'" in wf["jobs"]["resume"]["if"]
+
+
+def test_it_runs_only_with_deploys_on_and_no_input_is_written_into_a_run_line():
+    """CR F-RW-1 and F-RW-2: the job needs DEPLOY_ENABLED as well as main, and the inputs reach every step through env
+    only, never as ${{ inputs.* }} written into a shell line, where a quote in them would be code."""
+    wf = _wf()
+    assert "vars.DEPLOY_ENABLED == 'true'" in wf["jobs"]["resume"]["if"]
+    for step in wf["jobs"]["resume"]["steps"]:
+        assert "inputs." not in step.get("run", ""), step["name"]
