@@ -210,6 +210,40 @@ def positions_breaks(store: Store) -> list[str]:
     return out
 
 
+LIQUIDATION_INTENTS = ("liquidation", "liquidation_cut")
+
+
+def insurance_breaks(store: Store, since: datetime | None = None) -> list[str]:
+    """MUST-FUNDCASH-LOSS (HoE): an insurance credit is the venue's cover for a liquidation fill that left a Strategy
+    below zero, so one that names no journaled liquidation fill is a loss booked back as income. Both readers of the
+    identity include insurance, so the cash leg can't see it: this leg can. Credits from `since` (the bridge, or the
+    PM's last Resume) on, per Strategy in the book. Returns each in words, [] when every credit names its liquidation."""
+    from sqlalchemy import select
+
+    from sleeve_fund.store import fills_t, insurance_t, orders_t
+
+    names = [s.name for s in store.sleeves() if _in_book(store, s)]
+    if not names:
+        return []
+    i, f, o = insurance_t.c, fills_t.c, orders_t.c
+    q = (select(i.sleeve, i.amount, i.ts, o.intent)
+         .select_from(insurance_t.outerjoin(fills_t, (f.sleeve == i.sleeve) & (f.order_id == i.order_id)
+                                            & (f.trade_id == i.trade_id))
+                      .outerjoin(orders_t, o.order_id == f.order_id))
+         .where(i.sleeve.in_(names)).order_by(i.id))
+    if since is not None:
+        q = q.where(i.ts >= since)
+    with store.engine.connect() as c:
+        rows = list(c.execute(q))
+    return [f"{r.sleeve}: an insurance credit of {to_decimal(r.amount, 'amount'):,.2f} names no liquidation fill"
+            for r in rows if r.intent not in LIQUIDATION_INTENTS]
+
+
+def _last_resume(store: Store) -> datetime | None:
+    rows = store.decisions(action=IDENTITY_RESUME_ACTION)
+    return max((r["ts"] for r in rows), default=None) if rows else None
+
+
 def empty_book_pockets(store: Store) -> list[str]:
     """What keeps the book from being empty, in the PM's words; empty is nothing left (CAP5-RESET: a re-base deposit
     lands only onto an empty book). Every Strategy whose equity still counts, one waiting to leave, anything that
@@ -884,11 +918,12 @@ class Supervisor:
         if bridge_start(store) is None or self.ledger.identity_hold():
             return
         tol = identity_tolerance(store)
-        gap, apart = identity_gap(store), positions_breaks(store)
+        since = max((t for t in (bridge_start(store), _last_resume(store)) if t is not None), default=None)
+        gap, apart = identity_gap(store), positions_breaks(store) + insurance_breaks(store, since)
         if abs(gap) <= tol and not apart:
             return
         # once more: a fill between the first reads moves both sides by the time of this one
-        gap, apart = identity_gap(store), positions_breaks(store)
+        gap, apart = identity_gap(store), positions_breaks(store) + insurance_breaks(store, since)
         if abs(gap) <= tol and not apart:
             return
         why = "; ".join(([f"cash + Strategy P&L + positions differs from the journal by {gap:,.2f}"]
