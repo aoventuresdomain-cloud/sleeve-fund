@@ -96,7 +96,7 @@ def test_an_edit_is_a_whole_new_version_journaled_old_to_new_and_v1_stays(store)
 def test_a_stale_form_is_refused_and_writes_nothing(store):
     c1 = store.compliance()
     store.add_compliance_version(_edit(c1, asset_stop_loss="0.03"), c1.asset_types, expected_version=1, note="a")
-    with pytest.raises(ValueError, match="changed since this page was opened"):
+    with pytest.raises(ValueError, match="the compliance tests changed since this page was opened"):
         store.add_compliance_version(_edit(c1, asset_stop_loss="0.02"), c1.asset_types, expected_version=1, note="b")
     assert _count(store.engine, compliance_versions_t) == 2
 
