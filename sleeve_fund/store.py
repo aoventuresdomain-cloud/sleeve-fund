@@ -805,6 +805,19 @@ INTENTS = ("entry", "exit", "stop_loss", "take_profit", "risk_halt", "risk_pause
            "liquidation", "liquidation_cut", "wind_down", "wind_down_stop")  # the venue would take it; cut back before it does (String(16))
 
 
+def _position_venue(c, sleeve: str) -> str | None:
+    """F-WED1-3: the venue the journal says the strategy's open position is on: that of the order behind its latest
+    fill, while its fills net to a position; None when flat. Read on the caller's connection."""
+    net = c.execute(select(func.sum(case((fills_t.c.side == "BUY", fills_t.c.qty), else_=-fills_t.c.qty)))
+                    .where(fills_t.c.sleeve == sleeve)).scalar()
+    if not net:
+        return None
+    return c.execute(select(orders_t.c.venue).join(fills_t, (fills_t.c.order_id == orders_t.c.order_id)
+                                                   & (fills_t.c.sleeve == orders_t.c.sleeve))
+                     .where(fills_t.c.sleeve == sleeve).order_by(fills_t.c.ts.desc(), fills_t.c.id.desc())
+                     .limit(1)).scalar()
+
+
 def _check_rebook(order_id: str, row) -> None:
     """Refuse any re-booking but a filled stop-loss becoming a liquidation (Store/MemoryJournal.rebook_liquidation)."""
     if row is None:
@@ -1229,17 +1242,32 @@ class Store:
         now = ts or utcnow()
         with self.engine.begin() as c:
             # The venue is the router's, never the caller's (P2-4): read with the order, in its transaction.
-            venue = c.execute(select(sleeve_venues_t.c.venue).where(sleeve_venues_t.c.sleeve == sleeve)).scalar()
+            venue = venue_for(c.execute(select(sleeve_venues_t.c.venue).where(sleeve_venues_t.c.sleeve == sleeve))
+                              .scalar())
+            # F-WED1-3 (DA): an open position on another venue than the pin keeps its own. Its exits are journaled
+            # there, where they go; an opening order is refused, behind the start's entry hold. Same transaction, so
+            # a fill can't land between the two reads.
+            held = _position_venue(c, sleeve)
+            if held is not None and held != venue:
+                if intent in GATED_INTENTS:
+                    raise ValueError(f"{sleeve}: an opening order is refused while its open position is on another "
+                                     "venue than its pin")
+                venue = held
             c.execute(insert(orders_t).values(sleeve=sleeve, order_id=order_id, ts=now, updated_at=now, side=side,
                                               order_type=order_type, qty=qty, status="submitted", filled_qty=0.0,
                                               fee=0.0, intent=intent, reason=reason, signal=signal or {},
-                                              message="", venue=venue_for(venue)))
+                                              message="", venue=venue))
             if timing:
                 c.execute(insert(order_timings_t).values(order_id=order_id, sleeve=sleeve, **{
                     k: _from_ns(v) for k, v in timing.items() if v is not None}))
             if reservation is not None:
                 with self._gate_ledger().using(c):
                     self._gate_ledger().attach_order(reservation, order_id)
+
+    def position_venue(self, sleeve: str) -> str | None:
+        """The venue the strategy's open position is on, as the journal holds it (_position_venue); None when flat."""
+        with self.engine.connect() as c:
+            return _position_venue(c, sleeve)
 
     def record_timing(self, sleeve: str, order_id: str, *, fill: int | None = None, **stamps: int | None) -> None:
         """An order's timing stamps (UNIX ns, kept to the microsecond), filled in as they come (the send, the
