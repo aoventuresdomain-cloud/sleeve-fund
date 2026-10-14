@@ -35,7 +35,8 @@ from sleeve_fund.risk import PORTFOLIO, trading_day
 from sleeve_fund.paper.safety import assert_portfolio_gate, credential_var
 from sleeve_fund.paper.single_lock import EXIT_DUPLICATE
 from sleeve_fund.paper.config import check_hub_bar_spec, load_sleeve, to_store_kwargs
-from sleeve_fund.store import DUST_NOTIONAL, OPEN_ORDER_STATUSES, TWO_LEG_FENCE, Sleeve, Store, is_dust, utcnow
+from sleeve_fund.store import (DUST_NOTIONAL, OPEN_ORDER_STATUSES, TWO_LEG_FENCE, Sleeve, Store, is_backtest, is_dust,
+                               utcnow)
 from sleeve_fund.strategies import check_perp_sizing, check_perp_stop
 from sleeve_fund.paper.runtime import entry_blocked, liquidation_head, said_since_last_fill
 from sleeve_fund.strategies.base import EXITS_ONLY
@@ -813,6 +814,36 @@ class Supervisor:
                 self._start(sleeve.name, proc)
             elif action == "none" and proc.alive and proc.crashes and now - proc.started_at > STARTUP_GRACE:
                 proc.crashes = 0  # healthy again
+        self.close_dead_orders()
+
+    def close_dead_orders(self) -> None:
+        """F-REFRESH-RES (HoE, DA): a Strategy put away whose process is gone can't fill an order its journal still
+        shows open (the simulated venue went with the process), and that order's room would keep it, and the PM's
+        refresh, waiting forever. Each one still in the book (not yet withdrawn) has those orders closed and the room
+        released (Store.close_dead_orders), but only once its process is confirmed gone: none of ours alive, and its
+        single-instance lock free, so no process started elsewhere holds it either. The lock is held while it closes,
+        so none can start meanwhile. Paper only; one failing never holds up the rest."""
+        from sleeve_fund.paper.single_lock import instance_lock
+
+        withdrawn = self.store.withdrawn()
+        for name in self.store.archived():
+            if name in withdrawn or is_backtest(name):
+                continue
+            runner = name.split("~", 1)[0]  # a leg is traded by its Strategy's own process
+            if self.procs.get(runner, Proc()).alive or self.procs.get(name, Proc()).alive:
+                continue
+            try:
+                if self.store.account_of(name) != "paper":
+                    continue
+                lock = instance_lock(runner)
+                if lock is None:  # a live process holds it: not confirmed gone
+                    continue
+                try:
+                    self.store.close_dead_orders(name, "put away, and its process has stopped")
+                finally:
+                    lock.close()
+            except Exception as exc:  # noqa: BLE001 - the next poll tries again; the dashboard shows why
+                self.store.event(name, "error", "supervisor_error", f"closing a stopped Strategy's orders: {exc!r}")
 
     def true_up_stopped(self) -> None:
         """True up every strategy without a running process (true_up_stopped); one failing never holds up the rest."""
