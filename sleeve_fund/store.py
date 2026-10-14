@@ -72,6 +72,20 @@ RAL = "reset_after_liquidation"
 # references re-based at its equity now, journaled as an event of this kind; the command tells a running process.
 BOOK_RESET = "book_reset"
 COMMANDS = {"pause", "resume", "flatten", RAL, BOOK_RESET}
+# The reason the supervisor gives the flatten it sends every holder under a portfolio halt (Supervisor.
+# _halt_every_strategy). A command carries no actor, so the words a flatten leaves on a strategy come from this
+# (F-HALTREF-2): "flattened by the portfolio halt", not "flattened by PM".
+HALT_FLATTEN = "Portfolio halted: "
+HALT_WORDS = "flattened by the portfolio halt"
+
+
+def flattened_words(reason: str) -> str:
+    """A strategy's status words for a flatten given with this reason."""
+    if reason.startswith(HALT_FLATTEN):
+        return f"{HALT_WORDS}: {reason[len(HALT_FLATTEN):]}"
+    return f"flattened by PM: {reason}"
+
+
 # Applied by the supervisor, not the strategy: restart the process so it trades under settings the PM
 # changed (Store.change_settings).
 RELOAD = "reload"
@@ -3233,8 +3247,9 @@ class Store:
                     commands_t.c.sleeve == sleeve, commands_t.c.applied_at.is_(None),
                     commands_t.c.command.in_(("pause", "flatten"))).order_by(commands_t.c.id)) if r.reason not in system]
                 if asked:
-                    words = "flattened by PM" if asked[-1].command == "flatten" else "paused by PM"
-                    hold = {"status": "paused", "status_reason": f"{words}: {asked[-1].reason}", "paused_until": None}
+                    words = (flattened_words(asked[-1].reason) if asked[-1].command == "flatten"
+                             else f"paused by PM: {asked[-1].reason}")
+                    hold = {"status": "paused", "status_reason": words, "paused_until": None}
             if hold:
                 c.execute(insert(reset_holds_t).values(reset_id=rid, **hold))
         if cleared:
@@ -4243,10 +4258,10 @@ class Store:
         if held != "halted":  # never downgrade a halt, as the paper process doesn't
             # The reset drops pending commands and starts the run afresh, so record the pause the paper process
             # would have set (paper.runtime) as the hold split_run carries over.
-            words = "flattened by PM" if command == "flatten" else "paused by PM"
+            words = flattened_words(reason.strip()) if command == "flatten" else f"paused by PM: {reason.strip()}"
             c.execute(reset_holds_t.delete().where(reset_holds_t.c.reset_id == req.id))
-            c.execute(insert(reset_holds_t).values(reset_id=req.id, status="paused",
-                                                   status_reason=f"{words}: {reason.strip()}", paused_until=None))
+            c.execute(insert(reset_holds_t).values(reset_id=req.id, status="paused", status_reason=words,
+                                                   paused_until=None))
         return True
 
     def add_missing_param(self, sleeve: str, key: str, value) -> bool:

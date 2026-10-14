@@ -54,7 +54,7 @@ from sleeve_fund.research.ledger import IdeaLedger, opened_words
 from sleeve_fund.research.holdout import HoldoutLocks
 from sleeve_fund.research.trials import TrialsRegister
 from sleeve_fund.risk import PROFILES, leverage_cap
-from sleeve_fund.store import BACKTEST_PREFIX, LIQUIDATION_RESET, RAL, Store, is_backtest, utcnow
+from sleeve_fund.store import BACKTEST_PREFIX, HALT_FLATTEN, LIQUIDATION_RESET, RAL, Store, is_backtest, utcnow
 from sleeve_fund.paper.runtime import (EXITS_ONLY, RESUMABLE, clearing_action, entry_blocked, liquidation_event,
                                       pair_ral_figures)
 from sleeve_fund.strategies import REGISTRY, check_perp_sizing, check_perp_stop
@@ -2342,7 +2342,8 @@ KIND_WORDS = {"handler_failed": "Strategy error", "maker_fill_above_tape": "Make
               "backup_problem": "Backup problem", "exits_change": "Exits changed", "settings_applied": "Settings applied",
               "stop_rejected": "Stop refused", "stop_reset": "Stop reset", "exits_applied": "Exits applied", "warmup_short": "Short warm-up",
               "start_refused": "Start refused",
-              "account_move": "Moved account", "portfolio_carried_invalid": "Portfolio not marked"}
+              "account_move": "Moved account", "portfolio_carried_invalid": "Portfolio not marked",
+              "pm_flatten": "Flattened by PM"}
 
 
 def action_words(action: str) -> str:
@@ -2712,7 +2713,10 @@ def _timeline(events: list[dict], decisions: list[dict]) -> list[dict]:
             continue
         kind = ("decisions" if k.startswith("pm_") else "trades" if k in _TRADE_KINDS
                 else "risk" if k in _RISK_KINDS or e["level"] in ("warning", "error") else "system")
-        rows.append({"ts": e["ts"], "kind": kind, "level": e["level"], "title": kind_words(k), "text": e["message"]})
+        # The portfolio halt's flatten rides the PM's (its intent is pm_flatten) but isn't the PM's (F-HALTREF-2).
+        title = ("Flattened by the portfolio halt" if k == "pm_flatten" and e["message"].startswith(HALT_FLATTEN)
+                 else kind_words(k))
+        rows.append({"ts": e["ts"], "kind": kind, "level": e["level"], "title": title, "text": e["message"]})
     for d in decisions:
         rows.append({"ts": d["ts"], "kind": "decisions", "level": "info", "title": action_words(d["action"]),
                      "text": f"by {d['actor']}: {d['reason']}"})
