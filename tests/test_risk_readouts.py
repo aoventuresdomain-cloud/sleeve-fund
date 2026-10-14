@@ -21,7 +21,7 @@ AUTH = ("pm", "test-pw")
 
 def _hold(store, name, qty, price=60_000.0, entry=60_000.0, strategy="ping_pong", params=None, stop_frac=None):
     """A strategy holding qty at entry, marked at price, with the entry's stop journaled as stop_frac (None: none)."""
-    store.create_sleeve(name=name, strategy=strategy, instrument="BTC/USD", bar_spec="1-HOUR-LAST-INTERNAL",
+    store.create_sleeve(name=name, strategy=strategy, instrument="BTC/USDT", bar_spec="1-HOUR-LAST-INTERNAL",
                         starting_balance=10_000, params=PERP if params is None else params,
                         risk_profile="conservative")
     side = "BUY" if qty > 0 else "SELL"
