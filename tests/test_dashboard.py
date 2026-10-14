@@ -2306,6 +2306,16 @@ def test_the_spot_exposure_reads_on_its_own_with_no_entry_cap(client):
         assert gone not in page, gone
 
 
+def test_the_position_size_reads_as_a_share_of_the_fund_not_a_cap(client):
+    """TEC-FE-CAP amendment (HoE ruling, 14 Oct 2026): the profile's share is the Strategy's sizing setting, shown in
+    the Advisor's words in Settings; never a cap."""
+    c, store = client
+    _new(c)
+    page = c.get("/sleeves/btc-test", auth=AUTH).text
+    row = re.search(r'<tr><th scope="row">Position size</th><td data-position-size>([^<]+)</td></tr>', page)
+    assert row and row.group(1) == "33% of the fund"
+
+
 def test_an_atr_stop_says_it_is_the_simple_atr_and_the_chart_draws_it(client):
     """atr-149 A2: the models' ATR stops use the simple ATR, the chart's ATR is Wilder's, so wherever the
     position's stop is shown its basis says "simple ATR", and the chart draws the stop level itself."""
