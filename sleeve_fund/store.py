@@ -1989,6 +1989,38 @@ class Store:
             led = self.__dict__["_settle_ledger"] = DbLedger(self, no_book)
         return led
 
+    def close_dead_orders(self, sleeve: str, why: str, ts: datetime | None = None) -> list[str]:
+        """F-REFRESH-RES (HoE, Drop A SHOULD): a paper Strategy's process is confirmed stopped, so the simulated venue
+        its orders rested at went with it and none of them can fill. Each order the journal still shows open is
+        closed as canceled with `why` (its reservation released as 'cancel' with it, as any cancel's is), and any
+        reservation of the Strategy holding no order is released too, in one transaction with one event. Call it only
+        after the process has exited (Supervisor._stop waits for it). Refused for a live account: a venue order
+        outlives the process. Returns the orders closed."""
+        if self.account_of(sleeve) != "paper":
+            raise ValueError(f"{sleeve} trades on a live account: its orders outlive its process, so none is closed")
+        ts = ts or utcnow()
+        d, r = gate_decisions_t, gate_reservations_t
+        with self.engine.begin() as c:
+            open_ids = [o for (o,) in c.execute(select(orders_t.c.order_id).where(
+                orders_t.c.sleeve == sleeve, orders_t.c.status.in_(OPEN_ORDER_STATUSES)).order_by(orders_t.c.id))]
+            for oid in open_ids:
+                self._retry_held.discard(oid)  # a second leg's retry hold dies with its process too
+                self._update_order(c, oid, status="canceled", message=f"closed: {why}")
+            sid = c.execute(select(sleeves_t.c.id).where(sleeves_t.c.name == sleeve)).scalar()
+            orphans = [rid for (rid,) in c.execute(select(r.c.decision_id).join(d, d.c.id == r.c.decision_id).where(
+                r.c.sleeve_id == sid, r.c.released_at.is_(None), d.c.order_id.is_(None)))]
+            if orphans:
+                led = self._gate_ledger()
+                with led.using(c):
+                    for rid in orphans:
+                        led.release(rid, "cancel")
+            if open_ids or orphans:
+                c.execute(insert(events_t).values(
+                    sleeve=sleeve, ts=ts, level="info", kind="orders_closed_stopped",
+                    message=f"{why}: its process has stopped, so {len(open_ids)} order(s) still shown open can't fill "
+                            "and are closed, and the room they or the Strategy held in the book is released"))
+        return open_ids
+
     def _settle_reservation(self, c, order_id: str, fill_qty, status: str | None) -> None:
         """An entry's fills and end settle the reservation it holds, in the order's own transaction (HoQA w2b, w2c):
         a fill reduces it (filled to nothing, it is released as 'fill'); a filled order releases what is left as
