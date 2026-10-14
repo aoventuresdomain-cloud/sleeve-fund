@@ -372,7 +372,7 @@
 
 {# One confirmation dialog per command: says exactly what will happen before it does. #}
 {# F-T-2 (Advisor Addition A): a Resume while the fill hold is on clears the hold and nothing else. #}
-{% set fill_hold_words = 'A fill wasn\'t handled ' ~ (fill_hold.ts|ts if fill_hold else '') ~ ', so its book may be off and it has opened nothing new since. Check its position and orders first. Resuming clears the fill hold only' ~ (': it stays ' ~ s.status ~ ' until that is lifted its own way.' if s.status in ['halted', 'stopped'] else ', and it trades again on its next signal.') %}
+{% set fill_hold_words = 'A fill wasn\'t handled ' ~ (fill_hold.ts|ts if fill_hold else '') ~ ', so its book may be off and it has opened nothing new since. Check its position and orders first. Resuming clears the fill hold only: anything stricter on it, a halt, a stop or a pause, stays until it is lifted its own way.' %}
 {% set dialogs = {
   'close': ('Close the ' ~ s.instrument ~ ' position', 'It ' ~ ('buys back ' if x.qty < 0 else 'sells ') ~ (x.qty|abs|qty) ~ ' ' ~ base ~ ' (about ' ~ (x.position_value|abs|money) ~ ' ' ~ quote ~ ') at market, paying the taker fee. This is the same as Flatten: the strategy pauses once it has sent the order, so it doesn\'t enter again until you resume it.', 'Close and pause', 'danger'),
   'pause': ('Pause ' ~ s.name, 'Stops new entries. Any position is kept and its stop-loss still applies.', 'Pause strategy', ''),
