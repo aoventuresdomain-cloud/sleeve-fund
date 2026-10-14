@@ -208,3 +208,38 @@ def test_a_second_rebase_counts_capital_from_its_own_flow_not_one_applied_at_the
     st = _mark(store, T0 + MIN)
     assert [e[1] for e in _ended(store)] == [True, True, True]
     assert supervisor.fund_book(store).capital == D(50_000) == st.equity
+
+
+def _covered(store, name, intent, at, oid):
+    """A fill on an order of `intent` that left `name` 300 below zero, and the insurance credit naming it."""
+    store.record_order(name, order_id=oid, side="SELL", qty=1.0, intent=intent, reason="QA", signal={}, ts=at)
+    store.record_fill(name, side="BUY", qty=1.0, price=1_000.0, fee=0.0, order_id=f"{oid}-in", trade_id=f"{oid}-in",
+                      ts=at)
+    store.record_fill(name, side="SELL", qty=1.0, price=700.0, fee=0.0, order_id=oid, trade_id=f"{oid}-t", ts=at)
+    store.record_insurance(name, price=700.0, amount=300.0, order_id=oid, trade_id=f"{oid}-t", ts=at)
+
+
+def test_an_insurance_credit_naming_no_liquidation_fill_holds_entries_with_one_alert(store):  # noqa: F811
+    """MUST-FUNDCASH-LOSS (HoE): a 0-capital Strategy's stop-out loss credited back as insurance hides from the cash
+    leg (both readers count insurance); the insurance leg holds new entries, alerts once, and a Resume lifts it for
+    that credit."""
+    _rebased(store)
+    _make(store, "x", 0)
+    _covered(store, "x", "stop_loss", T0 + MIN, "s1")
+    _mark(store, T0 + 2 * MIN)
+    _mark(store, T0 + 3 * MIN)
+    assert len(_alerts(store)) == 1 and "x: an insurance credit of 300.00 names no liquidation fill" in _alerts(store)[0]
+    assert _entry(store, T0 + 3 * MIN).outcome == "rejected"
+    with pytest.raises(ValueError, match="must name"):
+        store.record_insurance("x", price=1.0, amount=1.0, ts=T0 + 3 * MIN)
+    supervisor.resume_identity_hold(store, "pm", "QA: the credit is QD's bug, fixed", now=T0 + 4 * MIN)
+    _mark(store, T0 + 5 * MIN)
+    assert _entry(store, T0 + 5 * MIN).outcome == "approved" and len(_alerts(store)) == 1
+
+
+def test_an_insurance_credit_for_a_liquidation_fill_is_no_break(store):  # noqa: F811
+    _rebased(store)
+    _make(store, "x", 0)
+    _covered(store, "x", "liquidation", T0 + MIN, "l1")
+    _mark(store, T0 + 2 * MIN)
+    assert _alerts(store) == [] and supervisor.insurance_breaks(store) == []
