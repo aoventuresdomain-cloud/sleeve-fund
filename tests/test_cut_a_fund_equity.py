@@ -138,3 +138,22 @@ def test_a_gain_not_yet_taken_anywhere_in_the_fund_never_sizes_an_entry_up(tmp_p
                                                            day_start_equity=marked))
     s = SimpleNamespace(runtime=SimpleNamespace(store=store, now=lambda: T0), log=SimpleNamespace(warning=print))
     assert LongFlatStrategy._paper_fund_equity(s) == pytest.approx(19_995.0)
+
+
+def test_inside_the_fund_the_strategys_own_open_risk_check_never_refuses_an_entry():
+    """CUT-A (d): the per-Strategy interim open-risk refusal read the Strategy's own book; inside the fund the gate's
+    whole-fund open-risk limit (T3) judges the entry, under its own name."""
+    s = SimpleNamespace(_stop_frac=0.02, pair=None, _backtest=False, _fund_held=lambda: True)
+    assert LongFlatStrategy._open_risk_refusal(s, 1, 10.0, 60_000.0, 0.0, 0) is None  # equity 0: nothing of its own
+
+
+def test_the_fund_figure_is_pe2s_reader_once_it_is_there(tmp_path, monkeypatch):
+    """PE2's supervisor.sizing_equity (the book less every position's gain not yet taken, None when stale) replaces the
+    raw mark once merged; None from it is refused."""
+    import sleeve_fund.supervisor as sup
+
+    s = SimpleNamespace(runtime=SimpleNamespace(store=None, now=lambda: T0), log=SimpleNamespace(warning=print))
+    monkeypatch.setattr(sup, "sizing_equity", lambda store, now=None: D("18000"), raising=False)
+    assert LongFlatStrategy._paper_fund_equity(s) == 18_000.0
+    monkeypatch.setattr(sup, "sizing_equity", lambda store, now=None: None, raising=False)
+    assert LongFlatStrategy._paper_fund_equity(s) is None

@@ -1636,6 +1636,8 @@ class LongFlatStrategy(Strategy):
             if open_risk.check_entry(equity, 0.0, risk):
                 self.open_risk_binds += 1
             return None
+        if self._fund_held():
+            return None  # CUT-A (d): the fund's own open-risk limit (the gate's T3) judges it, never this Strategy's book
         from sleeve_fund.venues import venue as venue_profile
 
         now = self.runtime.now()
@@ -5062,10 +5064,19 @@ class LongFlatStrategy(Strategy):
         """Paper's fund equity: the supervisor's last portfolio mark, or None when it is stale by the book's own rule
         (gate.MARK_STALE, the one that already blocks entries) or can't be read (Advisor SIZE-FUND Q5: stale is
         refused, never sized off)."""
+        from sleeve_fund import supervisor
         from sleeve_fund.gate_ledger import DbLedger
         from sleeve_fund.paper.runtime import _no_positions
         from sleeve_fund.portfolio import gate
 
+        reader = getattr(supervisor, "sizing_equity", None)  # PE2's fund figure (Q5: + min(0, unrealised)), once merged
+        if reader is not None:
+            try:
+                fund = reader(self.runtime.store, self.runtime.now())
+            except Exception as exc:  # noqa: BLE001 - fail closed: an unread book sizes nothing
+                self.log.warning(f"fund equity unreadable: {type(exc).__name__}: {exc}")
+                return None
+            return None if fund is None else float(fund)
         try:
             st = DbLedger(self.runtime.store, _no_positions).state()
         except Exception as exc:  # noqa: BLE001 - fail closed: an unread book sizes nothing
