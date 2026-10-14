@@ -389,6 +389,19 @@ class SleeveRuntime:
         rt.backtest = True
         return rt
 
+    @property
+    def halts(self) -> bool:
+        return self._halts
+
+    @halts.setter
+    def halts(self, on: bool) -> None:
+        """Turning the halts off is for a backtest's runtime only (HoE, F240-1): a paper or live Strategy without its
+        drawdown halt and daily-loss pause must never trade."""
+        if not on and not self.backtest:
+            raise ValueError(f"{self.name}: the drawdown halt and daily-loss pause can be turned off in a backtest "
+                             "only, never in paper or live")
+        self._halts = bool(on)
+
     def risk_events(self) -> list[dict]:
         """Halts and pauses, oldest first, for a backtest to show."""
         kinds = ("risk_halt", "risk_pause", "resume", "reconcile_mismatch", "liquidation", "liquidation_cut")
@@ -405,6 +418,9 @@ class SleeveRuntime:
         sleeve = self.store.sleeve(sleeve_name)
         self.profile = risk.profile(sleeve.risk_profile)
         self.cap = risk.position_cap(self.profile, sleeve.params)  # on a perp, the margin cap times the leverage cap
+        # The profile's drawdown halt and daily-loss pause act. Off only in a research backtest's ablation 1x pair
+        # (research.ablation.one_x_runtime, CR F235-5); never in paper or live (the halts setter and on_start, F240-1).
+        self._halts = True
         self.starting_balance = sleeve.starting_balance
         self.status = sleeve.status
         self.paused_until = sleeve.paused_until
@@ -502,6 +518,9 @@ class SleeveRuntime:
     # --- lifecycle ------------------------------------------------------------
 
     def on_start(self, taker_fee: float, now=None) -> None:
+        if not self._halts and not self.backtest:  # however it got here (F240-1): refuse before anything is sent
+            raise RuntimeError(f"{self.name} won't start: its drawdown halt and daily-loss pause are off, which only a "
+                               "backtest may run")
         self.taker_fee = taker_fee
         if now is not None:
             self.now = now
@@ -955,7 +974,7 @@ class SleeveRuntime:
                 flatten, self.flatten_why = True, ("risk_halt", f"Risk halt: {ruined}")
         elif self.status == "running":
             judged = min(equity, guard_equity) if guard_equity is not None else equity
-            breach = risk.check(self.profile, judged, self.peak, self._day_open)
+            breach = risk.check(self.profile, judged, self.peak, self._day_open, self.halts)
             if breach and breach.action == "halt":
                 self._set("halted", breach.reason)
                 self.store.event(self.name, "error", "risk_halt", breach.reason + "; flattened, PM must resume", ts=self.now())
@@ -973,7 +992,7 @@ class SleeveRuntime:
             # pause; a daily-loss breach flattens and is journaled but keeps the pause it was in, so a PM pause or an
             # exits-only start is never turned into one the 00:00 roll lifts. A daily pause already flattened.
             judged = min(equity, guard_equity) if guard_equity is not None else equity
-            breach = risk.check(self.profile, judged, self.peak, self._day_open)
+            breach = risk.check(self.profile, judged, self.peak, self._day_open, self.halts)
             if breach and breach.action == "halt":
                 self._set("halted", breach.reason)
                 self.store.event(self.name, "error", "risk_halt", breach.reason + "; flattened, PM must resume",
