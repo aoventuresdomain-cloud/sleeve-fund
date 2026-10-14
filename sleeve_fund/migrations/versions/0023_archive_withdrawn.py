@@ -7,7 +7,7 @@ each out with its own flow (Advisor 14 Oct 09:45 UK). A reset's run is archived 
 
 Additive only; nothing existing is edited. Skipped when a Store on the same code built the column first (create_all).
 
-Revision ID: 0022
+Revision ID: 0023
 Revises: 0020
 Create Date: 2026-10-14 10:00:00.000000
 """
@@ -18,7 +18,7 @@ import sqlalchemy as sa
 EXACT = sa.Numeric(38, 18)  # as sleeve_fund.exact, frozen here
 
 
-revision = '0022'
+revision = '0023'
 down_revision = '0020'
 branch_labels = None
 depends_on = None

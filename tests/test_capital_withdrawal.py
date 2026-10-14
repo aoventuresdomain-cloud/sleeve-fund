@@ -205,3 +205,38 @@ def test_the_withdrawal_is_journaled_as_capital_not_pnl(store):
     led = DbLedger(store, lambda: ())
     assert led.state().equity == D(16_000)
     assert "isn't a gain or a loss" in _flows(store)[0]
+
+
+# --- W12, W13: put away twice, and a reset's run (DA schema review, 14 Oct) ------------------------------------------------
+
+def test_w12_putting_away_again_keeps_the_withdrawal_and_adds_no_second_flow(store):
+    """Archive then retire, or archive twice: already out of the book, so the row keeps its amount and when it went,
+    and nothing flows again."""
+    _make(store, "a", 15_000)
+    _make(store, "b", 5_000)
+    _trade(store, "b", 1_000)
+    _mark(store, T0)
+    store.archive("b")
+    went = store.archived()["b"]
+    _trade(store, "a", 500)  # the book moves on; b's figure must not be read again
+    marked = _four(_mark(store, T0 + timedelta(minutes=1)))
+    store.archive("b")
+    store.set_lifecycle("b", "retire", "pm", "done with it", now=T0 + timedelta(minutes=2))
+    assert store.withdrawn() == {"b": D(6_000)} and store.archived()["b"] == went
+    assert len(_flows(store)) == 1 and _four(_state(store)) == marked and marked[0] == D(15_500)
+    assert supervisor.fund_equity(store) == D(15_500)
+
+
+def test_w13_withdraw_archived_keys_on_reset_runs_so_never_takes_a_runs_cash_out(store):
+    """A reset's run is archived with withdrawn NULL, the same as an archive from before F-C3B-A; withdraw-archived
+    tells them apart by store.reset_runs() and leaves the run's cash in the book."""
+    _make(store, "a", 10_000)
+    _mark(store, T0)
+    _trade(store, "a", 1_000)
+    _mark(store, T0 + timedelta(minutes=1))
+    run = _reset(store, "a")
+    assert run in store.archived() and run in store.reset_runs() and run not in store.withdrawn()
+    before = _four(_mark(store, T0 + timedelta(minutes=2)))
+    assert supervisor.withdraw_archived(store, "operator", "abc1234") == []
+    assert _flows(store) == [] and store.withdrawn() == {}
+    assert _four(_mark(store, T0 + timedelta(minutes=3))) == before

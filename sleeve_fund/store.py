@@ -447,7 +447,7 @@ sleeve_archive_t = Table(
     metadata,
     Column("sleeve", String(64), ForeignKey("sleeves.name"), primary_key=True),
     Column("archived_at", TS, nullable=False),
-    # F-C3B-A (0022): the equity it took out of the fund's book when it was put away, with its flow; NULL for an archive
+    # F-C3B-A (0023): the equity it took out of the fund's book when it was put away, with its flow; NULL for an archive
     # made before that (still counted until supervisor withdraw-archived) and for a reset's run (its cash stays).
     Column("withdrawn", EXACT),
 )
@@ -1603,6 +1603,11 @@ class Store:
         with self._book_move(amount, lambda: f"{sleeve} put away ({why}): its equity {taken[0]:,.2f} leaves the "
                                              "fund's book", ts) as c:
             yield c
+            # Put away again (archived, then retired; a second archive): already out, so it keeps its row, its
+            # amount and when it went, with no second flow (DA, 14 Oct).
+            if c.execute(select(sleeve_archive_t.c.sleeve).where(sleeve_archive_t.c.sleeve == sleeve,
+                                                                 sleeve_archive_t.c.withdrawn.is_not(None))).first():
+                return
             out = taken[0] if taken else part()  # nothing marked yet: no flow, but out of the book all the same
             c.execute(sleeve_archive_t.delete().where(sleeve_archive_t.c.sleeve == sleeve))
             c.execute(insert(sleeve_archive_t).values(sleeve=sleeve, archived_at=ts, withdrawn=stored(out)))
