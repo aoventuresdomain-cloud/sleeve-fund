@@ -24,6 +24,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -77,9 +78,10 @@ def bars(history, venue: str, pair: str, minutes: int, start: datetime, end: dat
 
 
 def replay(store, s, start: datetime, end: datetime, capital: Decimal, equity: Decimal, history=None,
-           instrument=None, run=None):
+           instrument=None, run=None, wait: float = 0.0):
     """The portfolio backtest of `s` alone over [start, end], fed what paper had. Returns (result, why): why is set
-    when the stored bars can't cover the window, and the run isn't made."""
+    when the stored bars can't cover the window, and the run isn't made. wait: seconds to wait for the bar closing at
+    `end` to reach the history store (B7 runs straight after B3, before that bar may have closed)."""
     from sleeve_fund import markets, spreads
     from sleeve_fund.data import spec_minutes
     from sleeve_fund.history import HistoryStore
@@ -91,9 +93,17 @@ def replay(store, s, start: datetime, end: datetime, capital: Decimal, equity: D
     profile = venue((s.venue or "").lower())
     history = history or HistoryStore(os.environ.get("HISTORY_DIR"))
     minutes = spec_minutes(s.bar_spec)
-    warm, window = bars(history, profile.name, s.instrument, minutes, start, end, ATR_DAYS + 1)
+    deadline = time.monotonic() + wait
+    while True:
+        warm, window = bars(history, profile.name, s.instrument, minutes, start, end, ATR_DAYS + 1)
+        if (not window.empty and window.index[-1].to_pydatetime() >= end) or time.monotonic() >= deadline:
+            break
+        time.sleep(15)
     if window.empty or window.index[0].to_pydatetime() != start:
         return None, f"the history store has no {minutes}-minute bar closing at {start:%H:%M:%S} UTC"
+    if window.index[-1].to_pydatetime() < end:
+        return None, (f"the history store has no {minutes}-minute bar closing at {end:%H:%M:%S} UTC yet, the one the "
+                      "replay needs after the last decided bar: re-run B7 alone (check=replay) once it has")
     exec_prices = window if minutes == 1 else bars(history, profile.name, s.instrument, 1, start, end, 0)[1]
     if instrument is None:
         base, quote = s.instrument.split("/")
@@ -107,7 +117,8 @@ def replay(store, s, start: datetime, end: datetime, capital: Decimal, equity: D
 
 
 def parity(store, name: str, since: datetime, until: datetime | None = None, history=None, instrument=None,
-           run=None) -> int:
+           run=None, wait: float = 0.0) -> int:
+    from sleeve_fund.data import spec_minutes
     from sleeve_fund.research import portfolio
     from sleeve_fund.research.replay_parity import (
         compare,
@@ -144,9 +155,13 @@ def parity(store, name: str, since: datetime, until: datetime | None = None, his
     if fig["profile_version"] != PORTFOLIO.version:
         notes.append(f"paper decided under portfolio profile v{fig['profile_version']}, the replay v{PORTFOLIO.version}")
     start, end = first.bar_ts, until.replace(second=0, microsecond=0)
-    print(f"replay from the first decided bar {start:%H:%M} to {end:%H:%M} UTC: capital {capital:.2f}, fund equity "
-          f"{equity:.2f}, risk profile {s.risk_profile}")
-    result, why = replay(store, s, start, end, capital, equity, history, instrument, run)
+    # The backtest's gate pass for a bar runs just after its close (research.portfolio.BATCH_DELAY_NS), which the run
+    # reaches only on a later bar: a window of one bar decides nothing. So the replay runs one bar past `end`, and the
+    # decisions are compared over [start, end] only.
+    through = end + timedelta(minutes=spec_minutes(s.bar_spec))
+    print(f"replay from the first decided bar {start:%H:%M} to {end:%H:%M} UTC (run to {through:%H:%M}): capital "
+          f"{capital:.2f}, fund equity {equity:.2f}, risk profile {s.risk_profile}")
+    result, why = replay(store, s, start, through, capital, equity, history, instrument, run, wait)
     if why:
         return verdict("B7 replay parity", [why], notes)
     # A Strategy outside the fund's book (a test account, F229-6) is listed apart, never compared (F-P27-2).
@@ -228,7 +243,7 @@ def main(argv: list[str]) -> int:
     a = ap.parse_args(argv)
     print(json.dumps({"check": "b7", "at": datetime.now(UTC).isoformat(timespec="seconds")}))
     store = Store()
-    rc = parity(store, a.strategy, a.since, a.until)
+    rc = parity(store, a.strategy, a.since, a.until, wait=180.0)
     return dashboard(store, a.strategy, a.since) | rc
 
 
