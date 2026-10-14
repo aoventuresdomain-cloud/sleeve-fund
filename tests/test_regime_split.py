@@ -109,3 +109,14 @@ def test_naive_fill_times_are_read_as_utc():
     naive = {"opened": (DAYS[bull] + pd.Timedelta(minutes=1)).tz_localize(None).to_pydatetime(), "pnl": 1.0}
     d = {s.dimension: s for s in rs.split([naive], bars)}["direction"]
     assert {b.name: b.trades for b in d.buckets}["bull"] == 1
+
+
+def test_a_trade_s_labels_never_change_with_the_prices_after_its_entry():
+    # Point in time at entry: rewrite every close after the entry day and the trade lands in the same buckets.
+    path = _walk(4)
+    entry = 450
+    trip = [{"opened": DAYS[entry] + pd.Timedelta(hours=5), "pnl": 1.0}]
+    other = np.concatenate([path[: entry + 1], path[entry] * np.exp(np.cumsum(np.full(len(path) - entry - 1, 0.05)))])
+    tag = lambda close: {s.dimension: next(b.name for b in s.buckets if b.trades)  # noqa: E731
+                         for s in rs.split(trip, _bars(close))}
+    assert tag(path) == tag(other) and rs.UNLABELLED not in tag(path).values()
