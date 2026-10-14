@@ -380,13 +380,13 @@ class Pair:
         for each in (self.lead, self.follow):
             if each.pair is not self:
                 return "its coordinator is gone"
+            rt = each.runtime
+            if rt is not None and not rt.can_open():
+                return (rt.entry_blocked()[1] if not rt.backtest else None) or f"a leg is {rt.status}"
         if getattr(self, "_store", None) is not None:
             row = self._store.pair_state(self._parent)
             if row is None or (row["state"], row["trade_id"]) != ("legging", self.trade_id):
                 return "its coordinator lost the trade: the journal no longer holds it legging"
-            rt = each.runtime
-            if rt is not None and not rt.can_open():
-                return (rt.entry_blocked()[1] if not rt.backtest else None) or f"a leg is {rt.status}"
         if leg.runtime is not None and not leg.runtime.backtest:
             try:
                 router.check(leg.runtime.name, str(leg._cfg.instrument_id), leg.runtime.venue)
