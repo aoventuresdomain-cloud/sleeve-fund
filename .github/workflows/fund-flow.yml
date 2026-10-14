@@ -1,0 +1,68 @@
+name: fund-flow
+# Bridge A: journal a deposit to or withdrawal from the fund's capital (python -m sleeve_fund.fund). A dry run first
+# (the default) checks the request and writes nothing; the real run (dry_run false) writes the flow and its decision,
+# and the supervisor's next poll applies it in order, or refuses it with the reason. Paper only. It runs inside the
+# supervisor container, with the deploy workflow's secrets (DEPLOY_HOST, DEPLOY_SSH_KEY) and variable DEPLOY_USER, as
+# rebase.yml does. The log is public: the command prints only the kind, the amount, the flow's id and the outcome, and
+# ssh runs quiet so it names no host or user. The job fails when the command refuses (exit 1).
+on:
+  workflow_dispatch:
+    inputs:
+      kind:
+        description: "deposit or withdraw"
+        type: choice
+        options: [deposit, withdraw]
+        required: true
+      amount:
+        description: "Amount, e.g. 25000 or 1250.50"
+        type: string
+        required: true
+      reason:
+        description: "Why (letters, digits, spaces, . , : ( ) _ -)"
+        type: string
+        required: true
+      actor:
+        description: "Who asks for it (letters, digits, . _ -)"
+        type: string
+        required: true
+      dry_run:
+        description: "Only check it (untick to write it)"
+        type: boolean
+        default: true
+concurrency: { group: fund-flow, cancel-in-progress: false }  # one at a time; flows keep their order
+jobs:
+  fund-flow:
+    runs-on: ubuntu-24.04
+    permissions: { contents: read }
+    if: ${{ vars.DEPLOY_ENABLED == 'true' && github.ref == 'refs/heads/main' }}
+    env:
+      USER_AT: ${{ vars.DEPLOY_USER || 'root' }}
+    steps:
+      - name: Check the inputs
+        env:
+          AMOUNT: ${{ inputs.amount }}
+          REASON: ${{ inputs.reason }}
+          ACTOR: ${{ inputs.actor }}
+        # They go into the remote command line, so only plain words get through (the command checks them again).
+        run: |
+          [[ "$AMOUNT" =~ ^[0-9]{1,12}(\.[0-9]{1,2})?$ ]] || { echo "amount: digits, at most two decimals"; exit 1; }
+          [[ "$REASON" =~ ^[A-Za-z0-9\ .,:()_-]{1,200}$ ]] || { echo "reason: plain words only"; exit 1; }
+          [[ "$ACTOR" =~ ^[A-Za-z0-9._-]{1,32}$ ]] || { echo "actor: letters, digits, . _ - only"; exit 1; }
+      - name: Configure SSH
+        env:
+          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/id_deploy && chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts 2>/dev/null
+      - name: Journal the flow
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          KIND: ${{ inputs.kind }}
+          AMOUNT: ${{ inputs.amount }}
+          REASON: ${{ inputs.reason }}
+          ACTOR: ${{ inputs.actor }}
+          APPLY: ${{ inputs.dry_run == false && '--apply' || '' }}
+        run: |
+          ssh -o LogLevel=QUIET -i ~/.ssh/id_deploy "$USER_AT@$HOST" "cd /opt/sleeve-fund && sudo docker compose exec -T supervisor python -m sleeve_fund.fund $KIND $AMOUNT --actor '$ACTOR' --reason '$REASON' $APPLY"
