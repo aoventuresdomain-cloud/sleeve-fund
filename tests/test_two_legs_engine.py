@@ -377,3 +377,46 @@ def test_on_paper_a_pair_the_gate_refuses_sends_neither_leg(monkeypatch):
     gate, r = _gated(monkeypatch, D(0))
     assert gate.pairs and gate.singles == []
     assert _orders(r, "lead") == [] and _orders(r, "follow") == [] and r.trades == 0
+
+
+def test_a_second_leg_still_unfilled_a_bar_or_60_seconds_on_is_cancelled_and_the_first_unwound(monkeypatch):
+    """Ruling C's deadline: the spot leg (second out) rests at the venue and never fills. Within 60 s of the entry
+    (a daily bar is longer) it is cancelled and the perp leg unwound, with the alert; the pair state goes flat."""
+    from nautilus_trader.model import Price
+
+    real = LongFlatStrategy.submit_order
+
+    def rest_spot_entries(self, order, *a, **k):
+        coid = str(order.client_order_id)
+        if not isinstance(self, LegFollower) and (self.decisions.get(coid) or {}).get("intent") == "entry":
+            far = Price(self._price() / 2, self.instrument.price_precision)
+            order = self.order_factory.limit(instrument_id=order.instrument_id, order_side=order.side,
+                                             quantity=order.quantity, price=far)  # rests: never fills
+            self.decisions[str(order.client_order_id)] = self.decisions[coid]
+        return real(self, order, *a, **k)
+
+    monkeypatch.setattr(LongFlatStrategy, "submit_order", rest_spot_entries)
+    states = []
+    import sleeve_fund.research.two_leg_run as tlr
+
+    made = tlr.Pair
+
+    def watched(*a, **kw):
+        p = made(*a, **kw)
+        p.on_state = states.append
+        return p
+
+    monkeypatch.setattr(tlr, "Pair", watched)
+    r = _carry((2, 10))
+    follow = _orders(r, "follow")
+    assert [o["intent"] for o in follow[:2]] == ["entry", "leg_unwind"]
+    sent = pd.Timestamp(follow[0]["ts"])
+    assert pd.Timestamp(follow[1]["ts"]) - sent <= pd.Timedelta(seconds=61)
+    assert any(e["kind"] == BROKEN and "legged" in e["message"] for e in r.lead.journal.events_)
+    assert r.lead.fills.empty  # the resting spot entry was cancelled, never filled (the journal's row is the market
+    # order the fixture replaced, so its status isn't the venue's)
+    steps = {what: ts for ts, what, _ in reversed(r.pair_log)}  # each step's first time
+    assert steps["flat"] - steps["entry"] <= 61 * 10**9  # flat: nothing held and nothing still working
+    first = states[:3]
+    assert [s["state"] for s in first] == ["legging", "closing", "flat"]
+    assert first[0]["deadline_ns"] is not None and first[0]["trade_id"] == follow[0]["parent_trade_id"]

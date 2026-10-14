@@ -28,6 +28,7 @@ REHEDGE = 0.10  # the hedge leg is brought back to the ratio once it has drifted
 BROKEN = "two_leg_broken"  # the alert raised when a pair can't be completed and its first leg is unwound
 CLAMP = 0.5  # a perp leg's distance to liquidation below this share of its entry distance closes the pair (Advisor B)
 CLAMPED = "two_leg_liq_distance"  # the alert raised when it does
+LEG_TIMEOUT_NS = 60_000_000_000  # a legged state is unwound after one bar or this, whichever is first (Advisor C)
 # Ruling B's top-up (margin added from the perp leg's free cash) needs a venue profile that allows it; none does yet,
 # so the close is the path that runs (Advisor 14 Oct 05:35 UK).
 
@@ -83,7 +84,11 @@ class Pair:
                 leg.runtime.paired = True
         self.trade_id: str | None = None
         self.trades = 0
-        self.state = "flat"  # flat, legging (one leg sent or held without the other), hedged, closing
+        self._state = "flat"  # flat, legging (one leg sent or held without the other), hedged, closing
+        self.deadline_ns: int | None = None  # while legging: when the legged state is unwound if still legged
+        # Called with the pair's state (state, trade_id, deadline_ns) whenever it changes: paper keeps it in the journal
+        # so a restart recovers it (Advisor M3); a backtest has none.
+        self.on_state = None
         self.second: dict | None = None  # the leg still to send: leg, qty, reason, signal, tries
         self.sending: LongFlatStrategy | None = None  # the leg whose own _send_entry the pair is calling now
         self.closing_from: LongFlatStrategy | None = None
@@ -91,6 +96,31 @@ class Pair:
         self._entry_dist: dict[int, float] = {}  # a perp leg's distance to liquidation as a share of its entry
         self._clamped: int | None = None  # the bar the pair was last closed for its liquidation distance
         self.log: list[tuple[int, str, str]] = []  # (ts, what, detail): the pair's own steps, for tests and reports
+
+    # --- state -------------------------------------------------------------------------------------------------------
+
+    @property
+    def state(self) -> str:
+        return self._state
+
+    @state.setter
+    def state(self, value: str) -> None:
+        if value == self._state:
+            return
+        self._state = value
+        if value != "legging":
+            self.deadline_ns = None
+        if self.on_state is not None:
+            self.on_state({"state": value, "trade_id": self.trade_id, "deadline_ns": self.deadline_ns})
+
+    def _leg_timeout(self) -> int:
+        return min(bar_minutes(self.lead._cfg.bar_type) * 60_000_000_000, LEG_TIMEOUT_NS)
+
+    def _timed_out(self, trade_id: str) -> None:
+        """The legged state's deadline: still one leg without the other, so whatever is held is unwound and anything
+        still working is cancelled (ruling C: unwound within one bar or 60 s)."""
+        if self.state == "legging" and self.trade_id == trade_id:
+            self._broken(f"it was still legged {self._leg_timeout() / 1e9:.0f} s after its entry")
 
     # --- helpers -----------------------------------------------------------------------------------------------------
 
@@ -177,7 +207,11 @@ class Pair:
         self.trades += 1
         self.trade_id = f"{self._name()}-{self._now()}"
         first, self.second = (follow_part, lead_part) if self.first_out == "follow" else (lead_part, follow_part)
+        self.deadline_ns = self._now() + self._leg_timeout()
         self.state = "legging"
+        trade_id = self.trade_id
+        self.lead.clock.set_time_alert_ns(f"pair-deadline-{self.trades}", self.deadline_ns,
+                                          callback=lambda _e: self._timed_out(trade_id))
         self._note("entry", f"{self.trade_id}: {first['leg'] is self.lead and 'lead' or 'follow'} first")
         # After every venue's bar for this close (as a portfolio gate pass), so each leg fills on its own latest bar.
         self.lead.clock.set_time_alert_ns(f"pair-entry-{self.trades}", self._now() + DELAY_NS,
@@ -330,7 +364,7 @@ class Pair:
         # As after a stop: the model's signal must reset before the pair is tried again, not every bar while it holds.
         self.lead._exit_lock = self.sides[id(self.lead)] if self.lead._margin else True
         for leg in (self.lead, self.follow):
-            if not self._flat(leg):
+            if not self._flat(leg) or leg._working():  # a leg's entry still working is cancelled with it
                 self.closing_from = leg
                 try:
                     leg._sell_all("leg_unwind", f"Unwound: {why}")
@@ -467,6 +501,7 @@ class Pair:
     def _end(self) -> None:
         self._release(self.second)
         self._note("flat", self.trade_id or "")
-        self.state, self.second, self.trade_id = "flat", None, None
+        self.second, self.trade_id = None, None
+        self.state = "flat"
         self._entry_dist.clear()
 
