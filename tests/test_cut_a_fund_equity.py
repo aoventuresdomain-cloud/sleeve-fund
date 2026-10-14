@@ -179,9 +179,10 @@ def test_only_a_fund_held_strategy_after_the_re_base_loses_its_own_shortfall_cov
 
 
 @pytest.mark.parametrize("bridged, credit", [(True, 0.0), (False, 250.0)])
-def test_a_book_below_zero_once_flat_is_covered_only_outside_the_bridged_fund(bridged, credit):
+def test_a_book_below_zero_once_flat_is_covered_only_outside_the_bridged_fund(monkeypatch, bridged, credit):
     rows = []
-    s = SimpleNamespace(_fund_bridged=lambda: bridged, _mark=lambda: (-250.0, -250.0, 0.0, 60_000.0), _cash_adj=0.0,
+    monkeypatch.setattr(LongFlatStrategy, "_fund_bridged", lambda self: bridged)
+    s = SimpleNamespace(_mark=lambda: (-250.0, -250.0, 0.0, 60_000.0), _cash_adj=0.0,
                         insurance_log=[], clock=SimpleNamespace(utc_now=lambda: T0),
                         runtime=SimpleNamespace(name="s1", now=lambda: T0, store=SimpleNamespace(
                             record_insurance=lambda *a, **k: rows.append(k) or "new", event=lambda *a, **k: None)))
