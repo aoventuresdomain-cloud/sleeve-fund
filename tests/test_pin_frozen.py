@@ -94,7 +94,7 @@ def test_the_journals_own_writers_still_pin_a_new_strategy_and_carry_the_pin_to_
     store.record_order("s", order_id="s-x", side="SELL", qty=1.0, intent="exit", reason="r")
     store.record_fill("s", side="SELL", qty=1.0, price=101.0, fee=0.0, order_id="s-x", trade_id="t2")  # flat: a reset
     store.request_reset("s", "Settings changed")
-    run = store.split_run(store.pending_resets()[0])  # moves the orders to the run, then copies the pin to it
+    run = store.split_run(store.pending_resets()[0])  # copies the pin to the run, then moves the orders to it
     assert _pin(store, run) == "BINANCE" and _pin(store, "s") == "BINANCE"
     assert router.venue_for(store.sleeve(run).venue) == "BINANCE"
 
