@@ -98,8 +98,12 @@ def spark_path(values: list[float], w: int = 96, h: int = 24) -> str:
 def book_view(store: Store, summaries: list[dict], frames: dict[str, pd.DataFrame]) -> dict:
     # Every strategy in the current book counts, stopped and archived ones included: their cash is still the
     # fund's, and stopping one must never rewrite the book's past. A clean slate starts a new book; the
-    # strategies it put away are an earlier book's, so the caller leaves them out (Store.previous_book).
-    active = summaries
+    # strategies it put away are an earlier book's, so the caller leaves them out (Store.previous_book). One put
+    # away whose equity the poll has taken out (Store.withdrawn, F-C3B-A) is out of the book, as fund_equity
+    # leaves it out (T-FIX4); it still lists as archived.
+    out = store.withdrawn()
+    active = [x for x in summaries if x["sleeve"].name not in out]
+    put_away = sum(x["equity"] for x in summaries if x["sleeve"].name in out)
     start = sum(x["sleeve"].starting_balance for x in active)
     equity = sum(x["equity"] for x in active)
     curve = book_curve(active, frames)
@@ -124,6 +128,10 @@ def book_view(store: Store, summaries: list[dict], frames: dict[str, pd.DataFram
                           if not x["healthy"] and x["sleeve"].desired_state == "running"}),
         "start": start,
         "equity": equity,
+        # Put away, not trading (Advisor on T-FIX4): what the withdrawn put-aways hold, apart from the book; the two
+        # add up to the capital of every Strategy in the current book.
+        "put_away": put_away,
+        "capital": equity + put_away,
         "pnl": equity - start,
         "ret": equity / start - 1 if start else 0.0,
         "bench_ret": (sum(x["benchmark"] for x in active) / start - 1) if start else 0.0,

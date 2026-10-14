@@ -76,6 +76,17 @@ def read_only_store(url: str):
     return store
 
 
+def check_store(engine: Engine) -> Section:
+    """Paper journals to Postgres only (the Independent Quant Advisor's condition on #286): SQLite has none of the row
+    locks the portfolio gate's reservations and the put-away flows rely on, so paper refuses to start on it."""
+    sec = Section("Journal store")
+    if engine.dialect.name == "postgresql":
+        sec.add(PASS, "Postgres")
+    else:
+        sec.add(FAIL, f"{engine.dialect.name}: paper must journal to Postgres")
+    return sec
+
+
 def check_keys(environ: dict[str, str], engine: Engine) -> Section:
     from sleeve_fund.mirror import ACCOUNTS as DEMO_ACCOUNTS
     from sleeve_fund.paper.safety import credential_var
@@ -168,19 +179,29 @@ def check_books(store) -> Section:
             sec.add(NOTE, f"{s.name}: {late} landed after its latest mark ({last['ts']:%H:%M:%S} UTC); compare "
                           "again after the next mark")
             continue
-        compared += 1
         # The reconcile's tolerances (SleeveRuntime.reconcile): a cent per fill for cash, float steps for the qty.
         cash_tol = 0.01 * (1 + 2 * book["fills"])
         scale = max(abs(float(last["qty"])), abs(float(book["qty"])))
         qty_tol = max(1e-8, (2 + book["fills"]) * math.ulp(scale))
         d_qty = float(Decimal(repr(float(last["qty"]))) - Decimal(repr(float(book["qty"]))))
         d_cash = float(last["cash"]) - float(book["cash"])
+        if fills and fills[0]["ts"] == last["ts"] and (abs(d_qty) > qty_tol or abs(d_cash) > cash_tol):
+            # A fill in the mark's own second (the runtime stamps both to the second) that the mark doesn't hold: the
+            # tick that sends a flatten marks before its fill is booked (MARK-ON-STOP). Not a wrong book, and not
+            # a skip that makes "nothing compared": a tie the mark does hold is compared below, as a tick that books
+            # a fill and then marks in one second is the usual case (HALT-REF-1's re-base reads it).
+            sec.add(NOTE, f"{s.name}: a fill in its latest mark's own second ({last['ts']:%H:%M:%S} UTC), which the "
+                          "mark predates; compare again after the next mark")
+            continue
+        compared += 1
         price, equity = float(last["price"]), float(last["equity"])
         want = float(book["cash"]) + float(book["qty"]) * price
         equity_tol = cash_tol + qty_tol * abs(price) + 4 * math.ulp(max(abs(want), abs(equity)))
         what = (f"{s.name}: position {_qty(last['qty']):.12g} vs journal {_qty(book['qty']):.12g}; "
                 f"cash {last['cash']:,.2f} vs journal {book['cash']:,.2f} ({book['fills']} fills)")
-        if abs(d_qty) > qty_tol or abs(d_cash) > cash_tol:
+        if abs(d_qty) > qty_tol:
+            sec.add(FAIL, f"{what}: the mark doesn't hold the journal's position: it predates or misses a fill")
+        elif abs(d_cash) > cash_tol:
             sec.add(FAIL, what)
         elif equity == 0.0 and want < 0 and markets.is_perp(s.params):
             # Isolated margin: a Strategy wiped out can't lose more than it had, so its mark is floored at zero. A
@@ -207,7 +228,7 @@ def run(url: str, environ: dict[str, str] | None = None) -> tuple[bool, str]:
     env = dict(os.environ if environ is None else environ)
     store = read_only_store(url)
     engine = store.engine
-    sections = [check_keys(env, engine), check_venues(engine), check_books(store)]
+    sections = [check_store(engine), check_keys(env, engine), check_venues(engine), check_books(store)]
     ok = not any(s.failed for s in sections)
     out = [f"Start check: {'PASS' if ok else 'FAIL'}",
            f"{datetime.now(UTC):%Y-%m-%d %H:%M} UTC, {journal_kind(url)} journal, read-only",

@@ -58,11 +58,13 @@ def test_start_and_stop_set_both_rows(tmp_path):
     assert store.sleeve("carry~2").desired_state == "running"
 
 
-def test_a_reset_after_liquidation_is_refused_on_either_leg(tmp_path):
+def test_a_reset_after_liquidation_with_no_liquidation_is_refused_on_either_leg(tmp_path):
+    """F283-O3 built it (tests/test_two_legs_ral.py): sent to the Strategy, it answers a liquidated leg's incident; with
+    no leg liquidated there is nothing to answer, and a second leg's row takes none of its own."""
     store = Store(f"sqlite:///{tmp_path}/t.db")
     _carry(store)
-    for name in ("carry", "carry~2"):
-        with pytest.raises(ValueError, match="isn't built for a two-leg Strategy"):
+    for name, words in (("carry", "isn't halted after a liquidation"), ("carry~2", "second leg of carry")):
+        with pytest.raises(ValueError, match=words):
             store.command(name, RAL, "after the liquidation", incident=1)
     assert _pending(store, "carry") == _pending(store, "carry~2") == []
 
@@ -166,35 +168,145 @@ def test_f283_2_a_portfolio_halt_flattens_a_holding_second_leg_through_its_first
     assert set(sup._flatten_told) == {"carry"}  # told once, as the Strategy, never the second leg's row alone
 
 
-def test_f283_2_a_clean_slate_flattens_and_starts_the_strategy_whole_and_archives_both_legs_once_flat(tmp_path):
+# --- T fence (HoE + Advisor, 14 Oct 18:00 UK) --------------------------------------------------------------------------
+# F-C3B-A (#286) puts one row away; how a two-leg Strategy leaves the fund's book is not built yet. Archive, unarchive,
+# retire, wind-down and a clean slate refuse it and change nothing; close-now never does (the PM's emergency exit).
+# These replace CR F283-2's whole-Strategy archive and clean-slate cells (HoE OK, 14 Oct 17:56 UK).
+FENCE = "isn't built for a two-leg Strategy yet, so nothing was changed"
+
+
+def _book(store):
+    return ([(r.name, r.lifecycle, r.desired_state) for r in store.sleeves(include_legs=True)], store.archived(),
+            store.withdrawn(), _pending(store, "carry"), _pending(store, "carry~2"),
+            [d["action"] for d in store.decisions(limit=1000)])
+
+
+def test_fence_a_clean_slate_with_a_two_leg_strategy_is_refused_whole_and_changes_nothing(tmp_path):
     from sleeve_fund import supervisor
 
     store = Store(f"sqlite:///{tmp_path}/t.db")
     _carry(store)
-    store.set_desired_state("carry", "stopped")
+    store.create_sleeve(name="solo", strategy="trend_filter", instrument="BTC/USD", bar_spec="1-HOUR-LAST-INTERNAL",
+                        starting_balance=1000)
     _leg_holds(store)
     path = tmp_path / "clear.toml"
     path.write_text('[[clear]]\nid = "s1"\nreason = "fresh book"\n')
-    assert supervisor.clear(store, str(path)) == []
-    assert _pending(store, "carry") == ["flatten"] and _pending(store, "carry~2") == ["flatten"]
-    assert store.sleeve("carry").desired_state == store.sleeve("carry~2").desired_state == "running"
-    assert store.archived() == {}
-    store.record_fill("carry~2", side="BUY", qty=0.05, price=60_000.0, fee=0.0, order_id="l3", trade_id="l3")
-    store.drop_pending("carry", "flat now")
-    assert supervisor.clear(store, str(path)) == ["carry"]
-    assert set(store.archived()) == {"carry", "carry~2"}
+    before = _book(store)
+    assert supervisor.clear(store, str(path)) == []  # never raised: the supervisor's poll goes on
+    assert _book(store) == before  # nothing flattened, stopped or archived, the single-leg Strategy neither
+    refused = store.events_of(("clear_refused",))
+    assert len(refused) == 1 and FENCE in refused[0]["message"] and "(carry)" in refused[0]["message"]
 
 
-def test_f283_2_archive_puts_both_legs_away_from_the_first_and_never_the_second_alone(tmp_path):
+@pytest.mark.parametrize("leg", ["carry", "carry~2"])
+def test_fence_archive_and_unarchive_refuse_either_leg_and_change_nothing(tmp_path, leg):
     store = Store(f"sqlite:///{tmp_path}/t.db")
     _carry(store)
     store.set_desired_state("carry", "stopped")
-    with pytest.raises(ValueError, match="second leg of carry"):
-        store.archive("carry~2")
-    store.archive("carry")
-    assert set(store.archived()) == {"carry", "carry~2"}
-    store.unarchive("carry")
-    assert store.archived() == {}
+    before = _book(store)
+    with pytest.raises(ValueError, match=FENCE):
+        store.archive(leg)
+    with pytest.raises(ValueError, match=FENCE):
+        store.unarchive(leg)
+    assert _book(store) == before
+
+
+def test_fence_every_put_away_refuses_a_leg_behind_the_named_routes_too(tmp_path):
+    """The backstop: the poll's withdrawal and withdraw-archived reach a row through _put_away, never one leg alone."""
+    from datetime import datetime, timezone
+
+    store = Store(f"sqlite:///{tmp_path}/t.db")
+    _carry(store)
+    for leg in ("carry", "carry~2"):
+        with pytest.raises(ValueError, match=FENCE):
+            with store._put_away(leg, datetime.now(timezone.utc), "testing"):
+                pass
+    assert store.archived() == {} and store.withdrawn() == {}
+
+
+@pytest.mark.parametrize("action", ["wind_down", "retire"])
+def test_fence_wind_down_and_retire_are_refused_and_change_nothing(tmp_path, action):
+    from sleeve_fund import lifecycle
+
+    store = Store(f"sqlite:///{tmp_path}/t.db")
+    _carry(store)
+    store.set_desired_state("carry", "stopped")
+    before = _book(store)
+    for leg in ("carry", "carry~2"):
+        with pytest.raises(ValueError, match=FENCE):
+            store.set_lifecycle(leg, action, lifecycle.PM, "testing")
+    assert _book(store) == before
+
+
+@pytest.mark.parametrize("holds", [False, True])
+def test_fence_close_now_is_never_refused_it_winds_the_strategy_down_due_now_and_never_retires_it(tmp_path, holds):
+    """Close-now, the PM's emergency exit (Advisor): flat or holding, the Strategy winds down, due now, so it opens
+    nothing and its runtime closes what it holds through the pair's unwind; its retire, a put-away, waits for that
+    design, so complete_retire leaves it winding down and nothing leaves the book."""
+    from sleeve_fund import lifecycle
+
+    store = Store(f"sqlite:///{tmp_path}/t.db")
+    _carry(store)
+    if holds:
+        _leg_holds(store)
+    s = store.set_lifecycle("carry", "close_now", lifecycle.PM, "testing")
+    assert s.lifecycle == lifecycle.WINDING_DOWN and s.wind_down_deadline is not None
+    assert store.complete_retire("carry") is False
+    assert store.sleeve("carry").lifecycle == lifecycle.WINDING_DOWN
+    assert store.archived() == {} and store.withdrawn() == {}
+    with pytest.raises(ValueError, match="second leg"):  # through the first leg's row only, as every PM action
+        store.set_lifecycle("carry~2", "close_now", lifecycle.PM, "testing")
+
+
+def test_fence_close_now_goes_through_the_dashboard_and_wind_down_does_not(client):
+    from sleeve_fund import lifecycle
+
+    c, store = client
+    r = c.post("/sleeves/carry/lifecycle", data={"action": "wind_down", "reason": "x"}, auth=AUTH, headers=SAME,
+               follow_redirects=False)
+    assert r.status_code == 303 and "isn%27t+built+for+a+two-leg+Strategy" in r.headers["location"]
+    assert store.sleeve("carry").lifecycle != lifecycle.WINDING_DOWN
+    r = c.post("/sleeves/carry/lifecycle", data={"action": "close_now", "reason": "x"}, auth=AUTH, headers=SAME,
+               follow_redirects=False)
+    assert r.status_code == 303 and "command_error" not in r.headers["location"]
+    assert store.sleeve("carry").lifecycle == lifecycle.WINDING_DOWN
+    r = c.post("/sleeves/carry~2/lifecycle", data={"action": "close_now", "reason": "x"}, auth=AUTH, headers=SAME,
+               follow_redirects=False)
+    assert r.status_code == 303 and "second+leg+of+carry" in r.headers["location"]
+
+
+def test_fence_a_single_leg_strategy_still_archives_and_retires_under_f_c3b_a(tmp_path):
+    """Single-leg F-C3B-A is unchanged beside a two-leg Strategy: archived on a book never marked, its equity is
+    taken out at once; retired, likewise."""
+    from sleeve_fund import lifecycle
+
+    store = Store(f"sqlite:///{tmp_path}/t.db")
+    _carry(store)
+    for name in ("solo", "solo2"):
+        store.create_sleeve(name=name, strategy="trend_filter", instrument="BTC/USD",
+                            bar_spec="1-HOUR-LAST-INTERNAL", starting_balance=1000, desired_state="stopped")
+    store.archive("solo")
+    assert set(store.archived()) == {"solo"} and set(store.withdrawn()) == {"solo"}
+    assert store.set_lifecycle("solo2", "retire", lifecycle.PM, "testing").lifecycle == lifecycle.RETIRED
+    assert set(store.withdrawn()) == {"solo", "solo2"}
+    store.unarchive("solo")
+    assert set(store.archived()) == {"solo2"}
+
+
+def test_fence_a_fund_halt_flattens_both_legs_and_reaches_no_fenced_function(tmp_path, monkeypatch):
+    """Advisor's condition (1), fund halt: both legs' flatten is queued through the first leg's row, and nothing on
+    the way puts the Strategy away or moves its lifecycle."""
+    from datetime import datetime, timezone
+
+    from sleeve_fund.supervisor import Supervisor
+
+    store = Store(f"sqlite:///{tmp_path}/t.db")
+    _carry(store)
+    _leg_holds(store)
+    for fn in ("_put_away", "archive", "unarchive", "set_lifecycle", "complete_retire"):
+        monkeypatch.setattr(Store, fn, lambda *a, _fn=fn, **k: pytest.fail(f"a halt reached {_fn}"))
+    Supervisor(store)._halt_every_strategy("testing", datetime.now(timezone.utc))
+    assert _pending(store, "carry") == ["flatten"] and _pending(store, "carry~2") == ["flatten"]
 
 
 def test_f283_2_the_kill_switch_tells_a_strategy_whose_second_leg_holds_through_its_first_legs_row(client):

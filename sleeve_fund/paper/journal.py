@@ -150,8 +150,9 @@ class MemoryJournal:
     def rebook_liquidation(self, order_id: str, reason: str, signal: dict, ts: datetime | None = None) -> None:
         row = self.orders_.get(order_id)
         _check_rebook(order_id, row)
+        was = row["intent"]
         row.update(intent="liquidation", reason=reason, signal=signal)
-        self.event(row["sleeve"], "info", "order_rebooked", _rebook_words(order_id, reason), ts=ts)
+        self.event(row["sleeve"], "info", "order_rebooked", _rebook_words(order_id, was, reason), ts=ts)
 
     def last_order(self, sleeve: str, intents: tuple[str, ...]) -> dict | None:
         rows = [o for o in self.orders_.values() if o["intent"] in intents]

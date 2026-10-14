@@ -251,6 +251,24 @@ def test_a_pair_whose_summed_book_draws_down_past_the_limit_halts_and_flattens_b
     assert r.pair_log[-1][1] == "flat"
 
 
+def test_fence_a_strategy_halt_closes_both_legs_through_the_pair_and_reaches_no_fenced_function(monkeypatch):
+    """Advisor's condition (1) for the T fence, Strategy halt: the summed drawdown halt closes both legs on one mark
+    under one trade id (the pair's unwind), and nothing on the way puts the Strategy away or moves its lifecycle."""
+    from sleeve_fund.store import Store
+
+    for fn in ("_put_away", "archive", "unarchive", "set_lifecycle", "complete_retire"):
+        monkeypatch.setattr(Store, fn, lambda *a, _fn=fn, **k: pytest.fail(f"a halt reached {_fn}"))
+    bars = _rising(days=40, daily=-0.03)
+    params = {"windows": [[int(bars.index[1].value), int(bars.index[-1].value) + 1]]}
+    r = run_two_legs("window", LegRun(SPOT, INST, bars), LegRun({**PERP, "side": 1}, INST), 10_000, params=params,
+                     risk_profile="conservative")
+    assert _halts(r.lead) and _halts(r.follow)
+    lead_close = next(o for o in _orders(r, "lead") if o["intent"] == "risk_halt")
+    follow_close = next(o for o in _orders(r, "follow") if o["intent"] == "risk_halt")
+    assert lead_close["ts"] == follow_close["ts"] and lead_close["parent_trade_id"] == follow_close["parent_trade_id"]
+    assert r.pair_log[-1][1] == "flat"
+
+
 def test_the_perp_leg_is_margined_at_its_own_leverage_not_the_risk_profiles():
     """Under the balanced profile (2x) the carry's perp leg holds its own 1x by default: its liquidation price is
     about twice the entry for a short, not one and a half times; at 2x it is about one and a half."""

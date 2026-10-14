@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 
 from sleeve_fund import funding
+from sleeve_fund.research import regime_split
 from sleeve_fund.research.guardrails import CANDIDATE_CHECK, G1_RULES, MIN_OOS_TRADES, nearby_scored
 from sleeve_fund.research.ledger import IdeaLedger
 from sleeve_fund.research.metrics import (
@@ -567,6 +568,8 @@ def render(r: StudyResult, ledger: IdeaLedger, register=None, liquidation_ack: s
                    "at the rung's cost: the strategy's out-of-sample trips priced on the bars' closes, and the median "
                    "of the same number of random trips held as long.")
         out.append("")
+    if r.by_regime:
+        out += regime_split.render(r.by_regime)
     out.append("## Walk-forward folds")
     out.append("")
     out.append("| Train | Test to | Chosen params | Train Sharpe | Test trades | Test CAGR | Benchmark CAGR | Test Sharpe | Benchmark Sharpe |")

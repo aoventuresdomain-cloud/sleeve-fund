@@ -479,6 +479,7 @@ _HANDLER_WORDS = {"on_trade": "a trade print", "on_quote": "a quote", "on_order_
                   "on_order_modify_rejected": "a resize refused", "on_bar": "a bar", "_on_tick": "the risk check",
                   "_maker_timeout": "a post-only order's wait running out"}
 MAX_KEPT_ERRORS = 100  # handler errors kept with their text; every one is counted
+FILL_HANDLER_PAUSE = "paused: a fill handler failed, so its book is in doubt; resume once it is checked"  # T-FIX8
 
 
 def handler_error_words(handler: str, exc: BaseException | str) -> str:
@@ -829,6 +830,15 @@ class LongFlatStrategy(Strategy):
                                          f"The strategy failed {handler_error_words(name, exc)}. Its "
                                          "orders after this may be wrong.", ts=self.runtime.now())
             except Exception:  # the journal itself failing must not hide the first error
+                pass
+        if name == "on_order_filled" and self.runtime is not None and not self.runtime.backtest:
+            # The Advisor's loud failure (T-FIX8): a fill this Strategy failed to handle leaves its book in doubt, so it
+            # opens nothing more until the PM resumes it: the PM's own pause, with no end time (a daily-loss pause's
+            # 00:00 roll never lifts it). Exits, stops and flattens still go; a halt in force stays.
+            try:
+                if self.runtime.status != "halted":
+                    self.runtime._set("paused", FILL_HANDLER_PAUSE)
+            except Exception:  # the journal failing must not hide the first error
                 pass
 
     def attach_runtime(self, runtime) -> "LongFlatStrategy":
@@ -3197,7 +3207,7 @@ class LongFlatStrategy(Strategy):
         # leverage (None on spot); and, with no stop, the daily ATR the stopless measure takes.
         intent = {"side": s, "qty": qty, "close": close, "price": fill_price(close, s, self._half_spread()),
                   "stop_frac": self._stop_frac, "what": what, "step": self._lot(), "min_qty": self._min_qty(),
-                  "instrument": self._base_code(),
+                  "instrument": self._base_code(), "opens": self._position_qty() < self._min_qty(),
                   "leverage": LongFlatStrategy._max_leverage(self)
                   if self._margin else None,
                   "atr_pct": None if self._stop_frac else self._entry_atr_pct()}
@@ -3828,6 +3838,11 @@ class LongFlatStrategy(Strategy):
         return self._position_qty() >= self._min_qty()
 
     def _sell_all(self, intent: str = "exit", reason: str = "Signal to be flat", values: dict | None = None) -> None:
+        if (self._pending_exit is not None and self._pending_exit[0] == "liquidation"
+                and intent != "liquidation"):
+            # A liquidation waiting for its working orders' cancels outranks any later close (a halt's flatten, the
+            # pair's unwind, a PM close): it is never re-labelled as a plain close (F283-P1, GAP-LIQ on every path).
+            return
         if self.pair is not None:  # a two-leg Strategy's other leg closes with this one (strategies.pair)
             self.pair.leg_closing(self, intent, reason)
         self._drop_kept(earn=self._pending_exit is None)
@@ -3852,7 +3867,10 @@ class LongFlatStrategy(Strategy):
             return
         # A short is closed by buying it back.
         side = OrderSide.BUY if self._margin and self._pos_side() < 0 else OrderSide.SELL
-        self._submit(side, qty, intent, reason, dict(values or {}))
+        values = dict(values or {})
+        if self._margin and "liquidation_px" not in values:
+            values.update(self._liq_signal())  # GAP-LIQ judges its fill against it (F283-P1, _gap_liquidation)
+        self._submit(side, qty, intent, reason, values)
 
     # --- perpetuals: restore, funding, liquidation and intrabar guards ---------------
 
@@ -4673,27 +4691,44 @@ class LongFlatStrategy(Strategy):
         liq = self._liq_now(cash, qty) if qty else None
         return {"liquidation_px": round(liq, 8)} if liq is not None else {}
 
+    def _flush_rebook(self, coid: str, at: datetime | None) -> None:
+        """Re-book the order _gap_liquidation relabelled, once its fill is in the journal. Taken before the call
+        (T-FIX7): a journal that refuses it raises once, for this fill, and never again on the leg's later fills."""
+        rebook, self._rebook = self._rebook, None
+        if rebook is not None:
+            d = self.decisions[coid]
+            self.runtime.store.rebook_liquidation(rebook, d["reason"], d["signal"], ts=at or self.runtime.now())
+
     def _gap_liquidation(self, coid: str, journal_id: str, price: float) -> bool:
         """GAP-LIQ (Independent Quant Advisor, 6 Oct): a stop whose fill, after slippage, is at or past the
-        liquidation price books as a liquidation, the venue having taken the position first. Its order is journaled
+        liquidation price books as a liquidation, the venue having taken the position first; since 14 Oct 15:00 UK
+        (F283-P1) any closing fill does, a halt's flatten, the pair's unwind or a PM close alike. Its order is journaled
         as one, with the liquidation event and an incident, so the D3 loss, the halt with X and Y, and the reset after
         liquidation follow as for any liquidation. The liquidation price is the one the engine's own check had when
         the stop fired (paper) or as of the bar it rested through (backtest); through_liquidation decides both."""
         d = self.decisions.get(coid)
         held = self._entry_side or 0
-        if d is None or d.get("intent") != "stop_loss" or not held:
+        intent = d.get("intent") if d is not None else None
+        if intent is None or intent in OPENING_INTENTS or intent == "liquidation" or not held:
             return False
         liq = (d.get("signal") or {}).get("liquidation_px")
         if not through_liquidation(held, price, liq):
             return False
-        reason = (f"Liquidated: the stop filled at {price:,.6g}, at or past the liquidation price {liq:,.6g}, so the "
-                  "venue took the position first")
-        # The flag says a stop fired and filled past liquidation, so the screens never parse the reason (FE, HoE OK
-        # 7 Oct 18:54 UK): the stop's level and its raw fill, before the liquidation's booking.
-        stop_px = d["signal"].get("stop_px", d["signal"].get("trigger"))
+        if intent == "stop_loss":
+            reason = (f"Liquidated: the stop filled at {price:,.6g}, at or past the liquidation price {liq:,.6g}, so "
+                      "the venue took the position first")
+            # The flag says a stop fired and filled past liquidation, so the screens never parse the reason (FE, HoE
+            # OK 7 Oct 18:54 UK): the stop's level and its raw fill, before the liquidation's booking.
+            stop_px = d["signal"].get("stop_px", d["signal"].get("trigger"))
+            extra = {"stop_relabelled": True, "stop_px": stop_px, "stop_fill_px": round(price, 8)}
+        else:
+            # F283-P1 (Advisor 14 Oct 15:00 UK): GAP-LIQ on every exit path, a halt's flatten, the pair's unwind or a
+            # PM close alike; the close it was is kept on the order (`relabelled_from`).
+            reason = (f"Liquidated: the {intent.replace('_', ' ')} close filled at {price:,.6g}, at or past the "
+                      f"liquidation price {liq:,.6g}, so the venue took the position first")
+            extra = {"relabelled_from": intent, "fill_px": round(price, 8)}
         d.update(intent="liquidation", reason=reason, signal={**d["signal"], "price": price, "market_px": round(price, 8),
-                                                               "stop_relabelled": True, "stop_px": stop_px,
-                                                               "stop_fill_px": round(price, 8)})
+                                                               **extra})
         self._rebook = journal_id  # the journal re-books it once this fill is in (on_order_filled)
         self._liquidation_events(reason, price, liq)
         self._on_liquidation(price, liq, reason)  # a gapped stop is a liquidation like any other (QA P1-L22 pins)
@@ -5111,6 +5146,9 @@ class LongFlatStrategy(Strategy):
                 cash = 0.0 if ruined else cash
             elif kept and (self.runtime.status != "halted" or self.runtime.liquidated is None):
                 wiped = self._wiped_out_why()
+            if self.pair is not None:
+                # F283-P1: the other leg's own liquidation check before this mark's summed halts act on the pair.
+                self.pair.liquidation_first(self, worst or price)
             liquidating = any(self.decisions.get(str(o.client_order_id), {}).get("intent") == "liquidation"
                               for o in self._working())
             other = self.pair.other_book(self, price)[0] if self.pair is not None else 0.0
@@ -5533,10 +5571,7 @@ class LongFlatStrategy(Strategy):
             self.runtime.on_fill(side="BUY" if event.is_buy else "SELL", qty=qty, price=px, fee=fee,
                                  order_id=journal_id, trade_id=str(event.trade_id), ts=at)
             self.runtime.on_timing(journal_id, fill=int(event.ts_init), venue_ts=int(event.ts_event))
-            if self._rebook is not None:
-                d = self.decisions[coid]
-                self.runtime.store.rebook_liquidation(self._rebook, d["reason"], d["signal"], ts=at or self.runtime.now())
-                self._rebook = None
+            self._flush_rebook(coid, at)
         if self._margin and opening and intrabar is not None and coid != self._restore_id:
             self._opened_in_bar.append((intrabar, sign * qty))  # charged with the bar's range in on_bar
         if self._margin and self._entry_side == 0:
@@ -5856,6 +5891,19 @@ class LongFlatStrategy(Strategy):
             self._resize_due = False
             self._rest_exits()
 
+    def _final_mark(self) -> None:
+        """Paper: the book as it stands when the process stops (SleeveRuntime.final_mark). Skipped when it can't be
+        valued (a carried-over position not back at the venue yet, no price, nothing left); a failure here is logged,
+        never in the way of the stop."""
+        if self.runtime.backtest or self._restore is not None:
+            return
+        try:
+            equity, cash, qty, price = self._mark()
+            if equity > 0:
+                self.runtime.final_mark(equity=equity, cash=cash, qty=qty, price=price)
+        except Exception as e:  # noqa: BLE001 - the stop goes on; the next start marks again
+            self.log.warning(f"no final mark on stop: {e}")
+
     def on_stop(self) -> None:
         self._drop_kept()
         for coid in list(self._maker):
@@ -5864,6 +5912,7 @@ class LongFlatStrategy(Strategy):
         if self.runtime is not None:
             for timer in ("sleeve-tick", GATE_WATCH):
                 self.clock.cancel_timer(timer) if timer in self.clock.timer_names() else None
+            self._final_mark()
             self.runtime.on_stop()
         if self.recorder is not None:
             self.recorder.close()

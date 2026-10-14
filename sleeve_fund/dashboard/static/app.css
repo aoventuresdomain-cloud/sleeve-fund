@@ -1222,3 +1222,11 @@ table.movers tbody tr.tot th, table.movers tbody tr.tot td { border-top: 1px sol
 .chip-pick input:disabled + span { cursor: default; opacity: .6; }
 .chip-pick input:disabled:checked + span { opacity: 1; }
 .study .picklist .pl-badge { display: none; }  /* the study has its own history chip beside it */
+/* The fund's book after a Strategy is put away and the limits in use against it (F-C3B-A-UI). */
+.limits-after { font-size: 13px; margin: 8px 0 12px; }
+.limits-after p { margin: 0 0 6px; }
+.limits-after-list { list-style: none; margin: 0 0 6px; padding: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 4px 14px; }
+.limits-after-list li { display: flex; gap: 6px; align-items: baseline; }
+.limits-after-list b { font-variant-numeric: tabular-nums; }
+.banner .limits-after { margin: 6px 0 0; }
+.banner-note { margin: -6px 0 12px; font-size: 13px; color: var(--muted); }

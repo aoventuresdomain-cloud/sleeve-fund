@@ -63,14 +63,16 @@ def risk_view(store: Store, summaries: list[dict], book: dict) -> dict:
     equity = book["equity"] or 1.0
     scenarios = []
     for i, shock in enumerate(SHOCKS):
-        # The book's loss is every leg's, as before: a pair's row carries its two legs' signed sum.
-        loss = sum(r["shocks"][i]["loss"] for r in rows if r["x"]["sleeve"].desired_state == "running")
+        # The book's loss is every leg's, a pair's row carrying its two legs' signed sum; a test-account Strategy is
+        # outside the fund's book (it still halts on its own limit).
+        loss = sum(r["shocks"][i]["loss"] for r in rows
+                   if r["x"]["sleeve"].desired_state == "running" and not r["x"].get("test_account"))
         scenarios.append({"shock": shock, "loss": loss, "pnl": -loss, "loss_pct": loss / equity,
                           "breaches": [r["x"]["sleeve"].name for r in rows if r["shocks"][i]["breach"]],
                           "unhedged": [r["x"]["sleeve"].name for r in rows if r["shocks"][i].get("unhedged")]})
     largest = largest_asset(book["allocation"], book["equity"])
     return {"rows": rows, "scenarios": scenarios, "largest": largest,
-            **{k: held[k] for k in ("accounts", "margin", "open_risk", "estimated", "through", "left_out", "trailing", "hint", "spot",
+            **{k: held[k] for k in ("accounts", "book", "unallocated", "margin", "open_risk", "estimated", "through", "left_out", "trailing", "hint", "spot",
                                        "spot_risk", "spot_left_out", "spot_hint")},
             "down20": next(sc for sc in scenarios if sc["shock"] == -0.20),
             "up20": next(sc for sc in scenarios if sc["shock"] == 0.20),

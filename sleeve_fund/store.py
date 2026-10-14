@@ -57,6 +57,7 @@ from sqlalchemy.schema import DropConstraint
 from sleeve_fund import lifecycle
 from sleeve_fund.exact import EXACT
 from sleeve_fund.money import stored, to_decimal
+from sleeve_fund import router
 from sleeve_fund.router import venue_for
 
 DEFAULT_URL = "sqlite:///data/sleeve_fund.db"
@@ -459,6 +460,10 @@ sleeve_archive_t = Table(
     metadata,
     Column("sleeve", String(64), ForeignKey("sleeves.name"), primary_key=True),
     Column("archived_at", TS, nullable=False),
+    # F-C3B-A (0023): the equity it took out of the fund's book when it was put away, with its flow; NULL for an archive
+    # made before that (still counted until supervisor withdraw-archived), for a reset's run (its cash stays) and for one
+    # archived while not flat, until the supervisor withdraws it once flat. NULL always means it still counts in the book.
+    Column("withdrawn", EXACT),
 )
 # When each paper strategy last saw a trade or quote from its venue: the price feed's age on its page.
 # Written at most every few seconds by the strategy's process. A new table: CREATE TABLE.
@@ -659,6 +664,17 @@ event.listen(portfolio_profile_t, "after_create",
              lambda target, conn, **kw: conn.execute(insert(target), [PORTFOLIO_PROFILE_V1]))
 # The supervisor's one row: what the gate's entry block reads. Only the supervisor writes it, but for the PM's Resume.
 PORTFOLIO_STATE_FIGURES = ("reference_equity", "hwm", "day_start_equity", "day_start", "book_equity")
+# MUST-F286-H4 (DA, 14 Oct): the carried ratios, kept only across an unmarked book; the HWM's anchors the set.
+PORTFOLIO_STATE_CARRIED_CHECKS = (
+    ("unmarked", "marked_at IS NULL OR (carried_hwm_drawdown IS NULL AND carried_reference_drawdown IS NULL "
+                 "AND carried_day_return IS NULL AND carried_day IS NULL)"),
+    ("anchor", "carried_hwm_drawdown IS NOT NULL OR (carried_reference_drawdown IS NULL AND carried_day_return IS NULL)"),
+    ("day", "(carried_day_return IS NULL) = (carried_day IS NULL)"),
+    ("hwm_range", "carried_hwm_drawdown IS NULL OR (carried_hwm_drawdown >= 0 AND carried_hwm_drawdown < 1)"),
+    ("reference_range", "carried_reference_drawdown IS NULL OR "
+                        "(carried_reference_drawdown >= 0 AND carried_reference_drawdown < 1)"),
+    ("day_range", "carried_day_return IS NULL OR carried_day_return > -1"),
+)
 portfolio_state_t = Table(
     "portfolio_state",
     metadata,
@@ -675,6 +691,12 @@ portfolio_state_t = Table(
     Column("book_equity", EXACT),  # the last mark: the whole fund, unallocated cash included
     Column("marked_at", TS),  # older than 60 s: entries blocked as portfolio_state_stale
     Column("stale_told_at", TS),  # the mark a stale-book alert was raised for: once per spell, across processes (0011)
+    # MUST-F286-H4 (0023): what a withdrawal that emptied the book carries to the next capital's first mark, taken
+    # from the book before it; set only while unmarked, restored and cleared by that mark (portfolio.gate.mark_book).
+    Column("carried_hwm_drawdown", EXACT),  # 1 - book / hwm
+    Column("carried_reference_drawdown", EXACT),  # 1 - book / reference_equity; NULL when the reference was the HWM
+    Column("carried_day_return", EXACT),  # book / day_start_equity - 1, for carried_day
+    Column("carried_day", Date),  # the UTC day carried_day_return belongs to
     Column("profile_version", Integer, ForeignKey("portfolio_profile.version"), nullable=False),
     Column("updated_at", TS, nullable=False),
     CheckConstraint("id = 1", name="portfolio_state_one_row"),
@@ -688,6 +710,7 @@ portfolio_state_t = Table(
     # all of the book's figures set, or none (before the first mark): one CHECK per figure (DA, 0011)
     *(CheckConstraint(f"({c} IS NULL) = (marked_at IS NULL)", name=f"portfolio_state_{c}_marked")
       for c in PORTFOLIO_STATE_FIGURES),
+    *(CheckConstraint(sql, name=f"portfolio_state_carried_{name}") for name, sql in PORTFOLIO_STATE_CARRIED_CHECKS),
 )
 # The book's history: one mark a minute and one at every status change; a cache rebuilt from fills, which stay the
 # source of truth. The 5 s mark lives in portfolio_state only.
@@ -839,6 +862,19 @@ LIQUIDATION_RESET = "liquidation_reset"
 # "Incident #<id> note by <author>: ...", so the incident it answers is in its words.
 INCIDENT_NOTE = "incident_note"
 WHY_STOP_FIELD = "why the half-liquidation stop did not protect the position"
+# A two-leg Strategy's leg (Advisor F283-O3, 14 Oct 13:15 UK): its incident also says why ruling B's close of the pair
+# at half its entry distance to liquidation didn't prevent it; its reset after liquidation is refused until it does.
+WHY_CLAMP_FIELD = "why closing the pair at half its distance to liquidation did not prevent it"
+# The other leg's half of a two-leg Strategy's reset after liquidation: the summed figures re-based, nothing reset.
+PAIR_REBASE = "pair re-base"
+# Its journal kind on the other leg: never LIQUIDATION_RESET, which would answer that leg's own liquidation (each
+# liquidated leg needs its own reset, Advisor F283-O3 (a)). It still starts a fresh run there (RAL-ANCHOR).
+PAIR_REBASED = "pair_rebase"
+# T fence (HoE + Advisor, 14 Oct 18:00 UK): F-C3B-A puts one row away, and how a two-leg Strategy's two legs leave the
+# fund's book (one flow, both legs flat first) is not built yet. Archive, unarchive, retire, wind-down and a clean slate
+# refuse one with these words; close-now, the PM's emergency exit, never does (it winds the pair down through its
+# unwind and the retire waits for that design).
+TWO_LEG_FENCE = "isn't built for a two-leg Strategy yet, so nothing was changed"
 # Backtest names can't collide with a strategy's: those are lower-case letters, digits and dashes.
 BACKTEST_PREFIX = "bt:"
 # "triggered": paper's watched stop (not an order at the venue) when it fired, its market stop-loss sent for it.
@@ -846,23 +882,55 @@ ORDER_STATUSES = ("submitted", "accepted", "partially_filled", "filled", "cancel
                   "triggered")
 FINISHED_ORDER_STATUSES = ("filled", "canceled", "rejected", "denied", "expired", "triggered")
 OPEN_ORDER_STATUSES = ("submitted", "accepted", "partially_filled")
+# F-C3B-A: a Strategy archived while not yet flat waits for its withdrawal; one with nothing to withdraw says so
+WITHDRAWAL_DEFERRED, WITHDRAWAL_NONE = "withdrawal_deferred", "withdrawal_none"
+NEXT_MARK = "flat, waiting for the supervisor's next mark"  # why a flat Strategy put away is deferred (F286-CR1)
 GATED_INTENTS = ("entry", "rebalance")  # the orders the portfolio gate reserves for (engine OPENING_INTENTS)
 INTENTS = ("entry", "exit", "stop_loss", "take_profit", "risk_halt", "risk_pause", "pm_flatten", "rebalance",
            "liquidation", "liquidation_cut", "wind_down", "wind_down_stop",  # the venue would take it; cut back before it does (String(16))
            "leg_unwind")  # P2-8: a two-leg Strategy's leg closed because its other leg couldn't be held
 
 
+def _traded_venue(c, sleeve: str) -> str | None:
+    """F-WED1-3: the venue the strategy last traded on, as its journal holds it: that of the order behind its latest
+    fill; None when it has no fills. Read on the caller's connection."""
+    return c.execute(select(orders_t.c.venue).join(fills_t, (fills_t.c.order_id == orders_t.c.order_id)
+                                                   & (fills_t.c.sleeve == orders_t.c.sleeve))
+                     .where(fills_t.c.sleeve == sleeve).order_by(fills_t.c.ts.desc(), fills_t.c.id.desc())
+                     .limit(1)).scalar()
+
+
+def holding(qty) -> bool:
+    """Whether a journal's net position is a position at all (F-WED1-3, DA): the one rule record_order's venue and
+    the start's venue check share. Dust is a position here: its exit goes where it is."""
+    return abs(qty) > 1e-12
+
+
+def _position_venue(c, sleeve: str) -> str | None:
+    """F-WED1-3: the venue the journal says the strategy's open position is on (_traded_venue) while it holds one;
+    None when flat. The fills are summed here as Decimals, each read back exact (DA-9): a sum inside the database
+    is in floats on SQLite (DA). Read on the caller's connection."""
+    net = sum((to_decimal(q) if s == "BUY" else -to_decimal(q))
+              for s, q in c.execute(select(fills_t.c.side, fills_t.c.qty).where(fills_t.c.sleeve == sleeve)))
+    return _traded_venue(c, sleeve) if holding(net) else None
+
+
+# The closes a fill at or past the liquidation price re-books as a liquidation (F283-P1, GAP-LIQ on every exit path):
+# every intent but an opening one or a liquidation, exactly as the engine's _gap_liquidation relabels (T-FIX7).
+REBOOKABLE = tuple(i for i in INTENTS if i not in GATED_INTENTS and i != "liquidation")
+
+
 def _check_rebook(order_id: str, row) -> None:
-    """Refuse any re-booking but a filled stop-loss becoming a liquidation (Store/MemoryJournal.rebook_liquidation)."""
+    """Refuse any re-booking but a filled close becoming a liquidation (Store/MemoryJournal.rebook_liquidation)."""
     if row is None:
         raise ValueError(f"no order {order_id!r} to re-book")
-    if row["intent"] != "stop_loss" or not row["filled_qty"]:
-        raise ValueError(f"order {order_id!r} can't be re-booked as a liquidation: only a filled stop-loss can "
+    if row["intent"] not in REBOOKABLE or not row["filled_qty"]:
+        raise ValueError(f"order {order_id!r} can't be re-booked as a liquidation: only a filled close can "
                          f"(it is {row['intent']}, {row['filled_qty']:g} filled)")
 
 
-def _rebook_words(order_id: str, reason: str) -> str:
-    return f"Order {order_id} re-booked from stop_loss to liquidation: {reason}"
+def _rebook_words(order_id: str, intent: str, reason: str) -> str:
+    return f"Order {order_id} re-booked from {intent} to liquidation: {reason}"
 
 
 def exact_sum(a: float, b: float) -> float:
@@ -947,6 +1015,10 @@ def fill_cash(side: str, qty, price, fee) -> Decimal:
     return (-leg if side == "BUY" else leg) - per_fill(D(fee, "fee"))
 
 
+class _NotRetired(Exception):
+    """complete_retire found it retired by another process: roll its put-away back and return False."""
+
+
 def _outside_book(store: "Store", s, account: str | None = None) -> bool:
     """supervisor.outside_fund_book, the one predicate (imported late: the supervisor imports this module)."""
     from sleeve_fund.supervisor import outside_fund_book
@@ -986,6 +1058,10 @@ _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 def _from_ns(ns: int) -> datetime:
     """UNIX nanoseconds -> an aware UTC datetime to the microsecond (utcnow() drops them)."""
     return _EPOCH + timedelta(microseconds=ns // 1000)
+
+
+def _money2(x) -> str:
+    return "none" if x is None else f"{x:,.2f}"
 
 
 def _aware(ts: datetime | None) -> datetime | None:
@@ -1125,6 +1201,16 @@ class BookResetRefused(ValueError):
         self.code = code
 
 
+def _drop_carried(c) -> bool:
+    """Drops the ratios a withdrawal that emptied the book carried to the next capital's first mark (MUST-F286-H4),
+    while the book is still empty: a book reset or a clean slate is a fresh start. True when there were any."""
+    st = portfolio_state_t.c
+    return bool(c.execute(update(portfolio_state_t)
+                          .where(st.id == 1, st.marked_at.is_(None), st.carried_hwm_drawdown.is_not(None))
+                          .values(carried_hwm_drawdown=None, carried_reference_drawdown=None,
+                                  carried_day_return=None, carried_day=None)).rowcount)
+
+
 class Store:
     def __init__(self, url: str | None = None, engine: Engine | None = None, portfolio_gate: bool = False) -> None:
         """portfolio_gate: the portfolio gate is in force on this journal, and with no state row its entries are
@@ -1221,15 +1307,18 @@ class Store:
         return self.sleeve(name), self.sleeve(name + LEG)
 
     @contextmanager
-    def _book_move(self, amount, why, ts: datetime | None = None):
+    def _book_move(self, amount, why, ts: datetime | None = None, leaving: str | None = None, carry: bool = True):
         """A capital move into (amount() > 0) or out of (< 0) the fund's book (HALT-REF-1): the caller's writes, made on
         the connection this yields, and the flow they make commit together under the portfolio gate's lock, so the
         book moves by it and its HWM, the halt's reference and the day's start scale with it (portfolio.gate.apply_flow),
         so the move is never read as a gain or a loss. The amount is read under the lock, before the writes, so two moves never both
         count the same Strategy, and a supervisor mark that read the book while a move landed is skipped
         (Supervisor.mark_portfolio). Journaled as a portfolio_flow event. With no state ever marked there is nothing to
-        move: the first mark reads the book as it is."""
+        move: the first mark reads the book as it is. leaving: the Strategy put away by this move, which never holds an
+        emptied book open itself (supervisor.nothing_open, F286-1). carry: a move that empties the book carries its
+        drawdown and the day's change to the next capital's first mark (MUST-F286-H4); False for a clean slate's."""
         from sleeve_fund.portfolio.gate import apply_flow
+        from sleeve_fund.supervisor import nothing_open
 
         led = self._gate_ledger()
         with led.lock():
@@ -1239,13 +1328,28 @@ class Store:
             yield c
             if amount:
                 before = led.state().reference()
-                apply_flow(led, amount)
-                after = led.state().reference()
+                emptied = apply_flow(led, amount, lambda: nothing_open(self, led, leaving), ts, carry=carry)
+                if emptied is not None:  # the old figures stay in the journal (Advisor 14 Oct 10:00 UK)
+                    kept = led.state()
+                    if kept.carried_hwm_drawdown is None:
+                        then = "so the next mark starts it afresh"
+                    else:  # MUST-F286-H4: what the next capital's first mark restores
+                        day = ("" if kept.carried_day_return is None else
+                               f" and the day's change of {kept.carried_day_return:.4%} on {kept.carried_day}")
+                        ref = ("" if kept.carried_reference_drawdown is None else
+                               f", {kept.carried_reference_drawdown:.4%} below the halt's reference")
+                        then = (f"so the next capital's first mark keeps its drawdown of "
+                                f"{kept.carried_hwm_drawdown:.4%}{ref}{day}")
+                    tail = (f"which empties it, {then} (it was: high-water mark "
+                            f"{_money2(emptied.hwm)}, the halt's reference {_money2(emptied.reference())}, the day's "
+                            f"start {_money2(emptied.day_start_equity)}); a halt in force stays until the PM resumes")
+                else:
+                    tail = (f"and its high-water mark, the halt's reference and the day's start scale with it (the "
+                            f"reference {before:,.2f} -> {led.state().reference():,.2f})")
                 c.execute(insert(events_t).values(
                     sleeve=None, ts=ts or utcnow(), level="info", kind="portfolio_flow",
-                    message=f"{why() if callable(why) else why}: the fund's book moves by {amount:+,.2f} and its "
-                            f"high-water mark, the halt's reference and the day's start scale with it (the reference "
-                            f"{before:,.2f} -> {after:,.2f}), so it isn't a gain or a loss"))
+                    message=f"{why() if callable(why) else why}: the fund's book moves by {amount:+,.2f} {tail}, so "
+                            "it isn't a gain or a loss"))
 
     def sleeve(self, name: str) -> Sleeve:
         with self.engine.connect() as c:
@@ -1298,6 +1402,10 @@ class Store:
         row = self.sleeve(name)
         first = row.parent or name
         return [first] + [leg] if (leg := self._leg_of(first)) is not None else [first]
+
+    def two_leg(self, name: str) -> bool:
+        """Whether `name` is either leg's row of a two-leg Strategy (P2-8)."""
+        return self.sleeve(name).parent is not None or self._leg_of(name) is not None
 
     def holds_any(self, name: str) -> bool:
         """Whether any leg of the Strategy `name` belongs to holds a position an order can close (not dust): a
@@ -1396,17 +1504,49 @@ class Store:
         now = ts or utcnow()
         with self.engine.begin() as c:
             # The venue is the router's, never the caller's (P2-4): read with the order, in its transaction.
-            venue = c.execute(select(sleeve_venues_t.c.venue).where(sleeve_venues_t.c.sleeve == sleeve)).scalar()
+            venue = venue_for(c.execute(select(sleeve_venues_t.c.venue).where(sleeve_venues_t.c.sleeve == sleeve))
+                              .scalar())
+            # F-WED1-3 (DA): an open position on another venue than the pin keeps its own. Its exits are journaled
+            # there, where they go; an opening order is refused, behind the start's entry hold. Same transaction, so
+            # a fill can't land between the two reads.
+            held = _position_venue(c, sleeve)
+            held = None if held is None else venue_for(held)  # a run's clone is its base venue, as router.start_mode
+            if held is not None and held != venue:
+                if intent in GATED_INTENTS:
+                    raise ValueError(f"{sleeve}: an opening order is refused while its open position is on another "
+                                     "venue than its pin")
+                venue = held
             c.execute(insert(orders_t).values(sleeve=sleeve, order_id=order_id, ts=now, updated_at=now, side=side,
                                               order_type=order_type, qty=qty, status="submitted", filled_qty=0.0,
                                               fee=0.0, intent=intent, reason=reason, signal=signal or {},
-                                              message="", venue=venue_for(venue), parent_trade_id=parent_trade_id))
+                                              message="", venue=venue, parent_trade_id=parent_trade_id))
             if timing:
                 c.execute(insert(order_timings_t).values(order_id=order_id, sleeve=sleeve, **{
                     k: _from_ns(v) for k, v in timing.items() if v is not None}))
             if reservation is not None:
                 with self._gate_ledger().using(c):
                     self._gate_ledger().attach_order(reservation, order_id)
+
+    def position_venue(self, sleeve: str) -> str | None:
+        """The venue the strategy's open position is on, as the journal holds it (_position_venue); None when flat."""
+        with self.engine.connect() as c:
+            return _position_venue(c, sleeve)
+
+    def traded_venue(self, sleeve: str) -> str | None:
+        """The venue the strategy last traded on, as the journal holds it (_traded_venue); None with no fills."""
+        with self.engine.connect() as c:
+            return _traded_venue(c, sleeve)
+
+    def venue_start(self, sleeve) -> tuple[str, str | None]:
+        """How `sleeve` (a Sleeve) may start, by the venue its journal last traded on against its pin
+        (router.start_mode), as (mode, that venue). Holding means a position no flatten leaves as dust (is_dust), as
+        the supervisor's exits-only start reads it. One answer for the supervisor and the paper process (F-WED1-3)."""
+        traded = self.traded_venue(sleeve.name)
+        if traded is None:
+            return router.NORMAL, None
+        book = self.journal_book(sleeve.name, sleeve.starting_balance)
+        held = holding(book["qty"]) and not is_dust(book)  # a dust holder off its pin is refused, as a flat one
+        return router.start_mode(venue_for(sleeve.venue), traded, held), traded
 
     def record_timing(self, sleeve: str, order_id: str, *, fill: int | None = None, **stamps: int | None) -> None:
         """An order's timing stamps (UNIX ns, kept to the microsecond), filled in as they come (the send, the
@@ -1551,14 +1691,14 @@ class Store:
 
     def rebook_liquidation(self, order_id: str, reason: str, signal: dict, ts: datetime | None = None) -> None:
         """GAP-LIQ (Advisor): a resting stop whose fill was at or past the liquidation price is re-booked as the
-        liquidation it was. The only intent change the journal allows (Data Architect): stop_loss to liquidation, on
-        an order that has filled; its fills stay as they are, and an order_rebooked event keeps the lineage."""
+        liquidation it was; since F283-P1 any close filled there is (REBOOKABLE). The only intent change the journal
+        allows (Data Architect): a close to liquidation, on an order that has filled; its fills stay as they are, and an order_rebooked event keeps the lineage."""
         with self.engine.begin() as c:
             row = c.execute(select(orders_t).where(orders_t.c.order_id == order_id)).first()
             _check_rebook(order_id, row and row._mapping)
             c.execute(update(orders_t).where(orders_t.c.order_id == order_id)
                       .values(intent="liquidation", reason=reason, signal=signal, updated_at=utcnow()))
-        self.event(row.sleeve, "info", "order_rebooked", _rebook_words(order_id, reason), ts=ts)
+        self.event(row.sleeve, "info", "order_rebooked", _rebook_words(order_id, row.intent, reason), ts=ts)
     def merge_order_signal(self, order_id: str, values: dict) -> None:
         """Add to an order's signal what was known only once it filled (an entry's liquidation price). Unknown ids
         are ignored, as in update_order."""
@@ -1716,7 +1856,7 @@ class Store:
         moved = []
 
         def amount() -> Decimal:
-            if is_backtest(sleeve):
+            if is_backtest(sleeve) or sleeve in self.withdrawn():  # out of the book already (F-C3B-A)
                 return Decimal(0)
             s = self.sleeve(sleeve)
             was = _outside_book(self, s)
@@ -1739,6 +1879,141 @@ class Store:
         with self.engine.connect() as c:
             return {r.sleeve: _aware(r.archived_at) for r in c.execute(select(sleeve_archive_t))}
 
+    def withdrawn(self) -> dict[str, Decimal]:
+        """Strategies put away whose equity left the fund's book with its flow (F-C3B-A): {name: the equity taken out}.
+        fund_equity counts none of them."""
+        with self.engine.connect() as c:
+            return {r.sleeve: to_decimal(r.withdrawn) for r in c.execute(
+                select(sleeve_archive_t).where(sleeve_archive_t.c.withdrawn.is_not(None)))}
+
+    @contextmanager
+    def _put_away(self, sleeve: str, ts: datetime, why: str, polled: bool = False):
+        """F-C3B-A (Advisor 14 Oct 09:45 UK): a Strategy put away for good (archived, retired, or archived by a clean
+        slate) takes its whole equity out of the fund's book, as a flow (_book_move), in the same transaction as its
+        archive row, which this writes; the caller's own writes go on the connection this yields. One outside the book
+        (a test account, a saved backtest) takes nothing out, as it brought nothing in.
+
+        Not settled flat yet (withdrawal_blocker: a position, an open order, room an order holds), it takes nothing
+        out now: it stays in the book in full until it is flat (F229-6 C3), journaled as WITHDRAWAL_DEFERRED, and the
+        supervisor's poll withdraws it then, after that poll's mark (Advisor 14 Oct 10:45 UK). A settled equity of 0 or
+        less is never withdrawn: it stays in the book, journaled as WITHDRAWAL_NONE. Each is decided under the gate's
+        lock, so the poll and withdraw-archived racing take it out once.
+
+        Only the supervisor's poll (polled), after its own mark, takes equity out of a marked book (F286-CR1, HoE on the
+        Advisor's option (b)): put away anywhere else, flat or not, it is WITHDRAWAL_DEFERRED, so the P&L made since the
+        last mark is judged at the book's scale before its equity leaves, never landing on the Strategies that remain.
+        A book never marked has no scale to keep: it is taken out at once, with no flow."""
+        if self.two_leg(sleeve):  # the backstop behind every put-away: never one leg alone (TWO_LEG_FENCE)
+            raise ValueError(f"putting a Strategy away {TWO_LEG_FENCE}")
+        seen: list[tuple[str, Decimal | str]] = []
+        dust_qty: list[Decimal] = []
+
+        def decide(marked: bool) -> tuple[str, Decimal | str]:
+            if sleeve in self.withdrawn():
+                return "out already", Decimal(0)
+            if self._outside_or_backtest(sleeve):
+                return "out", Decimal(0)  # it brought nothing into the book
+            blocked = self.withdrawal_blocker(sleeve)
+            if blocked is not None:
+                return "deferred", blocked
+            if marked and not polled:
+                return "deferred", NEXT_MARK
+            equity = self.in_book_equity(sleeve)
+            return ("out", equity) if equity > 0 else ("none", equity)
+
+        def amount() -> Decimal:
+            seen.append(decide(True))
+            # Read here, before this move writes: on a store sharing one connection (Store.in_memory), a read after the
+            # writes ends the lock's transaction and loses them (F286-ENG).
+            dust_qty.append(self.lifecycle_flat(sleeve)[0])
+            kind, value = seen[0]
+            return -value if kind == "out" else Decimal(0)
+
+        def said() -> str:
+            qty = dust_qty[0]
+            dust = f", with dust of {qty} no order can close, which leaves with it" if qty else ""
+            return f"{sleeve} put away ({why}): its equity {seen[0][1]:,.2f} leaves the fund's book{dust}"
+
+        # A clean slate's put-away (previous_book) starts a fresh book, so its emptying carries nothing (MUST-F286-H4)
+        with self._book_move(amount, said, ts, leaving=sleeve, carry=sleeve not in self.previous_book()) as c:
+            yield c
+            # Put away again (archived, then retired; a second archive): already out, so it keeps its row, its
+            # amount and when it went, with no second flow (DA, 14 Oct).
+            if c.execute(select(sleeve_archive_t.c.sleeve).where(sleeve_archive_t.c.sleeve == sleeve,
+                                                                 sleeve_archive_t.c.withdrawn.is_not(None))).first():
+                return
+            kind, value = seen[0] if seen else decide(False)  # nothing marked yet: no flow, but decided all the same
+            out = stored(value) if kind == "out" else None
+            # An archive from before 0023 (withdraw-archived), or one waiting to go flat, keeps when it went:
+            # previous_book reads archived_at against the clean slate's start (DA, 14 Oct). A fresh one is written now.
+            if not c.execute(update(sleeve_archive_t).where(sleeve_archive_t.c.sleeve == sleeve)
+                             .values(withdrawn=out)).rowcount:
+                c.execute(insert(sleeve_archive_t).values(sleeve=sleeve, archived_at=ts, withdrawn=out))
+            if kind == "deferred" and value == NEXT_MARK:
+                c.execute(insert(events_t).values(
+                    sleeve=sleeve, ts=ts, level="info", kind=WITHDRAWAL_DEFERRED,
+                    message=f"{sleeve} put away ({why}): it stays in the fund's book until the supervisor's next mark, "
+                            "and its equity leaves the book then, so what it made since the last mark counts first"))
+            elif kind == "deferred":
+                c.execute(insert(events_t).values(
+                    sleeve=sleeve, ts=ts, level="info", kind=WITHDRAWAL_DEFERRED,
+                    message=f"{sleeve} put away ({why}) while not yet flat ({value}): it stays in the fund's book in "
+                            "full, exiting but never entering, and its settled equity leaves the book when it is flat"))
+            elif kind == "none":
+                c.execute(insert(events_t).values(
+                    sleeve=sleeve, ts=ts, level="warning", kind=WITHDRAWAL_NONE,
+                    message=f"{sleeve} put away ({why}) with a settled equity of {value:,.2f}: nothing is withdrawn, "
+                            "as a withdrawal is never negative, and it stays in the fund's book at that"))
+
+    def _outside_or_backtest(self, sleeve: str) -> bool:
+        return is_backtest(sleeve) or _outside_book(self, self.sleeve(sleeve))
+
+    def withdrawal_blocker(self, sleeve: str) -> str | None:
+        """Why `sleeve` isn't settled flat for its withdrawal, or None (Advisor 14 Oct 10:45 UK): a position (dust no
+        venue takes an order for counts as flat, as for a retire: lifecycle_flat), an order still open, or room an
+        order still holds in the portfolio gate. Fills, fees and funding are booked with the fill, so a flat journal
+        with no open order has them all."""
+        qty, flat = self.lifecycle_flat(sleeve)
+        if not flat:
+            return f"it holds {float(qty):g}"
+        if self.orders(sleeve, statuses=OPEN_ORDER_STATUSES, limit=1):
+            return "an order of it is still open"
+        if any(r.strategy == sleeve for r in self._gate_ledger().reservations()):
+            return "an order of it still holds room in the book"
+        return None
+
+    def withdrawal_pending(self) -> list[str]:
+        """Strategies archived while not flat whose equity waits to leave the book (WITHDRAWAL_DEFERRED, and no
+        WITHDRAWAL_NONE since): the supervisor's poll withdraws each once it is flat. The dashboard shows them as
+        archived, waiting to go flat. Every archive since F-C3B-A either withdraws (withdrawn) or journals one of the
+        two, so the latest of them is the current archive's, whatever clocks wrote them."""
+        archived, out = self.archived(), self.withdrawn()
+        last: dict[str, tuple] = {}
+        for e in self.events_of((WITHDRAWAL_DEFERRED, WITHDRAWAL_NONE), limit=10_000):  # newest first
+            last.setdefault(e["sleeve"], (e["kind"], e["ts"]))
+        return [n for n, (kind, _) in last.items() if kind == WITHDRAWAL_DEFERRED and n in archived and n not in out]
+
+    def nothing_withdrawn(self) -> dict[str, Decimal]:
+        """Strategies archived with a settled equity of 0 or less, so nothing left the book (WITHDRAWAL_NONE since
+        their archive): {name: that equity, as the book still counts it}. For the dashboard's "archived, nothing to
+        withdraw" (Advisor 14 Oct 11:10 UK)."""
+        archived, out = self.archived(), self.withdrawn()
+        last: dict[str, tuple] = {}
+        for e in self.events_of((WITHDRAWAL_DEFERRED, WITHDRAWAL_NONE), limit=10_000):  # newest first
+            last.setdefault(e["sleeve"], (e["kind"], e["ts"]))
+        return {n: self.in_book_equity(n) for n, (kind, _) in last.items()
+                if kind == WITHDRAWAL_NONE and n in archived and n not in out}
+
+    def in_book_equity(self, sleeve: str) -> Decimal:
+        """`sleeve`'s equity as the fund's book counts it (supervisor.strategy_equity), or nothing when it sits outside
+        the book (a saved backtest, a test account, F229-6)."""
+        s = self.sleeve(sleeve)
+        if is_backtest(sleeve) or _outside_book(self, s):
+            return Decimal(0)
+        from sleeve_fund.supervisor import strategy_equity
+
+        return strategy_equity(self, s)
+
     def book_start(self) -> datetime | None:
         """When the current book began: the latest clean slate (supervisor.clear), or None if never cleared."""
         with self.engine.connect() as c:
@@ -1760,24 +2035,34 @@ class Store:
                            if at <= start and abs(self.journal_book(name, self.sleeve(name).starting_balance)["qty"]) <= 1e-12}}
 
     def archive(self, sleeve: str) -> None:
-        """Put a stopped, flat sleeve away. Raises ValueError if it is running or still holds a position. A two-leg
-        Strategy is put away whole, from its first leg's row, never one leg alone (CR F283-2)."""
+        """Put a stopped, flat sleeve away, its equity out of the fund's book with its flow (F-C3B-A). Raises
+        ValueError if it is running or still holds a position."""
         s = self.sleeve(sleeve)
         if s.desired_state != "stopped":
             raise ValueError("stop the strategy before archiving it")
-        if s.parent is not None:
-            raise ValueError(f"this is the second leg of {s.parent}: archive {s.parent}, which puts both legs away")
-        now = utcnow()
-        with self.engine.begin() as c:
-            for name in [sleeve] + ([leg] if (leg := self._leg_of(sleeve, c)) is not None else []):
-                c.execute(sleeve_archive_t.delete().where(sleeve_archive_t.c.sleeve == name))
-                c.execute(insert(sleeve_archive_t).values(sleeve=name, archived_at=now))
+        if self.two_leg(sleeve):
+            raise ValueError(f"archiving {TWO_LEG_FENCE}")
+        with self._put_away(sleeve, utcnow(), "archived"):
+            pass
 
     def unarchive(self, sleeve: str) -> None:
+        """Bring a put-away sleeve back: the equity it took out comes back into the book with its flow, at what it is
+        worth now (F-C3B-A, the undo of archive)."""
         if self.sleeve(sleeve).lifecycle == lifecycle.RETIRED:
             raise ValueError("this strategy is retired, and a retired strategy can't be brought back")
-        with self.engine.begin() as c:
-            c.execute(sleeve_archive_t.delete().where(sleeve_archive_t.c.sleeve.in_(self.legs(sleeve))))
+        if self.two_leg(sleeve):  # TWO_LEG_FENCE
+            raise ValueError(f"putting a Strategy away {TWO_LEG_FENCE}")
+        back: list[Decimal] = []
+
+        def amount() -> Decimal:
+            if sleeve not in self.withdrawn():
+                return Decimal(0)  # an archive from before F-C3B-A: it never left the book
+            back.append(self.in_book_equity(sleeve))
+            return back[0]
+
+        with self._book_move(amount, lambda: f"{sleeve} brought back: its equity {back[0]:,.2f} comes into the fund's "
+                                             "book") as c:
+            c.execute(sleeve_archive_t.delete().where(sleeve_archive_t.c.sleeve == sleeve))
 
     # --- lifecycle (P2-6) ------------------------------------------------------------
 
@@ -1815,6 +2100,10 @@ class Store:
             raise ValueError("a saved backtest has no lifecycle")
         now = now or utcnow()
         s = self.sleeve(sleeve)
+        two_leg = self.two_leg(sleeve)
+        if two_leg and (action != "close_now" or s.parent is not None):
+            raise ValueError(f"{action.replace('_', ' ')} on its second leg {TWO_LEG_FENCE}" if action == "close_now"
+                             else f"{action.replace('_', ' ')} {TWO_LEG_FENCE}")
         held, flat = self.lifecycle_flat(sleeve)
         started, deadline_at, basis = s.wind_down_started, s.wind_down_deadline, ""
         if action == "wind_down":
@@ -1827,10 +2116,15 @@ class Store:
         else:
             m = lifecycle.close_now(s.lifecycle, actor, now, flat=flat)
             to = m.lifecycle
+            if to == lifecycle.RETIRED and two_leg:
+                # Close-now is never refused (Advisor): flat, a two-leg Strategy still only winds down, due now, so it
+                # opens nothing; its retire waits for the put-away design (TWO_LEG_FENCE).
+                to = lifecycle.WINDING_DOWN
             if to == lifecycle.WINDING_DOWN:
                 started, deadline_at = started or now, now
         text = lifecycle.moved_words(s.lifecycle, to, action, deadline_at, held) + basis
-        with self.engine.begin() as c:
+        # A retire puts it away for good: its equity leaves the book with the lifecycle row (F-C3B-A).
+        with (self._put_away(sleeve, now, "retired") if to == lifecycle.RETIRED else self.engine.begin()) as c:
             values = {"lifecycle": to, "wind_down_started": started, "wind_down_deadline": deadline_at,
                       "updated_at": now}
             if to == lifecycle.RETIRED:
@@ -1841,9 +2135,6 @@ class Store:
                                                      sleeves_t.c.lifecycle == s.lifecycle).values(**values)).rowcount
             if not done:
                 raise lifecycle.LifecycleError("This strategy's lifecycle changed meanwhile; look again and retry.")
-            if to == lifecycle.RETIRED:
-                c.execute(sleeve_archive_t.delete().where(sleeve_archive_t.c.sleeve == sleeve))
-                c.execute(insert(sleeve_archive_t).values(sleeve=sleeve, archived_at=now))
             c.execute(insert(decisions_t).values(ts=now, actor="PM", action=action, sleeve=sleeve,
                                                  reason=reason.strip()))
             c.execute(insert(events_t).values(sleeve=sleeve, ts=now, level="info", kind=LIFECYCLE_EVENT, message=text))
@@ -1852,20 +2143,26 @@ class Store:
     def complete_retire(self, sleeve: str, now: datetime | None = None, how: str = "flat") -> bool:
         """Retire a winding-down strategy once the journal shows it flat (dust counts as flat: lifecycle_flat): the end of the PM's own wind-down, never a
         new move (lifecycle.due's RETIRE). False, and nothing written, unless it is winding down and flat. how: flat,
-        deadline or close_now, for the journal's words."""
+        deadline or close_now, for the journal's words. Its equity leaves the fund's book with the row (F-C3B-A)."""
+        if self.two_leg(sleeve):
+            return False  # it stays winding down, flat, until the put-away design lands (TWO_LEG_FENCE)
+        try:
+            return self._complete_retire(sleeve, now, how)
+        except _NotRetired:
+            return False
+
+    def _complete_retire(self, sleeve: str, now: datetime | None, how: str) -> bool:
         now = now or utcnow()
         s = self.sleeve(sleeve)
         if s.lifecycle != lifecycle.WINDING_DOWN or not self.lifecycle_flat(sleeve)[1]:
             return False
         text = lifecycle.retired_words(how)
-        with self.engine.begin() as c:
+        with self._put_away(sleeve, now, "retired") as c:  # its equity leaves the book with the row (F-C3B-A)
             done = c.execute(update(sleeves_t).where(sleeves_t.c.name == sleeve,
                                                      sleeves_t.c.lifecycle == lifecycle.WINDING_DOWN)
                              .values(lifecycle=lifecycle.RETIRED, desired_state="stopped", updated_at=now)).rowcount
-            if not done:  # another process retired it first
-                return False
-            c.execute(sleeve_archive_t.delete().where(sleeve_archive_t.c.sleeve == sleeve))
-            c.execute(insert(sleeve_archive_t).values(sleeve=sleeve, archived_at=now))
+            if not done:  # another process retired it first: nothing taken out (the raise rolls the flow back)
+                raise _NotRetired
             # The PM's wind-down, ended by the system once flat: the row names both, so it never reads as the PM
             # pressing retire (Advisor 13 Oct 16:40)
             c.execute(insert(decisions_t).values(ts=now, actor="PM", action="retire", sleeve=sleeve,
@@ -1957,10 +2254,11 @@ class Store:
 
     def event(self, sleeve: str | None, level: str, kind: str, message: str, ts: datetime | None = None,
               command_id: int | None = None) -> None:
-        """`command_id`: only on a liquidation_reset, the command it carries out (unique: a second raises)."""
+        """`command_id`: only on a liquidation_reset (or a pair's re-base with one, PAIR_REBASED), the command it carries
+        out (unique: a second raises)."""
         if level not in LEVELS:
             raise ValueError(f"bad level {level!r}")
-        if command_id is not None and kind != LIQUIDATION_RESET:
+        if command_id is not None and kind not in (LIQUIDATION_RESET, PAIR_REBASED):
             raise ValueError("only a liquidation_reset names the command it carries out")
         with self.engine.begin() as c:
             c.execute(insert(events_t).values(sleeve=sleeve, ts=ts or utcnow(), level=level, kind=kind, message=message,
@@ -2050,9 +2348,10 @@ class Store:
             c.execute(update(pair_state_t).where(pair_state_t.c.parent == parent,
                                                  pair_state_t.c.marked_at.is_not(None)).values(**values))
 
-    def reset_for_command(self, command_id: int) -> dict | None:
-        """The liquidation_reset journaled for this command (F217-3), else None."""
-        q = select(events_t).where(events_t.c.command_id == command_id, events_t.c.kind == LIQUIDATION_RESET)
+    def reset_for_command(self, command_id: int, kind: str = LIQUIDATION_RESET) -> dict | None:
+        """The liquidation_reset journaled for this command (F217-3), else None. kind=PAIR_REBASED: the other leg's
+        half of a two-leg Strategy's reset after liquidation."""
+        q = select(events_t).where(events_t.c.command_id == command_id, events_t.c.kind == kind)
         with self.engine.connect() as c:
             rows = _rows(c.execute(q))
         return rows[0] if rows else None
@@ -2461,10 +2760,17 @@ class Store:
                 if not stopped:  # its process re-bases its own references too
                     c.execute(insert(commands_t).values(sleeve=s.name, command=BOOK_RESET, reason=reason.strip(),
                                                         created_at=now))
+            _drop_carried(c)  # MUST-F286-H4 (HoQA): a reset while the book is empty is a fresh start
             c.execute(insert(decisions_t).values(
                 ts=now, actor=actor, action=BOOK_RESET, sleeve=None,
                 reason=f"Book reset: {reason.strip()} (cleared: {', '.join(s.name for s, *_ in cleared) or 'none'})"))
         return [s.name for s, *_ in cleared]
+
+    def drop_carried(self) -> bool:
+        """A clean slate while the book is empty (F286-4): the next capital starts afresh, not at the drawdown a
+        withdrawal that emptied the book carried (MUST-F286-H4). True when there was one to drop."""
+        with self.engine.begin() as c:
+            return _drop_carried(c)
 
     def pending_reset(self, sleeve: str | None = None) -> dict | None:
         rows = self.pending_resets()
@@ -2672,10 +2978,14 @@ class Store:
             rows = _rows(c.execute(select(events_t).where(events_t.c.id == event_id)))
         return rows[0] if rows else None
 
-    def write_incident_note(self, incident_id: int, *, author: str, why_stop_did_not_protect: str) -> None:
+    def write_incident_note(self, incident_id: int, *, author: str, why_stop_did_not_protect: str,
+                            why_clamp_did_not_prevent: str = "") -> None:
         """The note on a liquidation's incident (Advisor 18:17): why the half-liquidation stop did not protect the
-        position, and who wrote it. Both are required. A later note on the same incident replaces it."""
+        position, and who wrote it. Both are required. A later note on the same incident replaces it. A two-leg
+        Strategy's leg's note also says why closing the pair at half its distance to liquidation didn't prevent it
+        (WHY_CLAMP_FIELD, Advisor F283-O3): its reset after liquidation is refused without it."""
         why, author = (why_stop_did_not_protect or "").strip(), (author or "").strip()
+        clamp = (why_clamp_did_not_prevent or "").strip()
         if not why:
             raise ValueError(f"the note needs {WHY_STOP_FIELD}")
         if not author:
@@ -2684,7 +2994,8 @@ class Store:
         if ev is None or ev["kind"] != "incident" or ev["sleeve"] is None:
             raise ValueError(f"#{incident_id} is not a strategy's incident")
         self.event(ev["sleeve"], "info", INCIDENT_NOTE,
-                   f"Incident #{incident_id} note by {author}: {WHY_STOP_FIELD}: {why}")
+                   f"Incident #{incident_id} note by {author}: {WHY_STOP_FIELD}: {why}"
+                   + (f" | {WHY_CLAMP_FIELD}: {clamp}" if clamp else ""))
 
     def incident_note(self, incident_id: int) -> dict | None:
         """The latest note on an incident (write_incident_note), with its author, else None."""
@@ -2698,6 +3009,8 @@ class Store:
             return None
         note = notes[-1]
         note["author"] = note["message"][len(head):].split(f": {WHY_STOP_FIELD}: ", 1)[0]
+        clamp = note["message"].split(f" | {WHY_CLAMP_FIELD}: ", 1)
+        note["clamp"] = clamp[1] if len(clamp) == 2 else None
         return note
 
     def incident_is_open(self, incident_id: int) -> bool:
@@ -2974,8 +3287,13 @@ class Store:
         if is_backtest(sleeve):
             raise ValueError("a saved backtest takes no commands")
         row = self.sleeve(sleeve)  # raises if unknown
-        if command in (RAL, BOOK_RESET) and (row.parent is not None or self._leg_of(sleeve) is not None):
+        two_leg = row.parent is not None or self._leg_of(sleeve) is not None
+        if command == BOOK_RESET and two_leg:
             raise ValueError("a reset isn't built for a two-leg Strategy yet, so nothing was changed")  # P2-8
+        pair = None  # a two-leg Strategy's reset after liquidation: the leg it resets and the leg re-based with it
+        if command == RAL and two_leg:
+            pair = self._pair_ral(row, incident, actor)
+            sleeve = pair["leg"]  # journaled on the liquidated leg's row, so one reset per incident still holds
         here = None  # a reset after liquidation applied here, as no process will apply it
         if command == RAL:
             from sleeve_fund.paper.runtime import ral_refusal  # the engine's liquidation rule (liquidation_head)
@@ -2983,7 +3301,7 @@ class Store:
             if (why := ral_refusal(self, sleeve, incident, actor)) is not None:
                 raise ValueError(why)
             reason = f"{reason.strip()} (incident #{incident})"
-            here = self._ral_here(sleeve, reason, incident)
+            here = self._ral_here(sleeve, reason, incident, pair)
         elif incident is not None:
             raise ValueError("only a reset after liquidation names an incident")
         now = utcnow()
@@ -3006,8 +3324,17 @@ class Store:
                                                         created_at=now))
                     if holds_through_reset and command in ("pause", "flatten"):
                         self._hold_on_reset(c, leg, command, reason)
+                if pair:
+                    # The other leg's half (Advisor F283-O3 (b)): its process re-bases the pair's summed figures and
+                    # its own with the liquidated leg's; it resets nothing and lifts no halt of its own.
+                    pair["companion"] = c.execute(insert(commands_t).values(
+                        sleeve=pair["other"], command=RAL, created_at=now,
+                        reason=f"{PAIR_REBASE}: {sleeve}'s reset after liquidation (command #{cid})"
+                    )).inserted_primary_key[0]
                 if here:
                     self._apply_ral(c, sleeve, cid, here, now)
+                    if pair:
+                        self._apply_pair_rebase(c, pair, pair["companion"], now)
         except IntegrityError:
             if incident is None:
                 raise
@@ -3015,12 +3342,98 @@ class Store:
                              "liquidation") from None
         if here:
             self._lapse_resets_before(sleeve, now)
-        self.decide(actor, command, reason, sleeve)
+        self.decide(actor, command, reason, pair["parent"] if pair else sleeve)
+
+    def _pair_ral(self, row: Sleeve, incident: int | None, actor: str) -> dict:
+        """A two-leg Strategy's reset after liquidation (Advisor F283-O3, 14 Oct 13:15 UK), sent to the Strategy (its
+        first leg's row) naming a liquidated leg's incident. Raises ValueError, in words naming what is in the way,
+        unless: that leg takes it under the one-leg rule (ral_refusal); its incident's note also says why the pair's
+        close at half its distance to liquidation didn't prevent it (WHY_CLAMP_FIELD); the pair is flat in its journal
+        (pair_state); neither leg holds anything but dust; and neither has an order working. Returns the parent, the
+        liquidated leg and the other. A leg liquidated too needs its own reset, naming its own incident: the pair stays
+        blocked until each liquidated leg has one."""
+        from sleeve_fund.paper.runtime import liquidation_head, ral_refusal
+
+        if row.parent is not None:
+            raise ValueError(f"this is the second leg of {row.parent}: send the reset after liquidation to {row.parent}, "
+                             "naming the liquidated leg's incident")
+        parent, legs = row.name, self.legs(row.name)
+        ev = self.event_by_id(incident) if incident is not None else None
+        # The leg the incident is on; else (none named, or not a leg's) the one liquidated leg, so the refusal is
+        # its own (name the incident, or not this liquidation's), not "nothing to clear" from the leg that is fine.
+        liquidated = [n for n in legs if liquidation_head(self, n) is not None]
+        leg = (ev["sleeve"] if ev is not None and ev["sleeve"] in legs else
+               liquidated[0] if len(liquidated) == 1 else parent)
+        if (why := ral_refusal(self, leg, incident, actor)) is not None:
+            raise ValueError(why)
+        if (self.incident_note(incident) or {}).get("clamp") is None:
+            raise ValueError(f"incident #{incident}'s note needs {WHY_CLAMP_FIELD} too, as {leg} is a leg of the "
+                             f"two-leg Strategy {parent}: write it first")
+        state = self.pair_state(parent)
+        if state is not None and state["state"] != "flat":
+            raise ValueError(f"the pair is still {state['state']}: a reset after liquidation waits until both legs "
+                             "are closed")
+        for name in legs:
+            book = self.journal_book(name, self.sleeve(name).starting_balance)
+            if abs(book["qty"]) > 1e-12 and not is_dust(book):
+                raise ValueError(f"{name} still holds {book['qty']}: a reset after liquidation waits until both legs "
+                                 "are closed")
+            if self.orders(name, statuses=OPEN_ORDER_STATUSES, limit=1):
+                raise ValueError(f"{name} has an order working: a reset after liquidation waits until it is done")
+        return {"parent": parent, "leg": leg, "other": next(n for n in legs if n != leg)}
+
+    def pair_rebase_words(self, parent: str, leg: str, old, equity) -> str:
+        """What the other leg's half of a pair's reset after liquidation journals."""
+        return (f"Pair re-base with {leg}'s reset after liquidation: {parent}'s high-water mark {to_decimal(old):,.2f} "
+                f"becomes {to_decimal(equity):,.2f}, both legs' equity summed, which is also the day's loss baseline. "
+                "Nothing of this leg is reset and no halt of its own is lifted.")
+
+    def pair_figures(self, pair: dict, now: datetime) -> dict:
+        """What a stopped pair's re-base writes, read before its transaction: each leg's cash (both flat), their sum,
+        the pair's high-water mark before, and the other leg's last mark (its price and benchmark)."""
+        cash = {n: to_decimal(self.journal_book(n, self.sleeve(n).starting_balance)["cash"], "cash")
+                for n in (pair["leg"], pair["other"])}
+        summed = sum(cash.values(), Decimal(0))
+        state = self.pair_state(pair["parent"])
+        return {"cash": cash, "summed": summed,
+                "old": state["hwm"] if state is not None and state["hwm"] is not None else summed,
+                "last": self.equity_at_or_before(pair["other"], now)}
+
+    def _apply_pair_rebase(self, c, pair: dict, command_id: int, now: datetime) -> bool:
+        """A stopped two-leg Strategy's reset after liquidation, the other leg's half, in the command's transaction (as
+        _apply_ral is the liquidated leg's): the pair's summed high-water mark, halt reference and day's start re-based
+        at both legs' equity now (both flat: their cash), a mark of this leg's at it, and the re-base journaled, so a
+        Start restores the summed figures (_pair_first_mark). The book-level figures are not touched."""
+        took = c.execute(update(commands_t).where(commands_t.c.id == command_id, commands_t.c.applied_at.is_(None))
+                         .values(applied_at=now)).rowcount
+        if not took:
+            return False
+        other, f = pair["other"], pair["figures"]
+        c.execute(insert(events_t).values(sleeve=other, ts=now, level="info", kind=PAIR_REBASED,
+                                          message=self.pair_rebase_words(pair["parent"], pair["leg"], f["old"],
+                                                                         f["summed"]),
+                                          command_id=command_id))
+        if f["last"] is not None:
+            v = float(f["cash"][other])
+            c.execute(insert(equity_t).values(sleeve=other, ts=now, equity=v, cash=v, qty=0.0,
+                                              price=f["last"]["price"], benchmark=f["last"]["benchmark"]))
+        from sleeve_fund import risk
+
+        v = stored(f["summed"], "equity")
+        c.execute(update(pair_state_t).where(pair_state_t.c.parent == pair["parent"],
+                                             pair_state_t.c.marked_at.is_not(None))
+                  .values(reference_equity=v, hwm=v, day_start=risk.trading_day(now), day_start_equity=v,
+                          marked_at=now, updated_at=now))
+        return True
 
     def apply_waiting_ral(self, sleeve: str) -> bool:
         """A reset after liquidation still waiting when its strategy was stopped (QA RAL-F2: Stop after the RAL): no
         process will apply it once the strategy is stopped and flat, so it is applied here as Store.command applies
-        one sent to a stopped strategy. True if one was applied; a process that got there first wins."""
+        one sent to a stopped strategy. True if one was applied; a process that got there first wins. A two-leg
+        Strategy: each leg's waiting reset, with the other leg's half that came with it (PAIR_REBASE)."""
+        legs = self.legs(sleeve)
+        if len(legs) > 1:
+            return any([self._apply_waiting_pair_ral(legs, leg) for leg in legs])
         waiting = [c for c in self.pending_commands(sleeve) if c["command"] == RAL]
         if not waiting or (here := self._ral_here(sleeve, waiting[-1]["reason"], waiting[-1]["incident"])) is None:
             return False
@@ -3029,6 +3442,25 @@ class Store:
             if not self._apply_ral(c, sleeve, waiting[-1]["id"], here, now):
                 return False
         self._lapse_resets_before(sleeve, now)
+        return True
+
+    def _apply_waiting_pair_ral(self, legs: list[str], leg: str) -> bool:
+        waiting = [c for c in self.pending_commands(leg) if c["command"] == RAL and c["incident"] is not None]
+        if not waiting:
+            return False
+        cmd, other = waiting[-1], next(n for n in legs if n != leg)
+        half = [c for c in self.pending_commands(other) if c["command"] == RAL and c["incident"] is None
+                and c["reason"].endswith(f"(command #{cmd['id']})")]
+        pair = {"parent": legs[0], "leg": leg, "other": other}
+        if (here := self._ral_here(leg, cmd["reason"], cmd["incident"], pair)) is None:
+            return False
+        now = utcnow()
+        with self.engine.begin() as c:
+            if not self._apply_ral(c, leg, cmd["id"], here, now):
+                return False
+            if half:
+                self._apply_pair_rebase(c, pair, half[-1]["id"], now)
+        self._lapse_resets_before(leg, now)
         return True
 
     def _apply_ral(self, c, sleeve: str, command_id: int, here: dict, now: datetime) -> bool:
@@ -3054,11 +3486,13 @@ class Store:
                 self.refuse_reset(request, "lapsed: asked before the liquidation, which the reset after "
                                   "liquidation answered")
 
-    def _ral_here(self, sleeve: str, reason: str, incident: int) -> dict | None:
+    def _ral_here(self, sleeve: str, reason: str, incident: int, pair: dict | None = None) -> dict | None:
         """A reset after liquidation for a strategy no process will apply it for (CR on #193): stopped and flat, so
         the supervisor runs nothing, and Start is refused while it is liquidated. Returns what Store.command journals
         for it in the command's own transaction (the engine's words, and a mark at the remaining equity, so a later
-        Start restores the new high-water mark and day baseline from it), else None for the process to apply."""
+        Start restores the new high-water mark and day baseline from it), else None for the process to apply. A
+        two-leg Strategy's leg (`pair`, from _pair_ral): the words carry the pair's summed figures, and the figures
+        the other leg's half writes (pair_figures) are read into `pair` here, before the transaction."""
         from sleeve_fund.paper.runtime import SleeveRuntime, liquidation_event, ral_words
 
         s = self.sleeve(sleeve)
@@ -3069,7 +3503,11 @@ class Store:
         equity = book["cash"]
         last = self.equity_at_or_before(sleeve, utcnow())
         cmd = {"incident": incident, "reason": reason}
-        words = ral_words(self, sleeve, cmd, liq, SleeveRuntime(self, sleeve).peak, equity)
+        if pair is not None:
+            pair["figures"] = self.pair_figures(pair, utcnow())
+            words = ral_words(self, sleeve, cmd, liq, pair["figures"]["old"], pair["figures"]["summed"])
+        else:
+            words = ral_words(self, sleeve, cmd, liq, SleeveRuntime(self, sleeve).peak, equity)
         mark = (None if last is None else
                 {"equity": equity, "cash": equity, "qty": 0.0, "price": last["price"], "benchmark": last["benchmark"]})
         return {"words": words, "mark": mark}
@@ -3156,6 +3594,11 @@ class Store:
                     self.decide("system", f"drop {cmd['command']}", f"{why} ({cmd['reason']})", name)
             n += len(pending)
         return n
+
+    def command_by_id(self, command_id: int) -> dict | None:
+        with self.engine.connect() as c:
+            rows = _rows(c.execute(select(commands_t).where(commands_t.c.id == command_id)))
+        return rows[0] if rows else None
 
     def mark_applied(self, command_id: int) -> None:
         with self.engine.begin() as c:

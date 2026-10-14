@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "_macros.html" import chip, test_chip, signed, money_signed, usage, spark, pts, tag, cost_share, open_risk_text, open_risk_hint, open_risk_warn, open_risk_room, leg_flag, legs_list %}
+{% from "_macros.html" import chip, test_chip, signed, money_signed, usage, spark, pts, tag, cost_share, open_risk_text, open_risk_hint, open_risk_warn, open_risk_room, limits_after, leg_flag, legs_list %}
 {% from "_reasons.html" import reason_picker %}
 {% from "_positions.html" import positions_table %}
 {% block title %}Portfolio · Multi-Strategy Fund{% endblock %}
@@ -16,6 +16,8 @@
   </p>
 </div>
 
+{% if archived_now %}<div class="banner" role="status">Archived {{ archived_now }}{% if archived_words %}, {{ archived_words }}{% endif %}.{{ limits_after(put_away_now) }}</div>{% endif %}
+
 {% if summaries or archived %}
 {# Shown only when an alert is waiting to be acknowledged: the newest one, and a link to the rest. #}
 {% if alerts %}{% set a = alerts[0] %}
@@ -30,7 +32,7 @@
 {% set day_base = book.equity - book.day_pnl %}
 {% set closest = (summaries|sort(attribute='dd_used')|last) if summaries else none %}
 <section class="kpis ledger8" aria-label="Book figures">
-  <div class="kpi lead" title="Sum of every strategy's equity; started at {{ book.start|money }}"><div class="k">Book value</div><div class="v">{{ book.equity|money }}</div></div>
+  <div class="kpi lead" title="Sum of every strategy's equity; started at {{ book.start|money }}"><div class="k">Book value</div><div class="v">{{ book.equity|money }}</div>{% if book.put_away %}<div class="s" title="Archived Strategies whose equity has left the fund's book; with the book, {{ book.capital|money }} in all">Put away, not trading {{ book.put_away|money }}</div>{% endif %}</div>
   <div class="kpi" title="Since 00:00 UTC{% if day_base > 0 %} · {{ (book.day_pnl / day_base)|pct }}{% endif %}"><div class="k">Today</div><div class="v">{{ money_signed(book.day_pnl) }}</div></div>
   <div class="kpi" title="Since the 1st of the month, 00:00 UTC"><div class="k">Month to date</div><div class="v">{{ money_signed(book.mtd_pnl) }}</div></div>
   <div class="kpi" title="{{ book.pnl|smoney }} since the book started at {{ book.start|money }}"><div class="k">Since start</div><div class="v">{{ signed(book.ret) }}</div></div>
@@ -166,9 +168,9 @@
 
 {% if archived %}
 <details class="panel archived" id="archived">
-  <summary><strong>Archived strategies ({{ archived|length }})</strong> <span class="muted">stopped and put away; their cash still counts in the book</span></summary>
+  <summary><strong>Archived strategies ({{ archived|length }})</strong> <span class="muted">stopped and put away; their equity is out of the fund's book{% set kept = (still_counted|length) + (waiting_flat|length) + (nothing_out|length) %}{% if kept %}, except {{ kept }} still in it{% if waiting_flat %} ({{ waiting_flat|length }} waiting to go flat){% endif %}{% endif %}</span></summary>
   <ul class="feed" style="margin-top:10px">{% for x in archived %}{% set s = x.sleeve %}
-    <li><span class="when">{{ x.equity|money }}</span><span class="what"><a href="/sleeves/{{ s.name }}">{{ s.name }}</a> <span class="muted">{{ s.instrument }} · {{ s.strategy|replace('_', ' ') }} · {{ signed(x.ret) }} since start</span></span></li>{% endfor %}
+    <li><span class="when">{{ x.equity|money }}</span><span class="what"><a href="/sleeves/{{ s.name }}">{{ s.name }}</a>{% if s.name in waiting_flat %} <span class="warn">waiting to go flat: {{ waiting_flat[s.name] }}</span>{% elif s.name in leaving %} <span class="{{ 'warn' if leaving[s.name] else 'muted' }}">{{ leaving[s.name] or 'leaving the fund\'s book at the supervisor\'s next mark' }}</span>{% elif s.name in nothing_out %} <span class="muted">nothing to withdraw (equity {{ nothing_out[s.name]|money }})</span>{% endif %} <span class="muted">{{ s.instrument }} · {{ s.strategy|replace('_', ' ') }} · {{ signed(x.ret) }} since start</span></span></li>{% endfor %}
   </ul>
 </details>
 {% endif %}
@@ -223,7 +225,7 @@
     <thead><tr><th>Time</th><th>Strategy</th><th>Side</th><th>Instrument</th><th class="num">Quantity</th><th class="num">Price</th><th class="num">Fee</th><th>For</th><th>Reason</th></tr></thead>
     <tbody>{% for f in book_fills %}
     <tr><td data-m="hide">{{ f.ts|ts }}</td>
-      <td data-m="hide"><a href="/sleeves/{{ f.sleeve }}">{{ f.sleeve|leg_label }}</a></td>
+      <td data-m="hide"><a href="/sleeves/{{ f.sleeve }}">{{ f.sleeve|leg_label }}</a>{% if f.sleeve in test_names %} {{ test_chip() }}{% endif %}</td>
       <td><span class="side {{ f.side|lower }}">{{ 'Buy' if f.side == 'BUY' else 'Sell' }}</span> <span class="m-only">{{ f.sleeve|leg_label }}</span> <span class="muted m-only">{{ f.ts|ts }}</span></td>
       <td data-m="hide">{{ f.pair }}</td>
       <td class="num" data-m="right">{{ f.qty|qty }} {{ f.pair.split('/')[0] }}<span class="muted m-only"> at {{ f.price|px }}</span></td>
@@ -245,13 +247,13 @@
     <thead><tr><th>Settled</th><th>Strategy</th><th>Instrument</th><th class="num">Rate</th><th class="num">Position</th><th class="num">Paid / received</th></tr></thead>
     <tbody>{% for f in funding.payments %}
     <tr><td data-m="hide">{{ f.ts|ts }}</td>
-      <td><a href="/sleeves/{{ f.sleeve }}">{{ f.sleeve|leg_label }}</a> <span class="muted m-only">{{ f.ts|ts }}</span></td>
+      <td><a href="/sleeves/{{ f.sleeve }}">{{ f.sleeve|leg_label }}</a>{% if f.sleeve in test_names %} {{ test_chip() }}{% endif %} <span class="muted m-only">{{ f.ts|ts }}</span></td>
       <td data-m="hide">{{ f.pair }}</td>
       <td class="num" data-m="hide">{{ '%.4f%%'|format(f.rate * 100) }}</td>
       <td class="num" data-m="hide">{{ 'Short' if f.qty < 0 else 'Long' }} {{ f.qty|abs|qty }}</td>
       <td class="num" data-m="right">{{ money_signed(f.amount) }}</td></tr>
     {% endfor %}</tbody>
-    <tfoot><tr><th scope="row" colspan="5">Since start, {{ funding.totals|length }} perpetual strateg{{ 'ies' if funding.totals|length != 1 else 'y' }}</th><td class="num">{{ money_signed(funding.total) }}</td></tr></tfoot>
+    <tfoot><tr><th scope="row" colspan="5">Since start, {{ funding.totals|length }} perpetual strateg{{ 'ies' if funding.totals|length != 1 else 'y' }}{% if test_names %}, test accounts not counted{% endif %}</th><td class="num">{{ money_signed(funding.total) }}</td></tr></tfoot>
   </table>
   {% if funding.totals|length > 1 %}<p class="muted fund-split">{% for t in funding.totals %}<a href="/sleeves/{{ t.sleeve }}">{{ t.sleeve|leg_label }}</a> {{ money_signed(t.total) }}{{ ' · ' if not loop.last }}{% endfor %}</p>{% endif %}
   {% elif funding.perps %}<p class="empty" style="padding:4px 18px 16px">No funding settled yet. A perpetual position pays or receives it at each funding time while it is open.</p>

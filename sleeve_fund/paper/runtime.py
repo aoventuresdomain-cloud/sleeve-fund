@@ -20,8 +20,8 @@ from types import SimpleNamespace
 from sleeve_fund import lifecycle, risk
 from sleeve_fund.exact import EngineJournal
 from sleeve_fund.router import venue_for
-from sleeve_fund.store import (BOOK_RESET, LIQUIDATION_RESET, OPEN_ORDER_STATUSES, RAL, RELOAD, WHY_STOP_FIELD, Store,
-                               replay_book, utcnow)
+from sleeve_fund.store import (BOOK_RESET, LIQUIDATION_RESET, OPEN_ORDER_STATUSES, PAIR_REBASE, PAIR_REBASED, RAL,
+                               RELOAD, WHY_STOP_FIELD, Store, replay_book, utcnow)
 
 # P2-6 journal kinds and order intents (orders.intent is String(16)).
 WIND_STOP, WIND_NOTICE, WIND_RETRY, WIND_FLATTEN = "wind_down_stop", "wind_down_notice", "wind_down_retry", "wind_down"
@@ -296,11 +296,42 @@ def ral_words(store, name: str, cmd: dict, liq: dict, old: float, equity: float)
     strategy, which no process applies it for) say the same."""
     note = store.incident_note(cmd["incident"]) if cmd.get("incident") is not None else None
     before = store.equity_at_or_before(name, liq["ts"] - timedelta(seconds=1))
+    if (pair := pair_ral_figures(store, name, liq)) is not None:
+        # A two-leg Strategy's leg (Advisor F283-O3): the Strategy is the pair, so its figures are both legs summed.
+        return (f"Reset after liquidation of {name}, a leg of {pair['parent']}, by the PM, answering incident "
+                f"#{cmd['incident']} (note by {note['author'] if note else 'nobody'}): the pair's high-water mark "
+                f"{old:,.2f} becomes {equity:,.2f}, both legs' equity summed, which is also the day's loss baseline. "
+                f"Both legs summed {pair['before']:,.2f} just before the liquidation, {pair['after']:,.2f} after it: "
+                f"this leg lost {pair['x']:,.2f}, {pair['y']:.1f}% of the pair, the other leg's unwind "
+                f"{pair['unwind']:+,.2f}, the pair {-pair['net']:+,.2f} in all. {cmd['reason']}")
     return (f"Reset after liquidation by the PM, answering incident #{cmd['incident']} (note by "
             f"{note['author'] if note else 'nobody'}): high-water mark {old:,.2f} becomes {equity:,.2f}, "
             "the remaining equity, which is also the day's loss baseline. Equity "
             + (f"{before['equity']:,.2f}" if before else "unknown")
             + f" just before the liquidation, {equity:,.2f} after it. {cmd['reason']}")
+
+
+def pair_ral_figures(store, name: str, liq: dict) -> dict | None:
+    """A two-leg Strategy's leg's liquidation in the pair's terms (Advisor F283-O3 (d) 1), else None for one leg:
+    `before`, both legs' marked equity summed just before it; `x`, this leg's loss (its equity then less its cash now,
+    flat); `y`, x as a % of `before`, not of the leg's own equity, which would read about 100%; `unwind`, the other
+    leg's gain or loss from then to now (its forced close); `after`, both legs' cash now; `net`, the pair's loss."""
+    row = store.sleeve(name)
+    legs = store.legs(name)
+    if len(legs) < 2:
+        return None
+    other = next(n for n in legs if n != name)
+    at = liq["ts"] - timedelta(seconds=1)
+    mine, theirs = store.equity_at_or_before(name, at), store.equity_at_or_before(other, at)
+    if mine is None or theirs is None:
+        return None
+    now = {n: float(store.journal_book(n, store.sleeve(n).starting_balance)["cash"]) for n in legs}
+    before = float(mine["equity"]) + float(theirs["equity"])
+    after = now[name] + now[other]
+    x = float(mine["equity"]) - now[name]
+    return {"parent": row.parent or name, "other": other, "before": before, "after": after, "x": x,
+            "y": 100 * x / before if before > 0 else float("nan"), "unwind": now[other] - float(theirs["equity"]),
+            "net": before - after}
 
 
 def said_since_last_fill(store, name: str, head: str) -> bool:
@@ -496,7 +527,8 @@ class SleeveRuntime:
         fills = self.store.fills(self.name, limit=1)
         if not fills or any(c["command"] == RAL for c in self.store.pending_commands(self.name)):
             return None
-        reset = self.store.last_event(self.name, (RESET_AFTER_LIQUIDATION,))
+        # A two-leg Strategy's other leg re-based with it (PAIR_REBASED) starts a fresh run too (Advisor F283-O3 (d) 3).
+        reset = self.store.last_event(self.name, (RESET_AFTER_LIQUIDATION, PAIR_REBASED))
         return None if reset is not None and reset["ts"] >= fills[0]["ts"] else fills[0]
 
     def _last_liquidation(self) -> str | None:
@@ -844,6 +876,9 @@ class SleeveRuntime:
         so the restart takes it again. One journaled but not yet marked (a liquidation_reset carries its command_id,
         F217-3) is finished on the retry, never journaled twice: the earlier resets lapse (QA F217-1) and
         a halt still standing is lifted. Any other RAL with nothing to reset is ignored as before, and lapses nothing."""
+        if cmd.get("incident") is None and self.pair_parent is not None and cmd["reason"].startswith(PAIR_REBASE):
+            self._pair_rebase_after_ral(cmd, equity)
+            return
         liq = liquidation_event(self.store, self.name)
         if liq is None and (reset := self.store.reset_for_command(cmd["id"])) is not None:
             # The process died after journaling this reset and before marking it applied: finish it from the journal,
@@ -852,6 +887,7 @@ class SleeveRuntime:
             # on the restart); any other halt stays for its own reason (HoE on #217: PE2, QA F217-2).
             self._lapse_resets_before(cmd)
             self.peak, self._day_open = equity, equity
+            self._pair_rebase_all(equity)
             self.wiped_out, self.liquidated = False, None
             if self.status == "halted":
                 kept = self._lift_the_liquidations_halt(after_id=reset["id"])
@@ -875,11 +911,54 @@ class SleeveRuntime:
                          ral_words(self.store, self.name, cmd, liq, old, equity), ts=self.now(), command_id=cmd["id"])
         self._lapse_resets_before(cmd)
         self.peak, self._day_open = equity, equity
+        self._pair_rebase_all(equity)
         self.wiped_out, self.liquidated = False, None
         if (kept := self._lift_the_liquidations_halt(after_id=liq["id"] or 0,
                                                      since=None if liq["id"] else liq["ts"])) is not None:
             self.store.event(self.name, "info", "ral_halt_kept", f"reset after liquidation done; {kept}",
                              ts=self.now())
+        self.store.mark_applied(cmd["id"])
+
+    def _pair_rebase_all(self, equity: float) -> None:
+        """A two-leg Strategy's reset after liquidation re-bases the pair's summed high-water mark, halt reference and
+        day's start at `equity`, both legs summed (Advisor F283-O3 (b)), as one leg's re-bases its own. Idempotent: the
+        other leg's half sets the same. The book-level figures are not touched."""
+        if self.paired and self.pair_parent is not None:
+            self._pair_rebase(equity, hwm=True)
+            self.store.set_pair_day(self.pair_parent, risk.trading_day(self.now()), equity, self.now(), rebase=True)
+
+    def _pair_rebase_after_ral(self, cmd: dict, equity: float) -> None:
+        """The other leg's half of a two-leg Strategy's reset after liquidation (Store.command, PAIR_REBASE): this leg's
+        drawdown reference and day's start, and the pair's summed ones, re-based at `equity`, both legs summed, so it
+        doesn't judge the pair against the high-water mark before the liquidation and halt it on its next tick. It
+        resets nothing else and lifts no halt of its own: a summed drawdown halt stays until a Resume (F217-4). One
+        pair_rebase event on this leg journals it (and starts a fresh run here too, RAL-ANCHOR); never a
+        liquidation_reset, which would answer this leg's own liquidation if it had one. Taken only
+        with the liquidated leg's own reset: while that waits, this waits; refused, this is refused too."""
+        m = re.search(r"\(command #(\d+)\)$", cmd["reason"])
+        theirs = self.store.command_by_id(int(m.group(1))) if m else None
+        sibling = self.store.legs(self.name)
+        if (theirs is None or theirs["command"] != RAL or theirs["incident"] is None or theirs["sleeve"] == self.name
+                or theirs["sleeve"] not in sibling):
+            self.store.event(self.name, "warning", "ral_refused",
+                             f"pair re-base refused: it names no reset after liquidation of the other leg. "
+                             f"{cmd['reason']}", ts=self.now())
+            self.store.mark_applied(cmd["id"])
+            return
+        if theirs["applied_at"] is None:
+            return  # the liquidated leg's reset first: this is taken on a later tick, once it is
+        if self.store.reset_for_command(theirs["id"]) is None:
+            self.store.event(self.name, "warning", "ral_refused",
+                             f"pair re-base refused: the other leg's reset after liquidation wasn't taken. "
+                             f"{cmd['reason']}", ts=self.now())
+            self.store.mark_applied(cmd["id"])
+            return
+        if self.store.reset_for_command(cmd["id"], PAIR_REBASED) is None:  # a retry after a crash journals it once
+            self.store.event(self.name, "info", PAIR_REBASED,
+                             self.store.pair_rebase_words(self.pair_parent, theirs["sleeve"], self.peak, equity),
+                             ts=self.now(), command_id=cmd["id"])
+        self.peak, self._day_open = equity, equity
+        self._pair_rebase_all(equity)
         self.store.mark_applied(cmd["id"])
 
     def _lift_the_liquidations_halt(self, after_id: int, since: datetime | None = None) -> str | None:
@@ -952,6 +1031,28 @@ class SleeveRuntime:
 
     # --- periodic tick ----------------------------------------------------------
 
+    def _record_mark(self, *, equity: float, cash: float, qty: float, price: float, ts: datetime) -> None:
+        if self.bench_base_price is None:
+            self.bench_base_price = price
+        # Buy and hold at the exposure this sleeve may take (its position cap), the rest in cash, so the
+        # comparison isn't flattered or punished by the cap itself; never above 1x, as a perp's cap can pass 1x
+        # and a levered hold can't be liquidated. The backtest page's definition, so a saved
+        # run's screen and its result agree (round 12, M12-U1).
+        cap = min(self.cap, 1.0)
+        benchmark = self.starting_balance * ((1 - cap) + cap * (1 - self.taker_fee) * price / self.bench_base_price)
+        self.store.record_equity(self.name, equity=equity, cash=cash, qty=qty, price=price, benchmark=benchmark,
+                                 ts=ts)
+
+    def final_mark(self, *, equity: float, cash: float, qty: float, price: float) -> None:
+        """Paper, on stop (MARK-ON-STOP): one last mark of the book as it stands, with every fill booked so far, so the
+        latest mark a stopped Strategy leaves (the book page, the Open-risk tile, the start check) is never one taken
+        before its last fill, e.g. the flatten tick's own mark. Only a mark: no guard, no command, no status change.
+        A backtest takes none (its last bar's tick is its last mark)."""
+        if self.backtest or price <= 0:
+            return
+        self._record_mark(equity=equity, cash=cash, qty=qty, price=price, ts=self.now())
+
+
     def tick(self, *, equity: float, cash: float, qty: float, price: float,
              guard_equity: float | None = None, busy: bool = False, ruined: str | None = None,
              liquidating: bool = False, other_equity: float = 0.0) -> str | None:
@@ -974,16 +1075,7 @@ class SleeveRuntime:
             self.progress(now)
         if price <= 0:
             return None
-        if self.bench_base_price is None:
-            self.bench_base_price = price
-        # Buy and hold at the exposure this sleeve may take (its position cap), the rest in cash, so the
-        # comparison isn't flattered or punished by the cap itself; never above 1x, as a perp's cap can pass 1x
-        # and a levered hold can't be liquidated. The backtest page's definition, so a saved
-        # run's screen and its result agree (round 12, M12-U1).
-        cap = min(self.cap, 1.0)
-        benchmark = self.starting_balance * ((1 - cap) + cap * (1 - self.taker_fee) * price / self.bench_base_price)
-        self.store.record_equity(self.name, equity=equity, cash=cash, qty=qty, price=price, benchmark=benchmark,
-                                 ts=now)
+        self._record_mark(equity=equity, cash=cash, qty=qty, price=price, ts=now)
         equity += other_equity  # from here on, what the guard judges: a two-leg Strategy's both legs
         if self.paired and self.pair_parent is not None and self._day is None:
             self._pair_first_mark(now, equity)

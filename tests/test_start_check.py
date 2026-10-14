@@ -16,6 +16,19 @@ from sleeve_fund.store import Store, account_keys_t
 T0 = datetime(2026, 10, 13, 12, 0, tzinfo=UTC)
 
 
+@pytest.fixture(autouse=True)
+def _postgres_journal(request, monkeypatch):
+    """The cells below read a SQLite journal for the rest of the page; the journal-store line is pinned on its own
+    (the journal_store cells), where SQLite fails it."""
+    if "journal_store" not in request.node.name:
+        def postgres(engine):
+            sec = start_check.Section("Journal store")
+            sec.add(start_check.PASS, "Postgres")
+            return sec
+
+        monkeypatch.setattr(start_check, "check_store", postgres)
+
+
 def _journal(tmp_path, *, mark_qty=0.1, mark_cash=4_000.0 - 3.0, params=None):
     """One Strategy that bought 0.1 at 60,000 (fee 3), marked after the fill at mark_qty / mark_cash."""
     url = f"sqlite:///{tmp_path}/j.db"
@@ -249,3 +262,32 @@ def test_a_flat_position_on_the_page_is_0(tmp_path, monkeypatch):
     ok, page = start_check.run(url, environ={})
     assert ok and "s1: position 0 vs journal 0; cash 9,994.00" in page, page
     assert "e-18" not in page
+
+
+def test_journal_store_paper_refuses_a_sqlite_journal(tmp_path):
+    """The Advisor's condition on #286: paper journals to Postgres, so a SQLite journal fails the start check."""
+    url, _ = _journal(tmp_path)
+    ok, page = start_check.run(url, environ={})
+    assert not ok and "Journal store: FAIL\n  FAIL  sqlite: paper must journal to Postgres" in page
+
+
+def test_journal_store_postgres_passes():
+    from sqlalchemy import create_engine
+
+    engine = create_engine("postgresql+psycopg://paper@/journal")  # the dialect only: nothing connects
+    assert start_check.check_store(engine).lines == [(start_check.PASS, "Postgres")]
+
+
+@pytest.mark.skipif(not os.environ.get("TEST_DATABASE_URL"), reason="needs Postgres (TEST_DATABASE_URL)")
+def test_journal_store_a_postgres_journal_passes_the_whole_page():
+    from sleeve_fund.store import make_engine, metadata
+
+    url = os.environ["TEST_DATABASE_URL"]
+    engine = make_engine(url)
+    metadata.drop_all(engine)
+    store = Store(engine=engine)
+    store.create_sleeve(name="s1", strategy="ping_pong", instrument="BTC/USDT", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=10_000, venue="BINANCE")
+    engine.dispose()
+    ok, page = start_check.run(url, environ={})
+    assert ok and "Journal store: PASS\n  PASS  Postgres" in page, page

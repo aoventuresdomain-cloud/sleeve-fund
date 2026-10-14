@@ -98,3 +98,29 @@ def test_the_limits_inputs_are_unchanged_by_the_display_filter(tmp_path, monkeyp
     monkeypatch.setattr(bookm, "is_test_account", lambda store, sleeve: False)
     assert (open_risk.book_open_risk(store, {}), [store.last_equity(s.name) for s in store.sleeves()]) == marked
     assert [s.name for s in store.sleeves()] == ["real", "tst"]
+
+
+def test_its_fills_and_funding_show_marked_and_the_funding_total_leaves_them_out(tmp_path, monkeypatch):
+    """F273-1: Home lists what a test-account Strategy did on every tab, as its order and position are, marked; the
+    book's funding total, and so its costs, leave it out."""
+    c, store = _client(tmp_path, monkeypatch)
+    for name, inst, venue in (("realp", "BTC/USDT", "BINANCE"), ("tstp", "BTC/USD", None)):
+        store.create_sleeve(name=name, strategy="trend_filter", instrument=inst, bar_spec="1-HOUR-LAST-EXTERNAL",
+                            starting_balance=3000, params={"fast": 10, "slow": 30, "market": "perp"},
+                            **({"venue": venue} if venue else {}))
+        store.record_fill(name, side="BUY", qty=0.01, price=100000, fee=0.5, order_id=f"o-{name}",
+                          trade_id=f"t-{name}")
+        store.record_equity(name, equity=3000, cash=2000, qty=0.01, price=100000, benchmark=3000)
+    store.record_funding("realp", qty=0.01, price=100000, rate=0.0001, amount=-0.1)
+    store.record_funding("tstp", qty=0.01, price=100000, rate=0.0001, amount=-7.0)
+    home = c.get("/", auth=AUTH).text
+    fills = home[home.index('id="fills-h"'):].split("</section>")[0]
+    funding = home[home.index('id="funding-h"'):].split("</section>")[0]
+    for tab in (fills, funding):
+        assert 'href="/sleeves/realp"' in tab and 'href="/sleeves/tstp"' in tab
+        row = tab[tab.index('href="/sleeves/tstp"'):].split("</td>")[0]
+        assert "Test account</span>" in row  # marked where it is listed
+        assert "Test account</span>" not in tab[tab.index('href="/sleeves/realp"'):].split("</td>")[0]
+    assert "−7.00" in funding or "-7.00" in funding  # its payment is listed
+    total = funding[funding.index("<tfoot>"):].split("</tfoot>")[0]
+    assert "test accounts not counted" in total and "0.10" in total and "7.10" not in total
