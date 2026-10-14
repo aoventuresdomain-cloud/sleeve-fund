@@ -210,33 +210,24 @@ def positions_breaks(store: Store) -> list[str]:
     return out
 
 
-LIQUIDATION_INTENTS = ("liquidation", "liquidation_cut")
-
-
 def insurance_breaks(store: Store, since: datetime | None = None) -> list[str]:
-    """MUST-FUNDCASH-LOSS (HoE): an insurance credit is the venue's cover for a liquidation fill that left a Strategy
-    below zero, so one that names no journaled liquidation fill is a loss booked back as income. Both readers of the
-    identity include insurance, so the cash leg can't see it: this leg can. Credits from `since` (the bridge, or the
-    PM's last Resume) on, per Strategy in the book. Returns each in words, [] when every credit names its liquidation."""
+    """MUST-FUNDCASH-LOSS, TEC-INSURE-ZERO (HoE): once the fund holds the cash, a liquidation is booked at the bankruptcy
+    price (GAP-LIQ-CAP), so no fund-held Strategy is ever credited by the insurance fund; a credit is a loss booked back
+    as income, which the cash leg can't see (both its readers count insurance). Any credit from `since` (the bridge,
+    or the PM's last Resume) on, per Strategy in the book, whatever fill it names. Returns each in words, [] for none."""
     from sqlalchemy import select
 
-    from sleeve_fund.store import fills_t, insurance_t, orders_t
+    from sleeve_fund.store import insurance_t
 
     names = [s.name for s in store.sleeves() if _in_book(store, s)]
-    if not names:
+    if not names or since is None:
         return []
-    i, f, o = insurance_t.c, fills_t.c, orders_t.c
-    q = (select(i.sleeve, i.amount, i.ts, o.intent)
-         .select_from(insurance_t.outerjoin(fills_t, (f.sleeve == i.sleeve) & (f.order_id == i.order_id)
-                                            & (f.trade_id == i.trade_id))
-                      .outerjoin(orders_t, o.order_id == f.order_id))
-         .where(i.sleeve.in_(names)).order_by(i.id))
-    if since is not None:
-        q = q.where(i.ts >= since)
+    i = insurance_t.c
+    q = select(i.sleeve, i.amount).where(i.sleeve.in_(names), i.ts >= since).order_by(i.id)
     with store.engine.connect() as c:
         rows = list(c.execute(q))
-    return [f"{r.sleeve}: an insurance credit of {to_decimal(r.amount, 'amount'):,.2f} names no liquidation fill"
-            for r in rows if r.intent not in LIQUIDATION_INTENTS]
+    return [f"{r.sleeve}: an insurance credit of {to_decimal(r.amount, 'amount'):,.2f} booked inside the fund, which "
+            "books every liquidation at the bankruptcy price" for r in rows]
 
 
 def _last_resume(store: Store) -> datetime | None:
