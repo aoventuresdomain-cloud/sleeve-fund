@@ -145,3 +145,13 @@ def test_shares_add_up_with_the_unlabelled_and_read_n_a_when_the_total_is_not_po
     assert {b.name: b.share for b in d.buckets}[rs.UNLABELLED] == pytest.approx(0.25)
     lost = rs.split([_trip(bull, -6.0), _trip(10, 2.0)], bars)
     assert "n/a (total <= 0)" in "\n".join(rs.render(lost))
+
+
+def test_a_bucket_over_80_percent_of_a_positive_total_is_flagged_regime_dependent():
+    # F281-1 (CR): the threshold itself is pinned; 85% must be flagged, 75% must not.
+    bars = _bars(np.concatenate([np.linspace(100, 300, 260), np.linspace(300, 150, 120)]))
+    lab = rs.labels(bars)
+    bull, bear = int(np.flatnonzero(lab["direction"] == "bull")[5]), int(np.flatnonzero(lab["direction"] == "bear")[-5])
+    at = {s.dimension: s for s in rs.split([_trip(bull, 85.0), _trip(bear, 15.0)], bars)}["direction"]
+    under = {s.dimension: s for s in rs.split([_trip(bull, 75.0), _trip(bear, 25.0)], bars)}["direction"]
+    assert at.dependent == "bull" and under.dependent is None
