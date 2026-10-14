@@ -1226,3 +1226,52 @@ table.movers tbody tr.tot th, table.movers tbody tr.tot td { border-top: 1px sol
 .limits-after-list b { font-variant-numeric: tabular-nums; }
 .banner .limits-after { margin: 6px 0 0; }
 .banner-note { margin: -6px 0 12px; font-size: 13px; color: var(--muted); }
+
+/* Portfolio compliance settings (PM-approved look, ui-v2/compliance-build-spec.md C1-C5). */
+.ps-head .ps-ver { flex-basis: 100%; order: 4; margin: 6px 0 0; display: flex; flex-wrap: wrap; gap: 4px 6px; align-items: center; font-size: 12px; color: var(--muted); }
+.okbox { background: var(--gain-bg); border: 1px solid color-mix(in srgb, var(--gain) 40%, transparent); border-radius: var(--r-sm); padding: 9px 11px; font-size: 13px; margin: 0 0 12px; }
+.ps-fixed { display: flex; flex-wrap: wrap; gap: 6px 20px; font-size: 12.5px; color: var(--muted); margin: 0 0 14px; }
+.ps-fixed span::before { content: "● "; color: var(--accent); }
+.ps-fixed b { color: var(--text); font-weight: 550; }
+.ps-err ul { margin: 4px 0 0; padding-left: 18px; }
+.ps-review { border-color: color-mix(in srgb, var(--accent) 45%, transparent); margin-bottom: 16px; }
+.ps-review h2 { margin-top: 0; }
+.ps-diff { list-style: none; margin: 0 0 12px; padding: 0; display: grid; gap: 4px; }
+.ps-diff li { font-variant-numeric: tabular-nums; padding: 6px 10px; background: var(--raised); border-radius: var(--r-sm); }
+.ps-tests { width: 100%; }
+.ps-tests td { vertical-align: top; }
+.ps-tests .ps-grouphead th { padding-top: 12px; border-bottom: 0; font-size: 13px; color: var(--text); font-weight: 600; }
+.ps-tests .ps-sub .ps-name { padding-left: 22px; color: var(--muted); }
+.ps-tests .ps-group + .ps-group tr:first-child > * { border-top: 1px solid var(--line-strong); }
+.ps-desc { white-space: normal; min-width: 220px; max-width: 360px; color: var(--muted); font-size: 12.5px; }
+.ps-lim { font-variant-numeric: tabular-nums; font-weight: 550; }
+.ps-input { display: inline-flex; align-items: center; gap: 4px; }
+.ps-input input { width: 64px; text-align: right; }
+.ps-bounds { display: block; font-size: 11.5px; font-weight: 400; margin-top: 3px; }
+.ps-use { display: grid; gap: 4px; min-width: 150px; font-size: 12px; font-variant-numeric: tabular-nums; }
+.ps-use .track { height: 5px; background: var(--raised); border-radius: 3px; position: relative; overflow: hidden; }
+.ps-use .track i { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 3px; background: var(--gain); }
+.ps-use.warn .track i { background: var(--warn); }
+.ps-use.loss .track i { background: var(--loss); }
+.ps-use.warn, .ps-use.loss { color: inherit; }
+.ps-use.warn > span:first-child { color: var(--warn); } .ps-use.loss > span:first-child { color: var(--loss); }
+.ps-tog { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+.ps-tog .sw { appearance: none; -webkit-appearance: none; margin: 0; flex: none; width: 28px; height: 16px; border-radius: 999px; background: var(--gain); position: relative; display: inline-block; cursor: default; }
+.ps-tog .sw::after { content: ""; position: absolute; right: 2px; top: 2px; width: 12px; height: 12px; border-radius: 50%; background: var(--page); transition: right .12s; }
+.ps-tog .sw.off, .ps-tog input.sw:not(:checked) { background: var(--raised); box-shadow: inset 0 0 0 1px var(--line-strong); }
+.ps-tog .sw.off::after, .ps-tog input.sw:not(:checked)::after { right: 14px; background: var(--muted); }
+.ps-tog input.sw { cursor: pointer; }
+.ps-tog input.sw:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.ps-tog .sw.locked { background: var(--raised); box-shadow: inset 0 0 0 1px var(--line-strong); }
+.ps-tog .sw.locked::after { background: var(--muted); }
+.ps-act { white-space: normal; max-width: 220px; font-size: 12.5px; color: var(--muted); }
+.ps-two { display: grid; grid-template-columns: minmax(260px, 1fr) minmax(0, 2fr); gap: 16px; margin-top: 16px; }
+.ps-note { font-size: 12.5px; margin: 0 0 8px; }
+.ps-groups tr.ps-unmapped td { background: var(--warn-bg); }
+.ps-hist .ps-changes { white-space: normal; font-variant-numeric: tabular-nums; }
+.ps-hist .ps-why { white-space: normal; color: var(--muted); max-width: 260px; }
+.ps-hist tr.ps-current td { background: var(--hover); }
+.ps-bar { position: sticky; bottom: 0; padding: 12px 0; background: linear-gradient(to top, var(--page) 70%, transparent); }
+@media (max-width: 1100px) { .ps-two { grid-template-columns: 1fr; } }
+.ps-two .tbl-wrap, .panel > .tbl-wrap { overflow-x: auto; }
+.ps-groups td { white-space: normal; }
