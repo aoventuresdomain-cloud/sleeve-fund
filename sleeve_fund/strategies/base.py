@@ -3136,7 +3136,9 @@ class LongFlatStrategy(Strategy):
                 self._note(f"{what}_refused_by_portfolio", decision.decision.reason)
             return
         batch, name = self._portfolio
-        batch.post(self.clock, self.clock.timestamp_ns(), Pending(name, intent, send, lambda i, d: count("refused")))
+        bar = {"bar": self._deciding[0] if self._deciding else None}  # as paper's gate gets it: parity keys on it
+        batch.post(self.clock, self.clock.timestamp_ns(),
+                   Pending(name, {**intent, **bar}, send, lambda i, d: count("refused")))
 
     def _resting_entry_terms(self):
         """ORPHAN-GUARD og1 for a resting entry on paper: good-till-date to its decision bar's next close, clamped past
