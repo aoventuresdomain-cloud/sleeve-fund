@@ -200,6 +200,47 @@ RESTING_OFF = ("its entries would rest at the venue as post-only limits (maker-f
                "its execution to market to run it")
 
 
+# CCY-8DP (Advisor 13 Oct 16:15 and 16:25 UK): the journal books each fill's fee and cash leg at 8 dp, so a quote
+# currency the engine holds to fewer places (USD: 2) would book what the venue never charged. Only the test accounts
+# a venue profile names (VenueProfile.sub_8dp_test_accounts) may run on one, with a warning; every other account, a
+# future venue included, is refused. Their results are never Strategy evidence.
+FILL_PLACES = 8
+
+
+def _test_account_reason(account: str, venue: str | None) -> str | None:
+    """Why (account, venue) may run under 8 places, from the venue's profile; None when it may not (an unknown venue
+    included)."""
+    from sleeve_fund.venues import DEFAULT_VENUE, VENUES
+
+    profile = VENUES.get((venue or DEFAULT_VENUE).upper())
+    return None if profile is None else profile.sub_8dp_test_accounts.get(account)
+
+
+def is_test_currency_account(account: str, venue: str | None) -> bool:
+    """Whether (account, venue) is a named test account allowed under 8 places: its results are never Strategy
+    evidence (CCY-8DP-UI keys the PM's views on this, not on a copy of the list)."""
+    return _test_account_reason(account, venue) is not None
+
+
+def check_quote_places(s: Sleeve, account: str) -> str | None:
+    """Raises ValueError when the Strategy's quote currency is held to fewer than 8 places on an account its venue
+    doesn't name as a test account; returns the warning to log when it does; None when the currency holds 8. The
+    words name no venue (they reach the PM)."""
+    from nautilus_trader.model import Currency
+
+    quote = s.instrument.split("/")[-1].split("-")[0].upper()
+    places = Currency.from_str(quote).precision  # as the engine holds it (one it doesn't list it holds to 8)
+    if places >= FILL_PLACES:
+        return None
+    why = _test_account_reason(account, getattr(s, "venue", None))
+    held = f"{places} places"
+    if why is None:
+        raise ValueError(f"its quote currency {quote} is held to {held}, and fills are booked to {FILL_PLACES}; only "
+                         f"named test accounts may run on it, and account {account} is not one on this venue")
+    return (f"Test account: its quote currency {quote} is held to {held}, under the {FILL_PLACES} fills are booked "
+            f"to, which only {why} may do. Its results are not Strategy evidence")
+
+
 def check_resting_entries(s: Sleeve) -> None:
     """RESTING-OFF (HoE, Advisor 13 Oct): raises ValueError for a Strategy whose entries would rest at the venue
     (maker_wait_minutes set), until ORPHAN-GUARD lands. Market entries are unaffected; a backtest never comes here."""
@@ -243,6 +284,7 @@ class Supervisor:
             check_perp_stop(s.strategy, s.params, s.risk_profile)
             check_funding_schedule(s)
             check_resting_entries(s)
+            warn = check_quote_places(s, self.store.account_of(name))
         except ValueError as exc:
             if any(c["command"] == "flatten" for c in self.store.pending_commands(name)):
                 self.store.event(name, "warning", "start_refused", f"Started only to sell its position: {exc}. The "
@@ -254,6 +296,8 @@ class Supervisor:
             self.store.set_status(name, "stopped", f"not started: {exc}")
             self.store.event(name, "error", "start_refused", f"Not started: {exc}")
             return True
+        if warn:
+            self.store.event(name, "warning", "test_currency", warn)
         return False
 
     def _exits_only(self, s: Sleeve, why: str) -> bool:
