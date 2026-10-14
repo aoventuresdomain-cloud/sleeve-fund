@@ -149,7 +149,8 @@ def _rising(days=30, start=60_000.0, daily=0.03):
     idx = pd.date_range("2024-01-02", periods=days, freq="D", tz="UTC")
     close = pd.Series([start * (1 + daily) ** i for i in range(days)], index=idx)
     open_ = close.shift(1).fillna(start)
-    return pd.DataFrame({"open": open_, "high": close * 1.001, "low": open_ * 0.999, "close": close,
+    return pd.DataFrame({"open": open_, "high": pd.concat([open_, close], axis=1).max(axis=1) * 1.001,
+                         "low": pd.concat([open_, close], axis=1).min(axis=1) * 0.999, "close": close,
                          "volume": 1_000_000.0})
 
 
@@ -166,3 +167,70 @@ def test_a_liquidated_perp_leg_closes_the_spot_leg_at_once_with_an_alert():
     unwound = [o for o in lead if o["intent"] == "leg_unwind"]
     assert unwound and unwound[0]["parent_trade_id"] == cut[0]["parent_trade_id"]
     assert any(e["kind"] == BROKEN for e in r.lead.journal.events_)
+    assert [o["intent"] for o in follow].count("entry") == 1  # not reopened while the signal holds (as after a stop)
+
+
+def _halts(res):
+    return [e for e in res.risk_events if "halt" in str(e).lower()]
+
+
+def test_the_drawdown_halt_judges_both_legs_summed_so_a_hedged_carry_isnt_halted_by_one_leg():
+    """Ruling E: the price climbs 1.6% a day for a month. The short perp leg alone loses past the 10% drawdown
+    limit, but the spot leg gains as much, so the pair isn't halted and both legs stay open to the window's end."""
+    bars = _rising(days=31, daily=0.016)
+    params = {"windows": [[int(bars.index[1].value), int(bars.index[-1].value) + 1]]}
+    r = run_two_legs("window", LegRun(SPOT, INST, bars), LegRun(PERP, INST), 10_000, params=params,
+                     risk_profile="conservative")
+    follow = r.follow.equity
+    assert (follow.cummax() - follow).max() / follow.cummax().max() > 0.10  # alone, it would have halted
+    assert _halts(r.lead) == [] and _halts(r.follow) == []
+    assert [o["intent"] for o in _orders(r, "follow")] == ["entry"]  # never closed
+    assert (r.equity.cummax() - r.equity).max() / r.equity.cummax().max() < 0.10
+
+
+def test_a_pair_whose_summed_book_draws_down_past_the_limit_halts_and_flattens_both_legs():
+    """Two long legs (spot and perp) on a falling price: the summed book passes the 10% drawdown limit, and both
+    legs halt and close on that mark."""
+    bars = _rising(days=40, daily=-0.03)
+    params = {"windows": [[int(bars.index[1].value), int(bars.index[-1].value) + 1]]}
+    r = run_two_legs("window", LegRun(SPOT, INST, bars), LegRun({**PERP, "side": 1}, INST), 10_000, params=params,
+                     risk_profile="conservative")
+    assert _halts(r.lead) and _halts(r.follow)
+    lead_close = next(o for o in _orders(r, "lead") if o["intent"] == "risk_halt")
+    follow_close = next(o for o in _orders(r, "follow") if o["intent"] == "risk_halt")
+    assert lead_close["ts"] == follow_close["ts"] and lead_close["parent_trade_id"] == follow_close["parent_trade_id"]
+    assert r.pair_log[-1][1] == "flat"
+
+
+def test_the_perp_leg_is_margined_at_its_own_leverage_not_the_risk_profiles():
+    """Under the balanced profile (2x) the carry's perp leg holds its own 1x by default: its liquidation price is
+    about twice the entry for a short, not one and a half times; at 2x it is about one and a half."""
+    for lev, near in ((1, 2.0), (2, 1.5)):
+        r = _carry((2, 10)) if lev == 1 else run_two_legs(
+            "window", LegRun(SPOT, INST, BARS), LegRun({**PERP, "leverage": lev}, INST), 10_000,
+            params={"windows": [[_ns(2), _ns(10)]]}, risk_profile="balanced")
+        entry = next(o for o in _orders(r, "follow") if o["intent"] == "entry")
+        sig = entry["signal"]
+        assert sig["liquidation_px"] / sig["close"] == pytest.approx(near, rel=0.02), (lev, sig)
+
+
+def test_a_hedge_that_drifts_past_10_percent_is_brought_back_to_the_ratio_once_a_bar():
+    """Ruling D: a pair whose second leg trades its own price. That price climbs 2% a day while the first leg's holds
+    still, so the short leg's notional grows past the ratio; at the first close it has drifted more than 10% it is cut
+    back (a rebalance, never gated), at most once a bar, under the trade's id."""
+    flat = _rising(days=30, daily=0.0)
+    climbing = _rising(days=30, start=3_000.0, daily=0.02)
+    eth = venue("kraken").instrument("ETH", "USDT")
+    eth_perp = {"instrument": "ETH/USDT", "params": {"market": "perp"}, "venue": "KRAKEN", "side": -1}
+    params = {"windows": [[int(flat.index[1].value), int(flat.index[-1].value) + 1]]}
+    r = run_two_legs("window", LegRun(SPOT, INST, flat), LegRun(eth_perp, eth, climbing), 10_000, params=params,
+                     risk_profile="conservative")
+    follow = _orders(r, "follow")
+    cuts = [o for o in follow if o["intent"] == "rebalance"]
+    assert cuts and all(o["side"] == "BUY" for o in cuts)  # a short leg grown too big is bought back
+    assert {o["parent_trade_id"] for o in follow} == {follow[0]["parent_trade_id"]}
+    days = [pd.Timestamp(o["ts"]).floor("D") for o in cuts]
+    assert len(days) == len(set(days))  # at most once a bar
+    steps = [d for _, what, d in r.pair_log if what == "rehedge"]
+    assert steps and all("drifted 1" in d or "drifted" in d for d in steps)
+    assert all(float(d.split("drifted ")[1].split("%")[0]) > 10 for d in steps)

@@ -436,6 +436,7 @@ class SleeveRuntime:
         self._day = None
         self._day_open = None
         self._last_equity = None
+        self.paired = False  # one leg of a two-leg Strategy (strategies.pair): its guard judges both legs summed
         self._feed_written = None
         self._spreads: list[float] = []
         self._spread_since = None
@@ -916,7 +917,7 @@ class SleeveRuntime:
 
     def tick(self, *, equity: float, cash: float, qty: float, price: float,
              guard_equity: float | None = None, busy: bool = False, ruined: str | None = None,
-             liquidating: bool = False) -> str | None:
+             liquidating: bool = False, other_equity: float = 0.0) -> str | None:
         """Mark, guard, then apply PM commands. Returns "flatten" if the strategy must flatten now.
         guard_equity: the equity at the worst price since the last tick (a backtest's minute high or low on
         a perp), which the guard judges by when lower; the mark is still this tick's equity.
@@ -925,7 +926,10 @@ class SleeveRuntime:
         halts, from running or paused, and flattens whatever is still open.
         liquidating: a liquidation order is working (the price went through the liquidation price): the PM's commands
         wait, so a resume queued while paused is never applied on the liquidating tick (QA P1-U34); the next tick has
-        the liquidation's halt, which a resume doesn't clear."""
+        the liquidation's halt, which a resume doesn't clear.
+        other_equity: a two-leg Strategy's other leg, marked now (P2-8): the drawdown halt and the daily-loss pause
+        judge both legs summed and act on both (Advisor 13 Oct 23:55 UK, E), so the peak, the day's open and the
+        guard all read the sum; the journal still marks this leg's own equity. guard_equity is then the sum too."""
         now = self.now()
         self.store.heartbeat(self.name, now)
         self.refresh_lifecycle()
@@ -943,13 +947,18 @@ class SleeveRuntime:
         benchmark = self.starting_balance * ((1 - cap) + cap * (1 - self.taker_fee) * price / self.bench_base_price)
         self.store.record_equity(self.name, equity=equity, cash=cash, qty=qty, price=price, benchmark=benchmark,
                                  ts=now)
+        equity += other_equity  # from here on, what the guard judges: a two-leg Strategy's both legs
         self.peak = max(self.peak, equity)
         if self._day != risk.trading_day(now):
             # The day opens at the equity last marked at or before midnight: the same thing in paper, which
             # marks every few seconds, and in a backtest, which marks once a bar. The first tick after a
             # (re)start reads it from the journal, so a restart mid-day, such as the reload a settings
             # edit makes, can't lift the daily-loss pause by resetting the baseline (review round 8, B8-2).
-            if self._day is None and self._last_equity is None:
+            if self._day is None and self._last_equity is None and self.paired:
+                # A two-leg Strategy's first mark: the journal's day open is one leg's; until restarts read both
+                # legs' (P2-8 paper), the day opens at both legs' equity now.
+                self._day_open = equity
+            elif self._day is None and self._last_equity is None:
                 self._day_open = self._restored_day_open(now, equity)
             else:
                 self._day_open = self._last_equity if self._last_equity is not None else equity

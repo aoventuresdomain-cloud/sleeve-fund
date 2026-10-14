@@ -89,6 +89,9 @@ def run_two_legs(strategy: str, first: LegRun, second: LegRun, starting_capital:
         for n, (run, plan) in enumerate(((first, lead_plan), (second, follow_plan)), start=1):
             clone = clone_instrument(run.instrument, clone_venue(run.instrument.id.venue, n))
             legs.append(add_leg(engine, plan, clone, order_id_tag=f"{n:03d}"))
+        for leg, spec in zip(legs, (lead_leg, follow_leg)):
+            if leg.plan.perp:  # the leg's own leverage, not the risk profile's (Advisor B)
+                leg.strategy.leg_leverage = float(spec["leverage"])
         pair = Pair(legs[0].strategy, legs[1].strategy, lead_side=lead_leg["side"], follow_side=follow_leg["side"],
                     ratio=follow_leg["ratio"], first_out=first_out, name="two_leg")
         feed_legs(engine, legs)

@@ -18,10 +18,12 @@ from decimal import ROUND_DOWN, Decimal
 
 from nautilus_trader.model import Bar, ClientOrderId, OrderSide
 
+from sleeve_fund.margin import entry_liquidation
 from sleeve_fund.strategies.base import OPENING_INTENTS, LongFlatStrategy
 
 DELAY_NS = 1  # the first leg goes after every venue's bar for the close it was decided on, as a portfolio gate pass
 RETRIES = 1  # the second leg is sent once more before the first is unwound (Advisor C)
+REHEDGE = 0.10  # the hedge leg is brought back to the ratio once it has drifted more than this (Advisor D)
 BROKEN = "two_leg_broken"  # the alert raised when a pair can't be completed and its first leg is unwound
 
 
@@ -64,12 +66,19 @@ class Pair:
         self.first_out = first_out
         self.name = name
         lead.pair = follow.pair = self
+        # One price feed for both legs (a perp simulated on the spot's prices): the other leg is marked at this leg's
+        # price, so the summed book the guard judges has one price level.
+        self.same_prices = str(lead._cfg.instrument_id.symbol) == str(follow._cfg.instrument_id.symbol)
+        for leg in (lead, follow):
+            if leg.runtime is not None:
+                leg.runtime.paired = True
         self.trade_id: str | None = None
         self.trades = 0
         self.state = "flat"  # flat, legging (one leg sent or held without the other), hedged, closing
         self.second: dict | None = None  # the leg still to send: leg, qty, reason, signal, tries
         self.sending: LongFlatStrategy | None = None  # the leg whose own _send_entry the pair is calling now
         self.closing_from: LongFlatStrategy | None = None
+        self._measured: int | None = None  # the last decision close the hedge was measured at
         self.log: list[tuple[int, str, str]] = []  # (ts, what, detail): the pair's own steps, for tests and reports
 
     # --- helpers -----------------------------------------------------------------------------------------------------
@@ -94,6 +103,12 @@ class Pair:
         for leg in (self.lead, self.follow):
             if leg.runtime is not None:
                 leg.runtime.store.event(leg.runtime.name, "warning", kind, message, ts=leg.runtime.now())
+
+    def other_book(self, leg: LongFlatStrategy, price: float) -> tuple[float, float, float]:
+        """The other leg's (equity, cash, qty), marked at `price` when both legs trade one price feed, else at its own
+        last price: what the summed guard adds to this leg's (Advisor E)."""
+        equity, cash, qty, _ = self.other(leg)._mark(price if self.same_prices else None)
+        return equity, cash, qty
 
     def held(self, leg: LongFlatStrategy) -> Decimal:
         return leg._position_qty() if leg.cache is not None and leg.instrument is not None else Decimal(0)
@@ -163,9 +178,10 @@ class Pair:
             return False
         part["tries"] += 1
         before = getattr(leg, "_last_submitted", None)
+        signal = {**part["signal"], **self._margin_signal(leg, qty)}
         self.sending = leg
         try:
-            leg._send_entry(_side(self.sides[id(leg)]), qty, part["reason"], part["signal"])
+            leg._send_entry(_side(self.sides[id(leg)]), qty, part["reason"], signal)
         finally:
             self.sending = None
         coid = getattr(leg, "_last_submitted", None)
@@ -174,6 +190,23 @@ class Pair:
         part["coid"] = coid
         self._note("sent", f"{'lead' if leg is self.lead else 'follow'} {qty} ({coid})")
         return True
+
+    def _margin_signal(self, leg: LongFlatStrategy, qty: Decimal) -> dict:
+        """A perp leg's entry: its liquidation price at its own leverage and its leverage on its equity, journaled with
+        the order as a single perp entry's are (LongFlatStrategy._open)."""
+        if not leg._margin:
+            return {}
+        equity, cash, _, _ = leg._mark()
+        px = leg._price()
+        if equity <= 0 or px <= 0:
+            return {}
+        side = self.sides[id(leg)]
+        liq, _ = entry_liquidation(cash, float(qty), px, side, leg._cfg.assumed_taker_fee,
+                                   leg._cfg.perp.maintenance_margin, leg._max_leverage())
+        out = {"close": px, "leverage": round(float(qty) * px / equity, 4)}
+        if liq is not None:
+            out["liquidation_px"] = round(liq, 8)
+        return out
 
     # --- what each leg's orders came to ------------------------------------------------------------------------------
 
@@ -185,7 +218,8 @@ class Pair:
         if intent in OPENING_INTENTS and self.state == "legging":
             self._entry_closed(leg, coid, order, filled)
         elif intent not in OPENING_INTENTS and intent is not None:
-            if filled > 0 and self._flat(leg) and not self._flat(self.other(leg)) and self.closing_from is None:
+            if (filled > 0 and self.state in ("legging", "hedged") and self.closing_from is None and self._flat(leg)
+                    and not self._flat(self.other(leg))):
                 # A resting order closed this leg at the venue (a stop, a target, a liquidation) without its own
                 # sell-all: the other leg goes with it.
                 self.leg_closing(leg, intent, (leg.decisions.get(coid) or {}).get("reason") or intent)
@@ -249,6 +283,57 @@ class Pair:
                     self.closing_from = None
         self._maybe_flat()
 
+    # --- the hedge ----------------------------------------------------------------------------------------------------
+
+    def bar_closed(self, leg: LongFlatStrategy, bar: Bar) -> None:
+        """The lead's decision bar closed: measure the hedge after every venue's bar for this close (ruling D)."""
+        if leg is not self.lead or self.state != "hedged" or bar.ts_event == self._measured:
+            return
+        self._measured = bar.ts_event
+        self.lead.clock.set_time_alert_ns(f"pair-hedge-{bar.ts_event}", self._now() + DELAY_NS,
+                                          callback=lambda _e: self.rehedge())
+
+    def hedge_drift(self) -> float | None:
+        """|the hedge leg's notional / its target - 1|, the target the ratio times the lead's notional; None when
+        either leg has no price or the lead is flat."""
+        lead_px, follow_px = self.lead._price(), self.follow._price()
+        lead_q = self.held(self.lead)
+        if not lead_px or not follow_px or lead_q <= 0:
+            return None
+        target = float(lead_q) * lead_px * float(self.ratio)
+        return abs(float(self.held(self.follow)) * follow_px / target - 1)
+
+    def rehedge(self) -> None:
+        """Ruling D: at a bar close, at most once a bar, bring the hedge leg back to the ratio when it has drifted more
+        than REHEDGE from it. An increase is a gated order (an add, intent rebalance); a reduction never is."""
+        # A resting exit or the backtest's risk stop doesn't block it; an order on its way to the venue does.
+        if self.state != "hedged" or self.lead._busy() or self.follow._busy() or self.follow._pending_exit is not None:
+            return
+        drift = self.hedge_drift()
+        if drift is None or drift <= REHEDGE:
+            return
+        want = self._sized(self.follow, self.held(self.lead), self.lead, self.lead._price())
+        have = self.held(self.follow)
+        delta = (want - have).quantize(self.follow._lot(), rounding=ROUND_DOWN) if want > have else \
+            (have - want).quantize(self.follow._lot(), rounding=ROUND_DOWN)
+        if delta <= 0 or delta < self.follow._min_qty():
+            return
+        side = self.sides[id(self.follow)] * (1 if want > have else -1)
+        reason = (f"Re-hedged: the second leg had drifted {drift:.1%} from its ratio to the first; "
+                  f"{'added' if want > have else 'cut'} {delta} to bring it back")
+        self._note("rehedge", reason)
+        signal = {"pair": self.trade_id, "drift": round(drift, 6), "close": self.follow._price()}
+        if want > have:
+            self.sending = self.follow
+            try:
+                self.follow._send_entry(_side(side), delta, reason, {**signal, **self._margin_signal(self.follow,
+                                                                                                    delta)},
+                                        what="rebalance")
+            finally:
+                self.sending = None
+        else:
+            self.follow._submit(_side(side), delta, "rebalance", reason, signal)
+
     # --- exits -------------------------------------------------------------------------------------------------------
 
     def leg_closing(self, leg: LongFlatStrategy, intent: str, reason: str) -> None:
@@ -269,7 +354,8 @@ class Pair:
             self.closing_from = None
         if intent in ("liquidation", "liquidation_cut"):
             self._alert(BROKEN, f"Two-leg trade {self.trade_id}: a leg was liquidated, so the other was closed at "
-                                "market")
+                                "market; no new entry until the first leg's signal has moved off its side")
+            self.lead._exit_lock = self.sides[id(self.lead)] if self.lead._margin else True
 
     def _maybe_flat(self) -> None:
         if self.state in ("closing", "hedged") and self._flat(self.lead) and self._flat(self.follow) \
