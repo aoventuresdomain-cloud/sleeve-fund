@@ -13,7 +13,7 @@
 {% block content %}
 {# The strategy page (combined build F2): header, seven figures, then the desk in tabs. #}
 <div class="page-head" data-live="head">
-  <h1>{{ s.name }}</h1> {% if backtest_id %}<span class="chip">Backtest</span>{% else %}{# Until the supervisor catches up, a strategy the PM stopped reads as stopping, not running (round 10, m5). #}{{ chip('stopping' if s.desired_state != 'running' and s.status in ['running', 'starting'] else s.status) }} <span class="chip {{ x.mode }}">{{ x.mode|capitalize }}</span>{% if x.test_account %} {{ test_chip() }}{% endif %}{% endif %}
+  <h1>{{ s.name }}</h1> {% if backtest_id %}<span class="chip">Backtest</span>{% else %}{# Until the supervisor catches up, a strategy the PM stopped reads as stopping, not running (round 10, m5). #}{{ chip('stopping' if s.desired_state != 'running' and s.status in ['running', 'starting'] else s.status) }} <span class="chip {{ x.mode }}">{{ x.mode|capitalize }}</span>{% if fill_hold %} <span class="chip paused fill-hold" title="A fill wasn't handled, so its book may be off: it opens nothing new until you resume it. Its stop and exits still work.">Fill hold</span>{% endif %}{% if x.test_account %} {{ test_chip() }}{% endif %}{% endif %}
   <div class="actions">
     {% set flattening = pending|selectattr('command', 'equalto', 'flatten')|list %}
     {% if backtest_id %}<a class="button" href="/backtest/{{ backtest_id }}">Back to the backtest</a>
@@ -77,6 +77,7 @@
   {% if signals %}{{ signals_tab(signals) }}{% endif %}
   <a href="#positions" role="tab" data-tab="positions">Position<span class="n">{{ 1 if x.qty else 0 }}</span></a>
   <a href="#activity" role="tab" data-tab="activity">Activity</a>
+  {% if attr %}<a href="#attribution" role="tab" data-tab="attribution">Attribution{% if attr.refused %}<span class="n">{{ attr.refused|length }}</span>{% endif %}</a>{% endif %}
   {% if path %}<a href="#path" role="tab" data-tab="path">Path to live</a>{% endif %}
   <a href="#settings" role="tab" data-tab="settings">Settings</a>
 </nav>
@@ -102,10 +103,6 @@
     {# Three limits: margin (or position) against its cap, room before the drawdown halt, today's loss against the pause. #}
     {% set room = x.room if x.room is defined else none %}
     <div class="limit-bars">
-      {# Perpetuals: margin put up against the margin cap. Spot: the same exposure basis as the Exposure figure,
-         so the bar, its hover and its screen-reader text agree (P1-U17). #}
-      {% if perp %}<div title="{{ risk.margin|money }} of margin against a cap of {{ risk.margin_cap|money }}"><span class="k">Isolated margin of cap</span>{{ usage(risk.margin_used, drift=True) }}</div>
-      {% else %}<div class="exposure-cap" title="Exposure {{ '%.2f'|format(x.exposure|abs) }}× equity, against an entry cap of {{ '%.2f'|format(x.cap) }}×"><span class="k">Exposure of cap</span>{{ usage(risk.cap_used, drift=True) }}</div>{% endif %}
       <div title="Drawdown {{ x.drawdown|pct1 }} of the {{ x.profile.max_drawdown|pct0 }} halt"><span class="k">Room to halt</span>{{ usage(x.dd_used) }} <b>{% if room is not none %}{{ room|money }}{% else %}<span class="faint" title="Waiting on the corrected room-to-halt figure">–</span>{% endif %}</b></div>
       {% if not backtest_id %}<div title="Today's loss {{ [0 - x.day_ret, 0]|max|pct1 }} of the {{ x.profile.daily_loss|pct0 }} pause limit"><span class="k">Today's loss</span>{{ usage(risk.day_used) }}</div>{% endif %}
     </div>
@@ -182,7 +179,7 @@
       <div><dt>Notional</dt><dd>{% if position %}{{ position.value|abs|money }} {{ quote }}{% else %}<span class="muted">–</span>{% endif %}</dd></div>
       {% if not perp %}<div><dt>Side</dt><dd>{% if position %}{{ "Short" if position.side < 0 else "Long" }}{% else %}<span class="muted">Flat</span>{% endif %}</dd></div>
       <div><dt title="Spot: no leverage">Leverage</dt><dd>1×</dd></div>
-      <div><dt title="Position value at the current price ÷ the strategy's equity. The cap applies when a position is opened.">Exposure</dt><dd>{{ '%.2f'|format(x.exposure|abs) }}× equity <span class="faint">· cap {{ '%.2f'|format(x.cap) }}×</span>{% if x.exposure|abs > x.cap + 0.005 %} <span class="warn exposure-drift">above entry cap because the price moved; no action</span>{% endif %}</dd></div>{% endif %}
+      <div><dt title="Position value at the current price ÷ the strategy's equity.">Exposure</dt><dd>{{ '%.2f'|format(x.exposure|abs) }}× equity</dd></div>{% endif %}
     </dl></div>
     <div class="pos-card"><h3>Price</h3><dl>
       <div><dt>Entry</dt><dd>{% if position %}{{ position.entry_px|px }}{% else %}<span class="muted">–</span>{% endif %}</dd></div>
@@ -205,7 +202,7 @@
     <div class="pos-card"><h3>Margin <span class="faint">isolated</span></h3><dl>
       <div><dt>Side</dt><dd>{% if position %}{{ "Short" if position.side < 0 else "Long" }}{% else %}<span class="muted">Flat</span>{% endif %}</dd></div>
       <div><dt title="Position value at entry ÷ the margin set aside for it (isolated): the leverage it opened at. Effective: position value now ÷ the same margin, which moves with the price.">Leverage</dt><dd>{% if position and perp.leverage %}{{ '%g'|format((perp.leverage * 10)|round / 10) }}×{% if perp.effective_leverage %} <span class="faint">· effective {{ '%.2f'|format(perp.effective_leverage) }}×</span>{% endif %}{% else %}<span class="muted">–</span>{% endif %}</dd></div>
-      <div><dt title="Position value at the current price ÷ the strategy's equity. The cap applies when a position is opened: at most {{ x.profile.max_position_pct|pct0 }} of equity as margin × {{ '%g'|format(x.profile.max_leverage) }}× leverage = {{ '%.2f'|format(x.cap) }}× equity.">Exposure</dt><dd>{% if position and perp.exposure is not none %}{{ '%.2f'|format(perp.exposure) }}× equity <span class="faint">· cap {{ '%.2f'|format(x.cap) }}×</span>{% if perp.exposure > x.cap + 0.005 %} <span class="warn exposure-drift">above entry cap because the price moved; no action</span>{% endif %}{% else %}<span class="muted">–</span>{% endif %}</dd></div>
+      <div><dt title="Position value at the current price ÷ the strategy's equity.">Exposure</dt><dd>{% if position and perp.exposure is not none %}{{ '%.2f'|format(perp.exposure) }}× equity{% else %}<span class="muted">–</span>{% endif %}</dd></div>
       <div><dt title="Isolated: the notional at entry over the leverage cap">Margin used</dt><dd>{{ perp.margin|money }} {{ quote }} <span class="faint">maintenance {{ perp.maintenance|money }} ({{ perp.maintenance_rate|pct1 }} of notional)</span></dd></div>
       <div><dt>Liquidation</dt><dd>{% if perp.liq_px %}{{ perp.liq_px|px }} <span class="{{ 'loss' if perp.to_liq < 0.1 else 'faint' }}">{{ perp.to_liq|pct1 }} {{ "above" if position and position.side < 0 else "below" }}</span>{% elif position %}<span class="muted">None at any price</span>{% else %}<span class="muted">–</span>{% endif %}</dd></div>
     </dl></div>
@@ -241,7 +238,6 @@
   <div class="panel-head"><h2 id="lim-h">Limits and health</h2></div>
   <div class="pos-grid two">
     <div class="pos-card"><h3>Limits used</h3><dl>
-      <div><dt>Exposure</dt><dd>{{ usage(risk.cap_used, drift=True) }} <span class="faint">{{ '%.2f'|format(x.exposure|abs) }}× of {{ '%.2f'|format(x.cap) }}× cap</span>{% if x.exposure|abs > x.cap + 0.005 %} <span class="warn" title="The cap applies when a position is opened; it doesn't trim an open one.">above entry cap because the price moved; no action</span>{% endif %}</dd></div>
       <div><dt>Drawdown</dt><dd>{{ usage(x.dd_used) }} <span class="faint">{{ x.drawdown|pct1 }} of {{ x.profile.max_drawdown|pct0 }}</span></dd></div>
       {% if not backtest_id %}<div><dt>Today's loss</dt><dd>{{ usage(risk.day_used) }} <span class="faint">{{ [0 - x.day_ret, 0]|max|pct1 }} of {{ x.profile.daily_loss|pct0 }}</span></dd></div>{% endif %}
     </dl></div>
@@ -267,6 +263,36 @@
 </section>
 </div>
 
+{% if attr %}
+<div class="tab-panel" id="tab-attribution" role="tabpanel" data-panel="attribution">
+<section class="panel" aria-labelledby="attr-h" style="margin-bottom:14px">
+  <div class="panel-head"><h2 id="attr-h">Attribution</h2>
+    <span class="right range" role="group" aria-label="Period">{% for k, label in attr.periods.items() %}<a class="button {{ '' if k == attr.period else 'secondary' }}" href="?attr={{ k }}#attribution">{{ label }}</a>{% endfor %}</span></div>
+  <table class="tbl" data-attribution>
+    <thead><tr><th scope="col" class="num">Money P&amp;L</th><th scope="col" class="num">Fees and funding</th><th scope="col" class="num">Closed trades</th><th scope="col" class="num">R per trade</th><th scope="col" class="num">Contribution to the fund's return</th><th scope="col" class="num">Refused ideas</th></tr></thead>
+    <tbody><tr>
+      <td class="num">{{ money_signed(attr.pnl) }}</td>
+      <td class="num">{{ money_signed(attr.funding - attr.fees) }}</td>
+      <td class="num">{{ attr.trades }}</td>
+      <td class="num">{% if attr.r_mean is not none %}{{ '%+.2f'|format(attr.r_mean) }}R{% if attr.r_trades < attr.trades %} <span class="faint">({{ attr.r_trades }} with a stop)</span>{% endif %}{% else %}<span class="muted">–</span>{% endif %}</td>
+      <td class="num">{% if attr.contribution is not none %}{{ '%+.2f'|format(attr.contribution * 100) }}%{% else %}<span class="muted" title="The fund's book has no mark yet">–</span>{% endif %}</td>
+      <td class="num">{{ attr.refused|length }}</td>
+    </tr></tbody>
+  </table>
+  <p class="faint">{{ attr.label }}. Money P&amp;L is the trades closed in the period, after fees and funding; the open position's is on Overview. Contribution is that P&amp;L as a share of the fund's book at the period's start{% if attr.fund_start %} ({{ attr.fund_start|money }}){% endif %}.</p>
+</section>
+<section class="panel" aria-labelledby="refused-h" style="margin-bottom:14px">
+  <div class="panel-head"><h2 id="refused-h">Refused ideas</h2><span class="right faint">the compliance tests' refusals and cuts, newest first</span></div>
+  {% if attr.refused %}<table class="tbl" data-refused>
+    <thead><tr><th scope="col">Time</th><th scope="col">Asset</th><th scope="col" class="num">Asked</th><th scope="col">Outcome</th><th scope="col">Test</th></tr></thead>
+    <tbody>{% for r in attr.refused %}<tr><td>{{ r.decided_at|ts }}</td><td>{{ r.underlying }}</td><td class="num">{{ r.requested_qty|float|qty }}</td>
+      <td>{% if r.outcome == 'rejected' %}<span class="loss">Refused</span>{% else %}<span class="warn">Cut to {{ r.approved_qty|float|qty }}</span>{% endif %}</td>
+      <td>{{ r.test }}</td></tr>{% endfor %}</tbody>
+  </table>{% else %}<p class="empty">No idea was refused or cut in this period.</p>{% endif %}
+</section>
+</div>
+{% endif %}
+
 {% if path %}{% set met = path|selectattr('ok')|list|length %}
 <div class="tab-panel" id="tab-path" role="tabpanel" data-panel="path">
 <section class="panel" aria-labelledby="g2-h" style="margin-bottom:14px">
@@ -290,7 +316,10 @@
       <tr><th scope="row">Account</th><td><a href="/accounts#acct-{{ account }}">{{ account }}</a>
         <button type="button" class="quiet" style="margin-left:8px" data-open="dlg-move" {% if not movable %}disabled title="Flatten it first: a position cannot change accounts"{% endif %}>Move</button></td></tr>{% endif %}
       <tr><th scope="row">Starting capital</th><td>{{ s.starting_balance|money }} {{ quote }}</td></tr>
-      <tr><th scope="row">Risk profile</th><td>{{ x.profile.name|capitalize }}: halt at {{ x.profile.max_drawdown|pct0 }} drawdown, pause at {{ x.profile.daily_loss|pct0 }} daily loss, {% if x.cap != x.profile.max_position_pct %}at most {{ x.profile.max_position_pct|pct0 }} of equity as margin, at {{ '%g'|format(x.profile.max_leverage) }}x a notional of {{ x.cap|pct0 }}{% else %}max {{ x.cap|pct0 }} in the market{% endif %}</td></tr>
+      {# A sizing setting, not a cap: the engine sizes each entry at this share of the fund's equity and never refuses
+         or cuts an order on it (TEC-FE-CAP, HoE ruling 14 Oct 2026; QD; the Advisor's words). #}
+      <tr><th scope="row">Position size</th><td data-position-size>{{ x.profile.max_position_pct|pct0 }} of the fund</td></tr>
+      <tr><th scope="row">Risk profile</th><td>{{ x.profile.name|capitalize }}: halt at {{ x.profile.max_drawdown|pct0 }} drawdown, pause at {{ x.profile.daily_loss|pct0 }} daily loss, up to {{ '%g'|format(x.profile.max_leverage) }}x leverage</td></tr>
       {% for k, v in s.params.items() %}
       <tr><th scope="row">{{ {'stop_loss': 'Stop-loss', 'take_profit': 'Take-profit', 'risk_per_trade': 'Risk per trade', 'max_notional': 'Max per order', 'maker_wait_minutes': 'Orders', 'stop_atr': 'Stop, simple average true ranges below entry', 'atr_bars': 'Simple average true range over, bars', 'stop_swing_bars': 'Stop at the lowest low of, bars', 'take_profit_r': 'Target in R, after costs'}.get(k, k|replace('_', ' ')|capitalize) }}</th>
         <td>{% if k in ['stop_loss', 'take_profit', 'risk_per_trade'] %}{{ (v * 100)|round(2) }}%{% elif k == 'max_notional' %}{{ v|money }} {{ quote }}{% elif k == 'maker_wait_minutes' %}Maker first, the rest at market after {{ v }} min{% else %}{{ v }}{% endif %}</td></tr>
@@ -312,7 +341,7 @@
     {% elif saved == 'account' %}<div class="banner" style="margin-bottom:12px" role="status">Moved to {{ account }}.</div>{% endif %}
     {% if archived %}<p class="muted">Restore the strategy to change its settings.</p>{% else %}
     <input type="hidden" name="instrument" value="{{ s.instrument }}">
-    <div class="field"><label for="risk_profile">Risk profile</label><select id="risk_profile" name="risk_profile">{% for p in profiles.values() %}<option value="{{ p.name }}" data-limits="{{ p.name|capitalize }}: halts at {{ p.max_drawdown|pct0 }} drawdown and pauses for the day at a {{ p.daily_loss|pct0 }} daily loss, from now." {{ 'selected' if p.name == settings_pre.get('risk_profile') }}>{{ p.name|capitalize }}: up to {{ p.max_position_pct|pct0 }} in the market, halt at {{ p.max_drawdown|pct0 }} drawdown</option>{% endfor %}</select></div>
+    <div class="field"><label for="risk_profile">Risk profile</label><select id="risk_profile" name="risk_profile">{% for p in profiles.values() %}<option value="{{ p.name }}" data-limits="{{ p.name|capitalize }}: halts at {{ p.max_drawdown|pct0 }} drawdown and pauses for the day at a {{ p.daily_loss|pct0 }} daily loss, from now." {{ 'selected' if p.name == settings_pre.get('risk_profile') }}>{{ p.name|capitalize }}: up to {{ '%g'|format(p.max_leverage) }}x leverage, halt at {{ p.max_drawdown|pct0 }} drawdown</option>{% endfor %}</select></div>
     <div class="field"><label for="max_notional">Largest single order, {{ quote }} (optional)</label><input id="max_notional" name="max_notional" type="number" min="10" step="10" placeholder="No cap" value="{{ settings_pre.get('max_notional', '') }}"></div>
     {{ exit_fields(settings_pre, costs, position.side if position else none, s.params) }}
     <p class="hint" style="margin:10px 0 0">{% if s.desired_state == 'running' %}Saving restarts the strategy to apply them; the book and any position carry over.{% else %}They apply when it next starts.{% endif %}{% if x.qty %} The open position takes the new stop and target too. Changing only the target keeps its stop where it is; a new stop set from the market is set on the first bar with bars enough, the old one working until then, and it can only tighten.{% endif %}</p>
@@ -340,10 +369,12 @@
 
 
 {# One confirmation dialog per command: says exactly what will happen before it does. #}
+{# F-T-2 (Advisor Addition A): a Resume while the fill hold is on clears the hold and nothing else. #}
+{% set fill_hold_words = 'A fill wasn\'t handled ' ~ (fill_hold.ts|ts if fill_hold else '') ~ ', so its book may be off and it has opened nothing new since. Check its position and orders first. Resuming clears the fill hold only: anything stricter on it, a halt, a stop or a pause, stays until it is lifted its own way.' %}
 {% set dialogs = {
   'close': ('Close the ' ~ s.instrument ~ ' position', 'It ' ~ ('buys back ' if x.qty < 0 else 'sells ') ~ (x.qty|abs|qty) ~ ' ' ~ base ~ ' (about ' ~ (x.position_value|abs|money) ~ ' ' ~ quote ~ ') at market, paying the taker fee. This is the same as Flatten: the strategy pauses once it has sent the order, so it doesn\'t enter again until you resume it.', 'Close and pause', 'danger'),
   'pause': ('Pause ' ~ s.name, 'Stops new entries. Any position is kept and its stop-loss still applies.', 'Pause strategy', ''),
-  'resume': ('Resume ' ~ s.name, ('Its position margin was lost (liquidated), so it stays halted: resuming doesn\'t restart it. It trades again only after you use Reset after liquidation, which asks for an incident note.' if liquidated else ('It has no equity left (wiped out), so it cannot open a trade: resuming only halts it again.' if x.equity <= 0 else 'The strategy trades again on its next signal.') ~ (' Its drawdown reference resets to today\'s equity of ' ~ (x.equity|money) ~ '.' if s.status == 'halted' else '')), 'Resume trading', ''),
+  'resume': ('Resume ' ~ s.name, (fill_hold_words if fill_hold else ('Its position margin was lost (liquidated), so it stays halted: resuming doesn\'t restart it. It trades again only after you use Reset after liquidation, which asks for an incident note.' if liquidated else ('It has no equity left (wiped out), so it cannot open a trade: resuming only halts it again.' if x.equity <= 0 else 'The strategy trades again on its next signal.') ~ (' Its drawdown reference resets to today\'s equity of ' ~ (x.equity|money) ~ '.' if s.status == 'halted' else ''))), 'Clear the fill hold' if fill_hold else 'Resume trading', ''),
   'flatten': ('Flatten ' ~ s.name, ('It is stopped, so it starts only to ' ~ ('buy back ' if held < 0 else 'sell ') ~ (held|abs|qty) ~ ' ' ~ base ~ ' (about ' ~ ((held * x.price)|abs|money) if s.desired_state != 'running' else ('Buys back ' if x.qty < 0 else 'Sells ') ~ (x.qty|abs|qty) ~ ' ' ~ base ~ ' (about ' ~ (x.position_value|abs|money)) ~ ' ' ~ quote ~ ') at market, paying the taker fee, then pauses the strategy.', 'Close to cash and pause' if x.qty < 0 or held < 0 else 'Sell to cash and pause', 'danger'),
   'stop': ('Stop ' ~ s.name, 'Shuts the strategy process down. ' ~ ('It keeps its ' ~ ('short of ' if x.qty < 0 else '') ~ (x.qty|abs|qty) ~ ' ' ~ base ~ ' unmanaged until restarted, so flatten first if you want cash.' if x.qty else 'It has no open position.'), 'Stop strategy', 'danger' if x.qty else ''),
   'archive': ('Archive ' ~ s.name, 'Hides it from the strategy list on the home page' ~ (', and its equity of ' ~ ((put_away.taken if put_away and put_away.taken is not none else x.equity)|money) ~ ' leaves the fund\'s book at the supervisor\'s next mark, which isn\'t a loss' if not (put_away and (put_away.taken == 0 or put_away.waiting)) else (', and its equity leaves the fund\'s book once it is flat' if put_away.waiting else '')) ~ '. Nothing is deleted: its trades, orders and decisions stay, and you can restore it any time.', 'Archive strategy', ''),

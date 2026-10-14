@@ -49,7 +49,8 @@ def monthly(summaries: list[dict], frames: dict[str, pd.DataFrame], fills_by_sle
             continue
         me = f["equity"].resample("ME").last()
         prev = me.shift(1).fillna(x["sleeve"].starting_balance)
-        grid[x["sleeve"].name] = {ts.strftime("%b %Y"): float(v / prev[ts] - 1) for ts, v in me.items()}
+        # A month that began with no capital of the Strategy's own (CUT-A) has no return on it: left blank.
+        grid[x["sleeve"].name] = {ts.strftime("%b %Y"): float(v / prev[ts] - 1) for ts, v in me.items() if prev[ts] > 0}
     return {"rows": rows, "sleeves": list(grid), "grid": grid, "months": months}
 
 

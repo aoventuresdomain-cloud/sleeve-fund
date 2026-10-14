@@ -2947,6 +2947,33 @@ class Store:
             rows = _rows(c.execute(q))
         return rows[0] if rows else None
 
+    def book_equity_at_or_before(self, ts: datetime) -> Decimal | None:
+        """The fund's book at its last minute mark at or before `ts` (book_marks), or None before the first."""
+        q = select(book_marks_t.c.equity).where(book_marks_t.c.ts <= ts).order_by(book_marks_t.c.ts.desc()).limit(1)
+        with self.engine.connect() as c:
+            return c.execute(q).scalar()
+
+    def first_book_mark(self) -> dict | None:
+        q = select(book_marks_t.c.ts, book_marks_t.c.equity).order_by(book_marks_t.c.ts).limit(1)
+        with self.engine.connect() as c:
+            rows = _rows(c.execute(q))
+        return rows[0] if rows else None
+
+    def refused_ideas(self, sleeve: str, since: datetime | None = None, limit: int = 200) -> list[dict]:
+        """The gate's refusals and trims of `sleeve`'s ideas, newest first, one per idea (its submit check; the fill
+        backstop only when it decided alone): decided_at, underlying, intent, requested_qty, approved_qty, outcome,
+        limit_hit, price, book_equity and open_risk."""
+        d = gate_decisions_t
+        q = (select(d.c.decided_at, d.c.underlying, d.c.intent, d.c.requested_qty, d.c.approved_qty, d.c.outcome,
+                    d.c.limit_hit, d.c.price, d.c.book_equity, d.c.open_risk, d.c.stage)
+             .join(sleeves_t, sleeves_t.c.id == d.c.sleeve_id)
+             .where(sleeves_t.c.name == sleeve, d.c.outcome.in_(("rejected", "trimmed")))
+             .order_by(d.c.decided_at.desc(), d.c.seq.desc()).limit(limit))
+        if since is not None:
+            q = q.where(d.c.decided_at >= since)
+        with self.engine.connect() as c:
+            return _rows(c.execute(q))
+
     def fills(self, sleeve: str | None = None, limit: int = 200) -> list[dict]:
         q = select(fills_t)
         q = q.where(fills_t.c.sleeve == sleeve) if sleeve else q.where(_not_backtest(fills_t.c.sleeve))

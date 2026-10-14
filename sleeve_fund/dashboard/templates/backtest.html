@@ -21,7 +21,7 @@
       <div class="field"><label for="period">Period</label><select id="period" name="period">{% for k, (label, _d) in periods.items() %}<option value="{{ k }}" {{ 'selected' if k == period }}>{{ label }}</option>{% endfor %}</select></div>
     </div>
     <div class="grid2">
-      <div class="field"><label for="risk_profile">Risk profile</label><select id="risk_profile" name="risk_profile">{% for p in profiles.values() %}<option value="{{ p.name }}" {{ 'selected' if p.name == pre.get('risk_profile', 'balanced') }}>{{ p.name|capitalize }}: positions up to {{ p.max_position_pct|pct0 }}</option>{% endfor %}</select></div>
+      <div class="field"><label for="risk_profile">Risk profile</label><select id="risk_profile" name="risk_profile">{% for p in profiles.values() %}<option value="{{ p.name }}" {{ 'selected' if p.name == pre.get('risk_profile', 'balanced') }}>{{ p.name|capitalize }}: up to {{ '%g'|format(p.max_leverage) }}x leverage</option>{% endfor %}</select></div>
       <div class="field"><label for="max_notional">Largest single order (optional)</label><input id="max_notional" name="max_notional" type="number" min="10" step="10" placeholder="No cap" value="{{ pre.get('max_notional', '') }}"></div>
     </div>
     {{ market_fields(pre) }}

@@ -43,8 +43,6 @@ def risk_view(store: Store, summaries: list[dict], book: dict) -> dict:
             "x": x,
             "dd_used": x["dd_used"],
             "day_used": min(max(-x["day_ret"], 0.0) / p.daily_loss, 1.0) if p.daily_loss else 0.0,
-            # Not capped at 100%: drift past the entry cap shows its true share, in amber (P1-U13).
-            "cap_used": abs(x["exposure"]) / cap if (cap := x.get("cap", p.max_position_pct)) else 0.0,
             "headroom": x["room"],
             # An open position's own stop (an exit-plan edit moves it), else the model's setting (P1-U14).
             "has_stop": bool(pos["stop_px"]) if (pos := positions.get(s.name)) else bool(
@@ -251,17 +249,11 @@ def status_items(rows: list[dict], health: dict) -> list[dict]:
         s = r["x"]["sleeve"]
         if s.status in ("halted", "error"):
             continue  # already named, worse
-        # The limits that halt or pause are judged on their own; drift past the entry cap gets its own line, so
-        # it never hides a drawdown or daily-loss warning (P1-U13, Code Reviewer on #152).
+        # The limits that halt or pause (the per-Strategy position cap is gone: TEC-FE-CAP, HoE 14 Oct 2026).
         used = [(r["dd_used"], "drawdown"), (r["day_used"], "daily loss")]
         share, which = max(used, key=lambda u: u[0])
         if share > NEAR_LIMIT:
             warn.append(f"{s.name} has used {share:.0%} of its {which} limit")
-        if r["cap_used"] > 1:
-            # The cap limits new entries only: past it through price drift is information, not a call to act.
-            warn.append(f"{s.name}'s exposure is {r['cap_used']:.0%} of its entry cap because the price moved; no action")
-        elif r["cap_used"] > NEAR_LIMIT:
-            warn.append(f"{s.name} has used {r['cap_used']:.0%} of its position cap")
     warn += [f"{name} has had no trade or quote from the venue lately" for name in health["stale_feeds"]]
     if health["backup_issue"]:
         warn.append(health["backup_issue"])
