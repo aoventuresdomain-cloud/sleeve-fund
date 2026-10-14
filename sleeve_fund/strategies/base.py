@@ -479,6 +479,7 @@ _HANDLER_WORDS = {"on_trade": "a trade print", "on_quote": "a quote", "on_order_
                   "on_order_modify_rejected": "a resize refused", "on_bar": "a bar", "_on_tick": "the risk check",
                   "_maker_timeout": "a post-only order's wait running out"}
 MAX_KEPT_ERRORS = 100  # handler errors kept with their text; every one is counted
+FILL_HANDLER_PAUSE = "paused: a fill handler failed, so its book is in doubt; resume once it is checked"  # T-FIX8
 
 
 def handler_error_words(handler: str, exc: BaseException | str) -> str:
@@ -829,6 +830,15 @@ class LongFlatStrategy(Strategy):
                                          f"The strategy failed {handler_error_words(name, exc)}. Its "
                                          "orders after this may be wrong.", ts=self.runtime.now())
             except Exception:  # the journal itself failing must not hide the first error
+                pass
+        if name == "on_order_filled" and self.runtime is not None and not self.runtime.backtest:
+            # The Advisor's loud failure (T-FIX8): a fill this Strategy failed to handle leaves its book in doubt, so it
+            # opens nothing more until the PM resumes it: the PM's own pause, with no end time (a daily-loss pause's
+            # 00:00 roll never lifts it). Exits, stops and flattens still go; a halt in force stays.
+            try:
+                if self.runtime.status != "halted":
+                    self.runtime._set("paused", FILL_HANDLER_PAUSE)
+            except Exception:  # the journal failing must not hide the first error
                 pass
 
     def attach_runtime(self, runtime) -> "LongFlatStrategy":
