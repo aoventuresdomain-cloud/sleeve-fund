@@ -5876,6 +5876,19 @@ class LongFlatStrategy(Strategy):
             self._resize_due = False
             self._rest_exits()
 
+    def _final_mark(self) -> None:
+        """Paper: the book as it stands when the process stops (SleeveRuntime.final_mark). Skipped when it can't be
+        valued (a carried-over position not back at the venue yet, no price, nothing left); a failure here is logged,
+        never in the way of the stop."""
+        if self.runtime.backtest or self._restore is not None:
+            return
+        try:
+            equity, cash, qty, price = self._mark()
+            if equity > 0:
+                self.runtime.final_mark(equity=equity, cash=cash, qty=qty, price=price)
+        except Exception as e:  # noqa: BLE001 - the stop goes on; the next start marks again
+            self.log.warning(f"no final mark on stop: {e}")
+
     def on_stop(self) -> None:
         self._drop_kept()
         for coid in list(self._maker):
@@ -5884,6 +5897,7 @@ class LongFlatStrategy(Strategy):
         if self.runtime is not None:
             for timer in ("sleeve-tick", GATE_WATCH):
                 self.clock.cancel_timer(timer) if timer in self.clock.timer_names() else None
+            self._final_mark()
             self.runtime.on_stop()
         if self.recorder is not None:
             self.recorder.close()
