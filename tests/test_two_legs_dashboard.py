@@ -200,3 +200,27 @@ def test_the_outside_alert_chat_names_a_second_leg_by_its_strategy():
     assert "[warning] carry, leg 2: leg unwound" in out and "~2" not in out
     assert "[warning] solo: paused" in out and "[error] system: no backup" in out
     assert leg_name("carry~2") == "carry, leg 2" and leg_name("carry") == "carry" and leg_name(None) == ""
+
+
+def test_archive_and_reset_follow_the_whole_strategy(carry):
+    """CR F283-1/2: a two-leg Strategy is archived whole and isn't reset yet. Holding on either leg, Archive waits;
+    Reset isn't offered; once flat and archived, the Portfolio's archived list has one row for it, its legs summed."""
+    client, store = carry
+    for name in ("carry", "carry~2"):
+        store.set_desired_state(name, "stopped")
+    head = _get(client, "/sleeves/carry").split('class="page-head"')[1].split("</div>")[0]
+    assert 'disabled title="Close both legs before archiving">Archive' in head
+    assert "disabled title=\"A reset isn't built for a two-leg Strategy yet\"" in head.replace("&#39;", "'")
+    dialog = _get(client, "/sleeves/carry").split('id="dlg-archive"')[1].split("</dialog>")[0]
+    assert "Both legs are put away together." in dialog
+    for name, side, px in (("carry", "SELL", 61_000), ("carry~2", "BUY", 61_000)):
+        store.record_fill(name, side=side, qty=0.05, price=px, fee=0.0, order_id=f"{name}-o2", trade_id=f"{name}-t2")
+        store.record_equity(name, equity=5_000, cash=5_000, qty=0.0, price=61_000, benchmark=5_000)
+    head = _get(client, "/sleeves/carry").split('class="page-head"')[1].split("</div>")[0]
+    assert 'data-open="dlg-archive" >Archive' in head
+    store.archive("carry")
+    assert {"carry", "carry~2"} <= set(store.archived())
+    home = _get(client, "/")
+    shelf = home.split('id="archived"')[1].split("</details>")[0]
+    assert shelf.count('href="/sleeves/carry"') == 1 and "carry~2" not in _visible(shelf)
+    assert ">10,000.00<" in shelf  # both legs' 5,000

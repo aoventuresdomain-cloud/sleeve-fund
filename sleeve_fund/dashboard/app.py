@@ -284,7 +284,8 @@ def create_app(store: Store | None = None) -> FastAPI:
         return page(request, "home.html",
                     summaries=legs.fold(st(), [x for x in summaries if x["sleeve"].name not in put_away], frames),
                     leg_flags=legs.flags(st()),
-                    archived=[x for x in summaries if x["sleeve"].name in put_away],
+                    # A two-leg Strategy is archived whole: one row, its legs summed (CR F283-2).
+                    archived=legs.fold(st(), [x for x in summaries if x["sleeve"].name in put_away], frames),
                     earlier=[st().sleeve(n) for n in earlier], book_start=st().book_start(),
                     earlier_resets=bool(set(earlier) & set(st().reset_runs())),
                     book=book, alerts=st().alerts(limit=30), shell=shell(),
