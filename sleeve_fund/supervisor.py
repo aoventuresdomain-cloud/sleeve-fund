@@ -68,10 +68,12 @@ def fund_equity(store: Store) -> Decimal:
     with no mark is held at its entry price (F229-7)."""
     from sleeve_fund.store import is_backtest
 
-    runs = store.reset_runs()
+    runs, out = store.reset_runs(), store.withdrawn()
     total = Decimal(0)
     for s in store.sleeves():
         if is_backtest(s.name) or outside_fund_book(store, s):  # F229-6: a sub-8dp test Strategy isn't the fund's
+            continue
+        if s.name in out:  # F-C3B-A: put away, its equity taken out of the book with its flow
             continue
         total += strategy_equity(store, s, runs)
     return total
@@ -846,9 +848,9 @@ def capital_in(store: Store) -> Decimal:
     """The capital put into the fund's book: every Strategy's starting balance that fund_equity counts (a reset's run
     counts only its cash, its successor the capital). What the book is worth with no gain or loss since, the
     flow-corrected reference the re-base measures the drawdown from (Advisor, 14 Oct 09:10 UK)."""
-    runs = store.reset_runs()
+    runs, out = store.reset_runs(), store.withdrawn()
     return sum((to_decimal(s.starting_balance, "starting balance") for s in store.sleeves()
-                if s.name not in runs and not outside_fund_book(store, s)), Decimal(0))
+                if s.name not in runs and s.name not in out and not outside_fund_book(store, s)), Decimal(0))
 
 
 def could_trade(s: Sleeve) -> bool:
@@ -956,6 +958,30 @@ def rebase_halt_ref_1(store: Store, actor: str, commit: str, now: datetime | Non
     return before, after, words
 
 
+def withdraw_archived(store: Store, actor: str, commit: str) -> list[str]:
+    """F-C3B-A's one-off for the Strategies archived before it landed, which still count in the book: each is taken
+    out with its own flow (Store._put_away, under the gate's lock), so the drawdown and the P&L don't move (Advisor 14
+    Oct 09:45 UK). A reset's earlier run is not one: its cash stays in the book. Idempotent: one already out is skipped.
+    Refused, with nothing written, while any of them holds a position. Returns the names taken out."""
+    from sleeve_fund.store import is_backtest
+
+    if not actor.strip() or not commit.strip():
+        raise ValueError("an actor and the deployed commit are required")
+    runs, out = store.reset_runs(), store.withdrawn()
+    due = [n for n in store.archived() if n not in runs and n not in out and not is_backtest(n)]
+    held = [f"{n} holds {store.journal_book(n, store.sleeve(n).starting_balance)['qty']}" for n in due
+            if store.journal_book(n, store.sleeve(n).starting_balance)["qty"] != 0]
+    if held:
+        raise RuntimeError("withdraw-archived refused, nothing written: " + "; ".join(held)
+                           + " (flatten it first: a position has no settled equity to take out)")
+    for n in due:
+        with store._put_away(n, utcnow(), f"withdraw-archived by {actor.strip()} at {commit.strip()}"):
+            pass
+        store.decide(actor.strip(), "withdraw_archived", f"F-C3B-A: {n}'s equity taken out of the fund's book at "
+                                                         f"commit {commit.strip()}", n)
+    return due
+
+
 REBASE_PAUSE = f"{REBASE_KEY}: paused for the portfolio re-base; resumed at the first test start"
 
 
@@ -1011,6 +1037,9 @@ def main(argv: list[str] | None = None) -> int:
     cl = sub.add_parser("clear", help="stop and archive every strategy, once per entry in the file")
     cl.add_argument("path")
     sub.add_parser("book", help="print the book's strategies and headline figures")
+    wa = sub.add_parser("withdraw-archived", help="F-C3B-A only: take each Strategy archived before it out of the book")
+    wa.add_argument("--actor", required=True, help="who ran it, for the decision log")
+    wa.add_argument("--commit", required=True, help="the deployed commit, for the journal")
     rb = sub.add_parser("rebase", help=f"{REBASE_KEY} only: re-base the paper portfolio's state to the true book, once")
     rb.add_argument("--actor", required=True, help="who ran it, for the decision log")
     rb.add_argument("--commit", required=True, help="the deployed commit, for the journal")
@@ -1030,6 +1059,13 @@ def main(argv: list[str] | None = None) -> int:
         print("book figures:", book_figures(store))
     elif args.cmd == "rebase":
         return _rebase_command(store, args)
+    elif args.cmd == "withdraw-archived":
+        try:
+            done = withdraw_archived(store, args.actor, args.commit)
+        except RuntimeError as exc:
+            print(exc)
+            return 1
+        print(f"withdrawn: {', '.join(done) or 'none (nothing archived still counted)'}")
     else:
         assert_portfolio_gate(store)
         Supervisor(store, clear_path=args.clear).run()

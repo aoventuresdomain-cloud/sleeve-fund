@@ -447,6 +447,9 @@ sleeve_archive_t = Table(
     metadata,
     Column("sleeve", String(64), ForeignKey("sleeves.name"), primary_key=True),
     Column("archived_at", TS, nullable=False),
+    # F-C3B-A (0022): the equity it took out of the fund's book when it was put away, with its flow; NULL for an archive
+    # made before that (still counted until supervisor withdraw-archived) and for a reset's run (its cash stays).
+    Column("withdrawn", EXACT),
 )
 # When each paper strategy last saw a trade or quote from its venue: the price feed's age on its page.
 # Written at most every few seconds by the strategy's process. A new table: CREATE TABLE.
@@ -900,6 +903,10 @@ def fill_cash(side: str, qty, price, fee) -> Decimal:
     D = to_decimal
     leg = per_fill(D(qty, "qty") * D(price, "price"))
     return (-leg if side == "BUY" else leg) - per_fill(D(fee, "fee"))
+
+
+class _NotRetired(Exception):
+    """complete_retire found it retired by another process: roll its put-away back and return False."""
 
 
 def _outside_book(store: "Store", s, account: str | None = None) -> bool:
@@ -1548,7 +1555,7 @@ class Store:
         moved = []
 
         def amount() -> Decimal:
-            if is_backtest(sleeve):
+            if is_backtest(sleeve) or sleeve in self.withdrawn():  # out of the book already (F-C3B-A)
                 return Decimal(0)
             s = self.sleeve(sleeve)
             was = _outside_book(self, s)
@@ -1571,6 +1578,45 @@ class Store:
         with self.engine.connect() as c:
             return {r.sleeve: _aware(r.archived_at) for r in c.execute(select(sleeve_archive_t))}
 
+    def withdrawn(self) -> dict[str, Decimal]:
+        """Strategies put away whose equity left the fund's book with its flow (F-C3B-A): {name: the equity taken out}.
+        fund_equity counts none of them."""
+        with self.engine.connect() as c:
+            return {r.sleeve: to_decimal(r.withdrawn) for r in c.execute(
+                select(sleeve_archive_t).where(sleeve_archive_t.c.withdrawn.is_not(None)))}
+
+    @contextmanager
+    def _put_away(self, sleeve: str, ts: datetime, why: str):
+        """F-C3B-A (Advisor 14 Oct 09:45 UK): a Strategy put away for good (archived, retired, or archived by a clean
+        slate) takes its whole equity out of the fund's book, as a flow (_book_move), in the same transaction as its
+        archive row, which this writes; the caller's own writes go on the connection this yields. One outside the book
+        (a test account, a saved backtest) takes nothing out, as it brought nothing in."""
+        taken: list[Decimal] = []
+
+        def part() -> Decimal:
+            return Decimal(0) if sleeve in self.withdrawn() else self._in_book_equity(sleeve)
+
+        def amount() -> Decimal:
+            taken.append(part())
+            return -taken[0]
+
+        with self._book_move(amount, lambda: f"{sleeve} put away ({why}): its equity {taken[0]:,.2f} leaves the "
+                                             "fund's book", ts) as c:
+            yield c
+            out = taken[0] if taken else part()  # nothing marked yet: no flow, but out of the book all the same
+            c.execute(sleeve_archive_t.delete().where(sleeve_archive_t.c.sleeve == sleeve))
+            c.execute(insert(sleeve_archive_t).values(sleeve=sleeve, archived_at=ts, withdrawn=stored(out)))
+
+    def _in_book_equity(self, sleeve: str) -> Decimal:
+        """`sleeve`'s equity as the fund's book counts it (supervisor.strategy_equity), or nothing when it sits outside
+        the book (a saved backtest, a test account, F229-6)."""
+        s = self.sleeve(sleeve)
+        if is_backtest(sleeve) or _outside_book(self, s):
+            return Decimal(0)
+        from sleeve_fund.supervisor import strategy_equity
+
+        return strategy_equity(self, s)
+
     def book_start(self) -> datetime | None:
         """When the current book began: the latest clean slate (supervisor.clear), or None if never cleared."""
         with self.engine.connect() as c:
@@ -1592,18 +1638,29 @@ class Store:
                            if at <= start and abs(self.journal_book(name, self.sleeve(name).starting_balance)["qty"]) <= 1e-12}}
 
     def archive(self, sleeve: str) -> None:
-        """Put a stopped, flat sleeve away. Raises ValueError if it is running or still holds a position."""
+        """Put a stopped, flat sleeve away, its equity out of the fund's book with its flow (F-C3B-A). Raises
+        ValueError if it is running or still holds a position."""
         s = self.sleeve(sleeve)
         if s.desired_state != "stopped":
             raise ValueError("stop the strategy before archiving it")
-        with self.engine.begin() as c:
-            c.execute(sleeve_archive_t.delete().where(sleeve_archive_t.c.sleeve == sleeve))
-            c.execute(insert(sleeve_archive_t).values(sleeve=sleeve, archived_at=utcnow()))
+        with self._put_away(sleeve, utcnow(), "archived"):
+            pass
 
     def unarchive(self, sleeve: str) -> None:
+        """Bring a put-away sleeve back: the equity it took out comes back into the book with its flow, at what it is
+        worth now (F-C3B-A, the undo of archive)."""
         if self.sleeve(sleeve).lifecycle == lifecycle.RETIRED:
             raise ValueError("this strategy is retired, and a retired strategy can't be brought back")
-        with self.engine.begin() as c:
+        back: list[Decimal] = []
+
+        def amount() -> Decimal:
+            if sleeve not in self.withdrawn():
+                return Decimal(0)  # an archive from before F-C3B-A: it never left the book
+            back.append(self._in_book_equity(sleeve))
+            return back[0]
+
+        with self._book_move(amount, lambda: f"{sleeve} brought back: its equity {back[0]:,.2f} comes into the fund's "
+                                             "book") as c:
             c.execute(sleeve_archive_t.delete().where(sleeve_archive_t.c.sleeve == sleeve))
 
     # --- lifecycle (P2-6) ------------------------------------------------------------
@@ -1657,7 +1714,8 @@ class Store:
             if to == lifecycle.WINDING_DOWN:
                 started, deadline_at = started or now, now
         text = lifecycle.moved_words(s.lifecycle, to, action, deadline_at, held) + basis
-        with self.engine.begin() as c:
+        # A retire puts it away for good: its equity leaves the book with the lifecycle row (F-C3B-A).
+        with (self._put_away(sleeve, now, "retired") if to == lifecycle.RETIRED else self.engine.begin()) as c:
             values = {"lifecycle": to, "wind_down_started": started, "wind_down_deadline": deadline_at,
                       "updated_at": now}
             if to == lifecycle.RETIRED:
@@ -1668,9 +1726,6 @@ class Store:
                                                      sleeves_t.c.lifecycle == s.lifecycle).values(**values)).rowcount
             if not done:
                 raise lifecycle.LifecycleError("This strategy's lifecycle changed meanwhile; look again and retry.")
-            if to == lifecycle.RETIRED:
-                c.execute(sleeve_archive_t.delete().where(sleeve_archive_t.c.sleeve == sleeve))
-                c.execute(insert(sleeve_archive_t).values(sleeve=sleeve, archived_at=now))
             c.execute(insert(decisions_t).values(ts=now, actor="PM", action=action, sleeve=sleeve,
                                                  reason=reason.strip()))
             c.execute(insert(events_t).values(sleeve=sleeve, ts=now, level="info", kind=LIFECYCLE_EVENT, message=text))
@@ -1679,20 +1734,24 @@ class Store:
     def complete_retire(self, sleeve: str, now: datetime | None = None, how: str = "flat") -> bool:
         """Retire a winding-down strategy once the journal shows it flat (dust counts as flat: lifecycle_flat): the end of the PM's own wind-down, never a
         new move (lifecycle.due's RETIRE). False, and nothing written, unless it is winding down and flat. how: flat,
-        deadline or close_now, for the journal's words."""
+        deadline or close_now, for the journal's words. Its equity leaves the fund's book with the row (F-C3B-A)."""
+        try:
+            return self._complete_retire(sleeve, now, how)
+        except _NotRetired:
+            return False
+
+    def _complete_retire(self, sleeve: str, now: datetime | None, how: str) -> bool:
         now = now or utcnow()
         s = self.sleeve(sleeve)
         if s.lifecycle != lifecycle.WINDING_DOWN or not self.lifecycle_flat(sleeve)[1]:
             return False
         text = lifecycle.retired_words(how)
-        with self.engine.begin() as c:
+        with self._put_away(sleeve, now, "retired") as c:  # its equity leaves the book with the row (F-C3B-A)
             done = c.execute(update(sleeves_t).where(sleeves_t.c.name == sleeve,
                                                      sleeves_t.c.lifecycle == lifecycle.WINDING_DOWN)
                              .values(lifecycle=lifecycle.RETIRED, desired_state="stopped", updated_at=now)).rowcount
-            if not done:  # another process retired it first
-                return False
-            c.execute(sleeve_archive_t.delete().where(sleeve_archive_t.c.sleeve == sleeve))
-            c.execute(insert(sleeve_archive_t).values(sleeve=sleeve, archived_at=now))
+            if not done:  # another process retired it first: nothing taken out (the raise rolls the flow back)
+                raise _NotRetired
             # The PM's wind-down, ended by the system once flat: the row names both, so it never reads as the PM
             # pressing retire (Advisor 13 Oct 16:40)
             c.execute(insert(decisions_t).values(ts=now, actor="PM", action="retire", sleeve=sleeve,
