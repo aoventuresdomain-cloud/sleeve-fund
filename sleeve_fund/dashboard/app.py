@@ -242,7 +242,10 @@ def create_app(store: Store | None = None) -> FastAPI:
                    if o["sleeve"] in names]
         book = bookm.book_view(st(), summaries, frames)
         positions = trading.book_positions(st(), summaries + tests)  # shown; outside the book is marked not counted
-        funding = trading.book_funding(st(), summaries)
+        # The book's funding totals leave a test-account Strategy out; its payments are listed, marked, as its
+        # fills, orders and position are (F273-1).
+        funding = {**trading.book_funding(st(), summaries),
+                   "payments": trading.book_funding(st(), summaries + tests)["payments"]}
         # Costs as money paid: fees plus funding paid (funding totals are + received, - paid).
         book["funding_paid"] = -funding["total"]
         book["fees_funding"] = book.get("costs", book["fees"] - funding["total"])
@@ -255,8 +258,9 @@ def create_app(store: Store | None = None) -> FastAPI:
                     earlier_resets=bool(set(earlier) & set(st().reset_runs())),
                     book=book, alerts=st().alerts(limit=30), shell=shell(),
                     positions=positions, working=working, holdings=bookm.holdings(positions["rows"], book["equity"]),
-                    book_fills=trading.book_fills(st(), sleeves), funding=funding,
-                    fill_count=sum(x["fills"] for x in summaries), tests=tests)
+                    book_fills=trading.book_fills(st(), sleeves + [x["sleeve"] for x in tests]), funding=funding,
+                    fill_count=sum(x["fills"] for x in summaries), tests=tests,
+                    test_names={x["sleeve"].name for x in tests})
 
     def _recent_json(sleeves, days: int, daily) -> JSONResponse:
         """The last day or week at fine resolution, in the shape the charts read."""
