@@ -311,14 +311,16 @@ def test_c3b_a_strategy_an_earlier_book_put_away_is_out_of_both(tmp_path):
     assert open_risk.account_equity(store, "paper") == 30_000  # in the current book
     store.decide("PM", "clear", "Clean slate")  # a new book starts after held was put away
     assert "held" in store.previous_book()
-    assert open_risk.account_equity(store, "paper") == 20_000
+    # Advisor C3b, option B: out of the holdings and the risk, its cash still in the book, as fund_equity counts it.
+    assert open_risk.account_equity(store, "paper") == 30_000
     assert [r["sleeve"] for r in open_risk.book_open_risk(store, _atr)] == ["fund"]
-    assert open_risk.account_book(store, "entry", 10_000.0, _atr)[:2] == (20_000.0, pytest.approx(60.0))
+    assert open_risk.account_book(store, "entry", 10_000.0, _atr)[:2] == (30_000.0, pytest.approx(60.0))
     # Advisor C3b, option B: the tile measures against the gate's book, the fund's equity, put-away cash included.
     from sleeve_fund.dashboard import trading
 
     tile = trading.open_risk([{"sleeve": "fund", "perp_limit": True, "margin": 0.0}], store)
-    assert tile["book"] == float(supervisor.fund_equity(store)) == 30_000
+    assert tile["book"] == float(supervisor.fund_equity(store)) == open_risk.account_equity(store, "paper") == 30_000
+    assert tile["open_risk"] / tile["book"] == pytest.approx(60.0 / 30_000)  # the tile's % is the interim check's
     assert [h.notional for h in portfolio_gate.fund_holdings(store, atr_pct=_atr)] == [Decimal(6_000)]
 
 

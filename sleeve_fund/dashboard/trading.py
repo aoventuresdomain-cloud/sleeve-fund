@@ -403,18 +403,14 @@ def _by_account(store: Store, perps: list[tuple[str, dict]]) -> list[dict]:
 
 
 def _one_book(store: Store, perps: list[tuple[str, dict]]) -> float | None:
-    """The book the portfolio gate measures open risk against (supervisor.fund_equity: the fund's equity, cash a
-    clean slate put away included, a Strategy outside the fund's book not), so the Open risk tile's % of book equals
-    the gate's (Advisor C3b, option B). Only when the tile's perpetuals are on one account; None when they span
-    accounts (each has its own line), or when the fund can't be valued (a position with no mark)."""
-    from sleeve_fund.supervisor import fund_equity
+    """The book the limit measures the Open risk tile's figure against when its perpetuals are on one account
+    (open_risk.account_equity, the fund's equity as supervisor.fund_equity counts it: cash a clean slate put away
+    included, a Strategy outside the fund's book not), so the tile's % of book equals the gate's (F229-6-a; Advisor
+    C3b, option B). None when there are none, or they span accounts (each has its own line)."""
+    from sleeve_fund import open_risk as limit
 
-    if len({store.account_of(n) for n, _ in perps}) != 1:
-        return None
-    try:
-        return float(fund_equity(store))
-    except Exception:  # noqa: BLE001 - unvalued: the tile falls back to the book's equity, as before
-        return None
+    names = {store.account_of(n) for n, _ in perps}
+    return limit.account_equity(store, names.pop()) if len(names) == 1 else None
 
 
 def open_risk_hint(estimated: list[str], through: list[str], left_out: dict[str, list[str]],

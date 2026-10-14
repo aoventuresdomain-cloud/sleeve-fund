@@ -154,13 +154,34 @@ def gapped(qty: float, mark: float, stop: float | None) -> bool:
 
 
 def _left_out(store, s, earlier) -> bool:
-    """Not in the book's figures: a Strategy an earlier book put away (Store.previous_book, `earlier`), or one outside
-    the fund's book (a sub-8dp test Strategy, supervisor.outside_fund_book). The rest is the dashboard's current book:
-    one archived in it while still holding counts in full, and one archived flat keeps its equity in at no risk
-    (Advisor 14 Oct 00:15 UK and C3, F229-6 and F229-6-a)."""
+    """Not in the book's holdings or risk: a Strategy an earlier book put away (Store.previous_book, `earlier`), or
+    one outside the fund's book (a sub-8dp test Strategy, supervisor.outside_fund_book). The rest is the dashboard's
+    current book: one archived in it while still holding counts in full, and one archived flat keeps its equity in at
+    no risk (Advisor 14 Oct 00:15 UK and C3, F229-6 and F229-6-a)."""
     from sleeve_fund.supervisor import outside_fund_book
 
     return s.name in earlier or outside_fund_book(store, s)
+
+
+def _put_away_equity(store, s, runs) -> float:
+    """What a Strategy an earlier book put away still adds to the book, as supervisor.fund_equity counts it, so the
+    limit's book is the portfolio gate's and the tile's (Advisor C3b, option B): a reset's run its cash movement
+    only (its capital is its successor's), one a clean slate put away (flat) its capital and that movement."""
+    cash = float(store.strategy_cash_pnl(s.name))
+    return cash if s.name in runs else s.starting_balance + cash
+
+
+def _book_part(store, s, earlier, runs) -> float | None:
+    """A Strategy's part of its account's book, or None when it is outside the fund's book. Put away by an earlier
+    book: its put-away equity, at no risk. Otherwise its current equity (its starting balance before its first mark)."""
+    from sleeve_fund.supervisor import outside_fund_book
+
+    if outside_fund_book(store, s):
+        return None
+    if s.name in earlier:
+        return _put_away_equity(store, s, runs)
+    last = store.last_equity(s.name)
+    return s.starting_balance if last is None else last["equity"]
 
 
 def book_open_risk(store, atr_pct, account: str | None = None) -> list[dict]:
@@ -200,15 +221,15 @@ def book_open_risk(store, atr_pct, account: str | None = None) -> list[dict]:
 
 
 def account_equity(store, account: str) -> float:
-    """The book the limit measures an account's open risk against: the current equity of every strategy on the
-    account that isn't left out (_left_out; its starting balance before its first mark), as account_book adds it up."""
-    earlier = store.previous_book()
+    """The book the limit measures an account's open risk against: every strategy on the account inside the fund's
+    book, as account_book adds it up (_book_part), so one account's book is supervisor.fund_equity."""
+    earlier, runs = store.previous_book(), store.reset_runs()
     book = 0.0
     for s in store.sleeves():
-        if _left_out(store, s, earlier) or store.account_of(s.name) != account:
+        if store.account_of(s.name) != account:
             continue
-        last = store.last_equity(s.name)
-        book += s.starting_balance if last is None else last["equity"]
+        part = _book_part(store, s, earlier, runs)
+        book += part or 0.0
     return book
 
 
@@ -219,17 +240,17 @@ def account_book(store, sleeve_name: str, own_equity: float, atr_pct) -> tuple[f
     from sleeve_fund import markets
 
     account = store.account_of(sleeve_name)
-    earlier = store.previous_book()
+    earlier, runs = store.previous_book(), store.reset_runs()
     book, risk, through = own_equity, 0.0, []
     for s in store.sleeves():
-        if s.name == sleeve_name or _left_out(store, s, earlier) or store.account_of(s.name) != account:
+        if s.name == sleeve_name or store.account_of(s.name) != account:
             continue
+        part = _book_part(store, s, earlier, runs)
+        if part is None:
+            continue
+        book += part
         last = store.last_equity(s.name)
-        if last is None:
-            book += s.starting_balance
-            continue
-        book += last["equity"]
-        if not last["qty"] or not markets.is_perp(s.params):
+        if s.name in earlier or last is None or not last["qty"] or not markets.is_perp(s.params):
             continue
         stop = _journal_stop(store, s, last["qty"])
         if gapped(last["qty"], last["price"], stop):
