@@ -4,7 +4,7 @@ the final head is deployed, before testing starts. Each subcommand prints its fi
 subscription, and one dry check_order on an in-memory copy of the ledger (never reserved, never sent).
 
 Runs over stdin inside a container on the server (.github/workflows/final-smoke.yml), from /app:
-    python -u - safety                                   # B6: in each container the workflow names
+    python -u - safety [--mirror]                        # B6: in each container the workflow names
     python -u - hub [--wait 60]                          # B2: hub-fed trades and quotes, and the history store
     python -u - journal --strategy NAME --since ISO      # B4: B3's orders, fills, funding and events
     python -u - gate                                     # B5: the gate's book against the dashboard's tile
@@ -50,18 +50,21 @@ def configured(pattern: str = "configs/sleeves/*.toml") -> list[tuple[str, str]]
 
 # --- B6 safety -------------------------------------------------------------------------------------------------------
 
-def safety(environ: dict[str, str] | None = None) -> int:
+def safety(environ: dict[str, str] | None = None, mirror_container: bool = False) -> int:
     """No venue credential is set in this container's environment (names only are printed, never values), and the
-    demo mirror's hosts are demo hosts."""
+    demo mirror's hosts are demo hosts. In the mirror's container (mirror_container) only its demo and testnet
+    accounts' names may be set (mirror.ACCOUNTS); any other credential name fails: never a live key."""
     from sleeve_fund import mirror
     from sleeve_fund.paper.safety import credential_var
 
     env = os.environ if environ is None else environ
-    found = sorted(k for k, v in env.items() if v and credential_var(k))
-    print(f"credential variables set: {found or 'none'}")
+    demo = {name for pair in mirror.ACCOUNTS.values() for name in pair} if mirror_container else set()
+    found = sorted(k for k, v in env.items() if v and (credential_var(k) or k in demo))
+    print(f"credential variables set: {found or 'none'}" + (f" (demo accounts allowed: {sorted(demo)})" if demo else ""))
     hosts = (mirror.TESTNET_HOST, mirror.BYBIT_DEMO_HOST)
     print(f"mirror hosts: {hosts}")
-    fails = [f"credential set: {', '.join(found)}"] if found else []
+    live = [k for k in found if k not in demo]
+    fails = [f"credential set: {', '.join(live)}"] if live else []
     fails += [f"mirror host {h} is not a demo host" for h in hosts if not h.startswith(("test.", "api-demo."))]
     return verdict("B6 safety", fails)
 
@@ -234,7 +237,8 @@ def gate(store=None, now=None, atr_pct=None) -> int:
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="final_smoke")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("safety")
+    sf = sub.add_parser("safety")
+    sf.add_argument("--mirror", action="store_true", help="the mirror's container: its demo accounts' names allowed")
     h = sub.add_parser("hub")
     h.add_argument("--wait", type=float, default=60.0)
     j = sub.add_parser("journal")
@@ -244,7 +248,7 @@ def main(argv: list[str]) -> int:
     a = ap.parse_args(argv)
     print(json.dumps({"check": a.cmd, "at": datetime.now(UTC).isoformat(timespec="seconds")}))
     if a.cmd == "safety":
-        return safety()
+        return safety(mirror_container=a.mirror)
     if a.cmd == "hub":
         return hub(a.wait)
     if a.cmd == "journal":

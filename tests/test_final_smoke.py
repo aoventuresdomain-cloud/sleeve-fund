@@ -48,6 +48,16 @@ def test_safety_passes_without_credentials_and_names_a_credential_without_its_va
     assert "BINANCE_API_KEY" in out and "sekrit-value" not in out
 
 
+def test_safety_in_the_mirror_allows_only_its_demo_account_names(capfd):
+    demo = {"BYBIT_DEMO_API_KEY": "k", "BYBIT_DEMO_API_SECRET": "s", "DERIBIT_TESTNET_API_KEY": "k"}
+    assert fs.safety(demo, mirror_container=True) == 0
+    assert fs.safety(demo) == 1  # anywhere else, even a demo key fails
+    assert fs.safety({**demo, "BYBIT_API_KEY": "live-value"}, mirror_container=True) == 1
+    assert fs.safety({"BINANCE_API_KEY__DESK": "x"}, mirror_container=True) == 1
+    out = capfd.readouterr().out
+    assert "credential set: BYBIT_API_KEY" in out and "live-value" not in out
+
+
 # --- B2 hub ----------------------------------------------------------------------------------------------------------
 
 class _Hub:
