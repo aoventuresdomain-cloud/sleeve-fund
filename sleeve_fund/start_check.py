@@ -9,6 +9,8 @@ round. One page, pass or fail:
    the dashboard reads) match the journal (fills, the source of truth) within the reconcile's tolerances, and so does
    the mark's equity, which Book, P&L and Return show. If every Strategy with fills had a fill after its latest mark,
    nothing was compared and the check fails.
+4. Assets. A multi-asset Strategy has a row for every listed asset, and every journal row is keyed to its own row's
+   asset. One failing asset fails, named.
 
 Strictly read-only. It opens the database read-only (SQLite mode=ro; Postgres default_transaction_read_only), never
 the Store's own engine, and imports nothing that places an order or opens a network connection.
@@ -221,6 +223,30 @@ def check_books(store) -> Section:
     return sec
 
 
+def check_assets(store) -> Section:
+    """A multi-asset Strategy asset by asset (multi-asset spec §7): every listed asset has its row, and every journal
+    row is keyed to its own row's asset (DA 0028's reconcile, store.asset_mismatches). One failing asset fails, named."""
+    sec = Section("Multi-asset Strategies")
+    for s in store.sleeves(include_legs=False):
+        want = list((s.params or {}).get("assets") or [])
+        if not want:
+            continue
+        have = [a["instrument"] for a in store.strategy_assets(s.name)]
+        missing, extra = [a for a in want if a not in have], [a for a in have if a not in want]
+        for a in missing:
+            sec.add(FAIL, f"{s.name}: {a} has no row, so that asset can't trade or be put away")
+        for a in extra:
+            sec.add(FAIL, f"{s.name}: a row trades {a}, which is not on its list")
+        if not missing and not extra:
+            sec.add(PASS, f"{s.name}: {', '.join(want)}, each with its row")
+    for m in store.asset_mismatches():
+        sec.add(FAIL, f"{m['table']} row {m['id']}: {m['sleeve']} is keyed to {m['instrument'] or 'nothing'}, not its "
+                      f"{m['expected'] or 'row (gone)'}")
+    if not sec.lines:
+        sec.add(NOTE, "no multi-asset Strategy; every journal row is keyed to its own asset")
+    return sec
+
+
 def run(url: str, environ: dict[str, str] | None = None) -> tuple[bool, str]:
     """The checks against the journal at url, and the one-page report."""
     from datetime import UTC, datetime
@@ -228,7 +254,8 @@ def run(url: str, environ: dict[str, str] | None = None) -> tuple[bool, str]:
     env = dict(os.environ if environ is None else environ)
     store = read_only_store(url)
     engine = store.engine
-    sections = [check_store(engine), check_keys(env, engine), check_venues(engine), check_books(store)]
+    sections = [check_store(engine), check_keys(env, engine), check_venues(engine), check_books(store),
+                check_assets(store)]
     ok = not any(s.failed for s in sections)
     out = [f"Start check: {'PASS' if ok else 'FAIL'}",
            f"{datetime.now(UTC):%Y-%m-%d %H:%M} UTC, {journal_kind(url)} journal, read-only",
