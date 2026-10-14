@@ -1099,6 +1099,16 @@ class BookResetRefused(ValueError):
         self.code = code
 
 
+def _drop_carried(c) -> bool:
+    """Drops the ratios a withdrawal that emptied the book carried to the next capital's first mark (MUST-F286-H4),
+    while the book is still empty: a book reset or a clean slate is a fresh start. True when there were any."""
+    st = portfolio_state_t.c
+    return bool(c.execute(update(portfolio_state_t)
+                          .where(st.id == 1, st.marked_at.is_(None), st.carried_hwm_drawdown.is_not(None))
+                          .values(carried_hwm_drawdown=None, carried_reference_drawdown=None,
+                                  carried_day_return=None, carried_day=None)).rowcount)
+
+
 class Store:
     def __init__(self, url: str | None = None, engine: Engine | None = None, portfolio_gate: bool = False) -> None:
         """portfolio_gate: the portfolio gate is in force on this journal, and with no state row its entries are
@@ -2395,15 +2405,17 @@ class Store:
                 if not stopped:  # its process re-bases its own references too
                     c.execute(insert(commands_t).values(sleeve=s.name, command=BOOK_RESET, reason=reason.strip(),
                                                         created_at=now))
-            # MUST-F286-H4 (HoQA): a reset while the book is empty drops the ratios an emptying withdrawal carried
-            c.execute(update(portfolio_state_t)
-                      .where(portfolio_state_t.c.id == 1, portfolio_state_t.c.marked_at.is_(None))
-                      .values(carried_hwm_drawdown=None, carried_reference_drawdown=None, carried_day_return=None,
-                              carried_day=None))
+            _drop_carried(c)  # MUST-F286-H4 (HoQA): a reset while the book is empty is a fresh start
             c.execute(insert(decisions_t).values(
                 ts=now, actor=actor, action=BOOK_RESET, sleeve=None,
                 reason=f"Book reset: {reason.strip()} (cleared: {', '.join(s.name for s, *_ in cleared) or 'none'})"))
         return [s.name for s, *_ in cleared]
+
+    def drop_carried(self) -> bool:
+        """A clean slate while the book is empty (F286-4): the next capital starts afresh, not at the drawdown a
+        withdrawal that emptied the book carried (MUST-F286-H4). True when there was one to drop."""
+        with self.engine.begin() as c:
+            return _drop_carried(c)
 
     def pending_reset(self, sleeve: str | None = None) -> dict | None:
         rows = self.pending_resets()

@@ -492,6 +492,20 @@ def test_h4e_a_clean_slates_emptying_carries_nothing(store, tmp_path):
     assert _four(_mark(store, T0 + timedelta(minutes=1))) == (D(5_000),) * 4
 
 
+def test_h4e2_a_clean_slate_on_an_already_empty_book_drops_the_kept_drawdown(store, tmp_path):
+    """F286-4 (HoQA, QT3 e2): a slate that archives nothing on a book a withdrawal emptied 14% down is still the PM's
+    fresh start: the next capital marks at itself, never 5,000 / 0.86."""
+    _emptied_at_a_loss(store)
+    slate = tmp_path / "clear.toml"
+    slate.write_text('[[clear]]\nid = "s1"\nreason = "fresh book"\n')
+    assert supervisor.clear(store, str(slate)) == []
+    assert _carried(_state(store)) == (None,) * 4
+    (made,) = store.decisions(action="clear")
+    assert "the next capital starts afresh" in made["reason"]
+    _make(store, "b", 5_000)
+    assert _four(_mark(store, T0 + timedelta(minutes=1))) == (D(5_000),) * 4
+
+
 def test_h4f_a_fresh_stack_carries_nothing(store):
     _make(store, "a", 10_000)
     st = _mark(store, T0)

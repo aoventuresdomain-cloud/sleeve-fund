@@ -853,7 +853,10 @@ def clear(store: Store, path: str) -> list[str]:
             cleared.append(s.name)
         if holding:
             continue  # applied again on the next start, once those are flat
-        store.decide("system", "clear", f"{key}: {reason} ({len(cleared)} put away)")
+        # F286-4 (HoQA): a slate on an empty book drops the drawdown its emptying carried, as a book reset does
+        fresh = "; the drawdown the emptied book kept is dropped, so the next capital starts afresh" \
+            if store.drop_carried() else ""
+        store.decide("system", "clear", f"{key}: {reason} ({len(cleared)} put away{fresh})")
         store.event(None, "info", "book_cleared", f"{reason}: {', '.join(cleared) or 'nothing to put away'}")
         done.add(key)
     return cleared
