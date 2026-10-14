@@ -302,3 +302,36 @@ def test_exits_only_close_then_refused_then_reset_then_a_normal_start_on_the_pin
     assert started == ["s", "s"] and _events(store, "start_refused") == []  # started, not refused (the run has those)
     store.record_order("s", order_id="s-n", side="BUY", qty=1.0, intent="entry", reason="r")
     assert _venue(store, "s-n") == "BINANCE"
+
+
+# --- CR on #277 -------------------------------------------------------------------------------------------------------
+
+def test_a_position_on_its_pins_run_clone_is_on_the_pin_for_the_journal_as_for_the_start(store):
+    """F277-1: one rule. A portfolio run's clone (BINANCE_P1) is its base venue for record_order as for start_mode."""
+    store.create_sleeve(name="s", strategy="buy_and_hold", instrument="BTC/USDT", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=10_000.0, venue="BINANCE")
+    store.record_order("s", order_id="s-e", side="BUY", qty=1.0, intent="entry", reason="r")
+    store.record_fill("s", side="BUY", qty=1.0, price=100.0, fee=0.0, order_id="s-e", trade_id="t1")
+    with store.engine.begin() as c:
+        c.execute(text("UPDATE orders SET venue = 'BINANCE_P1' WHERE order_id = 's-e'"))
+    assert store.venue_start(store.sleeve("s"))[0] == router.NORMAL
+    store.record_order("s", order_id="s-a", side="BUY", qty=1.0, intent="entry", reason="r")  # not refused
+    store.record_order("s", order_id="s-x", side="SELL", qty=2.0, intent="stop_loss", reason="r")
+    assert _venue(store, "s-a") == _venue(store, "s-x") == "BINANCE"
+
+
+def test_an_off_pin_holder_another_check_also_refuses_runs_under_the_venue_reason(store, monkeypatch):
+    """F277-2: the venue check comes first, so the exits-only status names it, and the run ends once flat."""
+    store.create_sleeve(name="s", strategy="buy_and_hold", instrument="BTC/USDT", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=10_000.0, venue="BINANCE", params={"maker_wait_minutes": 9})
+    store.record_order("s", order_id="s-e", side="BUY", qty=1.0, intent="entry", reason="r")
+    store.record_fill("s", side="BUY", qty=1.0, price=100.0, fee=0.0, order_id="s-e", trade_id="t1")
+    with store.engine.begin() as c:
+        c.execute(text("UPDATE orders SET venue = 'KRAKEN' WHERE order_id = 's-e'"))
+    sup, started, stopped = _supervised(store, monkeypatch)
+    sup.step()
+    assert started == ["s"] and store.sleeve("s").status_reason == VENUE_EXITS
+    store.record_order("s", order_id="s-x", side="SELL", qty=1.0, intent="exit", reason="r")
+    store.record_fill("s", side="SELL", qty=1.0, price=101.0, fee=0.0, order_id="s-x", trade_id="t2")
+    sup.step()
+    assert [n for n, _ in stopped] == ["s"] and store.sleeve("s").desired_state == "stopped"

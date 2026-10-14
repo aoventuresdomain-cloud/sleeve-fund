@@ -1260,6 +1260,7 @@ class Store:
             # there, where they go; an opening order is refused, behind the start's entry hold. Same transaction, so
             # a fill can't land between the two reads.
             held = _position_venue(c, sleeve)
+            held = None if held is None else venue_for(held)  # a run's clone is its base venue, as router.start_mode
             if held is not None and held != venue:
                 if intent in GATED_INTENTS:
                     raise ValueError(f"{sleeve}: an opening order is refused while its open position is on another "

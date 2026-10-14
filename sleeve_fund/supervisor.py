@@ -308,11 +308,11 @@ class Supervisor:
             self.store.event(name, "error", "start_refused", f"Not started: {exc}{held}")
             return True
         try:
+            check_venue_pin(self.store, s)  # first: an off-pin holder's exits-only run reads this reason (CR F277-2)
             check_perp_sizing(s.strategy, s.params)
             check_perp_stop(s.strategy, s.params, s.risk_profile)
             check_funding_schedule(s)
             check_resting_entries(s)
-            check_venue_pin(self.store, s)
             warn = check_quote_places(s, self.store.account_of(name))
         except ValueError as exc:
             if any(c["command"] == "flatten" for c in self.store.pending_commands(name)):
