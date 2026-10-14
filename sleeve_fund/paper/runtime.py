@@ -921,6 +921,28 @@ class SleeveRuntime:
 
     # --- periodic tick ----------------------------------------------------------
 
+    def _record_mark(self, *, equity: float, cash: float, qty: float, price: float, ts: datetime) -> None:
+        if self.bench_base_price is None:
+            self.bench_base_price = price
+        # Buy and hold at the exposure this sleeve may take (its position cap), the rest in cash, so the
+        # comparison isn't flattered or punished by the cap itself; never above 1x, as a perp's cap can pass 1x
+        # and a levered hold can't be liquidated. The backtest page's definition, so a saved
+        # run's screen and its result agree (round 12, M12-U1).
+        cap = min(self.cap, 1.0)
+        benchmark = self.starting_balance * ((1 - cap) + cap * (1 - self.taker_fee) * price / self.bench_base_price)
+        self.store.record_equity(self.name, equity=equity, cash=cash, qty=qty, price=price, benchmark=benchmark,
+                                 ts=ts)
+
+    def final_mark(self, *, equity: float, cash: float, qty: float, price: float) -> None:
+        """Paper, on stop (MARK-ON-STOP): one last mark of the book as it stands, with every fill booked so far, so the
+        latest mark a stopped Strategy leaves (the book page, the Open-risk tile, the start check) is never one taken
+        before its last fill, e.g. the flatten tick's own mark. Only a mark: no guard, no command, no status change.
+        A backtest takes none (its last bar's tick is its last mark)."""
+        if self.backtest or price <= 0:
+            return
+        self._record_mark(equity=equity, cash=cash, qty=qty, price=price, ts=self.now())
+
+
     def tick(self, *, equity: float, cash: float, qty: float, price: float,
              guard_equity: float | None = None, busy: bool = False, ruined: str | None = None,
              liquidating: bool = False) -> str | None:
@@ -940,16 +962,7 @@ class SleeveRuntime:
             self.progress(now)
         if price <= 0:
             return None
-        if self.bench_base_price is None:
-            self.bench_base_price = price
-        # Buy and hold at the exposure this sleeve may take (its position cap), the rest in cash, so the
-        # comparison isn't flattered or punished by the cap itself; never above 1x, as a perp's cap can pass 1x
-        # and a levered hold can't be liquidated. The backtest page's definition, so a saved
-        # run's screen and its result agree (round 12, M12-U1).
-        cap = min(self.cap, 1.0)
-        benchmark = self.starting_balance * ((1 - cap) + cap * (1 - self.taker_fee) * price / self.bench_base_price)
-        self.store.record_equity(self.name, equity=equity, cash=cash, qty=qty, price=price, benchmark=benchmark,
-                                 ts=now)
+        self._record_mark(equity=equity, cash=cash, qty=qty, price=price, ts=now)
         self.peak = max(self.peak, equity)
         if self._day != risk.trading_day(now):
             # The day opens at the equity last marked at or before midnight: the same thing in paper, which
