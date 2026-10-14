@@ -84,8 +84,11 @@ metadata = MetaData()
 TS = DateTime(timezone=True)
 LEG = "~2"  # a two-leg Strategy's second leg row: "<name>~2" (P2-8)
 # "parent IS NOT NULL" is needed: with a NULL parent the second term is NULL, and a CHECK passes on NULL.
+# 0028 (DA) widens 0022's "~2" to "~<ASSET>" for a multi-asset Strategy's legs (multi-asset spec §1): still one level,
+# and a "~" only as the one suffix.
 LEG_NAME = ("(parent IS NULL AND name NOT LIKE '%~%') "
-            "OR (parent IS NOT NULL AND name = parent || '~2' AND parent NOT LIKE '%~%')")
+            "OR (parent IS NOT NULL AND name LIKE parent || '~%' AND parent NOT LIKE '%~%' "
+            "AND name NOT LIKE parent || '~%~%')")
 
 sleeves_t = Table(
     "sleeves",
@@ -1686,6 +1689,54 @@ class Store:
                 _put_trial_in(c, trial)
         return self.sleeve(name), self.sleeve(name + LEG)
 
+    def create_legs(self, *, name: str, strategy: str, bar_spec: str, assets: list[str], params: dict | None,
+                    starting_balance: float, universe_date: str, risk_profile: str = "balanced", warmup_bars: int = 0,
+                    desired_state: str = "running", venue: str | None = None,
+                    trial: dict | None = None) -> list[Sleeve]:
+        """A multi-asset Strategy (multi-asset spec §1-2): the parent row `name` trades the first asset, and each other
+        asset is a leg row "<name>~<UNDERLYING>" under it, every row with the one settings block, made together in one
+        transaction (with its trials row when given), or none. The list and universe_date are kept on the parent's
+        params: fixed for the Strategy's life (a new list is a new Strategy). Inside the fund only, every leg with 0
+        (CUT-A (a)); legs are independent ideas, never a pair."""
+        if is_backtest(name):
+            raise ValueError("a multi-asset backtest is a portfolio run of its legs, not stored rows")
+        if "~" in name:
+            raise ValueError(f"a Strategy's name can't hold a \"~\": {name!r}")
+        if not _fund_held(self):
+            raise ValueError("a multi-asset Strategy runs inside the fund: make it once the fund holds the cash")
+        if to_decimal(starting_balance or 0) != 0:
+            _no_own_capital(self, name, starting_balance)
+        assets = [str(a).strip().upper() for a in assets]
+        if len(assets) < 2:
+            raise ValueError("a multi-asset Strategy lists at least two assets; one asset is a single-asset Strategy")
+        unders = [a.split("/")[0] for a in assets]
+        if len(set(unders)) != len(unders):
+            raise ValueError(f"an asset is listed twice: {assets}")
+        if not universe_date:
+            raise ValueError("a multi-asset Strategy names the date its list was chosen (universe_date)")
+        params = {**(params or {}), "assets": assets, "universe_date": str(universe_date)}
+        if trial is not None:
+            check_trial(trial)
+        ts = utcnow()
+        rows = [(name, assets[0], None)] + [(f"{name}~{u}", a, name) for u, a in zip(unders[1:], assets[1:])]
+
+        def joins(c) -> None:  # F-ASSIGN-STALE: every leg joins at the supervisor's next poll, together
+            self._ensure_paper_account(c)
+            for leg_name, _, _ in rows:
+                self._wait_move(c, leg_name, "paper", "create", ts)
+
+        with self._book_move(lambda: Decimal(0), f"multi-asset Strategy {name} created", ts, defer=joins) as c:
+            for leg_name, instrument, parent in rows:
+                _insert_sleeve(c, ts, name=leg_name, strategy=strategy, instrument=instrument, bar_spec=bar_spec,
+                               params=params, starting_balance=0, risk_profile=risk_profile, warmup_bars=warmup_bars,
+                               desired_state=desired_state, venue=venue, parent=parent)
+            c.execute(insert(decisions_t).values(
+                ts=ts, actor="system", action="multi_asset", sleeve=name,
+                reason=f"asset legs made: {', '.join(assets)}, fixed on {universe_date}"))
+            if trial is not None:
+                _put_trial_in(c, trial)
+        return [self.sleeve(n) for n, _, _ in rows]
+
     @contextmanager
     def _book_move(self, amount, why, ts: datetime | None = None, leaving: str | None = None, carry: bool = True,
                    defer=None, waits_out: list | None = None):
@@ -1776,13 +1827,17 @@ class Store:
             raise ValueError(f"bad desired state {state!r}")
         if is_backtest(name):
             raise ValueError("a saved backtest can't be started")
-        self._update_sleeve(name, desired_state=state)
-        if (leg := self._leg_of(name)) is not None:  # a two-leg Strategy starts and stops as one (P2-8)
-            self._update_sleeve(leg, desired_state=state)
+        if self.multi_asset(name) and self.sleeve(name).parent is not None:
+            raise ValueError(f"{name} is an asset leg of {self.sleeve(name).parent}: start or stop the Strategy")
+        names = [name] + ([leg] if (leg := self._leg_of(name)) is not None else self._asset_legs(name))
+        with self.engine.begin() as c:  # a two-leg or multi-asset Strategy starts and stops as one (P2-8)
+            c.execute(update(sleeves_t).where(sleeves_t.c.name.in_(names)).values(updated_at=utcnow(),
+                                                                                  desired_state=state))
 
     def _leg_of(self, name: str, c=None) -> str | None:
-        """A two-leg Strategy's second leg row, when `name` is its first leg's (P2-8); else None."""
-        q = select(sleeves_t.c.name).where(sleeves_t.c.parent == name)
+        """A two-leg Strategy's second leg row, when `name` is its first leg's (P2-8); else None. A multi-asset
+        Strategy's asset legs are not one: they are never a pair (_asset_legs)."""
+        q = select(sleeves_t.c.name).where(sleeves_t.c.parent == name, sleeves_t.c.name == name + LEG)
         if c is not None:
             return c.execute(q).scalar()
         with self.engine.connect() as conn:
@@ -1790,14 +1845,31 @@ class Store:
 
     def legs(self, name: str) -> list[str]:
         """Every row of the Strategy `name` belongs to: [name] for one leg; a two-leg Strategy's first leg's row and
-        its second's, from either (P2-8)."""
+        its second's (P2-8), or a multi-asset Strategy's parent and its asset legs in asset order, from any of them."""
         row = self.sleeve(name)
         first = row.parent or name
-        return [first] + [leg] if (leg := self._leg_of(first)) is not None else [first]
+        if (leg := self._leg_of(first)) is not None:
+            return [first, leg]
+        return [first] + self._asset_legs(first)
+
+    def _asset_legs(self, parent: str, c=None) -> list[str]:
+        """A multi-asset Strategy's asset leg rows ("<parent>~<ASSET>"), in its asset list's order; [] for any other."""
+        q = (select(sleeves_t.c.name).where(sleeves_t.c.parent == parent, sleeves_t.c.name != parent + LEG)
+             .order_by(sleeves_t.c.id))
+        if c is not None:
+            return list(c.execute(q).scalars())
+        with self.engine.connect() as conn:
+            return list(conn.execute(q).scalars())
 
     def two_leg(self, name: str) -> bool:
-        """Whether `name` is either leg's row of a two-leg Strategy (P2-8)."""
-        return self.sleeve(name).parent is not None or self._leg_of(name) is not None
+        """Whether `name` is either leg's row of a two-leg Strategy (P2-8): a hedged pair, never a multi-asset one."""
+        row = self.sleeve(name)
+        return name.endswith(LEG) and row.parent is not None or self._leg_of(name) is not None
+
+    def multi_asset(self, name: str) -> bool:
+        """Whether `name` is the parent or an asset leg of a multi-asset Strategy (multi-asset spec §1)."""
+        row = self.sleeve(name)
+        return (row.parent is not None and not name.endswith(LEG)) or bool(self._asset_legs(name))
 
     def holds_any(self, name: str) -> bool:
         """Whether any leg of the Strategy `name` belongs to holds a position an order can close (not dust): a
@@ -2632,7 +2704,12 @@ class Store:
         if two_leg and (action != "close_now" or s.parent is not None):
             raise ValueError(f"{action.replace('_', ' ')} on its second leg {TWO_LEG_FENCE}" if action == "close_now"
                              else f"{action.replace('_', ' ')} {TWO_LEG_FENCE}")
+        multi = self.multi_asset(sleeve)
+        if multi and s.parent is not None:
+            raise ValueError(f"{sleeve} is an asset leg of {s.parent}: a lifecycle move is on the Strategy, every leg")
+        names = self.legs(sleeve) if multi else [sleeve]
         held, flat = self.lifecycle_flat(sleeve)
+        flat = all(self.lifecycle_flat(n)[1] for n in names) if multi else flat  # retired once every leg is flat
         started, deadline_at, basis = s.wind_down_started, s.wind_down_deadline, ""
         if action == "wind_down":
             to = lifecycle.move(s.lifecycle, lifecycle.WINDING_DOWN, actor, flat=flat)
@@ -2651,6 +2728,9 @@ class Store:
             if to == lifecycle.WINDING_DOWN:
                 started, deadline_at = started or now, now
         text = lifecycle.moved_words(s.lifecycle, to, action, deadline_at, held) + basis
+        if multi:
+            self._lifecycle_legs(names, s.lifecycle, to, started, deadline_at, now, action, reason, text)
+            return self.sleeve(sleeve)
         # A retire puts it away for good: its equity leaves the book with the lifecycle row (F-C3B-A).
         with (self._put_away(sleeve, now, "retired") if to == lifecycle.RETIRED else self.engine.begin()) as c:
             values = {"lifecycle": to, "wind_down_started": started, "wind_down_deadline": deadline_at,
@@ -2668,16 +2748,69 @@ class Store:
             c.execute(insert(events_t).values(sleeve=sleeve, ts=now, level="info", kind=LIFECYCLE_EVENT, message=text))
         return self.sleeve(sleeve)
 
+    def _lifecycle_legs(self, names: list[str], was: str, to: str, started, deadline_at, now: datetime, action: str,
+                        reason: str, text: str) -> None:
+        """A multi-asset Strategy's lifecycle move, on every leg (names: the parent first). A move short of retired is one
+        transaction over every leg. A retire puts each leg away (F-C3B-A: its own flow under the gate's lock, as any
+        put-away), the asset legs first and the parent last, each with its row; one that fails leaves the rest winding
+        down and flat, and complete_retire finishes them. Journaled once, on the parent."""
+        values = {"lifecycle": to, "wind_down_started": started, "wind_down_deadline": deadline_at, "updated_at": now}
+        parent = names[0]
+
+        def journal(c) -> None:
+            c.execute(insert(decisions_t).values(ts=now, actor="PM", action=action, sleeve=parent, reason=reason.strip()))
+            c.execute(insert(events_t).values(sleeve=parent, ts=now, level="info", kind=LIFECYCLE_EVENT, message=text))
+
+        if to != lifecycle.RETIRED:
+            with self.engine.begin() as c:
+                done = c.execute(update(sleeves_t).where(sleeves_t.c.name.in_(names), sleeves_t.c.lifecycle == was)
+                                 .values(**values)).rowcount
+                if done != len(names):
+                    raise lifecycle.LifecycleError("This strategy's lifecycle changed meanwhile; look again and retry.")
+                journal(c)
+            return
+        values["desired_state"] = "stopped"
+        for name in names[1:] + names[:1]:
+            with self._put_away(name, now, "retired") as c:
+                c.execute(update(sleeves_t).where(sleeves_t.c.name == name).values(**values))
+                if name == parent:
+                    journal(c)
+
     def complete_retire(self, sleeve: str, now: datetime | None = None, how: str = "flat") -> bool:
         """Retire a winding-down strategy once the journal shows it flat (dust counts as flat: lifecycle_flat): the end of the PM's own wind-down, never a
         new move (lifecycle.due's RETIRE). False, and nothing written, unless it is winding down and flat. how: flat,
         deadline or close_now, for the journal's words. Its equity leaves the fund's book with the row (F-C3B-A)."""
         if self.two_leg(sleeve):
             return False  # it stays winding down, flat, until the put-away design lands (TWO_LEG_FENCE)
+        if self.multi_asset(sleeve):
+            return self._complete_retire_legs(self.legs(sleeve), now or utcnow(), how)
         try:
             return self._complete_retire(sleeve, now, how)
         except _NotRetired:
             return False
+
+    def _complete_retire_legs(self, names: list[str], now: datetime, how: str) -> bool:
+        """A multi-asset Strategy's wind-down ends once every leg is flat: each leg not yet retired is put away (the
+        parent last), so one leg's process finishing first never retires the Strategy alone."""
+        rows = {n: self.sleeve(n) for n in names}
+        left = [n for n in names if rows[n].lifecycle != lifecycle.RETIRED]
+        if not left or any(rows[n].lifecycle != lifecycle.WINDING_DOWN for n in left):
+            return False
+        if not all(self.lifecycle_flat(n)[1] for n in names):
+            return False
+        text = lifecycle.retired_words(how)
+        for name in [n for n in left if n != names[0]] + [n for n in left if n == names[0]]:
+            with self._put_away(name, now, "retired") as c:
+                c.execute(update(sleeves_t).where(sleeves_t.c.name == name, sleeves_t.c.lifecycle ==
+                                                  lifecycle.WINDING_DOWN)
+                          .values(lifecycle=lifecycle.RETIRED, desired_state="stopped", updated_at=now))
+                if name == names[0]:
+                    c.execute(insert(decisions_t).values(ts=now, actor="PM", action="retire", sleeve=name,
+                                                         reason="Triggered by the system once every leg was flat, "
+                                                                f"ending the PM's wind-down. {text}"))
+                    c.execute(insert(events_t).values(sleeve=name, ts=now, level="info", kind=LIFECYCLE_EVENT,
+                                                      message=text))
+        return True
 
     def _complete_retire(self, sleeve: str, now: datetime | None, how: str) -> bool:
         now = now or utcnow()
@@ -4287,10 +4420,20 @@ class Store:
         s = self.sleeve(sleeve)
         if is_backtest(sleeve):
             raise ValueError("a saved backtest's settings are what it tested; run a new backtest instead")
+        names = [sleeve]
+        if self.multi_asset(sleeve):
+            # One settings block for every leg (multi-asset spec §2); the asset list is the Strategy's identity (QT3 b3c).
+            if s.parent is not None:
+                raise ValueError(f"{sleeve} is an asset leg of {s.parent}: change the Strategy's settings")
+            for key in ("assets", "universe_date"):
+                if params.get(key) != s.params.get(key):
+                    raise ValueError(f"a multi-asset Strategy's {key} is fixed when it is made: a new list is a new "
+                                     "Strategy")
+            names = self.legs(sleeve)
         if trial is not None:
             check_trial(trial)
         with self.engine.begin() as c:
-            c.execute(update(sleeves_t).where(sleeves_t.c.name == sleeve).values(
+            c.execute(update(sleeves_t).where(sleeves_t.c.name.in_(names)).values(
                 updated_at=utcnow(), risk_profile=risk_profile, params=params, warmup_bars=warmup_bars))
             if trial is not None:
                 _put_trial_in(c, trial)

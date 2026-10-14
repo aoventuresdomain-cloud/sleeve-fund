@@ -89,10 +89,19 @@ def test_start_and_stop_act_on_every_leg():
 
 
 @pytest.mark.parametrize("action, to", [("wind_down", "winding_down"), ("close_now", "retired")])
-def test_a_lifecycle_move_acts_on_every_leg_in_one_go(action, to):
-    store = _fund(Store.in_memory())
+def test_a_lifecycle_move_acts_on_every_leg_in_one_go(action, to, tmp_path):
+    store = _fund(Store(f"sqlite:///{tmp_path}/ma.db"))  # a put-away's writes need their own connection (F286-ENG)
     _make(store)
     store.set_lifecycle("trend-x", action, "pm", "PM's call")
     assert {store.sleeve(n).lifecycle for n in store.legs("trend-x")} == {to}
     with pytest.raises(ValueError, match="leg"):
         store.set_lifecycle("trend-x~ETH", "wind_down", "pm", "on one leg")
+
+
+def test_a_retire_after_wind_down_waits_for_every_leg_then_puts_each_away(tmp_path):
+    store = _fund(Store(f"sqlite:///{tmp_path}/ma.db"))
+    _make(store)
+    store.set_lifecycle("trend-x", "wind_down", "pm", "PM's call")
+    assert store.complete_retire("trend-x~ETH")  # one leg's process finding every leg flat retires the Strategy
+    assert {store.sleeve(n).lifecycle for n in store.legs("trend-x")} == {"retired"}
+    assert not store.complete_retire("trend-x~SOL")  # once, never twice
