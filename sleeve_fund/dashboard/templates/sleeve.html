@@ -37,6 +37,7 @@
 <div data-live="banners">
 {% if backtest_id %}<div class="banner" role="status">Backtest run{% if tested %}, {{ tested }}{% endif %}. Not in the book.</div>{% endif %}
 {% if strategy_errors %}<div class="banner loss" role="alert">The strategy's code raised an error {{ strategy_errors }} time{{ 's' if strategy_errors != 1 }}{% if backtest_id %} during this run, so its results after that can't be relied on{% else %} since it last started; its orders after that may be wrong{% endif %}. The Activity tab has the details.</div>{% endif %}
+{% if x.test_account and not backtest_id %}<div class="banner" role="status">On a test account, outside the fund's book: its equity, P&amp;L and risk are not in the fund's figures, and its results are never Strategy evidence.</div>{% endif %}
 {% if archived %}<div class="banner" role="status">Archived.</div>{% if away and not put_away_now %}<p class="banner-note" role="status">{{ 'Retired' if s.lifecycle == 'retired' else 'Archived' }}, {{ away }}.</p>{% endif %}{% endif %}
 {% if put_away_now %}<div class="banner" role="status">{{ ('Retired' ~ (', ' ~ away if away else '') ~ '.') if put_away_done == 'retired' else 'Restored: its equity is back in the fund\'s book, which isn\'t a gain.' }}{{ limits_after(put_away_now) }}</div>{% endif %}
 {% if liquidated and s.status != 'halted' %}<div class="banner loss" role="alert"><strong>Liquidated:</strong> its position margin was lost, so it can't start, resume or be reset until you use Reset after liquidation, which asks for an incident note.</div>{% endif %}

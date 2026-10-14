@@ -314,12 +314,15 @@ def create_app(store: Store | None = None) -> FastAPI:
 
     @app.get("/risk", response_class=HTMLResponse)
     def risk_page(request: Request, _: str = Depends(require_pm)):
-        sleeves, frames, summaries = book_data()
+        # The book's figures (drawdown, stress, largest asset) are the fund's, as on Portfolio (shown_book): a
+        # test-account Strategy keeps its own row, marked, and the kill switch and health still cover it.
+        sleeves, frames, summaries, tests = shown_book()
+        every = summaries + tests
         book = bookm.book_view(st(), summaries, frames)
-        kill = _kill_targets(summaries)
-        risk = riskops.risk_view(st(), summaries, book)
-        health = riskops.health_view(st(), summaries)
-        running = sum(1 for x in summaries if x["sleeve"].status == "running")
+        kill = _kill_targets(every)
+        risk = riskops.risk_view(st(), every, book)
+        health = riskops.health_view(st(), every)
+        running = sum(1 for x in every if x["sleeve"].status == "running")
         # The drawdown chart's halt line only when the whole book shares one risk profile's limit.
         profiles = {x["profile"].name: x["profile"].max_drawdown for x in summaries}
         halt = next(iter(profiles.items())) if len(profiles) == 1 else None
@@ -327,7 +330,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         return page(request, "risk.html", book=book, risk=risk, health=health, chart=chart, size=riskops.gate_size(st(), book),
                     halt_name=halt[0] if halt else None, stress=riskops.stress_bars(risk["scenarios"]),
                     status=riskops.status_word(riskops.status_items(risk["rows"], health), running),
-                    ops=riskops.ops_view(st(), summaries), shell=shell(sleeves), kill=kill,
+                    ops=riskops.ops_view(st(), every), shell=shell(sleeves + [x["sleeve"] for x in tests]), kill=kill,
                     kill_error=request.query_params.get("kill_error"), killed=request.query_params.get("killed"))
 
     def _kill_targets(summaries) -> dict:
