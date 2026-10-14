@@ -511,7 +511,7 @@ def bybit_leverage(store) -> dict[str, tuple[float, list]]:
         symbol = s.instrument.replace("/", "").upper()
         if target_for(s) != "BYBIT" or symbol not in BYBIT_CONTRACTS or not markets.is_perp(s.params):
             continue
-        lev = risk.profile(s.risk_profile).max_leverage
+        lev = risk.leverage_cap(risk.profile(s.risk_profile), s.params)
         prev, names = out.get(symbol, (lev, []))
         out[symbol] = (min(prev, lev), names + [s])
     return out

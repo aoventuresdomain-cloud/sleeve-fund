@@ -150,3 +150,24 @@ def test_a_second_leg_not_held_for_a_retry_releases_on_its_reject_as_any_order()
     _sent(store, "carry~2", "follow-1", b)
     store.update_order("follow-1", status="rejected")
     assert "carry~2" not in dict(_rows(store)[1]) and store.hand_on("follow-1") is None
+
+
+def test_the_perp_legs_margin_in_the_book_is_at_its_own_leverage_not_the_profiles():
+    """HoQA P2-8 F3 (Advisor 05:35 UK): the fund's holdings margin a carry's perp leg at its effective leverage,
+    min(the leg's 1x, 2x, balanced's 2x) = 1x, as its reservation did; a single perp Strategy keeps the profile's cap."""
+    from sleeve_fund import risk
+    from sleeve_fund.paper.portfolio_gate import fund_holdings
+
+    store = _carry()
+    store.create_sleeve(name="solo", strategy="trend_filter", instrument="ETH/USDT", bar_spec="1-HOUR-LAST-INTERNAL",
+                        starting_balance=5000, params={"market": "perp"})
+    for name, side, inst, px in (("carry", "BUY", "BTC", 60_000.0), ("carry~2", "SELL", "BTC", 60_000.0),
+                                 ("solo", "BUY", "ETH", 3_000.0)):
+        store.record_fill(name, side=side, qty=0.02 if inst == "BTC" else 0.4, price=px, fee=0.0, order_id=f"o-{name}",
+                          trade_id=f"t-{name}", ts=T0)
+    held = {(h.underlying, h.notional > 0): h for h in fund_holdings(store, T0, lambda s: 0.05)}
+    assert held[("BTC", False)].margin == D(1200)  # the perp leg, 0.02 x 60,000 at 1x: not 600 at the profile's 2x
+    assert held[("BTC", True)].margin == D(1200)  # the spot leg: its notional
+    assert held[("ETH", True)].margin == D(600)  # a single perp Strategy: 0.4 x 3,000 at balanced's 2x, as before
+    assert risk.leverage_cap(risk.profile("balanced"), store.sleeve("carry~2").params) == 1.0
+    assert risk.leverage_cap(risk.profile("conservative"), {"leg": {"leverage": "2"}}) == 1.0  # never above the profile

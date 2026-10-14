@@ -37,7 +37,7 @@ def fund_holdings(store: Store, now: datetime | None = None, atr_pct=None) -> tu
     """Every strategy's open position as the book's Holdings, archived ones still holding included: its journal
     quantity (fills, the source of truth) at its latest mark, measured to the stop its entry journaled, or with none
     by the stopless measure from the daily ATR (`atr_pct(sleeve)`, the history store's by default). Leverage is the
-    strategy's profile cap on a perpetual, None on spot. Raises ValueError when a stopless position's ATR isn't known:
+    strategy's profile cap on a perpetual (a two-leg Strategy's perp leg: its own, risk.leverage_cap), None on spot. Raises ValueError when a stopless position's ATR isn't known:
     the check then fails closed."""
     from sleeve_fund import markets, risk
     from sleeve_fund.open_risk import _journal_stop, history_atr_pct
@@ -63,7 +63,7 @@ def fund_holdings(store: Store, now: datetime | None = None, atr_pct=None) -> tu
         stop = _journal_stop(store, s, float(qty))
         stop = None if stop is None else to_decimal(stop, "stop")
         through = stop is not None and (mark - stop) * qty <= 0  # gapped: the stop no longer bounds the loss
-        lev = risk.profile(s.risk_profile).max_leverage if markets.is_perp(s.params) else None
+        lev = risk.leverage_cap(risk.profile(s.risk_profile), s.params) if markets.is_perp(s.params) else None
         pos = Position(s.name, underlying(s.instrument), qty, None if stop is None or through else stop, lev)
         out.append(holding_for(pos, mark, None if pos.stop is not None else atr_pct(s)))
     return tuple(out)

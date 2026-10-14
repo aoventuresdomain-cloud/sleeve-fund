@@ -52,7 +52,7 @@ from sleeve_fund.research import run as study_run
 from sleeve_fund.research.ledger import IdeaLedger, opened_words
 from sleeve_fund.research.holdout import HoldoutLocks
 from sleeve_fund.research.trials import TrialsRegister
-from sleeve_fund.risk import PROFILES
+from sleeve_fund.risk import PROFILES, leverage_cap
 from sleeve_fund.store import BACKTEST_PREFIX, LIQUIDATION_RESET, RAL, Store, is_backtest, utcnow
 from sleeve_fund.paper.runtime import EXITS_ONLY, RESUMABLE, clearing_action, entry_blocked, liquidation_event
 from sleeve_fund.strategies import REGISTRY, check_perp_sizing, check_perp_stop
@@ -2080,7 +2080,7 @@ def _demo_copy(store, s) -> dict | None:
                  if r["status"] == "filled")
     last = store.last_resync(s.name)
     return {"label": "the demo account", "put_on": put_on, "last": last,
-            "leverage": PROFILES[s.risk_profile].max_leverage}
+            "leverage": leverage_cap(PROFILES[s.risk_profile], s.params)}
 
 
 

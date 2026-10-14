@@ -213,6 +213,32 @@ class _Leg:
         return self.price
 
 
+
+def test_a_retry_is_refused_once_the_journal_no_longer_holds_the_trade_legging(tmp_path):
+    """Advisor leg-2 retry MUST 3 (HoQA C13, QT2's lost-coordinator cell): another writer moved the pair's journal row,
+    so this coordinator lost the trade; its second leg is not retried (the pair unwinds instead)."""
+    from datetime import datetime, timezone
+
+    from sleeve_fund.store import Store
+
+    store = Store(f"sqlite:///{tmp_path}/t.db")
+    store.create_two_legs(name="carry", strategy="trend_filter", bar_spec="1-HOUR-LAST-INTERNAL",
+                          starting_balance=10_000,
+                          first={"instrument": "BTC/USD", "params": {}, "venue": "KRAKEN", "side": 1},
+                          second={"instrument": "BTC/USD", "params": {"market": "perp"}, "venue": "KRAKEN",
+                                  "side": -1})
+    now = datetime.now(timezone.utc)
+    store.set_pair_state("carry", expected=None, state="flat", ts=now)
+    store.set_pair_state("carry", expected="flat", state="legging", trade_id="carry-t1", deadline=now, ts=now)
+    p = Pair.__new__(Pair)
+    p.lead, p.follow = SimpleNamespace(runtime=None), SimpleNamespace(runtime=None)
+    p.lead.pair = p.follow.pair = p
+    p._store, p._parent, p.trade_id = store, "carry", "carry-t1"
+    assert Pair._retry_refusal(p, p.follow) is None  # still its trade, legging: the retry may go
+    assert store.set_pair_state("carry", expected="legging", state="flat", ts=now, expected_trade_id="carry-t1")
+    assert "lost the trade" in Pair._retry_refusal(p, p.follow)
+
+
 def test_a_restarted_pair_is_recovered_once_both_legs_are_back_and_priced_and_opens_nothing_before():
     p = Pair.__new__(Pair)
     p.lead, p.follow, p.recovered = _Leg(restore={"qty": 1}), _Leg(price=0.0), False

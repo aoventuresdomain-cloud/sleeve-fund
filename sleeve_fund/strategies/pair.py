@@ -375,10 +375,15 @@ class Pair:
 
     def _retry_refusal(self, leg: LongFlatStrategy) -> str | None:
         """Why the second leg's retry is not sent and the pair unwinds instead (Advisor, leg-2 retry MUST 3): a halt,
-        pause or stale data on either leg, its venue pin not matching, or the coordinator gone."""
+        pause or stale data on either leg, its venue pin not matching, or the coordinator gone: on paper, also when the
+        journal no longer holds this trade legging (another writer moved it, so this coordinator lost it)."""
         for each in (self.lead, self.follow):
             if each.pair is not self:
                 return "its coordinator is gone"
+        if getattr(self, "_store", None) is not None:
+            row = self._store.pair_state(self._parent)
+            if row is None or (row["state"], row["trade_id"]) != ("legging", self.trade_id):
+                return "its coordinator lost the trade: the journal no longer holds it legging"
             rt = each.runtime
             if rt is not None and not rt.can_open():
                 return (rt.entry_blocked()[1] if not rt.backtest else None) or f"a leg is {rt.status}"

@@ -91,6 +91,16 @@ def check(profile: RiskProfile, equity: float, peak: float, day_open: float, hal
     return None
 
 
+def leverage_cap(p: RiskProfile, params: dict | None = None) -> float:
+    """The leverage a position is margined at: the profile's cap, or a two-leg Strategy's perp leg's own setting
+    (params["leg"]["leverage"]) when lower, never above 2x (P2-8, Advisor 05:35 UK: min(leg, 2x, profile)). The one
+    figure for its margin, liquidation price and the gate's book (LongFlatStrategy._max_leverage, fund_holdings)."""
+    leg = (params or {}).get("leg") or {}
+    if leg.get("leverage") is None:
+        return p.max_leverage
+    return min(float(leg["leverage"]), 2.0, p.max_leverage)
+
+
 def position_cap(p: RiskProfile, params: dict | None = None) -> float:
     """The largest position's notional as a multiple of equity. On spot, the profile's position cap. On a
     perpetual the same cap applies to the margin, and the notional is that margin times the leverage cap

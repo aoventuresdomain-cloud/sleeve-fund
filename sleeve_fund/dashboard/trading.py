@@ -3,7 +3,7 @@ the strategy gave when it acted (journaled in the orders table at decision time)
 
 from __future__ import annotations
 
-from sleeve_fund import markets
+from sleeve_fund import markets, risk
 from sleeve_fund.research.metrics import ZERO, _dec, trade_stats, trades
 from sleeve_fund.paper.runtime import liquidation_head
 from sleeve_fund.store import LIQUIDATION_RESET, OPEN_ORDER_STATUSES, Store, utcnow  # noqa: F401  (QA's tests import it here)
@@ -243,7 +243,7 @@ def position_margin(x: dict) -> tuple[float, float | None]:
     t = markets.terms(x["sleeve"].params, getattr(x["sleeve"], "venue", None))
     if t is None:
         return abs(qty) * entry, None
-    lev = x["profile"].max_leverage
+    lev = risk.leverage_cap(x["profile"], x["sleeve"].params)
     return (markets.isolated_margin(qty, entry, lev, cash + qty * entry),
             markets.isolated_liquidation(cash, qty, entry, lev, t.maintenance_margin))
 
