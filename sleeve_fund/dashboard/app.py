@@ -95,10 +95,38 @@ def same_origin(request: Request) -> None:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "cross-site request blocked")
 
 
+_SLEEVE_POST = re.compile(r"^/sleeves/(?P<name>[^/]+)/(?P<action>[^/]+)$")
+# What isn't built to act on both legs of a two-leg Strategy yet (P2-8): refused on its first leg's row rather than
+# applied to one leg only. Its pause, resume, flatten, start and stop reach both legs (Store.command).
+_ONE_LEG_ONLY = {"reset": "a reset", "account": "a move to another account", "archive": "archiving",
+                 "lifecycle": "winding down or retiring", "settings": "a change of settings"}
+
+
+def two_leg_refusal(store: Store, name: str, action: str) -> str | None:
+    """Why a PM action on this strategy's row is refused because it is part of a two-leg Strategy, or None."""
+    try:
+        row = store.sleeve(name)
+    except KeyError:
+        return None  # the route says so
+    if row.parent is not None:
+        return f"this is the second leg of {row.parent}: act on {row.parent}, whose commands reach both legs"
+    if action in _ONE_LEG_ONLY and store._leg_of(name) is not None:
+        return f"{_ONE_LEG_ONLY[action]} isn't built for a two-leg Strategy yet, so nothing was changed"
+    return None
+
+
 def create_app(store: Store | None = None) -> FastAPI:
     _password()  # fail at start-up, not on first request
     app = FastAPI(title="Multi-Strategy Fund", docs_url=None, redoc_url=None, openapi_url=None)
     app.state.store = store or Store(portfolio_gate=True)  # the server's journal: CHOKE reads the portfolio too
+
+    @app.middleware("http")
+    async def two_leg_rows(request: Request, call_next):
+        """A two-leg Strategy is acted on through its first leg's row, never one leg alone (P2-8, Advisor M2)."""
+        m = _SLEEVE_POST.match(request.scope["path"]) if request.method == "POST" else None
+        if m is not None and (why := two_leg_refusal(app.state.store, m["name"], m["action"])) is not None:
+            return RedirectResponse(f"/sleeves/{m['name']}?{urlencode({'command_error': why})}", status_code=303)
+        return await call_next(request)
     app.state.jobs = Jobs()
     try:
         study_run.seed(LEDGER, TEARSHEETS)

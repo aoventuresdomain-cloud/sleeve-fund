@@ -1157,6 +1157,16 @@ class Store:
         if is_backtest(name):
             raise ValueError("a saved backtest can't be started")
         self._update_sleeve(name, desired_state=state)
+        if (leg := self._leg_of(name)) is not None:  # a two-leg Strategy starts and stops as one (P2-8)
+            self._update_sleeve(leg, desired_state=state)
+
+    def _leg_of(self, name: str, c=None) -> str | None:
+        """A two-leg Strategy's second leg row, when `name` is its first leg's (P2-8); else None."""
+        q = select(sleeves_t.c.name).where(sleeves_t.c.parent == name)
+        if c is not None:
+            return c.execute(q).scalar()
+        with self.engine.connect() as conn:
+            return conn.execute(q).scalar()
 
     def set_status(self, name: str, status: str, reason: str = "", paused_until: datetime | None = None) -> None:
         if status not in STATUSES:
@@ -2741,7 +2751,9 @@ class Store:
             raise ValueError("every command needs a reason")
         if is_backtest(sleeve):
             raise ValueError("a saved backtest takes no commands")
-        self.sleeve(sleeve)  # raises if unknown
+        row = self.sleeve(sleeve)  # raises if unknown
+        if command in (RAL, BOOK_RESET) and (row.parent is not None or self._leg_of(sleeve) is not None):
+            raise ValueError("a reset isn't built for a two-leg Strategy yet, so nothing was changed")  # P2-8
         here = None  # a reset after liquidation applied here, as no process will apply it
         if command == RAL:
             from sleeve_fund.paper.runtime import ral_refusal  # the engine's liquidation rule (liquidation_head)
@@ -2759,6 +2771,18 @@ class Store:
                                                           created_at=now, incident=incident)).inserted_primary_key[0]
                 if holds_through_reset and command in ("pause", "flatten"):
                     self._hold_on_reset(c, sleeve, command, reason)
+                # A two-leg Strategy's pause, resume and flatten reach both legs' runtimes, in the same transaction:
+                # each leg keeps its own status, and a leg left halted or paused would refuse its half of the next
+                # pair (P2-8, Advisor M2).
+                # Once: the kill switch and the supervisor already send each row its own flatten.
+                if (command in ("pause", "resume", "flatten") and (leg := self._leg_of(sleeve, c)) is not None
+                        and c.execute(select(commands_t.c.id).where(
+                            commands_t.c.sleeve == leg, commands_t.c.command == command,
+                            commands_t.c.applied_at.is_(None))).first() is None):
+                    c.execute(insert(commands_t).values(sleeve=leg, command=command, reason=reason.strip(),
+                                                        created_at=now))
+                    if holds_through_reset and command in ("pause", "flatten"):
+                        self._hold_on_reset(c, leg, command, reason)
                 if here:
                     self._apply_ral(c, sleeve, cid, here, now)
         except IntegrityError:
