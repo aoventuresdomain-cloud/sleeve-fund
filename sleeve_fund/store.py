@@ -1901,6 +1901,7 @@ class Store:
         if self.two_leg(sleeve):  # the backstop behind every put-away: never one leg alone (TWO_LEG_FENCE)
             raise ValueError(f"putting a Strategy away {TWO_LEG_FENCE}")
         seen: list[tuple[str, Decimal | str]] = []
+        dust_qty: list[Decimal] = []
 
         def decide(marked: bool) -> tuple[str, Decimal | str]:
             if sleeve in self.withdrawn():
@@ -1917,11 +1918,14 @@ class Store:
 
         def amount() -> Decimal:
             seen.append(decide(True))
+            # Read here, before this move writes: on a store sharing one connection (Store.in_memory), a read after the
+            # writes ends the lock's transaction and loses them (F286-ENG).
+            dust_qty.append(self.lifecycle_flat(sleeve)[0])
             kind, value = seen[0]
             return -value if kind == "out" else Decimal(0)
 
         def said() -> str:
-            qty = self.lifecycle_flat(sleeve)[0]
+            qty = dust_qty[0]
             dust = f", with dust of {qty} no order can close, which leaves with it" if qty else ""
             return f"{sleeve} put away ({why}): its equity {seen[0][1]:,.2f} leaves the fund's book{dust}"
 
