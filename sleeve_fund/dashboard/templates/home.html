@@ -225,7 +225,7 @@
     <thead><tr><th>Time</th><th>Strategy</th><th>Side</th><th>Instrument</th><th class="num">Quantity</th><th class="num">Price</th><th class="num">Fee</th><th>For</th><th>Reason</th></tr></thead>
     <tbody>{% for f in book_fills %}
     <tr><td data-m="hide">{{ f.ts|ts }}</td>
-      <td data-m="hide"><a href="/sleeves/{{ f.sleeve }}">{{ f.sleeve }}</a></td>
+      <td data-m="hide"><a href="/sleeves/{{ f.sleeve }}">{{ f.sleeve }}</a>{% if f.sleeve in test_names %} {{ test_chip() }}{% endif %}</td>
       <td><span class="side {{ f.side|lower }}">{{ 'Buy' if f.side == 'BUY' else 'Sell' }}</span> <span class="m-only">{{ f.sleeve }}</span> <span class="muted m-only">{{ f.ts|ts }}</span></td>
       <td data-m="hide">{{ f.pair }}</td>
       <td class="num" data-m="right">{{ f.qty|qty }} {{ f.pair.split('/')[0] }}<span class="muted m-only"> at {{ f.price|px }}</span></td>
@@ -247,13 +247,13 @@
     <thead><tr><th>Settled</th><th>Strategy</th><th>Instrument</th><th class="num">Rate</th><th class="num">Position</th><th class="num">Paid / received</th></tr></thead>
     <tbody>{% for f in funding.payments %}
     <tr><td data-m="hide">{{ f.ts|ts }}</td>
-      <td><a href="/sleeves/{{ f.sleeve }}">{{ f.sleeve }}</a> <span class="muted m-only">{{ f.ts|ts }}</span></td>
+      <td><a href="/sleeves/{{ f.sleeve }}">{{ f.sleeve }}</a>{% if f.sleeve in test_names %} {{ test_chip() }}{% endif %} <span class="muted m-only">{{ f.ts|ts }}</span></td>
       <td data-m="hide">{{ f.pair }}</td>
       <td class="num" data-m="hide">{{ '%.4f%%'|format(f.rate * 100) }}</td>
       <td class="num" data-m="hide">{{ 'Short' if f.qty < 0 else 'Long' }} {{ f.qty|abs|qty }}</td>
       <td class="num" data-m="right">{{ money_signed(f.amount) }}</td></tr>
     {% endfor %}</tbody>
-    <tfoot><tr><th scope="row" colspan="5">Since start, {{ funding.totals|length }} perpetual strateg{{ 'ies' if funding.totals|length != 1 else 'y' }}</th><td class="num">{{ money_signed(funding.total) }}</td></tr></tfoot>
+    <tfoot><tr><th scope="row" colspan="5">Since start, {{ funding.totals|length }} perpetual strateg{{ 'ies' if funding.totals|length != 1 else 'y' }}{% if test_names %}, test accounts not counted{% endif %}</th><td class="num">{{ money_signed(funding.total) }}</td></tr></tfoot>
   </table>
   {% if funding.totals|length > 1 %}<p class="muted fund-split">{% for t in funding.totals %}<a href="/sleeves/{{ t.sleeve }}">{{ t.sleeve }}</a> {{ money_signed(t.total) }}{{ ' · ' if not loop.last }}{% endfor %}</p>{% endif %}
   {% elif funding.perps %}<p class="empty" style="padding:4px 18px 16px">No funding settled yet. A perpetual position pays or receives it at each funding time while it is open.</p>

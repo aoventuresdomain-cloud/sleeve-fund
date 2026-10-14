@@ -242,7 +242,10 @@ def create_app(store: Store | None = None) -> FastAPI:
                    if o["sleeve"] in names]
         book = bookm.book_view(st(), summaries, frames)
         positions = trading.book_positions(st(), summaries + tests)  # shown; outside the book is marked not counted
-        funding = trading.book_funding(st(), summaries)
+        # The book's funding totals leave a test-account Strategy out; its payments are listed, marked, as its
+        # fills, orders and position are (F273-1).
+        funding = {**trading.book_funding(st(), summaries),
+                   "payments": trading.book_funding(st(), summaries + tests)["payments"]}
         # Costs as money paid: fees plus funding paid (funding totals are + received, - paid).
         book["funding_paid"] = -funding["total"]
         book["fees_funding"] = book.get("costs", book["fees"] - funding["total"])
@@ -255,9 +258,9 @@ def create_app(store: Store | None = None) -> FastAPI:
                     earlier_resets=bool(set(earlier) & set(st().reset_runs())),
                     book=book, alerts=st().alerts(limit=30), shell=shell(),
                     positions=positions, working=working, holdings=bookm.holdings(positions["rows"], book["equity"]),
-                    book_fills=trading.book_fills(st(), sleeves), funding=funding,
+                    book_fills=trading.book_fills(st(), sleeves + [x["sleeve"] for x in tests]), funding=funding,
                     fill_count=sum(x["fills"] for x in summaries), tests=tests,
-                    **_archived_now(request, put_away))
+                    test_names={x["sleeve"].name for x in tests}, **_archived_now(request, put_away))
 
     def _archived_now(request: Request, put_away) -> dict:
         """F-C3B-A-UI on the Portfolio: right after an archive, which Strategy went and the fund's book as it now is
