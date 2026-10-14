@@ -73,6 +73,7 @@ def pair_view(store: Store, parent: str) -> dict:
     state = row.get("state") or "flat"
     return {"state": state, "words": STATE_WORDS.get(state, state.capitalize()),
             "trade_id": row.get("trade_id"), "deadline": row.get("deadline"), "hwm": row.get("hwm"),
+            "day_start_equity": row.get("day_start_equity"),
             "open": state in ("legging", "closing")}
 
 
@@ -103,7 +104,7 @@ def fold_one(store: Store, first: dict, second: dict, frames: dict | None = None
         "bench_ret": (first["benchmark"] + second["benchmark"]) / start - 1 if start else 0.0,
         "day_pnl": day_pnl, "day_ret": day_pnl / (equity - day_pnl) if equity - day_pnl else 0.0,
         "week_pnl": first["week_pnl"] + second["week_pnl"], "mtd_pnl": first["mtd_pnl"] + second["mtd_pnl"],
-        "drawdown": dd, "dd_used": min(dd / max_dd, 1.0) if max_dd else 0.0,
+        "peak": peak, "drawdown": dd, "dd_used": min(dd / max_dd, 1.0) if max_dd else 0.0,
         "room": max(equity - peak * (1 - max_dd), 0.0),
         # Gross: a hedged pair's net is near nothing, and its size is both legs'.
         "exposure": (abs(first["position_value"]) + abs(second["position_value"])) / equity if equity else 0.0,
