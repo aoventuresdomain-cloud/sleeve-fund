@@ -72,6 +72,14 @@ class Pending:
     intent: Any  # the gate's Intent (P2-2), or any payload the submit callback understands
     submit: Callable[[Any, Any], None]  # (intent, decision) -> sends what the gate approved; never called on a refusal
     refused: Callable[[Any, Any], None] | None = None  # (intent, decision) on a refusal, so the strategy can count it
+    strength: float = 0.0  # a multi-asset leg's idea strength (LongFlatStrategy.idea_strength): stronger gated first
+
+
+def strategy_of(name: str) -> str:
+    """The Strategy a run's name belongs to: a multi-asset leg's ("<strategy>~<ASSET>") its parent's; any other name,
+    a pair's "~2" leg included, its own (multi-asset spec §4)."""
+    head, sep, tail = name.partition("~")
+    return head if sep and tail != "2" else name
 
 
 # The gate pass: (strategy, intent, ts_ns) -> a decision with .approved_qty (P2-2's check_order over the MemoryLedger).
@@ -108,10 +116,16 @@ class CloseBatch:
 
     def run(self, ts: int) -> list[tuple[Pending, Any]]:
         """The gate pass for the close `ts`: each intent in strategy order (this bar's, bar_order, when rotating), then
-        in the order it was posted."""
+        in the order it was posted. A multi-asset Strategy's legs are taken together, at the Strategy's first place,
+        strongest idea first and then by the asset's place in its list (multi-asset spec §4): never by which feed's bar
+        came first. Every other strategy keeps its place, so a run without one is ordered exactly as before."""
         items = self.pending.pop(ts, [])
-        rank = {name: n for n, name in enumerate(bar_order(self.order, ts) if self.rotate else self.order)}
-        items = sorted(items, key=lambda p: rank[p.strategy])  # stable: a strategy's own intents keep their order
+        ordered = bar_order(self.order, ts) if self.rotate else self.order
+        group: dict[str, int] = {}
+        for name in ordered:
+            group.setdefault(strategy_of(name), len(group))
+        place = {name: n for n, name in enumerate(self.order)}  # a leg's place in its list, never rotated
+        items = sorted(items, key=lambda p: (group[strategy_of(p.strategy)], -p.strength, place[p.strategy]))  # stable
         self.passes.append((ts, tuple(dict.fromkeys(p.strategy for p in items))))
         out = []
         for p in items:

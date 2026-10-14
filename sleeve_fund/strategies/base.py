@@ -1858,6 +1858,12 @@ class LongFlatStrategy(Strategy):
         alone), with the reason and values to journal (_on_bar_stepped)."""
         raise NotImplementedError
 
+    def idea_strength(self) -> float:
+        """How strong this bar's idea is, for ordering a multi-asset Strategy's ideas on one close (multi-asset spec §4,
+        Advisor MA-SPEC): from bar data only, on a scale comparable across assets (a z-score or ATRs, never a raw
+        price), and part of the idea's hash. 0 by default, so the asset list's order decides."""
+        return 0.0
+
     def entry_sent(self, qty: Decimal, values: dict) -> None:
         """An opening order of `qty` went out from _open with these values (a STEPPED model reads its size here)."""
 
@@ -3296,7 +3302,7 @@ class LongFlatStrategy(Strategy):
         batch, name = self._portfolio
         bar = {"bar": self._deciding[0] if self._deciding else None}  # as paper's gate gets it: parity keys on it
         batch.post(self.clock, self.clock.timestamp_ns(),
-                   Pending(name, {**intent, **bar}, send, lambda i, d: count("refused")))
+                   Pending(name, {**intent, **bar}, send, lambda i, d: count("refused"), self.idea_strength()))
 
     def _gate_intent(self, side, qty: Decimal, signal: dict, what: str) -> tuple[dict, dict]:
         """(the signal with its decision bar, the intent the portfolio gate reads) for an opening order."""
