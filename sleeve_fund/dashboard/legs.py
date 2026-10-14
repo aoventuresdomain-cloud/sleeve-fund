@@ -14,6 +14,7 @@ from sleeve_fund import markets
 from sleeve_fund.dashboard.book import spark_path
 from sleeve_fund.dashboard.metrics import costs
 from sleeve_fund.store import LEG, Store
+from sleeve_fund.wording import leg_name
 
 # The pair's alerts the Strategy's row and page flag in red until acknowledged (M4): no coordinator, a broken pair
 # (a leg unwound), the liquidation-distance close (ruling B) and a pair state that couldn't be saved.
@@ -38,10 +39,8 @@ def uk_time(t: datetime | None) -> str:
 
 
 def label(name: str | None) -> str:
-    """A strategy row's name as the PM reads it: a second leg's "<name>~2" as "<name>, leg 2"."""
-    if name and name.endswith(LEG):
-        return f"{name[:-len(LEG)]}, leg 2"
-    return name or ""
+    """A strategy row's name as the PM reads it: a second leg's "<name>~2" as "<name>, leg 2" (wording.leg_name)."""
+    return leg_name(name)
 
 
 def legs_of(sleeves) -> dict[str, str]:

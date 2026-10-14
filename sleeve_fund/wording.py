@@ -70,3 +70,13 @@ def no_venues(text):
     for pattern, words in _VENUE_WORDS:
         out = pattern.sub(words, out)
     return out
+
+
+def leg_name(name: str | None) -> str:
+    """A strategy row's name as the PM reads it: a two-leg Strategy's second leg "<name>~2" as "<name>, leg 2"."""
+    # Imported here, so the wording stays importable without the journal.
+    from sleeve_fund.store import LEG
+
+    if name and name.endswith(LEG):
+        return f"{name.removesuffix(LEG)}, leg 2"
+    return name or ""

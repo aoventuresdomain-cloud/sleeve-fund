@@ -188,3 +188,15 @@ def test_the_outside_alert_chat_never_names_the_venue_clone():
                     "message": "Two-leg trade T1: BTCUSDT-PERP.BINANCE_P2 couldn't fill on BINANCE_P2"}])
     assert "_P2" not in out and "BINANCE" not in out.upper()
     assert "BTCUSDT-PERP couldn't fill on the perpetual venue" in out
+
+
+def test_the_outside_alert_chat_names_a_second_leg_by_its_strategy():
+    from sleeve_fund.alerts import message
+    from sleeve_fund.wording import leg_name
+
+    out = message([{"level": "warning", "sleeve": "carry~2", "kind": "two_leg_broken", "message": "leg unwound"},
+                   {"level": "warning", "sleeve": "solo", "kind": "risk_pause", "message": "paused"},
+                   {"level": "error", "sleeve": None, "kind": "backup", "message": "no backup"}])
+    assert "[warning] carry, leg 2: leg unwound" in out and "~2" not in out
+    assert "[warning] solo: paused" in out and "[error] system: no backup" in out
+    assert leg_name("carry~2") == "carry, leg 2" and leg_name("carry") == "carry" and leg_name(None) == ""
