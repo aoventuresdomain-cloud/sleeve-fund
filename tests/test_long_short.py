@@ -14,7 +14,7 @@ from sleeve_fund.research.metrics import fills_to_rows, trades
 from sleeve_fund.research.runner import run_backtest
 from sleeve_fund.store import replay_book
 from test_backtest import _path
-from test_dashboard import client  # noqa: F401, F811 - the dashboard fixture
+from test_dashboard import _strategy_accounts, client  # noqa: F401, F811 - the dashboard fixtures
 
 PERP = {"market": "perp", "allow_short": True}
 

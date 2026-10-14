@@ -3,7 +3,12 @@ unrealised, realised and fees and a totals row, and the get-started steps on an 
 
 import re
 
-from test_dashboard import AUTH, SAME, client  # noqa: F401 - the fixture
+from test_dashboard import (  # noqa: F401 - the fixtures
+    AUTH,
+    SAME,
+    _strategy_accounts,
+    client,
+)
 
 from sleeve_fund.dashboard import reasons
 
