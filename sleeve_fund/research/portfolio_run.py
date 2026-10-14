@@ -28,6 +28,7 @@ from sleeve_fund.instruments import FeeSchedule
 from sleeve_fund.money import scale
 from sleeve_fund.open_risk import ATR_DAYS
 from sleeve_fund.portfolio import netting as nt
+from sleeve_fund.portfolio.regime_weight import Weighting
 from sleeve_fund.research import metrics, trials
 from sleeve_fund.research.portfolio import (
     BATCH_DELAY_NS,
@@ -201,11 +202,12 @@ def _check(specs: list[LegSpec]) -> None:
 
 
 def run_portfolio(specs: list[LegSpec], profile: PortfolioProfile = PORTFOLIO, unallocated: float = 0.0,
-                  log_level: str = "ERROR", netting: bool = False) -> PortfolioResult:
+                  log_level: str = "ERROR", netting: bool = False, regime: Weighting | None = None) -> PortfolioResult:
     """Run every Strategy in `specs` together, in their order (the gate's fixed order), each on its own venue clone,
     under the portfolio limits in `profile`. unallocated: the fund's cash held by no Strategy, counted in the book
     (Done-when 3). netting: also report step B in shadow (P2-3, netting_shadow) on the result; off by default, and
-    it never changes the run."""
+    it never changes the run. regime: the P2-5 weight on each new entry, for the counted regime variant only; None
+    (always, in G1) runs unweighted."""
     _check(specs)
     order = tuple(s.name for s in specs)
     # A Strategy deciding on bars as short as its execution bars is fed its decision bars alone (run_backtest's
@@ -278,7 +280,7 @@ def run_portfolio(specs: list[LegSpec], profile: PortfolioProfile = PORTFOLIO, u
             for leg in legs:  # every Strategy, in the run's order, in this one pass (Done-when 3)
                 leg.strategy.portfolio_halt(why)
 
-    gate = PortfolioGate(book, profile, on_action=act, unmeasured=unmeasured)
+    gate = PortfolioGate(book, profile, on_action=act, unmeasured=unmeasured, regime=regime)
     batch = CloseBatch(order, gate)
     engine = new_engine(log_level)
     try:
@@ -340,7 +342,8 @@ def _result(results, spread, marks, actions, gate, hours, window, profile, unall
     decisions = [{"strategy": r.strategy, "ts": r.at, "bar_ts": r.intent.bar_ts, "kind": r.intent.kind,
                   "outcome": r.decision.outcome, "approved": r.decision.approved_qty,
                   "requested": r.decision.requested_qty, "limit": r.decision.limit_hit, "reason": r.decision.reason,
-                  "side": r.intent.side, "price": r.intent.price,
+                  "side": r.intent.side, "price": r.intent.price, "regime_weight": r.intent.regime_weight,
+                  "regime_state": r.intent.regime_state,
                   "bar_decided": r.intent.intent_id not in gate.unbarred} for r in gate.ledger.records]
     gaps = [{"ts": at, "strategy": msg.split(":", 1)[0], "why": msg.split(":", 1)[1].strip(),
              "what": "entry" if kind == "portfolio_check_failed" else "open_risk"}
