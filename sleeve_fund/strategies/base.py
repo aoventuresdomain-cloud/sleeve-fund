@@ -3778,7 +3778,8 @@ class LongFlatStrategy(Strategy):
             return None
         lev = LongFlatStrategy._max_leverage(self)
         entry = self._entry_px if self._entry_px else self._net_position()[1]
-        return markets.isolated_liquidation(cash + self._funded(), qty, entry, lev, self._cfg.perp.maintenance_margin)
+        return markets.isolated_liquidation(cash + LongFlatStrategy._funded(self), qty, entry, lev,
+                                            self._cfg.perp.maintenance_margin)
 
     def _position_opened(self, fills: list[dict]) -> int:
         """When the position held now opened (ns): its first fill since the journal was last flat or went through
