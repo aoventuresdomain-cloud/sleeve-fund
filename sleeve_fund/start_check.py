@@ -76,6 +76,17 @@ def read_only_store(url: str):
     return store
 
 
+def check_store(engine: Engine) -> Section:
+    """Paper journals to Postgres only (the Independent Quant Advisor's condition on #286): SQLite has none of the row
+    locks the portfolio gate's reservations and the put-away flows rely on, so paper refuses to start on it."""
+    sec = Section("Journal store")
+    if engine.dialect.name == "postgresql":
+        sec.add(PASS, "Postgres")
+    else:
+        sec.add(FAIL, f"{engine.dialect.name}: paper must journal to Postgres")
+    return sec
+
+
 def check_keys(environ: dict[str, str], engine: Engine) -> Section:
     from sleeve_fund.mirror import ACCOUNTS as DEMO_ACCOUNTS
     from sleeve_fund.paper.safety import credential_var
@@ -207,7 +218,7 @@ def run(url: str, environ: dict[str, str] | None = None) -> tuple[bool, str]:
     env = dict(os.environ if environ is None else environ)
     store = read_only_store(url)
     engine = store.engine
-    sections = [check_keys(env, engine), check_venues(engine), check_books(store)]
+    sections = [check_store(engine), check_keys(env, engine), check_venues(engine), check_books(store)]
     ok = not any(s.failed for s in sections)
     out = [f"Start check: {'PASS' if ok else 'FAIL'}",
            f"{datetime.now(UTC):%Y-%m-%d %H:%M} UTC, {journal_kind(url)} journal, read-only",
