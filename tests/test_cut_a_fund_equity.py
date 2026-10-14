@@ -207,3 +207,15 @@ def test_a_trade_calls_the_guards_off_the_account_and_inside_the_fund_never_off_
                         runtime=SimpleNamespace(status="running", fund_held=held, funded=funded, _day_open=0.0, peak=0.0,
                                                 halts=True, profile=SimpleNamespace(min_liquidation_distance=0.1)))
     assert LongFlatStrategy._guard_breached(s, 60_000.0) is breached
+
+
+def test_inside_the_fund_a_perp_nearing_liquidation_still_calls_the_guards_on_the_trade():
+    """F-GUARD-OWN-EQ (a), HoE: the per-trade call still acts inside the fund when the position is within the profile's
+    distance of its liquidation price (the cut), whatever the Strategy's own equity reads."""
+    s = SimpleNamespace(_entry_px=60_000.0, _mark=lambda: (-30.0, -6_030.0, 0.1, 60_000.0), pair=None,
+                        _guard_book=lambda e, c, q, p: (e, c, q), _liq_now=lambda c, q: 57_000.0,
+                        runtime=SimpleNamespace(status="running", fund_held=True, funded=200_000.0, _day_open=0.0,
+                                                peak=0.0, halts=True, profile=SimpleNamespace(min_liquidation_distance=0.1)))
+    assert LongFlatStrategy._guard_breached(s, 60_000.0) is True  # 5% from liquidation, inside the 10% distance
+    s._liq_now = lambda c, q: 40_000.0
+    assert LongFlatStrategy._guard_breached(s, 60_000.0) is False  # 33% away: nothing to act on
