@@ -106,3 +106,35 @@ def test_the_risk_page_shows_the_pair_once_with_its_legs_under_it(carry):  # noq
     assert '<a href="/sleeves/carry~2">Leg 2</a> <span class="faint">BTC/USDT perp</span>' in limits
     strats = page.split('id="strats-h"')[1].split("</section>")[0]
     assert strats.count('href="/sleeves/carry"') == 1 and "carry~2" not in strats
+
+
+def test_the_risk_tables_summed_figures_are_the_gates_to_the_cent(carry):  # noqa: F811
+    """X-D2-5 (HoQA): the pair's row on the Risk page reads the very figures its summed guard judges: both legs'
+    equity, the summed high-water mark, today's summed start and the room to the halt line, to the cent."""
+    from datetime import timedelta
+
+    from sleeve_fund.paper.runtime import SleeveRuntime
+    from sleeve_fund.store import utcnow
+
+    client, store = carry
+    clock = [utcnow() + timedelta(seconds=1)]
+    rt = SleeveRuntime(store, "carry", now=lambda: clock[0])
+    rt.paired = True  # as the Pair sets it
+    rt.on_start(0.0005)
+    # Leg 2 marks itself; the guard on leg 1 judges both legs summed (ruling E).
+    for own, other in ((5_048.0, 4_953.0), (5_311.37, 4_942.21), (5_087.13, 4_900.66)):
+        clock[0] += timedelta(seconds=1)
+        store.record_equity("carry~2", equity=other, cash=4_998.0, qty=-0.05, price=61_000, benchmark=5_000,
+                            ts=clock[0])
+        rt.tick(equity=own, cash=1_998.0, qty=0.05, price=61_000.0, other_equity=other)
+    summed, peak, day_open = 5_087.13 + 4_900.66, rt.peak, rt._day_open
+    assert (round(peak, 2), round(day_open, 2)) == (10_253.58, 10_001.00)  # the gate's own figures
+    max_dd = rt.profile.max_drawdown
+    view, _ = _view(store)
+    pair = view["rows"][0]
+    assert round(pair["x"]["equity"], 2) == round(summed, 2)
+    assert round(pair["x"]["peak"], 2) == round(peak, 2)
+    assert round(pair["x"]["equity"] / (1 + pair["x"]["day_ret"]), 2) == round(day_open, 2)
+    assert round(pair["headroom"], 2) == round(summed - peak * (1 - max_dd), 2)
+    limits = client.get("/risk", auth=AUTH).text.split('id="lim-h"')[1].split("</table>")[0]
+    assert f"{summed - peak * (1 - max_dd):,.2f}" in limits
