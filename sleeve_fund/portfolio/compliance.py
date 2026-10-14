@@ -35,18 +35,24 @@ KEY = {
 }
 FIELD = {k: f for f, k in KEY.items()}
 TESTS = tuple(KEY)
+# Each key's (default, low, high) from compliance_rules, the Front-end's one source (Rule rows; or the DA's stand-in's
+# DEFAULTS and BOUNDS dicts).
+_RULE = {k: ((r.default, r.low, r.high) if (r := getattr(rules, "BY_KEY", {}).get(k)) is not None
+             else (rules.DEFAULTS[k], *rules.BOUNDS[k])) for k in KEY.values()}
 LABELS = {f: rules.LABELS[k] for f, k in KEY.items()}
-BOUNDS = {f: (float(rules.BOUNDS[k][0]), float(rules.BOUNDS[k][1])) for f, k in KEY.items()}
+BOUNDS = {f: (float(_RULE[k][1]), float(_RULE[k][2])) for f, k in KEY.items()}
 LOCKED = tuple(f for f, k in KEY.items() if k in rules.LOCKED)  # T3 and T5 can't be switched off (BRIDGE-3)
 # The seeded version 1's tests (PM DEFAULTS-2: T1 4%, T2 6%, T3 10%; T4 and T5 the accepted portfolio limits). Its
 # asset-group map lives with the version in the journal (compliance_rules.DEFAULT_GROUPS), not here.
-SEEDED = replace(PortfolioProfile(), **{f: float(rules.DEFAULTS[k]) for f, k in KEY.items()})
+SEEDED = replace(PortfolioProfile(), **{f: float(_RULE[k][0]) for f, k in KEY.items()})
+# A refusal because the fund is halted or paused for the day is T5's (compliance_rules.LIMIT_HIT)
+_OUTCOME = {"halt": "fund_drawdown", "pause": "fund_day_loss"}
 
 
 def test_key(limit_hit: str | None) -> str | None:
     """The compliance test a gate outcome names (limits.decide's limit_hit), or None for an outcome that isn't a test
-    (lock_error, portfolio_state_stale, below_min, a halt or pause already in force)."""
-    return KEY.get(limit_hit) if limit_hit else None
+    (lock_error, portfolio_state_stale, below_min). A halt or a day's pause in force is T5's."""
+    return (KEY.get(limit_hit) or _OUTCOME.get(limit_hit)) if limit_hit else None
 
 
 def validate_tests(profile: PortfolioProfile) -> None:
@@ -86,7 +92,7 @@ def to_tests(profile: PortfolioProfile, current=None) -> list[dict]:
         scope, measure, action = rules.SHAPE[k]
         was = current.test(k) if current is not None else None
         limit = (Decimal(str(value)).quantize(Decimal("0.0001")) if value is not None
-                 else (was["limit"] if was is not None else rules.DEFAULTS[k]))
+                 else (was["limit"] if was is not None else _RULE[k][0]))
         out.append({"test": k, "label": rules.LABELS[k], "scope": scope, "measure": measure, "limit": limit,
                     "action": action, "enabled": value is not None})
     return out

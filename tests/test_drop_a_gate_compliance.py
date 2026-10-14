@@ -98,3 +98,13 @@ def test_paper_reads_the_compliance_tests_and_a_direct_profile_still_wins():
     check_order(ledger, "a", _wide("1"), PORTFOLIO, T0)  # an explicit profile: no T1; its 5% fund loss binds
     r = _rows(ledger)[-1]
     assert (r.compliance_version, r.test_hit, r.limit_hit) == (None, None, "open_risk")
+
+
+def test_a_halted_book_refuses_and_names_the_drawdown_test():
+    ledger = _marked()
+    with ledger.lock():
+        ledger.set_state(replace(ledger.state(), halted="the book is 15.0% below its reference"))
+    c = check_order(ledger, "a", _wide("0.001"), None, T0)
+    assert c.decision.outcome == "rejected"
+    r = _rows(ledger)[-1]
+    assert (r.limit_hit, r.test_hit, r.compliance_version) == ("halt", "fund_drawdown", 1)
