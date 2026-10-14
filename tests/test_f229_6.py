@@ -314,3 +314,29 @@ def test_c3b_a_strategy_an_earlier_book_put_away_is_out_of_both(tmp_path):
     assert open_risk.account_equity(store, "paper") == 20_000
     assert [r["sleeve"] for r in open_risk.book_open_risk(store, _atr)] == ["fund"]
     assert open_risk.account_book(store, "entry", 10_000.0, _atr)[:2] == (20_000.0, pytest.approx(60.0))
+    # Advisor C3b, option B: the tile measures against the gate's book, the fund's equity, put-away cash included.
+    from sleeve_fund.dashboard import trading
+
+    tile = trading.open_risk([{"sleeve": "fund", "perp_limit": True, "margin": 0.0}], store)
+    assert tile["book"] == float(supervisor.fund_equity(store)) == 30_000
+    assert [h.notional for h in portfolio_gate.fund_holdings(store, atr_pct=_atr)] == [Decimal(6_000)]
+
+
+def test_c3c_a_clean_slate_and_an_archived_holder_going_flat_after_it_fire_no_halt_or_pause(tmp_path):
+    """Advisor C3b (B): the halt, the pause and their references stay on the fund's equity, so neither the slate nor
+    a holder it left going flat later moves the book."""
+    store = _fund(tmp_path, "c3c")
+    sup = supervisor.Supervisor(store)
+    sup.mark_portfolio(T_MARK + timedelta(minutes=5))
+    before = supervisor.fund_equity(store)
+    store.decide("PM", "clear", "Clean slate", ts=T_MARK + timedelta(minutes=6))
+    sup.mark_portfolio(T_MARK + timedelta(minutes=7))
+    store.record_fill("held", side="BUY", qty=0.1, price=60_000.0, fee=0.0, order_id="x-held", trade_id="x-held",
+                      ts=T_MARK + timedelta(minutes=8))
+    store.record_equity("held", equity=10_000.0, cash=10_000.0, qty=0.0, price=60_000.0, benchmark=10_000.0,
+                        ts=T_MARK + timedelta(minutes=8))
+    assert "held" in store.previous_book()  # the earlier book's now
+    sup.mark_portfolio(T_MARK + timedelta(minutes=9))
+    st = sup.ledger.state()
+    assert supervisor.fund_equity(store) == before
+    assert st.halted is None and st.paused is None and st.equity == before
