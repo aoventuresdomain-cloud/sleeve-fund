@@ -19,7 +19,11 @@ on:
     types: [completed]
     branches: [main]
   workflow_dispatch:
-concurrency: deploy
+# Shares the history-writer group with canon.yml and funding-backfill.yml, so a deploy waits behind a running
+# canon or backfill instead of recreating the hub under it (cancel-in-progress false: a queued deploy never
+# cancels a running writer). A newer pending run replaces an older pending one; pick_commit ships main's newest
+# green commit, so a replaced pending deploy loses nothing.
+concurrency: { group: history-writer, cancel-in-progress: false }
 jobs:
   deploy:
     runs-on: ubuntu-24.04
@@ -71,6 +75,20 @@ jobs:
           else
             echo "current=false" >> "$GITHUB_OUTPUT"
           fi
+      - name: Wait for history writers to finish
+        if: steps.tip.outputs.current == 'true'
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          # The concurrency group guards jobs, not containers: a canon or backfill container can outlive its job (an
+          # SSH drop), and `up --remove-orphans` or a network recreate would kill it. Wait, never kill; fail after 90 min.
+          for i in $(seq 1 90); do
+            running=$(ssh -i ~/.ssh/id_deploy "$USER_AT@$HOST" 'sudo docker ps --filter name=canon- --filter name=backfill- --format "{{.Names}} {{.Status}}"')
+            [ -z "$running" ] && exit 0
+            echo "waiting ($i min) for a history writer:"; echo "$running"
+            sleep 60
+          done
+          echo "FAIL: a history writer is still running after 90 min; nothing was shipped"; exit 1
       - name: Ship code
         if: steps.tip.outputs.current == 'true'
         env:
