@@ -77,9 +77,6 @@ def test_a2_the_pe1_case_ends_at_100000_fresh(store):
     assert _four(st) == (D(100_000),) * 4 and _carried(st) == (None,) * 4 and not st.halted
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason="PE2: fund_book counts a flow applied at the same poll "
-                   "as the re-base (applied_at >= since) when it is before it in id order: the fund's withdrawal "
-                   "lands in the new book (500 instead of 100,000)")
 def test_a3_a_second_reset_once_the_fund_holds_the_book_starts_it_afresh_again(store):
     _old_book(store)
     _until_done(store, T0 + timedelta(minutes=3))
