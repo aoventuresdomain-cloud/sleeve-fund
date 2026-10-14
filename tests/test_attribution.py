@@ -60,7 +60,7 @@ def test_the_strategy_shows_its_pnl_r_contribution_and_refused_ideas_by_test(cli
     assert [(r["outcome"], r["test"]) for r in a["refused"]] == [("trimmed", "T3 Whole fund"),
                                                                 ("rejected", "T4 Net per asset")]
     page = c.get("/sleeves/btc-test", auth=AUTH).text
-    panel = page.split('id="tab-attribution"')[1].split('id="tab-')[0]
+    panel = page.split('id="attr-h"')[1].split('id="tab-activity"')[0]  # the summary on Trades, the list on Refused ideas
     assert "+0.98R" in panel and "+0.98%" in panel and "98.00" in panel
     assert "Refused" in panel and "Cut to 0.45" in panel and "T4 Net per asset" in panel and "T3 Whole fund" in panel
 
@@ -82,5 +82,5 @@ def test_before_the_books_first_mark_the_contribution_reads_as_a_dash(client):  
 
     a = attribution.strategy(store, "btc-test", [], utcnow())
     assert a["fund_start"] is None and a["contribution"] is None
-    panel = c.get("/sleeves/btc-test", auth=AUTH).text.split('id="tab-attribution"')[1]
+    panel = c.get("/sleeves/btc-test", auth=AUTH).text.split('id="tab-refused"')[1]
     assert "No idea was refused or cut in this period." in panel

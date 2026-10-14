@@ -21,7 +21,7 @@ def test_the_page_has_one_position_view_and_its_views_in_one_panel(client):  # n
     assert 'data-tabs' not in page and "desk-tabs" not in page  # no top tab row
     lower = page.split('class="sub-tabs" role="tablist"')[1].split("</div>")[0]
     assert re.findall(r'data-sub="(\w+)"', lower) == ["pos", "trades", "open", "history", "refused", "activity"]
-    assert page.count('data-sub-panel="pos"') == 1 and 'id="pos-h"' not in page and "<h3>Size</h3>" not in page
+    assert page.count('data-sub-panel="pos"') == 1 and page.count('id="pos-h"') == 1
     side = page.split('class="sub-tabs side"')[1].split("</div>")[0]
     assert re.findall(r'data-sub="(\w+)"', side) == ["signals", "settings"]
     settings = page.split('id="tab-settings-side"')[1].split("</aside>")[0]

@@ -116,7 +116,7 @@ main { padding: 26px 28px 56px; min-width: 0; max-width: 1680px; }
 .page-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 16px; margin-bottom: 20px; }
 .page-head h1 { font-size: 24px; font-weight: 600; letter-spacing: -0.03em; margin: 0; line-height: 1.2; }
 .page-head .lede { color: var(--muted); margin: 0; flex-basis: 100%; order: 3; }
-.page-head .actions { margin-left: auto; display: flex; gap: 8px; }
+.page-head .actions { margin-left: auto; display: flex; flex-wrap: wrap; gap: 8px; }
 h2 { font-size: 13.5px; font-weight: 600; letter-spacing: -0.01em; margin: 0; }
 /* Older templates use bare h1/.sub; keep them aligned with the new head. */
 main > h1 { font-size: 24px; font-weight: 600; letter-spacing: -0.03em; margin: 0 0 4px; }

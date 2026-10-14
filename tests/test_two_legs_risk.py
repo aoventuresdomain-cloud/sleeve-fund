@@ -38,9 +38,9 @@ def test_one_row_for_the_pair_with_its_legs_nested(carry):  # noqa: F811
     pair = view["rows"][0]
     assert [leg["x"]["sleeve"].name for leg in pair["legs"]] == ["carry", "carry~2"]
     assert pair["x"]["equity"] == pytest.approx(10_001.0)
-    # Gross: 0.05 x 61,000 on each leg over the pair's 10,001, against the Strategy's cap; each leg keeps its own.
-    assert pair["cap_used"] == pytest.approx((2 * 3_050 / 10_001) / pair["legs"][0]["x"]["cap"])
-    assert pair["legs"][1]["cap_used"] == pytest.approx(3_050 / 4_953 / pair["legs"][1]["x"]["cap"])
+    # TEC-FE-CAP: no Strategy carries an exposure cap any more (the compliance tests judge the fund), so the pair and
+    # its legs carry no cap-used figure.
+    assert "cap_used" not in pair and all("cap_used" not in leg for leg in pair["legs"])
 
 
 def test_a_hedged_pair_is_not_halted_by_a_rally_that_would_halt_its_short_leg_alone(carry):  # noqa: F811

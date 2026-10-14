@@ -76,7 +76,7 @@
 
 {# Six figures (C8). A Strategy holds no capital of its own (CUT-A), so there is no equity tile. #}
 <section class="kpis" aria-label="Strategy figures">
-  <div class="kpi lead" title="{{ x.ret|pct1s }} on the {{ s.starting_balance|money }} it was sized from · buy-and-hold {{ x.bench_ret|pct1s }}"><div class="k">P&amp;L since start</div><div class="v">{{ money_signed(x.pnl) }}</div></div>
+  <div class="kpi lead" title="{{ x.pnl|smoney }} since start, {{ x.ret|pct1s }} · buy-and-hold, {% if x.cap > 1 %}unlevered{% else %}{{ x.cap|pct0 }} invested{% endif %}: {{ x.bench_ret|pct1s }}"><div class="k">P&amp;L since start</div><div class="v">{{ money_signed(x.pnl) }}</div></div>
   {% if not backtest_id %}<div class="kpi" title="Since 00:00 UTC · {{ x.day_ret|pct1s }}"><div class="k">Today</div><div class="v">{{ money_signed(x.day_pnl) }}</div></div>{% endif %}
   {% if not backtest_id %}<div class="kpi" title="Its P&amp;L since start over the fund's book at its first mark{% if contribution is none %}; the fund's book has no mark yet{% endif %}"><div class="k">Contribution to fund</div><div class="v">{% if contribution is not none %}{{ '%+.2f'|format(contribution * 100) }}%{% else %}<span class="muted">–</span>{% endif %}</div></div>{% endif %}
   <div class="kpi" title="{% if x.entry_px %}On the open position, entered at {{ x.entry_px|px }}{% else %}No open position{% endif %}"><div class="k">Unrealised</div><div class="v">{{ money_signed(x.unrealised) }}</div></div>
@@ -135,7 +135,35 @@
     </div>
   </div>
 
-  <section class="pos pos-more" aria-label="More on the position">
+  <section class="pos pos-more" aria-labelledby="pos-h">
+  <div class="panel-head"><h2 id="pos-h">{% if position %}{{ "Short" if position.side < 0 else "Long" }} {{ s.instrument }}{% else %}No open position{% endif %}</h2>
+    {% if position and position.opened %}<span class="right faint">since {{ position.opened|ts }} · held {{ position.held|held }}</span>{% endif %}</div>
+  {# The detail the table has no room for: size, leverage and exposure, and how each exit was set. #}
+  <div class="pos-grid">
+    <div class="pos-card"><h3>Size</h3><dl>
+      <div><dt>Quantity</dt><dd>{% if position %}{{ position.qty|abs|qty }} {{ base }}{% else %}<span class="muted">0 {{ base }}</span>{% endif %}</dd></div>
+      <div><dt>Notional</dt><dd>{% if position %}{{ position.value|abs|money }} {{ quote }}{% else %}<span class="muted">–</span>{% endif %}</dd></div>
+      {% if not perp %}<div><dt>Side</dt><dd>{% if position %}{{ "Short" if position.side < 0 else "Long" }}{% else %}<span class="muted">Flat</span>{% endif %}</dd></div>
+      <div><dt title="Spot: no leverage">Leverage</dt><dd>1×</dd></div>
+      <div><dt title="Position value at the current price ÷ the strategy's equity.">Exposure</dt><dd>{{ '%.2f'|format(x.exposure|abs) }}× equity</dd></div>{% endif %}
+    </dl></div>
+    <div class="pos-card"><h3>Price</h3><dl>
+      <div><dt>Entry</dt><dd>{% if position %}{{ position.entry_px|px }}{% else %}<span class="muted">–</span>{% endif %}</dd></div>
+      <div><dt>Last</dt><dd>{{ x.price|px }}</dd></div>
+      <div><dt>Move</dt><dd>{% if position %}{{ signed(position.price / position.entry_px - 1) }}{% else %}<span class="muted">–</span>{% endif %}</dd></div>
+    </dl></div>
+    <div class="pos-card"><h3>Exits</h3><dl>
+      <div><dt>Stop-loss</dt><dd>{% if risk.stop_px %}{{ risk.stop_px|px }} <span class="faint">{{ risk.to_stop|pct1 }} away{% if position and position.stop_basis %} · {{ position.stop_basis }}{% endif %}</span>{% elif stop_words(s.params)|trim %}<span class="muted">{{ stop_words(s.params) }}</span>{% elif trail_words(s)|trim %}<span class="muted trail-stop" title="{{ trail_words(s) }}">Trailing stop · Trail level not shown</span>{% else %}<span class="muted">Not set</span>{% endif %}</dd></div>
+      <div><dt>Take-profit</dt><dd>{% if risk.target_px %}{{ risk.target_px|px }}{% if x.price %} <span class="faint">{{ (risk.target_px / x.price - 1)|pct1 }} away</span>{% endif %}{% elif s.params.take_profit %}<span class="muted">{{ (s.params.take_profit * 100)|round(1) }}% {{ "below" if position and position.side < 0 else "above" }} entry</span>{% elif s.params.take_profit_r %}<span class="muted">{{ s.params.take_profit_r }}R after costs</span>{% else %}<span class="muted">Not set</span>{% endif %}</dd></div>
+      {% if perp and position and position.stop_liq is not none %}<div><dt>To liquidation</dt><dd>{{ stop_liq(position.stop_liq) }}</dd></div>{% endif %}
+      <div><dt>At risk</dt><dd>{% if position and risk.stop_px and position.qty * (x.price - risk.stop_px) <= 0 %}<span class="warn" title="The price has gone through its stop and the position is still open: the open-risk limit counts it as if it had no stop">past stop</span>{% elif position and risk.stop_px %}{{ (position.qty * (x.price - risk.stop_px))|money }} {{ quote }}{% set r_now = (position.price - position.entry_px) / (position.entry_px - risk.stop_px) if position.entry_px != risk.stop_px else none %}{% if r_now is not none %} <span class="faint">{{ r_now|rmult }} now</span>{% endif %}{% else %}<span class="muted">–</span>{% endif %}</dd></div>
+    </dl></div>
+    <div class="pos-card"><h3>P&amp;L <span class="faint">{{ quote }}</span></h3><dl>
+      <div><dt>Unrealised</dt><dd>{{ money_signed(x.unrealised) }}{% if position %} <span class="faint">{{ position.unrealised_ret|pct1s }}</span>{% endif %}</dd></div>
+      <div><dt>Realised {{ help('realised') }}</dt><dd>{{ money_signed(realised) }}</dd></div>
+      <div class="total"><dt>Total</dt><dd>{{ money_signed(x.pnl) }} <span class="faint">{{ x.ret|pct1s }}</span></dd></div>
+    </dl></div>
+  </div>
   {% if perp %}<div class="pos-grid two">
     <div class="pos-card"><h3>Margin <span class="faint">isolated</span></h3><dl>
       <div><dt>Side</dt><dd>{% if position %}{{ "Short" if position.side < 0 else "Long" }}{% else %}<span class="muted">Flat</span>{% endif %}</dd></div>
@@ -396,7 +424,7 @@
 </dialog>
 {% endfor %}
 {% if ral and not archived %}<dialog id="dlg-ral" aria-labelledby="dlg-ral-h">
-  <h2 id="dlg-ral-h">Reset after liquidation: {{ s.name|leg_label }}{% if ral.leg and ral.leg != s.name %}, its leg {{ ral.leg|leg_label }}{% endif %}</h2>
+  <h2 id="dlg-ral-h">Reset after liquidation: {{ s.name|leg_label }}{% if ral.leg and ral.leg != s.name %}, its leg {{ ral.leg }}{% endif %}</h2>{# the leg as journaled, as main pins it #}
   {% if ral.pair %}<p>Its leg {{ ral.leg|leg_label }} was liquidated: it lost {{ ral.pair.x|money }} {{ quote }}, {{ '%.1f'|format(ral.pair.y) }}% of both legs' equity just before ({{ ral.pair.before|money }} {{ quote }}). The other leg's forced close made {{ '%+.2f'|format(ral.pair.unwind) }} {{ quote }}, so the pair lost {{ ral.pair.net|money }} {{ quote }} in all and has {{ ral.pair.after|money }} {{ quote }} left.{% if ral.others %} {{ ral.others|map('leg_label')|join(', ') }} was liquidated too and needs its own reset after this one.{% endif %}</p>
   {% else %}<p>{% if ral.x %}Its position margin was lost: {{ ral.x }} {{ quote }}, {{ ral.y }}% of its equity when the position was opened{% if ral.adds %} (includes adds){% endif %}.{% else %}Its position margin was lost.{% endif %} It has {{ ral.left|money }} {{ quote }} left.</p>{% endif %}
   {% if not ral.incident %}<div class="warnbox"><b>No incident is open for this liquidation yet.</b> The engine opens one; the reset needs it, and its note, before it will go ahead.</div>
