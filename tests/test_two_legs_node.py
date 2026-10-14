@@ -262,7 +262,8 @@ def test_a_two_leg_node_runs_on_the_hub_and_a_trade_the_journal_left_legging_wit
                           second={"instrument": "ETH/USDT", "params": {"market": "perp"}, "venue": "BINANCE",
                                   "side": -1})
     now = datetime.now(timezone.utc)
-    assert store.set_pair_state("pairx", expected=None, state="legging", trade_id="pairx-t1",
+    assert store.set_pair_state("pairx", expected=None, state="flat", ts=now)
+    assert store.set_pair_state("pairx", expected="flat", state="legging", trade_id="pairx-t1",
                                 deadline=now - timedelta(seconds=5), ts=now)
     journal = QueuedStore(store)
     lead, follow = (from_store(store.sleeve(n)) for n in ("pairx", "pairx~2"))

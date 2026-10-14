@@ -15,10 +15,12 @@ pe2-plans/p2-8-spec.md; Independent Quant Advisor, 13 Oct 23:55 UK):
 from __future__ import annotations
 
 from decimal import ROUND_DOWN, Decimal
+from types import SimpleNamespace
 
 from nautilus_trader.model import Bar, ClientOrderId, OrderSide
 
 from sleeve_fund.data import bar_minutes
+from sleeve_fund import router
 from sleeve_fund.margin import entry_liquidation
 from sleeve_fund.strategies.base import OPENING_INTENTS, LongFlatStrategy
 
@@ -151,7 +153,7 @@ class Pair:
         if row is None:
             store.set_pair_state(parent, expected=None, state="flat", ts=_utc(self._now()))
             row = store.pair_state(parent)
-        self._written = row["state"]
+        self._written = row["state"], row["trade_id"]
         self._saved = row
         self.on_state = self._write
         self.recovered = False
@@ -169,12 +171,18 @@ class Pair:
         deadline = _utc(st["deadline_ns"]) if st["deadline_ns"] is not None else None
         trade = st["trade_id"] if st["state"] != "flat" else None
         for _ in range(2):  # lost a race: re-read what is there and move from that
-            if self._store.set_pair_state(self._parent, expected=self._written, state=st["state"], trade_id=trade,
-                                          deadline=deadline, ts=_utc(self._now())):
-                self._written = st["state"]
-                return
+            try:
+                if self._store.set_pair_state(self._parent, expected=self._written[0], state=st["state"],
+                                              trade_id=trade, deadline=deadline, ts=_utc(self._now()),
+                                              expected_trade_id=self._written[1]):
+                    self._written = st["state"], trade
+                    return
+            except ValueError:  # what is there can't move to this state: re-read it, then alert below if still so
+                pass
             row = self._store.pair_state(self._parent)
-            self._written = row["state"] if row is not None else None
+            self._written = (row["state"], row["trade_id"]) if row is not None else (None, None)
+            if self._written[1] not in (None, trade):
+                break  # another trade's row: never moved from here (DA, stale writer)
         self._alert("pair_state_unsaved", f"Two-leg trade {self.trade_id}: its state ({st['state']}) couldn't be "
                                           "kept in the journal; a restart reads the fills instead")
 
@@ -357,9 +365,44 @@ class Pair:
         return True
 
     def _release(self, part: dict | None) -> None:
-        """A checked part never sent: its reservation goes back to the book."""
-        if part is not None and part.get("gated") is not None:
+        """A checked part never sent, or a second leg's held for its retry: its reservation goes back to the book."""
+        if part is None:
+            return
+        if part.get("gated") is not None:
             part.pop("gated").release("cancel")
+        if part.get("held") is not None:
+            part["leg"].runtime.store.release_held(part.pop("held"))
+
+    def _retry_refusal(self, leg: LongFlatStrategy) -> str | None:
+        """Why the second leg's retry is not sent and the pair unwinds instead (Advisor, leg-2 retry MUST 3): a halt,
+        pause or stale data on either leg, its venue pin not matching, or the coordinator gone."""
+        for each in (self.lead, self.follow):
+            if each.pair is not self:
+                return "its coordinator is gone"
+            rt = each.runtime
+            if rt is not None and not rt.can_open():
+                return (rt.entry_blocked()[1] if not rt.backtest else None) or f"a leg is {rt.status}"
+        if leg.runtime is not None and not leg.runtime.backtest:
+            try:
+                router.check(leg.runtime.name, str(leg._cfg.instrument_id), leg.runtime.venue)
+            except ValueError as exc:
+                return str(exc)
+        return None
+
+    def _carry_reservation(self, part: dict) -> bool:
+        """Paper: the retry draws on what the pair's check reserved for this leg, never a check of its own (Advisor,
+        MUST 1, 2): at most what is left of it. False when nothing is left."""
+        if part.get("held") is None:
+            return True  # no gate (a backtest): nothing reserved to carry
+        got = part["leg"].runtime.store.hand_on(part.pop("held"))
+        if got is None:
+            return False
+        rid, left = got
+        part["qty"] = min(part["qty"], left).quantize(part["leg"]._lot(), rounding=ROUND_DOWN)
+        store = part["leg"].runtime.store
+        part["gated"] = SimpleNamespace(approved_qty=left, checked=SimpleNamespace(reservation=rid),
+                                        release=lambda reason, rid=rid: store.release_reservation(rid, reason))
+        return True
 
     def _send_first(self, part: dict) -> None:
         """The first leg's order: when none was placed (too small, or its strategy declined it), nothing is held or
@@ -381,7 +424,6 @@ class Pair:
         part["tries"] += 1
         before = getattr(leg, "_last_submitted", None)
         signal = {**part["signal"], **self._margin_signal(leg, qty)}
-        # The pair's check is spent on its first send; a retry is a fresh check of that leg alone (Advisor C's retry).
         gated = part.pop("gated", None)
         self.sending = leg
         try:
@@ -392,6 +434,11 @@ class Pair:
         if coid is None or coid == before:
             return False
         part["coid"] = coid
+        store = getattr(leg.runtime, "store", None)
+        if gated is not None and part is self.second and hasattr(store, "hold_for_retry"):
+            # Its reject or cancel keeps what is left reserved for the retry (Advisor, leg-2 retry MUST 1).
+            store.hold_for_retry(coid)
+            part["held"] = coid
         self._note("sent", f"{'lead' if leg is self.lead else 'follow'} {qty} ({coid})")
         return True
 
@@ -454,8 +501,13 @@ class Pair:
         rest = sent - filled
         if second["tries"] <= RETRIES and rest >= leg._min_qty():
             second["qty"] = rest.quantize(leg._lot(), rounding=ROUND_DOWN)
-            if self._send(second):
+            if (why := self._retry_refusal(leg)) is not None:
+                self._note("retry_refused", why)
+            elif not self._carry_reservation(second):
+                self._note("retry_refused", "nothing is left of the pair's reservation for it")
+            elif self._send(second):
                 return
+        self._release(second)
         if not self._flat(leg):  # what the earlier tries filled is held: trim to it, don't unwind (CR P2-8 6)
             self._trim_first(leg)
             return
