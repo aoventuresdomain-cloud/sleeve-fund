@@ -71,10 +71,16 @@ def test_ii_a_gap_that_stops_just_inside_the_liquidation_price_is_a_normal_close
     assert "liquidation" not in _kinds(r, "follow") and "incident" not in _kinds(r, "follow")
 
 
-def test_i_on_paper_the_gap_books_the_perp_legs_liquidation_unwinds_the_spot_leg_and_still_halts(tmp_path, monkeypatch):
+@pytest.mark.parametrize("liquidation_first", [True, False])
+def test_i_on_paper_the_gap_books_the_perp_legs_liquidation_unwinds_the_spot_leg_and_still_halts(tmp_path, monkeypatch,
+                                                                                               liquidation_first):
     """The real two-leg node on a local hub: a long pair (spot, and a perp at 2x) entered at 60,000, then the price
     prints 29,000. The perp leg's liquidation is booked as one (loss X, the insurance line, the incident, a reset after
-    liquidation needed); the spot leg is unwound with it; the summed drawdown halt is raised too."""
+    liquidation needed); the spot leg is unwound with it; the summed drawdown halt is raised too.
+
+    T-FIX7 (QT2 F-P1-REBOOK, the _qa_p1_loud set-up): with Pair.liquidation_first off, the summed halt's flatten closes
+    the perp leg first, past its liquidation price, so its close is relabelled and re-booked in the journal: the same
+    liquidation, incident, insurance line and reset needed, and no handler_failed on either leg."""
     import threading
     import time
     from datetime import datetime, timezone
@@ -110,6 +116,10 @@ def test_i_on_paper_the_gap_books_the_perp_legs_liquidation_unwinds_the_spot_leg
                 self._send_entry(OrderSide.BUY, D("0.06"), "entry", {"close": self._price()})
 
     monkeypatch.setitem(REGISTRY, "driven", (Driven, LongFlatConfig))
+    if not liquidation_first:
+        from sleeve_fund.strategies.pair import Pair
+
+        monkeypatch.setattr(Pair, "liquidation_first", lambda self, leg, price: None)
     monkeypatch.setattr(LongFlatStrategy, "_entry_atr_pct", lambda self: 0.05)
     inst = venue("kraken").instrument("BTC", "USDT")
     insts = {str(inst.id): inst}
@@ -159,6 +169,12 @@ def test_i_on_paper_the_gap_books_the_perp_legs_liquidation_unwinds_the_spot_leg
         assert "liquidation" in kinds and "incident" in kinds
         assert liquidation_head(store, "carry~2") is not None  # a reset after liquidation is needed
         assert "insurance_fund" in kinds  # 29,000 is past the bankruptcy price (~30,000): the diagnostic line
+        failed = [e["message"] for n in ("carry", "carry~2") for e in store.events(n, limit=500)
+                  if e["kind"] == "handler_failed"]
+        assert failed == [], failed
+        if not liquidation_first:  # relabelled from the close that reached it, re-booked by the journal
+            assert closes[0]["signal"].get("relabelled_from") not in (None, "stop_loss"), closes[0]["signal"]
+            assert any(e["kind"] == "order_rebooked" for e in store.events("carry~2", limit=500))
         spot = [o["intent"] for o in store.orders("carry") if o["intent"] != "entry"]
         assert spot, "the spot leg was not unwound"
         halts = [e["message"] for n in ("carry", "carry~2") for e in store.events(n, limit=500)
@@ -190,6 +206,27 @@ def test_any_close_filled_past_the_liquidation_price_is_booked_as_a_liquidation(
     d = s.decisions["c1"]
     assert d["intent"] == "liquidation" and d["signal"]["market_px"] == 29_000.0 and booked
     assert d["signal"].get("relabelled_from", "stop_loss") == intent and s._rebook == "c1"
+
+
+def test_t_fix7_a_rebook_the_journal_refuses_is_taken_once_and_never_raises_on_the_legs_later_fills():
+    """T-FIX7: _rebook is taken before the journal's call, so a refusal raises for that fill only; the leg's next
+    fills re-book nothing and raise nothing (before, it stayed set and every later fill raised again, silently)."""
+    from sleeve_fund.strategies.base import LongFlatStrategy
+
+    calls = []
+
+    def refuse(*a, **k):
+        calls.append(a)
+        raise ValueError("refused")
+
+    s = SimpleNamespace(_rebook="c1", decisions={"c1": {"reason": "r", "signal": {}}, "c2": {"reason": "r", "signal": {}}},
+                        runtime=SimpleNamespace(store=SimpleNamespace(rebook_liquidation=refuse), now=lambda: None))
+    with pytest.raises(ValueError):
+        LongFlatStrategy._flush_rebook(s, "c1", None)
+    assert s._rebook is None
+    for coid in ("c2", "c2"):  # two later fills on the same leg
+        LongFlatStrategy._flush_rebook(s, coid, None)
+    assert len(calls) == 1
 
 
 @pytest.mark.parametrize("intent, px", [("risk_halt", 31_000.0), ("entry", 29_000.0), ("liquidation", 29_000.0)])

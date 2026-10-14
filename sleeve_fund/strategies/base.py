@@ -4681,6 +4681,14 @@ class LongFlatStrategy(Strategy):
         liq = self._liq_now(cash, qty) if qty else None
         return {"liquidation_px": round(liq, 8)} if liq is not None else {}
 
+    def _flush_rebook(self, coid: str, at: datetime | None) -> None:
+        """Re-book the order _gap_liquidation relabelled, once its fill is in the journal. Taken before the call
+        (T-FIX7): a journal that refuses it raises once, for this fill, and never again on the leg's later fills."""
+        rebook, self._rebook = self._rebook, None
+        if rebook is not None:
+            d = self.decisions[coid]
+            self.runtime.store.rebook_liquidation(rebook, d["reason"], d["signal"], ts=at or self.runtime.now())
+
     def _gap_liquidation(self, coid: str, journal_id: str, price: float) -> bool:
         """GAP-LIQ (Independent Quant Advisor, 6 Oct): a stop whose fill, after slippage, is at or past the
         liquidation price books as a liquidation, the venue having taken the position first; since 14 Oct 15:00 UK
@@ -5553,10 +5561,7 @@ class LongFlatStrategy(Strategy):
             self.runtime.on_fill(side="BUY" if event.is_buy else "SELL", qty=qty, price=px, fee=fee,
                                  order_id=journal_id, trade_id=str(event.trade_id), ts=at)
             self.runtime.on_timing(journal_id, fill=int(event.ts_init), venue_ts=int(event.ts_event))
-            if self._rebook is not None:
-                d = self.decisions[coid]
-                self.runtime.store.rebook_liquidation(self._rebook, d["reason"], d["signal"], ts=at or self.runtime.now())
-                self._rebook = None
+            self._flush_rebook(coid, at)
         if self._margin and opening and intrabar is not None and coid != self._restore_id:
             self._opened_in_bar.append((intrabar, sign * qty))  # charged with the bar's range in on_bar
         if self._margin and self._entry_side == 0:
