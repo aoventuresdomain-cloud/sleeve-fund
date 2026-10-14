@@ -142,11 +142,16 @@ def test_c1_replay_cash_equals_stored_cash_to_the_cent_before_and_after_the_migr
         from alembic import command
 
         command.upgrade(schema._config(conn), PRE_DA9)
+        # The strategy's row as the pre-DA-9 schema holds it: today's Store names columns later migrations add (0017's
+        # lifecycle), so it is written, and its starting balance read, without it until the migration below.
+        conn.execute(text("INSERT INTO sleeves (name, strategy, instrument, bar_spec, params, starting_balance, "
+                          "risk_profile, warmup_bars, desired_state, status, status_reason, created_at, updated_at) "
+                          "VALUES ('da9', 'trend', 'BTC/USD', '1-HOUR-LAST-EXTERNAL', '{}', 10000, 'balanced', 0, "
+                          "'running', 'starting', '', :ts, :ts)"), {"ts": T0})
     store = Store(engine=engine)
-    _sleeve(store)
     exact = _seed(store)
 
-    before = store.journal_book("da9", store.sleeve("da9").starting_balance)
+    before = store.journal_book("da9", Decimal(10000))
     stored_before = store.last_equity("da9")["cash"]
     assert _to_cent(before["cash"]) == _to_cent(stored_before)
     if PG:  # the exact figure: Postgres only (SQLITE_WHY)
