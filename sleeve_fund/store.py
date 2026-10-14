@@ -3967,8 +3967,8 @@ class Store:
             with self.engine.begin() as c:
                 latest = c.execute(select(func.max(compliance_versions_t.c.version))).scalar() or 0
                 if latest != expected_version:
-                    raise ValueError(f"the tests changed since this page was opened (now version {latest}): reload "
-                                     "and edit again")
+                    raise ValueError("the compliance tests changed since this page was opened "
+                                     f"(now version {latest}): reload and edit again")
                 old = self.compliance(latest, conn=c) if latest else None
                 v = latest + 1
                 c.execute(insert(compliance_versions_t).values(version=v, created_at=now, created_by=created_by,
@@ -3981,7 +3981,7 @@ class Store:
                     ts=now, actor=created_by, action="compliance_version", sleeve=None,
                     reason=f"compliance tests v{v} ({note.strip()}): {_compliance_changes(old, rows, groups)}"))
         except IntegrityError as exc:  # another write took the same version number first
-            raise ValueError("the tests changed since this page was opened: reload and edit again") from exc
+            raise ValueError("the compliance tests changed since this page was opened: reload and edit again") from exc
         return v
 
     def prune_backtests(self, keep: int = 50) -> int:
