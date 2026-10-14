@@ -28,7 +28,7 @@ from decimal import Decimal
 from nautilus_trader.model import Bar
 
 from sleeve_fund.data import bar_minutes
-from sleeve_fund.strategies.base import IdeaSpec, LongFlatConfig, LongFlatStrategy
+from sleeve_fund.strategies.base import EXIT_LEGS, IdeaSpec, LongFlatConfig, LongFlatStrategy
 
 CYCLE = 6
 HALF = Decimal("0.5")
@@ -144,6 +144,14 @@ SPEC = IdeaSpec(
     listed=False,
 )
 
+def D_(x) -> Decimal:
+    return Decimal(str(x))
+
+
+def _ts(t) -> datetime:
+    return t if t.tzinfo is not None else t.replace(tzinfo=UTC)
+
+
 STEP_WORDS = ("buy Q", "sell half", "sell the rest and short Q", "cover half", "close the short and buy Q", "wait")
 
 
@@ -167,6 +175,28 @@ class CandleStep(LongFlatStrategy):
         self.c = config
         self._plan: Plan | None = None
         self._started: datetime | None = None
+        self._last_q: Decimal | None = None  # the last cycle's Q, carried while its long is held
+        self._resumed: tuple[int, Decimal | None, bool] | None = None  # (cycle, Q, ended) from the journal
+
+    def resume_cycle(self) -> None:
+        """After a restart: the cycle the journal's newest step order was in, its Q, and whether a stop or target has
+        ended it, so the cycle carries on where it stood. Every step is an absolute target in Q, so a step decided after
+        the restart sends only what is still missing, and one missed while down is made up by the next: it never
+        doubles a position. With nothing in the journal it starts afresh at the next step 0."""
+        if self.runtime is None or self.runtime.backtest:
+            return
+        rows = self.runtime.store.orders(self.runtime.name, limit=100)
+        steps = [o for o in rows if "cycle" in (o["signal"] or {})]
+        if not steps:
+            return
+        cycle = steps[0]["signal"]["cycle"]
+        mine = [o for o in steps if o["signal"]["cycle"] == cycle]
+        q = next((D_(o["signal"]["q"]) for o in mine if o["signal"].get("q") is not None), None)
+        if q is None:  # only the cycle's first open is journaled yet: what it asked for is Q
+            q = next((D_(o["qty"]) for o in mine if o["intent"] == "entry" and o["signal"].get("step") == 0), None)
+        first = min(_ts(o["ts"]) for o in mine)
+        ended = any(o["intent"] in EXIT_LEGS and (o["filled_qty"] or 0) > 0 and _ts(o["ts"]) >= first for o in rows)
+        self._resumed, self._last_q = (cycle, q, ended), q
 
     def want_side(self, bar: Bar) -> int | None:
         return None  # never decides by side: every order comes from the step
@@ -188,9 +218,16 @@ class CandleStep(LongFlatStrategy):
             self._started = close
         plan = self._plan
         if plan is None or plan.cycle != cycle:
-            # A long carried into the cycle's first candle (the last cycle's wait) is this cycle's Q: no top-up.
-            plan = self._plan = Plan(cycle, held if step == 0 and held > 0 else None, self._started,
-                                     self.c.run_for_hours)
+            q, ended = None, False
+            if self._resumed is not None and self._resumed[0] == cycle:
+                _, q, ended = self._resumed  # a restart inside this cycle: carry on with its Q
+            elif step == 0 and held > 0:
+                # The last cycle's long, carried into this one's first candle: its Q carries too, topped up to if
+                # short of it. Q is sized afresh only from flat, so a missed step never shrinks every later cycle.
+                q = self._last_q or held
+            plan = self._plan = Plan(cycle, q, self._started, self.c.run_for_hours, exited=ended)
+            if q is not None:
+                self._last_q = q
         values = {"cycle": cycle, "step": step}
         if plan.q is not None:
             values["q"] = float(plan.q)
@@ -208,7 +245,7 @@ class CandleStep(LongFlatStrategy):
     def entry_sent(self, qty: Decimal, values: dict) -> None:
         """The cycle's first open was sized: its quantity is Q for the rest of the cycle (Advisor CANDLE-STEP)."""
         if self._plan is not None and self._plan.q is None and values.get("cycle") == self._plan.cycle:
-            self._plan.q = qty
+            self._plan.q = self._last_q = qty
 
 
 __all__ = ["CYCLE", "STEPS", "SPEC", "CandleStep", "CandleStepConfig", "Plan", "Step", "step_at"]
