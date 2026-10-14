@@ -84,3 +84,45 @@ def test_past_the_run_window_it_closes_and_opens_nothing(prices, instrument):
     q = fills[0][1]
     assert fills == [("BUY", q, "entry"), ("SELL", q / 2, "exit"), ("SELL", q / 2, "exit"), ("SELL", q, "entry"),
                      ("BUY", q, "exit")]
+
+
+def test_after_a_top_up_the_stop_covers_the_whole_position(prices, instrument):
+    """Advisor (HoE 14 Oct ~23:38 UK): Q carries into the next cycle and a long short of it is topped up; once the top-up
+    fills, the stop covers the FULL position. Step 4's open is trimmed to Q/2 by the bar's volume cap (a thin bar), so
+    the next step 0 tops up; then the price goes through the stop, which sells everything."""
+    first, closes = _from_step_0(prices, 8)
+    closes[first + 7:] = [99.7] * (len(closes) - first - 7)  # through the 0.1% stop on the bar after the top-up
+    path = _path(prices, closes)
+    path.iloc[first + 4, path.columns.get_loc("volume")] = 3_000  # step 4: 1% of it is 30, half of Q
+    res = run_backtest("candle_step", path, instrument, {**PARAMS, "max_participation": 0.01}, half_spread=0)
+    fills = _fills(res)
+    q = fills[0][1]
+    assert fills[6:] == [("BUY", q / 2, "entry"), ("BUY", q / 2, "entry"), ("SELL", q, "stop_loss")], fills
+    assert res.exposure.iloc[-1] == 0  # nothing left naked
+
+
+def test_a_top_up_goes_through_the_compliance_tests_and_is_refused_on_a_full_book():
+    """Advisor: a top-up is new risk, so it is gated like any entry. Net per asset at 0.45 of the book trims every open
+    of Q (0.6) to about 0.45; the next step 0 asks to top up to Q and the same test refuses it, naming itself."""
+    import pandas as pd
+    from nautilus_trader.model import Venue
+
+    from sleeve_fund.instruments import spot_pair
+    from sleeve_fund.research.portfolio_run import LegSpec, run_portfolio
+    from sleeve_fund.risk import PortfolioProfile
+    from test_portfolio_run import FEES, _daily
+
+    idx = pd.date_range("2024-01-01 01:00", periods=24 * 40, freq="h", tz="UTC")
+    h = pd.DataFrame({"open": 100.0, "high": 100.0, "low": 100.0, "close": 100.0, "volume": 1e6}, index=idx)
+    d = _daily(h)
+    w, window = d.iloc[:20], d.iloc[20:]
+    spec = LegSpec("cs", "candle_step", spot_pair("BTC", "USD", FEES, Venue("KRAKEN")), window,
+                   h[h.index > w.index[-1]], w, params={k: v for k, v in PARAMS.items() if k != "stop_loss"})
+    run = run_portfolio([spec], PortfolioProfile(gross=100, net_instrument=0.45, margin=100, open_risk=100,
+                                                 drawdown=0.99, daily_loss=0.99))
+    opens = [x for x in run.decisions if x["requested"] == D(60)]
+    assert opens and all(x["outcome"] == "trimmed" and x["limit"] == "net_instrument" for x in opens)
+    top_ups = [x for x in run.decisions if x["requested"] < D(30)]
+    assert top_ups and all(x["outcome"] == "rejected" and x["approved"] == 0 and x["limit"] == "net_instrument"
+                           for x in top_ups)
+    assert all(x["side"] == 1 for x in top_ups)  # only ever a long carried into step 0
