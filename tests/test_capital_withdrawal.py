@@ -510,3 +510,30 @@ def test_d8_a_withdrawn_strategy_holding_blocks_every_entry_and_raises_an_alert(
     _poll(store, T0 + timedelta(minutes=2))
     alerts = store.events_of(("withdrawn_holds",))
     assert len(alerts) >= 1 and all(e["level"] == "error" for e in alerts)
+
+
+def test_d8b_dust_left_after_a_withdrawal_blocks_nothing_and_is_named_while_a_real_position_blocks(store):
+    """Advisor 11:10 UK: the invariant uses the withdrawal's own flat (Store.lifecycle_flat), so dust is no breach."""
+    from sleeve_fund.paper import portfolio_gate
+
+    _make(store, "a", 20_000)
+    _make(store, "b", 10_000)
+    _open(store, "b")
+    _mark(store, T0)
+    store.archive("b")
+    store.record_fill("b", side="SELL", qty=0.4995, price=1_000.0, fee=0.0, order_id="b-out", trade_id="b-out",
+                      ts=T0 + timedelta(minutes=1))  # 0.0005 left at 1,000: 0.50 of notional, under any order
+    _settle(store, "b", T0 + timedelta(minutes=1))
+    sup = supervisor.Supervisor(store)
+    sup.mark_portfolio(T0 + timedelta(minutes=1))
+    (flow,) = _flows(store)
+    assert "b" in store.withdrawn() and "dust of 0.0005" in flow
+    assert portfolio_gate.fund_holdings(store, atr_pct=lambda s: 0.02) == ()
+    sup.mark_portfolio(T0 + timedelta(minutes=2))
+    assert store.events_of(("withdrawn_holds",)) == []
+    store.record_fill("b", side="BUY", qty=0.5, price=1_000.0, fee=0.0, order_id="b-again", trade_id="b-again",
+                      ts=T0 + timedelta(minutes=3))
+    with pytest.raises(ValueError, match="every entry is refused"):
+        portfolio_gate.fund_holdings(store, atr_pct=lambda s: 0.02)
+    sup.mark_portfolio(T0 + timedelta(minutes=3))
+    assert len(store.events_of(("withdrawn_holds",))) == 1

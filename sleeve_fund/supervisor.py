@@ -627,11 +627,12 @@ class Supervisor:
 
     def _alert_withdrawn_holders(self, now: datetime) -> None:
         """A withdrawn Strategy holding a position is a broken invariant (Advisor 14 Oct 10:45 UK): its exposure
-        would count against a book its equity left. The gate's holdings refuse it (fund_holdings raises, so every
+        would count against a book its equity left; dust no order can close is flat, as for the withdrawal. The gate's
+        holdings refuse it (fund_holdings raises, so every
         entry fails closed); this raises the alert, once per spell."""
         out = self.store.withdrawn()
-        breach = {s.name for s in self.store.sleeves() if s.name in out
-                  and abs(self.store.journal_book(s.name, s.starting_balance)["qty"]) > 1e-12}
+        # flat as a withdrawal judges it (Store.lifecycle_flat): dust left after one is no breach (Advisor 11:10 UK)
+        breach = {s.name for s in self.store.sleeves() if s.name in out and not self.store.lifecycle_flat(s.name)[1]}
         for name in sorted(breach - self._breach_told):
             self.store.event(name, "error", "withdrawn_holds", f"{name}'s equity left the fund's book, yet it holds "
                              "a position: no Strategy may enter until it is resolved")

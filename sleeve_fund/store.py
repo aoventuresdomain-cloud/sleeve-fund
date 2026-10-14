@@ -1627,8 +1627,12 @@ class Store:
             kind, value = seen[0]
             return -value if kind == "out" else Decimal(0)
 
-        with self._book_move(amount, lambda: f"{sleeve} put away ({why}): its equity {seen[0][1]:,.2f} leaves the "
-                                             "fund's book", ts) as c:
+        def said() -> str:
+            qty = self.lifecycle_flat(sleeve)[0]
+            dust = f", with dust of {qty} no order can close, which leaves with it" if qty else ""
+            return f"{sleeve} put away ({why}): its equity {seen[0][1]:,.2f} leaves the fund's book{dust}"
+
+        with self._book_move(amount, said, ts) as c:
             yield c
             # Put away again (archived, then retired; a second archive): already out, so it keeps its row, its
             # amount and when it went, with no second flow (DA, 14 Oct).
