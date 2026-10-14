@@ -36,6 +36,7 @@ from sleeve_fund.data import bar_minutes
 from sleeve_fund import router
 from sleeve_fund.instruments import BOOK_SHARE, lot_decimals, pair_of, taker_slippage, target_fill_px
 from sleeve_fund.margin import entry_liquidation
+from sleeve_fund.paper.runtime import FILL_HANDLER_PAUSE  # noqa: F401  (T-FIX8's name, kept for its callers)
 from sleeve_fund.paper.runtime import ENTRY_CANCELLED, EXITS_ONLY, RACED_FILL, RESUMABLE, WIPED_OUT, block_codes, liquidation_reason
 from sleeve_fund.paper.runtime import WIND_STOP as WIND_STOP_INTENT
 from sleeve_fund.store import DUST, OPEN_ORDER_STATUSES, replay_book
@@ -479,7 +480,6 @@ _HANDLER_WORDS = {"on_trade": "a trade print", "on_quote": "a quote", "on_order_
                   "on_order_modify_rejected": "a resize refused", "on_bar": "a bar", "_on_tick": "the risk check",
                   "_maker_timeout": "a post-only order's wait running out"}
 MAX_KEPT_ERRORS = 100  # handler errors kept with their text; every one is counted
-FILL_HANDLER_PAUSE = "paused: a fill handler failed, so its book is in doubt; resume once it is checked"  # T-FIX8
 
 
 def handler_error_words(handler: str, exc: BaseException | str) -> str:
@@ -768,6 +768,9 @@ class LongFlatStrategy(Strategy):
         self._fills_read: tuple[int, list] | None = None  # (last fill id, the journal's fills then): _position_at
         self._filling = 0.0  # a fill the venue has booked and the journal not yet: on_order_filled, _apply_funding
         self._portfolio = None  # (CloseBatch, name) in a portfolio run (P2-7): opening orders wait for its gate pass
+        # BRIDGE-3 (Advisor 14 Oct ~21:55 UK): the fund's equity an entry is sized from, () -> float, set where the fund
+        # holds the cash (paper's book, a portfolio run). Unset, the Strategy is the whole fund: its own equity.
+        self.fund_equity = None
         # In a portfolio run, what its gate did to each opening order: "<entry|rebalance>_<outcome>" -> count, outcome
         # one of sent, trimmed (sent smaller), below_minimum (trimmed under the venue's minimum, not sent), refused.
         self.portfolio_gate: dict[str, int] = {}
@@ -832,14 +835,40 @@ class LongFlatStrategy(Strategy):
             except Exception:  # the journal itself failing must not hide the first error
                 pass
         if name == "on_order_filled" and self.runtime is not None and not self.runtime.backtest:
-            # The Advisor's loud failure (T-FIX8): a fill this Strategy failed to handle leaves its book in doubt, so it
-            # opens nothing more until the PM resumes it: the PM's own pause, with no end time (a daily-loss pause's
-            # 00:00 roll never lifts it). Exits, stops and flattens still go; a halt in force stays.
+            # The Advisor's loud failure (T-FIX8, F-T-2): a fill this Strategy failed to handle leaves its book in doubt,
+            # so it opens nothing more until the PM resumes it: the runtime's fill-handler hold, with no end time, which
+            # never overwrites a stricter state. Exits, stops and flattens still go.
             try:
-                if self.runtime.status != "halted":
-                    self.runtime._set("paused", FILL_HANDLER_PAUSE)
+                self.runtime.hold_entries()
             except Exception:  # the journal failing must not hide the first error
                 pass
+            try:
+                self._protect_after_failed_fill()
+            except Exception:  # its own failure is counted and journaled as the tick's would be, once
+                self.handler_error_count += 1
+                self.log.error(f"protecting the position after a failed fill handler failed\n{traceback.format_exc()}")
+
+    def _protect_after_failed_fill(self) -> None:
+        """F-T-2 (Advisor 14 Oct ~21:40 UK, MUST): the hold only blocks entries, so a position it leaves must be under
+        a working stop computed from its fill: the stop the paper engine watches (_check_exits), on an entry book that
+        matches the venue's position. A fill handler can fail before that is so (the entry book, the liquidation
+        price, the stop's plan or cap), and then the position is closed at market instead. Never unprotected."""
+        held = self._position_qty()
+        if held < self._min_qty():
+            return  # flat, or dust no order can close
+        if not self._stop_designed:
+            return  # a stopless Model holds no stop by design, inside its 1x cap: as it trades every day
+        side = self._pos_side() if self._margin else 1
+        booked = Decimal(repr(float(self._entry_qty or 0.0)))
+        if (self._entry_px is not None and self._stop_frac is not None and self._entry_side == side
+                and abs(booked - held) <= self._lot() / 2):
+            return  # its stop is watched, from an entry book the fill reached
+        why = ("Fill-handler hold: the position has no working stop computed from its fill (the fill handler failed "
+               "before it was set), so it is closed at market")
+        self.runtime.store.event(self.runtime.name, "error", "fill_hold_flatten", why, ts=self.runtime.now())
+        self.cancel_all_orders(self._cfg.instrument_id)
+        self._flip = None
+        self._sell_all("exit", why, {"position": float(held)})
 
     def attach_runtime(self, runtime) -> "LongFlatStrategy":
         self.runtime = runtime
@@ -1289,6 +1318,12 @@ class LongFlatStrategy(Strategy):
     def _has_exits(self) -> bool:
         c = self._cfg
         return bool(c.stop_loss or c.stop_atr or c.stop_swing_bars or c.take_profit)
+
+    @property
+    def _stop_designed(self) -> bool:
+        """Whether this Model's positions carry a stop (a stopless one is held to 1x instead)."""
+        c = self._cfg
+        return bool(c.stop_loss or c.stop_atr or c.stop_swing_bars)
 
     def _plan_exits(self, close: float, side: int = 1) -> tuple[float | None, float | None, str] | None:
         """This entry's stop and target as shares of the price, and how the stop was set; None while
@@ -2125,21 +2160,30 @@ class LongFlatStrategy(Strategy):
             else:
                 self._noted.discard("target_below_costs")
         equity, cash, _, _ = self._mark()
-        if equity <= 0:
+        # CUT-A: sized off the fund's equity, never the Strategy's own (which starts at 0 once the fund holds the cash).
+        base = self._sizing_base(equity)
+        if base is None:
+            self._note("entry_refused_fund_equity", "Entry refused: fund equity stale: the last portfolio mark is older "
+                       "than its interval allows, so nothing is sized off an old figure")
+            return
+        self._noted.discard("entry_refused_fund_equity")
+        if base <= 0:
             self.log.warning("no equity to size from yet; skipping entry")
             return
         fee = Decimal(str(self._cfg.assumed_taker_fee))
         room = Decimal(1) - Decimal(str(self._cfg.cash_buffer)) - fee
         lev = LongFlatStrategy._max_leverage(self)
-        limits = {f"{lev:g}x leverage cap": Decimal(str(equity * lev)) * room}
+        limits = {f"{lev:g}x leverage cap": Decimal(str(base * lev)) * room}  # SIZE-FUND Q3: on fund equity
+        if self._fund_held():  # the margin the simulated account can post (PE2 funds it from the fund's free cash)
+            limits["margin account"] = Decimal(str(max(cash, 0.0) * lev)) * room
         if self.runtime is not None:
-            limits[f"{self.runtime.profile.name} risk profile cap"] = Decimal(str(self.runtime.position_budget(equity)))
+            limits[f"{self.runtime.profile.name} risk profile cap"] = Decimal(str(self.runtime.position_budget(base)))
         elif self._cfg.position_cap_pct is not None:
-            limits["risk profile cap"] = Decimal(str(equity * self._cfg.position_cap_pct))
+            limits["risk profile cap"] = Decimal(str(base * self._cfg.position_cap_pct))
         if self._cfg.max_notional is not None:
             limits["largest order cap"] = Decimal(str(self._cfg.max_notional))
         if self._cfg.risk_per_trade and self._stop_frac:
-            limits["risk per trade"] = Decimal(str(equity * self._cfg.risk_per_trade / self._loss_at_stop(side)))
+            limits["risk per trade"] = Decimal(str(base * self._cfg.risk_per_trade / self._loss_at_stop(side)))
         if (cap := self._volume_cap(bar)) is not None:
             limits["share of the bar's volume"] = cap
         size_by = min(limits, key=limits.get)
@@ -3032,15 +3076,18 @@ class LongFlatStrategy(Strategy):
             limits["target weight"] = Decimal(str((self._mark()[0] or float(free.as_decimal())) * weight))
         if self._cfg.max_notional is not None:
             limits["largest order cap"] = Decimal(str(self._cfg.max_notional))
+        base = self._sizing_base(self._mark()[0] or float(free.as_decimal()))
+        if base is None:
+            self._note("entry_refused_fund_equity", "Buy refused: fund equity stale: the last portfolio mark is older "
+                       "than its interval allows, so nothing is sized off an old figure")
+            return
+        self._noted.discard("entry_refused_fund_equity")
         if self.runtime is not None:
-            limits[f"{self.runtime.profile.name} risk profile cap"] = Decimal(
-                str(self.runtime.position_budget(self._mark()[0])))
+            limits[f"{self.runtime.profile.name} risk profile cap"] = Decimal(str(self.runtime.position_budget(base)))
         elif self._cfg.position_cap_pct is not None:
-            equity = self._mark()[0] or float(free.as_decimal())
-            limits["risk profile cap"] = Decimal(str(equity * self._cfg.position_cap_pct))
+            limits["risk profile cap"] = Decimal(str(base * self._cfg.position_cap_pct))
         if self._cfg.risk_per_trade:
-            equity = self._mark()[0] or float(free.as_decimal())
-            limits["risk per trade"] = Decimal(str(equity * self._cfg.risk_per_trade / self._loss_at_stop()))
+            limits["risk per trade"] = Decimal(str(base * self._cfg.risk_per_trade / self._loss_at_stop()))
         if (cap := self._volume_cap(bar)) is not None:
             limits["share of the bar's volume"] = cap
         size_by = min(limits, key=limits.get)
@@ -5003,6 +5050,47 @@ class LongFlatStrategy(Strategy):
         if account is None:  # live sandbox: ask the cache directly
             account = self.cache.account_for_venue(self._cfg.instrument_id.venue)
         return account
+
+    def _fund_held(self) -> bool:
+        """Paper inside the fund (the portfolio gate on, and in the fund's book): the fund holds the cash, so the
+        Strategy's own equity (its P&L, from a starting balance of 0) never sizes, halts or pauses it (Advisor CUT-A
+        (d)). A test Strategy outside the book (F229-6) is its own fund."""
+        rt = self.runtime
+        return rt is not None and not rt.backtest and self._paper_gated() is not None
+
+    def _paper_fund_equity(self) -> float | None:
+        """Paper's fund equity: the supervisor's last portfolio mark, or None when it is stale by the book's own rule
+        (gate.MARK_STALE, the one that already blocks entries) or can't be read (Advisor SIZE-FUND Q5: stale is
+        refused, never sized off)."""
+        from sleeve_fund.gate_ledger import DbLedger
+        from sleeve_fund.paper.runtime import _no_positions
+        from sleeve_fund.portfolio import gate
+
+        try:
+            st = DbLedger(self.runtime.store, _no_positions).state()
+        except Exception as exc:  # noqa: BLE001 - fail closed: an unread book sizes nothing
+            self.log.warning(f"fund equity unreadable: {type(exc).__name__}: {exc}")
+            return None
+        if st.equity is None or st.mark_ts is None:
+            return None
+        if self.runtime.now() - st.mark_ts > gate.MARK_STALE:
+            return None
+        return float(st.equity)
+
+    def _sizing_base(self, equity: float) -> float | None:
+        """BRIDGE-3: the equity an entry's size is a share of: the fund's when the fund holds the cash (fund_equity),
+        else this Strategy's own, which is then the whole fund; in both without a gain not yet taken (+ min(0,
+        unrealised)), so a winning position never sizes the next order up. The leverage cap reads it too (SIZE-FUND Q3);
+        free cash stays the margin account's, an order-validity rule."""
+        if self.fund_equity is not None:
+            fund = self.fund_equity()  # None: the last portfolio mark is stale (Advisor SIZE-FUND Q5, fail closed)
+            return None if fund is None else float(fund)
+        if self._fund_held():
+            return self._paper_fund_equity()  # never the Strategy's own, nor its unrealised gain
+        if self._entry_px is None or not self._entry_qty:
+            return equity
+        gain = (self._entry_side or 1) * self._entry_qty * (self._price() - self._entry_px)
+        return equity - max(gain, 0.0)
 
     def _mark(self, price: float | None = None) -> tuple[float, float, float, float]:
         """(equity, cash, position qty, price) in the quote currency, at `price` (default: the last price)."""

@@ -30,26 +30,40 @@ def _gated(journal, equity=D(20_000)) -> Store:
 def _decisions(journal) -> list:
     d, r = gate_decisions_t, gate_reservations_t
     with journal.engine.connect() as c:
-        return list(c.execute(select(d.c.id, d.c.order_id, d.c.outcome, r.c.release_reason)
+        return list(c.execute(select(d.c.id, d.c.order_id, d.c.outcome, d.c.limit_hit, r.c.release_reason)
                               .outerjoin(r, r.c.decision_id == d.c.id).order_by(d.c.id)))
+
+
+def _one_checked_entry(tmp_path, paper, monkeypatch, params=None) -> tuple:
+    run(tmp_path, paper, Plan(t0=STD_T0, minutes=6, windows=[(M(STD_T0, 2), M(STD_T0, 6), 1)], params=params or {}),
+        monkeypatch)
+    entries = [o for o in _orders(paper) if o["intent"] == "entry"]
+    assert entries, "no entry sent"
+    (row,) = _decisions(paper)  # one check
+    assert (row.order_id, row.release_reason) == (entries[0]["order_id"], "fill"), row  # linked to its order, its fill
+    return row
 
 
 def test_a_paper_entry_is_checked_its_order_holds_the_reservation_and_its_fill_releases_it(
         tmp_path, store, monkeypatch):  # noqa: F811
-    paper = _gated(store)
-    run(tmp_path, paper, Plan(t0=STD_T0, minutes=6, windows=[(M(STD_T0, 2), M(STD_T0, 6), 1)]), monkeypatch)
-    entries = [o for o in _orders(paper) if o["intent"] == "entry"]
-    assert entries, "no entry sent"
-    rows = _decisions(paper)
-    assert [(r.order_id, r.outcome, r.release_reason) for r in rows] == [
-        (entries[0]["order_id"], "approved", "fill")], rows  # one check, linked to its order, settled by its fill
+    # 1% risk at the 2% stop sizes ~9,200 off the 20,000 fund (CUT-A), inside the 0.5x net limit (10,000): approved.
+    row = _one_checked_entry(tmp_path, _gated(store), monkeypatch, params={"risk_per_trade": 0.01})
+    assert row.outcome == "approved", row
+
+
+def test_a_paper_entry_sized_past_the_net_limit_is_trimmed_by_it_and_still_sent(tmp_path, store, monkeypatch):  # noqa: F811
+    """TEC-QD-CUTA: sized off the 20,000 fund (balanced, 2x: 66%), the entry is past the 0.5x net limit (T4)."""
+    row = _one_checked_entry(tmp_path, _gated(store), monkeypatch)
+    assert (row.outcome, row.limit_hit) == ("trimmed", "net_instrument"), row
 
 
 def test_a_paper_entry_the_portfolio_refuses_is_never_sent_and_says_why(tmp_path, store, monkeypatch):  # noqa: F811
     paper = _gated(store)
-    # A book this small has no room for the smallest order. Set once the replay has created the Strategy, whose
-    # capital is a deposit into a marked book (HALT-REF-1) and would otherwise make the room.
-    shrink = (M(STD_T0, 1), lambda rt, kw: _gated(paper, equity=D(1)))
+    # A book of 100 sizes the entry to the smallest order (66 of notional, 0.001), and its 0.5x net room (50) can't
+    # take it (TEC-QD-CUTA: sizing reads the same book, so at 1 nothing would be sized to reach the gate). Set once
+    # the replay has created the Strategy, whose capital is a deposit into a marked book (HALT-REF-1) and would
+    # otherwise make the room.
+    shrink = (M(STD_T0, 1), lambda rt, kw: _gated(paper, equity=D(100)))
     run(tmp_path, paper, Plan(t0=STD_T0, minutes=6, windows=[(M(STD_T0, 2), M(STD_T0, 6), 1)], hooks=[shrink]),
         monkeypatch)
     assert not [o for o in _orders(paper) if o["intent"] == "entry"]
