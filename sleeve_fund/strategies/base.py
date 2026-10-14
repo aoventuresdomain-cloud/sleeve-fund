@@ -2549,7 +2549,7 @@ class LongFlatStrategy(Strategy):
             elif intent == "liquidation":
                 self._liquidation_guard(cash, qty, px)
             else:  # the risk guard: the tick judges the equity at the minute's worst price, as it would have
-                self._guard_equity = cash + qty * worst
+                self._guard_equity = self._replayed_guard_equity(cash, qty, worst)
                 self._guard_price = px if intent == "liquidation_cut" else None
                 self._on_tick()
         finally:
@@ -3411,6 +3411,13 @@ class LongFlatStrategy(Strategy):
         if not self.pair.same_prices:
             return equity + o_equity, None, None
         return equity + o_equity, cash + o_cash, qty + o_qty
+
+    def _replayed_guard_equity(self, cash: float, qty: float, worst: float) -> float:
+        """The equity an outage replay's risk guard is judged by, at the minute's worst price: this strategy's own, or a
+        two-leg Strategy's both legs summed through _guard_book, as the live tick judges it (CR F283-5). One leg alone
+        against the summed peak would read a hedged pair as half lost."""
+        own = cash + qty * worst
+        return own if self.pair is None else self._guard_book(own, cash, qty, worst)[0]
 
     def _pair_trade(self) -> dict:
         """A two-leg Strategy's open trade id, journaled on every order of the trade on both legs (P2-8), or nothing."""

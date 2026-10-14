@@ -381,8 +381,17 @@ class Pair:
             if each.pair is not self:
                 return "its coordinator is gone"
             rt = each.runtime
-            if rt is not None and not rt.can_open():
-                return (rt.entry_blocked()[1] if not rt.backtest else None) or f"a leg is {rt.status}"
+            if rt is None:
+                continue
+            if rt.backtest:
+                if not rt.can_open():
+                    return f"a leg is {rt.status}"
+                continue
+            # CHOKE on each leg, not can_open alone: stale data, a degraded candle or the portfolio's block on the
+            # other leg unwinds the pair too (CR F283-4).
+            blocked, why = rt.entry_blocked()
+            if blocked or not rt.can_open():
+                return why or f"a leg is {rt.status}"
         if getattr(self, "_store", None) is not None:
             row = self._store.pair_state(self._parent)
             if row is None or (row["state"], row["trade_id"]) != ("legging", self.trade_id):

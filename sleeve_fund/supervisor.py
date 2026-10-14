@@ -120,6 +120,16 @@ def _holding(store: Store, s: Sleeve) -> bool:
     return abs(book["qty"]) > 1e-12 and not is_dust(book)
 
 
+def _held_words(store: Store, name: str) -> str:
+    """What the Strategy `name` belongs to holds, leg by leg when it has two (CR F283-2): "0.1", or "carry 0.1,
+    carry~2 -0.1"."""
+    legs = store.legs(name)
+    qty = {leg: store.journal_book(leg, store.sleeve(leg).starting_balance)["qty"] for leg in legs}
+    if len(legs) == 1:
+        return f"{qty[legs[0]]:.12g}"
+    return ", ".join(f"{leg} {q:.12g}" for leg, q in qty.items())
+
+
 def _status(st: PortfolioState, now: datetime) -> str:
     return "halted" if st.halted else "paused" if st.paused_until and now < st.paused_until else "ok"
 
@@ -301,9 +311,8 @@ class Supervisor:
         try:
             check_hub_bar_spec(s.venue, s.bar_spec)
         except ValueError as exc:
-            qty = self.store.journal_book(name, s.starting_balance)["qty"]
-            held = (f". It still holds a position ({qty:.12g}), which a flatten can't close while it can't start: "
-                    "an engineer needs to close it" if abs(qty) > 1e-12 else "")
+            held = (f". It still holds a position ({_held_words(self.store, name)}), which a flatten can't close while "
+                    "it can't start: an engineer needs to close it" if self.store.holds_any(name) else "")
             self.store.set_desired_state(name, "stopped")
             self.store.set_status(name, "stopped", f"not started: {exc}{held}")
             self.store.event(name, "error", "start_refused", f"Not started: {exc}{held}")
@@ -334,16 +343,16 @@ class Supervisor:
         reason: its exits run, a safety stop is set from the mark, no entry or add opens, and an incident is raised
         (LongFlatStrategy._safety_stop_on_restore). Any refusal can use it, so a position is never left without a
         process watching it. True when it applies."""
-        book = self.store.journal_book(s.name, s.starting_balance)
-        if abs(book["qty"]) <= 1e-12 or is_dust(book):
+        if not self.store.holds_any(s.name):  # either leg of a two-leg Strategy (CR F283-2)
             return False
+        held = _held_words(self.store, s.name)
         reason = f"{EXITS_ONLY}: {why}"
         if s.status != "paused" or s.status_reason != reason:
             self.store.set_status(s.name, "paused", reason)
             self.store.event(s.name, "error", "start_refused", f"Not started to trade: {why}. It still holds a "
                              "position, so it is started for its exits only, with a safety stop")
             self.store.event(s.name, "error", "incident",
-                             f"Incident, {s.name}: not started to trade ({why}), but it holds {book['qty']:.12g}, so it "
+                             f"Incident, {s.name}: not started to trade ({why}), but it holds {held}, so it "
                              "runs for its exits only, with a safety stop from the current price and no new entries")
         return True
 
@@ -353,8 +362,7 @@ class Supervisor:
         if s.desired_state == "running":
             return False
         if proc.holds is None or proc.alive:
-            book = self.store.journal_book(s.name, s.starting_balance)
-            proc.holds = abs(book["qty"]) > 1e-12 and not is_dust(book)
+            proc.holds = self.store.holds_any(s.name)  # either leg of a two-leg Strategy (CR F283-2)
         return proc.holds
 
     def _watch_stopped_holder(self, s: Sleeve, proc: Proc, starting: bool = False) -> None:
@@ -362,7 +370,6 @@ class Supervisor:
         fill that raced the stop) is never left unwatched. It runs for its exits only: its own stop, or a safety stop
         from the mark where it has none (_safety_stop_on_restore), and nothing opens, with an incident. A halt or a
         pause keeps its own status, which already holds every entry and is cleared only by its own action (HC)."""
-        book = self.store.journal_book(s.name, s.starting_balance)
         proc.watched = True
         if s.status not in ("halted", "paused"):
             self.store.set_status(s.name, "paused", f"{EXITS_ONLY}: {STOPPED_HOLDING}")
@@ -372,7 +379,7 @@ class Supervisor:
         if said_since_last_fill(self.store, s.name, head):
             return  # already said for this position: a deploy or a crash restarts it without a second incident
         self.store.event(s.name, "error", "incident",
-                         f"{head}{book['qty']:.12g}, so it runs for its exits only: its stop (or a safety stop from the "
+                         f"{head}{_held_words(self.store, s.name)}, so it runs for its exits only: its stop (or a safety stop from the "
                          "current price) still closes it, and nothing new opens. Flatten closes it; once it is flat it "
                          "stops.")
 
@@ -587,9 +594,11 @@ class Supervisor:
         holding after its flatten, is told again: never while a flatten waits for it, and at most once a minute (CR
         F229-3). One strategy's failure never stops the rest."""
         reason = f"Portfolio halted: {why}"
-        for s in self.store.sleeves():
+        # A two-leg Strategy is told through its first leg's row, whose flatten reaches both legs, while either holds:
+        # a flatten sent to the second leg's row alone has no process to act on it (CR F283-2).
+        for s in self.store.sleeves(include_legs=False):
             told = self._flatten_told.get(s.name)
-            if not _holding(self.store, s):
+            if not self.store.holds_any(s.name):
                 self._flatten_told.pop(s.name, None)
                 self._halt_tells.pop(s.name, None)
                 continue
@@ -599,9 +608,8 @@ class Supervisor:
                 # F229-5: still holding after that many flattens, perhaps less than the venue's smallest order. Said
                 # once; the PM closes it. Its entries stay blocked by the halt meanwhile.
                 if self._halt_tells[s.name] == SYSTEM_FLATTENS:
-                    qty = self.store.journal_book(s.name, s.starting_balance)["qty"]
                     self.store.event(s.name, "error", "flatten_gave_up",
-                                     f"still holding {qty:.12g} after {SYSTEM_FLATTENS} flattens, perhaps less than the "
+                                     f"still holding {_held_words(self.store, s.name)} after {SYSTEM_FLATTENS} flattens, perhaps less than the "
                                      f"venue's smallest order; the PM must close it: {reason}")
                     self._halt_tells[s.name] += 1
                 continue
@@ -714,7 +722,7 @@ def seed(store: Store, paths: list[str]) -> list[str]:
     return added
 
 
-def _flatten_again(store: Store, name: str, why: str, since, qty: float) -> bool:
+def _flatten_again(store: Store, name: str, why: str, since, qty: float | str) -> bool:
     """Whether a reset or a clean slate may queue another flatten (`why`) for a strategy still holding qty: at
     most SYSTEM_FLATTENS since `since` (the reset's request, or the last clean slate finished, so an earlier slate
     with the same reason doesn't count). The last refusal says once what is left and that the PM must close it."""
@@ -725,7 +733,8 @@ def _flatten_again(store: Store, name: str, why: str, since, qty: float) -> bool
     if not any(e["kind"] == "flatten_gave_up" and e["message"].endswith(why)
                for e in store.events(name, limit=200)):
         store.event(name, "error", "flatten_gave_up",
-                    f"still holding {qty:.12g} after {SYSTEM_FLATTENS} flattens, perhaps less than the venue's smallest "
+                    f"still holding {qty if isinstance(qty, str) else f'{qty:.12g}'} after {SYSTEM_FLATTENS} flattens, "
+                    "perhaps less than the venue's smallest "
                     f"order; the PM must close it before this can finish: {why}")
     return False
 
@@ -752,15 +761,19 @@ def clear(store: Store, path: str) -> list[str]:
         waiting = {e["sleeve"] for e in store.events_of(("clear_held",), limit=10_000)
                    if e["message"].startswith(f"{reason}:")}
         holding = []
-        for s in store.sleeves():
+        # A two-leg Strategy is cleared whole, through its first leg's row: its flatten and start reach both legs,
+        # it holds while either leg does, and archive puts both away (CR F283-2).
+        for s in store.sleeves(include_legs=False):
             if s.name in keep or (waiting and s.name not in waiting):
                 continue
-            qty = store.journal_book(s.name, s.starting_balance)["qty"]
-            if s.name in put_away and abs(qty) <= 1e-12 and s.name not in waiting:
+            legs = store.legs(s.name)
+            held = any(abs(store.journal_book(n, store.sleeve(n).starting_balance)["qty"]) > 1e-12 for n in legs)
+            qty = _held_words(store, s.name)
+            if s.name in put_away and not held and s.name not in waiting:
                 continue  # put away flat by an earlier slate
             # One archived while still holding (the 4 Oct slate, before holders were flattened first) is
             # flattened like any other holder: until it is flat it stays in the book's figures.
-            if abs(qty) > 1e-12:
+            if held:
                 holding.append(s.name)
                 why = f"{reason}: flattened so it can be archived"
                 if (not any(c["command"] == "flatten" for c in store.pending_commands(s.name))
@@ -770,7 +783,7 @@ def clear(store: Store, path: str) -> list[str]:
                     store.set_desired_state(s.name, "running")
                     store.decide("system", "start", f"{reason}: started only to flatten its position", s.name)
                 store.event(s.name, "warning", "clear_held",
-                            f"{reason}: not archived yet, it still holds {qty:.12g}; it is being flattened and "
+                            f"{reason}: not archived yet, it still holds {qty}; it is being flattened and "
                             "paused, and the next start archives it")
                 continue
             if s.desired_state != "stopped":

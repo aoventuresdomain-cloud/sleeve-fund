@@ -377,13 +377,15 @@ def create_app(store: Store | None = None) -> FastAPI:
             return RedirectResponse("/risk?killed=0", status_code=303)
         for name in held:
             st().decide(actor, "flatten", f"Book kill switch: {why}", name)
-        for x in targets["all"]:
-            name = x["sleeve"].name
+        # A two-leg Strategy is told through its first leg's row, once: its flatten and start reach both legs, and
+        # the second leg's row has no process of its own to act on one (CR F283-2).
+        told = list(dict.fromkeys(st().legs(x["sleeve"].name)[0] for x in targets["all"]))
+        for name in told:
             st().command(name, "flatten", f"Book kill switch: {why}", actor=actor)
-            if x["sleeve"].desired_state != "running":
+            if st().sleeve(name).desired_state != "running":
                 st().set_desired_state(name, "running")
                 st().decide(actor, "start", f"Book kill switch: started to sell its position ({why})", name)
-        n = len(targets["all"]) + len(held)
+        n = len(told) + len(held)
         st().decide(actor, "flatten everything", f"{why} ({n} strateg{'y' if n == 1 else 'ies'})")
         return RedirectResponse(f"/risk?killed={n}", status_code=303)
 
@@ -787,8 +789,8 @@ def create_app(store: Store | None = None) -> FastAPI:
                 # A stopped strategy's process isn't there to act on a flatten, which would wait for its next
                 # start, maybe weeks later (review round 8, M8-2). Holding a position, it starts to sell it,
                 # as the kill switch does; flat, there is nothing to sell.
-                s = st().sleeve(name)
-                if abs(st().journal_book(name, s.starting_balance)["qty"]) <= 1e-12:
+                if all(abs(st().journal_book(n, st().sleeve(n).starting_balance)["qty"]) <= 1e-12
+                       for n in st().legs(name)):  # either leg of a two-leg Strategy (CR F283-2)
                     raise ValueError("it is stopped and holds no position, so there is nothing to flatten")
                 st().command(name, command, reason, actor=actor)
                 st().set_desired_state(name, "running")
@@ -918,9 +920,12 @@ def create_app(store: Store | None = None) -> FastAPI:
         return RedirectResponse(f"/setup?{urlencode({'reset': '1'})}", status_code=303)
 
     def _book_to_reset() -> list:
-        """The strategies a book reset covers: not archived, not a backtest, none already resetting."""
+        """The strategies a book reset covers: not archived, not a backtest, none already resetting, and no two-leg
+        Strategy, as a reset isn't built for one yet (CR F283-1: one leg's run put away alone)."""
         gone = set(st().archived())
-        return [s for s in st().sleeves() if s.name not in gone and not st().pending_reset(s.name)]
+        two_leg = {n for s in st().sleeves() if s.parent is not None for n in (s.name, s.parent)}
+        return [s for s in st().sleeves() if s.name not in gone and s.name not in two_leg
+                and not st().pending_reset(s.name)]
 
     def _retired(account: str) -> bool:
         return any(a["name"] == account and a["retired_at"] for a in st().accounts())

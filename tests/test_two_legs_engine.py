@@ -133,7 +133,7 @@ def test_a_second_leg_the_venue_refuses_is_sent_once_more_then_the_first_is_unwo
 
 @pytest.mark.parametrize("cause", ["halt", "no_coordinator"])
 def test_a_second_leg_isnt_retried_when_a_leg_is_halted_or_the_coordinator_is_gone(monkeypatch, cause):
-    """Advisor leg-2 retry MUST 3: after the second leg's refusal, a halt (or pause, or stale data: all are can_open) on
+    """Advisor leg-2 retry MUST 3: after the second leg's refusal, a halt or pause (can_open; stale data is CHOKE, see test_two_legs_node) on
     either leg, or the coordinator gone, unwinds the pair instead of retrying."""
     from sleeve_fund.paper.runtime import SleeveRuntime
 

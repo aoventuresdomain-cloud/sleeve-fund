@@ -1292,6 +1292,22 @@ class Store:
         with self.engine.connect() as conn:
             return conn.execute(q).scalar()
 
+    def legs(self, name: str) -> list[str]:
+        """Every row of the Strategy `name` belongs to: [name] for one leg; a two-leg Strategy's first leg's row and
+        its second's, from either (P2-8)."""
+        row = self.sleeve(name)
+        first = row.parent or name
+        return [first] + [leg] if (leg := self._leg_of(first)) is not None else [first]
+
+    def holds_any(self, name: str) -> bool:
+        """Whether any leg of the Strategy `name` belongs to holds a position an order can close (not dust): a
+        two-leg Strategy holds while either leg does (CR F283-2)."""
+        for leg in self.legs(name):
+            book = self.journal_book(leg, self.sleeve(leg).starting_balance)
+            if abs(book["qty"]) > 1e-12 and not is_dust(book):
+                return True
+        return False
+
     def set_status(self, name: str, status: str, reason: str = "", paused_until: datetime | None = None) -> None:
         if status not in STATUSES:
             raise ValueError(f"bad status {status!r}")
@@ -1744,19 +1760,24 @@ class Store:
                            if at <= start and abs(self.journal_book(name, self.sleeve(name).starting_balance)["qty"]) <= 1e-12}}
 
     def archive(self, sleeve: str) -> None:
-        """Put a stopped, flat sleeve away. Raises ValueError if it is running or still holds a position."""
+        """Put a stopped, flat sleeve away. Raises ValueError if it is running or still holds a position. A two-leg
+        Strategy is put away whole, from its first leg's row, never one leg alone (CR F283-2)."""
         s = self.sleeve(sleeve)
         if s.desired_state != "stopped":
             raise ValueError("stop the strategy before archiving it")
+        if s.parent is not None:
+            raise ValueError(f"this is the second leg of {s.parent}: archive {s.parent}, which puts both legs away")
+        now = utcnow()
         with self.engine.begin() as c:
-            c.execute(sleeve_archive_t.delete().where(sleeve_archive_t.c.sleeve == sleeve))
-            c.execute(insert(sleeve_archive_t).values(sleeve=sleeve, archived_at=utcnow()))
+            for name in [sleeve] + ([leg] if (leg := self._leg_of(sleeve, c)) is not None else []):
+                c.execute(sleeve_archive_t.delete().where(sleeve_archive_t.c.sleeve == name))
+                c.execute(insert(sleeve_archive_t).values(sleeve=name, archived_at=now))
 
     def unarchive(self, sleeve: str) -> None:
         if self.sleeve(sleeve).lifecycle == lifecycle.RETIRED:
             raise ValueError("this strategy is retired, and a retired strategy can't be brought back")
         with self.engine.begin() as c:
-            c.execute(sleeve_archive_t.delete().where(sleeve_archive_t.c.sleeve == sleeve))
+            c.execute(sleeve_archive_t.delete().where(sleeve_archive_t.c.sleeve.in_(self.legs(sleeve))))
 
     # --- lifecycle (P2-6) ------------------------------------------------------------
 
@@ -2349,6 +2370,8 @@ class Store:
             raise ValueError("an archived strategy can't be reset; restore it first")
         if not reason.strip():
             raise ValueError("a reason is required")
+        if s.parent is not None or self._leg_of(sleeve) is not None:  # CR F283-1: split_run makes one leg's run
+            raise ValueError("a reset isn't built for a two-leg Strategy yet, so nothing was changed")
         if self.pending_reset(sleeve):
             raise ValueError("a reset is already under way")
         from sleeve_fund.paper.runtime import liquidation_head  # the engine's liquidation rule
@@ -2973,11 +2996,12 @@ class Store:
                 # A two-leg Strategy's pause, resume and flatten reach both legs' runtimes, in the same transaction:
                 # each leg keeps its own status, and a leg left halted or paused would refuse its half of the next
                 # pair (P2-8, Advisor M2).
-                # Once: the kill switch and the supervisor already send each row its own flatten.
+                # The leg's queue follows the parent's in order: only a repeat of the leg's own last waiting command
+                # is not queued twice (CR F283-3: resume, pause, resume must leave both legs resumed).
                 if (command in ("pause", "resume", "flatten") and (leg := self._leg_of(sleeve, c)) is not None
-                        and c.execute(select(commands_t.c.id).where(
-                            commands_t.c.sleeve == leg, commands_t.c.command == command,
-                            commands_t.c.applied_at.is_(None))).first() is None):
+                        and c.execute(select(commands_t.c.command).where(
+                            commands_t.c.sleeve == leg, commands_t.c.applied_at.is_(None))
+                            .order_by(commands_t.c.id.desc()).limit(1)).scalar() != command):
                     c.execute(insert(commands_t).values(sleeve=leg, command=command, reason=reason.strip(),
                                                         created_at=now))
                     if holds_through_reset and command in ("pause", "flatten"):
@@ -3119,15 +3143,19 @@ class Store:
             return _rows(c.execute(q))
 
     def drop_pending(self, sleeve: str, why: str) -> int:
-        """Retire a strategy's waiting commands unapplied, each noted in the decision log."""
+        """Retire a strategy's waiting commands unapplied, each noted in the decision log: a two-leg Strategy's
+        second leg's too, as its commands are the first leg's (P2-8, CR F283-3)."""
         # A reset after liquidation doesn't lapse: its incident can't be answered twice, so it is applied instead
         # (apply_waiting_ral, or the process still running for its exits) (QA RAL-F2).
-        pending = [c for c in self.pending_commands(sleeve) if c["command"] != RAL]
-        for cmd in pending:
-            self.mark_applied(cmd["id"])
-            if cmd["command"] != RELOAD:  # saved settings don't lapse: the next start trades under them
-                self.decide("system", f"drop {cmd['command']}", f"{why} ({cmd['reason']})", sleeve)
-        return len(pending)
+        n = 0
+        for name in self.legs(sleeve):
+            pending = [c for c in self.pending_commands(name) if c["command"] != RAL]
+            for cmd in pending:
+                self.mark_applied(cmd["id"])
+                if cmd["command"] != RELOAD:  # saved settings don't lapse: the next start trades under them
+                    self.decide("system", f"drop {cmd['command']}", f"{why} ({cmd['reason']})", name)
+            n += len(pending)
+        return n
 
     def mark_applied(self, command_id: int) -> None:
         with self.engine.begin() as c:
