@@ -60,7 +60,6 @@ def test_a_zero_balance_strategy_sizes_off_the_fund_fills_pays_its_fee_marks_and
     assert page.status_code == 200 and "Traceback" not in page.text and "division" not in page.text.lower()
 
 
-@PE2_BUILT
 @pytest.mark.parametrize("headroom", [10, 1])
 def test_a_fund_held_losing_trade_books_no_insurance_and_the_fund_falls_by_exactly_the_loss(tmp_path, monkeypatch,
                                                                                             headroom):
