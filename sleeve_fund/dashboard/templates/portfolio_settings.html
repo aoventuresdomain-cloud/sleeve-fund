@@ -19,12 +19,12 @@
 {% set cur = v.history[0] if v.history else none %}
 <div class="page-head ps-head">
   <h1>Portfolio compliance settings</h1>
-  {% if mode == 'view' %}<div class="actions"><a class="button" href="/portfolio-settings?edit=1">Edit tests and groups</a></div>{% endif %}
-  <p class="lede">Every trade idea from every Strategy passes these tests before an order goes out, or it is refused and the test that refused it is recorded.</p>
+  {% if mode == 'view' %}<div class="actions"><a class="button" href="/portfolio-settings?edit=1">Edit compliance tests and groups</a></div>{% endif %}
+  <p class="lede">Every trade idea from every Strategy passes these compliance tests before an order goes out, or it is refused and the test that refused it is recorded.</p>
   <p class="ps-ver"><span class="chip running">Version {{ v.version }}</span>{% if cur %}<span> · in force since {{ cur.created_at|uk }}</span><span> · set by {{ cur.created_by }}</span>{% endif %}</p>
 </div>
 {% if saved %}<div class="okbox" role="status">Saved as version {{ saved }}. It applies from the next trade idea.</div>{% endif %}
-<div class="ps-fixed"><span><b>Edits apply to new trades only.</b> Open positions and working orders are not changed.</span><span>The whole-fund test and the loss brakes can be changed but not switched off.</span><span>If the tests can't be read, no new trade goes out.</span></div>
+<div class="ps-fixed"><span><b>Edits apply to new trades only.</b> Open positions and working orders are not changed.</span><span>The whole-fund test and the loss brakes can be changed but not switched off.</span><span>If the compliance tests can't be read, no new trade goes out.</span></div>
 {% if errors %}<div class="warnbox ps-err" role="alert"><b>Not saved.</b><ul>{% for e in errors %}<li>{{ e }}</li>{% endfor %}</ul></div>{% endif %}
 
 {% if mode == 'review' %}
@@ -46,7 +46,7 @@
 {% set editing = mode == 'edit' %}
 {% if editing %}<form method="post" action="/portfolio-settings/review"><input type="hidden" name="expected_version" value="{{ v.version }}">{% endif %}
 <section class="panel" aria-labelledby="tests-h">
-  <div class="panel-head"><h2 id="tests-h">The five tests</h2>
+  <div class="panel-head"><h2 id="tests-h">The five compliance tests</h2>
     {% if v.source == 'unmarked' %}<span class="right">The fund's book has no mark yet, so there is no use to show.</span>{% elif v.source == 'unreadable' %}<span class="right warn">The use now can't be read.</span>{% endif %}</div>
   <div class="tbl-wrap"><table class="tbl ps-tests">
     <thead><tr><th scope="col">Test</th><th scope="col">What it checks</th><th scope="col">Limit, share of the fund</th><th scope="col">Use now</th><th scope="col">State</th><th scope="col">At the limit</th></tr></thead>
