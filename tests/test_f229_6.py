@@ -142,10 +142,14 @@ def test_c_the_holding_drops_out_once_flat(tmp_path):
     store = _archived_holder(tmp_path)
     store.record_fill("usdt", side="SELL", qty=0.1, price=60_000.0, fee=0.0, order_id="x1", trade_id="t2",
                       ts=T_MARK + timedelta(minutes=2))
+    store.record_equity("usdt", equity=10_000.0, cash=10_000.0, qty=0.0, price=60_000.0, benchmark=10_000.0,
+                        ts=T_MARK + timedelta(minutes=3))  # its exit's process marks it flat
     assert portfolio_gate.fund_holdings(store, atr_pct=_atr) == ()
     from sleeve_fund import open_risk
 
-    assert open_risk.book_open_risk(store, _atr) == [] and open_risk.account_book(store, "x", 0.0, _atr)[1] == 0
+    assert open_risk.book_open_risk(store, _atr) == []
+    # Advisor C3: archived flat in the current book, its equity stays in the book at no risk.
+    assert open_risk.account_book(store, "x", 0.0, _atr)[:2] == (10_000.0, 0)
 
 
 def test_d_the_gates_holdings_are_the_dashboard_books_holders(tmp_path):
@@ -288,6 +292,25 @@ def test_c3_an_archived_holder_counts_in_all_three_readers_until_flat(tmp_path):
     assert before[1] == pytest.approx(60.0 + 60.0)  # fund's and held's 1% stops
     store.record_fill("held", side="BUY", qty=0.1, price=60_000.0, fee=0.0, order_id="x-held", trade_id="x-held",
                       ts=T_MARK + timedelta(minutes=2))
+    store.record_equity("held", equity=10_000.0, cash=10_000.0, qty=0.0, price=60_000.0, benchmark=10_000.0,
+                        ts=T_MARK + timedelta(minutes=3))
     assert [r["sleeve"] for r in open_risk.book_open_risk(store, _atr)] == ["fund"]
-    assert open_risk.account_equity(store, "paper") == 20_000  # fund and entry
+    assert open_risk.account_equity(store, "paper") == 30_000  # Advisor C3: held's equity stays in, at no risk
     assert open_risk.account_book(store, "entry", 10_000.0, _atr)[1] == pytest.approx(60.0)
+
+
+def test_c3b_a_strategy_an_earlier_book_put_away_is_out_of_both(tmp_path):
+    """QT3 C3b: archived flat before a clean slate, it is the earlier book's: out of the equity and the risk."""
+    from sleeve_fund import open_risk
+
+    store = _fund(tmp_path, "c3b")
+    store.record_fill("held", side="BUY", qty=0.1, price=60_000.0, fee=0.0, order_id="x-held", trade_id="x-held",
+                      ts=T_MARK + timedelta(minutes=2))
+    store.record_equity("held", equity=10_000.0, cash=10_000.0, qty=0.0, price=60_000.0, benchmark=10_000.0,
+                        ts=T_MARK + timedelta(minutes=3))
+    assert open_risk.account_equity(store, "paper") == 30_000  # in the current book
+    store.decide("PM", "clear", "Clean slate")  # a new book starts after held was put away
+    assert "held" in store.previous_book()
+    assert open_risk.account_equity(store, "paper") == 20_000
+    assert [r["sleeve"] for r in open_risk.book_open_risk(store, _atr)] == ["fund"]
+    assert open_risk.account_book(store, "entry", 10_000.0, _atr)[:2] == (20_000.0, pytest.approx(60.0))
