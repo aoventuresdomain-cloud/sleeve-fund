@@ -175,6 +175,41 @@ def identity_gap(store: Store) -> Decimal:
     return gap
 
 
+def identity_tolerance(store: Store) -> Decimal:
+    """A gap within a cent is rounding, not a break. RECON-SCOPE allows max(0.01, 1e-6 x the book), but the journal is
+    exact (DA-9) and HoQA's cells hold a 0.02 gap on a 100,000 book to be a break, so the cent stands (the stricter)."""
+    return CENT
+
+
+def positions_breaks(store: Store) -> list[str]:
+    """RECON-SCOPE (Advisor, the positions leg): per Strategy in the book, the position its journal's fills come to up to
+    its last mark against the live position that mark carries (the runtime's equity row). Apart by more than dust at
+    the mark (DUST_NOTIONAL: below any venue's smallest order, so within a lot) is a break even when the cash agrees: a
+    fill journaled twice, or one the journal lost. Returns each break in words, [] when every position ties."""
+    from sqlalchemy import case, func, select
+
+    from sleeve_fund.store import fills_t
+
+    out = []
+    for s in store.sleeves():
+        if not _in_book(store, s):
+            continue
+        last = store.last_equity(s.name)
+        if last is None:
+            continue
+        signed = case((fills_t.c.side == "BUY", fills_t.c.qty), else_=-fills_t.c.qty)
+        q = select(func.coalesce(func.sum(signed), 0)).where(fills_t.c.sleeve == s.name, fills_t.c.ts <= last["ts"])
+        with store.engine.connect() as c:
+            replayed = to_decimal(c.execute(q).scalar(), "qty")
+        live = to_decimal(last["qty"] or 0, "qty")
+        price = to_decimal(last["price"] or 0, "mark")
+        apart = abs(replayed - live)
+        if apart > Decimal("1e-12") and (price <= 0 or apart * price >= Decimal(str(DUST_NOTIONAL))):
+            out.append(f"{s.name}: the journal's fills come to {replayed.normalize():f} but the live position is "
+                       f"{live.normalize():f}")
+    return out
+
+
 def empty_book_pockets(store: Store) -> list[str]:
     """What keeps the book from being empty, in the PM's words; empty is nothing left (CAP5-RESET: a re-base deposit
     lands only onto an empty book). Every Strategy whose equity still counts, one waiting to leave, anything that
@@ -207,10 +242,13 @@ def resume_identity_hold(store: Store, actor: str, reason: str, now: datetime | 
     if not actor.strip() or not reason.strip():
         raise ValueError("a Resume names who and why")
     gap = identity_gap(store)
-    if abs(gap) > CENT:
+    if abs(gap) > identity_tolerance(store):
         raise ValueError(f"the book still doesn't add up by {gap:,.2f}: fix it before resuming")
+    if apart := positions_breaks(store):
+        raise ValueError(f"the positions still don't tie ({'; '.join(apart)}): fix them before resuming")
     words = f"book check resumed: the book adds up again (gap {gap:,.2f}); {reason.strip()}"
     store.decide(actor.strip(), IDENTITY_RESUME_ACTION, words, ts=now)
+    led.alert("book_identity_resumed", f"The PM resumed new entries after the book check: {words}", now or utcnow())
     return words
 
 
@@ -845,13 +883,16 @@ class Supervisor:
         store = self.ledger.store
         if bridge_start(store) is None or self.ledger.identity_hold():
             return
-        gap = identity_gap(store)
-        if abs(gap) <= CENT:
+        tol = identity_tolerance(store)
+        gap, apart = identity_gap(store), positions_breaks(store)
+        if abs(gap) <= tol and not apart:
             return
-        gap = identity_gap(store)  # once more: a fill between the first reads moves both sides by the time of this one
-        if abs(gap) <= CENT:
+        # once more: a fill between the first reads moves both sides by the time of this one
+        gap, apart = identity_gap(store), positions_breaks(store)
+        if abs(gap) <= tol and not apart:
             return
-        why = f"cash + Strategy P&L + positions differs from the journal by {gap:,.2f}"
+        why = "; ".join(([f"cash + Strategy P&L + positions differs from the journal by {gap:,.2f}"]
+                         if abs(gap) > tol else []) + apart)
         store.decide("supervisor", IDENTITY_HOLD_ACTION, why, ts=now)
         self.ledger.alert("book_identity_broken", f"The fund's book doesn't add up: {why}. New entries are held until "
                           "the PM resumes; exits and stops still go out", now)
