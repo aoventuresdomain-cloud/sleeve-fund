@@ -1,10 +1,10 @@
 name: funding-backfill
 # FUNDING-BACKFILL (START CHECKLIST 5): the settled funding a perpetual's history store lacks from a date up to its
 # newest kept rate, asked of the venue's public funding history (python -m sleeve_fund.history funding-backfill),
-# inside the venue's hub container on the paper server. Only adds: a kept rate is never changed or removed. Run it by
-# hand from main, once and on purpose (HoE): first with dry_run (the default), which only counts the settlements it
-# would add per instrument; then, on the HoE's go, without, whose counts must equal the dry run's. Fails when an
-# instrument's pages ran out before its newest kept rate. Same secrets and variable as canon and history-coverage.
+# in a one-off container of the venue's hub (a deploy that recreates the hub doesn't kill it) on the paper server.
+# Only adds: a kept rate is never changed or removed. Run it by hand from main, once and on purpose (HoE): first with
+# dry_run (the default), which only counts the settlements it would add per instrument; then, on the HoE's go,
+# without, whose counts must equal the dry run's. Fails when an instrument's pages ran out before its newest kept rate. Same secrets and variable as canon and history-coverage.
 on:
   workflow_dispatch:
     inputs:
@@ -24,6 +24,8 @@ on:
         type: boolean
         required: true
         default: true
+# One history writer at a time, across canon and funding-backfill: a queued run waits for the running one.
+concurrency: { group: history-writer, cancel-in-progress: false }
 jobs:
   funding-backfill:
     runs-on: ubuntu-24.04
@@ -49,8 +51,17 @@ jobs:
           install -m 700 -d ~/.ssh
           printf '%s\n' "$KEY" > ~/.ssh/id_deploy && chmod 600 ~/.ssh/id_deploy
           ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts
+      - name: Refuse to stack a second history writer
+        # A one-off container can outlive its job (an SSH drop, a cancelled run), so a run still going is shown and
+        # this job stops rather than start another writer on the same files.
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          ssh -i ~/.ssh/id_deploy "$USER_AT@$HOST" \
+            'running=$(sudo docker ps --filter name=canon- --filter name=backfill- --format "{{.Names}} {{.Status}}"); if [ -n "$running" ]; then echo "a history writer is still running:"; echo "$running"; exit 1; fi'
       - name: Fill the funding
         env:
+          RUN_ID: ${{ github.run_id }}
           HOST: ${{ secrets.DEPLOY_HOST }}
           VENUE: ${{ inputs.venue }}
           SINCE: ${{ inputs.since }}
@@ -58,4 +69,4 @@ jobs:
           DRY: ${{ inputs.dry_run && '--dry-run' || '' }}
         run: |
           ssh -i ~/.ssh/id_deploy -o ServerAliveInterval=30 -o ServerAliveCountMax=10 "$USER_AT@$HOST" \
-            "cd /opt/sleeve-fund && sudo docker compose exec -T hub-$VENUE python -u -m sleeve_fund.history funding-backfill --venue $VENUE --since $SINCE $DRY $PAIRS"
+            "cd /opt/sleeve-fund && sudo docker compose run --rm -T --no-deps --name backfill-$RUN_ID hub-$VENUE python -u -m sleeve_fund.history funding-backfill --venue $VENUE --since $SINCE $DRY $PAIRS"

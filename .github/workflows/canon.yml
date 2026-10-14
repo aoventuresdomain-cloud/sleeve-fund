@@ -1,6 +1,7 @@
 name: canon
 # P1-1-CANON backfill: make the stored 1-minute history since a date the venue's own candles
-# (python -m sleeve_fund.history canon), inside the venue's hub container on the paper server. Run it by hand from main,
+# (python -m sleeve_fund.history canon), in a one-off container of the venue's hub (same image, volume and env, so a
+# deploy that recreates the hub doesn't kill it) on the paper server. Run it by hand from main,
 # once and on purpose (HoE): first with dry_run (the default), which only counts the minutes it would replace and fill
 # per instrument; then, on the HoE's go, without. It reads the venue's public candles and writes only the history files
 # (each replacement recorded in provenance with both values). Same secrets and variable as parity and status.
@@ -28,6 +29,8 @@ on:
         type: boolean
         required: true
         default: true
+# One history writer at a time, across canon and funding-backfill: a queued run waits for the running one.
+concurrency: { group: history-writer, cancel-in-progress: false }
 jobs:
   canon:
     runs-on: ubuntu-24.04
@@ -55,10 +58,19 @@ jobs:
           install -m 700 -d ~/.ssh
           printf '%s\n' "$KEY" > ~/.ssh/id_deploy && chmod 600 ~/.ssh/id_deploy
           ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts
+      - name: Refuse to stack a second history writer
+        # A one-off container can outlive its job (an SSH drop, a cancelled run), so a run still going is shown and
+        # this job stops rather than start another writer on the same files.
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          ssh -i ~/.ssh/id_deploy "$USER_AT@$HOST" \
+            'running=$(sudo docker ps --filter name=canon- --filter name=backfill- --format "{{.Names}} {{.Status}}"); if [ -n "$running" ]; then echo "a history writer is still running:"; echo "$running"; exit 1; fi'
       - name: Run the backfill
         # Keep-alives: canon prints nothing until an instrument is done, and the runner's network drops an SSH
         # session idle for ~4 min (run 38477676309 died at 5 min with "Broken pipe"); -u prints each line as it lands.
         env:
+          RUN_ID: ${{ github.run_id }}
           HOST: ${{ secrets.DEPLOY_HOST }}
           VENUE: ${{ inputs.venue }}
           SINCE: ${{ inputs.since }}
@@ -67,4 +79,4 @@ jobs:
           PAIRS: ${{ inputs.pairs }}
         run: |
           ssh -i ~/.ssh/id_deploy -o ServerAliveInterval=30 -o ServerAliveCountMax=10 "$USER_AT@$HOST" \
-            "cd /opt/sleeve-fund && sudo docker compose exec -T hub-$VENUE python -u -m sleeve_fund.history canon --venue $VENUE --since $SINCE $UNTIL $DRY $PAIRS"
+            "cd /opt/sleeve-fund && sudo docker compose run --rm -T --no-deps --name canon-$RUN_ID hub-$VENUE python -u -m sleeve_fund.history canon --venue $VENUE --since $SINCE $UNTIL $DRY $PAIRS"
