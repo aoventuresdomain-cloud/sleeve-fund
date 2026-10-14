@@ -1,6 +1,8 @@
 {# Why the PM took an action, as a pick-list (UI v2, item 9): the action's suggested reasons, then the PM's own
    reasons from the decision log ("You used recently"), then "+ Write your own reason", which needs a note
-   (dashboard/reasons.py). A search box filters the list; the arrow keys move through it. Shared by every dialog
+   (dashboard/reasons.py). With JavaScript it is a combo-box like the instrument field's (UP-4): the list shows until a
+   reason is picked, then folds into the search box, which opens it again; typing narrows it, the arrow keys move, Enter picks, Escape closes; the pick is the same radio, so
+   the form posts the same `reason_pick`. Without JavaScript the list stays open as radios. Shared by every dialog
    that asks for a reason, on the strategy page, Portfolio, Risk & health and Setup. Inside a form whose submit
    buttons carry data-needs-reason (rendered disabled); Console.reasons() enables them once the pick is complete
    and keeps the "Logged as" line current. The handler stores "<picked>", "<picked>: <note>" or "Other: <note>". #}
@@ -8,8 +10,9 @@
 {% set recent = recent_reasons() %}
 <fieldset class="reasons" data-reasons data-min="{{ reason_note_min }}">
   <legend>Why? This goes in the decision log and Records.</legend>
-  <input type="search" class="reason-search" data-reason-search placeholder="Pick or search a reason" aria-label="Search the reasons" autocomplete="off">
-  <div class="reason-list" role="radiogroup" aria-label="Reasons">
+  <input type="search" class="reason-search" data-reason-search placeholder="Pick or search a reason" aria-label="Search the reasons" autocomplete="off"
+    role="combobox" aria-expanded="false" aria-controls="{{ id }}-reasons" aria-autocomplete="list">
+  <div class="reason-list" id="{{ id }}-reasons" role="radiogroup" aria-label="Reasons">
     <p class="grp">Suggested</p>
     {% for r, hint in action_reasons[action] %}<label class="opt"><input type="radio" name="reason_pick" value="{{ r }}" required{{ ' checked' if prefill == r }}><span>{{ r }}<small>{{ hint }}</small></span></label>
     {% endfor %}

@@ -35,6 +35,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}  # exactly the commit that was tested
+          fetch-depth: 0  # main's history, for picking the commit to ship (deploy/pick_commit.sh)
       - name: Require green tests for this commit
         if: github.event_name == 'workflow_dispatch'
         env:
@@ -44,23 +45,7 @@ jobs:
           ok=$(gh run list --workflow tests.yml --commit "$GITHUB_SHA" --branch main --event push --status success \
                --json databaseId --jq length)
           [ "$ok" -gt 0 ] || { echo "FAIL: the tests have not passed on main at $GITHUB_SHA; wait for the tests workflow"; exit 1; }
-      - name: Still main's newest commit
-        id: tip
-        env:
-          GH_TOKEN: ${{ github.token }}
-          SHIP: ${{ github.event.workflow_run.head_sha || github.sha }}
-        run: |
-          # A run that waited behind another deploy may be shipping a commit main has since moved past;
-          # the newer commit's own run ships that one, so this run stops rather than roll the server back.
-          tip=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)
-          if [ "$tip" = "$SHIP" ]; then
-            echo "current=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "::notice::main is now at $tip, past this commit; its own run deploys it. Nothing shipped."
-            echo "current=false" >> "$GITHUB_OUTPUT"
-          fi
       - name: Configure SSH
-        if: steps.tip.outputs.current == 'true'
         env:
           KEY: ${{ secrets.DEPLOY_SSH_KEY }}
           HOST: ${{ secrets.DEPLOY_HOST }}
@@ -68,6 +53,24 @@ jobs:
           install -m 700 -d ~/.ssh
           printf '%s\n' "$KEY" > ~/.ssh/id_deploy && chmod 600 ~/.ssh/id_deploy
           ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts
+      - name: Pick the commit to ship
+        id: tip
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          SHIP: ${{ github.event.workflow_run.head_sha || github.sha }}
+        run: |
+          # A run that waited behind another deploy ships main's newest green commit, not nothing; never an
+          # in-flight commit, nor one older than the server's (deploy/pick_commit.sh). An unreachable server fails here.
+          deployed=$(ssh -i ~/.ssh/id_deploy "$USER_AT@$HOST" 'if sudo test -f /opt/sleeve-fund/.deployed_sha; then sudo cat /opt/sleeve-fund/.deployed_sha; fi')
+          pick=$(bash deploy/pick_commit.sh "$SHIP" "$(printf '%s' "$deployed" | tr -d '[:space:]')")
+          if [ -n "$pick" ]; then
+            git checkout -q --detach "$pick"
+            echo "sha=$pick" >> "$GITHUB_OUTPUT"
+            echo "current=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "current=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: Ship code
         if: steps.tip.outputs.current == 'true'
         env:
@@ -75,8 +78,8 @@ jobs:
         run: |
           # sudo is a no-op for root and needed for a non-root user such as Lightsail's ubuntu.
           ssh -i ~/.ssh/id_deploy "$USER_AT@$HOST" 'sudo mkdir -p /opt/sleeve-fund'
-          rsync -az --delete --exclude .git --exclude .env --exclude kraken.env --exclude data --rsync-path="sudo rsync" \
-            -e "ssh -i ~/.ssh/id_deploy" ./ "$USER_AT@$HOST":/opt/sleeve-fund/
+          rsync -az --delete --exclude .git --exclude .env --exclude kraken.env --exclude data --exclude .deployed_sha \
+            --rsync-path="sudo rsync" -e "ssh -i ~/.ssh/id_deploy" ./ "$USER_AT@$HOST":/opt/sleeve-fund/
       - name: Start stack
         if: steps.tip.outputs.current == 'true'
         env:
@@ -126,3 +129,27 @@ jobs:
             from sleeves s left join sleeve_archive a on a.sleeve = s.name where s.name not like '"'"'bt:%'"'"' order by s.id"' |
             while read -r line; do [ -n "$line" ] && echo "::notice title=Strategy::$line"; done
           [ "$LIVE" = "0" ] || { echo "FAIL: some running sleeves are not reporting"; exit 1; }
+      - name: Record the deployed commit
+        if: steps.tip.outputs.current == 'true'
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          SHA: ${{ steps.tip.outputs.sha }}
+        run: |
+          # Only after the health check passed: the record the next run's pick reads (no rollback past it). A failed
+          # deploy keeps the old record and alerts below.
+          echo "$SHA" | ssh -i ~/.ssh/id_deploy "$USER_AT@$HOST" 'sudo tee /opt/sleeve-fund/.deployed_sha >/dev/null'
+      - name: Alert on a failed deploy
+        if: failure() && steps.tip.outputs.current == 'true'
+        env:
+          ALERT_WEBHOOK_URL: ${{ secrets.ALERT_WEBHOOK_URL }}
+          SHA: ${{ steps.tip.outputs.sha }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # The same shape as sleeve_fund/alerts.post: JSON {text, content}, or plain text for an ntfy topic.
+          [ -n "$ALERT_WEBHOOK_URL" ] || { echo "::warning::no ALERT_WEBHOOK_URL; the failed run is the only alert"; exit 0; }
+          text="Deploy of $SHA failed; the server keeps its previous deployed record. $RUN"
+          case "$ALERT_WEBHOOK_URL" in
+            *ntfy*) curl -sS -m 20 -d "$text" "$ALERT_WEBHOOK_URL" ;;
+            *) curl -sS -m 20 -H 'Content-Type: application/json' \
+                 -d "$(jq -n --arg t "$text" '{text: $t, content: $t}')" "$ALERT_WEBHOOK_URL" ;;
+          esac

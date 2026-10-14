@@ -191,6 +191,9 @@ class StudyResult:
     # Runs of this idea whose trials-register count failed (QA P1-T8): they count in N, but their Sharpes are
     # missing from the spread the bar is set by, so G1 can't judge until they are re-counted (Advisor, 6 Oct 2026).
     failed_counts: int = 0
+    # The idea family the study counted under: an optimiser's proposal's own structural idea (candidates.idea_hash,
+    # CR F236-1), or the hand-coded model's, by its name, when None.
+    idea_hash: str | None = None
     # The buy and hold G1 compares with (Advisor, 7 Oct 2026, RE-COST): on a perpetual, a 1x long perp hold paying the
     # perp's fees and funding, through the same engine, priced only over windows whose funding is all known.
     # oos_compare_returns: the strategy's out-of-sample days the hold covers, what the benchmark checks compare.
@@ -204,6 +207,8 @@ class StudyResult:
     # The probability of backtest overfitting (research.pbo, R4) over the sensitivity grid and every other counted
     # setting of the idea family, with its variant count.
     pbo: object = None
+    # The ablation report (research.ablation), when one was run for this definition: shown, never judged.
+    ablation: object = None
 
     @property
     def compare_returns(self) -> pd.Series:
@@ -501,6 +506,7 @@ def run_study(
     minute_loader=None,
     register=None,
     locks=None,
+    idea_hash: str | None = None,
 ) -> StudyResult:
     """prices: bars of any length that divides a day (daily, hourly, 15-minute, 1-minute...). The holdout,
     train and test windows are in days whatever the bar, and every statistic is on daily returns.
@@ -517,7 +523,10 @@ def run_study(
     minute_loader: (start, end) -> 1-minute bars over that span, for the spot check of a 5-minute pass.
     half_spread: the spread charged on orders that take liquidity: sleeve_fund.spreads.series gives the measured
     ones, each run charging the one in force at each time (SPREAD-PIT); None uses the venue's assumption.
-    progress: called with the share of the study's backtests done, 0 to 1."""
+    progress: called with the share of the study's backtests done, 0 to 1.
+    idea_hash: the idea family its trials count under, holdout lock included: an optimiser's proposal's own structural
+    idea (candidates.idea_hash), so its runs count towards that idea's budget (CR F236-1). None: a rule-builder study's
+    own definition's (CR F236-3), else the hand-coded model's, by its name."""
     from sleeve_fund.venues import VENUES
 
     perpetual = getattr(VENUES.get(str(instrument.id.venue)), "perpetual", False)
@@ -538,6 +547,7 @@ def run_study(
     research = prices.iloc[:-holdout_bars] if holdout_bars else prices
     combos = grid(spec.param_grid)
     default_params = default_params or spec.default_params or (combos[0] if combos else {})
+    idea_hash = idea_of(default_params, idea_hash)
 
     exits = {k: v for k, v in (exits or {}).items() if v is not None}
     from sleeve_fund.venues import VENUES
@@ -646,7 +656,8 @@ def run_study(
         setup = run_setup(risk_profile=risk_profile, fee=float(paid(params).taker) + spread_used,
                           windows=(train_days, test_days, holdout_days))
         return register.record(
-            definition_hash=legacy_definition_hash(spec.name, full, setup), idea_hash=legacy_idea_hash(spec.name),
+            definition_hash=legacy_definition_hash(spec.name, full, setup),
+            idea_hash=idea_hash or legacy_idea_hash(spec.name),
             name=spec.name, family=spec.family, settings=full, dataset=dataset,
             stage="holdout" if stage == "holdout" else "in_sample", source="study", sharpe=sharpe,
             row_id=line_id(line), data_start=data.index[0].to_pydatetime(), data_end=data.index[-1].to_pydatetime())
@@ -723,7 +734,7 @@ def run_study(
     if full_default is None:
         full_default = bt(spec.name, research, default_params)
     sensitivity = pd.DataFrame(rows)
-    overfit = _overfit(grid_returns, [{**p, **exits} for p in combos], register, spec, research, bt)
+    overfit = _overfit(grid_returns, [{**p, **exits} for p in combos], register, spec, research, bt, idea_hash)
     # The settings tuning on the whole period would pick; the ladder and its verified break-even are theirs.
     sharpes = [r["sharpe"] if math.isfinite(r["sharpe"]) else -math.inf for r in rows]
     if rows and max(sharpes) > -math.inf:
@@ -857,6 +868,7 @@ def run_study(
     else:
         hold_note = ""
     result = StudyResult(
+        idea_hash=idea_hash,
         spec=spec,
         dataset=dataset,
         synthetic=synthetic,
@@ -972,7 +984,7 @@ def run_study(
     if register is not None:
         from sleeve_fund.research.trials import legacy_idea_hash
 
-        result.failed_counts = register.failed(legacy_idea_hash(spec.name))
+        result.failed_counts = register.failed(idea_hash or legacy_idea_hash(spec.name))
 
     # 3. Holdout, only on request, using the most recent fold's choice. A study G1 can't judge leaves it
     # closed: opening it would spend it on no information (review round 8, M8-4).
@@ -985,8 +997,8 @@ def run_study(
         from sleeve_fund.research.holdout import MIN_UNDATED_HOLDOUT_TRADES, underlying_of
         from sleeve_fund.research.trials import legacy_idea_hash
 
-        idea_hash, underlying = legacy_idea_hash(spec.name), underlying_of(pair_of(instrument))
-        locked = locks.refusal(idea_hash, underlying, prices.index[-holdout_bars], prices.index[-1])
+        idea, underlying = idea_hash or legacy_idea_hash(spec.name), underlying_of(pair_of(instrument))
+        locked = locks.refusal(idea, underlying, prices.index[-holdout_bars], prices.index[-1])
     if use_holdout and holdout_days and result.not_judged:
         result.holdout_withheld = f"left closed, though asked for: G1 can't judge this study ({result.not_judged})"
     elif opened is not None:
@@ -997,7 +1009,7 @@ def run_study(
                                    "stretch, so there is no choice to test on it")
     elif locked:
         result.holdout_withheld = f"left closed, though asked for: {locked}"
-    elif (use_holdout and holdout_days and locks is not None and locks.undated(idea_hash)
+    elif (use_holdout and holdout_days and locks is not None and locks.undated(idea)
           and (few := _holdout_trades(bt(spec.name, prices, folds[-1].chosen), prices.index[-holdout_bars]))
           < MIN_UNDATED_HOLDOUT_TRADES):
         # Counted before the claim, and only the count is shown: spending the one clean look on too few trades
@@ -1006,7 +1018,7 @@ def run_study(
                                    f"trades, and {MIN_UNDATED_HOLDOUT_TRADES} are needed: "
                                    f"{MIN_UNDATED_HOLDOUT_TRADES - few} more")
     elif use_holdout and holdout_days and locks is not None and not locks.open(
-            idea_hash, underlying, prices.index[-holdout_bars], prices.index[-1]):
+            idea, underlying, prices.index[-holdout_bars], prices.index[-1]):
         # Claimed before the look: another study took the lock since the check above, so this one doesn't look.
         result.holdout_withheld = ("left closed, though asked for: another study opened this idea's holdout on "
                                    f"{underlying} while this one ran")
@@ -1040,13 +1052,13 @@ def run_study(
         except Exception:
             if locks is not None:
                 # The lock was claimed before the look, so the holdout is spent: recorded as a crash, not a result.
-                locks.crashed(idea_hash, underlying)
+                locks.crashed(idea, underlying)
                 log_.error("holdout of %s on %s spent by a crash, not a failed result: the lock stays", spec.name,
                            underlying)
             raise
         trial = log(chosen, "holdout", result.holdout["sharpe"], prices.iloc[-holdout_bars:])
         if locks is not None:
-            locks.settle(idea_hash, underlying, trial)
+            locks.settle(idea, underlying, trial)
     return result
 
 
@@ -1164,7 +1176,19 @@ def _one_way(result: StudyResult, ledger: IdeaLedger, fold_runs: list, bt, minut
         result.one_way = "void"
 
 
-def _overfit(grid_returns: dict, grid_settings: list[dict], register, spec: IdeaSpec, research: pd.DataFrame, bt):
+def idea_of(params: dict | None, idea_hash: str | None) -> str | None:
+    """The idea family a study counts under when its caller named none: a rule-builder definition's own structural idea
+    (candidates.idea_hash), so unrelated definitions never share the "rules" family's trial count, holdout lock and
+    PBO family, and a parent and its candidates share one (CR F236-3). None for a hand-coded model: its name."""
+    if idea_hash is not None or not isinstance((params or {}).get("definition"), dict):
+        return idea_hash
+    from sleeve_fund.research.candidates import idea_hash as structural
+
+    return structural(params["definition"])
+
+
+def _overfit(grid_returns: dict, grid_settings: list[dict], register, spec: IdeaSpec, research: pd.DataFrame, bt,
+             idea_hash: str | None = None):
     """R4's PBO (Advisor 13 Oct 16:50): the sensitivity grid plus every other counted setting of the idea family in the
     trials register, each re-run on this study's research period (never the holdout) and fee model, as daily net
     returns. Ablation and portfolio rows don't count there (trials._counted), so they stay out. A counted setting that
@@ -1180,10 +1204,11 @@ def _overfit(grid_returns: dict, grid_settings: list[dict], register, spec: Idea
         from sleeve_fund.research.pbo import no_selection
         from sleeve_fund.research.trials import legacy_idea_hash
 
-        if why := register.no_selection(legacy_idea_hash(spec.name)):
+        idea = idea_hash or legacy_idea_hash(spec.name)  # a candidate's own family (CR F236-1)
+        if why := register.no_selection(idea):
             return no_selection(why)
         seen = {json.dumps(s, sort_keys=True) for s in grid_settings}
-        for t in register._counted(legacy_idea_hash(spec.name)):
+        for t in register._counted(idea):
             try:
                 settings = json.loads(t["settings"]) if isinstance(t["settings"], str) else t["settings"]
                 if t["status"] == "failed" and set(settings) == {"params"}:  # trials.failed_row wraps them
