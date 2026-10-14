@@ -326,6 +326,7 @@ class LongFlatConfig(StrategyConfig):
         market: str = markets.SPOT,
         allow_short: bool = False,
         demo_mirror: bool = False,
+        keep_sub_cost_target: bool = False,
         trade_from: int | None = None,
         leg: dict | None = None,
         **kwargs: Any,
@@ -466,6 +467,9 @@ class LongFlatConfig(StrategyConfig):
         self.perp = markets.terms({"market": market}, str(instrument_id.venue))
         # Read by the demo mirror (sleeve_fund.mirror), not by the strategy: paper is unchanged.
         self.demo_mirror = bool(demo_mirror)
+        # C8 (Drop B): keep a take-profit even when a hit would not cover the round trip's costs (the entry's check
+        # otherwise drops it). Either way the entry's order says what the check found (_check_target).
+        self.keep_sub_cost_target = bool(keep_sub_cost_target)
 
 
 # Handlers whose exceptions the engine would swallow or only log: market data, order events, the bar
@@ -609,6 +613,9 @@ class LongFlatStrategy(Strategy):
         # (from the % settings, or from the market for an ATR or swing-low stop); None when flat.
         self._stop_frac: float | None = None
         self._tp_frac: float | None = None
+        # What the entry's target check found when it dropped or kept a target below costs, for that entry's order
+        # (_check_target; _send_entry adds it to the signal once)
+        self._tp_signal: dict = {}
         self._stop_basis = ""  # how the stop was set, in words, for the journal
         # After a restart: a new ATR or swing-low stop to set from the market on the next bar, with the old
         # stop working until then (_replan), as ("edit" or "restart", the settings-change event it applies).
@@ -2155,13 +2162,7 @@ class LongFlatStrategy(Strategy):
                 return
             self._noted.discard("stop_not_ready")
             self._stop_frac, self._tp_frac, self._stop_basis = plan
-            leg = self._round_trip_cost()
-            if self._tp_frac and gain_at_target(self._tp_frac, leg, side) <= 0:
-                self._note("target_below_costs", f"No take-profit on this entry: the {self._tp_frac:.2%} target "
-                           "doesn't cover the round trip's fees and spread at the venue's spread now")
-                self._tp_frac = None
-            else:
-                self._noted.discard("target_below_costs")
+            LongFlatStrategy._check_target(self, self._round_trip_cost(), side)
         equity, cash, _, _ = self._mark()
         # CUT-A: sized off the fund's equity, never the Strategy's own (which starts at 0 once the fund holds the cash).
         base = self._sizing_base(equity)
@@ -2737,15 +2738,9 @@ class LongFlatStrategy(Strategy):
                     return
                 self._noted.discard("stop_not_ready")
                 self._stop_frac, self._tp_frac, self._stop_basis = plan
-                leg = self._round_trip_cost()
-                if self._tp_frac and self._tp_frac <= leg + (1 + self._tp_frac) * leg:
-                    # A fixed target checked against the assumed spread can still fall short when the
-                    # venue's spread is wider now; a hit would lose money, so this trade goes without one.
-                    self._note("target_below_costs", f"No take-profit on this entry: the {self._tp_frac:.2%} target "
-                               "doesn't cover the round trip's fees and spread at the venue's spread now")
-                    self._tp_frac = None
-                else:
-                    self._noted.discard("target_below_costs")
+                # A fixed target checked against the assumed spread can still fall short when the venue's spread is
+                # wider now; a hit would lose money, so this trade goes without one unless its settings keep it.
+                LongFlatStrategy._check_target(self, self._round_trip_cost())
             reason, values = self.explain(bar, True)
             extra = {"target_weight": round(float(raw), 6)} if raw < 1 else {}
             # The cap is its own limit in _buy_all, so the journal says which one set the size.
@@ -3130,6 +3125,33 @@ class LongFlatStrategy(Strategy):
         cost, stop = self._round_trip_cost(), self._stop_frac if self._stop_frac is not None else self._cfg.stop_loss
         return loss_at_stop(stop, cost, side)
 
+    def _check_target(self, leg: float, side: int = 1) -> None:
+        """C8 (Drop B): an entry's take-profit that a hit would not pay the round trip's costs on (leg: one leg's fee
+        and half spread) is dropped, so the trade goes without one, or kept when the Strategy's settings say so
+        (keep_sub_cost_target). Either way the entry's order carries what was found, the target and its break-even
+        (the target a hit would just pay the costs at) as shares of the entry price, in the PM's words and as a code."""
+        self._tp_signal = {}
+        tp = self._tp_frac
+        if not tp or gain_at_target(tp, leg, side) > 0:
+            self._noted.discard("target_below_costs")
+            self._noted.discard("target_kept_below_costs")
+            return
+        even = 2 * leg / (1 - side * leg)  # gain_at_target(even, leg, side) == 0
+        found = {"tp_drop_step": "entry_target_check", "tp_target": round(tp, 6), "tp_break_even": round(even, 6)}
+        if getattr(self._cfg, "keep_sub_cost_target", False):
+            self._note("target_kept_below_costs", f"Take-profit kept on this entry by its settings: the {tp:.2%} "
+                       f"target doesn't cover the round trip's fees and spread (break-even {even:.2%})", level="info")
+            self._tp_signal = {**found, "tp_drop_code": "kept_by_config",
+                               "tp_kept": f"Take-profit {tp:.2%} kept by its settings, below the round trip's costs "
+                                          f"(break-even {even:.2%})"}
+            return
+        self._note("target_below_costs", f"No take-profit on this entry: the {tp:.2%} target "
+                   "doesn't cover the round trip's fees and spread at the venue's spread now")
+        self._tp_frac = None
+        self._tp_signal = {**found, "tp_drop_code": "below_round_trip_cost",
+                           "tp_dropped": f"Take-profit {tp:.2%} dropped: below the round trip's costs "
+                                         f"(break-even {even:.2%})"}
+
     def _round_trip_cost(self) -> float:
         """Each leg's cost as a share of its notional: the taker fee and half the spread."""
         return self._cfg.assumed_taker_fee + self._half_spread()
@@ -3177,6 +3199,8 @@ class LongFlatStrategy(Strategy):
         the order's journal row holds the reservation, so its fills and end settle it (Store._settle_reservation).
         A two-leg Strategy's entry opens both legs through its Pair (strategies.pair), which sends each leg's own,
         checked for both legs at once on paper (`gated`: this leg's answer from PaperGate.pair, Advisor M1)."""
+        if what == "entry" and getattr(self, "_tp_signal", None):
+            signal, self._tp_signal = {**signal, **self._tp_signal}, {}
         if self.pair is not None and self.pair.sending is not self:
             self.pair.entry(self, side, qty, reason, signal, what, sent)
             return
