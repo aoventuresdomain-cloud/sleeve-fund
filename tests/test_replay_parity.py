@@ -196,3 +196,16 @@ def test_a_backtest_entry_not_decided_on_a_bar_is_listed_on_its_own_never_a_fals
                      from_backtest([_b("a", _day(0)), {**_b("a", off_bar), "bar_decided": False}]))
     assert report.clean and report.matched == 1 and report.backtest == 1
     assert [(u.strategy, u.bar_ts) for u in report.unbarred_backtest] == [("a", off_bar)]
+
+
+def test_a_strategy_outside_the_funds_book_is_listed_apart_on_both_sides_never_compared():
+    # F-P27-2 (after F229-6): a test-account Strategy on a quote currency held under 8 places is outside the fund's
+    # book, so its decisions are neither matched nor a false 'paper only' / 'backtest only'; the rest still compare.
+    paper = from_journal([_j(1, "a", _day(1)), _j(2, "t", _day(1)), _j(3, "t", _day(2))])
+    backtest = from_backtest([_b("a", _day(1)), _b("t", _day(1), outcome="trimmed", appr="0.5")])
+    rep = compare(paper, backtest, outside={"t"})
+    assert rep.clean and rep.matched == 1 and (rep.paper, rep.backtest) == (1, 1)
+    assert [(r.strategy, r.bar_ts) for r in rep.outside] == [("t", _day(1)), ("t", _day(2))]
+    assert [(r.strategy, r.outcome) for r in rep.outside_backtest] == [("t", "trimmed")]
+    named = compare(paper, backtest)  # not named: it is compared like any other
+    assert not named.clean and not named.outside and not named.outside_backtest

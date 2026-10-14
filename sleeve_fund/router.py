@@ -5,6 +5,7 @@ order path call it and keep no rule of their own. Nothing here reads the databas
   change here. It routes paper accounts only: paper trading only until G2.
 - check() refuses any order whose instrument isn't on the strategy's pinned venue. The caller logs the refusal as an
   error event and sends nothing.
+- start_mode() decides how a strategy whose journal last traded on another venue than its pin may start (F-WED1-3).
 - venue_for() is the one place a strategy's stored pin becomes its venue: the node's config, the runtime and every
   orders row (orders.venue) read it.
 """
@@ -73,3 +74,23 @@ def check(strategy: str, instrument_id: str, pinned_venue: str) -> None:
     if got != want:
         raise VenueMismatch(f"Order refused: {strategy} trades on its own venue only, and this order was for "
                             f"another venue's instrument.")
+
+
+NORMAL, EXITS_ONLY, REFUSE = "normal", "exits_only", "refuse"
+# Why a strategy whose journal last traded on another venue than its pin doesn't start to trade, by start_mode. For
+# the PM, so no venue names; the caller's log line names them.
+VENUE_MOVED = {EXITS_ONLY: "its open position is on another venue than the one it is set to trade on, so it only "
+                           "closes that position there",
+               REFUSE: "it last traded on another venue than the one it is set to trade on; a reset starts a new run "
+                       "on its own venue"}
+
+
+def start_mode(pin_venue: str, traded_venue: str | None, holding: bool) -> str:
+    """How a strategy starts when its journal last traded on another venue than its pin (F-WED1-3, Advisor 14 Oct
+    03:35 UK). pin_venue: venue_for(its pin); traded_venue: the venue of the order behind its latest fill (None with
+    no fills). The same venue, or no fills: NORMAL, on the pin. Another venue while holding: EXITS_ONLY, on the
+    traded venue, so the open position's stop and target close it where it is and nothing opens. Another venue while
+    flat: REFUSE; a reset starts a new run on the pin."""
+    if traded_venue is None or base_venue(traded_venue).upper() == venue_for(pin_venue):
+        return NORMAL
+    return EXITS_ONLY if holding else REFUSE

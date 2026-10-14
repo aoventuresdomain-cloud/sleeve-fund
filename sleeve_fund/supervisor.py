@@ -24,7 +24,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
-from sleeve_fund import accounts, lifecycle, liquidation
+from sleeve_fund import accounts, lifecycle, liquidation, router
 from sleeve_fund.alerts import Forwarder
 from sleeve_fund.exact import float_view
 from sleeve_fund.money import to_decimal
@@ -39,6 +39,8 @@ from sleeve_fund.store import DUST_NOTIONAL, OPEN_ORDER_STATUSES, Sleeve, Store,
 from sleeve_fund.strategies import check_perp_sizing, check_perp_stop
 from sleeve_fund.paper.runtime import entry_blocked, liquidation_head, said_since_last_fill
 from sleeve_fund.strategies.base import EXITS_ONLY
+
+VENUE_EXITS = f"{EXITS_ONLY}: {router.VENUE_MOVED[router.EXITS_ONLY]}"  # F-WED1-3: the status reason of that start
 
 POLL_SECONDS = 5
 KEY_CHECK_EVERY = 12  # polls between key-presence checks: about a minute
@@ -173,6 +175,16 @@ def decide(sleeve: Sleeve, proc: Proc, now: datetime, holds: bool = False) -> st
         if sleeve.heartbeat_at is None or now - sleeve.heartbeat_at > HEARTBEAT_STALE:
             return "restart_stale"
     return "none"
+
+
+def check_venue_pin(store: Store, s: Sleeve) -> None:
+    """Raises ValueError when the strategy's journal last traded on another venue than its pin (Store.venue_start):
+    the supervisor's refusal then starts a holder for its exits only, on the venue its position is on, and refuses
+    a flat one."""
+    mode, traded = store.venue_start(s)
+    if mode != router.NORMAL:
+        print(f"{s.name}: venue {mode}: journal {traded}, pin {router.venue_for(s.venue)}", flush=True)
+        raise ValueError(router.VENUE_MOVED[mode])
 
 
 def check_funding_schedule(s: Sleeve) -> None:
@@ -333,6 +345,7 @@ class Supervisor:
             self.store.event(name, "error", "start_refused", f"Not started: {exc}{held}")
             return True
         try:
+            check_venue_pin(self.store, s)  # first: an off-pin holder's exits-only run reads this reason (CR F277-2)
             check_perp_sizing(s.strategy, s.params)
             check_perp_stop(s.strategy, s.params, s.risk_profile)
             check_funding_schedule(s)
@@ -370,6 +383,22 @@ class Supervisor:
                              f"Incident, {s.name}: not started to trade ({why}), but it holds {book['qty']:.12g}, so it "
                              "runs for its exits only, with a safety stop from the current price and no new entries")
         return True
+
+    def _venue_exits_done(self, s: Sleeve, proc: Proc) -> None:
+        """F-WED1-3 (HoE 14 Oct): a strategy running for its exits only on the venue its position is on stops once that
+        position is closed, so exits-only never outlives it. Still on another venue than its pin, it is then refused
+        as any flat one is (check_venue_pin) until a reset; its pin's venue again, it starts to trade."""
+        mode, _ = self.store.venue_start(s)
+        if mode == router.EXITS_ONLY:
+            return
+        self._stop(s.name, proc, "flat: its exits-only run on another venue is over")
+        if mode == router.REFUSE:
+            self.store.set_desired_state(s.name, "stopped")
+            self.store.set_status(s.name, "stopped", f"not started: {router.VENUE_MOVED[mode]}")
+            self.store.event(s.name, "info", "venue_exits_done", "Its position on the other venue is closed, so its "
+                             f"exits-only run has stopped. Not started to trade: {router.VENUE_MOVED[mode]}")
+        else:
+            self.store.set_status(s.name, "stopped", "flat: its exits-only run is over")
 
     def _holds(self, s: Sleeve, proc: Proc) -> bool:
         """Whether a stopped strategy still holds a position (not dust). Without a process its journal can't change,
@@ -528,6 +557,8 @@ class Supervisor:
             elif action == "none" and holds and not proc.watched:
                 # Stopped while halted or paused and still holding: its process keeps running, as it is (P1-U35)
                 self._watch_stopped_holder(sleeve, proc)
+            elif action == "none" and proc.alive and sleeve.status == "paused" and sleeve.status_reason == VENUE_EXITS:
+                self._venue_exits_done(sleeve, proc)
             elif action == "none" and exits_only and sleeve.desired_state == "running":
                 # Started again by the PM after a stop that left it running for its exits only: it trades again
                 self._stop(sleeve.name, proc, "started by PM: restarted to trade")

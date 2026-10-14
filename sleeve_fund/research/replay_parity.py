@@ -7,7 +7,9 @@ two decisions on one key pair in the order each side made them. Only 'submit' st
 no fill-stage backstop, and 'error' rows never reach replayable(). A paper entry sent outside a bar decision (a
 rebalance add, a resumed entry) carries the check time as its bar_ts (PE2, W2) and no signal.bar on its order row: the
 caller names those intents (`unbarred`), and they are listed on their own line, never matched or mismatched. The
-backtest's own such orders are marked in its decisions (bar_decided) and listed apart the same way."""
+backtest's own such orders are marked in its decisions (bar_decided) and listed apart the same way. A Strategy outside
+the fund's book (supervisor.outside_fund_book, F229-6: a test account on a quote currency held under 8 places) is
+named by the caller (`outside`): its decisions on both sides are listed apart and never compared (F-P27-2)."""
 
 from __future__ import annotations
 
@@ -69,6 +71,8 @@ class ParityReport:
     mismatches: list[Mismatch] = field(default_factory=list)
     unbarred: list[Decided] = field(default_factory=list)  # paper entries not decided on a bar: listed, not compared
     unbarred_backtest: list[Decided] = field(default_factory=list)  # the backtest's likewise
+    outside: list[Decided] = field(default_factory=list)  # paper decisions of Strategies outside the fund's book
+    outside_backtest: list[Decided] = field(default_factory=list)  # the backtest's likewise
 
     @property
     def clean(self) -> bool:
@@ -108,10 +112,13 @@ def _keyed(rows: list[Decided]) -> dict[tuple[str, datetime], list[Decided]]:
 
 
 def compare(paper: list[Decided], backtest: list[Decided], start: datetime | None = None,
-            end: datetime | None = None) -> ParityReport:
+            end: datetime | None = None, outside: Collection[str] = ()) -> ParityReport:
     """Every decision on either side between start and end (bar closes, inclusive), matched on (strategy, bar_ts).
-    Quantities are compared exactly: both sides size on the same step, so any difference is a real one."""
+    Quantities are compared exactly: both sides size on the same step, so any difference is a real one. outside: the
+    Strategies outside the fund's book, whose decisions on both sides are listed apart, never compared."""
     p, b = _within(paper, start, end), _within(backtest, start, end)
+    out_p, p = [r for r in p if r.strategy in outside], [r for r in p if r.strategy not in outside]
+    out_b, b = [r for r in b if r.strategy in outside], [r for r in b if r.strategy not in outside]
     unbarred, p = [r for r in p if not r.bar_decided], [r for r in p if r.bar_decided]
     unbarred_b, b = [r for r in b if not r.bar_decided], [r for r in b if r.bar_decided]
     pk, bk = _keyed(p), _keyed(b)
@@ -130,7 +137,7 @@ def compare(paper: list[Decided], backtest: list[Decided], start: datetime | Non
                     out.append(Mismatch(*key, what, x, y))
                 else:
                     matched += 1
-    return ParityReport(len(p), len(b), matched, out, unbarred, unbarred_b)
+    return ParityReport(len(p), len(b), matched, out, unbarred, unbarred_b, out_p, out_b)
 
 
 def adverse_bp(side: int, expected: Decimal, fill: Decimal) -> float:
