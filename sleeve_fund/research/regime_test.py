@@ -2,10 +2,17 @@
 weighted run against two nulls, the unweighted run, double fees and a minimum of entries per state. A fail means the
 weight is 1.0 everywhere; nothing here re-tunes a mapping to rescue it (a new mapping is a new counted idea).
 
-Primary null: the regime state series circularly shifted by a random offset of at least MIN_SHIFT_DAYS per draw, which
-keeps how long regimes last and how often each weight is used but breaks their timing. Secondary null: each entry's
-weight drawn independently with the frequencies the regime run used. DRAWS seeded draws of each; the seed is fixed and
-reported.
+Primary null: the regime state series circularly shifted by an offset in [L, N - L], L = max(MIN_SHIFT_DAYS,
+SPELL_MULTIPLE x the mean spell length of the run's states), which keeps how long regimes last and how often each weight
+is used but breaks their timing (a shift near N is a small shift the other way, so the top of the range is cut too).
+When fewer than DRAWS shifts are admissible, every one is used once instead of drawing (Advisor 14 Oct 08:45 UK).
+Secondary null: each entry's weight drawn independently with the frequencies the regime run used. DRAWS seeded draws;
+the seed is fixed and reported. A pass needs both nulls beaten at the 95th percentile and the weighted book's Sharpe at
+least the unweighted book's.
+
+The decision is on the book the PM would run (its Sharpe and drawdown); the per-family figures are reported, never
+judged. The verdict reads the development period only: the runs must end before the holdout starts, and the holdout is
+read once, after a pass, as its own run.
 
 How a draw is made (Advisor 13 Oct 19:45 UK, method A): the engine runs unweighted and regime-weighted for real. A
 trade's size scales with its entry weight, fixed for the trade's life (an add carries it), so a draw's P&L is each
@@ -13,7 +20,11 @@ trade's P&L at weight 1, from the unweighted run, times its weight. The regime r
 against the rebuilt nulls, so the approximation sits on both sides; the real runs decide the other lines (at least the
 unweighted Sharpe, drawdown, double fees). The rebuild must be faithful or the result is NOT JUDGED: the rebuilt
 regime Sharpe within FIDELITY_SHARPE of the real regime run's, and the two runs' entries the same but for at most
-FIDELITY_ENTRIES of them (a smaller weight can let a limit or a halt bind differently)."""
+FIDELITY_ENTRIES of them (a smaller weight can let a limit or a halt bind differently).
+
+A second, exact fidelity check (Advisor 14 Oct 08:45 UK, M3): the regime run with every weight forced to 1.0 (a
+Weighting with no family registered) must be the unweighted run itself, the same entries and the book the same to the
+cent, and the rebuild at weight 1.0 must be the unweighted book to the cent. Any difference is a bug, so NOT JUDGED."""
 
 from __future__ import annotations
 
@@ -29,6 +40,8 @@ from sleeve_fund.research import metrics
 
 DRAWS = 1000
 MIN_SHIFT_DAYS = 60
+SPELL_MULTIPLE = 3  # the shift is at least this many mean regime spells, so a shifted state is not the same spell
+CENT = 0.005  # half a cent: two books are the same to the cent when no mark differs by this much
 PCTL = 95.0
 MAX_DD_WORSE = 0.10  # relative: the weighted run's max drawdown at most 10% deeper than the unweighted run's
 MIN_ENTRIES_PER_STATE = 30
@@ -39,13 +52,31 @@ STATES = ("low", "mid", "high")
 NOT_JUDGED, PASS, FAIL = "NOT JUDGED", "PASS", "FAIL"
 
 
-def shifted_states(states: pd.Series, rng: np.random.Generator, min_shift: int = MIN_SHIFT_DAYS) -> pd.Series:
-    """The primary null's state series: `states` (one per day, in date order) rolled by an offset in
-    [min_shift, len - min_shift], wrapping round, on the same dates."""
-    n = len(states)
-    if n < 2 * min_shift + 1:
-        raise ValueError(f"a shifted null needs more than {2 * min_shift} days of regime states, got {n}")
-    k = int(rng.integers(min_shift, n - min_shift + 1))
+def mean_spell(states: pd.Series) -> float:
+    """The mean length in days of the runs of one unchanged state in `states` (in date order)."""
+    v = states.to_numpy()
+    return len(v) / (1 + int((v[1:] != v[:-1]).sum())) if len(v) else 0.0
+
+
+def min_shift(states: pd.Series) -> int:
+    """L, the smallest shift the primary null may use: MIN_SHIFT_DAYS or SPELL_MULTIPLE mean spells, the larger."""
+    return max(MIN_SHIFT_DAYS, int(np.ceil(SPELL_MULTIPLE * mean_spell(states))))
+
+
+def shifts(states: pd.Series, rng: np.random.Generator, draws: int = DRAWS) -> list[int]:
+    """The primary null's offsets: `draws` drawn from [L, N - L], or every one of them once when there are fewer."""
+    n, low = len(states), min_shift(states)
+    if n < 2 * low + 1:
+        raise ValueError(f"a shifted null needs more than {2 * low} days of regime states, got {n}")
+    every = n - 2 * low + 1
+    if every < draws:
+        return list(range(low, n - low + 1))
+    return [int(k) for k in rng.integers(low, n - low + 1, size=draws)]
+
+
+def shifted_states(states: pd.Series, k: int) -> pd.Series:
+    """The primary null's state series: `states` (one per day, in date order) rolled by k days, wrapping round, on the
+    same dates."""
     return pd.Series(np.roll(states.to_numpy(), k), index=states.index)
 
 
@@ -83,14 +114,16 @@ class Verdict:
     reasons: tuple[str, ...]
     rebuilt_sharpe: float = float("nan")
     seed: int | None = None
+    families: dict = None  # family -> {"sharpe", "unweighted_sharpe", "drawdown", "unweighted_drawdown"}: reported only
 
 
 def judge(weighted: pd.Series, unweighted: pd.Series, primary: Sequence[float], secondary: Sequence[float],
           double_fees_pass: bool, entries_per_state: dict, rebuilt_sharpe: float, unfaithful: Sequence[str] = (),
-          seed: int | None = None) -> Verdict:
+          seed: int | None = None, primary_complete: int = DRAWS) -> Verdict:
     """Section 4.4 on the out-of-sample daily net returns of the real runs, with the nulls ranked against the rebuilt
     regime Sharpe: every condition must hold. An unfaithful rebuild, fewer than MIN_ENTRIES_PER_STATE entries in any
-    state, or a null that isn't complete is NOT JUDGED, never a pass. The holdout confirm is a separate single run
+    state, or a null that isn't complete is NOT JUDGED, never a pass. primary_complete: how many primary draws make it
+    complete (DRAWS, or every admissible shift when there are fewer). The holdout confirm is a separate single run
     after a pass."""
     sr, base, rb = daily_sharpe(weighted), daily_sharpe(unweighted), rebuilt_sharpe
     p1 = float(np.percentile(primary, PCTL)) if len(primary) else float("nan")
@@ -104,7 +137,8 @@ def judge(weighted: pd.Series, unweighted: pd.Series, primary: Sequence[float], 
     if short:
         why = f"fewer than {MIN_ENTRIES_PER_STATE} entries in {', '.join(short)}"
         return Verdict(NOT_JUDGED, *args, (why,), rb, seed)
-    if len(primary) < DRAWS or len(secondary) < DRAWS or not np.isfinite([sr, base, rb, p1, p2]).all():
+    short_null = len(primary) < min(primary_complete, DRAWS) or len(secondary) < DRAWS
+    if short_null or not np.isfinite([sr, base, rb, p1, p2]).all():
         return Verdict(NOT_JUDGED, *args, (f"the nulls need {DRAWS} draws each and every Sharpe measured",), rb, seed)
     fails = []
     if not rb > p1:
@@ -155,12 +189,16 @@ def trades(run) -> Trades:
     return Trades(start, changes, tuple(entries))
 
 
-def rebuilt_returns(t: Trades, weights: Sequence[float]) -> pd.Series:
-    """Daily returns of the book with each trade's P&L scaled by its entry's weight (weights: one per t.entries)."""
+def rebuilt_book(t: Trades, weights: Sequence[float]) -> pd.Series:
+    """The book with each trade's P&L scaled by its entry's weight (weights: one per t.entries)."""
     w = np.append(np.asarray(weights, dtype=float), 1.0)  # index -1: flat, weight 1
     pnl = [(c["change"] * w[c["entry"].to_numpy()]).cumsum().rename(name) for name, c in t.changes.items()]
-    book = t.start + pd.concat(pnl, axis=1).sort_index().ffill().fillna(0.0).sum(axis=1)
-    return metrics.daily_returns(book)
+    return t.start + pd.concat(pnl, axis=1).sort_index().ffill().fillna(0.0).sum(axis=1)
+
+
+def rebuilt_returns(t: Trades, weights: Sequence[float]) -> pd.Series:
+    """Daily returns of rebuilt_book."""
+    return metrics.daily_returns(rebuilt_book(t, weights))
 
 
 def regime_weights(t: Trades, state_on: Callable[[date], str | None], families: Mapping[str, str]) -> list[float]:
@@ -180,27 +218,97 @@ def _opening(run) -> set:
     return {(d["strategy"], d["bar_ts"]) for d in run.decisions if d.get("kind") == "entry" and d["approved"] > 0}
 
 
+def _utc(ts) -> pd.Timestamp:
+    ts = pd.Timestamp(ts)
+    return ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+
+
+def development_only(runs: Sequence, folds: Sequence[tuple], holdout_start) -> None:
+    """Raise unless every run and fold ends before the holdout (None only when the data keeps no holdout): the verdict
+    never reads the held-back period, which is read once, after a pass (Advisor 14 Oct 08:45 UK, M5)."""
+    if holdout_start is None:
+        return
+    held = _utc(holdout_start)
+    for _, end in folds:
+        if _utc(end) >= held:
+            raise ValueError(f"the regime verdict never reads the held-back period: a fold to {_utc(end):%d %b %Y} "
+                             f"reaches the holdout from {held:%d %b %Y}")
+    for run in runs:
+        if len(run.book) and _utc(run.book.index[-1]) >= held:
+            raise ValueError(f"the regime verdict never reads the held-back period: a run to "
+                             f"{_utc(run.book.index[-1]):%d %b %Y} reaches the holdout from {held:%d %b %Y}")
+
+
+def _sized(run) -> list:
+    return sorted((d["strategy"], d["bar_ts"], d["approved"]) for d in run.decisions
+                  if d.get("kind") == "entry" and d["approved"] > 0)
+
+
+def exact(unweighted, ones) -> list[str]:
+    """Why the run with every weight forced to 1.0 isn't the unweighted run, or [] when it is: the same opening
+    entries at the same sizes and the book the same to the cent at every mark (M3)."""
+    if ones is None:
+        return ["the run with every weight forced to 1.0 hasn't run"]
+    why = []
+    if _sized(ones) != _sized(unweighted):
+        why.append("with every weight forced to 1.0 the entries differ from the unweighted run's")
+    a, b = unweighted.book.astype(float), ones.book.astype(float)
+    if not a.index.equals(b.index) or (a - b).abs().max() >= CENT:
+        why.append("with every weight forced to 1.0 the book differs from the unweighted run's")
+    return why
+
+
+def _family_books(run, families: Mapping[str, str]) -> dict:
+    books: dict = {}
+    for name, leg in run.legs.items():
+        f = families.get(name, "") or "unregistered"
+        books[f] = leg.equity.astype(float) if f not in books else books[f].add(leg.equity.astype(float),
+                                                                                  fill_value=0.0)
+    return books
+
+
+def per_family(unweighted, weighted, families: Mapping[str, str], folds: Sequence[tuple]) -> dict:
+    """Each family's Sharpe and drawdown, weighted and unweighted, out of sample: reported, never judged (M4)."""
+    u, w = _family_books(unweighted, families), _family_books(weighted, families)
+    out = {}
+    for f in sorted(u):
+        ru, rw = oos(metrics.daily_returns(u[f]), folds), oos(metrics.daily_returns(w.get(f, u[f])), folds)
+        out[f] = {"sharpe": daily_sharpe(rw), "unweighted_sharpe": daily_sharpe(ru), "drawdown": max_drawdown(rw),
+                  "unweighted_drawdown": max_drawdown(ru)}
+    return out
+
+
 def acceptance(unweighted, weighted, states: pd.Series, families: Mapping[str, str], folds: Sequence[tuple],
-               double_fees: tuple | None, seed: int = SEED, draws: int = DRAWS) -> Verdict:
+               double_fees: tuple | None, *, ones, holdout_start, seed: int = SEED, draws: int = DRAWS) -> Verdict:
     """Section 4 on two real PortfolioResults over the same Strategies, windows and fee model: `weighted` ran with
     Weighting over `states` (the regime state per date, a datetime.date index). double_fees: the same pair at double
     fees, judged the same way with the same seed (it passes when its own verdict passes); None when not yet run, and
-    then the result is at best NOT JUDGED."""
-    v = _verdict(unweighted, weighted, states, families, folds, seed, draws, None)
+    then the result is at best NOT JUDGED. ones: the same run with every weight forced to 1.0 (Weighting with no
+    family), which must be the unweighted run exactly; None is NOT JUDGED. holdout_start: where the held-back period
+    begins; a run or fold reaching it is refused."""
+    development_only([unweighted, weighted, ones, *(double_fees or ())], folds, holdout_start)
+    v = _verdict(unweighted, weighted, ones, states, families, folds, seed, draws, None)
     if double_fees is None:
         return v if v.result != PASS else replace(v, result=NOT_JUDGED, reasons=("the double-fee pair hasn't run",))
-    twice = _verdict(*double_fees, states, families, folds, seed, draws, None).result == PASS
-    return _verdict(unweighted, weighted, states, families, folds, seed, draws, twice)
+    twice = _verdict(*double_fees, None, states, families, folds, seed, draws, None, exact_check=False).result == PASS
+    return _verdict(unweighted, weighted, ones, states, families, folds, seed, draws, twice)
 
 
-def _verdict(unweighted, weighted, states, families, folds, seed, draws, twice: bool | None) -> Verdict:
+def _verdict(unweighted, weighted, ones, states, families, folds, seed, draws, twice: bool | None,
+             exact_check: bool = True) -> Verdict:
     rng = np.random.default_rng(seed)
     t = trades(unweighted)
     w = regime_weights(t, states.get, families)
     rebuilt = daily_sharpe(oos(rebuilt_returns(t, w), folds))
     real_w = oos(metrics.daily_returns(weighted.book), folds)
     real_u = oos(metrics.daily_returns(unweighted.book), folds)
-    unfaithful = []
+    unfaithful = exact(unweighted, ones) if exact_check else []
+    at_one = metrics.daily_closes(rebuilt_book(t, [1.0] * len(t.entries)))
+    book_u = metrics.daily_closes(unweighted.book.astype(float))
+    # The book is marked hourly from the window's start; a leg's first mark can come later, so the rebuild is checked
+    # on its own days, each of which must be a day of the book.
+    if not at_one.index.isin(book_u.index).all() or (at_one - book_u.reindex(at_one.index)).abs().max() >= CENT:
+        unfaithful.append("the rebuild at weight 1.0 isn't the unweighted book to the cent")
     if not abs(rebuilt - daily_sharpe(real_w)) <= FIDELITY_SHARPE:
         unfaithful.append(f"the rebuild is off the real regime run: Sharpe {rebuilt:.3f} vs {daily_sharpe(real_w):.3f}")
     a, b = _opening(unweighted), _opening(weighted)
@@ -208,10 +316,14 @@ def _verdict(unweighted, weighted, states, families, folds, seed, draws, twice: 
         unfaithful.append(f"{len(a ^ b)} of {len(a)} entries differ between the weighted and unweighted runs")
     weighed = [families.get(s, "") in DIRECTION for s, _ in t.entries]  # unregistered families stay at 1.0
     used = [x for x, f in zip(w, weighed) if f]
-    primary, secondary = [], []
+    try:
+        offsets = shifts(states, rng, draws)
+    except ValueError as e:  # too few days for the regime spells seen: there is no primary null, so no verdict
+        offsets, unfaithful = [], [*unfaithful, str(e)]
+    primary = [daily_sharpe(oos(rebuilt_returns(t, regime_weights(t, shifted_states(states, k).get, families)), folds))
+               for k in offsets]
+    secondary = []
     for _ in range(draws):
-        shifted = shifted_states(states, rng)
-        primary.append(daily_sharpe(oos(rebuilt_returns(t, regime_weights(t, shifted.get, families)), folds)))
         drawn = iter(iid_weights(used, rng) if used else [])
         secondary.append(daily_sharpe(oos(rebuilt_returns(t, [next(drawn) if f else x for x, f in zip(w, weighed)]),
                                           folds)))
@@ -219,4 +331,6 @@ def _verdict(unweighted, weighted, states, families, folds, seed, draws, twice: 
     for d in weighted.decisions:
         if d.get("kind") == "entry" and d["approved"] > 0:
             per_state[d["regime_state"]] = per_state.get(d["regime_state"], 0) + 1
-    return judge(real_w, real_u, primary, secondary, bool(twice), per_state, rebuilt, unfaithful, seed)
+    v = judge(real_w, real_u, primary, secondary, bool(twice), per_state, rebuilt, unfaithful, seed,
+              primary_complete=max(len(offsets), 1))
+    return replace(v, families=per_family(unweighted, weighted, families, folds))

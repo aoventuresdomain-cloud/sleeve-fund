@@ -95,6 +95,13 @@ def runs():
     return plain, weighted, rows
 
 
+@pytest.fixture(scope="module")
+def ones(runs):
+    # The regime run with every weight forced to 1.0: a Weighting with no family registered.
+    specs = [_spec("a", 2, model="ping_pong"), _spec("b", 10, model="ping_pong")]
+    return run_portfolio(specs, regime=Weighting(runs[2].get, {}))
+
+
 def test_unweighted_is_the_default_and_records_no_weight(runs):
     plain, _, _ = runs
     assert plain.decisions and all(d["regime_weight"] is None and d["regime_state"] is None for d in plain.decisions)
@@ -111,17 +118,39 @@ def test_the_variant_weighs_each_opening_entry_by_its_days_regime(runs):
     assert all(d["requested"] <= D("0.25") * max(p["requested"] for p in plain.decisions) + D("0.001") for d in low)
 
 
+def _spells(length: int, days: int) -> pd.Series:
+    cycle = ["low", "mid", "high"]
+    return pd.Series([cycle[(i // length) % 3] for i in range(days)], index=pd.date_range("2025-01-01", periods=days))
+
+
 def test_the_shifted_null_keeps_the_states_and_their_runs_but_moves_their_timing():
-    states = pd.Series(["low"] * 50 + ["mid"] * 70 + ["high"] * 80, index=pd.date_range("2025-01-01", periods=200))
-    rng = np.random.default_rng(7)
-    for _ in range(20):
-        s = rt.shifted_states(states, rng)
-        assert (s.value_counts() == states.value_counts()).all()
-        assert (s != states).any() and (s.index == states.index).all()
-        k = next(k for k in range(200) if (np.roll(states.to_numpy(), k) == s.to_numpy()).all())
-        assert rt.MIN_SHIFT_DAYS <= k <= 200 - rt.MIN_SHIFT_DAYS
+    states = pd.Series(["low"] * 10 + ["mid"] * 7 + ["high"] * 8, index=pd.date_range("2025-01-01", periods=25))
+    states = pd.concat([states] * 16).set_axis(pd.date_range("2025-01-01", periods=400))
+    offsets = rt.shifts(states, np.random.default_rng(7), 20)
+    assert len(offsets) == 20 and rt.min_shift(states) == rt.MIN_SHIFT_DAYS
+    for k in offsets:
+        assert rt.MIN_SHIFT_DAYS <= k <= 400 - rt.MIN_SHIFT_DAYS  # never near N, a small shift the other way
+        s = rt.shifted_states(states, k)
+        assert (s.value_counts() == states.value_counts()).all() and (s.index == states.index).all()
     with pytest.raises(ValueError):
-        rt.shifted_states(states.iloc[:120], rng)
+        rt.shifts(states.iloc[:120], np.random.default_rng(7), 20)
+
+
+def test_the_minimum_shift_is_three_mean_spells_when_that_is_longer_than_sixty_days():
+    states = _spells(40, 600)
+    assert rt.mean_spell(states) == 40 and rt.min_shift(states) == 120
+    assert all(120 <= k <= 480 for k in rt.shifts(states, np.random.default_rng(1), 50))
+    assert rt.min_shift(_spells(5, 600)) == rt.MIN_SHIFT_DAYS
+
+
+def test_with_fewer_admissible_shifts_than_draws_every_one_is_used_once_and_that_null_is_complete():
+    states = _spells(5, 131)  # L = 60: shifts 60..71
+    assert rt.shifts(states, np.random.default_rng(1), rt.DRAWS) == list(range(60, 72))
+    w, u = _returns(0.002, seed=1), _returns(0.001, seed=1)
+    v = rt.judge(w, u, [-1.0] * 12, [-1.0] * rt.DRAWS, True, ENOUGH, rt.daily_sharpe(w), primary_complete=12)
+    assert v.result == rt.PASS
+    assert rt.judge(w, u, [-1.0] * 11, [-1.0] * rt.DRAWS, True, ENOUGH, rt.daily_sharpe(w),
+                    primary_complete=12).result == rt.NOT_JUDGED
 
 
 def test_the_iid_null_draws_with_the_regime_runs_frequencies():
@@ -204,31 +233,78 @@ def test_with_no_limit_binding_the_rebuilt_regime_run_tracks_the_real_one():
     assert _rebuilt_gap(plain, weighted, rows) <= rt.FIDELITY_SHARPE
 
 
-def test_a_rebuild_off_the_real_regime_run_is_not_judged(runs):
+def test_a_rebuild_off_the_real_regime_run_is_not_judged(runs, ones):
     # Rebuild with a mapping the real regime run didn't use (every day "high", so weight 1.0): the rebuilt Sharpe is
     # the unweighted one, off the real regime run's by more than the fidelity limit (Advisor 19:45 UK).
     plain, weighted, rows = runs
     fams, folds = {"a": "trend", "b": "trend"}, [(plain.book.index[0], plain.book.index[-1])]
     every_high = pd.Series({d: "high" for d in rows})
     assert _rebuilt_gap(plain, weighted, every_high.to_dict()) > rt.FIDELITY_SHARPE
-    v = rt.acceptance(plain, weighted, every_high, fams, folds, (plain, weighted), draws=5)
+    v = rt.acceptance(plain, weighted, every_high, fams, folds, (plain, weighted), ones=ones, holdout_start=None,
+                      draws=5)
     assert v.result == rt.NOT_JUDGED and any("rebuild is off" in r for r in v.reasons)
+    assert any("shifted null needs more than" in r for r in v.reasons)  # one spell all along: no primary null
 
 
-def test_entries_differing_by_more_than_two_percent_is_not_judged(runs):
+def test_entries_differing_by_more_than_two_percent_is_not_judged(runs, ones):
     plain, weighted, rows = runs
     opening = [d for d in weighted.decisions if d["kind"] == "entry" and d["approved"] > 0]
     fewer = dataclasses.replace(weighted, decisions=[d for d in weighted.decisions if d is not opening[-1]])
     fams, folds = {"a": "trend", "b": "trend"}, [(plain.book.index[0], plain.book.index[-1])]
-    v = rt.acceptance(plain, fewer, pd.Series(rows), fams, folds, (plain, fewer), draws=5)
+    v = rt.acceptance(plain, fewer, pd.Series(rows), fams, folds, (plain, fewer), ones=ones, holdout_start=None,
+                      draws=5)
     assert v.result == rt.NOT_JUDGED and any("entries differ" in r for r in v.reasons)
 
 
-def test_the_acceptance_run_is_seeded_and_never_passes_without_the_double_fee_pair(runs):
+def test_the_acceptance_run_is_seeded_and_never_passes_without_the_double_fee_pair(runs, ones):
     plain, weighted, rows = runs
     states = pd.Series(rows)
     fams, folds = {"a": "trend", "b": "trend"}, [(plain.book.index[0], plain.book.index[-1])]
-    one = rt.acceptance(plain, weighted, states, fams, folds, None, seed=11, draws=30)
-    two = rt.acceptance(plain, weighted, states, fams, folds, None, seed=11, draws=30)
+    one = rt.acceptance(plain, weighted, states, fams, folds, None, ones=ones, holdout_start=None, seed=11,
+                        draws=30)
+    two = rt.acceptance(plain, weighted, states, fams, folds, None, ones=ones, holdout_start=None, seed=11,
+                        draws=30)
     assert one == two and one.seed == 11 and one.result == rt.NOT_JUDGED
 
+
+
+def test_with_every_weight_forced_to_one_the_run_is_the_unweighted_run_to_the_cent(runs, ones):
+    plain, weighted, _ = runs
+    assert rt.exact(plain, ones) == []
+    assert rt.exact(plain, weighted)  # a real weighting moves the sizes and the book: the check bites
+    assert rt.exact(plain, None) == ["the run with every weight forced to 1.0 hasn't run"]
+    nudged = dataclasses.replace(ones, book=ones.book + 0.01)
+    assert rt.exact(plain, nudged) == ["with every weight forced to 1.0 the book differs from the unweighted run's"]
+
+
+def test_without_the_forced_one_run_or_with_it_off_the_verdict_is_not_judged(runs, ones):
+    plain, weighted, rows = runs
+    fams, folds = {"a": "trend", "b": "trend"}, [(plain.book.index[0], plain.book.index[-1])]
+    for other in (None, weighted):
+        v = rt.acceptance(plain, weighted, pd.Series(rows), fams, folds, (plain, weighted), ones=other,
+                          holdout_start=None, draws=5)
+        assert v.result == rt.NOT_JUDGED and any("forced to 1.0" in r for r in v.reasons)
+
+
+def test_the_verdict_never_reads_the_holdout(runs, ones):
+    plain, weighted, rows = runs
+    fams, first, last = {"a": "trend", "b": "trend"}, plain.book.index[0], plain.book.index[-1]
+    with pytest.raises(ValueError, match="held-back period: a fold"):
+        rt.acceptance(plain, weighted, pd.Series(rows), fams, [(first, last)], None, ones=ones,
+                      holdout_start=last - pd.Timedelta(days=30), draws=5)
+    with pytest.raises(ValueError, match="held-back period: a run"):  # the folds stop short, the runs don't
+        rt.acceptance(plain, weighted, pd.Series(rows), fams, [(first, last - pd.Timedelta(days=60))], None,
+                      ones=ones, holdout_start=last - pd.Timedelta(days=30), draws=5)
+    v = rt.acceptance(plain, weighted, pd.Series(rows), fams, [(first, last)], None, ones=ones,
+                      holdout_start=last + pd.Timedelta(days=1), draws=5)
+    assert v.result == rt.NOT_JUDGED
+
+
+def test_per_family_figures_are_reported_and_never_decide(runs, ones):
+    plain, weighted, rows = runs
+    fams, folds = {"a": "trend", "b": "mean-reversion"}, [(plain.book.index[0], plain.book.index[-1])]
+    v = rt.acceptance(plain, weighted, pd.Series(rows), fams, folds, None, ones=ones, holdout_start=None, draws=5)
+    assert set(v.families) == {"trend", "mean-reversion"}
+    for f in v.families.values():
+        assert set(f) == {"sharpe", "unweighted_sharpe", "drawdown", "unweighted_drawdown"}
+    assert not any(f in r for r in v.reasons for f in ("trend", "mean-reversion"))
