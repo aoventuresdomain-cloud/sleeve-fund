@@ -29,7 +29,7 @@ from sleeve_fund.alerts import Forwarder
 from sleeve_fund.exact import float_view
 from sleeve_fund.money import to_decimal
 from sleeve_fund.gate_ledger import DbLedger
-from sleeve_fund.portfolio.gate import EMPTY, PortfolioState, mark_book, sweep
+from sleeve_fund.portfolio.gate import EMPTY, PortfolioState, mark_book, sweep, unrestorable
 from sleeve_fund.portfolio.limits import Book, Holding
 from sleeve_fund.risk import PORTFOLIO, trading_day
 from sleeve_fund.paper.safety import assert_portfolio_gate, credential_var
@@ -68,27 +68,33 @@ def fund_equity(store: Store) -> Decimal:
     with no mark is held at its entry price (F229-7)."""
     from sleeve_fund.store import is_backtest
 
-    runs = store.reset_runs()
+    runs, out = store.reset_runs(), store.withdrawn()
     total = Decimal(0)
     for s in store.sleeves():
         if is_backtest(s.name) or outside_fund_book(store, s):  # F229-6: a sub-8dp test Strategy isn't the fund's
+            continue
+        if s.name in out:  # F-C3B-A: put away, its equity taken out of the book with its flow
             continue
         total += strategy_equity(store, s, runs)
     return total
 
 
-def nothing_open(store: Store, ledger) -> str | None:
-    """Why the book isn't idle, or None when nothing is open: no reservation held, no Strategy that could trade
-    (could_trade), no position but dust. The one guard for an empty book (F282-3's no-op mark, F-C3B-A's emptying
-    flow)."""
+def nothing_open(store: Store, ledger, leaving: str | None = None) -> str | None:
+    """Why the book isn't idle, in the PM's words, or None when nothing is open: no reservation held, no Strategy that
+    could trade (could_trade), no position but dust. The one guard for an empty book (F282-3's no-op mark, F-C3B-A's
+    emptying flow). leaving: the Strategy whose withdrawal empties it, skipped (F286-1): it is stopped in the same
+    transaction, which this reads from outside, and found settled flat with no order open or room held before its
+    equity was taken out (Store.withdrawal_blocker)."""
     if ledger.reservations():
         return "an order still holds room in the book"
     for s in store.sleeves():
+        if s.name == leaving:
+            continue
         book = store.journal_book(s.name, s.starting_balance)
         if could_trade(s):
-            return f"{s.name} could trade"
+            return f"Strategy {s.name} can still trade"
         if abs(book["qty"]) > 1e-12 and not is_dust(book):
-            return f"{s.name} holds {book['qty']}"
+            return f"Strategy {s.name} still holds {book['qty']}"
     return None
 
 
@@ -302,6 +308,9 @@ class Supervisor:
         self.ledger = DbLedger(store, lambda: (_ for _ in ()).throw(RuntimeError("the supervisor runs no entry check")))
         self._equity_failing = False  # a failed equity read is said once per spell
         self._holdings_failing = False  # so is a failed read of the book's holdings (F-BM-1)
+        self._carried_told = False  # an emptied book's carried ratios that can't be restored, alerted once
+        self._withdraw_told: dict[str, str] = {}  # a deferred withdrawal's refusal, said once while it lasts
+        self._breach_told: set[str] = set()  # a withdrawn Strategy holding, alerted once per spell (F-C3B-A viii)
         self._flatten_told: dict[str, datetime] = {}  # when each holder was last told to flatten for a portfolio halt
         self._halt_tells: dict[str, int] = {}  # how often, this halt (F229-5: at most SYSTEM_FLATTENS)
 
@@ -568,6 +577,14 @@ class Supervisor:
                 # stay blocked as stale until the first capital's mark starts the book.
                 behind = behind or (st.equity is None and st.hwm is None and abs(equity) < EMPTY
                                     and nothing_open(self.store, led) is None)
+                # MUST-F286-H4: an emptied book's carried ratios wait for capital to restore them against, never ~0
+                behind = behind or (st.equity is None and st.carried_hwm_drawdown is not None and equity < EMPTY)
+                # Advisor MUST (14 Oct 14:45 UK): carried ratios that can't be restored fail closed, said once
+                if not behind:
+                    bad = unrestorable(st)
+                    if bad is not None and not self._carried_told:
+                        led.alert("portfolio_carried_invalid", f"Portfolio not marked: {bad}", now)
+                    self._carried_told = behind = bad is not None
                 acted = None if behind else mark_book(led, equity, now, PORTFOLIO)
         if not self._equity_failing and not behind:
             st = led.state()
@@ -589,6 +606,8 @@ class Supervisor:
             if acted == "halt":
                 self._flatten_told.clear()  # a new halt tells every holder at once
                 self._halt_tells.clear()
+            self._withdraw_flat(now)  # after the mark: the flatten's P&L is judged at the book's scale before it
+        self._alert_withdrawn_holders(now)
         st = led.state()
         if st.halted:
             self._halt_every_strategy(st.halted, now)
@@ -599,6 +618,38 @@ class Supervisor:
         # a dead owner's orders is ORPHAN-GUARD og2 on the DA's 0015. Past the TTL, an unacked order's reservation is
         # kept and alerted on as not cancelled, never released blind.
         sweep(led, now, self._order_live, None, is_acked=self._order_acked)
+
+    def _withdraw_flat(self, now: datetime) -> None:
+        """F-C3B-A (Advisor 14 Oct 10:45 UK): each Strategy put away and waiting (Store.withdrawal_pending: not flat
+        then, or put away outside this poll, F286-CR1) whose withdrawal nothing blocks any more has its settled equity
+        taken out of the book, with one journaled flow under the gate's lock (Store._put_away), the one place it leaves.
+        Called after this poll's mark. A refusal (a book a day's pause keeps marked) is said once and tried again
+        on the next poll; one Strategy's failure never stops the rest."""
+        for name in self.store.withdrawal_pending():
+            if self.store.withdrawal_blocker(name) is not None:
+                continue
+            try:
+                with self.store._put_away(name, now, "flat after it was put away", polled=True):
+                    pass
+                self._withdraw_told.pop(name, None)
+            except Exception as exc:  # noqa: BLE001 - kept in the book, tried again next poll
+                if self._withdraw_told.get(name) != str(exc):
+                    self.store.event(name, "warning", "withdrawal_waits", f"{name} is flat, and its equity "
+                                     f"couldn't leave the fund's book yet: {exc}")
+                    self._withdraw_told[name] = str(exc)
+
+    def _alert_withdrawn_holders(self, now: datetime) -> None:
+        """A withdrawn Strategy holding a position is a broken invariant (Advisor 14 Oct 10:45 UK): its exposure
+        would count against a book its equity left; dust no order can close is flat, as for the withdrawal. The gate's
+        holdings refuse it (fund_holdings raises, so every
+        entry fails closed); this raises the alert, once per spell."""
+        out = self.store.withdrawn()
+        # flat as a withdrawal judges it (Store.lifecycle_flat): dust left after one is no breach (Advisor 11:10 UK)
+        breach = {s.name for s in self.store.sleeves() if s.name in out and not self.store.lifecycle_flat(s.name)[1]}
+        for name in sorted(breach - self._breach_told):
+            self.store.event(name, "error", "withdrawn_holds", f"{name}'s equity left the fund's book, yet it holds "
+                             "a position: no Strategy may enter until it is resolved")
+        self._breach_told = breach
 
     def _halt_every_strategy(self, why: str, now: datetime) -> None:
         """A portfolio halt (15% under the reference): every strategy holding anything is flattened through its exit
@@ -802,7 +853,10 @@ def clear(store: Store, path: str) -> list[str]:
             cleared.append(s.name)
         if holding:
             continue  # applied again on the next start, once those are flat
-        store.decide("system", "clear", f"{key}: {reason} ({len(cleared)} put away)")
+        # F286-4 (HoQA): a slate on an empty book drops the drawdown its emptying carried, as a book reset does
+        fresh = "; the drawdown the emptied book kept is dropped, so the next capital starts afresh" \
+            if store.drop_carried() else ""
+        store.decide("system", "clear", f"{key}: {reason} ({len(cleared)} put away{fresh})")
         store.event(None, "info", "book_cleared", f"{reason}: {', '.join(cleared) or 'nothing to put away'}")
         done.add(key)
     return cleared
@@ -846,9 +900,9 @@ def capital_in(store: Store) -> Decimal:
     """The capital put into the fund's book: every Strategy's starting balance that fund_equity counts (a reset's run
     counts only its cash, its successor the capital). What the book is worth with no gain or loss since, the
     flow-corrected reference the re-base measures the drawdown from (Advisor, 14 Oct 09:10 UK)."""
-    runs = store.reset_runs()
+    runs, out = store.reset_runs(), store.withdrawn()
     return sum((to_decimal(s.starting_balance, "starting balance") for s in store.sleeves()
-                if s.name not in runs and not outside_fund_book(store, s)), Decimal(0))
+                if s.name not in runs and s.name not in out and not outside_fund_book(store, s)), Decimal(0))
 
 
 def could_trade(s: Sleeve) -> bool:
@@ -1002,6 +1056,32 @@ def rebase_halt_ref_1(store: Store, actor: str, commit: str, now: datetime | Non
     return before, after, words
 
 
+def withdraw_archived(store: Store, actor: str, commit: str) -> list[str]:
+    """F-C3B-A's one-off for the Strategies archived before it landed, which still count in the book: each is put on
+    the supervisor's withdrawal (Store._put_away: WITHDRAWAL_DEFERRED), and its next poll takes each out with its own
+    flow after its own mark, so the drawdown and the P&L don't move (Advisor 14 Oct 09:45 UK; F286-CR1). A reset's
+    earlier run is not one: its cash stays in the book. Idempotent: one already out or already waiting is skipped.
+    Refused, with nothing written, while any of them holds a position; dust no order can close is flat, as for the
+    archive, and leaves with it (F286-2, Advisor D8b). Returns the names queued."""
+    from sleeve_fund.store import is_backtest
+
+    if not actor.strip() or not commit.strip():
+        raise ValueError("an actor and the deployed commit are required")
+    runs, out, waiting = store.reset_runs(), store.withdrawn(), set(store.withdrawal_pending())
+    # One already waiting (put away after F-C3B-A, or queued by an earlier run) is the poll's to take out.
+    due = [n for n in store.archived() if n not in runs and n not in out and not is_backtest(n) and n not in waiting]
+    held = [f"{n} holds {float(qty):g}" for n in due for qty, flat in [store.lifecycle_flat(n)] if not flat]
+    if held:
+        raise RuntimeError("withdraw-archived refused, nothing written: " + "; ".join(held)
+                           + " (flatten it first: a position has no settled equity to take out)")
+    for n in due:
+        with store._put_away(n, utcnow(), f"withdraw-archived by {actor.strip()} at {commit.strip()}"):
+            pass
+        store.decide(actor.strip(), "withdraw_archived", f"F-C3B-A: {n}'s equity taken out of the fund's book at "
+                                                         f"commit {commit.strip()}", n)
+    return due
+
+
 REBASE_PAUSE = f"{REBASE_KEY}: paused for the portfolio re-base; resumed at the first test start"
 
 
@@ -1059,6 +1139,9 @@ def main(argv: list[str] | None = None) -> int:
     cl = sub.add_parser("clear", help="stop and archive every strategy, once per entry in the file")
     cl.add_argument("path")
     sub.add_parser("book", help="print the book's strategies and headline figures")
+    wa = sub.add_parser("withdraw-archived", help="F-C3B-A only: take each Strategy archived before it out of the book")
+    wa.add_argument("--actor", required=True, help="who ran it, for the decision log")
+    wa.add_argument("--commit", required=True, help="the deployed commit, for the journal")
     rb = sub.add_parser("rebase", help=f"{REBASE_KEY} only: re-base the paper portfolio's state to the true book, once")
     rb.add_argument("--actor", required=True, help="who ran it, for the decision log")
     rb.add_argument("--commit", required=True, help="the deployed commit, for the journal")
@@ -1078,6 +1161,17 @@ def main(argv: list[str] | None = None) -> int:
         print("book figures:", book_figures(store))
     elif args.cmd == "rebase":
         return _rebase_command(store, args)
+    elif args.cmd == "withdraw-archived":
+        try:
+            done = withdraw_archived(store, args.actor, args.commit)
+        except RuntimeError as exc:
+            print(exc)
+            return 1
+        print(f"queued for the supervisor's next mark: {', '.join(done) or 'none (nothing archived still counted)'}")
+        if done:  # the book after it and the limits in use against it, as the dashboard shows them (F-C3B-A-UI)
+            from sleeve_fund.dashboard.withdrawal import limits_in_use, words
+
+            print(words(limits_in_use(store)))
     else:
         assert_portfolio_gate(store)
         Supervisor(store, clear_path=args.clear).run()

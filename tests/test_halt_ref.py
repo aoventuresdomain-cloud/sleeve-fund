@@ -3,8 +3,8 @@ every capital move into or out of the fund's book goes through the flow path (po
 transaction as the move, so the book's high-water mark, the halt's reference and the day's start move with it and a
 deposit is never a gain nor a withdrawal a loss. The flows follow what fund_equity counts, so the book and its reference
 always move together: a create (+ its capital) and a move onto or off a test account (F229-6, -/+ its equity) move the
-book; a reset (its run keeps its cash in the book, its successor the capital) and an archive (an archived Strategy's
-cash is still the fund's) move nothing, so neither has a flow. And the state paper halted on is put back on the true
+book; a reset (its run keeps its cash in the book, its successor the capital) moves nothing, so has no flow; an archive
+takes its equity out with a flow (F-C3B-A, tests/test_capital_withdrawal.py). And the state paper halted on is put back on the true
 book once, by the operator's one-off command (supervisor rebase), under the Advisor's conditions (14 Oct 09:00, 09:10).
 
 The paper incident: Strategies created after the first mark raised the high-water mark as if they were gains, and test
@@ -235,28 +235,33 @@ def test_a_deposit_into_a_book_at_0_below_its_hwm_is_refused(store):
 
 
 def test_a_flow_that_leaves_no_book_is_refused_and_the_move_with_it(store):
-    """Every Strategy in the book leaving it: book + flow is 0, so there is no ratio to keep, and the move fails
-    closed (ValueError) with its flow: the account stays as it was and nothing is journaled."""
+    """Every Strategy in the book leaving it: book + flow is 0. While one could still trade, the move fails closed
+    (ValueError) with its flow: the account stays as it was and nothing is journaled. F-C3B-A (Advisor 14 Oct 10:00
+    UK; HoE OK to change this cell): stopped and flat, it empties the book, left unmarked for the next capital."""
     _make(store, "test", 20_000, instrument="BTC/USD", venue="KRAKEN")
     store.assign_account("test", "desk")
     _mark(store, T0)
-    with pytest.raises(ValueError, match="can't keep the book's percentages"):
+    store.set_desired_state("test", "running")
+    with pytest.raises(ValueError, match="no capital while Strategy test can still trade"):
         store.assign_account("test", "paper")
     assert store.account_of("test") == "desk" and _flows(store) == [] and _state(store).equity == D(20_000)
+    store.set_desired_state("test", "stopped")
+    store.assign_account("test", "paper")
+    assert store.account_of("test") == "paper" and len(_flows(store)) == 1 and _state(store).equity is None
 
 
 # --- C2, C3: archive and reset move nothing, as fund_equity counts them ------------------------------------------------
 
-def test_c2_an_archived_strategys_cash_stays_in_the_book_so_archiving_is_no_flow(store):
-    """fund_equity counts an archived Strategy in full (its cash is still the fund's): archiving one with 4,000 made
-    neither moves the book nor its reference, and the next mark is the same book, with no halt."""
+def test_c2_an_archived_strategy_takes_its_equity_out_of_the_book_with_a_flow(store):
+    """F-C3B-A inverts this cell (HoE OK 14 Oct 10:00 UK): archiving one with 4,000 made takes its 8,000 out of the
+    book with its flow, so the book and its reference move together and the next mark halts nothing."""
     _make(store, "a", 16_000)
     _make(store, "b", 4_000)
     _trade(store, "b", 4_000)
     assert _four(_mark(store, T0)) == (D(24_000),) * 4
     store.archive("b")
     st = _mark(store, T0 + timedelta(minutes=1))
-    assert _four(st) == (D(24_000),) * 4 and not st.halted and st.paused_until is None and _flows(store) == []
+    assert _four(st) == (D(16_000),) * 4 and not st.halted and st.paused_until is None and len(_flows(store)) == 1
 
 
 def _reset(store, name):
@@ -291,14 +296,19 @@ def test_c3b_a_reset_after_a_loss_keeps_the_drawdown(store):
     assert (st.hwm - st.equity) / st.hwm == D("0.1")
 
 
-def test_c2_a_clean_slate_archives_without_a_flow(store, tmp_path):
+def test_c2_a_clean_slate_takes_what_it_archives_out_of_the_book_with_a_flow(store, tmp_path):
+    """F-C3B-A inverts this cell (HoE OK 14 Oct 10:00 UK): the slate's archive takes a's 10,500 out with its flow, and
+    the Strategy it keeps is the whole book."""
     _make(store, "a", 10_000)
+    _make(store, "b", 10_000)
     _trade(store, "a", 500)
     _mark(store, T0)
     slate = tmp_path / "clear.toml"
-    slate.write_text('[[clear]]\nid = "s1"\nreason = "fresh book"\n')
+    slate.write_text('[[clear]]\nid = "s1"\nreason = "fresh book"\nkeep = ["b"]\n')
     assert supervisor.clear(store, str(slate)) == ["a"]
-    assert _four(_mark(store, T0 + timedelta(minutes=1))) == (D(10_500),) * 4 and _flows(store) == []
+    assert store.withdrawal_pending() == ["a"]  # the poll takes it out after its own mark (F286-CR1)
+    assert _four(_mark(store, T0 + timedelta(minutes=1))) == (D(10_000),) * 4
+    assert store.withdrawn() == {"a": D(10_500)} and len(_flows(store)) == 1
 
 
 # --- C4: onto or off a test account ------------------------------------------------------------------------------------

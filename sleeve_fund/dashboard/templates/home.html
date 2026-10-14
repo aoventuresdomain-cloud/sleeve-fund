@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "_macros.html" import chip, test_chip, signed, money_signed, usage, spark, pts, tag, cost_share, open_risk_text, open_risk_hint, open_risk_warn, open_risk_room %}
+{% from "_macros.html" import chip, test_chip, signed, money_signed, usage, spark, pts, tag, cost_share, open_risk_text, open_risk_hint, open_risk_warn, open_risk_room, limits_after %}
 {% from "_reasons.html" import reason_picker %}
 {% from "_positions.html" import positions_table %}
 {% block title %}Portfolio · Multi-Strategy Fund{% endblock %}
@@ -15,6 +15,8 @@
     After fees.
   </p>
 </div>
+
+{% if archived_now %}<div class="banner" role="status">Archived {{ archived_now }}{% if archived_words %}, {{ archived_words }}{% endif %}.{{ limits_after(put_away_now) }}</div>{% endif %}
 
 {% if summaries or archived %}
 {# Shown only when an alert is waiting to be acknowledged: the newest one, and a link to the rest. #}
@@ -166,9 +168,9 @@
 
 {% if archived %}
 <details class="panel archived" id="archived">
-  <summary><strong>Archived strategies ({{ archived|length }})</strong> <span class="muted">stopped and put away; their cash still counts in the book</span></summary>
+  <summary><strong>Archived strategies ({{ archived|length }})</strong> <span class="muted">stopped and put away; their equity is out of the fund's book{% set kept = (still_counted|length) + (waiting_flat|length) + (nothing_out|length) %}{% if kept %}, except {{ kept }} still in it{% if waiting_flat %} ({{ waiting_flat|length }} waiting to go flat){% endif %}{% endif %}</span></summary>
   <ul class="feed" style="margin-top:10px">{% for x in archived %}{% set s = x.sleeve %}
-    <li><span class="when">{{ x.equity|money }}</span><span class="what"><a href="/sleeves/{{ s.name }}">{{ s.name }}</a> <span class="muted">{{ s.instrument }} · {{ s.strategy|replace('_', ' ') }} · {{ signed(x.ret) }} since start</span></span></li>{% endfor %}
+    <li><span class="when">{{ x.equity|money }}</span><span class="what"><a href="/sleeves/{{ s.name }}">{{ s.name }}</a>{% if s.name in waiting_flat %} <span class="warn">waiting to go flat: {{ waiting_flat[s.name] }}</span>{% elif s.name in leaving %} <span class="{{ 'warn' if leaving[s.name] else 'muted' }}">{{ leaving[s.name] or 'leaving the fund\'s book at the supervisor\'s next mark' }}</span>{% elif s.name in nothing_out %} <span class="muted">nothing to withdraw (equity {{ nothing_out[s.name]|money }})</span>{% endif %} <span class="muted">{{ s.instrument }} · {{ s.strategy|replace('_', ' ') }} · {{ signed(x.ret) }} since start</span></span></li>{% endfor %}
   </ul>
 </details>
 {% endif %}
