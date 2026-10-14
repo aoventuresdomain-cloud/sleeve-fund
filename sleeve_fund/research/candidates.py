@@ -105,6 +105,10 @@ def idea_hash(defn: dict) -> str:
     body["blocks"] = sorted(
         (json.dumps({"kind": kinds[bid], "input": ref(str(b.get("input") or "close"))},
                     sort_keys=True) for bid, b in blocks.items() if isinstance(b, dict)))
+    if defn.get("assets"):
+        # A multi-asset Strategy's fixed list is part of the idea (multi-asset spec §2): another list is a new idea, its
+        # settings new trials; the same assets in another order are the same idea. Absent, the hash is as before.
+        body["assets"] = sorted({str(a).split("/")[0].upper() for a in defn["assets"]})
     text = json.dumps(body, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(text.encode()).hexdigest()[:16]
 

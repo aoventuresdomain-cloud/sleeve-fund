@@ -105,3 +105,13 @@ def test_a_retire_after_wind_down_waits_for_every_leg_then_puts_each_away(tmp_pa
     assert store.complete_retire("trend-x~ETH")  # one leg's process finding every leg flat retires the Strategy
     assert {store.sleeve(n).lifecycle for n in store.legs("trend-x")} == {"retired"}
     assert not store.complete_retire("trend-x~SOL")  # once, never twice
+
+
+def test_the_asset_list_is_part_of_the_idea_hash_and_its_order_is_not():
+    from sleeve_fund.research.candidates import idea_hash
+
+    d = {"blocks": {}, "long": {"all": []}}
+    two, other = {**d, "assets": ["BTC/USDT", "ETH/USDT"]}, {**d, "assets": ["BTC/USDT", "SOL/USDT"]}
+    assert idea_hash(two) != idea_hash(d) and idea_hash(two) != idea_hash(other)
+    assert idea_hash(two) == idea_hash({**d, "assets": ["ETH/USDT", "BTC/USDT"]})
+    assert idea_hash(d) == idea_hash({**d, "assets": []})  # no list: the hash every single-asset idea has today
