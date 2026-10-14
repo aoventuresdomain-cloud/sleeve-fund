@@ -173,3 +173,14 @@ def test_a_resume_that_clears_the_hold_under_a_halt_keeps_the_halts_owed_flatten
     _resume(store, rt, t)
     rt = _runtime(store, t)
     assert _state(store)[0] == "halted" and rt._owed_flatten is not None
+
+
+@pytest.mark.parametrize("order,held", [(("fill_hold", "fill_hold_cleared"), False),
+                                        (("fill_hold_cleared", "fill_hold"), True)])
+def test_a_restart_restores_the_hold_by_journal_order_not_by_time(store, order, held):
+    """Advisor F-T-2-DESIGN: two hold events in the same instant are read in the order the journal wrote them."""
+    t = [T0]
+    _runtime(store, t)
+    for kind in order:
+        store.event("s1", "info", kind, kind, ts=t[0])
+    assert _runtime(store, t).fill_hold is held

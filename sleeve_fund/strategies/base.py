@@ -839,6 +839,33 @@ class LongFlatStrategy(Strategy):
                 self.runtime.hold_entries()
             except Exception:  # the journal failing must not hide the first error
                 pass
+            try:
+                self._protect_after_failed_fill()
+            except Exception:  # its own failure is counted and journaled as the tick's would be, once
+                self.handler_error_count += 1
+                self.log.error(f"protecting the position after a failed fill handler failed\n{traceback.format_exc()}")
+
+    def _protect_after_failed_fill(self) -> None:
+        """F-T-2 (Advisor 14 Oct ~21:40 UK, MUST): the hold only blocks entries, so a position it leaves must be under
+        a working stop computed from its fill: the stop the paper engine watches (_check_exits), on an entry book that
+        matches the venue's position. A fill handler can fail before that is so (the entry book, the liquidation
+        price, the stop's plan or cap), and then the position is closed at market instead. Never unprotected."""
+        held = self._position_qty()
+        if held < self._min_qty():
+            return  # flat, or dust no order can close
+        if not self._stop_designed:
+            return  # a stopless Model holds no stop by design, inside its 1x cap: as it trades every day
+        side = self._pos_side() if self._margin else 1
+        booked = Decimal(repr(float(self._entry_qty or 0.0)))
+        if (self._entry_px is not None and self._stop_frac is not None and self._entry_side == side
+                and abs(booked - held) <= self._lot() / 2):
+            return  # its stop is watched, from an entry book the fill reached
+        why = ("Fill-handler hold: the position has no working stop computed from its fill (the fill handler failed "
+               "before it was set), so it is closed at market")
+        self.runtime.store.event(self.runtime.name, "error", "fill_hold_flatten", why, ts=self.runtime.now())
+        self.cancel_all_orders(self._cfg.instrument_id)
+        self._flip = None
+        self._sell_all("exit", why, {"position": float(held)})
 
     def attach_runtime(self, runtime) -> "LongFlatStrategy":
         self.runtime = runtime
@@ -1288,6 +1315,12 @@ class LongFlatStrategy(Strategy):
     def _has_exits(self) -> bool:
         c = self._cfg
         return bool(c.stop_loss or c.stop_atr or c.stop_swing_bars or c.take_profit)
+
+    @property
+    def _stop_designed(self) -> bool:
+        """Whether this Model's positions carry a stop (a stopless one is held to 1x instead)."""
+        c = self._cfg
+        return bool(c.stop_loss or c.stop_atr or c.stop_swing_bars)
 
     def _plan_exits(self, close: float, side: int = 1) -> tuple[float | None, float | None, str] | None:
         """This entry's stop and target as shares of the price, and how the stop was set; None while
