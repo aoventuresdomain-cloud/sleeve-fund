@@ -78,3 +78,35 @@ def test_a_rules_preregistration_lands_in_its_definitions_family(tmp_path):
 def test_run_study_records_the_definitions_family_on_its_result():
     r, _ = _study([(15, 15), (14, 14), (14, 14)])
     assert r.idea_hash == idea_hash(DEFN)
+
+
+def _run_row(strategy, params, source="strategy"):
+    from sleeve_fund.research.trials import model_run_row, run_setup
+
+    return model_run_row(strategy=strategy, params=params, dataset="d", source=source,
+                         setup=run_setup(risk_profile="balanced", fee=0.001))
+
+
+@pytest.mark.parametrize("source", ["strategy", "backtest"])
+def test_a_rules_run_outside_a_study_counts_in_its_definitions_family(source):
+    # CR F271-1: a rule-builder Strategy made, cloned or re-set on the dashboard (or backtested there) counts under
+    # its own structural idea, as its studies do, never the shared "rules" family; a retune shares it.
+    from sleeve_fund.research.trials import legacy_idea_hash
+
+    retune = copy.deepcopy(PARENT)
+    retune["blocks"]["rsi"]["period"] = 21
+    assert _run_row("rules", to_params(PARENT), source)["idea_hash"] == idea_hash(PARENT)
+    assert _run_row("rules", to_params(retune), source)["idea_hash"] == idea_hash(PARENT)
+    assert _run_row("rules", to_params(PARENT), source)["idea_hash"] != legacy_idea_hash("rules")
+    assert _run_row("trend_filter", {"fast": 5})["idea_hash"] == legacy_idea_hash("trend_filter")
+
+
+def test_a_failed_rules_run_counts_in_its_definitions_family_and_an_unreadable_one_still_counts():
+    from sleeve_fund.research.trials import failed_row, legacy_idea_hash
+
+    row = failed_row(strategy="rules", params=to_params(PARENT), source="strategy", error="e")
+    assert row["idea_hash"] == idea_hash(PARENT)
+    broken = failed_row(strategy="rules", params={"definition": {"blocks": "?"}}, source="strategy", error="e")
+    assert broken["idea_hash"] == legacy_idea_hash("rules")  # the failure is never lost for an unreadable definition
+    assert failed_row(strategy="trend_filter", params={"fast": 5}, source="backtest",
+                      error="e")["idea_hash"] == legacy_idea_hash("trend_filter")

@@ -202,7 +202,7 @@ def model_run_row(*, strategy: str, params: dict, dataset: str, source: str, set
         # afterwards reads nothing new into the choice; each edit is a new row, dated again.
         data_start, data_end = OPEN_START, datetime.now(timezone.utc)
     return trial_row(
-        definition_hash=legacy_definition_hash(strategy, params, setup), idea_hash=legacy_idea_hash(strategy),
+        definition_hash=legacy_definition_hash(strategy, params, setup), idea_hash=_run_idea(strategy, params),
         name=strategy, family=_family(strategy), settings=params, dataset=dataset, stage="in_sample", source=source,
         sharpe=sharpe, trades=trades, backtest_id=backtest_id, data_start=data_start, data_end=data_end)
 
@@ -235,13 +235,28 @@ def failed_row(*, strategy: str, params: dict, source: str, error: str, setup: d
     # a backtest's bars are unknown, which a holdout reads as overlapping.
     data_start, data_end = (OPEN_START, datetime.now(timezone.utc)) if source == "strategy" else (None, None)
     return {
-        "id": secrets.token_hex(8), "definition_hash": definition, "idea_hash": legacy_idea_hash(strategy),
+        "id": secrets.token_hex(8), "definition_hash": definition, "idea_hash": _run_idea(strategy, params, safe=True),
         "code_version": code_version(), "definition_name": strategy, "family": _family(strategy),
         "settings": json.dumps({"params": params}, sort_keys=True), "dataset": dataset or "unknown",
         "stage": "in_sample", "source": source, "sharpe": None, "trades": None, "oos_trades": None,
         "backtest_id": backtest_id, "data_start": data_start, "data_end": data_end, "status": "failed",
         "error": error, "created_at": datetime.now(timezone.utc),
     }
+
+
+def _run_idea(strategy: str, params: dict | None, *, safe: bool = False) -> str:
+    """The idea a run outside a study counts under: a rule-builder Strategy's own structural idea, as its studies and
+    pre-registrations (CR F271-1), so one made, cloned or re-set on the dashboard never joins the shared "rules"
+    family; a hand-coded model's name. safe, for a failed run's row: a definition that can't be read falls back to
+    the name, so the failure is still counted."""
+    from sleeve_fund.research.study import idea_of
+
+    try:
+        return idea_of(params, None) or legacy_idea_hash(strategy)
+    except Exception:  # noqa: BLE001 - only with safe: the failed row must still be written
+        if not safe:
+            raise
+        return legacy_idea_hash(strategy)
 
 
 def _family(strategy: str) -> str:
