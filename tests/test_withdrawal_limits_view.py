@@ -226,3 +226,37 @@ def test_a_carried_drawdown_that_cant_be_restored_shows_on_alerts_with_its_figur
     DbLedger(held, lambda: ()).alert("portfolio_carried_invalid", said, T0)
     page = _get(client, "/alerts")
     assert "Portfolio not marked" in page and said in page
+
+
+def test_once_the_poll_withdraws_a_put_away_the_portfolios_book_is_the_funds(held, client):
+    """T-FIX4 (HoQA F229-6 a4_ui): after the poll takes an archived Strategy's equity out, the Portfolio's book total
+    leaves it out as supervisor.fund_equity does: 10,000, not the 20,000 it read with b still added in."""
+    import re
+
+    client.post("/sleeves/b/archive", data={"action": "archive", "reason": "done with it"}, auth=AUTH, headers=HDR,
+                follow_redirects=False)
+    _mark(held, T0 + timedelta(seconds=5))
+    assert "b" in held.withdrawn() and supervisor.fund_equity(held) == D(10_000)
+    words = " ".join(re.sub(r"<[^>]+>", " ", _get(client, "/")).split())
+    assert "Book value 10,000.00" in words, re.search(r"Book value [\d,.]+", words)
+
+
+def test_the_book_the_put_away_line_and_the_capital_agree_to_the_cent(held, client):
+    """Advisor on T-FIX4: the headline equals fund_equity, the withdrawn put-away shows on its own line ("Put away,
+    not trading") at what it took out, and the two add up to the capital of every Strategy in the book, to the cent."""
+    import re
+
+    from test_halt_ref import _trade
+
+    _trade(held, "b", 250.37, ts=T0 + timedelta(seconds=1))  # b is up 250.37 when it goes
+    client.post("/sleeves/b/archive", data={"action": "archive", "reason": "done with it"}, auth=AUTH, headers=HDR,
+                follow_redirects=False)
+    _mark(held, T0 + timedelta(seconds=5))
+    fund, out = supervisor.fund_equity(held), held.withdrawn()
+    capital = sum(supervisor.strategy_equity(held, s) for s in held.sleeves())
+    assert (fund, out) == (D(10_000), {"b": D("10250.37")})
+    assert fund + out["b"] == capital == D("20250.37")
+    page = _get(client, "/")
+    words = " ".join(re.sub(r"<[^>]+>", " ", page).split())
+    assert "Book value 10,000.00 Put away, not trading 10,250.37" in words  # = fund_equity; = what left
+    assert "with the book, 20,250.37 in all" in page  # = the capital
