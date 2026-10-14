@@ -116,6 +116,7 @@ def parity(store, name: str, since: datetime, until: datetime | None = None, his
         from_journal,
     )
     from sleeve_fund.risk import PORTFOLIO
+    from sleeve_fund.supervisor import outside_fund_book
 
     s = store.sleeve(name)
     fills = sorted((f for f in store.fills(name, limit=100_000) if f["ts"] >= since), key=lambda f: f["ts"])
@@ -148,7 +149,9 @@ def parity(store, name: str, since: datetime, until: datetime | None = None, his
     result, why = replay(store, s, start, end, capital, equity, history, instrument, run)
     if why:
         return verdict("B7 replay parity", [why], notes)
-    report = compare(from_journal(rows, unbarred), from_backtest(result.decisions), start, end)
+    # A Strategy outside the fund's book (a test account, F229-6) is listed apart, never compared (F-P27-2).
+    outside = {name} if outside_fund_book(store, s) else set()
+    report = compare(from_journal(rows, unbarred), from_backtest(result.decisions), start, end, outside=outside)
     print(f"decisions: paper {report.paper}, backtest {report.backtest}, matched {report.matched}, "
           f"mismatched {len(report.mismatches)} {report.counts() or ''}")
     for m in report.mismatches:
@@ -156,6 +159,9 @@ def parity(store, name: str, since: datetime, until: datetime | None = None, his
         print(f"  {m.bar_ts:%H:%M} {', '.join(m.what)}: paper "
               f"{'-' if p is None else f'{p.outcome} {p.requested}->{p.approved} {p.limit or ''}'} | backtest "
               f"{'-' if b is None else f'{b.outcome} {b.requested}->{b.approved} {b.limit or ''}'}")
+    if report.outside or report.outside_backtest:
+        print(f"outside the fund's book (listed, not compared): paper {len(report.outside)}, backtest "
+              f"{len(report.outside_backtest)}")
     for u in report.unbarred:
         print(f"  not decided on a bar (listed, not compared): {u.bar_ts:%H:%M:%S} {u.outcome} {u.approved}")
     # Drift: each opening order paper filled, from the price its gate was handed (with any act drift taken back out).
