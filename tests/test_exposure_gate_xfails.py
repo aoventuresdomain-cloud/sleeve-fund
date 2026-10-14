@@ -325,6 +325,16 @@ def run(tmp_path, store, plan: Plan, monkeypatch) -> list[dict]:
     monkeypatch.setattr(SleeveRuntime, "tick", tick)
     if any(s.name == NAME for s in store.sleeves()):
         store.create_sleeve = lambda **kw: store.sleeve(kw["name"])  # a restart: the strategy is there already
+    else:
+        made = store.create_sleeve
+
+        def create(**kw):  # on a marked book the create waits for the supervisor's poll (F-ASSIGN-STALE): poll once
+            s = made(**kw)
+            if store.joining(kw["name"]):
+                store.land_move(kw["name"])
+            return s
+
+        store.create_sleeve = create
     try:
         return replay(path, store=store)
     finally:
