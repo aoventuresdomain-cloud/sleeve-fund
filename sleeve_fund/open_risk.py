@@ -239,12 +239,12 @@ def account_unallocated(store, account: str) -> float:
     """The part of an account's book (account_equity) no Strategy in the current book holds: what Strategies an
     earlier book put away still add to it (_put_away_equity), so the tile can say how much of its book is cash no
     Strategy trades (Advisor C3b, option B; F-C3B-UI)."""
-    earlier, runs = store.previous_book(), store.reset_runs()
+    earlier, runs, out = store.previous_book(), store.reset_runs(), store.withdrawn()
     total = 0.0
     for s in store.sleeves():
         if s.name not in earlier or store.account_of(s.name) != account:
             continue
-        part = _book_part(store, s, earlier, runs)
+        part = _book_part(store, s, earlier, runs, out)
         total += part or 0.0
     return total
 

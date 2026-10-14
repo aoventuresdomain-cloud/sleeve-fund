@@ -233,7 +233,7 @@ def test_f284_1_nothing_open_names_a_held_reservation_and_a_position_but_not_dus
     _dust(store, "a")
     assert supervisor.nothing_open(store, idle) is None  # dust is not open
     store.record_fill("a", side="BUY", qty=1.0, price=1_000.0, fee=0.0, order_id="p1", trade_id="p1", ts=T0)
-    assert supervisor.nothing_open(store, idle).startswith("a holds 1.000001")  # Postgres's NUMERIC pads the digits
+    assert supervisor.nothing_open(store, idle).startswith("Strategy a still holds 1.000001")  # Postgres's NUMERIC pads the digits
 
 
 @pytest.mark.parametrize("what", ["reservation", "position"])
