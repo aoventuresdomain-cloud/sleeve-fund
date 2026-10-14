@@ -344,7 +344,8 @@ class Supervisor:
     def step(self) -> None:
         self.reset_pending()
         now = utcnow()
-        for sleeve in self.store.sleeves():
+        # A two-leg Strategy's second leg row (P2-8) is traded by its first leg's process, never by one of its own.
+        for sleeve in self.store.sleeves(include_legs=False):
             proc = self.procs.setdefault(sleeve.name, Proc())
             holds = self._holds(sleeve, proc)
             action = decide(sleeve, proc, now, holds)

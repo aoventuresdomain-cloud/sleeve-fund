@@ -973,7 +973,8 @@ class SleeveRuntime:
     # --- orders -------------------------------------------------------------------
 
     def on_order(self, *, order_id: str, side: str, qty: float, intent: str, reason: str, signal: dict,
-                 order_type: str = "MARKET", timing: dict | None = None, reservation: int | None = None) -> None:
+                 order_type: str = "MARKET", timing: dict | None = None, reservation: int | None = None,
+                 parent_trade_id: str | None = None) -> None:
         """Journal an order and why it was sent. An opening order's row is written before it goes to the venue;
         with paper's queued journal an exit's is queued and may land after it (paper.queued). timing: the
         decision's stamps (on_timing), journaled with the order; a backtest keeps none. reservation: the paper
@@ -981,6 +982,8 @@ class SleeveRuntime:
         extra = {"timing": timing} if timing and not self.backtest else {}
         if reservation is not None:
             extra["reservation"] = reservation
+        if parent_trade_id is not None:  # P2-8: a two-leg trade's id, on both legs' orders
+            extra["parent_trade_id"] = parent_trade_id
         self.store.record_order(self.name, order_id=order_id, side=side, qty=qty, intent=intent, reason=reason,
                                 signal=signal, order_type=order_type, ts=self.now(), **extra)
 

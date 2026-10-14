@@ -837,6 +837,19 @@ def _not_backtest(col):
     return or_(col.is_(None), ~col.like(BACKTEST_PREFIX + "%"))
 
 
+def _insert_sleeve(c, ts: datetime, *, name: str, strategy: str, instrument: str, bar_spec: str, params: dict | None,
+                   starting_balance, risk_profile: str, warmup_bars: int, desired_state: str, venue: str | None,
+                   parent: str | None = None) -> None:
+    c.execute(insert(sleeves_t).values(
+        name=name, strategy=strategy, instrument=instrument, bar_spec=bar_spec, params=params or {},
+        starting_balance=starting_balance, risk_profile=risk_profile, warmup_bars=warmup_bars,
+        desired_state=desired_state, status="starting" if desired_state == "running" else "stopped",
+        status_reason="", created_at=ts, updated_at=ts, parent=parent,
+    ))
+    if venue:
+        c.execute(insert(sleeve_venues_t).values(sleeve=name, venue=venue.upper()))
+
+
 def utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(microsecond=0)
 
@@ -1026,17 +1039,42 @@ class Store:
             check_trial(trial)
         ts = utcnow()
         with self.engine.begin() as c:
-            c.execute(insert(sleeves_t).values(
-                name=name, strategy=strategy, instrument=instrument, bar_spec=bar_spec, params=params or {},
-                starting_balance=starting_balance, risk_profile=risk_profile, warmup_bars=warmup_bars,
-                desired_state=desired_state, status="starting" if desired_state == "running" else "stopped",
-                status_reason="", created_at=ts, updated_at=ts,
-            ))
-            if venue:
-                c.execute(insert(sleeve_venues_t).values(sleeve=name, venue=venue.upper()))
+            _insert_sleeve(c, ts, name=name, strategy=strategy, instrument=instrument, bar_spec=bar_spec,
+                           params=params, starting_balance=starting_balance, risk_profile=risk_profile,
+                           warmup_bars=warmup_bars, desired_state=desired_state, venue=venue)
             if trial is not None:
                 _put_trial_in(c, trial)
         return self.sleeve(name)
+
+    def create_two_legs(self, *, name: str, strategy: str, bar_spec: str, starting_balance: float, first: dict,
+                        second: dict, risk_profile: str = "balanced", warmup_bars: int = 0,
+                        desired_state: str = "running", trial: dict | None = None) -> tuple[Sleeve, Sleeve]:
+        """A two-leg Strategy (P2-8): the first leg's row `name` and the second's `name~2` under it, made together in
+        one transaction (with its trials row when given), or neither. first and second: each leg's instrument,
+        params and venue, its side (+1 long, -1 short) and its notional per unit of the first leg's (ratio, 1 for the
+        first). The Strategy's balance is split by what each leg needs at its ratio (two_legs.split_capital), and
+        each row's starting_balance is its share, so each leg's book reads from the journal like any other. Refused:
+        a short leg that isn't a perp (Advisor, 13 Oct 23:55 UK: no spot borrowing) and a perp leg above 2x."""
+        from sleeve_fund import two_legs
+
+        first, second = two_legs.check_legs(first, second)
+        shares = two_legs.split_capital(starting_balance, (first, second))
+        if trial is not None:
+            check_trial(trial)
+        ts = utcnow()
+        with self.engine.begin() as c:
+            for leg_name, leg, share, parent in ((name, first, shares[0], None), (name + LEG, second, shares[1], name)):
+                _insert_sleeve(c, ts, name=leg_name, strategy=strategy, instrument=leg["instrument"],
+                               bar_spec=bar_spec, params=two_legs.leg_params(leg), starting_balance=share,
+                               risk_profile=risk_profile, warmup_bars=warmup_bars, desired_state=desired_state,
+                               venue=leg.get("venue"), parent=parent)
+            c.execute(insert(decisions_t).values(
+                ts=ts, actor="system", action="two_legs", sleeve=name,
+                reason=f"two legs made: {first['instrument']} gets {shares[0]} and {second['instrument']} "
+                       f"{shares[1]} of the {starting_balance} balance"))
+            if trial is not None:
+                _put_trial_in(c, trial)
+        return self.sleeve(name), self.sleeve(name + LEG)
 
     def sleeve(self, name: str) -> Sleeve:
         with self.engine.connect() as c:
@@ -1046,12 +1084,15 @@ class Store:
             raise KeyError(f"no strategy {name!r}")
         return Sleeve.from_row(row, venue)
 
-    def sleeves(self, include_backtests: bool = False) -> list[Sleeve]:
+    def sleeves(self, include_backtests: bool = False, include_legs: bool = True) -> list[Sleeve]:
         """Paper and live strategies. Saved backtests are left out unless asked for: they never run,
-        count towards the book, or raise alerts."""
+        count towards the book, or raise alerts. include_legs=False leaves out a two-leg Strategy's second leg rows
+        (P2-8), for what lists or runs Strategies; the money paths keep them, as each leg holds its own book."""
         q = select(sleeves_t).order_by(sleeves_t.c.created_at, sleeves_t.c.id)
         if not include_backtests:
             q = q.where(_not_backtest(sleeves_t.c.name))
+        if not include_legs:
+            q = q.where(sleeves_t.c.parent.is_(None))
         with self.engine.connect() as c:
             rows = c.execute(q).all()
             venues = dict(c.execute(select(sleeve_venues_t.c.sleeve, sleeve_venues_t.c.venue)).all())
@@ -1144,11 +1185,13 @@ class Store:
 
     def record_order(self, sleeve: str, *, order_id: str, side: str, qty: float, intent: str, reason: str,
                      signal: dict | None = None, order_type: str = "MARKET", ts: datetime | None = None,
-                     timing: dict | None = None, reservation: int | None = None) -> None:
+                     timing: dict | None = None, reservation: int | None = None,
+                     parent_trade_id: str | None = None) -> None:
         """timing: the decision's stamps (bar_close, bar_recv, decided, as UNIX ns), written as the order's
         order_timings row in the same transaction, so that row never exists without its order (DA-8).
         reservation: the portfolio gate's reservation this entry holds (its gate_decisions id), linked to the order
-        (gate_decisions.order_id) in the same transaction, so the order's fills and end settle it (P2-1b W2)."""
+        (gate_decisions.order_id) in the same transaction, so the order's fills and end settle it (P2-1b W2).
+        parent_trade_id: the two-leg trade this order belongs to, the same id on both legs' rows (P2-8)."""
         if intent not in INTENTS:
             raise ValueError(f"bad intent {intent!r}")
         now = ts or utcnow()
@@ -1156,7 +1199,7 @@ class Store:
             c.execute(insert(orders_t).values(sleeve=sleeve, order_id=order_id, ts=now, updated_at=now, side=side,
                                               order_type=order_type, qty=qty, status="submitted", filled_qty=0.0,
                                               fee=0.0, intent=intent, reason=reason, signal=signal or {},
-                                              message=""))
+                                              message="", parent_trade_id=parent_trade_id))
             if timing:
                 c.execute(insert(order_timings_t).values(order_id=order_id, sleeve=sleeve, **{
                     k: _from_ns(v) for k, v in timing.items() if v is not None}))
