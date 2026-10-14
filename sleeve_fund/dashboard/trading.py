@@ -470,7 +470,9 @@ def perp_view(x: dict, position: dict | None, funding: list[dict]) -> dict | Non
     """What a perpetual position adds to a spot one: leverage, exposure, isolated margin, how far it is from
     liquidation, and the funding it has paid or received. funding: newest first, as the store returns it.
     Leverage is the position's notional at entry over its isolated margin (the open position's own figure);
-    exposure is its notional at the mark over the strategy's equity (QA U2, as the Advisor worded them)."""
+    exposure is its notional at the mark over the strategy's equity (QA U2, as the Advisor worded them). Effective
+    leverage is the notional at the mark over the same margin: it moves with the price, so it is always labelled
+    "effective" and never shown in the leverage's own format (UP-2, Advisor ADV1940)."""
     t = markets.terms(x["sleeve"].params, getattr(x["sleeve"], "venue", None))
     if t is None:
         return None
@@ -482,6 +484,7 @@ def perp_view(x: dict, position: dict | None, funding: list[dict]) -> dict | Non
     return {
         "leverage": position["leverage"] if position else None,
         "exposure": notional / equity if equity > 0 else None,
+        "effective_leverage": notional / margin if position and margin else None,
         "margin": margin,
         "maintenance": notional * t.maintenance_margin,
         "maintenance_rate": t.maintenance_margin,
