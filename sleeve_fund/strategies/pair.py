@@ -22,7 +22,7 @@ from nautilus_trader.model import Bar, ClientOrderId, OrderSide
 from sleeve_fund.data import bar_minutes
 from sleeve_fund import router
 from sleeve_fund.margin import entry_liquidation
-from sleeve_fund.strategies.base import OPENING_INTENTS, LongFlatStrategy
+from sleeve_fund.strategies.base import OPENING_INTENTS, LongFlatStrategy, through_liquidation
 
 DELAY_NS = 1  # the first leg goes after every venue's bar for the close it was decided on, as a portfolio gate pass
 RETRIES = 1  # the second leg is sent once more before the first is unwound (Advisor C)
@@ -252,6 +252,19 @@ class Pair:
         last price: what the summed guard adds to this leg's (Advisor E)."""
         equity, cash, qty, _ = self.other(leg)._mark(price if self.same_prices else None)
         return equity, cash, qty
+
+    def liquidation_first(self, leg: LongFlatStrategy, price: float) -> None:
+        """F283-P1 (Advisor 14 Oct 15:00 UK): on `leg`'s mark, before its summed halts act, the other leg's own
+        liquidation check at the price the summed book values it at (`price` when both legs trade one price feed,
+        else its own last price). A gap past the other leg's liquidation price is that leg's liquidation, booked as
+        one (loss X, the incident, a reset after liquidation), with the pair's consequences after it; the summed
+        halt still raises on this leg's mark, but never closes the other leg first as a plain risk close."""
+        other = self.other(leg)
+        if not other._margin or other.cache is None or other.instrument is None:
+            return
+        _, cash, qty, px = other._mark(price if self.same_prices else None)
+        if qty and px > 0 and through_liquidation(1 if qty > 0 else -1, px, other._liq_now(cash, qty)):
+            other._liquidation_guard(cash, qty, px)
 
     def held(self, leg: LongFlatStrategy) -> Decimal:
         return leg._position_qty() if leg.cache is not None and leg.instrument is not None else Decimal(0)
