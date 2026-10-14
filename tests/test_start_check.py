@@ -180,3 +180,31 @@ def test_a_zero_mark_when_the_journal_is_not_underwater_fails(tmp_path):
     store.engine.dispose()
     ok, page = start_check.run(url, environ={})
     assert not ok and "but equity 0.00 vs journal 9,997.00" in page
+
+
+@pytest.mark.parametrize("cash", ["funding", "true_up", "insurance"])
+def test_funding_or_insurance_booked_after_the_latest_mark_is_a_note_not_a_fail(tmp_path, cash):
+    """CR F276-1: a settlement, a true-up arriving or an insurance-fund cover moves the journal's cash after the latest
+    mark; the mark catches up at the next one, as with a late fill. Booked before the mark, it is compared."""
+    url, store = _journal(tmp_path)
+    after = T0 + timedelta(minutes=2)
+    if cash == "funding":
+        store.record_funding("s1", qty=0.1, price=60_000.0, rate=0.0001, amount=-0.6, ts=after)
+    elif cash == "true_up":
+        store.record_funding("s1", qty=0.1, price=60_000.0, rate=0.0001, amount=-0.6, ts=T0, kind="true_up",
+                             arrived_at=after)
+    else:
+        store.record_insurance("s1", price=60_000.0, amount=5.0, order_id="o1", trade_id="t1", ts=after)
+    store.engine.dispose()
+    ok, page = start_check.run(url, environ={})
+    assert f"  NOTE  s1: {'an insurance-fund cover' if cash == 'insurance' else 'a funding payment'} landed after " \
+           "its latest mark" in page
+    assert "  FAIL  nothing was compared" in page and not ok  # s1 was the only one: nothing was checked
+
+
+def test_funding_booked_before_the_latest_mark_is_compared(tmp_path):
+    url, store = _journal(tmp_path, mark_cash=4_000.0 - 3.0 - 0.6)
+    store.record_funding("s1", qty=0.1, price=60_000.0, rate=0.0001, amount=-0.6, ts=T0 + timedelta(seconds=30))
+    store.engine.dispose()
+    ok, page = start_check.run(url, environ={})
+    assert ok and "landed after" not in page

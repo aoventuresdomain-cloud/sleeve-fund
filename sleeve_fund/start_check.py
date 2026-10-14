@@ -117,6 +117,19 @@ def check_venues(engine: Engine) -> Section:
     return sec
 
 
+def _late_cash(store, name: str, since) -> str | None:
+    """A funding settlement or true-up, or an insurance-fund cover, that moved the journal's cash after the latest
+    mark (CR F276-1): the mark's cash is behind it until the next mark, as with a late fill."""
+    from sleeve_fund.store import funding_t, insurance_t
+
+    with store.engine.connect() as c:
+        for what, t in (("a funding payment", funding_t), ("an insurance-fund cover", insurance_t)):
+            moved = store._cash_moved_at(t)  # a true-up moves cash at its arrival (CASH-4)
+            if c.execute(select(t.c.id).where(t.c.sleeve == name, moved > since).limit(1)).first() is not None:
+                return what
+    return None
+
+
 def check_books(store) -> Section:
     """The dashboard's figures against the journal, for exactly the Strategies the dashboard's book counts
     (app.current_sleeves: every one but an earlier book's, store.previous_book, which holds the reset runs; an archived
@@ -143,9 +156,10 @@ def check_books(store) -> Section:
                 sec.add(NOTE, f"{s.name}: not marked yet; the journal is flat with no fills")
             continue
         fills = store.fills(s.name, limit=1)
-        if fills and fills[0]["ts"] > last["ts"]:
+        late = "a fill" if fills and fills[0]["ts"] > last["ts"] else _late_cash(store, s.name, last["ts"])
+        if late:
             late_with_fills.append(s.name)
-            sec.add(NOTE, f"{s.name}: a fill landed after its latest mark ({last['ts']:%H:%M:%S} UTC); compare "
+            sec.add(NOTE, f"{s.name}: {late} landed after its latest mark ({last['ts']:%H:%M:%S} UTC); compare "
                           "again after the next mark")
             continue
         compared += 1
