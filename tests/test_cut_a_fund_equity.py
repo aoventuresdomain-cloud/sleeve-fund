@@ -156,3 +156,29 @@ def test_the_fund_figure_is_pe2s_reader_once_it_is_there(tmp_path, monkeypatch):
     assert LongFlatStrategy._paper_fund_equity(s) == 18_000.0
     monkeypatch.setattr(sup, "sizing_equity", lambda store, now=None: None, raising=False)
     assert LongFlatStrategy._paper_fund_equity(s) is None
+
+
+# ---- MUST-FUNDCASH-LOSS: who keeps the shortfall cover (CR F-FC-1, F-FC-2) ------------------------------------------
+@PE2_BUILT
+@pytest.mark.parametrize("held, rebased, bridged", [(True, True, True), (True, False, False), (False, True, False),
+                                                    (False, False, False)])
+def test_only_a_fund_held_strategy_after_the_re_base_loses_its_own_shortfall_cover(tmp_path, held, rebased, bridged):
+    """Before the PM's re-base deposit a Strategy still carries its own capital (F-FC-1), and one outside the fund's
+    book keeps its own account after it (F-FC-2): both keep the cover. Only a fund-held one after the bridge doesn't."""
+    store = _store(tmp_path, True)
+    if rebased:
+        store.settle_flow(store.fund_flow("deposit", 20_000, actor="pm", reason="QA", rebase=True, now=T0), T0)
+    s = SimpleNamespace(runtime=SimpleNamespace(fund_held=held, store=store))
+    assert LongFlatStrategy._fund_bridged(s) is bridged
+
+
+@pytest.mark.parametrize("bridged, credit", [(True, 0.0), (False, 250.0)])
+def test_a_book_below_zero_once_flat_is_covered_only_outside_the_bridged_fund(monkeypatch, bridged, credit):
+    rows = []
+    monkeypatch.setattr(LongFlatStrategy, "_fund_bridged", lambda self: bridged)
+    s = SimpleNamespace(_mark=lambda: (-250.0, -250.0, 0.0, 60_000.0), _cash_adj=0.0,
+                        insurance_log=[], clock=SimpleNamespace(utc_now=lambda: T0),
+                        runtime=SimpleNamespace(name="s1", now=lambda: T0, store=SimpleNamespace(
+                            record_insurance=lambda *a, **k: rows.append(k) or "new", event=lambda *a, **k: None)))
+    LongFlatStrategy._cover_shortfall(s, 60_000.0, ("o1", "t1"))
+    assert s._cash_adj == credit and len(rows) == (1 if credit else 0)
