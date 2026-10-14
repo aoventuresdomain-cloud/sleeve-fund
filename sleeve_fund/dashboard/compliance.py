@@ -118,7 +118,7 @@ def page(store: Store) -> dict:
             "groups": [{"asset": a, "group": groups.get(a)} for a in sorted(names, key=lambda a: (a in groups, a))],
             "group_names": rules.GROUPS, "unmapped_words": rules.UNMAPPED,
             "t2_on": tests.get("type_stop_loss", {}).get("enabled", False), "history": history(store),
-            "current": {"tests": tests, "groups": groups}}
+            "refused": refused(store, limit=50), "current": {"tests": tests, "groups": groups}}
 
 
 def history(store: Store, limit: int = 30) -> list[dict]:
@@ -205,4 +205,27 @@ def strategy_bars(store: Store, underlying: str, risk_to_stop: float | None, ris
     out.append(bar("asset_stop_loss", f"{underlying} loss if stops hit", risk,
                    t1["limit"] * eq if t1 and t1["enabled"] and eq is not None else None,
                    f"The fund's loss on {underlying} if every stop is hit, every Strategy, against T1 per asset"))
+    return out
+
+
+def refused(store: Store, sleeve: str | None = None, since=None, limit: int = 200) -> list[dict]:
+    """C6: the ideas the tests refused or trimmed, newest first (every Strategy's, or one's): each with the test by
+    name, with its numbers when the gate journaled what the idea would have reached (would_be, a share of the book,
+    against the limit of the version that decided it), and that version. Display only: no figure is computed here."""
+    limits: dict[int, dict] = {}
+    out = []
+    for r in store.refused_ideas(sleeve, since, limit):
+        hit = r.get("test_hit") or r.get("limit_hit")
+        key = hit if hit in rules.BY_KEY else rules.LIMIT_HIT.get(hit)
+        words = rules.refused_by(hit)
+        v, would = r.get("compliance_version"), r.get("would_be")
+        if key and v is not None and would is not None:
+            if v not in limits:
+                limits[v] = as_set(store.compliance(v))[0]
+            lim = limits[v].get(key, {}).get("limit")
+            if lim is not None:
+                words = f"{words}: {rules.show(key, would)} would exceed {rules.show(key, lim)}"
+        side = r.get("side")
+        out.append({**r, "test": words,
+                    "side": {"BUY": "Buy", "SELL": "Sell", "long": "Long", "short": "Short"}.get(side, side)})
     return out

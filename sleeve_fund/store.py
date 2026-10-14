@@ -2954,16 +2954,20 @@ class Store:
             rows = _rows(c.execute(q))
         return rows[0] if rows else None
 
-    def refused_ideas(self, sleeve: str, since: datetime | None = None, limit: int = 200) -> list[dict]:
-        """The gate's refusals and trims of `sleeve`'s ideas, newest first, one per idea (its submit check; the fill
-        backstop only when it decided alone): decided_at, underlying, intent, requested_qty, approved_qty, outcome,
-        limit_hit, price, book_equity and open_risk."""
+    def refused_ideas(self, sleeve: str | None, since: datetime | None = None, limit: int = 200) -> list[dict]:
+        """The gate's refusals and trims of `sleeve`'s ideas (every Strategy's when None), newest first, one per idea
+        (its submit check; the fill backstop only when it decided alone): sleeve, decided_at, underlying, intent,
+        requested_qty, approved_qty, outcome, test_hit, limit_hit, compliance_version, price, book_equity and
+        open_risk."""
         d = gate_decisions_t
-        q = (select(d.c.decided_at, d.c.underlying, d.c.intent, d.c.requested_qty, d.c.approved_qty, d.c.outcome,
-                    d.c.limit_hit, d.c.price, d.c.book_equity, d.c.open_risk, d.c.stage)
+        q = (select(sleeves_t.c.name.label("sleeve"), d.c.decided_at, d.c.underlying, d.c.intent, d.c.requested_qty,
+                    d.c.approved_qty, d.c.outcome, d.c.test_hit, d.c.limit_hit, d.c.compliance_version, d.c.price,
+                    d.c.book_equity, d.c.open_risk, d.c.stage)
              .join(sleeves_t, sleeves_t.c.id == d.c.sleeve_id)
-             .where(sleeves_t.c.name == sleeve, d.c.outcome.in_(("rejected", "trimmed")))
+             .where(d.c.outcome.in_(("rejected", "trimmed")))
              .order_by(d.c.decided_at.desc(), d.c.seq.desc()).limit(limit))
+        if sleeve is not None:
+            q = q.where(sleeves_t.c.name == sleeve)
         if since is not None:
             q = q.where(d.c.decided_at >= since)
         with self.engine.connect() as c:

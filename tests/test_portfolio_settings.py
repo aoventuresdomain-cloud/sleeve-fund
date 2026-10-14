@@ -161,7 +161,8 @@ def test_each_row_carries_the_share_of_its_limit_used_as_a_number():
 
     v1 = SimpleNamespace(version=1, tests=[{"test": k, "limit": t["limit"], "enabled": True}
                                            for k, t in rules.defaults().items()], asset_types={"BTC": "large"})
-    store = SimpleNamespace(compliance=lambda version=None: v1, instruments=list, compliance_versions=lambda n: [])
+    store = SimpleNamespace(compliance=lambda version=None: v1, instruments=list, compliance_versions=lambda n: [],
+                            refused_ideas=lambda *a, **k: [])
     use = {"source": "gate", "fund_gross": {"used": D("0.75"), "what": ""}}
     with mock.patch.object(compliance, "use_now", return_value=use):
         rows = {r["key"]: r for g in compliance.page(store)["tests"] for r in g["rows"]}

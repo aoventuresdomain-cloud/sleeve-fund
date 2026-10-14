@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
-from sleeve_fund import compliance_rules as rules
+from sleeve_fund.dashboard import compliance
 from sleeve_fund.risk import trading_day
 from sleeve_fund.store import Store
 
@@ -38,8 +38,7 @@ def strategy(store: Store, name: str, trips: list[dict], now: datetime, period: 
         if base is None and (first := store.first_book_mark()) is not None:
             base = first["equity"]
     base = float(base) if base is not None else None
-    refused = [{**r, "test": rules.refused_by(r.get("test_hit") or r.get("limit_hit"))}
-               for r in store.refused_ideas(name, start)]
+    refused = compliance.refused(store, name, start)  # C6: one reader for this tab and Portfolio Settings
     return {"period": period, "label": PERIODS[period], "pnl": pnl,
             "fees": sum(float(t.get("fees", 0.0)) for t in closed),
             "funding": sum(float(t.get("funding", 0.0) or 0.0) for t in closed),

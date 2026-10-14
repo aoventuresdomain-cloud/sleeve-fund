@@ -4,6 +4,7 @@
 {% from "_signals.html" import signals_side, signals_clock, signals_lights %}
 {% from "_positions.html" import positions_table %}
 {% from "_reasons.html" import reason_picker %}
+{% from "_refused.html" import refused_table %}
 {% set s = x.sleeve %}{% set t = x.trades %}
 {% set base = s.instrument.split('/')[0] %}{% set quote = s.instrument.split('/')[1] %}
 {% set realised = x.pnl - x.unrealised %}
@@ -291,12 +292,7 @@
   {% if attr %}<div data-sub-panel="refused" role="tabpanel" id="tab-refused" hidden>
 <section class="panel" aria-labelledby="refused-h" style="margin-bottom:14px">
   <div class="panel-head"><h2 id="refused-h">Refused ideas</h2><span class="right faint">the compliance tests' refusals and cuts, newest first</span></div>
-  {% if attr.refused %}<table class="tbl" data-refused>
-    <thead><tr><th scope="col">Time</th><th scope="col">Asset</th><th scope="col" class="num">Asked</th><th scope="col">Outcome</th><th scope="col">Test</th></tr></thead>
-    <tbody>{% for r in attr.refused %}<tr><td>{{ r.decided_at|ts }}</td><td>{{ r.underlying }}</td><td class="num">{{ r.requested_qty|float|qty }}</td>
-      <td>{% if r.outcome == 'rejected' %}<span class="loss">Refused</span>{% else %}<span class="warn">Cut to {{ r.approved_qty|float|qty }}</span>{% endif %}</td>
-      <td>{{ r.test }}</td></tr>{% endfor %}</tbody>
-  </table>{% else %}<p class="empty">No idea was refused or cut in this period.</p>{% endif %}
+  {{ refused_table(attr.refused, strategy=false) }}
 </section>
   </div>{% endif %}
   <div data-sub-panel="activity" role="tabpanel" id="tab-activity" hidden>

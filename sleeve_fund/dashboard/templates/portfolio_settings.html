@@ -1,5 +1,6 @@
 {% extends "base.html" %}
 {% from "_reasons.html" import reason_picker %}
+{% from "_refused.html" import refused_table %}
 {% block title %}Portfolio compliance settings · Multi-Strategy Fund{% endblock %}
 {% block content %}
 {# Look: designer, PM-approved mockup (ui-v2/compliance-build-spec.md C1-C5). Words and data are FE's. #}
@@ -86,5 +87,10 @@
   </table></div>
 </section>
 </div>
+
+<section class="panel" aria-labelledby="refused-h">
+  <div class="panel-head"><h2 id="refused-h">Refused or trimmed ideas</h2><span class="right faint">every Strategy, newest first</span></div>
+  {{ refused_table(v.refused) }}
+</section>
 {% if editing %}<div class="dlg-actions ps-bar"><a class="button secondary" href="/portfolio-settings">Cancel</a> <button class="primary">Review changes</button></div></form>{% endif %}
 {% endblock %}
