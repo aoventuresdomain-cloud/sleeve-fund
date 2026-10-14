@@ -66,7 +66,7 @@
     <div class="srow h" aria-hidden="true"><span>Strategy</span><span class="r">Exposure</span><span class="r">Today</span><span>Room before halt</span><span class="r">Stop</span></div>
     {% for r in risk.rows %}{% set x = r.x %}{% set s = x.sleeve %}{% set left = [x.profile.max_drawdown - x.drawdown, 0]|max %}
     <div class="srow">
-      <div class="nm"><span class="rh-dot {{ tone_of(s.status) }}" title="{{ s.status|capitalize }}"></span><div><a href="/sleeves/{{ s.name }}">{{ s.name }}</a><span>{{ s.instrument }} · {{ s.status|capitalize }}</span></div></div>
+      <div class="nm"><span class="rh-dot {{ tone_of(s.status) }}" title="{{ s.status|capitalize }}"></span><div><a href="/sleeves/{{ s.name }}">{{ s.name|leg_label }}</a><span>{{ s.instrument }} · {{ s.status|capitalize }}</span></div></div>
       <span class="num r ex" title="Position value at the current price ÷ the strategy's equity">{{ '%.2f'|format(x.exposure|abs) }}×{% if x.exposure < -0.0005 %} <span class="faint">short</span>{% endif %}</span>
       <span class="num r td {{ 'gain' if x.day_ret > 0.00005 else ('loss' if x.day_ret < -0.00005 else 'muted') }}">{{ x.day_ret|pct1s }}</span>
       <div class="room" role="img" aria-label="{{ (r.dd_used * 100)|round(0)|int }}% of the drawdown limit used, {{ left|pct1 }} left before halt">
@@ -84,7 +84,7 @@
         <div class="track"><i class="{{ 'loss' if b.pnl < 0 else 'gain' }}" style="{{ 'right' if b.pnl < 0 else 'left' }}:50%;width:{{ '%.1f'|format(b.width) }}%"></i></div>
         <span class="num {{ 'loss' if b.pnl < -0.005 else ('gain' if b.pnl > 0.005 else 'muted') }}">{{ b.pnl|smoney0 }}</span></div>{% endfor %}
     </div>
-    {% if stress.halts %}<ul class="rh-halts">{% for sc in stress.halts %}<li><span class="num">{{ '+' if sc.shock > 0 else '−' }}{{ (sc.shock|abs * 100)|round(0)|int }}%</span> would halt <span class="loss">{{ sc.breaches|join(', ') }}</span></li>{% endfor %}</ul>
+    {% if stress.halts %}<ul class="rh-halts">{% for sc in stress.halts %}<li><span class="num">{{ '+' if sc.shock > 0 else '−' }}{{ (sc.shock|abs * 100)|round(0)|int }}%</span> would halt <span class="loss">{{ sc.breaches|map('leg_label')|join(', ') }}</span></li>{% endfor %}</ul>
     {% else %}<p class="faint rh-note">No strategy would halt at ±20%.</p>{% endif %}
     <p class="faint rh-note">Every position moves at once. Stops fill after the move. The Limits tab has every scenario.</p>
   </section>
@@ -110,7 +110,7 @@
     <thead><tr><th>Strategy</th><th>Drawdown</th><th>Today's loss</th><th title="Position value at the current price ÷ the strategy's equity, against the cap that applies when a position is opened">Exposure</th><th class="num" title="Further loss before the drawdown limit halts the strategy">Room to halt</th><th>Stop</th><th class="num" title="Isolated margin the open position has put up">Margin</th><th class="num">Liq. price</th><th class="num" title="Money lost if the stop is hit">Risk to stop</th></tr></thead>
     <tbody>{% for r in risk.rows %}{% set x = r.x %}{% set s = x.sleeve %}
     <tr>
-      <td class="cell-name" title="{{ x.profile.name|capitalize }} risk profile"><a href="/sleeves/{{ s.name }}">{{ s.name }}</a> {{ chip(s.status) }}</td>
+      <td class="cell-name" title="{{ x.profile.name|capitalize }} risk profile"><a href="/sleeves/{{ s.name }}">{{ s.name|leg_label }}</a> {{ chip(s.status) }}</td>
       <td data-label="Drawdown">{{ usage(r.dd_used) }} <span class="muted">{{ x.drawdown|pct1 }} of {{ x.profile.max_drawdown|pct0 }}</span></td>
       <td data-m="hide">{{ usage(r.day_used) }} <span class="muted">{{ [0 - x.day_ret, 0]|max|pct1 }} of {{ x.profile.daily_loss|pct0 }}</span></td>
       <td data-m="hide">{{ usage(r.cap_used, drift=True) }} <span class="muted">{{ '%.2f'|format(x.exposure|abs) }}× of {{ '%.2f'|format(x.cap) }}×</span></td>
@@ -130,7 +130,7 @@
     <thead><tr><th>Market move</th><th class="num">Book P&amp;L</th><th class="num">Share of book</th><th>Strategies that would halt</th></tr></thead>
     <tbody>{% for sc in risk.scenarios %}
     <tr><td>{{ '+' if sc.shock > 0 else '−' }}{{ (sc.shock|abs * 100)|round(0)|int }}%</td><td class="num {{ 'loss' if sc.pnl < -0.005 else ('gain' if sc.pnl > 0.005) }}">{{ sc.pnl|smoney }}</td><td class="num">{{ (0 - sc.loss_pct)|pct1s }}</td>
-      <td class="wrap">{% if sc.breaches %}<span class="loss">{{ sc.breaches|join(', ') }}</span>{% else %}<span class="muted">None</span>{% endif %}</td></tr>
+      <td class="wrap">{% if sc.breaches %}<span class="loss">{{ sc.breaches|map('leg_label')|join(', ') }}</span>{% else %}<span class="muted">None</span>{% endif %}</td></tr>
     {% endfor %}</tbody>
   </table>
   <p class="muted" style="margin:8px 0 0;font-size:12px">Every position moves at once: a long loses in a fall, a short in a rally. Gap risk: stops fill after the fact, and at 3x, a gap through liquidation loses the whole position margin.</p>
@@ -140,9 +140,9 @@
   <div class="panel-head"><h2 id="corr-h">How the strategies move together</h2> {{ help('correlation') }}</div>
   {% if book.correlation.matrix %}
   <div style="overflow-x:auto"><table class="corr">
-    <tr><th></th>{% for n in book.correlation.names %}<th scope="col">{{ n }}</th>{% endfor %}</tr>
+    <tr><th></th>{% for n in book.correlation.names %}<th scope="col">{{ n|leg_label }}</th>{% endfor %}</tr>
     {% for row in book.correlation.matrix %}{% set ri = loop.index0 %}{% set rn = book.correlation.names[ri] %}
-    <tr><th scope="row" class="row">{{ rn }}</th>{% for v in row %}
+    <tr><th scope="row" class="row">{{ rn|leg_label }}</th>{% for v in row %}
       {% if loop.index0 == ri %}<td class="self">·</td>{% elif v is none %}<td class="faint">n/a</td>
       {% else %}<td style="background: color-mix(in srgb, var(--accent) {{ ([v, 0]|max * 60)|round(0) }}%, var(--panel))">{{ '%.2f'|format(v) }}</td>{% endif %}
     {% endfor %}</tr>{% endfor %}
@@ -160,7 +160,7 @@
 <section class="panel" aria-labelledby="hist-h">
   <div class="panel-head"><h2 id="hist-h">Limits that fired</h2></div>
   {% if risk.history %}
-  <ul class="feed">{% for e in risk.history %}<li class="{{ e.level }}"><span class="when">{{ e.ts|ts }}</span><span class="what"><a href="/sleeves/{{ e.sleeve }}">{{ e.sleeve }}</a>: {{ e.message|no_venues }}</span></li>{% endfor %}</ul>
+  <ul class="feed">{% for e in risk.history %}<li class="{{ e.level }}"><span class="when">{{ e.ts|ts }}</span><span class="what"><a href="/sleeves/{{ e.sleeve }}">{{ e.sleeve|leg_label }}</a>: {{ e.message|no_venues }}</span></li>{% endfor %}</ul>
   {% else %}<p class="empty">No limit has fired yet.</p>{% endif %}
 </section>
 </div>
@@ -169,8 +169,8 @@
   <form method="post" action="/book/flatten">
     <h2 id="dlg-kill-h">Flatten everything</h2>
     {% set n = kill.all|length %}{% set holding = kill.holding %}{% set verb = 'close' if kill.shorts else 'sell' %}
-    <p>{% if n == 1 %}{{ kill.all[0].sleeve.name }}, the one strategy still trading or holding a position, {{ verb }}s{% else %}{{ 'Both' if n == 2 else 'All ' ~ n }} strategies still trading or holding a position {{ verb }}{% endif %} to cash at market{% if kill.shorts %} (longs sell, shorts buy back){% endif %}, paying the taker fee, then {{ 'pauses' if n == 1 else 'pause' }} until you resume {{ 'it' if n == 1 else 'each one' }}.
-      {% set dayp = kill.all|selectattr('sleeve.paused_until')|map(attribute='sleeve.name')|list %}{% if dayp %}{{ dayp|join(', ') }} {{ 'is' if dayp|length == 1 else 'are' }} on a daily-loss pause, which then lasts until you resume too, not 24 hours.{% endif %}
+    <p>{% if n == 1 %}{{ kill.all[0].sleeve.name|leg_label }}, the one strategy still trading or holding a position, {{ verb }}s{% else %}{{ 'Both' if n == 2 else 'All ' ~ n }} strategies still trading or holding a position {{ verb }}{% endif %} to cash at market{% if kill.shorts %} (longs sell, shorts buy back){% endif %}, paying the taker fee, then {{ 'pauses' if n == 1 else 'pause' }} until you resume {{ 'it' if n == 1 else 'each one' }}.
+      {% set dayp = kill.all|selectattr('sleeve.paused_until')|map(attribute='sleeve.name')|map('leg_label')|list %}{% if dayp %}{{ dayp|join(', ') }} {{ 'is' if dayp|length == 1 else 'are' }} on a daily-loss pause, which then lasts until you resume too, not 24 hours.{% endif %}
       {% if holding %}{{ holding|length }} {{ 'holds a position' if holding|length == 1 else 'hold positions' }} worth about {{ kill.gross|money }} in total{% if kill.shorts %}, shorts counted by their size{% endif %}.{% endif %}
       {% if kill.stopped %}{{ kill.stopped|join(', ') }} {{ 'is' if kill.stopped|length == 1 else 'are' }} stopped, so {{ 'it starts' if kill.stopped|length == 1 else 'they start' }} just to sell.{% endif %}</p>
     {{ reason_picker("book_flatten", "kill") }}

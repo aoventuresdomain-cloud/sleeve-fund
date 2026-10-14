@@ -30,7 +30,7 @@ from fastapi.templating import Jinja2Templates
 from sleeve_fund import lifecycle, liquidation, markets, open_risk
 from sleeve_fund.dashboard import book as bookm
 from sleeve_fund.dashboard import development as dev
-from sleeve_fund.dashboard import gates, reasons, reports, riskops, trading
+from sleeve_fund.dashboard import gates, legs, reasons, reports, riskops, trading
 from sleeve_fund.dashboard.jobs import Jobs
 from sleeve_fund.dashboard.metrics import STALE, sleeve_summary
 from sleeve_fund.data import spec_minutes
@@ -145,6 +145,8 @@ def create_app(store: Store | None = None) -> FastAPI:
     templates.env.globals["exit_ways"] = trading.exit_ways
     templates.env.globals["open_risk_limit"] = open_risk.LIMIT  # the share of the book the gate allows
     templates.env.filters["no_venues"] = no_venues  # stored reasons and messages name no venue (QA U18)
+    templates.env.filters["uk_time"] = legs.uk_time
+    templates.env.filters["leg_label"] = legs.label  # a second leg's row "<name>~2" reads "<name>, leg 2" (P2-8)
     templates.env.filters["pct"] = lambda x: f"{x:+.2%}"
     templates.env.filters["pct0"] = lambda x: f"{x:.0%}"
     # Biggest contributor first, by size whatever its sign (UP-3): rows keep their sign colour and bar direction.
@@ -204,18 +206,20 @@ def create_app(store: Store | None = None) -> FastAPI:
         now = utcnow()
         wanted = [x for x in sleeves if x.desired_state == "running"]
         put_away = st().archived()
+        ones = legs.without_legs(sleeves)  # a two-leg Strategy is one strategy (P2-8 step 7)
         return {
             "mode": "paper",  # live mode arrives with the G2 work; until then nothing can trade real money
             "live_locked": True,
             "now": now,
             "version": VERSION,
             "alerts": st().open_alert_count(),
-            "total": len(sleeves),
-            "running": sum(1 for x in sleeves if x.status == "running"),
-            "attention": sum(1 for x in sleeves if x.status in ("halted", "error")),
-            "unhealthy": sum(1 for x in wanted if not (x.heartbeat_at and now - x.heartbeat_at < STALE)),
+            "total": len(ones),
+            "running": sum(1 for x in ones if x.status == "running"),
+            "attention": sum(1 for x in ones if x.status in ("halted", "error")),
+            "unhealthy": len({x.parent or x.name for x in wanted
+                              if not (x.heartbeat_at and now - x.heartbeat_at < STALE)}),
             # The rail lists every strategy not put away, so each is one click from anywhere.
-            "strategies": [{"name": x.name, "status": x.status} for x in sleeves if x.name not in put_away],
+            "strategies": [{"name": x.name, "status": x.status} for x in ones if x.name not in put_away],
         }
 
     def page(request: Request, name: str, **ctx) -> HTMLResponse:
@@ -263,7 +267,9 @@ def create_app(store: Store | None = None) -> FastAPI:
         # Margin used and Open risk, as the position figures compute them (UI v2, item 7), once they exist.
         if "open_risk" in positions:
             book.update(margin_used=positions["margin"], open_risk=positions["open_risk"])
-        return page(request, "home.html", summaries=[x for x in summaries if x["sleeve"].name not in put_away],
+        return page(request, "home.html",
+                    summaries=legs.fold(st(), [x for x in summaries if x["sleeve"].name not in put_away], frames),
+                    leg_flags=legs.flags(st()),
                     archived=[x for x in summaries if x["sleeve"].name in put_away],
                     earlier=[st().sleeve(n) for n in earlier], book_start=st().book_start(),
                     earlier_resets=bool(set(earlier) & set(st().reset_runs())),
@@ -489,7 +495,9 @@ def create_app(store: Store | None = None) -> FastAPI:
         except KeyError:
             raise HTTPException(404, "no such strategy") from None
         bt_id = name[len(BACKTEST_PREFIX):] if is_backtest(name) else None
-        x = bookm.sleeve_extras(st(), sleeve_summary(st(), s), bookm.daily(st(), name))
+        frame = bookm.daily(st(), name)
+        x = bookm.sleeve_extras(st(), sleeve_summary(st(), s), frame)
+        two = None if bt_id else _two_legs(s, x, frame)
         fills = st().fills(name, limit=100_000)
         events = st().events(name, limit=400)
         orders = trading.orders_by_id(st(), name)
@@ -524,7 +532,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         positions = trading.book_positions(st(), [x])
         working = [trading.order_view(o) for o in st().orders(name, trading.STATUS_TABS["open"][1], limit=200)]
         fees_funding = x.get("costs", x["fees"] - (perp_x["funding_total"] if perp_x else 0.0))  # funding is + received
-        return page(request, "sleeve.html", x=x, fills=fills[:200], trips=trips, feed=feed, orders=recent,
+        return page(request, "sleeve.html", x=x, two=two, fills=fills[:200], trips=trips, feed=feed, orders=recent,
                     order_total=order_total, liquidated=liquidated, ral=ral, clearing=clearing,
                     reset_dropped=reset_dropped,
                     positions=positions, working=working, fees_funding=fees_funding,
@@ -551,6 +559,19 @@ def create_app(store: Store | None = None) -> FastAPI:
                     demo=None if bt_id else _demo_copy(st(), s),
                     strategy_errors=st().strategy_errors(name, since_start=not bt_id),
                     path=path, journey=None if bt_id else _journey(s, x, path, st().mirror_rows(name, limit=200)))
+
+    def _two_legs(s, x: dict, frame) -> dict | None:
+        """A two-leg Strategy's part of its page (P2-8 step 7): on its first leg, the Strategy folded (legs.fold_one)
+        with its flags; on its second, which Strategy it belongs to. None on a one-leg strategy."""
+        if s.parent:
+            return {"of": s.parent}
+        second = st()._leg_of(s.name)
+        if second is None:
+            return None
+        frame2 = bookm.daily(st(), second)
+        y = bookm.sleeve_extras(st(), sleeve_summary(st(), st().sleeve(second)), frame2)
+        folded = legs.fold_one(st(), x, y, {s.name: frame, second: frame2})
+        return {**folded, "flags": legs.flags(st()).get(s.name, [])}
 
     def _strategy_indicators(name: str) -> list[dict]:
         """The strategy's own indicator values for the chart (P1-3s, agreed shape v2/chart-indicators-shape.md):

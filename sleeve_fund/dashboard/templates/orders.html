@@ -8,7 +8,7 @@
     <form class="inline" method="get" action="/orders">
       <input type="hidden" name="status" value="{{ tab }}">
       <label class="sr-only" for="o-sleeve">Strategy</label>
-      <select id="o-sleeve" name="sleeve" onchange="this.form.submit()"><option value="">All strategies</option>{% if backtest %}<option value="{{ sleeve }}" selected>Backtest {{ backtest.run_id }}</option>{% endif %}{% for n in sleeves %}<option {{ 'selected' if sleeve == n }}>{{ n }}</option>{% endfor %}</select>
+      <select id="o-sleeve" name="sleeve" onchange="this.form.submit()"><option value="">All strategies</option>{% if backtest %}<option value="{{ sleeve }}" selected>Backtest {{ backtest.run_id }}</option>{% endif %}{% for n in sleeves %}<option value="{{ n }}" {{ 'selected' if sleeve == n }}>{{ n|leg_label }}</option>{% endfor %}</select>
       <noscript><button>Show</button></noscript>
     </form>
     <a class="button secondary" href="/exports/orders.csv{{ '?sleeve=' ~ sleeve|urlencode if sleeve }}">Download CSV</a>
@@ -27,8 +27,8 @@
     <thead><tr><th>Sent</th><th>Strategy</th><th>Side</th><th>For</th><th class="num">Quantity</th><th class="num">Avg price</th><th class="num">Value</th><th class="num">Fee</th><th>Status</th><th>Reason</th><th></th></tr></thead>
     <tbody>{% for o in orders %}{% set rid = 'o-' ~ loop.index %}
     <tr><td data-m="hide">{{ o.ts|ts }}</td>
-      <td data-m="hide"><a href="/sleeves/{{ o.sleeve }}">{{ o.sleeve }}</a></td>
-      <td><span class="side {{ o.side|lower }}">{{ 'Buy' if o.side == 'BUY' else 'Sell' }}</span> <span class="m-only">{{ o.sleeve }}</span> <span class="muted m-only">{{ o.intent_label }}</span></td>
+      <td data-m="hide"><a href="/sleeves/{{ o.sleeve }}">{{ o.sleeve|leg_label }}</a></td>
+      <td><span class="side {{ o.side|lower }}">{{ 'Buy' if o.side == 'BUY' else 'Sell' }}</span> <span class="m-only">{{ o.sleeve|leg_label }}</span> <span class="muted m-only">{{ o.intent_label }}</span></td>
       <td data-m="hide">{{ tag(o.intent_label, o.intent) }}</td>
       <td class="num" data-m="hide">{{ o.qty|qty }}{% if o.filled_qty and o.filled_qty|qty != o.qty|qty %}<div class="sub">{{ o.filled_qty|qty }} filled</div>{% endif %}</td>
       <td class="num" data-m="hide">{{ o.avg_px|px if o.avg_px else '–' }}</td>

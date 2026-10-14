@@ -104,11 +104,14 @@ def book_view(store: Store, summaries: list[dict], frames: dict[str, pd.DataFram
     # Gross counts a short as exposure too; net lets a short offset a long. Signed values: + long, - short.
     exposure = sum(abs(x["position_value"]) for x in active)
     net = sum(x["position_value"] for x in active)
+    # Counted as Strategies: a two-leg Strategy's second leg row (P2-8) is part of its first leg's, not one more.
+    ones = [x for x in summaries if not getattr(x["sleeve"], "parent", None)]
     return {
-        "sleeves": len(summaries),
-        "running": sum(1 for x in summaries if x["sleeve"].status == "running"),
-        "attention": sum(1 for x in summaries if x["sleeve"].status in ("halted", "error")),
-        "unhealthy": sum(1 for x in active if not x["healthy"] and x["sleeve"].desired_state == "running"),
+        "sleeves": len(ones),
+        "running": sum(1 for x in ones if x["sleeve"].status == "running"),
+        "attention": sum(1 for x in ones if x["sleeve"].status in ("halted", "error")),
+        "unhealthy": len({getattr(x["sleeve"], "parent", None) or x["sleeve"].name for x in active
+                          if not x["healthy"] and x["sleeve"].desired_state == "running"}),
         "start": start,
         "equity": equity,
         "pnl": equity - start,

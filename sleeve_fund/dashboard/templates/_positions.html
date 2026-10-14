@@ -20,7 +20,10 @@
 {% macro _risk(p) -%}{{ risk_cell(p) }}{%- endmacro %}
 
 {% macro _close(p, close_id, closable) -%}
-<button type="button" class="quiet close-btn" data-open="{{ close_id or 'dlg-close-' ~ p.sleeve }}" {% if p.flattening %}disabled title="A flatten is already waiting for the strategy to act on it"{% elif not closable %}disabled{% endif %}>Close</button>
+{%- if p.leg == 2 -%}<span class="faint" title="A two-leg Strategy closes as one: Close on its first leg closes both">with leg 1</span>
+{%- else -%}
+<button type="button" class="quiet close-btn" data-open="{{ close_id or 'dlg-close-' ~ p.sleeve }}" {% if p.flattening %}disabled title="A flatten is already waiting for the strategy to act on it"{% elif not closable %}disabled{% elif p.leg == 1 %}title="Closes both legs"{% endif %}>Close</button>
+{%- endif %}
 {%- endmacro %}
 
 {% macro positions_table(positions, show_strategy=True, close_id=None, closable=True) %}
@@ -30,7 +33,7 @@
     <th class="num">Entry</th><th class="num">Mark</th><th class="num">SL</th><th class="num">TP</th><th class="num">Liq. price</th>
     <th class="num">Unrealised</th><th class="num" title="Money lost if the stop is hit. A perpetual reads what the 5% open-risk limit counts: an estimate where there is no stop to measure. Spot is outside that limit.">Risk to stop</th><th class="num" title="Fees on the fills since the position opened">Fees</th><th><span class="sr-only">Close</span></th></tr></thead>
   <tbody>{% for p in rows %}{% set base = p.pair.split('/')[0] %}
-  <tr>{% if show_strategy %}<td class="cell-name"><a href="/sleeves/{{ p.sleeve }}">{{ p.sleeve }}</a></td>{% endif %}
+  <tr>{% if show_strategy %}<td class="cell-name"><a href="/sleeves/{{ p.strategy or p.sleeve }}">{{ p.strategy or p.sleeve }}</a>{% if p.leg %}<span class="sub2">leg {{ p.leg }}</span>{% endif %}</td>{% endif %}
     <td>{{ p.pair }}{% if p.perp %} <span class="faint">perp</span>{% endif %}</td>
     <td><span class="side {{ 'sell' if p.side < 0 else 'buy' }}">{{ 'Short' if p.side < 0 else 'Long' }}</span></td>
     <td class="num">{{ _lev(p) }}</td>
@@ -56,7 +59,7 @@
 <ul class="pos-cards">{% for p in rows %}{% set base = p.pair.split('/')[0] %}
   <li><div class="r"><span><span class="side {{ 'sell' if p.side < 0 else 'buy' }}">{{ 'Short' if p.side < 0 else 'Long' }}</span> <strong>{{ p.pair }}</strong> {{ _lev(p) }}</span>
       {{ _close(p, close_id, closable) }}</div>
-    <div class="m">{% if show_strategy %}<a href="/sleeves/{{ p.sleeve }}">{{ p.sleeve }}</a> · {% endif %}{{ p.qty|abs|qty }} {{ base }} · notional {{ p.value|abs|money }} · entry {{ p.entry_px|px }} · mark {{ p.price|px }}</div>
+    <div class="m">{% if show_strategy %}<a href="/sleeves/{{ p.strategy or p.sleeve }}">{{ p.strategy or p.sleeve }}</a>{% if p.leg %} leg {{ p.leg }}{% endif %} · {% endif %}{{ p.qty|abs|qty }} {{ base }} · notional {{ p.value|abs|money }} · entry {{ p.entry_px|px }} · mark {{ p.price|px }}</div>
     <div class="m">SL {% if p.stop_px %}{{ p.stop_px|px }}{% else %}<span class="warn">none</span>{% endif %} · TP {% if p.target_px %}{{ p.target_px|px }}{% else %}none{% endif %}{% if p.perp %} · liq. price {{ _liq(p) }}{% endif %}</div>
     <div class="g3"><span>Unrealised<b>{{ money_signed(p.unrealised) }}</b></span><span>Risk to stop<b>{{ _risk(p) }}</b></span><span>Fees<b>{{ p.fees|money }}</b></span></div></li>
   {% endfor %}

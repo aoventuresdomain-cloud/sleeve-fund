@@ -6,6 +6,7 @@ from __future__ import annotations
 from sleeve_fund import markets
 from sleeve_fund.research.metrics import ZERO, _dec, trade_stats, trades
 from sleeve_fund.paper.runtime import liquidation_head
+from sleeve_fund.dashboard.legs import label
 from sleeve_fund.store import LIQUIDATION_RESET, OPEN_ORDER_STATUSES, Store, utcnow  # noqa: F401  (QA's tests import it here)
 
 INTENTS = {"entry": "Entry", "exit": "Signal exit", "stop_loss": "Stop-loss", "take_profit": "Take-profit",
@@ -354,19 +355,22 @@ def open_risk(positions: list[dict], store: Store | None = None) -> dict:
         p["risk"] = risk_cell(p, rows.get(p["sleeve"]))
     perps = [(p["sleeve"], p["risk"]) for p in positions if p.get("perp_limit")]
     spots = [(p["sleeve"], p["risk"]) for p in positions if not p.get("perp_limit")]
+    accounts = _by_account(store, perps) if store is not None else []
+    book = _one_book(store, perps) if store is not None and not accounts else None
+    # Named as the PM reads them from here on: a second leg's row as "<name>, leg 2" (P2-8 step 7).
+    perps, spots = [(label(n), c) for n, c in perps], [(label(n), c) for n, c in spots]
     total, counted, estimated, through, left_out = _tally(perps)
     spot_total, spot_counted, _, _, spot_left = _tally(spots)
-    trailing = [p["sleeve"] for p in positions if p.get("trailing_model")]
-    accounts = _by_account(store, perps) if store is not None else []
+    trailing = [label(p["sleeve"]) for p in positions if p.get("trailing_model")]
     return {
         "accounts": accounts,
-        "book": _one_book(store, perps) if store is not None and not accounts else None,
+        "book": book,
         "margin": sum(p["margin"] for p in positions),
         "open_risk": total if counted or not left_out else None,
         "estimated": estimated,
         "through": through,
         "left_out": [n for names in left_out.values() for n in names],
-        "trailing": [p["sleeve"] for p in positions if p.get("trailing")],
+        "trailing": [label(p["sleeve"]) for p in positions if p.get("trailing")],
         "hint": open_risk_hint(estimated, through, left_out, trailing) or (
             "Money lost if every stop is hit, as the 5% open-risk limit counts it" if perps else
             "No perpetual positions: the 5% open-risk limit counts perpetuals only"),
@@ -533,6 +537,7 @@ def history(store: Store, summaries: list[dict], sleeve: str | None = None) -> d
                        store.insurance(name, limit=None) if perp else None):
             t["sleeve"], t["pair"] = name, x["sleeve"].instrument
             closed.append(t)
+    _by_strategy(positions, summaries)
     closed.sort(key=lambda t: t["closed"] or utcnow(), reverse=True)
     stats = trade_stats(closed)
     stats["fees"] = sum(t["fees"] for t in closed)
@@ -569,6 +574,7 @@ def book_positions(store: Store, summaries: list[dict]) -> dict:
             "fees": pos["fees"] if pos["fees"] is not None else x["fees"],
             "flattening": any(c["command"] == "flatten" for c in store.pending_commands(name)),
         })
+    _by_strategy(rows, summaries)
     return {
         "rows": rows,
         "unrealised": sum(r["unrealised"] for r in rows),
@@ -577,6 +583,21 @@ def book_positions(store: Store, summaries: list[dict]) -> dict:
         "fees": sum(r["fees"] for r in rows),
         **open_risk(rows, store),
     }
+
+
+def _by_strategy(rows: list[dict], summaries: list[dict]) -> None:
+    """Each position named by its Strategy (P2-8 step 7): a two-leg Strategy's legs under its first leg's name, with
+    `leg` 1 or 2 (None on a one-leg Strategy), next to each other, first leg first. In place."""
+    parents = {x["sleeve"].name: getattr(x["sleeve"], "parent", None) for x in summaries}
+    second = {parents.get(r["sleeve"]) for r in rows} - {None}
+    for r in rows:
+        parent = parents.get(r["sleeve"])
+        r["strategy"] = parent or r["sleeve"]
+        r["leg"] = 2 if parent else (1 if r["sleeve"] in second else None)
+    order = {}
+    for r in rows:
+        order.setdefault(r["strategy"], len(order))
+    rows.sort(key=lambda r: (order[r["strategy"]], r["leg"] or 0))
 
 
 def book_fills(store: Store, sleeves: list, limit: int = 100) -> list[dict]:

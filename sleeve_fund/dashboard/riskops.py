@@ -11,6 +11,7 @@ import pandas as pd
 
 from sleeve_fund import backups, markets
 from sleeve_fund.dashboard import trading
+from sleeve_fund.dashboard.legs import label
 from sleeve_fund.store import Store, utcnow
 from sleeve_fund.venues import venue as venue_profile
 
@@ -240,11 +241,11 @@ def status_items(rows: list[dict], health: dict) -> list[dict]:
     for r in rows:
         s = r["x"]["sleeve"]
         if s.status in ("halted", "error"):
-            bad.append(f"{s.name} is {s.status}" + (f": {s.status_reason}" if s.status_reason else ""))
+            bad.append(f"{label(s.name)} is {s.status}" + (f": {s.status_reason}" if s.status_reason else ""))
         elif s.status == "paused":
-            warn.append(f"{s.name} is paused" + (f": {s.status_reason}" if s.status_reason else ""))
-    bad += [f"{name} is not reporting" for name in health["down"]]
-    bad += [f"{name}'s balance doesn't match the venue's" for name in health["mismatched"]]
+            warn.append(f"{label(s.name)} is paused" + (f": {s.status_reason}" if s.status_reason else ""))
+    bad += [f"{label(name)} is not reporting" for name in health["down"]]
+    bad += [f"{label(name)}'s balance doesn't match the venue's" for name in health["mismatched"]]
     for r in rows:
         s = r["x"]["sleeve"]
         if s.status in ("halted", "error"):
@@ -254,13 +255,13 @@ def status_items(rows: list[dict], health: dict) -> list[dict]:
         used = [(r["dd_used"], "drawdown"), (r["day_used"], "daily loss")]
         share, which = max(used, key=lambda u: u[0])
         if share > NEAR_LIMIT:
-            warn.append(f"{s.name} has used {share:.0%} of its {which} limit")
+            warn.append(f"{label(s.name)} has used {share:.0%} of its {which} limit")
         if r["cap_used"] > 1:
             # The cap limits new entries only: past it through price drift is information, not a call to act.
-            warn.append(f"{s.name}'s exposure is {r['cap_used']:.0%} of its entry cap because the price moved; no action")
+            warn.append(f"{label(s.name)}'s exposure is {r['cap_used']:.0%} of its entry cap because the price moved; no action")
         elif r["cap_used"] > NEAR_LIMIT:
-            warn.append(f"{s.name} has used {r['cap_used']:.0%} of its position cap")
-    warn += [f"{name} has had no trade or quote from the venue lately" for name in health["stale_feeds"]]
+            warn.append(f"{label(s.name)} has used {r['cap_used']:.0%} of its position cap")
+    warn += [f"{label(name)} has had no trade or quote from the venue lately" for name in health["stale_feeds"]]
     if health["backup_issue"]:
         warn.append(health["backup_issue"])
     return [{"level": "bad", "text": t} for t in bad] + [{"level": "warn", "text": t} for t in warn]
