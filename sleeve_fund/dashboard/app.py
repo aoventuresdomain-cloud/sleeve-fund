@@ -1247,7 +1247,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         """Performance and the decision log under one period and strategy filter, which the exports follow."""
         q = request.query_params
         now = utcnow()
-        sleeves, frames, summaries, _tests = shown_book()
+        _, frames, summaries, _tests = shown_book()
         names = [s.name for s in st().sleeves()]
         chosen = q.get("sleeve") if q.get("sleeve") in names else ""
         if chosen and chosen not in frames:  # a strategy an earlier clean slate put away: its own figures
