@@ -16,8 +16,10 @@ Revises: 0024 (PE2's book_moves, on main's 0022)
 Create Date: 2026-10-14 22:00:00.000000
 """
 
+import importlib.util
 import json
 from datetime import datetime, timezone
+from pathlib import Path
 
 from alembic import op
 import sqlalchemy as sa
@@ -25,7 +27,17 @@ import sqlalchemy as sa
 EXACT = sa.Numeric(38, 18)  # as sleeve_fund.exact, frozen here
 BIG_ID = sa.BigInteger().with_variant(sa.Integer(), 'sqlite')
 TS = sa.DateTime(timezone=True)
-DEFAULT_VENUE = 'KRAKEN'  # sleeve_fund.venues.DEFAULT_VENUE, frozen
+
+
+def _default_venue_then() -> str:
+    """The default venue as 0020 froze it (a Strategy with no pin trades there): read from that migration, so the seed
+    agrees with the orders backfill and no module outside the venue ones names a venue."""
+    spec = importlib.util.spec_from_file_location('m0020', Path(__file__).with_name('0020_orders_venue.py'))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m.DEFAULT_VENUE_THEN
+
+
 ALIASES = {'XBT': 'BTC', 'XDG': 'DOGE'}  # sleeve_fund.portfolio.holding.ALIASES, frozen
 BACKTEST_PREFIX = 'bt:'
 
@@ -108,13 +120,14 @@ def upgrade() -> None:
     have = {(r.venue, r.symbol, r.contract) for r in bind.execute(sa.text(
         'SELECT venue, symbol, contract FROM instruments'))}
     pins = dict(bind.execute(sa.text('SELECT sleeve, venue FROM sleeve_venues')).all())
+    default = _default_venue_then()
     now, rows = datetime.now(timezone.utc), []
     for name, symbol, params in bind.execute(sa.text('SELECT name, instrument, params FROM sleeves')).all():
         if name.startswith(BACKTEST_PREFIX):
             continue
         params = json.loads(params) if isinstance(params, str) else (params or {})
         contract = 'spot' if (params.get('market') or 'spot') == 'spot' else 'perp'
-        key = ((pins.get(name) or DEFAULT_VENUE).upper(), symbol, contract)
+        key = ((pins.get(name) or default).upper(), symbol, contract)
         if key not in have:
             have.add(key)
             rows.append({'venue': key[0], 'symbol': symbol, 'contract': contract, 'underlying': _underlying(symbol),

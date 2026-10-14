@@ -54,7 +54,7 @@ def run(argv: list[str] | None = None, store=None, out=print) -> int:
     if store is None:
         from sleeve_fund.store import Store
 
-        store = Store()
+        store = Store(portfolio_gate=True)  # as the supervisor's: the journal the poll ends the flow in
     ahead = len(store.pending_flows())
     if not args.apply:
         out(f"dry run: would journal {args.kind} {amount:.2f}; {ahead} flow(s) ahead of it; nothing written")

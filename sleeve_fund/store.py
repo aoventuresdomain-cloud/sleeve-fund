@@ -2937,7 +2937,10 @@ class Store:
     def journal_book(self, sleeve: str, starting_balance: Decimal | float) -> dict:
         """Cash, signed position and average entry implied by the journal: the paper book's source of
         truth (replay_book), with the perp's funding and any insurance-fund cover booked to cash."""
-        q = select(fills_t).where(fills_t.c.sleeve == sleeve).order_by(fills_t.c.ts, fills_t.c.id)
+        # Every column the replay reads, not the table: the replay never needs the instrument (one per Strategy until
+        # Drop B), and a store opened on a journal migrated no further than DA-9 still reads it (QA DA-9 c1)
+        q = (select(*(c for c in fills_t.c if c.name != "instrument")).where(fills_t.c.sleeve == sleeve)
+             .order_by(fills_t.c.ts, fills_t.c.id))
         with self.engine.connect() as c:
             fills = _rows(c.execute(q))
         return replay_book(fills, starting_balance, self.funding_total(sleeve), self.insurance_total(sleeve))
