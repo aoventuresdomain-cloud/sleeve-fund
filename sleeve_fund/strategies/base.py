@@ -4851,7 +4851,7 @@ class LongFlatStrategy(Strategy):
         """Once flat, equity never ends below zero: a liquidation is booked at the bankruptcy price, so it loses
         its isolated margin and fees and no more (_book_liquidation); should this book's own arithmetic still leave
         it below zero, the difference comes back to cash, journaled as the venue's insurance fund's."""
-        if self._fund_bridged():
+        if LongFlatStrategy._fund_bridged(self):
             # MUST-FUNDCASH-LOSS (HoE, Advisor 14 Oct): inside the fund a Strategy's own equity starts at 0, so any
             # loss takes it below zero, and that loss is the fund's, never the insurance fund's. Its own equity feeds
             # no money decision: a liquidation is booked at the bankruptcy price (_book_liquidation), so it loses its
