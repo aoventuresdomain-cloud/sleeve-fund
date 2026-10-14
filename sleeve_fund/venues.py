@@ -82,6 +82,9 @@ class VenueProfile:
     # How far ahead a good-till-date order must expire for the venue to take it; None: it takes no good-till-date
     # orders (ORPHAN-GUARD og1 then sends good-till-cancelled and journals that only the backstops cover it)
     gtd_min_lead: timedelta | None = None
+    # Whether margin can be added to an open isolated perp position (P2-8, Advisor ruling B's top-up). Off on every
+    # venue until one is checked: a two-leg Strategy's perp leg near liquidation then closes the pair instead.
+    allows_margin_top_up: bool = False
     # A market data hub (sleeve_fund.hub) feeds paper here: every bar is built from its minutes, so the venue's
     # own candles (EXTERNAL bar specs) aren't offered until slower bars are built from minutes (v2 P1-4)
     hub: bool = False

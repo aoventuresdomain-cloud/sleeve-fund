@@ -420,3 +420,49 @@ def test_a_second_leg_still_unfilled_a_bar_or_60_seconds_on_is_cancelled_and_the
     first = states[:3]
     assert [s["state"] for s in first] == ["legging", "closing", "flat"]
     assert first[0]["deadline_ns"] is not None and first[0]["trade_id"] == follow[0]["parent_trade_id"]
+
+
+def test_no_venue_allows_the_margin_top_up_so_the_close_path_runs(monkeypatch):
+    """CR P2-8 7: ruling B's top-up is a venue profile switch, off on every venue; a venue that turned it on couldn't
+    run a two-leg Strategy until the top-up is built."""
+    import dataclasses
+
+    from sleeve_fund import venues
+
+    assert not any(p.allows_margin_top_up for p in venues.VENUES.values())
+    kraken = venues.VENUES["KRAKEN"]
+    monkeypatch.setitem(venues.VENUES, "KRAKEN", dataclasses.replace(kraken, allows_margin_top_up=True))
+    with pytest.raises(ValueError, match="top-up isn't built"):
+        _carry((2, 10))
+
+
+def test_a_lead_built_with_no_pair_refuses_by_its_own_settings(monkeypatch):
+    """CR P2-8 2: a leg knows it is one from its own settings (params["leg"], as its paper row has them), so a lead
+    whose Pair was never built opens nothing, with a warning alert, whatever built it."""
+    import sleeve_fund.research.two_leg_run as tlr
+
+    monkeypatch.setattr(tlr, "Pair", _Gone)
+    r = _carry((2, 10))
+    assert _orders(r, "lead") == [] and _orders(r, "follow") == []
+    told = [e for e in r.lead.journal.events_ if e["kind"] == "two_leg_no_pair"]
+    assert len(told) == 1 and told[0]["level"] == "warning"
+
+
+def test_a_first_leg_that_cant_be_placed_ends_the_pair_and_the_next_signal_opens_it(monkeypatch):
+    """CR P2-8 1: the first leg's order isn't placed (here: its strategy declines its first send), so nothing is held
+    or working: the pair goes back to flat at once rather than staying legged, and the next window opens it."""
+    real = LongFlatStrategy._send_entry
+    declined = []
+
+    def decline_once(self, *a, **k):
+        if isinstance(self, LegFollower) and not declined:
+            declined.append(1)
+            return None
+        return real(self, *a, **k)
+
+    monkeypatch.setattr(LongFlatStrategy, "_send_entry", decline_once)
+    r = _carry((2, 6), (12, 16))
+    steps = [what for _, what, _ in r.pair_log]
+    assert steps[:3] == ["entry", "first_unsent", "flat"]
+    assert "hedged" in steps[3:]  # the next bar's signal opened it
+    assert [o["intent"] for o in _orders(r, "follow")] == ["entry", "exit", "entry", "exit"]

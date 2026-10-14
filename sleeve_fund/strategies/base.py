@@ -324,6 +324,7 @@ class LongFlatConfig(StrategyConfig):
         allow_short: bool = False,
         demo_mirror: bool = False,
         trade_from: int | None = None,
+        leg: dict | None = None,
         **kwargs: Any,
     ) -> None:
         unknown = set(kwargs) - _BASE_FIELDS
@@ -400,6 +401,14 @@ class LongFlatConfig(StrategyConfig):
             if take_profit <= cost:
                 raise ValueError(f"Take-profit {take_profit:.2%} doesn't cover the round trip's fees and spread "
                                  f"({cost:.2%}), so every target hit would lose money")
+        if leg is not None:
+            if set(leg) != {"side", "ratio", "leverage"} or int(leg["side"]) not in (1, -1):
+                raise ValueError(f"a two-leg Strategy's leg is its side (+1 or -1), ratio and leverage, not {leg!r}")
+            if markets.is_perp({"market": market}) and not 0 < float(leg["leverage"]) <= 2:
+                raise ValueError(f"a perp leg's leverage is above 0 and at most 2x, not {leg['leverage']}")
+        # A leg of a two-leg Strategy (P2-8; two_legs.leg_params): it trades only through its Pair, and with no Pair it
+        # opens nothing (Advisor M4), whoever built it.
+        self.leg = dict(leg) if leg is not None else None
         self.instrument_id = instrument_id
         self.bar_type = bar_type
         # Backtest only: no trade on a bar that closes before this time (ns), so a study's out-of-sample window starts
@@ -760,7 +769,11 @@ class LongFlatStrategy(Strategy):
         self._reserved: dict[str, Any] = {}  # order id -> its portfolio gate answer, whose reservation it holds
         self.leg_leverage: float | None = None  # a two-leg Strategy's perp leg: its own leverage cap (_max_leverage)
         self.pair = None  # a two-leg Strategy's Pair (strategies.pair, P2-8): what spans both of its legs
-        self.two_leg = False  # a leg of a two-leg Strategy: with no Pair it opens nothing (Advisor M4)
+        # A leg of a two-leg Strategy, from its own settings (LongFlatConfig.leg): with no Pair it opens nothing (Advisor
+        # M4); a perp leg is margined at its own leverage (Advisor B).
+        self.two_leg = config.leg is not None
+        if self.two_leg and config.market != markets.SPOT:
+            self.leg_leverage = float(config.leg["leverage"])
         self._worst_px: float | None = None  # a backtest's worst price in the last bar, for the Pair's clamp
         self._paper_gate = None  # paper's portfolio gate (paper.portfolio_gate.PaperGate), made at its first entry
         # Exceptions raised in these handlers, oldest first, as (handler, repr). See _reporting.

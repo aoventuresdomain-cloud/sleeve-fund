@@ -54,6 +54,17 @@ class LegFollower(LongFlatStrategy):
         return "The second leg trades with its Strategy's first leg", {}
 
 
+def _allows_top_up(venue_name: str) -> bool:
+    """The venue profile's allows_margin_top_up (a portfolio or two-leg clone reads its real venue's); a venue with no
+    profile (a test's) allows none."""
+    from sleeve_fund.venues import venue
+
+    try:
+        return venue(venue_name).allows_margin_top_up
+    except ValueError:
+        return False
+
+
 def _side(s: int):
     return OrderSide.BUY if s > 0 else OrderSide.SELL
 
@@ -75,6 +86,10 @@ class Pair:
             raise ValueError(f"first_out is 'lead' or 'follow', not {first_out!r}")
         self.first_out = first_out
         self.name = name
+        for leg in (lead, follow):
+            if leg._cfg.perp is not None and _allows_top_up(str(leg._cfg.instrument_id.venue)):
+                raise ValueError("ruling B's margin top-up isn't built: a venue that allows it can't run a two-leg "
+                                 "Strategy until it is, so the close path is the one that runs")
         lead.pair = follow.pair = self
         # One price feed for both legs (a perp simulated on the spot's prices): the other leg is marked at this leg's
         # price, so the summed book the guard judges has one price level.
@@ -196,6 +211,9 @@ class Pair:
         if (why := self.blocks_entry()) is not None:
             leg._note("pair_entry_held", f"Entry held: {why}")
             return
+        if self.lead._portfolio is not None or self.follow._portfolio is not None:
+            leg._note("pair_entry_refused", "Entry refused: a two-leg Strategy doesn't run in a portfolio run yet")
+            return
         px = float(signal.get("close") or leg._price())
         f_qty = self._sized(self.follow, qty, self.lead, px)
         lead_part = {"leg": self.lead, "qty": qty, "reason": reason, "signal": signal, "tries": 0}
@@ -215,7 +233,7 @@ class Pair:
         self._note("entry", f"{self.trade_id}: {first['leg'] is self.lead and 'lead' or 'follow'} first")
         # After every venue's bar for this close (as a portfolio gate pass), so each leg fills on its own latest bar.
         self.lead.clock.set_time_alert_ns(f"pair-entry-{self.trades}", self._now() + DELAY_NS,
-                                          callback=lambda _e, part=first: self._send(part))
+                                          callback=lambda _e, part=first: self._send_first(part))
 
     def _gate_both(self, lead_part: dict, follow_part: dict) -> bool:
         """Paper with the portfolio gate (Advisor M1): both legs checked at once under the one lock, one share for both
@@ -252,6 +270,16 @@ class Pair:
         """A checked part never sent: its reservation goes back to the book."""
         if part is not None and part.get("gated") is not None:
             part.pop("gated").release("cancel")
+
+    def _send_first(self, part: dict) -> None:
+        """The first leg's order: when none was placed (too small, or its strategy declined it), nothing is held or
+        working, so the pair ends here and the next signal can open it, rather than staying legged (CR P2-8 1)."""
+        if self.state != "legging" or self._send(part):
+            return
+        why = "its first leg's order couldn't be placed"
+        self._note("first_unsent", why)
+        part["leg"]._note("pair_first_unsent", f"Entry not opened: {why}", level="info")
+        self._end()
 
     def _send(self, part: dict) -> bool:
         leg = part["leg"]
@@ -338,7 +366,7 @@ class Pair:
             second["qty"] = rest.quantize(leg._lot(), rounding=ROUND_DOWN)
             if self._send(second):
                 return
-        if filled > 0:
+        if not self._flat(leg):  # what the earlier tries filled is held: trim to it, don't unwind (CR P2-8 6)
             self._trim_first(leg)
             return
         self._broken(f"its second leg was not filled after {second['tries']} tries")
