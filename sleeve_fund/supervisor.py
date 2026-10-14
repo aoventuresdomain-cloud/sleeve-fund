@@ -77,6 +77,9 @@ def fund_equity(store: Store) -> Decimal:
     return total
 
 
+EMPTY_BOOK = Decimal("0.01")  # a fund worth under a cent holds nothing to mark (F282-3)
+
+
 def _flowed(st: PortfolioState) -> tuple:
     """What a flow (portfolio.gate.apply_flow) moves: a change here between reading the book and marking it is one."""
     return st.equity, st.hwm, st.halt_reference, st.day_start_equity
@@ -546,7 +549,13 @@ class Supervisor:
             with led.lock():
                 # HALT-REF-1: a capital move whose flow (Store._book_move) landed while the book was read left that read
                 # behind it, a phantom gain or loss; this mark is skipped and the next one, seconds on, reads it all.
-                behind = _flowed(led.state()) != _flowed(before)
+                st = led.state()
+                behind = _flowed(st) != _flowed(before)
+                # F282-3 (Advisor, 14 Oct 10:20 UK): an empty book never marked, with nothing open, has nothing to
+                # mark. It writes, raises and clears nothing (a halt or pause in force stays for the PM), and entries
+                # stay blocked as stale until the first capital's mark starts the book.
+                behind = behind or (st.equity is None and st.hwm is None and abs(equity) < EMPTY_BOOK
+                                    and self._nothing_open())
                 acted = None if behind else mark_book(led, equity, now, PORTFOLIO)
         if not self._equity_failing and not behind:
             st = led.state()
@@ -578,6 +587,16 @@ class Supervisor:
         # a dead owner's orders is ORPHAN-GUARD og2 on the DA's 0015. Past the TTL, an unacked order's reservation is
         # kept and alerted on as not cancelled, never released blind.
         sweep(led, now, self._order_live, None, is_acked=self._order_acked)
+
+    def _nothing_open(self) -> bool:
+        """No reservation held, no Strategy that could trade (could_trade), no position but dust (F282-3)."""
+        if self.ledger.reservations():
+            return False
+        for s in self.store.sleeves():
+            book = self.store.journal_book(s.name, s.starting_balance)
+            if could_trade(s) or (abs(book["qty"]) > 1e-12 and not is_dust(book)):
+                return False
+        return True
 
     def _halt_every_strategy(self, why: str, now: datetime) -> None:
         """A portfolio halt (15% under the reference): every strategy holding anything is flattened through its exit

@@ -175,16 +175,51 @@ def test_a_withdrawal_of_10k_after_a_1k_loss_on_20k_stays_5_percent_down(store):
     assert all(abs(x - D("0.05")) < D("1e-12") for x in _dd(st)) and not st.halted
 
 
-def test_an_empty_fund_marked_at_0_takes_its_first_strategy_as_its_starting_book(store):
-    """A fresh stack's supervisor marks the empty fund at 0 before any Strategy exists: the first create starts the
-    book at its capital (no HWM, so no drawdown to keep) rather than failing closed for ever. The halt that empty mark
-    set (its figures aren't usable) is the gate's own and stays, as before, for the PM's Resume: no flow clears one."""
-    assert _mark(store, T0).equity == D(0)
+def test_f282_3_a_fresh_stacks_empty_mark_writes_nothing_and_the_first_capital_starts_the_book(store):
+    """Advisor (10:20 UK) cell (i): the empty fund never marked, nothing open: the mark is a no-op (no figures, no
+    halt), entries stay blocked as stale; the first create makes no flow (nothing marked), and its mark starts the
+    book, HWM, reference and day start at its capital, 0% down."""
+    st = _mark(store, T0)
+    assert st.equity is None and st.hwm is None and not st.halted and st.paused_until is None
     _make(store, "a", 10_000)
-    st = _state(store)
-    assert _four(st) == (D(10_000),) * 4 and "figures aren't usable" in st.halted
+    assert _flows(store) == []
     st = _mark(store, T0 + timedelta(minutes=1))
-    assert _four(st) == (D(10_000),) * 4 and "figures aren't usable" in st.halted
+    assert _four(st) == (D(10_000),) * 4 and not st.halted and st.paused_until is None
+
+
+def test_f282_3_a_halt_in_force_on_an_empty_book_stays_through_marks_and_a_deposit(store):
+    """Cell (ii): only the PM resumes; the no-op mark clears nothing."""
+    led = DbLedger(store, lambda: ())
+    led.ensure_state()
+    with led.lock():
+        led.set_state(replace(led.state(), halted="the PM's test halt"))
+    _mark(store, T0)
+    _make(store, "a", 10_000)
+    st = _mark(store, T0 + timedelta(minutes=1))
+    assert st.halted == "the PM's test halt" and st.equity == D(10_000)
+
+
+def test_f282_3_a_book_at_0_with_a_hwm_still_halts(store, monkeypatch):
+    """Cell (iii): marked before (a HWM), the book at 0 is a 100% loss, not an empty fund: it halts as before."""
+    _make(store, "a", 10_000)
+    _mark(store, T0)
+    monkeypatch.setattr(supervisor, "fund_equity", lambda s: D(0))
+    assert _mark(store, T0 + timedelta(minutes=1)).halted
+
+
+def test_f282_3_a_book_below_0_is_never_empty_and_halts(store, monkeypatch):
+    """Cell (iv)."""
+    monkeypatch.setattr(supervisor, "fund_equity", lambda s: D(-5))
+    assert _mark(store, T0).halted
+
+
+def test_f282_3_an_empty_book_with_a_strategy_that_could_trade_is_marked_and_halts(store, monkeypatch):
+    """Condition 1's 'nothing open': a Strategy that could trade on an empty book is not a fresh stack; the mark
+    goes ahead and halts on its unusable figures, failing closed."""
+    monkeypatch.setattr(supervisor, "fund_equity", lambda s: D(0))
+    _make(store, "live", 10_000)
+    store.set_desired_state("live", "running")
+    assert _mark(store, T0).halted
 
 
 def test_a_deposit_into_a_book_at_0_below_its_hwm_is_refused(store):
