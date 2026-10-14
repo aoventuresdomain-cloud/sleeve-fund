@@ -189,9 +189,10 @@ def check_books(store) -> Section:
             # A fill in the mark's own second (the runtime stamps both to the second) that the mark doesn't hold: the
             # tick that sends a flatten marks before its fill is booked (MARK-ON-STOP). Not a wrong book, and not
             # a skip that makes "nothing compared": a tie the mark does hold is compared below, as a tick that books
-            # a fill and then marks in one second is the usual case (HALT-REF-1's re-base reads it).
-            sec.add(NOTE, f"{s.name}: a fill in its latest mark's own second ({last['ts']:%H:%M:%S} UTC), which the "
-                          "mark predates; compare again after the next mark")
+            # a fill and then marks in one second is the usual case (HALT-REF-1's re-base reads it). A FAIL, never a
+            # NOTE (F289-2, HoE 18:48 UK 14 Oct): nothing is signed or re-based off a book the dashboard can't show yet.
+            sec.add(FAIL, f"{s.name}: its latest mark predates a fill in the same second ({last['ts']:%H:%M:%S} UTC): "
+                          "compare again after the next mark")
             continue
         compared += 1
         price, equity = float(last["price"]), float(last["equity"])
