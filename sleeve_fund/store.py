@@ -1992,33 +1992,38 @@ class Store:
     def close_dead_orders(self, sleeve: str, why: str, ts: datetime | None = None) -> list[str]:
         """F-REFRESH-RES (HoE, Drop A SHOULD): a paper Strategy's process is confirmed stopped, so the simulated venue
         its orders rested at went with it and none of them can fill. Each order the journal still shows open is
-        closed as canceled with `why` (its reservation released as 'cancel' with it, as any cancel's is), and any
-        reservation of the Strategy holding no order is released too, in one transaction with one event. Call it only
-        after the process has exited (Supervisor._stop waits for it). Refused for a live account: a venue order
-        outlives the process. Returns the orders closed."""
-        if self.account_of(sleeve) != "paper":
-            raise ValueError(f"{sleeve} trades on a live account: its orders outlive its process, so none is closed")
+        closed as canceled with `why` (its reservation released as 'cancel' with it, as any cancel's is), then every
+        reservation of the Strategy still active (one holding no order, or one an order left behind) is released as
+        'cancel' too, in one transaction with one event. Call it only after the process has exited (the caller checks
+        the process is gone). Refused for a live account: a venue order outlives the process. Returns the orders
+        closed."""
         ts = ts or utcnow()
-        d, r = gate_decisions_t, gate_reservations_t
-        with self.engine.begin() as c:
-            open_ids = [o for (o,) in c.execute(select(orders_t.c.order_id).where(
-                orders_t.c.sleeve == sleeve, orders_t.c.status.in_(OPEN_ORDER_STATUSES)).order_by(orders_t.c.id))]
-            for oid in open_ids:
-                self._retry_held.discard(oid)  # a second leg's retry hold dies with its process too
-                self._update_order(c, oid, status="canceled", message=f"closed: {why}")
-            sid = c.execute(select(sleeves_t.c.id).where(sleeves_t.c.name == sleeve)).scalar()
-            orphans = [rid for (rid,) in c.execute(select(r.c.decision_id).join(d, d.c.id == r.c.decision_id).where(
-                r.c.sleeve_id == sid, r.c.released_at.is_(None), d.c.order_id.is_(None)))]
-            if orphans:
-                led = self._gate_ledger()
-                with led.using(c):
-                    for rid in orphans:
-                        led.release(rid, "cancel")
-            if open_ids or orphans:
-                c.execute(insert(events_t).values(
-                    sleeve=sleeve, ts=ts, level="info", kind="orders_closed_stopped",
-                    message=f"{why}: its process has stopped, so {len(open_ids)} order(s) still shown open can't fill "
-                            "and are closed, and the room they or the Strategy held in the book is released"))
+        r = gate_reservations_t
+        held: list[str] = []  # a second leg's retry hold dies with its process too; put back if nothing commits
+        try:
+            with self.engine.begin() as c:
+                account = c.execute(select(sleeve_accounts_t.c.account)
+                                    .where(sleeve_accounts_t.c.sleeve == sleeve)).scalar() or "paper"
+                if account != "paper":
+                    raise ValueError(f"{sleeve} trades on a live account: its orders outlive its process, so none is "
+                                     "closed")
+                open_ids = [o for (o,) in c.execute(select(orders_t.c.order_id).where(
+                    orders_t.c.sleeve == sleeve, orders_t.c.status.in_(OPEN_ORDER_STATUSES)).order_by(orders_t.c.id))]
+                held = [o for o in open_ids if o in self._retry_held]
+                self._retry_held.difference_update(held)  # so each cancel below releases its room
+                for oid in open_ids:
+                    self._update_order(c, oid, status="canceled", message=f"closed: {why}")
+                sid = c.execute(select(sleeves_t.c.id).where(sleeves_t.c.name == sleeve)).scalar()
+                left = c.execute(update(r).where(r.c.sleeve_id == sid, r.c.released_at.is_(None))
+                                 .values(released_at=ts, release_reason="cancel")).rowcount
+                if open_ids or left:
+                    c.execute(insert(events_t).values(
+                        sleeve=sleeve, ts=ts, level="info", kind="orders_closed_stopped",
+                        message=f"{why}: its process has stopped, so {len(open_ids)} order(s) still shown open can't "
+                                "fill and are closed, and the room they or the Strategy held in the book is released"))
+        except Exception:
+            self._retry_held.update(held)
+            raise
         return open_ids
 
     def _settle_reservation(self, c, order_id: str, fill_qty, status: str | None) -> None:

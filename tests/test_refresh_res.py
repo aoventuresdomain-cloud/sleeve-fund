@@ -68,13 +68,28 @@ def test_a_stopped_paper_strategys_open_order_and_its_room_are_closed_so_it_sett
 
 
 def test_another_strategys_orders_and_room_are_untouched(store):
+    """CR F-RR-1: scoped to the Strategy, for its orders and for room held with no order."""
     _make(store, "s")
     _make(store, "t")
     _reserve(store, "t", 1, order_id="t1")
+    _reserve(store, "t", 2)
+    _reserve(store, "s", 3)
     store.close_dead_orders("s", "refresh")
     with store.engine.connect() as c:
         assert c.execute(select(orders_t.c.status).where(orders_t.c.order_id == "t1")).scalar() == "accepted"
-    assert [r.strategy for r in store._gate_ledger().reservations()] == ["t"]
+    assert sorted(r.strategy for r in store._gate_ledger().reservations()) == ["t", "t"]
+
+
+def test_room_an_order_left_behind_is_released_too(store):
+    """CR F-RR-2: a reservation still active though its order has finished (left behind) holds room no order can use:
+    released as well, never left counting against the tests."""
+    _make(store)
+    did = _reserve(store, "s", 1, order_id="o1")
+    with store.engine.begin() as c:  # the order finished without settling its reservation (the case to clean up)
+        c.execute(orders_t.update().where(orders_t.c.order_id == "o1").values(status="filled"))
+    assert [r.id for r in store._gate_ledger().reservations()] == [did]
+    assert store.close_dead_orders("s", "refresh") == []
+    assert store._gate_ledger().reservations() == []
 
 
 def test_a_live_accounts_orders_are_never_closed(store):
