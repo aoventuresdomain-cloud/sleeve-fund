@@ -42,13 +42,13 @@ def test_a_fund_equal_to_the_strategys_balance_sizes_as_before(prices, instrumen
 @pytest.mark.parametrize("price,base", [(110.0, 1_000.0), (90.0, 990.0), (100.0, 1_000.0)])
 def test_a_gain_not_yet_taken_never_sizes_up_and_a_loss_sizes_down(price, base):
     """Equity 1,000 marked with 1 unit held from 100: a 10 gain is left out, a 10 loss stays in (realised + min(0, unrealised))."""
-    s = SimpleNamespace(fund_equity=None, _entry_px=100.0, _entry_qty=1.0, _entry_side=1, _price=lambda: price)
+    s = SimpleNamespace(fund_equity=None, _fund_held=lambda: False, _entry_px=100.0, _entry_qty=1.0, _entry_side=1, _price=lambda: price)
     equity = 1_000.0 + (price - 100.0)
     assert LongFlatStrategy._sizing_base(s, equity) == pytest.approx(base)
 
 
 def test_a_short_gain_is_left_out_too():
-    s = SimpleNamespace(fund_equity=None, _entry_px=100.0, _entry_qty=2.0, _entry_side=-1, _price=lambda: 95.0)
+    s = SimpleNamespace(fund_equity=None, _fund_held=lambda: False, _entry_px=100.0, _entry_qty=2.0, _entry_side=-1, _price=lambda: 95.0)
     assert LongFlatStrategy._sizing_base(s, 1_010.0) == pytest.approx(1_000.0)
 
 

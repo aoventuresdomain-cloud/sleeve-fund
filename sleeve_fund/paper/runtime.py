@@ -527,6 +527,7 @@ class SleeveRuntime:
         self.fill_hold = last is not None and last["kind"] == FILL_HOLD
         self.liq_working_since: datetime | None = None  # when the liquidation order now working was first seen
         self._refused = 0
+        self._fund_held: bool | None = None  # fund_held, read once
 
     def last_fill_this_run(self) -> dict | None:
         """The newest fill a strategy may pick its cycle up from after a restart, else None: none once a reset after
@@ -540,6 +541,20 @@ class SleeveRuntime:
         # A two-leg Strategy's other leg re-based with it (PAIR_REBASED) starts a fresh run too (Advisor F283-O3 (d) 3).
         reset = self.store.last_event(self.name, (RESET_AFTER_LIQUIDATION, PAIR_REBASED))
         return None if reset is not None and reset["ts"] >= fills[0]["ts"] else fills[0]
+
+    @property
+    def fund_held(self) -> bool:
+        """Paper inside the fund's book (the portfolio gate on; not a test Strategy outside the book, F229-6): the fund
+        holds the cash, so the Strategy's own equity (its P&L, from a starting balance of 0) never halts or pauses it;
+        the fund's drawdown halt and daily pause (T5) do (Advisor SIZE-FUND Q4, CUT-A (d)). Its liquidation still
+        halts it. A backtest's single Strategy is the whole fund and keeps its own."""
+        if self.backtest or not getattr(self.store, "portfolio_gate", False):
+            return False
+        if self._fund_held is None:
+            from sleeve_fund.supervisor import outside_fund_book
+
+            self._fund_held = not outside_fund_book(self.store, self.store.sleeve(self.name))
+        return self._fund_held
 
     def _last_liquidation(self) -> str | None:
         """The head of its liquidation halt while it is liquidated, else None (liquidation_head)."""
@@ -1131,6 +1146,8 @@ class SleeveRuntime:
                              ts=self.now())
             if held:
                 flatten, self.flatten_why = True, ("risk_halt", f"Risk halt: {ruined}")
+        elif self.fund_held:
+            pass  # CUT-A (d): the fund's own brakes (T5) halt and pause; the Strategy's own equity never does
         elif self.status == "running":
             judged = min(equity, guard_equity) if guard_equity is not None else equity
             breach = risk.check(self.profile, judged, self.peak, self._day_open, self.halts)

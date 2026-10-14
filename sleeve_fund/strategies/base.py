@@ -2160,14 +2160,22 @@ class LongFlatStrategy(Strategy):
             else:
                 self._noted.discard("target_below_costs")
         equity, cash, _, _ = self._mark()
-        if equity <= 0:
+        # CUT-A: sized off the fund's equity, never the Strategy's own (which starts at 0 once the fund holds the cash).
+        base = self._sizing_base(equity)
+        if base is None:
+            self._note("entry_refused_fund_equity", "Entry refused: fund equity stale: the last portfolio mark is older "
+                       "than its interval allows, so nothing is sized off an old figure")
+            return
+        self._noted.discard("entry_refused_fund_equity")
+        if base <= 0:
             self.log.warning("no equity to size from yet; skipping entry")
             return
         fee = Decimal(str(self._cfg.assumed_taker_fee))
         room = Decimal(1) - Decimal(str(self._cfg.cash_buffer)) - fee
         lev = LongFlatStrategy._max_leverage(self)
-        limits = {f"{lev:g}x leverage cap": Decimal(str(equity * lev)) * room}
-        base = self._sizing_base(equity)
+        limits = {f"{lev:g}x leverage cap": Decimal(str(base * lev)) * room}  # SIZE-FUND Q3: on fund equity
+        if self._fund_held():  # the margin the simulated account can post (PE2 funds it from the fund's free cash)
+            limits["margin account"] = Decimal(str(max(cash, 0.0) * lev)) * room
         if self.runtime is not None:
             limits[f"{self.runtime.profile.name} risk profile cap"] = Decimal(str(self.runtime.position_budget(base)))
         elif self._cfg.position_cap_pct is not None:
@@ -3069,9 +3077,13 @@ class LongFlatStrategy(Strategy):
         if self._cfg.max_notional is not None:
             limits["largest order cap"] = Decimal(str(self._cfg.max_notional))
         base = self._sizing_base(self._mark()[0] or float(free.as_decimal()))
+        if base is None:
+            self._note("entry_refused_fund_equity", "Buy refused: fund equity stale: the last portfolio mark is older "
+                       "than its interval allows, so nothing is sized off an old figure")
+            return
+        self._noted.discard("entry_refused_fund_equity")
         if self.runtime is not None:
-            limits[f"{self.runtime.profile.name} risk profile cap"] = Decimal(
-                str(self.runtime.position_budget(self._sizing_base(self._mark()[0]))))
+            limits[f"{self.runtime.profile.name} risk profile cap"] = Decimal(str(self.runtime.position_budget(base)))
         elif self._cfg.position_cap_pct is not None:
             limits["risk profile cap"] = Decimal(str(base * self._cfg.position_cap_pct))
         if self._cfg.risk_per_trade:
@@ -5039,13 +5051,41 @@ class LongFlatStrategy(Strategy):
             account = self.cache.account_for_venue(self._cfg.instrument_id.venue)
         return account
 
-    def _sizing_base(self, equity: float) -> float:
+    def _fund_held(self) -> bool:
+        """Paper inside the fund (the portfolio gate on, and in the fund's book): the fund holds the cash, so the
+        Strategy's own equity (its P&L, from a starting balance of 0) never sizes, halts or pauses it (Advisor CUT-A
+        (d)). A test Strategy outside the book (F229-6) is its own fund."""
+        return self._paper_gated() is not None
+
+    def _paper_fund_equity(self) -> float | None:
+        """Paper's fund equity: the supervisor's last portfolio mark, or None when it is stale by the book's own rule
+        (gate.MARK_STALE, the one that already blocks entries) or can't be read (Advisor SIZE-FUND Q5: stale is
+        refused, never sized off)."""
+        from sleeve_fund.gate_ledger import DbLedger
+        from sleeve_fund.paper.runtime import _no_positions
+        from sleeve_fund.portfolio import gate
+
+        try:
+            st = DbLedger(self.runtime.store, _no_positions).state()
+        except Exception as exc:  # noqa: BLE001 - fail closed: an unread book sizes nothing
+            self.log.warning(f"fund equity unreadable: {type(exc).__name__}: {exc}")
+            return None
+        if st.equity is None or st.mark_ts is None:
+            return None
+        if self.runtime.now() - st.mark_ts > gate.MARK_STALE:
+            return None
+        return float(st.equity)
+
+    def _sizing_base(self, equity: float) -> float | None:
         """BRIDGE-3: the equity an entry's size is a share of: the fund's when the fund holds the cash (fund_equity),
         else this Strategy's own, which is then the whole fund; in both without a gain not yet taken (+ min(0,
-        unrealised)), so a winning position never sizes the next order up. The leverage cap and free cash stay on the
-        Strategy's own margin: they are order-validity rules, not sizing."""
+        unrealised)), so a winning position never sizes the next order up. The leverage cap reads it too (SIZE-FUND Q3);
+        free cash stays the margin account's, an order-validity rule."""
         if self.fund_equity is not None:
-            return float(self.fund_equity())
+            fund = self.fund_equity()  # None: the last portfolio mark is stale (Advisor SIZE-FUND Q5, fail closed)
+            return None if fund is None else float(fund)
+        if self._fund_held():
+            return self._paper_fund_equity()  # never the Strategy's own, nor its unrealised gain
         if self._entry_px is None or not self._entry_qty:
             return equity
         gain = (self._entry_side or 1) * self._entry_qty * (self._price() - self._entry_px)
