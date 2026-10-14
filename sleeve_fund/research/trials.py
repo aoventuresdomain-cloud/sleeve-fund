@@ -69,9 +69,13 @@ class TrialsRegister:
         """Register a single setting before its first run on research data (Advisor 13 Oct 18:05, R4): a counted
         row with no result that has read no bars, so its window is NO_BARS and no holdout reads it as seen; when it
         was written is its created_at. With the study's setup and dataset it is the run's own variant, so N doesn't
-        grow. Returns its id."""
+        grow. A rule-builder setting is registered under its definition's own idea, where its study counts (HoQA
+        F236-4). Returns its id."""
+        from sleeve_fund.research.study import idea_of
+
         return self.record(definition_hash=legacy_definition_hash(strategy, settings, setup),
-                           idea_hash=legacy_idea_hash(strategy), name=strategy, family=family, settings=settings,
+                           idea_hash=idea_of(settings, None) or legacy_idea_hash(strategy), name=strategy,
+                           family=family, settings=settings,
                            dataset=dataset, stage="in_sample", source="study", sharpe=None, data_start=NO_BARS,
                            data_end=NO_BARS)
 
