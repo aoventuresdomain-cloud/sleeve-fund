@@ -153,3 +153,70 @@ def test_an_unmarked_book_still_moves_at_once_with_no_flow(store):  # noqa: F811
     store.assign_account("test", "desk")
     assert store.account_of("test") == "desk" and store.book_moves_pending() == {} and _flows(store) == []
     assert not store.joining("fund") and _mark(store, T0).equity == D(30_000)
+
+
+# The same stale scale hits any capital move made outside the poll, not only the moving Strategy's own P&L (FE prep,
+# fe-plans/f-assign-stale-plan.md): what the rest of the book made or lost since the mark skews the ratio too. The
+# right figures are again those of a mark at the move, then the flow.
+
+
+def _dd(st):
+    return (1 - st.equity / st.reference()).quantize(D("1e-6"))
+
+
+def test_a_create_after_an_unmarked_loss_keeps_the_books_real_drawdown(store):  # noqa: F811
+    """fund 10,000 marked, then loses 1,000 unmarked: the book really is 10% down. A new 10,000 Strategy joins it.
+    Right: 19,000 against a reference of 21,111.11, 10% down. Today (scaled from the 10,000 mark): 19,000 against
+    20,000, 5%: the drawdown understated, so the halt would come late."""
+    _make(store, "fund", 10_000)
+    assert _mark(store, T0).equity == D(10_000)
+    _trade(store, "fund", -1_000, ts=T0 + timedelta(seconds=30))
+    _make(store, "new", 10_000)
+    st = _mark(store, T0 + timedelta(minutes=1))
+    kept = _kept(10_000, 9_000, 19_000)
+    assert _four(st) == (D(19_000), kept, kept, kept), _four(st)
+    assert _dd(st) == D("0.1"), _dd(st)
+
+
+def test_a_move_off_the_book_when_only_the_rest_moved_keeps_the_books_real_drawdown(store):  # noqa: F811
+    """fund 10,000 and test 20,000 marked at 30,000; then fund loses 1,000 unmarked (the book really is 3.3% down)
+    and test, flat and unchanged, moves onto the test account. Right: 9,000 against 9,310.34, 3.3%. Today: 9,000
+    against 10,000, 10%."""
+    _make(store, "fund", 10_000)
+    _make(store, "test", 20_000, instrument="BTC/USD", venue="KRAKEN")
+    store.assign_account("test", "desk")
+    assert _mark(store, T0).equity == D(30_000)
+    _trade(store, "fund", -1_000, ts=T0 + timedelta(seconds=30))
+    store.assign_account("test", "paper")
+    st = _mark(store, T0 + timedelta(minutes=1))
+    kept = _kept(30_000, 29_000, 9_000)
+    assert _four(st) == (D(9_000), kept, kept, kept), _four(st)
+    assert not st.halted and st.paused_until is None
+
+
+def test_a_move_into_the_book_after_an_unmarked_loss_keeps_the_rests_drawdown(store):  # noqa: F811
+    """fund 10,000 marked alone (test 20,000 sits on the test account, outside); then fund loses 1,000 unmarked (10%
+    down) and test moves into the book. Right: 29,000 against 32,222.22, 10%. Today: 29,000 against 30,000, 3.3%."""
+    _make(store, "fund", 10_000)
+    _make(store, "test", 20_000, instrument="BTC/USD", venue="KRAKEN")
+    store.assign_account("test", "paper")  # outside the book
+    assert _mark(store, T0).equity == D(10_000)
+    _trade(store, "fund", -1_000, ts=T0 + timedelta(seconds=30))
+    store.assign_account("test", "desk")  # into the book
+    st = _mark(store, T0 + timedelta(minutes=1))
+    kept = _kept(10_000, 9_000, 29_000)
+    assert _four(st) == (D(29_000), kept, kept, kept), _four(st)
+    assert _dd(st) == D("0.1"), _dd(st)
+
+
+def test_a_book_never_marked_still_moves_at_once_with_no_flow(store):  # noqa: F811
+    """Guard, green today and after the fix: with nothing marked there is no scale to keep (Store._book_move), so a
+    move lands at once, journals no flow, waits for no poll, and the first mark reads the book as it is."""
+    _make(store, "fund", 10_000)
+    _make(store, "test", 20_000, instrument="BTC/USD", venue="KRAKEN")
+    store.assign_account("test", "desk")
+    _trade(store, "test", 5_000)
+    store.assign_account("test", "paper")
+    assert store.account_of("test") == "paper"  # moved now, not at a poll
+    assert [e for e in store.events(None, limit=100) if e["kind"] == "portfolio_flow"] == []
+    assert _four(_mark(store, T0)) == (D(10_000),) * 4
