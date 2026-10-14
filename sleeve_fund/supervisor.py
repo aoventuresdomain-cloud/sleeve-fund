@@ -1560,6 +1560,22 @@ def _rebase_command(store: Store, args) -> int:
     return 0 if not st.halted and not st.paused_until else 1
 
 
+def _resume_identity_command(store: Store, args) -> int:
+    """resume-identity: 0 once the hold is lifted (dry run: when there is one to lift), 1 when refused, naming why."""
+    held = DbLedger(store, lambda: ()).identity_hold()
+    print("book check hold:", held or "none")
+    if args.dry_run:
+        apart = positions_breaks(store)
+        print(f"cash gap {identity_gap(store):,.2f}; positions: {'; '.join(apart) or 'all tie'}")
+        return 0 if held else 1
+    try:
+        print(resume_identity_hold(store, args.actor, args.reason))
+    except ValueError as exc:
+        print(exc)
+        return 1
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="python -m sleeve_fund.supervisor")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1582,6 +1598,10 @@ def main(argv: list[str] | None = None) -> int:
     rs.add_argument("--id", required=True, help="the reset's id, e.g. 2026-10-21-reset; a second run of it carries on")
     rs.add_argument("--deposit", default="100000", help="the fund's fresh capital, deposited once the book is empty")
     rs.add_argument("--dry-run", action="store_true", help="print the book, the steps and what would hold them")
+    ri = sub.add_parser("resume-identity", help="RECON-B only: lift the book check's hold, on the PM's written word")
+    ri.add_argument("--actor", required=True, help="who runs it on the PM's word, for the decision log")
+    ri.add_argument("--reason", required=True, help="the PM's reason, quoted")
+    ri.add_argument("--dry-run", action="store_true", help="print the hold and whether the book adds up; write nothing")
     rn = sub.add_parser("run", help="supervise sleeve processes until stopped")
     rn.add_argument("--clear", help="clean slates file to retry while one waits on a flatten")
     args = ap.parse_args(argv)
@@ -1600,6 +1620,8 @@ def main(argv: list[str] | None = None) -> int:
         print("book figures:", book_figures(store))
     elif args.cmd == "rebase":
         return _rebase_command(store, args)
+    elif args.cmd == "resume-identity":
+        return _resume_identity_command(store, args)
     elif args.cmd == "withdraw-archived":
         try:
             done = withdraw_archived(store, args.actor, args.commit)
