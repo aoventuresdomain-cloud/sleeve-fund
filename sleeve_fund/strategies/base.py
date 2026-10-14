@@ -1562,13 +1562,20 @@ class LongFlatStrategy(Strategy):
         adds, never a start, and refuses rather than trims (Independent Quant Advisor). Paper gates on the account's
         book, counting this strategy's own position still held; a backtest only counts the entries it would have
         refused, against its own equity. A position whose stop the price has gone through counts as stopless and
-        alerts (QA P1-S9)."""
+        alerts (QA P1-S9). A two-leg Strategy's first leg adds what its entry opens on the second leg, in full: no
+        hedge credit (Advisor M6); a backtest judges it against both legs' equity summed."""
         stop = close * (1 - side * self._stop_frac) if self._stop_frac else None
+        pair = getattr(self, "pair", None)
+        follow = pair.follower_entry(Decimal(repr(qty)), close) if pair is not None and pair.lead is self else None
         if self._backtest:
-            atr = self._daily_atr.get((ts_ns - 1) // DAY_NS * DAY_NS)
+            day = (ts_ns - 1) // DAY_NS * DAY_NS
+            atr = self._daily_atr.get(day)
             try:
                 risk = (open_risk.position_risk(side * qty, close, stop, atr)
                         + open_risk.position_risk(held_qty, close, held_stop, atr))
+                if follow is not None:
+                    risk += open_risk.position_risk(*follow, pair.follow._daily_atr.get(day))
+                    equity += pair.other_book(self, close)[0]
             except ValueError:
                 return None
             if equity > 0:
@@ -1592,6 +1599,9 @@ class LongFlatStrategy(Strategy):
             mine_atr = atr(store.sleeve(name)) if needs_atr else None
             mine = (open_risk.position_risk(side * qty, close, stop, mine_atr)
                     + open_risk.position_risk(held_qty, close, None if name in through else held_stop, mine_atr))
+            if follow is not None:  # the second leg's row is in the book and its held risk in `others` already
+                leg = pair.follow.runtime.name
+                mine += open_risk.position_risk(*follow, atr(store.sleeve(leg)) if follow[2] is None else None)
         except ValueError as exc:
             return f"its open risk can't be measured: {exc}"
         if through:

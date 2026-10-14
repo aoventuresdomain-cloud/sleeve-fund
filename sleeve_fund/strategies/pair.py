@@ -260,6 +260,14 @@ class Pair:
             return Decimal(0)
         return (qty * ratio * Decimal(repr(px_from)) / Decimal(repr(px_to))).quantize(to._lot(), rounding=ROUND_DOWN)
 
+    def follower_entry(self, qty: Decimal, px: float) -> tuple[float, float, float | None]:
+        """What a lead entry of `qty` at `px` adds on the second leg: its signed quantity, price and stop (None without
+        one), for the open-risk check, which counts both legs in full with no hedge credit (Advisor M6)."""
+        f = self.follow
+        side, f_px = self.sides[id(f)], f._price() or px
+        stop = f_px * (1 - side * f._stop_frac) if f._stop_frac else None
+        return side * float(self._sized(f, qty, self.lead, px)), f_px, stop
+
     def blocks_entry(self) -> str | None:
         """Why the lead may not open now: a pair already open, being sent, or held on one leg only (ruling A), or one
         not yet recovered after a restart."""

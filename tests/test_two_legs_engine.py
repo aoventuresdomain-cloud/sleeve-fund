@@ -527,3 +527,30 @@ def test_a_pair_restarted_with_one_leg_held_unwinds_it_from_the_journals_state(m
     assert any(e["kind"] == BROKEN and "legging when the process stopped" in e["message"] for e in r.lead.journal.events_)
     moves = [e["message"].split(" (")[0] for e in reversed(store.events("carry", limit=50)) if e["kind"] == "pair_state"]
     assert moves == ["new -> flat", "flat -> legging", "legging -> closing", "closing -> flat"]
+
+
+
+def test_open_risk_counts_the_second_leg_in_full_against_both_legs_equity(monkeypatch):
+    """Advisor M6: no hedge credit. With the same 5% stop on both legs and the second at ratio 2, the pair's entry
+    risks three times what the first leg alone does, on the two legs' equity summed. (The interim open-risk check
+    measures perp entries, so the first leg here is a perp.)"""
+    from sleeve_fund.strategies.pair import Pair
+
+    real = Pair.follower_entry
+
+    def run(follower):
+        monkeypatch.setattr(Pair, "follower_entry", follower)
+        eth = {**PERP, "instrument": "ETH/USDT", "ratio": 2}
+        return run_two_legs("window", LegRun({**PERP, "side": 1}, INST, BARS),
+                            LegRun(eth, venue("kraken").instrument("ETH", "USDT"),
+                                   synthetic_ohlcv(days=40, seed=3, vol=0.02, start_price=3_000)), 10_000,
+                            params={"windows": [[_ns(2), _ns(10)]], "stop_loss": 0.05},
+                            risk_profile="balanced").lead.open_risk_max
+
+    def same_stop(self, qty, px):
+        q, f_px, _ = real(self, qty, px)
+        return q, f_px, f_px * 1.05  # the short leg's 5% stop, as the first leg's
+
+    paired = run(same_stop)
+    alone = run(lambda self, qty, px: (0.0, px, None))  # nothing on the second leg: the first leg's own risk
+    assert alone > 0 and paired == pytest.approx(3 * alone, rel=0.01)
