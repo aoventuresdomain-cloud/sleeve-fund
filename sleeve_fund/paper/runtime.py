@@ -20,8 +20,8 @@ from types import SimpleNamespace
 from sleeve_fund import lifecycle, risk
 from sleeve_fund.exact import EngineJournal
 from sleeve_fund.router import venue_for
-from sleeve_fund.store import (BOOK_RESET, LIQUIDATION_RESET, OPEN_ORDER_STATUSES, RAL, RELOAD, WHY_STOP_FIELD, Store,
-                               replay_book, utcnow)
+from sleeve_fund.store import (BOOK_RESET, LIQUIDATION_RESET, OPEN_ORDER_STATUSES, PAIR_REBASE, PAIR_REBASED, RAL,
+                               RELOAD, WHY_STOP_FIELD, Store, replay_book, utcnow)
 
 # P2-6 journal kinds and order intents (orders.intent is String(16)).
 WIND_STOP, WIND_NOTICE, WIND_RETRY, WIND_FLATTEN = "wind_down_stop", "wind_down_notice", "wind_down_retry", "wind_down"
@@ -296,11 +296,42 @@ def ral_words(store, name: str, cmd: dict, liq: dict, old: float, equity: float)
     strategy, which no process applies it for) say the same."""
     note = store.incident_note(cmd["incident"]) if cmd.get("incident") is not None else None
     before = store.equity_at_or_before(name, liq["ts"] - timedelta(seconds=1))
+    if (pair := pair_ral_figures(store, name, liq)) is not None:
+        # A two-leg Strategy's leg (Advisor F283-O3): the Strategy is the pair, so its figures are both legs summed.
+        return (f"Reset after liquidation of {name}, a leg of {pair['parent']}, by the PM, answering incident "
+                f"#{cmd['incident']} (note by {note['author'] if note else 'nobody'}): the pair's high-water mark "
+                f"{old:,.2f} becomes {equity:,.2f}, both legs' equity summed, which is also the day's loss baseline. "
+                f"Both legs summed {pair['before']:,.2f} just before the liquidation, {pair['after']:,.2f} after it: "
+                f"this leg lost {pair['x']:,.2f}, {pair['y']:.1f}% of the pair, the other leg's unwind "
+                f"{pair['unwind']:+,.2f}, the pair {-pair['net']:+,.2f} in all. {cmd['reason']}")
     return (f"Reset after liquidation by the PM, answering incident #{cmd['incident']} (note by "
             f"{note['author'] if note else 'nobody'}): high-water mark {old:,.2f} becomes {equity:,.2f}, "
             "the remaining equity, which is also the day's loss baseline. Equity "
             + (f"{before['equity']:,.2f}" if before else "unknown")
             + f" just before the liquidation, {equity:,.2f} after it. {cmd['reason']}")
+
+
+def pair_ral_figures(store, name: str, liq: dict) -> dict | None:
+    """A two-leg Strategy's leg's liquidation in the pair's terms (Advisor F283-O3 (d) 1), else None for one leg:
+    `before`, both legs' marked equity summed just before it; `x`, this leg's loss (its equity then less its cash now,
+    flat); `y`, x as a % of `before`, not of the leg's own equity, which would read about 100%; `unwind`, the other
+    leg's gain or loss from then to now (its forced close); `after`, both legs' cash now; `net`, the pair's loss."""
+    row = store.sleeve(name)
+    legs = store.legs(name)
+    if len(legs) < 2:
+        return None
+    other = next(n for n in legs if n != name)
+    at = liq["ts"] - timedelta(seconds=1)
+    mine, theirs = store.equity_at_or_before(name, at), store.equity_at_or_before(other, at)
+    if mine is None or theirs is None:
+        return None
+    now = {n: float(store.journal_book(n, store.sleeve(n).starting_balance)["cash"]) for n in legs}
+    before = float(mine["equity"]) + float(theirs["equity"])
+    after = now[name] + now[other]
+    x = float(mine["equity"]) - now[name]
+    return {"parent": row.parent or name, "other": other, "before": before, "after": after, "x": x,
+            "y": 100 * x / before if before > 0 else float("nan"), "unwind": now[other] - float(theirs["equity"]),
+            "net": before - after}
 
 
 def said_since_last_fill(store, name: str, head: str) -> bool:
@@ -443,6 +474,11 @@ class SleeveRuntime:
         self._day = None
         self._day_open = None
         self._last_equity = None
+        self.paired = False  # one leg of a two-leg Strategy (strategies.pair): its guard judges both legs summed
+        # Paper: a leg's two-leg Strategy (its first leg's row), whose summed guard figures pair_state keeps across
+        # restarts (Advisor M3, CR P2-8 4): the drawdown reference and the day's start, both legs summed.
+        self._pair_of = (sleeve.parent or sleeve.name) if "leg" in (sleeve.params or {}) else None
+        self._pair_day = None  # (UTC day, its start) as the journal kept it, read at the first summed mark
         self._feed_written = None
         self._spreads: list[float] = []
         self._spread_since = None
@@ -491,7 +527,8 @@ class SleeveRuntime:
         fills = self.store.fills(self.name, limit=1)
         if not fills or any(c["command"] == RAL for c in self.store.pending_commands(self.name)):
             return None
-        reset = self.store.last_event(self.name, (RESET_AFTER_LIQUIDATION,))
+        # A two-leg Strategy's other leg re-based with it (PAIR_REBASED) starts a fresh run too (Advisor F283-O3 (d) 3).
+        reset = self.store.last_event(self.name, (RESET_AFTER_LIQUIDATION, PAIR_REBASED))
         return None if reset is not None and reset["ts"] >= fills[0]["ts"] else fills[0]
 
     def _last_liquidation(self) -> str | None:
@@ -509,6 +546,32 @@ class SleeveRuntime:
         at = self.store.equity_at_or_before(self.name, reset["ts"])
         marks = [self.store.peak_equity(self.name, since=reset["ts"]), at["equity"] if at else None]
         return max((float(m) for m in marks if m is not None), default=starting_balance)
+
+    @property
+    def pair_parent(self) -> str | None:
+        """Paper only: a backtest's legs each run on a journal of their own, with nothing to restart from."""
+        return None if self.backtest else self._pair_of
+
+    def _pair_first_mark(self, now: datetime, equity: float) -> None:
+        """A two-leg Strategy's first summed mark in this process: its pair_state row and figures exist from here on
+        (made at this mark when the journal has none yet; kept as they are when it has), and this leg's drawdown
+        reference and day's start are the summed ones the journal kept, not its own row's (CR P2-8 4)."""
+        parent = self.pair_parent
+        if self.store.pair_state(parent) is None:
+            self.store.set_pair_state(parent, expected=None, state="flat", ts=now)
+        saved = self.store.mark_pair(parent, equity, risk.trading_day(now), now)
+        if saved is not None and saved["marked_at"] is not None:  # a restart: the summed figures as kept
+            self.peak = float(saved["reference_equity"])
+            self._pair_day = (saved["day_start"], float(saved["day_start_equity"]))
+
+    def _pair_rebase(self, equity: float, hwm: bool = False) -> None:
+        """A Resume after a halt (the halt reference) or a book reset (`hwm`, the high-water mark too) re-bases a two-leg
+        Strategy's summed figures as it does this leg's own."""
+        if self.paired and self.pair_parent is not None:
+            self.store.rebase_pair(self.pair_parent, equity, self.now(), hwm=hwm)
+            if hwm:
+                self.store.set_pair_day(self.pair_parent, risk.trading_day(self.now()), equity, self.now(),
+                                        rebase=True)
 
     def _restored_day_open(self, now: datetime, equity: float) -> float:
         """The daily-loss baseline after a (re)start: the equity at the PM's last resume today, which reset
@@ -813,6 +876,9 @@ class SleeveRuntime:
         so the restart takes it again. One journaled but not yet marked (a liquidation_reset carries its command_id,
         F217-3) is finished on the retry, never journaled twice: the earlier resets lapse (QA F217-1) and
         a halt still standing is lifted. Any other RAL with nothing to reset is ignored as before, and lapses nothing."""
+        if cmd.get("incident") is None and self.pair_parent is not None and cmd["reason"].startswith(PAIR_REBASE):
+            self._pair_rebase_after_ral(cmd, equity)
+            return
         liq = liquidation_event(self.store, self.name)
         if liq is None and (reset := self.store.reset_for_command(cmd["id"])) is not None:
             # The process died after journaling this reset and before marking it applied: finish it from the journal,
@@ -821,6 +887,7 @@ class SleeveRuntime:
             # on the restart); any other halt stays for its own reason (HoE on #217: PE2, QA F217-2).
             self._lapse_resets_before(cmd)
             self.peak, self._day_open = equity, equity
+            self._pair_rebase_all(equity)
             self.wiped_out, self.liquidated = False, None
             if self.status == "halted":
                 kept = self._lift_the_liquidations_halt(after_id=reset["id"])
@@ -844,11 +911,54 @@ class SleeveRuntime:
                          ral_words(self.store, self.name, cmd, liq, old, equity), ts=self.now(), command_id=cmd["id"])
         self._lapse_resets_before(cmd)
         self.peak, self._day_open = equity, equity
+        self._pair_rebase_all(equity)
         self.wiped_out, self.liquidated = False, None
         if (kept := self._lift_the_liquidations_halt(after_id=liq["id"] or 0,
                                                      since=None if liq["id"] else liq["ts"])) is not None:
             self.store.event(self.name, "info", "ral_halt_kept", f"reset after liquidation done; {kept}",
                              ts=self.now())
+        self.store.mark_applied(cmd["id"])
+
+    def _pair_rebase_all(self, equity: float) -> None:
+        """A two-leg Strategy's reset after liquidation re-bases the pair's summed high-water mark, halt reference and
+        day's start at `equity`, both legs summed (Advisor F283-O3 (b)), as one leg's re-bases its own. Idempotent: the
+        other leg's half sets the same. The book-level figures are not touched."""
+        if self.paired and self.pair_parent is not None:
+            self._pair_rebase(equity, hwm=True)
+            self.store.set_pair_day(self.pair_parent, risk.trading_day(self.now()), equity, self.now(), rebase=True)
+
+    def _pair_rebase_after_ral(self, cmd: dict, equity: float) -> None:
+        """The other leg's half of a two-leg Strategy's reset after liquidation (Store.command, PAIR_REBASE): this leg's
+        drawdown reference and day's start, and the pair's summed ones, re-based at `equity`, both legs summed, so it
+        doesn't judge the pair against the high-water mark before the liquidation and halt it on its next tick. It
+        resets nothing else and lifts no halt of its own: a summed drawdown halt stays until a Resume (F217-4). One
+        pair_rebase event on this leg journals it (and starts a fresh run here too, RAL-ANCHOR); never a
+        liquidation_reset, which would answer this leg's own liquidation if it had one. Taken only
+        with the liquidated leg's own reset: while that waits, this waits; refused, this is refused too."""
+        m = re.search(r"\(command #(\d+)\)$", cmd["reason"])
+        theirs = self.store.command_by_id(int(m.group(1))) if m else None
+        sibling = self.store.legs(self.name)
+        if (theirs is None or theirs["command"] != RAL or theirs["incident"] is None or theirs["sleeve"] == self.name
+                or theirs["sleeve"] not in sibling):
+            self.store.event(self.name, "warning", "ral_refused",
+                             f"pair re-base refused: it names no reset after liquidation of the other leg. "
+                             f"{cmd['reason']}", ts=self.now())
+            self.store.mark_applied(cmd["id"])
+            return
+        if theirs["applied_at"] is None:
+            return  # the liquidated leg's reset first: this is taken on a later tick, once it is
+        if self.store.reset_for_command(theirs["id"]) is None:
+            self.store.event(self.name, "warning", "ral_refused",
+                             f"pair re-base refused: the other leg's reset after liquidation wasn't taken. "
+                             f"{cmd['reason']}", ts=self.now())
+            self.store.mark_applied(cmd["id"])
+            return
+        if self.store.reset_for_command(cmd["id"], PAIR_REBASED) is None:  # a retry after a crash journals it once
+            self.store.event(self.name, "info", PAIR_REBASED,
+                             self.store.pair_rebase_words(self.pair_parent, theirs["sleeve"], self.peak, equity),
+                             ts=self.now(), command_id=cmd["id"])
+        self.peak, self._day_open = equity, equity
+        self._pair_rebase_all(equity)
         self.store.mark_applied(cmd["id"])
 
     def _lift_the_liquidations_halt(self, after_id: int, since: datetime | None = None) -> str | None:
@@ -945,7 +1055,7 @@ class SleeveRuntime:
 
     def tick(self, *, equity: float, cash: float, qty: float, price: float,
              guard_equity: float | None = None, busy: bool = False, ruined: str | None = None,
-             liquidating: bool = False) -> str | None:
+             liquidating: bool = False, other_equity: float = 0.0) -> str | None:
         """Mark, guard, then apply PM commands. Returns "flatten" if the strategy must flatten now.
         guard_equity: the equity at the worst price since the last tick (a backtest's minute high or low on
         a perp), which the guard judges by when lower; the mark is still this tick's equity.
@@ -954,7 +1064,10 @@ class SleeveRuntime:
         halts, from running or paused, and flattens whatever is still open.
         liquidating: a liquidation order is working (the price went through the liquidation price): the PM's commands
         wait, so a resume queued while paused is never applied on the liquidating tick (QA P1-U34); the next tick has
-        the liquidation's halt, which a resume doesn't clear."""
+        the liquidation's halt, which a resume doesn't clear.
+        other_equity: a two-leg Strategy's other leg, marked now (P2-8): the drawdown halt and the daily-loss pause
+        judge both legs summed and act on both (Advisor 13 Oct 23:55 UK, E), so the peak, the day's open and the
+        guard all read the sum; the journal still marks this leg's own equity. guard_equity is then the sum too."""
         now = self.now()
         self.store.heartbeat(self.name, now)
         self.refresh_lifecycle()
@@ -963,16 +1076,30 @@ class SleeveRuntime:
         if price <= 0:
             return None
         self._record_mark(equity=equity, cash=cash, qty=qty, price=price, ts=now)
+        equity += other_equity  # from here on, what the guard judges: a two-leg Strategy's both legs
+        if self.paired and self.pair_parent is not None and self._day is None:
+            self._pair_first_mark(now, equity)
+        if equity > self.peak and self.paired and self.pair_parent is not None:
+            self.store.raise_pair_peak(self.pair_parent, equity, now)
         self.peak = max(self.peak, equity)
         if self._day != risk.trading_day(now):
             # The day opens at the equity last marked at or before midnight: the same thing in paper, which
             # marks every few seconds, and in a backtest, which marks once a bar. The first tick after a
             # (re)start reads it from the journal, so a restart mid-day, such as the reload a settings
             # edit makes, can't lift the daily-loss pause by resetting the baseline (review round 8, B8-2).
-            if self._day is None and self._last_equity is None:
+            if self._day is None and self._last_equity is None and self.paired:
+                # A two-leg Strategy's first mark: the day's start both legs summed, as pair_state kept it for today
+                # (a restart mid-day keeps it, as B8-2 does for one Strategy), else both legs' equity now.
+                kept = self._pair_day
+                self._day_open = kept[1] if kept is not None and kept[0] == risk.trading_day(now) else equity
+                if self.pair_parent is not None and (kept is None or kept[0] != risk.trading_day(now)):
+                    self.store.set_pair_day(self.pair_parent, risk.trading_day(now), equity, now)
+            elif self._day is None and self._last_equity is None:
                 self._day_open = self._restored_day_open(now, equity)
             else:
                 self._day_open = self._last_equity if self._last_equity is not None else equity
+                if self.paired and self.pair_parent is not None:
+                    self.store.set_pair_day(self.pair_parent, risk.trading_day(now), self._day_open, now)
             self._day = risk.trading_day(now)
         self._last_equity = equity
         if not self.backtest and self.status == "paused" and self.paused_until is not None and self.paused_until <= now:
@@ -1043,6 +1170,7 @@ class SleeveRuntime:
                 # at its equity now. Never a liquidation, which only a reset after liquidation clears.
                 if not self.wiped_out and (self.status == "halted" or (self.status == "paused" and self.paused_until)):
                     self.peak = self._day_open = equity
+                    self._pair_rebase(equity, hwm=True)
                     self._set("running", "")
                 self.store.mark_applied(cmd["id"])
                 continue
@@ -1079,10 +1207,14 @@ class SleeveRuntime:
                     continue
                 elif self.status == "halted":
                     self.peak = equity  # a resume after a halt resets the drawdown reference
+                    self._pair_rebase(equity)
                     self.store.event(self.name, "info", "drawdown_reset",
                                      f"drawdown measured from {equity:,.2f}, the equity when the PM resumed "
                                      "after the halt", ts=self.now())
                 self._day_open = equity
+                if self.paired and self.pair_parent is not None:
+                    self.store.set_pair_day(self.pair_parent, risk.trading_day(self.now()), equity, self.now(),
+                                            rebase=True)
                 self._set("running", "")
             self.store.event(self.name, "info", f"pm_{cmd['command']}", cmd["reason"], ts=self.now())
             self.store.mark_applied(cmd["id"])
@@ -1204,7 +1336,8 @@ class SleeveRuntime:
     # --- orders -------------------------------------------------------------------
 
     def on_order(self, *, order_id: str, side: str, qty: float, intent: str, reason: str, signal: dict,
-                 order_type: str = "MARKET", timing: dict | None = None, reservation: int | None = None) -> None:
+                 order_type: str = "MARKET", timing: dict | None = None, reservation: int | None = None,
+                 parent_trade_id: str | None = None) -> None:
         """Journal an order and why it was sent. An opening order's row is written before it goes to the venue;
         with paper's queued journal an exit's is queued and may land after it (paper.queued). timing: the
         decision's stamps (on_timing), journaled with the order; a backtest keeps none. reservation: the paper
@@ -1212,6 +1345,8 @@ class SleeveRuntime:
         extra = {"timing": timing} if timing and not self.backtest else {}
         if reservation is not None:
             extra["reservation"] = reservation
+        if parent_trade_id is not None:  # P2-8: a two-leg trade's id, on both legs' orders
+            extra["parent_trade_id"] = parent_trade_id
         self.store.record_order(self.name, order_id=order_id, side=side, qty=qty, intent=intent, reason=reason,
                                 signal=signal, order_type=order_type, ts=self.now(), **extra)
 

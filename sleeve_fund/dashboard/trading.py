@@ -3,7 +3,7 @@ the strategy gave when it acted (journaled in the orders table at decision time)
 
 from __future__ import annotations
 
-from sleeve_fund import markets
+from sleeve_fund import markets, risk
 from sleeve_fund.research.metrics import ZERO, _dec, trade_stats, trades
 from sleeve_fund.paper.runtime import liquidation_head
 from sleeve_fund.store import LIQUIDATION_RESET, OPEN_ORDER_STATUSES, Store, utcnow  # noqa: F401  (QA's tests import it here)
@@ -200,8 +200,9 @@ def open_lot(fills: list[dict], shorts: bool = False) -> dict | None:
 def liquidated_since_reset(store: Store, sleeve: str) -> bool:
     """Whether the strategy's position margin was lost with no reset after liquidation since: the engine's own rule
     (runtime.liquidation_head), so the dashboard and the gate can't disagree (CR 7). Read from the journal, not the
-    latest halt: a Stop/Start that halts it again on drawdown must not make a Resume restart it (QA P1-U22)."""
-    return liquidation_head(store, sleeve) is not None
+    latest halt: a Stop/Start that halts it again on drawdown must not make a Resume restart it (QA P1-U22). A two-leg
+    Strategy is liquidated while either leg is (F283-O3): each liquidated leg needs its own reset after liquidation."""
+    return any(liquidation_head(store, n) is not None for n in store.legs(sleeve))
 
 
 def stop_basis(params: dict, signal: dict | None, plan: dict | None = None, side: int = 1) -> str | None:
@@ -243,7 +244,7 @@ def position_margin(x: dict) -> tuple[float, float | None]:
     t = markets.terms(x["sleeve"].params, getattr(x["sleeve"], "venue", None))
     if t is None:
         return abs(qty) * entry, None
-    lev = x["profile"].max_leverage
+    lev = risk.leverage_cap(x["profile"], x["sleeve"].params)
     return (markets.isolated_margin(qty, entry, lev, cash + qty * entry),
             markets.isolated_liquidation(cash, qty, entry, lev, t.maintenance_margin))
 
@@ -361,6 +362,7 @@ def open_risk(positions: list[dict], store: Store | None = None) -> dict:
     return {
         "accounts": accounts,
         "book": _one_book(store, perps) if store is not None and not accounts else None,
+        "unallocated": _one_book(store, perps, unallocated=True) if store is not None and not accounts else None,
         "margin": sum(p["margin"] for p in positions),
         "open_risk": total if counted or not left_out else None,
         "estimated": estimated,
@@ -398,19 +400,24 @@ def _by_account(store: Store, perps: list[tuple[str, dict]]) -> list[dict]:
         total, counted, _, _, left_out = _tally(mine)
         out.append({"name": a["name"], "open_risk": total if counted or not left_out else None,
                     "left_out": [n for names in left_out.values() for n in names],
-                    "book": limit.account_equity(store, a["name"])})
+                    "book": limit.account_equity(store, a["name"]),
+                    "unallocated": limit.account_unallocated(store, a["name"])})
     return out
 
 
-def _one_book(store: Store, perps: list[tuple[str, dict]]) -> float | None:
+def _one_book(store: Store, perps: list[tuple[str, dict]], unallocated: bool = False) -> float | None:
     """The book the limit measures the Open risk tile's figure against when its perpetuals are on one account
     (open_risk.account_equity, the fund's equity as supervisor.fund_equity counts it: cash a clean slate put away
     included, a Strategy outside the fund's book not), so the tile's % of book equals the gate's (F229-6-a; Advisor
-    C3b, option B). None when there are none, or they span accounts (each has its own line)."""
+    C3b, option B). None when there are none, or they span accounts (each has its own line). With `unallocated`, the
+    part of that book no Strategy in the current book holds (open_risk.account_unallocated; F-C3B-UI)."""
     from sleeve_fund import open_risk as limit
 
     names = {store.account_of(n) for n, _ in perps}
-    return limit.account_equity(store, names.pop()) if len(names) == 1 else None
+    if len(names) != 1:
+        return None
+    read = limit.account_unallocated if unallocated else limit.account_equity
+    return read(store, names.pop())
 
 
 def open_risk_hint(estimated: list[str], through: list[str], left_out: dict[str, list[str]],

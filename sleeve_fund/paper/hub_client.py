@@ -85,6 +85,24 @@ class HubStatus:
         # first_touch rule judges (R2), the same minutes the bar was built from. Kept SKIPPED_KEEP_NS.
         self.minutes: dict[str, dict[int, list[tuple]]] = {}
 
+        # Each further strategy on this node's feed (a two-leg Strategy's second leg, P2-8) reads its own (view()).
+        self.views: list[HubStatusView] = []
+
+    def note_bar(self, end: int, missing: int, degraded: bool) -> None:
+        """A bar sent with minutes missing: told to each strategy reading this status, each taking its own copy."""
+        for status in (self, *self.views):
+            status.missing[end] = missing
+            if degraded:
+                status.degraded[end] = missing
+
+    def view(self, aliases: dict[str, str]) -> "HubStatusView":
+        """What a further strategy on this feed reads: the hub's word and the lost and kept minutes as here, by the
+        instrument each clone id stands for (aliases: clone id -> its source id), with the bars sent missing minutes
+        told to it as well, for it to take."""
+        v = HubStatusView(self, dict(aliases))
+        self.views.append(v)
+        return v
+
     def unfilled(self, iid: str) -> list[int]:
         return sorted(self.lost.get(iid, ()))
 
@@ -100,6 +118,42 @@ class HubStatus:
     def venue_down(self, now_ns: int) -> bool:
         """The hub is alive (a recent heartbeat) and says its venue connection is down."""
         return now_ns - self.heartbeat_ns <= HUB_ALIVE_SECONDS * 1_000_000_000 and not self.venue_up
+
+
+class HubStatusView:
+    """HubStatus as a further strategy on the same feed reads it (HubStatus.view): its own degraded and missing bars,
+    everything else the hub's, a clone's instrument id read as the one it stands for, so a clone is stale and blind
+    exactly when its source is (HoE, 14 Oct 05:02 UK)."""
+
+    def __init__(self, base: HubStatus, aliases: dict[str, str]) -> None:
+        self.base, self.aliases = base, aliases
+        self.degraded: dict[int, int] = {}
+        self.missing: dict[int, int] = {}
+
+    @property
+    def heartbeat_ns(self) -> int:
+        return self.base.heartbeat_ns
+
+    @property
+    def venue_up(self) -> bool:
+        return self.base.venue_up
+
+    @property
+    def lost(self) -> dict[str, set[int]]:
+        return self.base.lost
+
+    @property
+    def minutes(self) -> dict[str, dict[int, list[tuple]]]:
+        return self.base.minutes
+
+    def unfilled(self, iid: str) -> list[int]:
+        return self.base.unfilled(self.aliases.get(iid, iid))
+
+    def minutes_of(self, iid: str, after: int, until: int) -> list[tuple]:
+        return self.base.minutes_of(self.aliases.get(iid, iid), after, until)
+
+    def venue_down(self, now_ns: int) -> bool:
+        return self.base.venue_down(now_ns)
 
 
 class _Building:
@@ -384,9 +438,7 @@ class Decoder:
                         f"{iid}: the bar closing {_hhmm(b.end)} was sent missing {missing} of its "
                         f"{self.period // MINUTE_NS} minutes")
             if self.status is not None:
-                self.status.missing[b.end] = missing
-                if bar_rule.degraded(missing, self.period // MINUTE_NS):
-                    self.status.degraded[b.end] = missing
+                self.status.note_bar(b.end, missing, bar_rule.degraded(missing, self.period // MINUTE_NS))
         bt = self.types.get(iid) or self.types.setdefault(iid, BarType.from_str(f"{iid}-{self.bar_spec}"))
         kept = self.bar_minutes.setdefault(iid, {})
         kept[b.end] = [(ts, *(float(b.minutes[ts][k]) for k in ("o", "h", "l", "c"))) for ts in sorted(b.minutes)]
@@ -398,21 +450,59 @@ class Decoder:
                    b.end, now_ns)
 
 
+def re_id(data, iid: InstrumentId):
+    """The same trade, quote or bar (or instrument definition) under another instrument id, every other field kept: a
+    two-leg Strategy's second leg trades a clone of its venue (research.portfolio.clone_venue), fed exactly what the
+    instrument it stands for is fed (P2-8, HoE and Advisor 14 Oct 05:02 UK)."""
+    if isinstance(data, TradeTick):
+        return TradeTick(iid, data.price, data.size, data.aggressor_side, data.trade_id, data.ts_event, data.ts_init)
+    if isinstance(data, QuoteTick):
+        return QuoteTick(iid, data.bid_price, data.ask_price, data.bid_size, data.ask_size, data.ts_event,
+                         data.ts_init)
+    if isinstance(data, Bar):
+        bt = data.bar_type
+        return Bar(BarType(iid, bt.spec, bt.aggregation_source), data.open, data.high, data.low, data.close,
+                   data.volume, data.ts_event, data.ts_init)
+    from sleeve_fund.research.portfolio import clone_instrument
+
+    return clone_instrument(data, iid.venue)
+
+
+def _iid_of(data) -> str | None:
+    if isinstance(data, Bar):
+        return str(data.bar_type.instrument_id)
+    iid = getattr(data, "instrument_id", None) or getattr(data, "id", None)
+    return str(iid) if iid is not None else None
+
+
 class HubDataClientConfig(DataClientConfig):
     def __init__(self, *, venue: str, instrument_ids: tuple[str, ...], host: str = "hub", port: int = 7700,
                  bar_spec: str = "1-MINUTE-LAST-EXTERNAL", report=None, recover=None,
-                 status: HubStatus | None = None, **kwargs) -> None:
+                 status: HubStatus | None = None, aliases: tuple[tuple[str, str], ...] = (), **kwargs) -> None:
         """report(level, kind, message): where skipped and incomplete bars and connection losses are told,
         e.g. the strategy's journal events; by default the node's log. recover: the stored minutes, as
-        Decoder takes them. status: kept up to date with the hub's heartbeats, for the strategy's watchdog."""
+        Decoder takes them. status: kept up to date with the hub's heartbeats, for the strategy's watchdog.
+        aliases: (instrument id, its clone's id) pairs: every definition, trade, quote and bar of the first is also
+        handed on, straight after it and unchanged but for its id, as the second's (a two-leg Strategy's second leg,
+        P2-8). None by default, and then nothing changes."""
         super().__init__(**kwargs)
         self.venue, self.instrument_ids, self.host, self.port = venue, tuple(instrument_ids), host, port
         self.bar_spec, self.report, self.recover, self.status = bar_spec, report, recover, status
+        self.aliases = tuple((str(a), str(b)) for a, b in aliases)
+        for a, b in self.aliases:
+            if a not in self.instrument_ids:
+                raise ValueError(f"{b} stands for {a}, which this client doesn't receive")
+            src, dst = InstrumentId.from_str(a), InstrumentId.from_str(b)
+            if dst.symbol != src.symbol or str(dst.venue) == str(src.venue):
+                raise ValueError(f"{b} isn't a clone of {a}: the same symbol, on a clone of its venue")
 
 
 class HubDataClient(MarketDataClient):
     def __init__(self, *, name: str, config: HubDataClientConfig, cache, clock) -> None:
-        super().__init__(name=name, config=config, cache=cache, clock=clock, venue=Venue(config.venue))
+        # With clones it serves their venues too: registered under no venue, it is the node's routing client, so a
+        # clone's subscription reaches it (it already sends the clone's data); without, exactly as before.
+        venue = None if getattr(config, "aliases", ()) else Venue(config.venue)
+        super().__init__(name=name, config=config, cache=cache, clock=clock, venue=venue)
         self.cfg = config
         self._report = config.report or self._log_report
         self.decode = Decoder(config.bar_spec, self.report, config.recover, getattr(config, "status", None))
@@ -422,6 +512,20 @@ class HubDataClient(MarketDataClient):
         self._writer: asyncio.StreamWriter | None = None
         self._reader_task = None
         self._closing = False
+        self._aliases: dict[str, list[InstrumentId]] = {}
+        for a, b in getattr(config, "aliases", ()):
+            self._aliases.setdefault(a, []).append(InstrumentId.from_str(b))
+
+    def _handle_data(self, data) -> None:
+        """Hands data on; an aliased instrument's then again as each clone's, in the same step (no added delay)."""
+        super()._handle_data(data)
+        for iid in self._aliases.get(_iid_of(data), ()):
+            super()._handle_data(re_id(data, iid))
+
+    def _handle_instrument(self, instrument) -> None:
+        super()._handle_instrument(instrument)
+        for iid in self._aliases.get(str(instrument.id), ()):
+            super()._handle_instrument(re_id(instrument, iid))
 
     def report(self, level: str, kind: str, message: str) -> None:
         try:

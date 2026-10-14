@@ -24,6 +24,7 @@ from sleeve_fund.money import money, scale
 from sleeve_fund.portfolio.gate import Checked, MemoryLedger, check_order, mark_book
 from sleeve_fund.portfolio.holding import Position, holding_for, underlying
 from sleeve_fund.portfolio.limits import Holding, Intent, rejected
+from sleeve_fund.portfolio.regime_weight import Weighting, weighed
 from sleeve_fund.risk import PortfolioProfile
 
 BATCH_DELAY_NS = 1  # the gate pass runs this long after a bar's close: after every venue's bar for that close
@@ -136,16 +137,19 @@ def gate_intent(d: dict) -> Intent:
 
 def tagged_intent(d: dict, now: datetime):
     """gate_intent's Intent with what the journal keys it on (gate_ledger.TaggedIntent): the strategy's id for it (a
-    fresh one when it has none), its kind (`what`) and the bar it was decided on (`bar`, that bar's close in ns, as
-    paper's journal and the parity report read it; the check time for an order sent outside a bar decision). Paper's
-    gate and the portfolio backtest's both build it here, so they gate the same order the same way (P2-7)."""
+    fresh one when it has none), its kind (`what`; an entry sent while a position is held is an "add") and the bar it
+    was decided on (`bar`, that bar's close in ns, as paper's journal and the parity report read it; the check time
+    for an order sent outside a bar decision). Paper's gate and the portfolio backtest's both build it here, so they
+    gate the same order the same way (P2-7)."""
     import uuid
 
     from sleeve_fund.gate_ledger import TaggedIntent
 
     order, bar = gate_intent(d), d.get("bar")
+    kind = str(d.get("what") or "entry")
+    kind = "add" if kind == "entry" and d.get("opens", True) is False else kind  # held when sent: an add (P2-5)
     return TaggedIntent(**{f: getattr(order, f) for f in order.__dataclass_fields__},
-                        intent_id=str(d.get("intent_id") or uuid.uuid4().hex), kind=str(d.get("what") or "entry"),
+                        intent_id=str(d.get("intent_id") or uuid.uuid4().hex), kind=kind,
                         bar_ts=_utc(int(bar)) if isinstance(bar, int) else now)
 
 
@@ -205,6 +209,8 @@ class PortfolioGate:
     # The intent_ids of orders sent outside a bar decision (no `bar`): their bar_ts is only the check time, so the
     # parity report lists them on their own, as it does paper's (P2-7, PE2 FU-1).
     unbarred: set[str] = field(default_factory=set)
+    # P2-5: the regime weight on each new entry, for the counted regime variant only (never in G1); None: unweighted.
+    regime: Weighting | None = None
 
     def mark(self, ts_ns: int) -> str | None:
         """Mark the fund at ts_ns, a close + BATCH_DELAY_NS: "halt" or "pause" when that mark has just set one
@@ -235,6 +241,8 @@ class PortfolioGate:
             order = tagged_intent(intent, now)
             if not isinstance(intent.get("bar"), int):
                 self.unbarred.add(order.intent_id)
+            if self.regime is not None:
+                order = weighed(order, *self.regime.for_order(strategy, intent.get("opens", True), order.bar_ts))
         except Exception as e:  # noqa: BLE001 - an order the gate can't read is never sent
             why = f"Entry rejected: the portfolio check couldn't run ({type(e).__name__}: {e}), so nothing is sent"
             self.ledger.alert("portfolio_check_failed", f"{strategy}: {why}", now)

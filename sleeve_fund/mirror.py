@@ -345,8 +345,14 @@ class BybitDemo:
 
 def target_for(sleeve) -> str:
     """The demo account a strategy's fills go to: Bybit Demo Trading for a strategy on Binance's USDT
-    perpetuals (Binance's own demo is closed to the PM's account), else the Deribit testnet."""
-    return "BYBIT" if (sleeve.venue or "").upper() == "BINANCE" else "DERIBIT"
+    perpetuals (Binance's own demo is closed to the PM's account), else the Deribit testnet. A venue clone (a two-leg
+    Strategy's second leg's simulated account, P2-8) is refused: it exists only inside the paper node (Advisor)."""
+    from sleeve_fund.venues import base_venue
+
+    v = sleeve.venue or ""
+    if base_venue(v) != v:
+        raise MirrorRefused(f"{v} is a simulated venue clone: it never reaches a demo or live account")
+    return "BYBIT" if v.upper() == "BINANCE" else "DERIBIT"
 
 
 def exact_copy(sleeve) -> str | None:
@@ -505,7 +511,7 @@ def bybit_leverage(store) -> dict[str, tuple[float, list]]:
         symbol = s.instrument.replace("/", "").upper()
         if target_for(s) != "BYBIT" or symbol not in BYBIT_CONTRACTS or not markets.is_perp(s.params):
             continue
-        lev = risk.profile(s.risk_profile).max_leverage
+        lev = risk.leverage_cap(risk.profile(s.risk_profile), s.params)
         prev, names = out.get(symbol, (lev, []))
         out[symbol] = (min(prev, lev), names + [s])
     return out

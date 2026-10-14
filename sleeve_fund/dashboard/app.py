@@ -30,7 +30,7 @@ from fastapi.templating import Jinja2Templates
 from sleeve_fund import lifecycle, liquidation, markets, open_risk
 from sleeve_fund.dashboard import book as bookm
 from sleeve_fund.dashboard import development as dev
-from sleeve_fund.dashboard import gates, reasons, reports, riskops, trading
+from sleeve_fund.dashboard import gates, reasons, reports, riskops, trading, withdrawal
 from sleeve_fund.dashboard.jobs import Jobs
 from sleeve_fund.dashboard.metrics import STALE, sleeve_summary
 from sleeve_fund.data import spec_minutes
@@ -52,9 +52,10 @@ from sleeve_fund.research import run as study_run
 from sleeve_fund.research.ledger import IdeaLedger, opened_words
 from sleeve_fund.research.holdout import HoldoutLocks
 from sleeve_fund.research.trials import TrialsRegister
-from sleeve_fund.risk import PROFILES
+from sleeve_fund.risk import PROFILES, leverage_cap
 from sleeve_fund.store import BACKTEST_PREFIX, LIQUIDATION_RESET, RAL, Store, is_backtest, utcnow
-from sleeve_fund.paper.runtime import EXITS_ONLY, RESUMABLE, clearing_action, entry_blocked, liquidation_event
+from sleeve_fund.paper.runtime import (EXITS_ONLY, RESUMABLE, clearing_action, entry_blocked, liquidation_event,
+                                      pair_ral_figures)
 from sleeve_fund.strategies import REGISTRY, check_perp_sizing, check_perp_stop
 from sleeve_fund.strategies.base import exit_warmup, maker_orders_enabled
 from sleeve_fund.wording import no_venues
@@ -95,10 +96,40 @@ def same_origin(request: Request) -> None:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "cross-site request blocked")
 
 
+_SLEEVE_POST = re.compile(r"^/sleeves/(?P<name>[^/]+)/(?P<action>[^/]+)$")
+# What isn't built to act on both legs of a two-leg Strategy yet (P2-8): refused on its first leg's row rather than
+# applied to one leg only. Its pause, resume, flatten, start and stop reach both legs (Store.command).
+_ONE_LEG_ONLY = {"reset": "a reset", "account": "a move to another account", "archive": "archiving",
+                 "lifecycle": "winding down or retiring", "settings": "a change of settings"}
+
+
+def two_leg_refusal(store: Store, name: str, action: str) -> str | None:
+    """Why a PM action on this strategy's row is refused because it is part of a two-leg Strategy, or None."""
+    try:
+        row = store.sleeve(name)
+    except KeyError:
+        return None  # the route says so
+    if row.parent is not None:
+        return f"this is the second leg of {row.parent}: act on {row.parent}, whose commands reach both legs"
+    if action in _ONE_LEG_ONLY and store._leg_of(name) is not None:
+        return f"{_ONE_LEG_ONLY[action]} isn't built for a two-leg Strategy yet, so nothing was changed"
+    return None
+
+
 def create_app(store: Store | None = None) -> FastAPI:
     _password()  # fail at start-up, not on first request
     app = FastAPI(title="Multi-Strategy Fund", docs_url=None, redoc_url=None, openapi_url=None)
     app.state.store = store or Store(portfolio_gate=True)  # the server's journal: CHOKE reads the portfolio too
+
+    @app.middleware("http")
+    async def two_leg_rows(request: Request, call_next):
+        """A two-leg Strategy is acted on through its first leg's row, never one leg alone (P2-8, Advisor M2)."""
+        m = _SLEEVE_POST.match(request.scope["path"]) if request.method == "POST" else None
+        # The lifecycle route judges its own: close-now, the PM's emergency exit, is never refused (Advisor, T fence)
+        if (m is not None and m["action"] != "lifecycle"
+                and (why := two_leg_refusal(app.state.store, m["name"], m["action"])) is not None):
+            return RedirectResponse(f"/sleeves/{m['name']}?{urlencode({'command_error': why})}", status_code=303)
+        return await call_next(request)
     app.state.jobs = Jobs()
     try:
         study_run.seed(LEDGER, TEARSHEETS)
@@ -242,7 +273,10 @@ def create_app(store: Store | None = None) -> FastAPI:
                    if o["sleeve"] in names]
         book = bookm.book_view(st(), summaries, frames)
         positions = trading.book_positions(st(), summaries + tests)  # shown; outside the book is marked not counted
-        funding = trading.book_funding(st(), summaries)
+        # The book's funding totals leave a test-account Strategy out; its payments are listed, marked, as its
+        # fills, orders and position are (F273-1).
+        funding = {**trading.book_funding(st(), summaries),
+                   "payments": trading.book_funding(st(), summaries + tests)["payments"]}
         # Costs as money paid: fees plus funding paid (funding totals are + received, - paid).
         book["funding_paid"] = -funding["total"]
         book["fees_funding"] = book.get("costs", book["fees"] - funding["total"])
@@ -255,8 +289,30 @@ def create_app(store: Store | None = None) -> FastAPI:
                     earlier_resets=bool(set(earlier) & set(st().reset_runs())),
                     book=book, alerts=st().alerts(limit=30), shell=shell(),
                     positions=positions, working=working, holdings=bookm.holdings(positions["rows"], book["equity"]),
-                    book_fills=trading.book_fills(st(), sleeves), funding=funding,
-                    fill_count=sum(x["fills"] for x in summaries), tests=tests)
+                    book_fills=trading.book_fills(st(), sleeves + [x["sleeve"] for x in tests]), funding=funding,
+                    fill_count=sum(x["fills"] for x in summaries), tests=tests,
+                    test_names={x["sleeve"].name for x in tests}, **_archived_now(request, put_away))
+
+    def _archived_now(request: Request, put_away) -> dict:
+        """F-C3B-A-UI on the Portfolio: right after an archive, which Strategy went and the fund's book as it now is
+        with the limits in use against it; and which archived Strategies still count in the book (archived before
+        their equity was taken out with it, until supervisor withdraw-archived; a reset's earlier run keeps its cash), and
+        which wait to go flat before theirs leaves (Store.withdrawal_pending), and which had nothing to withdraw
+        (Store.nothing_withdrawn)."""
+        gone = request.query_params.get("archived")
+        gone = gone if gone in put_away else None
+        out, runs, pending, none = st().withdrawn(), st().reset_runs(), st().withdrawal_pending(), st().nothing_withdrawn()
+        return {"archived_now": gone, "put_away_now": withdrawal.limits_in_use(app.state.store) if gone else None,
+                "archived_words": withdrawal.state_words(app.state.store, gone) if gone else "",
+                "still_counted": [n for n in put_away if n not in out and n not in runs and n not in pending
+                                  and n not in none],
+                # Settled at 0 or less: nothing withdrawn, in the book at that figure (Advisor 14 Oct 11:10 UK).
+                "nothing_out": none,
+                # Archived while not flat: in the book in full until it is (Advisor 14 Oct 10:45 UK), with why. One
+                # flat leaves at the supervisor's next mark, seconds on (F286-CR1), so it reads as out.
+                "waiting_flat": {n: why for n in pending if (why := st().withdrawal_blocker(n))},
+                # Put away and flat: leaving at the supervisor's next mark, with its word if one held it (F286-CR1).
+                "leaving": withdrawal.leaving(app.state.store)}
 
     def _recent_json(sleeves, days: int, daily) -> JSONResponse:
         """The last day or week at fine resolution, in the shape the charts read."""
@@ -292,12 +348,15 @@ def create_app(store: Store | None = None) -> FastAPI:
 
     @app.get("/risk", response_class=HTMLResponse)
     def risk_page(request: Request, _: str = Depends(require_pm)):
-        sleeves, frames, summaries = book_data()
+        # The book's figures (drawdown, stress, largest asset) are the fund's, as on Portfolio (shown_book): a
+        # test-account Strategy keeps its own row, marked, and the kill switch and health still cover it.
+        sleeves, frames, summaries, tests = shown_book()
+        every = summaries + tests
         book = bookm.book_view(st(), summaries, frames)
-        kill = _kill_targets(summaries)
-        risk = riskops.risk_view(st(), summaries, book)
-        health = riskops.health_view(st(), summaries)
-        running = sum(1 for x in summaries if x["sleeve"].status == "running")
+        kill = _kill_targets(every)
+        risk = riskops.risk_view(st(), every, book)
+        health = riskops.health_view(st(), every)
+        running = sum(1 for x in every if x["sleeve"].status == "running")
         # The drawdown chart's halt line only when the whole book shares one risk profile's limit.
         profiles = {x["profile"].name: x["profile"].max_drawdown for x in summaries}
         halt = next(iter(profiles.items())) if len(profiles) == 1 else None
@@ -305,7 +364,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         return page(request, "risk.html", book=book, risk=risk, health=health, chart=chart, size=riskops.gate_size(st(), book),
                     halt_name=halt[0] if halt else None, stress=riskops.stress_bars(risk["scenarios"]),
                     status=riskops.status_word(riskops.status_items(risk["rows"], health), running),
-                    ops=riskops.ops_view(st(), summaries), shell=shell(sleeves), kill=kill,
+                    ops=riskops.ops_view(st(), every), shell=shell(sleeves + [x["sleeve"] for x in tests]), kill=kill,
                     kill_error=request.query_params.get("kill_error"), killed=request.query_params.get("killed"))
 
     def _kill_targets(summaries) -> dict:
@@ -349,13 +408,15 @@ def create_app(store: Store | None = None) -> FastAPI:
             return RedirectResponse("/risk?killed=0", status_code=303)
         for name in held:
             st().decide(actor, "flatten", f"Book kill switch: {why}", name)
-        for x in targets["all"]:
-            name = x["sleeve"].name
+        # A two-leg Strategy is told through its first leg's row, once: its flatten and start reach both legs, and
+        # the second leg's row has no process of its own to act on one (CR F283-2).
+        told = list(dict.fromkeys(st().legs(x["sleeve"].name)[0] for x in targets["all"]))
+        for name in told:
             st().command(name, "flatten", f"Book kill switch: {why}", actor=actor)
-            if x["sleeve"].desired_state != "running":
+            if st().sleeve(name).desired_state != "running":
                 st().set_desired_state(name, "running")
                 st().decide(actor, "start", f"Book kill switch: started to sell its position ({why})", name)
-        n = len(targets["all"]) + len(held)
+        n = len(told) + len(held)
         st().decide(actor, "flatten everything", f"{why} ({n} strateg{'y' if n == 1 else 'ies'})")
         return RedirectResponse(f"/risk?killed={n}", status_code=303)
 
@@ -496,6 +557,17 @@ def create_app(store: Store | None = None) -> FastAPI:
         clearing = None if bt_id else _clearing(s)
         reset_dropped = False if bt_id else _reset_dropped(name)
         q = request.query_params
+        archived = name in st().archived()
+        # F-C3B-A-UI: archiving takes its equity out of the fund's book, so its dialog shows the book after it and the
+        # limits in use against that, read when Archive is offered (stopped and flat); after a retire or a restore, the
+        # book as it now is.
+        put_away = None
+        if not bt_id and not archived and s.desired_state != "running" and not x["qty"]:
+            put_away = withdrawal.limits_in_use(app.state.store, [name])
+        put_away_done = q.get("put_away") if q.get("put_away") in ("retired", "restored") else None
+        # Put away: whether its equity left, leaves at the supervisor's next mark (F286-CR1), waits for it to go flat,
+        # or had nothing to withdraw (Advisor 14 Oct 10:45 and 11:10 UK).
+        away = withdrawal.state_words(app.state.store, name) if archived else ""
         # The settings form: what was typed when a change was refused, else the settings as they are.
         typed = {k[2:]: v for k, v in q.items() if k.startswith("f_")}
         settings_pre = typed or {"risk_profile": s.risk_profile, **_risk_form(s.params)}
@@ -527,7 +599,9 @@ def create_app(store: Store | None = None) -> FastAPI:
                     feed_kind=request.query_params.get("feed", "all"), decisions=st().decisions(name, limit=50),
                     pending=st().pending_commands(name), risk=_risk_view(x, position),
                     resetting=None if bt_id else st().pending_reset(name),
-                    idea=_idea(s.strategy, s.params), archived=name in st().archived(),
+                    idea=_idea(s.strategy, s.params), archived=archived, put_away=put_away,
+                    put_away_done=put_away_done, away=away,
+                    put_away_now=withdrawal.limits_in_use(app.state.store) if put_away_done else None,
                     signals=None if bt_id else _signals_view(s, st().signal_state(name)),
                     timeline=_timeline(events, st().decisions(name, limit=50)),
                     pos_history=_position_history(events, funding, position),
@@ -759,8 +833,8 @@ def create_app(store: Store | None = None) -> FastAPI:
                 # A stopped strategy's process isn't there to act on a flatten, which would wait for its next
                 # start, maybe weeks later (review round 8, M8-2). Holding a position, it starts to sell it,
                 # as the kill switch does; flat, there is nothing to sell.
-                s = st().sleeve(name)
-                if abs(st().journal_book(name, s.starting_balance)["qty"]) <= 1e-12:
+                if all(abs(st().journal_book(n, st().sleeve(n).starting_balance)["qty"]) <= 1e-12
+                       for n in st().legs(name)):  # either leg of a two-leg Strategy (CR F283-2)
                     raise ValueError("it is stopped and holds no position, so there is nothing to flatten")
                 st().command(name, command, reason, actor=actor)
                 st().set_desired_state(name, "running")
@@ -786,14 +860,16 @@ def create_app(store: Store | None = None) -> FastAPI:
 
     @app.post("/sleeves/{name}/incident-note")
     def incident_note(name: str, incident: str = Form(""), author: str = Form(""),
-                      why_stop_did_not_protect: str = Form(""), actor: str = Depends(require_pm),
-                      _o: None = Depends(same_origin)):
-        """The note on a liquidation's incident that a reset after liquidation needs (P1-RAL, Advisor 18:17)."""
+                      why_stop_did_not_protect: str = Form(""), why_clamp_did_not_prevent: str = Form(""),
+                      actor: str = Depends(require_pm), _o: None = Depends(same_origin)):
+        """The note on a liquidation's incident that a reset after liquidation needs (P1-RAL, Advisor 18:17). A two-leg
+        Strategy's page takes the note on either leg's incident, with the pair's own cause too (F283-O3)."""
         try:
             ev = st().event_by_id(int(incident)) if incident.strip().isdigit() else None
-            if ev is None or ev["sleeve"] != name:
+            if ev is None or ev["sleeve"] not in st().legs(name):
                 raise ValueError("that incident is not this strategy's")
-            st().write_incident_note(ev["id"], author=author, why_stop_did_not_protect=why_stop_did_not_protect)
+            st().write_incident_note(ev["id"], author=author, why_stop_did_not_protect=why_stop_did_not_protect,
+                                     why_clamp_did_not_prevent=why_clamp_did_not_prevent)
         except ValueError as exc:
             return RedirectResponse(f"/sleeves/{name}?{urlencode({'command_error': str(exc)})}", status_code=303)
         return RedirectResponse(f"/sleeves/{name}?{urlencode({'done': 'Incident note saved.'})}", status_code=303)
@@ -890,9 +966,12 @@ def create_app(store: Store | None = None) -> FastAPI:
         return RedirectResponse(f"/setup?{urlencode({'reset': '1'})}", status_code=303)
 
     def _book_to_reset() -> list:
-        """The strategies a book reset covers: not archived, not a backtest, none already resetting."""
+        """The strategies a book reset covers: not archived, not a backtest, none already resetting, and no two-leg
+        Strategy, as a reset isn't built for one yet (CR F283-1: one leg's run put away alone)."""
         gone = set(st().archived())
-        return [s for s in st().sleeves() if s.name not in gone and not st().pending_reset(s.name)]
+        two_leg = {n for s in st().sleeves() if s.parent is not None for n in (s.name, s.parent)}
+        return [s for s in st().sleeves() if s.name not in gone and s.name not in two_leg
+                and not st().pending_reset(s.name)]
 
     def _retired(account: str) -> bool:
         return any(a["name"] == account and a["retired_at"] for a in st().accounts())
@@ -993,13 +1072,19 @@ def create_app(store: Store | None = None) -> FastAPI:
             raise HTTPException(404, "no such strategy") from None
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from None
-        return RedirectResponse("/" if action == "archive" else f"/sleeves/{name}", status_code=303)
+        # The page after shows the fund's book as it now is and the limits in use against it (F-C3B-A-UI).
+        if action == "archive":
+            return RedirectResponse(f"/?{urlencode({'archived': name})}", status_code=303)
+        return RedirectResponse(f"/sleeves/{name}?put_away=restored", status_code=303)
 
     @app.post("/sleeves/{name}/lifecycle")
     def sleeve_lifecycle(name: str, action: str = Form(...), reason: str = Form(""),
                          actor: str = Depends(require_pm), _o: None = Depends(same_origin)):
         """P2-6: the PM's lifecycle move (wind_down, retire, close_now), and the one caller of Store.set_lifecycle.
         The buttons come with the phase 2 UI; the rules are sleeve_fund.lifecycle's."""
+        why = two_leg_refusal(st(), name, "lifecycle")
+        if why is not None and (action != "close_now" or st().sleeve(name).parent is not None):
+            return RedirectResponse(f"/sleeves/{name}?{urlencode({'command_error': why})}", status_code=303)
         try:
             if not reason.strip():
                 raise ValueError("a reason is required")
@@ -1008,7 +1093,9 @@ def create_app(store: Store | None = None) -> FastAPI:
             raise HTTPException(404, "no such strategy") from None
         except (ValueError, PermissionError) as exc:
             raise HTTPException(400, getattr(exc, "reason", None) or str(exc)) from None
-        return RedirectResponse(f"/sleeves/{name}", status_code=303)
+        # A retire takes its equity out of the fund's book: the page after shows the book now (F-C3B-A-UI).
+        done = "?put_away=retired" if st().sleeve(name).lifecycle == lifecycle.RETIRED else ""
+        return RedirectResponse(f"/sleeves/{name}{done}", status_code=303)
 
     def research_page(request: Request, job=None, error: str = "", pre: dict | None = None,
                       notice: str = "", tab: str | None = None):
@@ -2022,6 +2109,21 @@ def _ral_view(store, name: str) -> dict | None:
     liquidation's incident (the newest since it) and its note; X and Y% read from the liquidation halt's own words
     ("... lost (liquidated): X, Y% of strategy equity at entry", with "includes adds" when the position was added
     to); and the equity left, the journal's cash. Whatever isn't there reads as None, and the dialog says so."""
+    legs = store.legs(name)
+    if len(legs) > 1:
+        # A two-leg Strategy (F283-O3): the first liquidated leg's reset, with the pair's figures (Advisor (d) 1); a
+        # second liquidated leg is offered once this one is reset.
+        for leg in legs:
+            if (view := _one_ral_view(store, leg)) is not None:
+                liq = view["liquidation"]
+                view.update(leg=leg, pair=pair_ral_figures(store, leg, liq),
+                            others=[n for n in legs if n != leg and liquidation_event(store, n) is not None])
+                return view
+        return None
+    return _one_ral_view(store, name)
+
+
+def _one_ral_view(store, name: str) -> dict | None:
     liq = liquidation_event(store, name)
     if liq is None:
         return None
@@ -2052,7 +2154,7 @@ def _demo_copy(store, s) -> dict | None:
                  if r["status"] == "filled")
     last = store.last_resync(s.name)
     return {"label": "the demo account", "put_on": put_on, "last": last,
-            "leverage": PROFILES[s.risk_profile].max_leverage}
+            "leverage": leverage_cap(PROFILES[s.risk_profile], s.params)}
 
 
 
@@ -2159,7 +2261,7 @@ KIND_WORDS = {"handler_failed": "Strategy error", "maker_fill_above_tape": "Make
               "backup_problem": "Backup problem", "exits_change": "Exits changed", "settings_applied": "Settings applied",
               "stop_rejected": "Stop refused", "stop_reset": "Stop reset", "exits_applied": "Exits applied", "warmup_short": "Short warm-up",
               "start_refused": "Start refused",
-              "account_move": "Moved account"}
+              "account_move": "Moved account", "portfolio_carried_invalid": "Portfolio not marked"}
 
 
 def action_words(action: str) -> str:

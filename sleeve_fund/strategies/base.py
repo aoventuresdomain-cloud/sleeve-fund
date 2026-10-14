@@ -41,6 +41,7 @@ from sleeve_fund.paper.runtime import WIND_STOP as WIND_STOP_INTENT
 from sleeve_fund.store import DUST, OPEN_ORDER_STATUSES, replay_book
 from sleeve_fund.strategies.indicators import AtrSma, warmup_for
 from sleeve_fund.strategies.timeframes import Candle, SlowerCandles, bar_spec, span
+from sleeve_fund.venues import base_venue
 
 # Orders the signal asks for may wait for a maker fill; protective exits (stop-loss, take-profit,
 # risk halts, PM flatten) always go at market, because getting out matters more than the fee.
@@ -325,8 +326,10 @@ class LongFlatConfig(StrategyConfig):
         allow_short: bool = False,
         demo_mirror: bool = False,
         trade_from: int | None = None,
+        leg: dict | None = None,
         **kwargs: Any,
     ) -> None:
+        leg_spec = leg  # `leg` is reused below for a fee and a half spread
         unknown = set(kwargs) - _BASE_FIELDS
         if unknown:
             raise TypeError(f"unknown strategy parameters: {sorted(unknown)}")
@@ -401,6 +404,15 @@ class LongFlatConfig(StrategyConfig):
             if take_profit <= cost:
                 raise ValueError(f"Take-profit {take_profit:.2%} doesn't cover the round trip's fees and spread "
                                  f"({cost:.2%}), so every target hit would lose money")
+        if leg_spec is not None:
+            if set(leg_spec) != {"side", "ratio", "leverage"} or int(leg_spec["side"]) not in (1, -1):
+                raise ValueError("a two-leg Strategy's leg is its side (+1 or -1), ratio and leverage, not "
+                                 f"{leg_spec!r}")
+            if markets.is_perp({"market": market}) and not 0 < float(leg_spec["leverage"]) <= 2:
+                raise ValueError(f"a perp leg's leverage is above 0 and at most 2x, not {leg_spec['leverage']}")
+        # A leg of a two-leg Strategy (P2-8; two_legs.leg_params): it trades only through its Pair, and with no Pair it
+        # opens nothing (Advisor M4), whoever built it.
+        self.leg = dict(leg_spec) if leg_spec is not None else None
         self.instrument_id = instrument_id
         self.bar_type = bar_type
         # Backtest only: no trade on a bar that closes before this time (ns), so a study's out-of-sample window starts
@@ -467,6 +479,7 @@ _HANDLER_WORDS = {"on_trade": "a trade print", "on_quote": "a quote", "on_order_
                   "on_order_modify_rejected": "a resize refused", "on_bar": "a bar", "_on_tick": "the risk check",
                   "_maker_timeout": "a post-only order's wait running out"}
 MAX_KEPT_ERRORS = 100  # handler errors kept with their text; every one is counted
+FILL_HANDLER_PAUSE = "paused: a fill handler failed, so its book is in doubt; resume once it is checked"  # T-FIX8
 
 
 def handler_error_words(handler: str, exc: BaseException | str) -> str:
@@ -759,6 +772,14 @@ class LongFlatStrategy(Strategy):
         # one of sent, trimmed (sent smaller), below_minimum (trimmed under the venue's minimum, not sent), refused.
         self.portfolio_gate: dict[str, int] = {}
         self._reserved: dict[str, Any] = {}  # order id -> its portfolio gate answer, whose reservation it holds
+        self.leg_leverage: float | None = None  # a two-leg Strategy's perp leg: its own leverage cap (_max_leverage)
+        self.pair = None  # a two-leg Strategy's Pair (strategies.pair, P2-8): what spans both of its legs
+        # A leg of a two-leg Strategy, from its own settings (LongFlatConfig.leg): with no Pair it opens nothing (Advisor
+        # M4); a perp leg is margined at its own leverage (Advisor B).
+        self.two_leg = config.leg is not None
+        if self.two_leg and config.market != markets.SPOT:
+            self.leg_leverage = float(config.leg["leverage"])
+        self._worst_px: float | None = None  # a backtest's worst price in the last bar, for the Pair's clamp
         self._paper_gate = None  # paper's portfolio gate (paper.portfolio_gate.PaperGate), made at its first entry
         # Exceptions raised in these handlers, oldest first, as (handler, repr). See _reporting.
         self.handler_errors: list[tuple[str, str]] = []
@@ -809,6 +830,15 @@ class LongFlatStrategy(Strategy):
                                          f"The strategy failed {handler_error_words(name, exc)}. Its "
                                          "orders after this may be wrong.", ts=self.runtime.now())
             except Exception:  # the journal itself failing must not hide the first error
+                pass
+        if name == "on_order_filled" and self.runtime is not None and not self.runtime.backtest:
+            # The Advisor's loud failure (T-FIX8): a fill this Strategy failed to handle leaves its book in doubt, so it
+            # opens nothing more until the PM resumes it: the PM's own pause, with no end time (a daily-loss pause's
+            # 00:00 roll never lifts it). Exits, stops and flattens still go; a halt in force stays.
+            try:
+                if self.runtime.status != "halted":
+                    self.runtime._set("paused", FILL_HANDLER_PAUSE)
+            except Exception:  # the journal failing must not hide the first error
                 pass
 
     def attach_runtime(self, runtime) -> "LongFlatStrategy":
@@ -1089,8 +1119,10 @@ class LongFlatStrategy(Strategy):
         finally:
             if self._pending_exit is None:
                 self._outage_book = None  # a fallback flag the live check didn't use
-        if self._margin and self._guard_breached(self._last_close):
-            self._on_tick()  # leveraged: the guards act on the trade, not on the next 30-second tick
+        if (self._margin or self.pair is not None) and self._guard_breached(self._last_close):
+            # Leveraged, or a leg of a two-leg Strategy (Advisor M5): the guards act on the trade, not on the next
+            # 30-second tick.
+            self._on_tick()
             return
         self._maybe_tick()
         self._publish_signals()
@@ -1108,7 +1140,7 @@ class LongFlatStrategy(Strategy):
         if not self._backtest and self._resting_openers():
             self._cancel_resting_entries()  # P1-SG15: as on a trade (on_trade); a quote can fill a resting order too
         if self.runtime is not None:
-            fresh = self.runtime.on_quote(bid, ask, venue=str(self._cfg.instrument_id.venue))
+            fresh = self.runtime.on_quote(bid, ask, venue=base_venue(str(self._cfg.instrument_id.venue)))
             if fresh is not None:  # the hour's spread measurements, reloaded (SPREAD-PIT)
                 self.spread_series = fresh
         if self._restore is not None:
@@ -1450,7 +1482,7 @@ class LongFlatStrategy(Strategy):
         side, entry = self._entry_side or 1, self._entry_px
         liq = None
         if self._margin:
-            lev = self.runtime.profile.max_leverage
+            lev = LongFlatStrategy._max_leverage(self)
             liq = markets.isolated_liquidation(cash, qty, entry, lev, self._cfg.perp.maintenance_margin)
         target = liq if liq is not None else 0.0
         if side * (mark - target) <= 0:
@@ -1548,13 +1580,20 @@ class LongFlatStrategy(Strategy):
         adds, never a start, and refuses rather than trims (Independent Quant Advisor). Paper gates on the account's
         book, counting this strategy's own position still held; a backtest only counts the entries it would have
         refused, against its own equity. A position whose stop the price has gone through counts as stopless and
-        alerts (QA P1-S9)."""
+        alerts (QA P1-S9). A two-leg Strategy's first leg adds what its entry opens on the second leg, in full: no
+        hedge credit (Advisor M6); a backtest judges it against both legs' equity summed."""
         stop = close * (1 - side * self._stop_frac) if self._stop_frac else None
+        pair = getattr(self, "pair", None)
+        follow = pair.follower_entry(Decimal(repr(qty)), close) if pair is not None and pair.lead is self else None
         if self._backtest:
-            atr = self._daily_atr.get((ts_ns - 1) // DAY_NS * DAY_NS)
+            day = (ts_ns - 1) // DAY_NS * DAY_NS
+            atr = self._daily_atr.get(day)
             try:
                 risk = (open_risk.position_risk(side * qty, close, stop, atr)
                         + open_risk.position_risk(held_qty, close, held_stop, atr))
+                if follow is not None:
+                    risk += open_risk.position_risk(*follow, pair.follow._daily_atr.get(day))
+                    equity += pair.other_book(self, close)[0]
             except ValueError:
                 return None
             if equity > 0:
@@ -1578,6 +1617,9 @@ class LongFlatStrategy(Strategy):
             mine_atr = atr(store.sleeve(name)) if needs_atr else None
             mine = (open_risk.position_risk(side * qty, close, stop, mine_atr)
                     + open_risk.position_risk(held_qty, close, None if name in through else held_stop, mine_atr))
+            if follow is not None:  # the second leg's row is in the book and its held risk in `others` already
+                leg = pair.follow.runtime.name
+                mine += open_risk.position_risk(*follow, atr(store.sleeve(leg)) if follow[2] is None else None)
         except ValueError as exc:
             return f"its open risk can't be measured: {exc}"
         if through:
@@ -2088,7 +2130,7 @@ class LongFlatStrategy(Strategy):
             return
         fee = Decimal(str(self._cfg.assumed_taker_fee))
         room = Decimal(1) - Decimal(str(self._cfg.cash_buffer)) - fee
-        lev = self.runtime.profile.max_leverage if self.runtime is not None else 1.0
+        lev = LongFlatStrategy._max_leverage(self)
         limits = {f"{lev:g}x leverage cap": Decimal(str(equity * lev)) * room}
         if self.runtime is not None:
             limits[f"{self.runtime.profile.name} risk profile cap"] = Decimal(str(self.runtime.position_budget(equity)))
@@ -2150,6 +2192,8 @@ class LongFlatStrategy(Strategy):
             self._deciding = self._deciding_bar = self._lag = None
         if self._waiting is not None and not self._still_missing():
             self._decide_waiting()  # every minute missing before it has landed: decide on it now, in order
+        if self.pair is not None and str(bar.bar_type) == str(self._cfg.bar_type).split("@")[0]:
+            self.pair.bar_closed(self, bar)  # a two-leg Strategy's hedge is measured at each decision close
 
     def _hold_for_missing(self, bar: Bar) -> bool:
         """Paper, hub-fed 1-minute bars (QA P1-L14, L15). A minute after missing ones that the hub client released
@@ -2455,10 +2499,11 @@ class LongFlatStrategy(Strategy):
                 d = self.runtime.profile.min_liquidation_distance
                 venue["liquidation"] = liq
                 guards["liquidation_cut"] = liq / (1 - d) if side > 0 else liq / (1 + d)
-            if qty and self.runtime.halts:
-                p, day_open = self.runtime.profile, self.runtime._day_open or equity
-                guards["risk_halt"] = (max(self.runtime.peak, equity) * (1 - p.max_drawdown) - cash) / qty
-                guards["risk_pause"] = (day_open * (1 - p.daily_loss) - cash) / qty
+            g_equity, g_cash, g_qty = self._guard_book(equity, cash, qty, self._price())
+            if qty and g_qty and self.runtime.halts:
+                p, day_open = self.runtime.profile, self.runtime._day_open or g_equity
+                guards["risk_halt"] = (max(self.runtime.peak, g_equity) * (1 - p.max_drawdown) - g_cash) / g_qty
+                guards["risk_pause"] = (day_open * (1 - p.daily_loss) - g_cash) / g_qty
                 guards = {k: v for k, v in guards.items() if v > 0}
         after = self._replayed_to if since is None else since  # since: a late minute, older than those replayed
         rows = sorted((int(b.ts_event), b.open.as_double(), b.high.as_double(), b.low.as_double())
@@ -2514,7 +2559,7 @@ class LongFlatStrategy(Strategy):
             elif intent == "liquidation":
                 self._liquidation_guard(cash, qty, px)
             else:  # the risk guard: the tick judges the equity at the minute's worst price, as it would have
-                self._guard_equity = cash + qty * worst
+                self._guard_equity = self._replayed_guard_equity(cash, qty, worst)
                 self._guard_price = px if intent == "liquidation_cut" else None
                 self._on_tick()
         finally:
@@ -3072,29 +3117,29 @@ class LongFlatStrategy(Strategy):
         self._portfolio = (batch, name)
         return self
 
-    def _send_entry(self, side, qty: Decimal, reason: str, signal: dict, what: str = "entry", sent=None) -> None:
+    def _send_entry(self, side, qty: Decimal, reason: str, signal: dict, what: str = "entry", sent=None,
+                    gated=None) -> None:
         """Send an opening order (`what`: an entry, or a rebalance that adds), or in a portfolio run post it to the
         run's gate pass at now + 1 ns (research.portfolio.CloseBatch) and send only what that approves, never more
         than was sized here, then call sent(trimmed). Exits and reductions never wait for it. On paper with the
         portfolio gate in force (Store.portfolio_gate) the same check runs at once over the journal (P2-1b W2), and
-        the order's journal row holds the reservation, so its fills and end settle it (Store._settle_reservation)."""
+        the order's journal row holds the reservation, so its fills and end settle it (Store._settle_reservation).
+        A two-leg Strategy's entry opens both legs through its Pair (strategies.pair), which sends each leg's own,
+        checked for both legs at once on paper (`gated`: this leg's answer from PaperGate.pair, Advisor M1)."""
+        if self.pair is not None and self.pair.sending is not self:
+            self.pair.entry(self, side, qty, reason, signal, what, sent)
+            return
+        if self.pair is None and self.two_leg:
+            self._note("two_leg_no_pair", "Entry refused: this leg's two-leg Strategy has no coordinator, so neither "
+                                          "leg opens anything new; exits still run")
+            return
         paper = self._paper_gated()
         if self._portfolio is None and paper is None:
             self._submit(side, qty, what, reason, signal)
             return
-        from sleeve_fund.research.portfolio import Pending, fill_price
+        from sleeve_fund.research.portfolio import Pending
 
-        if self._deciding_bar is not None:
-            signal = {**signal, "bar": self._deciding_bar}  # the gate pass runs after this bar's decision has ended
-        s, close = 1 if side == OrderSide.BUY else -1, Decimal(repr(float(signal["close"])))
-        # What the gate's Intent needs (research.portfolio.gate_intent): the expected fill, not the raw close; the
-        # leverage (None on spot); and, with no stop, the daily ATR the stopless measure takes.
-        intent = {"side": s, "qty": qty, "close": close, "price": fill_price(close, s, self._half_spread()),
-                  "stop_frac": self._stop_frac, "what": what, "step": self._lot(), "min_qty": self._min_qty(),
-                  "instrument": self._base_code(),
-                  "leverage": (self.runtime.profile.max_leverage if self.runtime is not None else 1.0)
-                  if self._margin else None,
-                  "atr_pct": None if self._stop_frac else self._entry_atr_pct()}
+        signal, intent = self._gate_intent(side, qty, signal, what)
 
         def count(outcome: str) -> None:
             key = f"{what}_{outcome}"
@@ -3123,6 +3168,9 @@ class LongFlatStrategy(Strategy):
             if sent is not None:
                 sent(trimmed)
 
+        if gated is not None:  # a two-leg entry, checked for both legs at once (strategies.pair)
+            send(intent, gated)
+            return
         if paper is not None and intent["atr_pct"] is None and not self._stop_frac:
             # No stop and no daily ATR (a pair with under 14 whole days of history): the entry's risk can't be
             # measured, so it is refused here as the interim open-risk check refuses it (QA P1-S3), a warning while it
@@ -3147,6 +3195,23 @@ class LongFlatStrategy(Strategy):
         bar = {"bar": self._deciding[0] if self._deciding else None}  # as paper's gate gets it: parity keys on it
         batch.post(self.clock, self.clock.timestamp_ns(),
                    Pending(name, {**intent, **bar}, send, lambda i, d: count("refused")))
+
+    def _gate_intent(self, side, qty: Decimal, signal: dict, what: str) -> tuple[dict, dict]:
+        """(the signal with its decision bar, the intent the portfolio gate reads) for an opening order."""
+        from sleeve_fund.research.portfolio import fill_price
+
+        if self._deciding_bar is not None:
+            signal = {**signal, "bar": self._deciding_bar}  # the gate pass runs after this bar's decision has ended
+        s, close = 1 if side == OrderSide.BUY else -1, Decimal(repr(float(signal["close"])))
+        # What the gate's Intent needs (research.portfolio.gate_intent): the expected fill, not the raw close; the
+        # leverage (None on spot); and, with no stop, the daily ATR the stopless measure takes.
+        intent = {"side": s, "qty": qty, "close": close, "price": fill_price(close, s, self._half_spread()),
+                  "stop_frac": self._stop_frac, "what": what, "step": self._lot(), "min_qty": self._min_qty(),
+                  "instrument": self._base_code(), "opens": self._position_qty() < self._min_qty(),
+                  "leverage": LongFlatStrategy._max_leverage(self)
+                  if self._margin else None,
+                  "atr_pct": None if self._stop_frac else self._entry_atr_pct()}
+        return signal, intent
 
     def _resting_entry_terms(self):
         """ORPHAN-GUARD og1 for a resting entry on paper: good-till-date to its decision bar's next close, clamped past
@@ -3214,7 +3279,7 @@ class LongFlatStrategy(Strategy):
             return Decimal(repr(float(equity))), None
         stop = (self._entry_px * (1 - (self._entry_side or 1) * self._stop_frac)
                 if self._entry_px and self._stop_frac is not None else None)
-        lev = (self.runtime.profile.max_leverage if self.runtime is not None else 1.0) if self._margin else None
+        lev = LongFlatStrategy._max_leverage(self) if self._margin else None
         pos = Position(name, underlying(self._base_code()), Decimal(repr(float(qty))),
                        None if stop is None else Decimal(repr(float(stop))), lev)
         return Decimal(repr(float(equity))), holding_for(pos, Decimal(repr(float(close))), atr_pct)
@@ -3316,7 +3381,8 @@ class LongFlatStrategy(Strategy):
             self.runtime.on_order(order_id=coid, side="BUY" if side == OrderSide.BUY else "SELL",
                                   qty=float(qty), intent=intent, reason=reason, signal=signal,
                                   order_type="POST-ONLY LIMIT" if maker else "MARKET", timing=timing,
-                                  **({"reservation": reservation} if reservation is not None else {}))
+                                  **({"reservation": reservation} if reservation is not None else {}),
+                                  **self._pair_trade())
         if maker and self.simulated_venue:
             self._kept[coid] = {"order": order, "info": self.decisions[coid], "bar": None, "earned": 0.0,
                                 "sent": Decimal(0), "inflight": 0}
@@ -3334,6 +3400,38 @@ class LongFlatStrategy(Strategy):
                                       callback=self._maker_timeout)
         self._last_submitted = coid
         return True
+
+    def _max_leverage(self) -> float:
+        """The leverage cap this strategy's sizing, isolated margin and liquidation price use: its risk profile's, or a
+        two-leg Strategy's perp leg's own, never above 2x or the profile's (P2-8, Advisor B; leg_leverage)."""
+        profile = self.runtime.profile.max_leverage if self.runtime is not None else 1.0
+        leg = getattr(self, "leg_leverage", None)  # called on a test's stand-in strategy too, which has none
+        if leg is not None:  # effective: min(the leg's setting, 2x, the profile's cap) (Advisor 05:35 UK)
+            return min(leg, 2.0, profile)
+        return profile
+
+    def _guard_book(self, equity: float, cash: float, qty: float, price: float) -> tuple[float, float | None, float | None]:
+        """(equity, cash, qty) as the drawdown halt and the daily-loss pause judge them: this strategy's own, or a
+        two-leg Strategy's both legs summed (Advisor 13 Oct 23:55 UK, E), the other leg marked at `price` when both
+        trade one price feed. On legs with prices of their own there is no one price level: cash and qty are None,
+        and only the summed equity is judged."""
+        if self.pair is None:
+            return equity, cash, qty
+        o_equity, o_cash, o_qty = self.pair.other_book(self, price)
+        if not self.pair.same_prices:
+            return equity + o_equity, None, None
+        return equity + o_equity, cash + o_cash, qty + o_qty
+
+    def _replayed_guard_equity(self, cash: float, qty: float, worst: float) -> float:
+        """The equity an outage replay's risk guard is judged by, at the minute's worst price: this strategy's own, or a
+        two-leg Strategy's both legs summed through _guard_book, as the live tick judges it (CR F283-5). One leg alone
+        against the summed peak would read a hedged pair as half lost."""
+        own = cash + qty * worst
+        return own if self.pair is None else self._guard_book(own, cash, qty, worst)[0]
+
+    def _pair_trade(self) -> dict:
+        """A two-leg Strategy's open trade id, journaled on every order of the trade on both legs (P2-8), or nothing."""
+        return {"parent_trade_id": self.pair.trade_id} if self.pair is not None and self.pair.trade_id else {}
 
     def _unsettled(self) -> bool:
         """Whether a decision now comes before the warm-up the model's indicators need (settle_bars_needed): today's
@@ -3543,7 +3641,10 @@ class LongFlatStrategy(Strategy):
     def _liq(self, cash: float, qty: float) -> float | None:
         """The open position's liquidation price on isolated margin at the risk profile's leverage cap, the
         same margin the sizing, the dashboard and the demo copy use (markets.isolated_margin): the one set when
-        it was entered (_set_liq), else worked out from its own average entry."""
+        it was entered (_set_liq), else worked out from its own average entry. None on spot: nothing liquidates it
+        (a two-leg Strategy's spot leg runs the guards on every trade and fill too, HoQA P2-8)."""
+        if self._cfg.perp is None:
+            return None
         if qty and self._liq_px is not None:
             return self._liq_px
         return self._liq_from_entry(cash, qty)
@@ -3621,8 +3722,10 @@ class LongFlatStrategy(Strategy):
 
     def _liq_from_entry(self, cash: float, qty: float) -> float | None:
         """From the position's average entry as the strategy (and the journal) keep it, never the simulated
-        venue's, which after a restart is the restore's price (QA P1-L22)."""
-        lev = self.runtime.profile.max_leverage if self.runtime is not None else 1.0
+        venue's, which after a restart is the restore's price (QA P1-L22). None on spot."""
+        if self._cfg.perp is None:
+            return None
+        lev = LongFlatStrategy._max_leverage(self)
         entry = self._entry_px if self._entry_px else self._net_position()[1]
         return markets.isolated_liquidation(cash, qty, entry, lev, self._cfg.perp.maintenance_margin)
 
@@ -3735,6 +3838,13 @@ class LongFlatStrategy(Strategy):
         return self._position_qty() >= self._min_qty()
 
     def _sell_all(self, intent: str = "exit", reason: str = "Signal to be flat", values: dict | None = None) -> None:
+        if (self._pending_exit is not None and self._pending_exit[0] == "liquidation"
+                and intent != "liquidation"):
+            # A liquidation waiting for its working orders' cancels outranks any later close (a halt's flatten, the
+            # pair's unwind, a PM close): it is never re-labelled as a plain close (F283-P1, GAP-LIQ on every path).
+            return
+        if self.pair is not None:  # a two-leg Strategy's other leg closes with this one (strategies.pair)
+            self.pair.leg_closing(self, intent, reason)
         self._drop_kept(earn=self._pending_exit is None)
         working = self._working()
         if working:
@@ -3757,7 +3867,10 @@ class LongFlatStrategy(Strategy):
             return
         # A short is closed by buying it back.
         side = OrderSide.BUY if self._margin and self._pos_side() < 0 else OrderSide.SELL
-        self._submit(side, qty, intent, reason, dict(values or {}))
+        values = dict(values or {})
+        if self._margin and "liquidation_px" not in values:
+            values.update(self._liq_signal())  # GAP-LIQ judges its fill against it (F283-P1, _gap_liquidation)
+        self._submit(side, qty, intent, reason, values)
 
     # --- perpetuals: restore, funding, liquidation and intrabar guards ---------------
 
@@ -4446,6 +4559,9 @@ class LongFlatStrategy(Strategy):
         if qty == 0 or equity <= 0 or price <= 0:
             return None
         p, side = rt.profile, (1 if qty > 0 else -1)
+        # The halt and the pause judge a two-leg Strategy's both legs summed (Advisor E): their level is where the
+        # pair's book reaches them, rested here only when it lies on this leg's losing side; else the tick finds it.
+        equity, g_cash, g_qty = self._guard_book(equity, cash, qty, price)
         peak = max(rt.peak, equity)
         day_open = rt._day_open or equity
         # The next bar opens a new UTC day: the day then opens at this equity (SleeveRuntime.tick).
@@ -4453,8 +4569,8 @@ class LongFlatStrategy(Strategy):
         now = self.clock.utc_now()
         if risk.trading_day(now + step) != risk.trading_day(now):
             day_open = equity
-        levels = [((peak * (1 - p.max_drawdown) - cash) / qty, "risk_halt"),
-                  ((day_open * (1 - p.daily_loss) - cash) / qty, "risk_pause")] if rt.halts else []
+        levels = [((peak * (1 - p.max_drawdown) - g_cash) / g_qty, "risk_halt"),
+                  ((day_open * (1 - p.daily_loss) - g_cash) / g_qty, "risk_pause")] if rt.halts and g_qty else []
         liq = self._liq_now(cash, qty)
         if liq is not None:
             d = p.min_liquidation_distance
@@ -4543,7 +4659,8 @@ class LongFlatStrategy(Strategy):
                                 if self.pessimistic else "")))
         intent = d["intent"]
         self.runtime.on_order(order_id=str(order.client_order_id), side=word.upper(), qty=float(order.quantity),
-                              intent=intent, reason=d["reason"], signal=d["signal"], order_type="STOP")
+                              intent=intent, reason=d["reason"], signal=d["signal"], order_type="STOP",
+                              **self._pair_trade())
 
     def _risk_stop_filled(self, done: bool, sign: int, price: float) -> None:
         """The risk stop traded: the guard acts as paper's would on that trade. A halt or pause is the
@@ -4574,27 +4691,44 @@ class LongFlatStrategy(Strategy):
         liq = self._liq_now(cash, qty) if qty else None
         return {"liquidation_px": round(liq, 8)} if liq is not None else {}
 
+    def _flush_rebook(self, coid: str, at: datetime | None) -> None:
+        """Re-book the order _gap_liquidation relabelled, once its fill is in the journal. Taken before the call
+        (T-FIX7): a journal that refuses it raises once, for this fill, and never again on the leg's later fills."""
+        rebook, self._rebook = self._rebook, None
+        if rebook is not None:
+            d = self.decisions[coid]
+            self.runtime.store.rebook_liquidation(rebook, d["reason"], d["signal"], ts=at or self.runtime.now())
+
     def _gap_liquidation(self, coid: str, journal_id: str, price: float) -> bool:
         """GAP-LIQ (Independent Quant Advisor, 6 Oct): a stop whose fill, after slippage, is at or past the
-        liquidation price books as a liquidation, the venue having taken the position first. Its order is journaled
+        liquidation price books as a liquidation, the venue having taken the position first; since 14 Oct 15:00 UK
+        (F283-P1) any closing fill does, a halt's flatten, the pair's unwind or a PM close alike. Its order is journaled
         as one, with the liquidation event and an incident, so the D3 loss, the halt with X and Y, and the reset after
         liquidation follow as for any liquidation. The liquidation price is the one the engine's own check had when
         the stop fired (paper) or as of the bar it rested through (backtest); through_liquidation decides both."""
         d = self.decisions.get(coid)
         held = self._entry_side or 0
-        if d is None or d.get("intent") != "stop_loss" or not held:
+        intent = d.get("intent") if d is not None else None
+        if intent is None or intent in OPENING_INTENTS or intent == "liquidation" or not held:
             return False
         liq = (d.get("signal") or {}).get("liquidation_px")
         if not through_liquidation(held, price, liq):
             return False
-        reason = (f"Liquidated: the stop filled at {price:,.6g}, at or past the liquidation price {liq:,.6g}, so the "
-                  "venue took the position first")
-        # The flag says a stop fired and filled past liquidation, so the screens never parse the reason (FE, HoE OK
-        # 7 Oct 18:54 UK): the stop's level and its raw fill, before the liquidation's booking.
-        stop_px = d["signal"].get("stop_px", d["signal"].get("trigger"))
+        if intent == "stop_loss":
+            reason = (f"Liquidated: the stop filled at {price:,.6g}, at or past the liquidation price {liq:,.6g}, so "
+                      "the venue took the position first")
+            # The flag says a stop fired and filled past liquidation, so the screens never parse the reason (FE, HoE
+            # OK 7 Oct 18:54 UK): the stop's level and its raw fill, before the liquidation's booking.
+            stop_px = d["signal"].get("stop_px", d["signal"].get("trigger"))
+            extra = {"stop_relabelled": True, "stop_px": stop_px, "stop_fill_px": round(price, 8)}
+        else:
+            # F283-P1 (Advisor 14 Oct 15:00 UK): GAP-LIQ on every exit path, a halt's flatten, the pair's unwind or a
+            # PM close alike; the close it was is kept on the order (`relabelled_from`).
+            reason = (f"Liquidated: the {intent.replace('_', ' ')} close filled at {price:,.6g}, at or past the "
+                      f"liquidation price {liq:,.6g}, so the venue took the position first")
+            extra = {"relabelled_from": intent, "fill_px": round(price, 8)}
         d.update(intent="liquidation", reason=reason, signal={**d["signal"], "price": price, "market_px": round(price, 8),
-                                                               "stop_relabelled": True, "stop_px": stop_px,
-                                                               "stop_fill_px": round(price, 8)})
+                                                               **extra})
         self._rebook = journal_id  # the journal re-books it once this fill is in (on_order_filled)
         self._liquidation_events(reason, price, liq)
         self._on_liquidation(price, liq, reason)  # a gapped stop is a liquidation like any other (QA P1-L22 pins)
@@ -4620,7 +4754,7 @@ class LongFlatStrategy(Strategy):
         the market's price px with the fee charged on that: the difference goes to cash beside it (_cash_adj), never
         as P&L. How far the market went past bankruptcy (the venue's insurance fund's) or stopped short of it (margin
         the venue kept) is journaled once the position is gone (_liquidation_diagnostic). Returns (price, fee)."""
-        lev = self.runtime.profile.max_leverage if self.runtime is not None else 1.0
+        lev = LongFlatStrategy._max_leverage(self)
         held = -sign
         bankrupt = markets.bankruptcy_price(held * qty, entry, lev)
         if self._liq_funded:
@@ -4730,7 +4864,7 @@ class LongFlatStrategy(Strategy):
         (liquidated): X, Y% of strategy equity at entry", X the position's isolated margin plus its entry and
         liquidation fees (18:17 point 4), Y its share of the strategy's equity when the position was opened, uncapped,
         to one decimal under 10% so a small loss never reads 0% (QA P1-D17, P1-D20)."""
-        lev = self.runtime.profile.max_leverage if self.runtime is not None else 1.0
+        lev = LongFlatStrategy._max_leverage(self)
         lost = markets.isolated_margin(qty, entry, lev) + fees
         if before is None:
             before = (self.runtime._last_equity or self.runtime.peak) if self.runtime is not None else 0.0
@@ -4811,11 +4945,14 @@ class LongFlatStrategy(Strategy):
         equity, cash, qty, _ = self._mark()
         if equity <= 0:
             return True
-        day_open = self.runtime._day_open or equity
-        if risk.check(self.runtime.profile, equity, max(self.runtime.peak, equity), day_open,
+        judged = self._guard_book(equity, cash, qty, price)[0]  # a two-leg Strategy: both legs summed (Advisor E)
+        day_open = self.runtime._day_open or judged
+        if risk.check(self.runtime.profile, judged, max(self.runtime.peak, judged), day_open,
                       self.runtime.halts) is not None:
             return True
         liq = self._liq_now(cash, qty)
+        if self.pair is not None and self.pair.distance_breached(self, price, liq):
+            return True  # a two-leg Strategy's perp leg past half its entry distance (Advisor B)
         return liq is not None and abs(price - liq) / price < self.runtime.profile.min_liquidation_distance
 
     def _intrabar_guard(self, bar: Bar) -> None:
@@ -4827,8 +4964,17 @@ class LongFlatStrategy(Strategy):
             self._guard_equity = None
             return
         worst = bar.low.as_double() if qty > 0 else bar.high.as_double()
+        self._worst_px = worst  # a two-leg Strategy's liquidation-distance check reads it at the tick (Pair)
         _, cash, _, _ = self._mark()
         self._guard_equity = cash + qty * worst
+        if self.pair is not None:
+            # A two-leg Strategy's guard judges both legs summed (Advisor E), at the minute's price worst for their net.
+            g_equity, g_cash, g_qty = self._guard_book(self._guard_equity, cash, qty, worst)
+            if g_qty is None:  # legs on different prices: this leg at its worst, the other at its last
+                self._guard_equity = g_equity
+            else:
+                at = bar.low.as_double() if g_qty > 0 else bar.high.as_double() if g_qty < 0 else bar.close.as_double()
+                self._guard_equity = g_cash + g_qty * at
         liq = self._liq_now(cash, qty)
         if liq is not None and (worst <= liq if qty > 0 else worst >= liq):
             self._guard_price = worst
@@ -4937,6 +5083,9 @@ class LongFlatStrategy(Strategy):
             # against the journal until it is, but the strategy is alive.
             self.runtime.store.heartbeat(self.runtime.name, self.runtime.now())
             return
+        pair = getattr(self, "pair", None)
+        if pair is not None and not pair.recovered:  # a two-leg Strategy's trade left open by a restart (P2-8, M3)
+            pair.ready()
         try:
             if self._margin:
                 self._apply_funding(self._price())
@@ -4997,16 +5146,26 @@ class LongFlatStrategy(Strategy):
                 cash = 0.0 if ruined else cash
             elif kept and (self.runtime.status != "halted" or self.runtime.liquidated is None):
                 wiped = self._wiped_out_why()
+            if self.pair is not None:
+                # F283-P1: the other leg's own liquidation check before this mark's summed halts act on the pair.
+                self.pair.liquidation_first(self, worst or price)
             liquidating = any(self.decisions.get(str(o.client_order_id), {}).get("intent") == "liquidation"
                               for o in self._working())
+            other = self.pair.other_book(self, price)[0] if self.pair is not None else 0.0
             if self.runtime.tick(equity=equity, cash=cash, qty=qty, price=price, guard_equity=guard,
-                                 busy=bool(self._working()), ruined=wiped, liquidating=liquidating) == "flatten":
+                                 busy=bool(self._working()), ruined=wiped, liquidating=liquidating,
+                                 other_equity=other) == "flatten":
                 self.cancel_all_orders(self._cfg.instrument_id)
                 self._flip = None
                 intent, reason = self.runtime.flatten_why or ("pm_flatten", "Flattened")
                 self._sell_all(intent, reason, {"equity": equity, "peak": self.runtime.peak})
             elif self._margin:
                 self._liquidation_guard(cash, qty, worst or price)
+                if self.pair is not None and qty != 0 and self._pending_exit is None:
+                    # Ruling B: a two-leg Strategy's perp leg nearer its liquidation price than half its entry
+                    # distance closes the pair; a backtest judges the minute's worst price, as the guards do.
+                    self.pair.check_distance(self, self._worst_px or price, self._liq_now(cash, qty))
+            self._worst_px = None
             self._cancel_resting_entries()
             self._sync_watched_stop()
         except Exception as exc:  # never let bookkeeping kill the sleeve silently: counted, kept and journaled
@@ -5154,13 +5313,16 @@ class LongFlatStrategy(Strategy):
         self._resize_if_due()
 
     def _resume_exit(self, coid: str) -> None:
-        """An order closed: if a sell was waiting for every working order to close, send it now."""
+        """An order closed: if a sell was waiting for every working order to close, send it now. A two-leg
+        Strategy's Pair hears of every order that closes (strategies.pair)."""
         self._release_reservation(coid)
         self._cancel_on_accept.discard(coid)
         if self._pending_exit is not None and not self._working():
             intent, reason, values = self._pending_exit
             self._pending_exit = None
             self._sell_all(intent, reason, values)
+        if getattr(self, "pair", None) is not None:  # a test's stand-in strategy has none
+            self.pair.order_closed(self, coid)
 
     def on_order_rejected(self, event) -> None:
         self._order_status(event, "rejected")
@@ -5409,10 +5571,7 @@ class LongFlatStrategy(Strategy):
             self.runtime.on_fill(side="BUY" if event.is_buy else "SELL", qty=qty, price=px, fee=fee,
                                  order_id=journal_id, trade_id=str(event.trade_id), ts=at)
             self.runtime.on_timing(journal_id, fill=int(event.ts_init), venue_ts=int(event.ts_event))
-            if self._rebook is not None:
-                d = self.decisions[coid]
-                self.runtime.store.rebook_liquidation(self._rebook, d["reason"], d["signal"], ts=at or self.runtime.now())
-                self._rebook = None
+            self._flush_rebook(coid, at)
         if self._margin and opening and intrabar is not None and coid != self._restore_id:
             self._opened_in_bar.append((intrabar, sign * qty))  # charged with the bar's range in on_bar
         if self._margin and self._entry_side == 0:
@@ -5444,6 +5603,8 @@ class LongFlatStrategy(Strategy):
                 side, bar, reason, values = self._flip
                 self._flip = None
                 self._open(side, bar, reason, values)
+        if getattr(self, "pair", None) is not None and not self._backtest:
+            self.pair.on_mark(self, px)  # Advisor M5: a two-leg Strategy's guards run on every fill of either leg
 
     def _track_entry(self, sign: int, filled: Decimal, qty: float, px: float) -> bool:
         """Perp: the entry book after a fill, read from the venue's position (already updated when the fill
@@ -5531,7 +5692,8 @@ class LongFlatStrategy(Strategy):
             self.decisions[str(order.client_order_id)] = {"intent": intent, "reason": reason, "signal": signal}
             if self.runtime is not None:
                 self.runtime.on_order(order_id=str(order.client_order_id), side="SELL" if side > 0 else "BUY",
-                                      qty=float(qty), intent=intent, reason=reason, signal=signal, order_type=kind)
+                                      qty=float(qty), intent=intent, reason=reason, signal=signal, order_type=kind,
+                                      **self._pair_trade())
         for order, *_ in orders:
             self._open_target(str(order.client_order_id))
             self._sent.append(order.client_order_id)

@@ -125,15 +125,58 @@ def test_parity_passes_when_the_backtest_decides_as_paper_did_and_is_fed_what_pa
     out = capfd.readouterr().out
     assert "decisions: paper 1, backtest 1, matched 1, mismatched 0" in out and "B7 replay parity: PASS" in out
     spec = fed["spec"]
-    # From paper's first decided bar to the flatten's minute; the warm-up before it; the Strategy's own cash and risk
-    # profile; the rest of the fund's equity as unallocated cash.
-    assert spec.prices.index[0] == pd.Timestamp(BAR) and spec.prices.index[-1] == pd.Timestamp(BAR + timedelta(minutes=1))
+    # From paper's first decided bar to one bar past the flatten's minute (the backtest decides a bar on the next
+    # one); the warm-up before it; the Strategy's own cash and risk profile; the rest of the fund's equity as
+    # unallocated cash.
+    assert spec.prices.index[0] == pd.Timestamp(BAR)
+    assert spec.prices.index[-1] == pd.Timestamp(BAR + timedelta(minutes=2))
     assert spec.warmup_prices.index[-1] < pd.Timestamp(BAR)
     assert spec.prices.index[0] - spec.warmup_prices.index[0] >= pd.Timedelta(days=14)
     assert (spec.capital, fed["unallocated"], spec.risk_profile) == (10_000.0, 40_000.0, "balanced")
     assert (spec.bar_minutes, spec.exec_minutes, spec.fees) == (1, 1, FEES)
     drift = next(x for x in out.splitlines() if x.startswith("fill drift"))
     assert "1 opening fill(s)" in drift and "trigger not met" in drift
+
+
+def test_parity_replays_a_round_trip_inside_one_minute_one_bar_past_it(capfd):
+    """B7 on cd4e589 (14 Oct 16:56 UTC): entry and flatten in one minute, so `until` truncates to the entry's own bar.
+    The replay still runs to the next bar, as the backtest decides a bar only once a later one arrives."""
+    store = _journal()
+    fed = {}
+
+    def run(specs, unallocated):
+        fed.update(spec=specs[0])
+        return SimpleNamespace(decisions=[_decided(), _decided(bar=BAR + timedelta(minutes=1))])
+
+    until = BAR + timedelta(seconds=9)
+    assert b7.parity(store, NAME, T0, until, history=HISTORY, instrument=INST, run=run) == 0
+    out = capfd.readouterr().out
+    # The next bar's decision is outside [start, end]: neither compared nor failed.
+    assert "decisions: paper 1, backtest 1, matched 1, mismatched 0" in out and "(run to 09:02)" in out
+    assert fed["spec"].prices.index[-1] == pd.Timestamp(BAR + timedelta(minutes=1))
+
+
+def test_the_real_portfolio_backtest_decides_nothing_on_a_window_of_one_bar():
+    """Why the replay runs one bar past: the gate pass for a bar runs at its close + BATCH_DELAY_NS, which the engine
+    never reaches when that bar is its last."""
+    store = _journal()
+    one, why = b7.replay(store, store.sleeve(NAME), BAR, BAR, D(10_000), D(50_000), HISTORY, INST)
+    assert why is None and one.decisions == []
+    two, _ = b7.replay(store, store.sleeve(NAME), BAR, BAR + timedelta(minutes=1), D(10_000), D(50_000), HISTORY, INST)
+    assert [d["bar_ts"] for d in two.decisions] == [BAR]
+
+
+def test_parity_waits_for_the_bar_after_the_last_decided_one_then_asks_for_a_re_run(capfd, monkeypatch):
+    slept = []
+    monkeypatch.setattr(b7.time, "sleep", slept.append)
+    clock = iter(range(0, 1000, 10))
+    monkeypatch.setattr(b7.time, "monotonic", lambda: next(clock))
+    history = _History(BAR - timedelta(days=16), BAR)  # the bar closing at 09:02 hasn't reached the store
+    assert b7.parity(_journal(), NAME, T0, BAR + timedelta(seconds=9), history=history, instrument=INST,
+                     run=lambda *a, **k: pytest.fail("ran"), wait=60.0) == 1
+    out = capfd.readouterr().out
+    assert "no 1-minute bar closing at 09:02:00 UTC yet" in out and "re-run B7 alone (check=replay)" in out
+    assert slept and set(slept) == {15}
 
 
 @pytest.mark.parametrize("backtest,what", [
@@ -159,6 +202,21 @@ def test_parity_lists_an_entry_sent_outside_a_bar_decision_without_comparing_it(
     assert "decisions: paper 1, backtest 1, matched 1" in out
     assert "not decided on a bar (listed, not compared): 09:02:30 approved 0.01" in out
     assert "2 opening fill(s)" in out
+
+
+def test_parity_lists_a_strategy_outside_the_fund_s_book_without_comparing_it(capfd, monkeypatch):
+    # F277-QA1: a test-account Strategy outside the book (F229-6) reaches compare() as `outside`, so a backtest that
+    # decided differently is listed apart, not failed.
+    import sleeve_fund.supervisor as supervisor
+
+    monkeypatch.setattr(supervisor, "outside_fund_book", lambda store, s: s.name == NAME)
+    run = _backtest(_decided(requested=D("0.150"), approved=D("0.150")))
+    assert b7.parity(_journal(), NAME, T0, history=HISTORY, instrument=INST, run=run) == 0
+    out = capfd.readouterr().out
+    assert "decisions: paper 0, backtest 0, matched 0" in out
+    assert "outside the fund's book (listed, not compared): paper 1, backtest 1" in out
+    monkeypatch.setattr(supervisor, "outside_fund_book", lambda store, s: False)  # in the book: the same run fails
+    assert b7.parity(_journal(), NAME, T0, history=HISTORY, instrument=INST, run=run) == 1
 
 
 @pytest.mark.parametrize("case,why", [

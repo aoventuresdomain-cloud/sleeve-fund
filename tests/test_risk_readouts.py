@@ -287,3 +287,52 @@ def test_a_spot_only_account_gets_no_headroom_line(client):
         assert 'paper: <span class="loss">over the 5% limit by 100.00</span>' in page, url
     page = c.get("/", auth=AUTH).text
     assert "spot-only:" not in page and "paper: over the 5% limit by 100.00" in page
+
+
+def _put_away(store, name, cash_pnl=0.0):
+    """A flat Strategy archived, then put away by a clean slate: an earlier book's, its capital (and cash_pnl, a
+    closed trade's) still in the fund's book (Advisor C3b, option B)."""
+    _hold(store, name, 0.1, stop_frac=0.02)
+    store.record_fill(name, side="SELL", qty=0.1, price=60_000.0 + cash_pnl * 10, fee=0.0, order_id=f"X-{name}",
+                      trade_id=f"x-{name}")
+    store.record_equity(name, equity=10_000 + cash_pnl, cash=10_000 + cash_pnl, qty=0.0, price=60_000.0,
+                        benchmark=10_000)
+    store.set_desired_state(name, "stopped")
+    store.archive(name)
+
+
+def test_the_headroom_names_the_part_of_the_book_no_strategy_holds(client):
+    """F-C3B-UI (Advisor C3b, option B): the limit's book counts cash a clean slate put away, which no Strategy now
+    trades, so the headroom line says how much of the book that is; with none, it reads as before."""
+    c, store = client
+    _hold(store, "a", 0.1, price=61_000, stop_frac=0.02)  # 220.00
+    _put_away(store, "old", cash_pnl=500.0)
+    assert open_risk.account_unallocated(store, "paper") == 0  # archived in the current book: still allocated
+    for url in ("/", "/risk", "/trades"):
+        assert "of book, of which" not in c.get(url, auth=AUTH).text, url
+    store.decide("PM", "clear", "Clean slate")
+    assert "old" in store.previous_book()
+    assert open_risk.account_unallocated(store, "paper") == pytest.approx(10_500)
+    assert open_risk.account_equity(store, "paper") == pytest.approx(20_500)
+    room = 0.05 * 20_500 - 220
+    for url in ("/", "/risk", "/trades"):
+        assert (f"{room:,.2f} headroom to the 5% limit · 1.1% of book, of which 10,500.00 unallocated"
+                in c.get(url, auth=AUTH).text), url
+    assert "of which" not in c.get("/trades?sleeve=a", auth=AUTH).text  # no headroom on a one-strategy page
+
+
+def test_with_two_accounts_each_line_names_its_own_unallocated_part(client):
+    """F-C3B-UI with RR-1: each account's line is against its own book, so each names its own put-away cash."""
+    c, store = client
+    store.create_account("second", "paper")
+    _hold(store, "a", 0.1, price=61_000, stop_frac=0.02)  # 220.00 on the default account
+    _hold(store, "b", 0.1)  # no stop: 600.00
+    store.assign_account("b", "second")
+    _put_away(store, "old")
+    store.decide("PM", "clear", "Clean slate")
+    assert open_risk.account_unallocated(store, "paper") == pytest.approx(10_000)
+    assert open_risk.account_unallocated(store, "second") == 0
+    for url in ("/risk", "/trades"):
+        page = c.get(url, auth=AUTH).text
+        assert "paper: 780.00 headroom to the 5% limit · 1.1% of book, of which 10,000.00 unallocated" in page, url
+        assert re.search(r"second: [^·]+· 6\.0% of book(?!, of which)", page), url

@@ -3,8 +3,8 @@ every capital move into or out of the fund's book goes through the flow path (po
 transaction as the move, so the book's high-water mark, the halt's reference and the day's start move with it and a
 deposit is never a gain nor a withdrawal a loss. The flows follow what fund_equity counts, so the book and its reference
 always move together: a create (+ its capital) and a move onto or off a test account (F229-6, -/+ its equity) move the
-book; a reset (its run keeps its cash in the book, its successor the capital) and an archive (an archived Strategy's
-cash is still the fund's) move nothing, so neither has a flow. And the state paper halted on is put back on the true
+book; a reset (its run keeps its cash in the book, its successor the capital) moves nothing, so has no flow; an archive
+takes its equity out with a flow (F-C3B-A, tests/test_capital_withdrawal.py). And the state paper halted on is put back on the true
 book once, by the operator's one-off command (supervisor rebase), under the Advisor's conditions (14 Oct 09:00, 09:10).
 
 The paper incident: Strategies created after the first mark raised the high-water mark as if they were gains, and test
@@ -14,6 +14,7 @@ import os
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal as D
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import select
@@ -222,6 +223,43 @@ def test_f282_3_an_empty_book_with_a_strategy_that_could_trade_is_marked_and_hal
     assert _mark(store, T0).halted
 
 
+def test_f284_1_nothing_open_names_a_held_reservation_and_a_position_but_not_dust(store):
+    """CR F284-1: each of nothing_open's conditions, alone, on a book with one stopped Strategy (could_trade false)."""
+    idle = SimpleNamespace(reservations=lambda: [])
+    _make(store, "a", 10_000)
+    assert supervisor.nothing_open(store, idle) is None
+    held = SimpleNamespace(reservations=lambda: ["an entry's reservation"])
+    assert supervisor.nothing_open(store, held) == "an order still holds room in the book"
+    _dust(store, "a")
+    assert supervisor.nothing_open(store, idle) is None  # dust is not open
+    store.record_fill("a", side="BUY", qty=1.0, price=1_000.0, fee=0.0, order_id="p1", trade_id="p1", ts=T0)
+    assert supervisor.nothing_open(store, idle).startswith("Strategy a still holds 1.000001")  # Postgres's NUMERIC pads the digits
+
+
+@pytest.mark.parametrize("what", ["reservation", "position"])
+def test_f284_1_an_empty_book_with_a_reservation_or_a_position_is_marked_and_halts(store, monkeypatch, what):
+    """CR F284-1, through the mark: a fresh stack's empty book that still holds room for an order, or a position
+    other than dust, is not idle, so F282-3's no-op doesn't apply: it is marked and halts, failing closed."""
+    monkeypatch.setattr(supervisor, "fund_equity", lambda s: D(0))
+    _make(store, "a", 10_000)  # stopped: could_trade is false
+    if what == "reservation":
+        from sleeve_fund.portfolio.gate import Holding, Reservation
+
+        held = Reservation(1, "a", Holding("BTC", D(1_000), D(1_000), D(150)), T0, D(1), "o1")  # fresh: the sweep skips it
+        monkeypatch.setattr(DbLedger, "reservations", lambda self: [held])
+    else:
+        store.record_fill("a", side="BUY", qty=1.0, price=1_000.0, fee=0.0, order_id="p1", trade_id="p1", ts=T0)
+    assert _mark(store, T0).halted
+
+
+def test_f284_1_an_empty_book_holding_only_dust_is_still_a_no_op(store, monkeypatch):
+    monkeypatch.setattr(supervisor, "fund_equity", lambda s: D(0))
+    _make(store, "a", 10_000)
+    _dust(store, "a")
+    st = _mark(store, T0)
+    assert st.equity is None and not st.halted
+
+
 def test_a_deposit_into_a_book_at_0_below_its_hwm_is_refused(store):
     """A book wiped to 0 under a HWM is a real 100% loss: no ratio keeps it, so the deposit fails closed."""
     _make(store, "a", 10_000)
@@ -235,28 +273,33 @@ def test_a_deposit_into_a_book_at_0_below_its_hwm_is_refused(store):
 
 
 def test_a_flow_that_leaves_no_book_is_refused_and_the_move_with_it(store):
-    """Every Strategy in the book leaving it: book + flow is 0, so there is no ratio to keep, and the move fails
-    closed (ValueError) with its flow: the account stays as it was and nothing is journaled."""
+    """Every Strategy in the book leaving it: book + flow is 0. While one could still trade, the move fails closed
+    (ValueError) with its flow: the account stays as it was and nothing is journaled. F-C3B-A (Advisor 14 Oct 10:00
+    UK; HoE OK to change this cell): stopped and flat, it empties the book, left unmarked for the next capital."""
     _make(store, "test", 20_000, instrument="BTC/USD", venue="KRAKEN")
     store.assign_account("test", "desk")
     _mark(store, T0)
-    with pytest.raises(ValueError, match="can't keep the book's percentages"):
+    store.set_desired_state("test", "running")
+    with pytest.raises(ValueError, match="no capital while Strategy test can still trade"):
         store.assign_account("test", "paper")
     assert store.account_of("test") == "desk" and _flows(store) == [] and _state(store).equity == D(20_000)
+    store.set_desired_state("test", "stopped")
+    store.assign_account("test", "paper")
+    assert store.account_of("test") == "paper" and len(_flows(store)) == 1 and _state(store).equity is None
 
 
 # --- C2, C3: archive and reset move nothing, as fund_equity counts them ------------------------------------------------
 
-def test_c2_an_archived_strategys_cash_stays_in_the_book_so_archiving_is_no_flow(store):
-    """fund_equity counts an archived Strategy in full (its cash is still the fund's): archiving one with 4,000 made
-    neither moves the book nor its reference, and the next mark is the same book, with no halt."""
+def test_c2_an_archived_strategy_takes_its_equity_out_of_the_book_with_a_flow(store):
+    """F-C3B-A inverts this cell (HoE OK 14 Oct 10:00 UK): archiving one with 4,000 made takes its 8,000 out of the
+    book with its flow, so the book and its reference move together and the next mark halts nothing."""
     _make(store, "a", 16_000)
     _make(store, "b", 4_000)
     _trade(store, "b", 4_000)
     assert _four(_mark(store, T0)) == (D(24_000),) * 4
     store.archive("b")
     st = _mark(store, T0 + timedelta(minutes=1))
-    assert _four(st) == (D(24_000),) * 4 and not st.halted and st.paused_until is None and _flows(store) == []
+    assert _four(st) == (D(16_000),) * 4 and not st.halted and st.paused_until is None and len(_flows(store)) == 1
 
 
 def _reset(store, name):
@@ -291,14 +334,19 @@ def test_c3b_a_reset_after_a_loss_keeps_the_drawdown(store):
     assert (st.hwm - st.equity) / st.hwm == D("0.1")
 
 
-def test_c2_a_clean_slate_archives_without_a_flow(store, tmp_path):
+def test_c2_a_clean_slate_takes_what_it_archives_out_of_the_book_with_a_flow(store, tmp_path):
+    """F-C3B-A inverts this cell (HoE OK 14 Oct 10:00 UK): the slate's archive takes a's 10,500 out with its flow, and
+    the Strategy it keeps is the whole book."""
     _make(store, "a", 10_000)
+    _make(store, "b", 10_000)
     _trade(store, "a", 500)
     _mark(store, T0)
     slate = tmp_path / "clear.toml"
-    slate.write_text('[[clear]]\nid = "s1"\nreason = "fresh book"\n')
+    slate.write_text('[[clear]]\nid = "s1"\nreason = "fresh book"\nkeep = ["b"]\n')
     assert supervisor.clear(store, str(slate)) == ["a"]
-    assert _four(_mark(store, T0 + timedelta(minutes=1))) == (D(10_500),) * 4 and _flows(store) == []
+    assert store.withdrawal_pending() == ["a"]  # the poll takes it out after its own mark (F286-CR1)
+    assert _four(_mark(store, T0 + timedelta(minutes=1))) == (D(10_000),) * 4
+    assert store.withdrawn() == {"a": D(10_500)} and len(_flows(store)) == 1
 
 
 # --- C4: onto or off a test account ------------------------------------------------------------------------------------
@@ -663,6 +711,41 @@ def test_a_move_whose_own_write_fails_leaves_no_flow_and_no_event(store):
     assert _four(_state(store)) == before and _flows(store) == [] and store.account_of("test") == "paper"
 
 
+def test_f_haltref_4_the_book_figures_leave_a_test_account_out_as_fund_equity_does(store):
+    """F-HALTREF-4: the status command's book figures count what fund_equity counts; a USD Strategy on its venue's test
+    account (F229-6, as deniz-yolo-test on paper) is left out of the figures and named apart."""
+    _make(store, "a", 20_000)
+    _make(store, "deniz-yolo-test", 10_000, instrument="BTC/USD", venue="KRAKEN")  # on "paper", its test account
+    store.record_fill("deniz-yolo-test", side="BUY", qty=1.0, price=1_000.0, fee=2.0, order_id="y1", trade_id="y1",
+                      ts=T0)
+    store.record_equity("deniz-yolo-test", equity=9_500.0, cash=9_000.0, qty=1.0, price=500.0, benchmark=10_000.0,
+                        ts=T0)
+    assert supervisor.fund_equity(store) == D(20_000)
+    figures = supervisor.book_figures(store)
+    assert figures.startswith("from 20,000.00, equity 20,000.00, fees 0.00, positions none, first mark none")
+    assert figures.endswith("; outside the book (a test account): deniz-yolo-test")
+    store.assign_account("deniz-yolo-test", "desk")  # on an account no venue names as a test account: in the book
+    assert supervisor.book_figures(store).startswith("from 30,000.00, equity 29,500.00, fees 2.00, positions "
+                                                     "deniz-yolo-test, first mark ")
+
+
+def test_f285_1_a_position_with_no_mark_doesnt_stop_the_dry_run_reaching_its_refusals(store, monkeypatch, capfd):
+    """CR F285-1: strategy_equity raises for a position never marked; the dry run still prints every row, says
+    "no mark" where a value can't be had, and reaches its refusals."""
+    _make(store, "a", 10_000)
+    _make(store, "b", 5_000)
+    _mark(store, T0)
+    store.record_fill("a", side="BUY", qty=1.0, price=1_000.0, fee=0.0, order_id="n1", trade_id="n1", ts=T0)
+    _incident(store, monkeypatch)
+    assert supervisor.main(["rebase", "--actor", "HoE", "--commit", "abc1234"]) == 1
+    out = capfd.readouterr().out
+    assert "| 1 | no mark | 10,000.00" in out.split("\na | ")[1].splitlines()[0]
+    assert "\nb | in | 5,000.00 | 0.00 | 0 | 0.00 |" in out and "| 5,000.00 | 5,000.00" in out
+    assert "total | | | | | | | | | no mark | 15,000.00" in out
+    assert "(cap 0.1%, n/a: the book can't be valued)" in out
+    assert "refused: a holds 1" in out and "not written (a dry run)" in out
+
+
 def test_f282_2_the_rebase_values_dust_at_its_mark_not_its_entry(store):
     """CR F282-2: 0.00001 bought at 60,000 (0.60) and marked at 70,000 is journaled at 0.70, its mark."""
     _make(store, "a", 30_000)
@@ -673,6 +756,20 @@ def test_f282_2_the_rebase_values_dust_at_its_mark_not_its_entry(store):
     _incident(store)
     _, _, words = supervisor.rebase_halt_ref_1(store, "HoE", "abc1234")
     assert "dust counted as flat: a 0.00001 worth 0.7000;" in words
+
+
+def test_a_two_leg_strategy_created_after_the_first_mark_is_one_deposit_of_its_balance(store):
+    """P2-8: both legs' shares come in together, with the rows, as one flow of the Strategy's whole balance."""
+    _make(store, "a", 20_000)
+    _mark(store, T0)
+    store.create_two_legs(name="carry", strategy="ping_pong", bar_spec="1-MINUTE-LAST-INTERNAL", starting_balance=10_000,
+                          first={"instrument": "BTC/USDT", "params": {}, "venue": "BINANCE", "side": 1},
+                          second={"instrument": "BTC/USDT", "params": {"market": "perp"}, "venue": "BINANCE",
+                                  "side": -1}, desired_state="stopped")
+    assert _four(_state(store)) == (D(30_000),) * 4
+    assert len(_flows(store)) == 1 and "two-leg Strategy carry created with 10,000.00" in _flows(store)[0]
+    st = _mark(store, T0 + timedelta(minutes=1))
+    assert _four(st) == (D(30_000),) * 4 and not st.halted
 
 
 def test_f_haltref_5_the_dry_run_prints_every_strategy_its_run_and_the_dust_and_they_sum_to_the_figures(

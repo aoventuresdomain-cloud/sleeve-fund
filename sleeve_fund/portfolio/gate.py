@@ -31,7 +31,7 @@ from decimal import ROUND_HALF_EVEN, Decimal, localcontext
 from typing import Protocol
 
 from sleeve_fund.money import PRECISION, QUANTUM, money
-from sleeve_fund.portfolio.limits import Book, Decision, Holding, Intent, book_breach, decide, rejected
+from sleeve_fund.portfolio.limits import Book, Decision, Holding, Intent, book_breach, decide, decide_pair, rejected
 from sleeve_fund.risk import PortfolioProfile, trading_day
 
 EMPTY = Decimal("0.01")  # a book worth under a cent holds nothing: empty (F282-3, F-C3B-A)
@@ -63,6 +63,12 @@ class PortfolioState:
     paused_until: datetime | None = None
     paused: str | None = None
     stale_told: datetime | None = None  # the mark a stale-book alert was raised for, so it is raised once per spell
+    # MUST-F286-H4 (Advisor 14 Oct 13:35 UK): a withdrawal that empties the book carries its ratios, taken from the book
+    # before it, to the next capital's first mark (mark_book), which restores them: set only while unmarked.
+    carried_hwm_drawdown: Decimal | None = None  # 1 - book / HWM
+    carried_reference_drawdown: Decimal | None = None  # 1 - book / the halt's reference; None: the reference is the HWM
+    carried_day_return: Decimal | None = None  # book / the day's start - 1, for carried_day only
+    carried_day: object = None  # the UTC day carried_day_return belongs to
 
     def reference(self) -> Decimal | None:
         return self.halt_reference if self.halt_reference is not None else self.hwm
@@ -281,6 +287,59 @@ def check_order(ledger: Ledger, strategy: str, intent: Intent, profile: Portfoli
         return Checked(rejected(qty, None, why), None, None)
 
 
+def check_pair(ledger: Ledger, strategy: str | tuple[str, str], first: Intent, second: Intent,
+               profile: PortfolioProfile, now: datetime) -> tuple[Checked, Checked]:
+    """A two-leg entry (P2-8) as one position: both legs decided together under the one lock (limits.decide_pair), the
+    same share of each or neither, and both reservations written before the lock is let go, so no other strategy's
+    check lands between them (Advisor M1). Each leg's decision is recorded, under its own row's name when `strategy`
+    names the two legs. Any failure fails closed for both legs, as check_order does for one."""
+    names = (strategy, strategy) if isinstance(strategy, str) else tuple(strategy)
+    strategy = names[0]
+    lock_failed = False
+    try:
+        with ExitStack() as held:
+            try:
+                held.enter_context(ledger.lock())
+            except Exception:
+                lock_failed = True
+                raise
+            block = _block(ledger, now)
+            if block is not None:
+                why = f"Entry rejected: {block[1]}"
+                decisions = (rejected(first.qty, block[0], why), rejected(second.qty, block[0], why))
+            else:
+                equity, held_now = ledger.positions()
+                book = Book(equity, (*held_now, *(r.holding for r in ledger.reservations())))
+                decisions = decide_pair(book, first, second, profile)
+            out = []
+            for name, intent, decision in zip(names, (first, second), decisions):
+                rid = None
+                if decision.approved_qty > 0:
+                    q = decision.approved_qty
+                    rid = ledger.reserve(name, Holding(intent.underlying, intent.side * q * intent.price,
+                                                       q * intent.margin_per_unit, q * intent.risk_per_unit), now, q)
+                out.append(Checked(decision, ledger.record(name, now, intent, decision, profile.version), rid))
+            return out[0], out[1]
+    except Exception as e:  # noqa: BLE001 - any failure here means neither leg is sent
+        why = f"Entry rejected: the portfolio check couldn't run ({type(e).__name__}: {e}), so neither leg is sent"
+        try:
+            ledger.alert("portfolio_check_failed", f"{strategy}: {why}", now)
+        except Exception:  # noqa: BLE001 - the refusal stands whether or not the alert lands
+            pass
+        out = []
+        for name, intent in zip(names, (first, second)):
+            qty = getattr(intent, "qty", Decimal(0))
+            qty = qty if isinstance(qty, Decimal) else Decimal(0)
+            try:
+                ledger.record(name, now, intent, Decision("error", Decimal(0), qty,
+                                                              "lock_error" if lock_failed else None, why),
+                              profile.version)
+            except Exception:  # noqa: BLE001 - as for the alert
+                pass
+            out.append(Checked(rejected(qty, None, why), None, None))
+        return out[0], out[1]
+
+
 def mark_book(ledger: Ledger, equity, now: datetime, profile: PortfolioProfile) -> str | None:
     """The supervisor's mark of the whole fund. Returns "halt" when it has just halted the portfolio (the caller
     flattens every position through the exit path and halts every strategy), "pause" when it has just paused it,
@@ -293,6 +352,8 @@ def mark_book(ledger: Ledger, equity, now: datetime, profile: PortfolioProfile) 
     with ledger.lock():
         st = ledger.state()
         day = trading_day(now)
+        if st.equity is None and st.carried_hwm_drawdown is not None:
+            st = _restored(st, equity, day)
         if st.day != day:
             st = replace(st, day=day, day_start_equity=st.equity if st.equity else equity)
         st = replace(st, equity=equity, mark_ts=now, hwm=max(st.hwm or equity, equity),
@@ -310,6 +371,61 @@ def mark_book(ledger: Ledger, equity, now: datetime, profile: PortfolioProfile) 
         return acted
 
 
+def _restored(st: PortfolioState, equity: Decimal, day) -> PortfolioState:
+    """MUST-F286-H4 (Advisor 14 Oct 13:35 UK): the first mark of new capital in a book a withdrawal emptied keeps the
+    drawdown and the day's change it had: the HWM at equity / (1 - d), the halt's reference likewise, and the day's
+    start at equity / (1 + r) on the same UTC day, else the equity (a new day starts at it). Exact, one rounding each,
+    as apply_flow; the carried figures are cleared in the same write (mark_book's one set_state)."""
+    if equity < EMPTY:
+        raise ValueError("an empty book's mark restores nothing: it is left unmarked (Supervisor.mark_portfolio)")
+    if (bad := unrestorable(st)) is not None:
+        raise ValueError(bad)
+    with localcontext() as ctx:
+        ctx.prec = 2 * PRECISION
+
+        def up(d):
+            return None if d is None else (equity / (1 - d)).quantize(QUANTUM, ROUND_HALF_EVEN)
+
+        same_day = st.carried_day == day and st.carried_day_return is not None
+        start = (equity / (1 + st.carried_day_return)).quantize(QUANTUM, ROUND_HALF_EVEN) if same_day else equity
+        return replace(st, hwm=up(st.carried_hwm_drawdown), halt_reference=up(st.carried_reference_drawdown), day=day,
+                       day_start_equity=start, carried_hwm_drawdown=None, carried_reference_drawdown=None,
+                       carried_day_return=None, carried_day=None)
+
+
+def unrestorable(st: PortfolioState) -> str | None:
+    """Why the carried ratios can't be restored, or None (Advisor MUST, 14 Oct 14:45 UK): restored only while 1 - d > 0
+    and 1 + r > 0, so never a division by 0. An emptying withdrawal always starts from a book above 0, so this never
+    fires; if it does, the book stays unmarked, entries stay blocked as stale, and the supervisor alerts once."""
+    if st.equity is not None or st.carried_hwm_drawdown is None:
+        return None
+    d, q, r = st.carried_hwm_drawdown, st.carried_reference_drawdown, st.carried_day_return
+    if 1 - d > 0 and (q is None or 1 - q > 0) and (r is None or 1 + r > 0):
+        return None
+    def pct(x):
+        return "none" if x is None else f"{x:.2%}"
+
+    return (f"the drawdown kept from when the fund's book was emptied can't be restored (from the high-water mark "
+            f"{pct(d)}, from the halt's reference {pct(q)}, the day's change {pct(r)}): the book stays unmarked and "
+            "entries stay blocked until it is fixed")
+
+
+def carried(st: PortfolioState) -> dict:
+    """The ratios an emptying withdrawal carries (MUST-F286-H4), from the book before it, never the ~0 after (DA)."""
+    if st.equity is None or st.equity <= 0 or not st.hwm:
+        return {}
+    with localcontext() as ctx:
+        ctx.prec = 2 * PRECISION
+
+        def down(ref):  # never below 0: a flow's rounding can leave the book a quantum over its HWM (hwm_range)
+            return None if not ref else max(Decimal(0), (1 - st.equity / ref).quantize(QUANTUM, ROUND_HALF_EVEN))
+
+        r = (None if not st.day_start_equity or st.day is None
+             else (st.equity / st.day_start_equity - 1).quantize(QUANTUM, ROUND_HALF_EVEN))
+        return {"carried_hwm_drawdown": down(st.hwm), "carried_reference_drawdown": down(st.halt_reference),
+                "carried_day_return": r, "carried_day": st.day if r is not None else None}
+
+
 def resume_after_halt(ledger: Ledger) -> PortfolioState:
     """The PM's Resume after a portfolio halt: clears it and re-bases the halt's reference to the book now, so it
     doesn't fire again at once; the next halt is the drawdown limit below this. A pause for the day stays until
@@ -321,14 +437,26 @@ def resume_after_halt(ledger: Ledger) -> PortfolioState:
         return st
 
 
-def apply_flow(ledger: Ledger, amount) -> None:
+def apply_flow(ledger: Ledger, amount, idle: Callable[[], str | None] | None = None,
+               now: datetime | None = None, carry: bool = True) -> PortfolioState | None:
     """Capital added (> 0) or withdrawn (< 0), so a deposit isn't a gain and a withdrawal isn't a loss (Advisor 3).
     The book moves by it, and the HWM, the halt's reference and the day's start each scale by (book + amount) / book,
     so the drawdown and the day's change keep their percentages (Advisor MUST, 14 Oct 09:45 UK): a shift by the
     amount would dilute a drawdown on a deposit (90 against 100 is 10% down; 190 against 200, 5%) and deepen it on a
-    withdrawal. Exact, to the column's 18 places. Refused (ValueError) on a book of 0 or less before or after, or one
-    never marked: no ratio then, so the move fails closed; except a deposit into a book at 0 that never had a
-    high-water mark (an empty fund, as a fresh stack marks it), which starts the book at the deposit."""
+    withdrawal. Exact, to the column's 18 places. Refused (ValueError) on a book of 0 or less before, or one never
+    marked: no ratio then, so the move fails closed; except a deposit into a book at 0 that never had a high-water
+    mark (an empty fund, as a fresh stack marks it), which starts the book at the deposit.
+
+    A withdrawal that empties the book (within EMPTY of 0 after it, either side: one that overshoots by under a cent
+    empties it too, rather than counting as below nothing) leaves it unmarked, so the next mark starts it
+    afresh, as a first mark does; only when idle() says nothing is open (no position, no Strategy that could trade:
+    it returns why not, or None), no reservation is held and no day's pause is in force at `now` (a pause needs a
+    mark, so the withdrawal waits for 00:00 UTC; one that has ended is cleared with the marks); otherwise, and below
+    0, refused. A halt in force stays until the PM resumes
+    it. Returns the state it emptied, for the caller's journal, else
+    None (Advisor 14 Oct 10:00 UK). Emptied, it carries the drawdown and the day's change it had (carried) to the next
+    capital's first mark, which restores them (MUST-F286-H4, Advisor 14 Oct 13:35 UK); carry False (a clean slate's
+    withdrawal: a fresh book) carries nothing."""
     amount = money(amount, "amount")
     with ledger.lock():
         st = ledger.state()
@@ -338,10 +466,36 @@ def apply_flow(ledger: Ledger, amount) -> None:
             # high-water mark, so no drawdown to keep, and the book starts at the deposit. A book at 0 below a HWM
             # is a real loss and is still refused below.
             ledger.set_state(replace(st, equity=amount, hwm=amount, halt_reference=None, day_start_equity=amount))
-            return
-        if book is None or book <= 0 or book + amount <= 0:
+            return None
+        if book is None or book <= 0:
             raise ValueError(f"a flow of {amount:,.2f} on a book of {'none' if book is None else f'{book:,.2f}'} "
                              "can't keep the book's percentages: refused")
+        if abs(book + amount) < EMPTY:
+            busy = "no check of what is open was given" if idle is None else idle()
+            if busy is None and ledger.reservations():
+                busy = "an order still holds room in the book"
+            now = now or datetime.now(timezone.utc)
+            if busy is None and st.paused_until is not None and now < st.paused_until:
+                # a pause follows a mark (portfolio_state_marked), so the day's pause keeps the book marked: emptied
+                # from 00:00 UTC, when it ends (Advisor 14 Oct 10:10 UK; nothing can trade an empty book meanwhile).
+                # Said to the PM as it is (the dashboard shows the refusal), with when to try again in UK time.
+                from zoneinfo import ZoneInfo
+
+                uk = st.paused_until.astimezone(ZoneInfo("Europe/London"))
+                raise ValueError(f"Not done: this would leave the fund with no capital while it is paused for the day "
+                                 f"({st.paused}), and the pause has to stay in force until it ends. Nothing is lost "
+                                 f"by waiting. Please try again after {uk:%H:%M} UK ({st.paused_until:%H:%M} UTC).")
+            if busy is not None:  # said to the PM as it is, as the pause's is (F286-1)
+                raise ValueError(f"Not done: this would leave the fund with no capital while {busy}. Nothing is lost "
+                                 f"by waiting: try again once that has changed.")
+            # a pause that has ended goes with the marks: an unmarked row can't say paused (portfolio_state_marked)
+            # MUST-F286-H4: its ratios carried to the next capital's first mark, unless a clean slate emptied it (carry)
+            ledger.set_state(replace(st, equity=None, mark_ts=None, hwm=None, halt_reference=None, day=None,
+                                     day_start_equity=None, paused_until=None, paused=None,
+                                     **(carried(st) if carry else {})))
+            return st
+        if book + amount <= 0:
+            raise ValueError(f"a flow of {amount:,.2f} would take the book of {book:,.2f} below nothing: refused")
         with localcontext() as ctx:
             ctx.prec = 2 * PRECISION  # each product is exact before its one rounding to the column's scale
 
@@ -351,6 +505,7 @@ def apply_flow(ledger: Ledger, amount) -> None:
             ledger.set_state(replace(st, equity=book + amount, hwm=scaled(st.hwm),
                                      halt_reference=scaled(st.halt_reference),
                                      day_start_equity=scaled(st.day_start_equity)))
+        return None
 
 
 def sweep(ledger: Ledger, now: datetime, is_live: Callable[[str], bool], cancel: Callable[[str], None] | None,

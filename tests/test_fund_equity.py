@@ -1,6 +1,7 @@
 """The fund's marked equity the supervisor marks the portfolio with (P2-1b W1 on CASH-2; Advisor 3, HoE 13 Oct): every
-strategy's starting capital and cash movement (Store.strategy_cash_pnl) and its position at its last mark; a strategy
-put away still counts, a run a reset put away only its cash movement, so neither archiving nor a reset moves it."""
+strategy's starting capital and cash movement (Store.strategy_cash_pnl) and its position at its last mark; a run a reset
+put away counts only its cash movement, so a reset doesn't move it. A strategy put away leaves with its whole equity as
+one journaled withdrawal (F-C3B-A, Advisor 14 Oct), which scales the halt's reference with it (test_capital_withdrawal)."""
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone, UTC
@@ -48,8 +49,9 @@ def test_a_position_with_no_mark_fails_the_fund_closed(store):
         fund_equity(store)
 
 
-def test_neither_archiving_a_strategy_nor_a_reset_moves_the_fund(store):
-    """HoE 13 Oct: either would otherwise move the book under the 15% halt's reference, tripping or clearing it."""
+def test_a_reset_leaves_the_fund_and_archiving_takes_out_exactly_the_strategys_equity(store):
+    """HoE 13 Oct: a reset would otherwise move the book under the 15% halt's reference. Archiving does move it, by
+    exactly the strategy's equity, through the withdrawal that scales the reference with it (F-C3B-A)."""
     _trade(store, "spot", "BUY", 0.1, 60_000.0, 6.0, 1, T0)
     _trade(store, "spot", "SELL", 0.1, 62_000.0, 6.2, 2, T0 + timedelta(minutes=5))  # flat, 187.8 up
     before = fund_equity(store)
@@ -60,13 +62,14 @@ def test_neither_archiving_a_strategy_nor_a_reset_moves_the_fund(store):
     assert fund_equity(store) == before  # the run keeps its 187.8, the strategy its 10,000
     store.set_desired_state("flat", "stopped")
     store.archive("flat")
-    assert fund_equity(store) == before  # put away, its 10,000 is the fund's still
+    assert fund_equity(store) == before - D(10_000)  # put away, its 10,000 leaves with it
+    assert store.withdrawn() == {"flat": D(10_000)}
 
 
-def test_retiring_a_strategy_leaves_the_fund_unchanged(store):
-    """HoE 13 Oct: a retired strategy's capital stays the fund's (unallocated cash) until the PM reallocates it. Retired
-    today is archived (runtime.RETIRED is the archived cause); lifecycle.move only rules on the move and writes nothing,
-    and neither starts a fresh run, so the strategy counts its start plus everything it made."""
+def test_retiring_a_strategy_takes_its_start_and_everything_it_made_out_of_the_fund(store):
+    """Retired today is archived (runtime.RETIRED is the archived cause); lifecycle.move only rules on the move and
+    writes nothing, and neither starts a fresh run, so the withdrawal is the strategy's start plus everything it made
+    (F-C3B-A: a strategy put away leaves the book with its equity; it was the fund's until 14 Oct, HoE 13 Oct)."""
     from sleeve_fund import lifecycle
 
     _trade(store, "spot", "BUY", 0.1, 60_000.0, 6.0, 1, T0)
@@ -77,7 +80,8 @@ def test_retiring_a_strategy_leaves_the_fund_unchanged(store):
     store.set_desired_state("spot", "stopped")
     store.archive("spot")
     assert "spot" not in store.reset_runs()
-    assert fund_equity(store) == before
+    assert store.withdrawn() == {"spot": D("9888.1")}
+    assert fund_equity(store) == before - D("9888.1") == D(20_000)
 
 
 def test_dust_with_no_mark_is_held_at_its_entry_price_and_a_real_position_still_fails_closed(store):

@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from sleeve_fund import backups, markets
+from sleeve_fund import backups, markets, risk
 from sleeve_fund.dashboard import trading
 from sleeve_fund.store import Store, utcnow
 from sleeve_fund.venues import venue as venue_profile
@@ -56,12 +56,14 @@ def risk_view(store: Store, summaries: list[dict], book: dict) -> dict:
     equity = book["equity"] or 1.0
     scenarios = []
     for i, shock in enumerate(SHOCKS):
-        loss = sum(r["shocks"][i]["loss"] for r in rows if r["x"]["sleeve"].desired_state == "running")
+        # The book's P&L is the fund's: a test-account Strategy is outside its book (it still halts on its own limit).
+        loss = sum(r["shocks"][i]["loss"] for r in rows
+                   if r["x"]["sleeve"].desired_state == "running" and not r["x"].get("test_account"))
         scenarios.append({"shock": shock, "loss": loss, "pnl": -loss, "loss_pct": loss / equity,
                           "breaches": [r["x"]["sleeve"].name for r in rows if r["shocks"][i]["breach"]]})
     largest = largest_asset(book["allocation"], book["equity"])
     return {"rows": rows, "scenarios": scenarios, "largest": largest,
-            **{k: held[k] for k in ("accounts", "margin", "open_risk", "estimated", "through", "left_out", "trailing", "hint", "spot",
+            **{k: held[k] for k in ("accounts", "book", "unallocated", "margin", "open_risk", "estimated", "through", "left_out", "trailing", "hint", "spot",
                                        "spot_risk", "spot_left_out", "spot_hint")},
             "down20": next(sc for sc in scenarios if sc["shock"] == -0.20),
             "up20": next(sc for sc in scenarios if sc["shock"] == 0.20),
@@ -116,7 +118,7 @@ def most_it_can_lose(x: dict) -> float:
     t = markets.terms(s.params, s.venue) if qty else None
     if t is None:
         return equity
-    entry, lev = x.get("entry_px") or x["price"], x["profile"].max_leverage
+    entry, lev = x.get("entry_px") or x["price"], risk.leverage_cap(x["profile"], s.params)
     liq = markets.isolated_liquidation(x["cash"], qty, entry, lev, t.maintenance_margin)
     taker = float(markets.fees_for(s.params, venue_profile(s.venue).fees, s.venue).taker)
     cap = markets.gap_loss_cap(qty, entry, lev, x["cash"] + qty * entry, taker, liq)  # what the engine books (P1-D3)

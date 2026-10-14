@@ -144,9 +144,9 @@ def test_only_a_filled_stop_loss_is_rebooked_as_a_liquidation_and_the_journal_sa
     j = store if kind == "store" else MemoryJournal()
     j.create_sleeve(name="s", strategy="ping_pong", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
                     starting_balance=1_000)
-    for oid, intent in (("stop", "stop_loss"), ("unfilled", "stop_loss"), ("exit", "exit")):
+    for oid, intent in (("stop", "stop_loss"), ("unfilled", "stop_loss"), ("exit", "exit"), ("entry", "entry")):
         j.record_order("s", order_id=oid, side="BUY", qty=1.0, intent=intent, reason=intent, signal={"a": 1})
-    for oid in ("stop", "exit"):
+    for oid in ("stop", "exit", "entry"):
         j.record_fill("s", side="BUY", qty=1.0, price=2.0, fee=0.01, order_id=oid, trade_id=f"t-{oid}")
         j.update_order(oid, fill_qty=1.0, fill_px=2.0, fee=0.01)
     why = "Liquidated: the stop filled at 2, at or past the liquidation price 1.9, so the venue took the position first"
@@ -156,7 +156,11 @@ def test_only_a_filled_stop_loss_is_rebooked_as_a_liquidation_and_the_journal_sa
         "liquidation", why, {"a": 1, "price": 2.0})
     (ev,) = [e for e in j.events("s", limit=50) if e["kind"] == "order_rebooked"]
     assert ev["level"] == "info" and ev["message"] == f"Order stop re-booked from stop_loss to liquidation: {why}"
-    for oid in ("unfilled", "exit", "stop", "missing"):  # unfilled, not a stop, already re-booked, no such order
+    for oid in ("unfilled", "entry", "stop", "missing"):  # unfilled, not a close, already re-booked, no such order
         with pytest.raises(ValueError):
             j.rebook_liquidation(oid, why, {})
-    assert [f["price"] for f in j.fills("s", limit=10)] == [2.0, 2.0]  # fills untouched
+    # T-FIX7 (F283-P1): any filled close is re-booked, named by the close it was
+    j.rebook_liquidation("exit", why, {})
+    assert any(e["message"] == f"Order exit re-booked from exit to liquidation: {why}"
+               for e in j.events("s", limit=50) if e["kind"] == "order_rebooked")
+    assert [f["price"] for f in j.fills("s", limit=10)] == [2.0, 2.0, 2.0]  # fills untouched

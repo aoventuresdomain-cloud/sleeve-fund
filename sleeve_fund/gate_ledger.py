@@ -320,7 +320,10 @@ class DbLedger:
             halt_reference=None if ref == hwm else ref,  # the row keeps reference(); equal to the HWM is no re-base
             day=row.day_start, day_start_equity=_num(row.day_start_equity),
             halted=row.halt_reason if row.status == "halted" else None, paused_until=_aware(row.paused_until),
-            paused=row.pause_reason, stale_told=_aware(row.stale_told_at))
+            paused=row.pause_reason, stale_told=_aware(row.stale_told_at),
+            carried_hwm_drawdown=_num(row.carried_hwm_drawdown),
+            carried_reference_drawdown=_num(row.carried_reference_drawdown),
+            carried_day_return=_num(row.carried_day_return), carried_day=row.carried_day)
 
     def set_state(self, state: PortfolioState) -> None:
         if state.halted:
@@ -335,6 +338,9 @@ class DbLedger:
                "book_equity": _dec(state.equity), "marked_at": state.mark_ts,
                # the stale alert's marker belongs to the spell of this mark; the first fresh mark after it clears it
                "stale_told_at": state.stale_told if state.stale_told == (state.mark_ts or NEVER) else None,
+               "carried_hwm_drawdown": _dec(state.carried_hwm_drawdown),
+               "carried_reference_drawdown": _dec(state.carried_reference_drawdown),
+               "carried_day_return": _dec(state.carried_day_return), "carried_day": state.carried_day,
                "updated_at": utcnow()}
         t = portfolio_state_t
         with self._tx() as conn:

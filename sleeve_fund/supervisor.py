@@ -24,21 +24,23 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
-from sleeve_fund import accounts, lifecycle, liquidation
+from sleeve_fund import accounts, lifecycle, liquidation, router
 from sleeve_fund.alerts import Forwarder
 from sleeve_fund.exact import float_view
 from sleeve_fund.money import to_decimal
 from sleeve_fund.gate_ledger import DbLedger
-from sleeve_fund.portfolio.gate import EMPTY, PortfolioState, mark_book, sweep
+from sleeve_fund.portfolio.gate import EMPTY, PortfolioState, mark_book, sweep, unrestorable
 from sleeve_fund.portfolio.limits import Book, Holding
 from sleeve_fund.risk import PORTFOLIO, trading_day
 from sleeve_fund.paper.safety import assert_portfolio_gate, credential_var
 from sleeve_fund.paper.single_lock import EXIT_DUPLICATE
 from sleeve_fund.paper.config import check_hub_bar_spec, load_sleeve, to_store_kwargs
-from sleeve_fund.store import DUST_NOTIONAL, OPEN_ORDER_STATUSES, Sleeve, Store, is_dust, utcnow
+from sleeve_fund.store import DUST_NOTIONAL, OPEN_ORDER_STATUSES, TWO_LEG_FENCE, Sleeve, Store, is_dust, utcnow
 from sleeve_fund.strategies import check_perp_sizing, check_perp_stop
 from sleeve_fund.paper.runtime import entry_blocked, liquidation_head, said_since_last_fill
 from sleeve_fund.strategies.base import EXITS_ONLY
+
+VENUE_EXITS = f"{EXITS_ONLY}: {router.VENUE_MOVED[router.EXITS_ONLY]}"  # F-WED1-3: the status reason of that start
 
 POLL_SECONDS = 5
 KEY_CHECK_EVERY = 12  # polls between key-presence checks: about a minute
@@ -68,27 +70,33 @@ def fund_equity(store: Store) -> Decimal:
     with no mark is held at its entry price (F229-7)."""
     from sleeve_fund.store import is_backtest
 
-    runs = store.reset_runs()
+    runs, out = store.reset_runs(), store.withdrawn()
     total = Decimal(0)
     for s in store.sleeves():
         if is_backtest(s.name) or outside_fund_book(store, s):  # F229-6: a sub-8dp test Strategy isn't the fund's
+            continue
+        if s.name in out:  # F-C3B-A: put away, its equity taken out of the book with its flow
             continue
         total += strategy_equity(store, s, runs)
     return total
 
 
-def nothing_open(store: Store, ledger) -> str | None:
-    """Why the book isn't idle, or None when nothing is open: no reservation held, no Strategy that could trade
-    (could_trade), no position but dust. The one guard for an empty book (F282-3's no-op mark, F-C3B-A's emptying
-    flow)."""
+def nothing_open(store: Store, ledger, leaving: str | None = None) -> str | None:
+    """Why the book isn't idle, in the PM's words, or None when nothing is open: no reservation held, no Strategy that
+    could trade (could_trade), no position but dust. The one guard for an empty book (F282-3's no-op mark, F-C3B-A's
+    emptying flow). leaving: the Strategy whose withdrawal empties it, skipped (F286-1): it is stopped in the same
+    transaction, which this reads from outside, and found settled flat with no order open or room held before its
+    equity was taken out (Store.withdrawal_blocker)."""
     if ledger.reservations():
         return "an order still holds room in the book"
     for s in store.sleeves():
+        if s.name == leaving:
+            continue
         book = store.journal_book(s.name, s.starting_balance)
         if could_trade(s):
-            return f"{s.name} could trade"
+            return f"Strategy {s.name} can still trade"
         if abs(book["qty"]) > 1e-12 and not is_dust(book):
-            return f"{s.name} holds {book['qty']}"
+            return f"Strategy {s.name} still holds {book['qty']}"
     return None
 
 
@@ -135,6 +143,16 @@ def _holding(store: Store, s: Sleeve) -> bool:
     return abs(book["qty"]) > 1e-12 and not is_dust(book)
 
 
+def _held_words(store: Store, name: str) -> str:
+    """What the Strategy `name` belongs to holds, leg by leg when it has two (CR F283-2): "0.1", or "carry 0.1,
+    carry~2 -0.1"."""
+    legs = store.legs(name)
+    qty = {leg: store.journal_book(leg, store.sleeve(leg).starting_balance)["qty"] for leg in legs}
+    if len(legs) == 1:
+        return f"{qty[legs[0]]:.12g}"
+    return ", ".join(f"{leg} {q:.12g}" for leg, q in qty.items())
+
+
 def _status(st: PortfolioState, now: datetime) -> str:
     return "halted" if st.halted else "paused" if st.paused_until and now < st.paused_until else "ok"
 
@@ -167,6 +185,16 @@ def decide(sleeve: Sleeve, proc: Proc, now: datetime, holds: bool = False) -> st
         if sleeve.heartbeat_at is None or now - sleeve.heartbeat_at > HEARTBEAT_STALE:
             return "restart_stale"
     return "none"
+
+
+def check_venue_pin(store: Store, s: Sleeve) -> None:
+    """Raises ValueError when the strategy's journal last traded on another venue than its pin (Store.venue_start):
+    the supervisor's refusal then starts a holder for its exits only, on the venue its position is on, and refuses
+    a flat one."""
+    mode, traded = store.venue_start(s)
+    if mode != router.NORMAL:
+        print(f"{s.name}: venue {mode}: journal {traded}, pin {router.venue_for(s.venue)}", flush=True)
+        raise ValueError(router.VENUE_MOVED[mode])
 
 
 def check_funding_schedule(s: Sleeve) -> None:
@@ -302,6 +330,9 @@ class Supervisor:
         self.ledger = DbLedger(store, lambda: (_ for _ in ()).throw(RuntimeError("the supervisor runs no entry check")))
         self._equity_failing = False  # a failed equity read is said once per spell
         self._holdings_failing = False  # so is a failed read of the book's holdings (F-BM-1)
+        self._carried_told = False  # an emptied book's carried ratios that can't be restored, alerted once
+        self._withdraw_told: dict[str, str] = {}  # a deferred withdrawal's refusal, said once while it lasts
+        self._breach_told: set[str] = set()  # a withdrawn Strategy holding, alerted once per spell (F-C3B-A viii)
         self._flatten_told: dict[str, datetime] = {}  # when each holder was last told to flatten for a portfolio halt
         self._halt_tells: dict[str, int] = {}  # how often, this halt (F229-5: at most SYSTEM_FLATTENS)
 
@@ -316,14 +347,14 @@ class Supervisor:
         try:
             check_hub_bar_spec(s.venue, s.bar_spec)
         except ValueError as exc:
-            qty = self.store.journal_book(name, s.starting_balance)["qty"]
-            held = (f". It still holds a position ({qty:.12g}), which a flatten can't close while it can't start: "
-                    "an engineer needs to close it" if abs(qty) > 1e-12 else "")
+            held = (f". It still holds a position ({_held_words(self.store, name)}), which a flatten can't close while "
+                    "it can't start: an engineer needs to close it" if self.store.holds_any(name) else "")
             self.store.set_desired_state(name, "stopped")
             self.store.set_status(name, "stopped", f"not started: {exc}{held}")
             self.store.event(name, "error", "start_refused", f"Not started: {exc}{held}")
             return True
         try:
+            check_venue_pin(self.store, s)  # first: an off-pin holder's exits-only run reads this reason (CR F277-2)
             check_perp_sizing(s.strategy, s.params)
             check_perp_stop(s.strategy, s.params, s.risk_profile)
             check_funding_schedule(s)
@@ -349,18 +380,34 @@ class Supervisor:
         reason: its exits run, a safety stop is set from the mark, no entry or add opens, and an incident is raised
         (LongFlatStrategy._safety_stop_on_restore). Any refusal can use it, so a position is never left without a
         process watching it. True when it applies."""
-        book = self.store.journal_book(s.name, s.starting_balance)
-        if abs(book["qty"]) <= 1e-12 or is_dust(book):
+        if not self.store.holds_any(s.name):  # either leg of a two-leg Strategy (CR F283-2)
             return False
+        held = _held_words(self.store, s.name)
         reason = f"{EXITS_ONLY}: {why}"
         if s.status != "paused" or s.status_reason != reason:
             self.store.set_status(s.name, "paused", reason)
             self.store.event(s.name, "error", "start_refused", f"Not started to trade: {why}. It still holds a "
                              "position, so it is started for its exits only, with a safety stop")
             self.store.event(s.name, "error", "incident",
-                             f"Incident, {s.name}: not started to trade ({why}), but it holds {book['qty']:.12g}, so it "
+                             f"Incident, {s.name}: not started to trade ({why}), but it holds {held}, so it "
                              "runs for its exits only, with a safety stop from the current price and no new entries")
         return True
+
+    def _venue_exits_done(self, s: Sleeve, proc: Proc) -> None:
+        """F-WED1-3 (HoE 14 Oct): a strategy running for its exits only on the venue its position is on stops once that
+        position is closed, so exits-only never outlives it. Still on another venue than its pin, it is then refused
+        as any flat one is (check_venue_pin) until a reset; its pin's venue again, it starts to trade."""
+        mode, _ = self.store.venue_start(s)
+        if mode == router.EXITS_ONLY:
+            return
+        self._stop(s.name, proc, "flat: its exits-only run on another venue is over")
+        if mode == router.REFUSE:
+            self.store.set_desired_state(s.name, "stopped")
+            self.store.set_status(s.name, "stopped", f"not started: {router.VENUE_MOVED[mode]}")
+            self.store.event(s.name, "info", "venue_exits_done", "Its position on the other venue is closed, so its "
+                             f"exits-only run has stopped. Not started to trade: {router.VENUE_MOVED[mode]}")
+        else:
+            self.store.set_status(s.name, "stopped", "flat: its exits-only run is over")
 
     def _holds(self, s: Sleeve, proc: Proc) -> bool:
         """Whether a stopped strategy still holds a position (not dust). Without a process its journal can't change,
@@ -368,8 +415,7 @@ class Supervisor:
         if s.desired_state == "running":
             return False
         if proc.holds is None or proc.alive:
-            book = self.store.journal_book(s.name, s.starting_balance)
-            proc.holds = abs(book["qty"]) > 1e-12 and not is_dust(book)
+            proc.holds = self.store.holds_any(s.name)  # either leg of a two-leg Strategy (CR F283-2)
         return proc.holds
 
     def _watch_stopped_holder(self, s: Sleeve, proc: Proc, starting: bool = False) -> None:
@@ -377,7 +423,6 @@ class Supervisor:
         fill that raced the stop) is never left unwatched. It runs for its exits only: its own stop, or a safety stop
         from the mark where it has none (_safety_stop_on_restore), and nothing opens, with an incident. A halt or a
         pause keeps its own status, which already holds every entry and is cleared only by its own action (HC)."""
-        book = self.store.journal_book(s.name, s.starting_balance)
         proc.watched = True
         if s.status not in ("halted", "paused"):
             self.store.set_status(s.name, "paused", f"{EXITS_ONLY}: {STOPPED_HOLDING}")
@@ -387,7 +432,7 @@ class Supervisor:
         if said_since_last_fill(self.store, s.name, head):
             return  # already said for this position: a deploy or a crash restarts it without a second incident
         self.store.event(s.name, "error", "incident",
-                         f"{head}{book['qty']:.12g}, so it runs for its exits only: its stop (or a safety stop from the "
+                         f"{head}{_held_words(self.store, s.name)}, so it runs for its exits only: its stop (or a safety stop from the "
                          "current price) still closes it, and nothing new opens. Flatten closes it; once it is flat it "
                          "stops.")
 
@@ -478,7 +523,8 @@ class Supervisor:
     def step(self) -> None:
         self.reset_pending()
         now = utcnow()
-        for sleeve in self.store.sleeves():
+        # A two-leg Strategy's second leg row (P2-8) is traded by its first leg's process, never by one of its own.
+        for sleeve in self.store.sleeves(include_legs=False):
             proc = self.procs.setdefault(sleeve.name, Proc())
             holds = self._holds(sleeve, proc)
             action = decide(sleeve, proc, now, holds)
@@ -519,6 +565,8 @@ class Supervisor:
             elif action == "none" and holds and not proc.watched:
                 # Stopped while halted or paused and still holding: its process keeps running, as it is (P1-U35)
                 self._watch_stopped_holder(sleeve, proc)
+            elif action == "none" and proc.alive and sleeve.status == "paused" and sleeve.status_reason == VENUE_EXITS:
+                self._venue_exits_done(sleeve, proc)
             elif action == "none" and exits_only and sleeve.desired_state == "running":
                 # Started again by the PM after a stop that left it running for its exits only: it trades again
                 self._stop(sleeve.name, proc, "started by PM: restarted to trade")
@@ -568,6 +616,14 @@ class Supervisor:
                 # stay blocked as stale until the first capital's mark starts the book.
                 behind = behind or (st.equity is None and st.hwm is None and abs(equity) < EMPTY
                                     and nothing_open(self.store, led) is None)
+                # MUST-F286-H4: an emptied book's carried ratios wait for capital to restore them against, never ~0
+                behind = behind or (st.equity is None and st.carried_hwm_drawdown is not None and equity < EMPTY)
+                # Advisor MUST (14 Oct 14:45 UK): carried ratios that can't be restored fail closed, said once
+                if not behind:
+                    bad = unrestorable(st)
+                    if bad is not None and not self._carried_told:
+                        led.alert("portfolio_carried_invalid", f"Portfolio not marked: {bad}", now)
+                    self._carried_told = behind = bad is not None
                 acted = None if behind else mark_book(led, equity, now, PORTFOLIO)
         if not self._equity_failing and not behind:
             st = led.state()
@@ -589,6 +645,8 @@ class Supervisor:
             if acted == "halt":
                 self._flatten_told.clear()  # a new halt tells every holder at once
                 self._halt_tells.clear()
+            self._withdraw_flat(now)  # after the mark: the flatten's P&L is judged at the book's scale before it
+        self._alert_withdrawn_holders(now)
         st = led.state()
         if st.halted:
             self._halt_every_strategy(st.halted, now)
@@ -600,6 +658,38 @@ class Supervisor:
         # kept and alerted on as not cancelled, never released blind.
         sweep(led, now, self._order_live, None, is_acked=self._order_acked)
 
+    def _withdraw_flat(self, now: datetime) -> None:
+        """F-C3B-A (Advisor 14 Oct 10:45 UK): each Strategy put away and waiting (Store.withdrawal_pending: not flat
+        then, or put away outside this poll, F286-CR1) whose withdrawal nothing blocks any more has its settled equity
+        taken out of the book, with one journaled flow under the gate's lock (Store._put_away), the one place it leaves.
+        Called after this poll's mark. A refusal (a book a day's pause keeps marked) is said once and tried again
+        on the next poll; one Strategy's failure never stops the rest."""
+        for name in self.store.withdrawal_pending():
+            if self.store.withdrawal_blocker(name) is not None:
+                continue
+            try:
+                with self.store._put_away(name, now, "flat after it was put away", polled=True):
+                    pass
+                self._withdraw_told.pop(name, None)
+            except Exception as exc:  # noqa: BLE001 - kept in the book, tried again next poll
+                if self._withdraw_told.get(name) != str(exc):
+                    self.store.event(name, "warning", "withdrawal_waits", f"{name} is flat, and its equity "
+                                     f"couldn't leave the fund's book yet: {exc}")
+                    self._withdraw_told[name] = str(exc)
+
+    def _alert_withdrawn_holders(self, now: datetime) -> None:
+        """A withdrawn Strategy holding a position is a broken invariant (Advisor 14 Oct 10:45 UK): its exposure
+        would count against a book its equity left; dust no order can close is flat, as for the withdrawal. The gate's
+        holdings refuse it (fund_holdings raises, so every
+        entry fails closed); this raises the alert, once per spell."""
+        out = self.store.withdrawn()
+        # flat as a withdrawal judges it (Store.lifecycle_flat): dust left after one is no breach (Advisor 11:10 UK)
+        breach = {s.name for s in self.store.sleeves() if s.name in out and not self.store.lifecycle_flat(s.name)[1]}
+        for name in sorted(breach - self._breach_told):
+            self.store.event(name, "error", "withdrawn_holds", f"{name}'s equity left the fund's book, yet it holds "
+                             "a position: no Strategy may enter until it is resolved")
+        self._breach_told = breach
+
     def _halt_every_strategy(self, why: str, now: datetime) -> None:
         """A portfolio halt (15% under the reference): every strategy holding anything is flattened through its exit
         path; CHOKE blocks every entry from the state row until the PM resumes the portfolio. Asked on every poll while
@@ -607,9 +697,11 @@ class Supervisor:
         holding after its flatten, is told again: never while a flatten waits for it, and at most once a minute (CR
         F229-3). One strategy's failure never stops the rest."""
         reason = f"Portfolio halted: {why}"
-        for s in self.store.sleeves():
+        # A two-leg Strategy is told through its first leg's row, whose flatten reaches both legs, while either holds:
+        # a flatten sent to the second leg's row alone has no process to act on it (CR F283-2).
+        for s in self.store.sleeves(include_legs=False):
             told = self._flatten_told.get(s.name)
-            if not _holding(self.store, s):
+            if not self.store.holds_any(s.name):
                 self._flatten_told.pop(s.name, None)
                 self._halt_tells.pop(s.name, None)
                 continue
@@ -619,9 +711,8 @@ class Supervisor:
                 # F229-5: still holding after that many flattens, perhaps less than the venue's smallest order. Said
                 # once; the PM closes it. Its entries stay blocked by the halt meanwhile.
                 if self._halt_tells[s.name] == SYSTEM_FLATTENS:
-                    qty = self.store.journal_book(s.name, s.starting_balance)["qty"]
                     self.store.event(s.name, "error", "flatten_gave_up",
-                                     f"still holding {qty:.12g} after {SYSTEM_FLATTENS} flattens, perhaps less than the "
+                                     f"still holding {_held_words(self.store, s.name)} after {SYSTEM_FLATTENS} flattens, perhaps less than the "
                                      f"venue's smallest order; the PM must close it: {reason}")
                     self._halt_tells[s.name] += 1
                 continue
@@ -734,7 +825,7 @@ def seed(store: Store, paths: list[str]) -> list[str]:
     return added
 
 
-def _flatten_again(store: Store, name: str, why: str, since, qty: float) -> bool:
+def _flatten_again(store: Store, name: str, why: str, since, qty: float | str) -> bool:
     """Whether a reset or a clean slate may queue another flatten (`why`) for a strategy still holding qty: at
     most SYSTEM_FLATTENS since `since` (the reset's request, or the last clean slate finished, so an earlier slate
     with the same reason doesn't count). The last refusal says once what is left and that the PM must close it."""
@@ -745,7 +836,8 @@ def _flatten_again(store: Store, name: str, why: str, since, qty: float) -> bool
     if not any(e["kind"] == "flatten_gave_up" and e["message"].endswith(why)
                for e in store.events(name, limit=200)):
         store.event(name, "error", "flatten_gave_up",
-                    f"still holding {qty:.12g} after {SYSTEM_FLATTENS} flattens, perhaps less than the venue's smallest "
+                    f"still holding {qty if isinstance(qty, str) else f'{qty:.12g}'} after {SYSTEM_FLATTENS} flattens, "
+                    "perhaps less than the venue's smallest "
                     f"order; the PM must close it before this can finish: {why}")
     return False
 
@@ -771,16 +863,26 @@ def clear(store: Store, path: str) -> list[str]:
         put_away = store.archived()
         waiting = {e["sleeve"] for e in store.events_of(("clear_held",), limit=10_000)
                    if e["message"].startswith(f"{reason}:")}
+        two = [s.name for s in store.sleeves(include_legs=False)
+               if s.name not in keep and s.name not in put_away and store.two_leg(s.name)]
+        if two:  # refused whole, before any write; never raised, so the supervisor's poll goes on (TWO_LEG_FENCE)
+            store.event(None, "error", "clear_refused", f"{reason}: a clean slate {TWO_LEG_FENCE} "
+                        f"({', '.join(two)})")
+            continue
         holding = []
-        for s in store.sleeves():
+        # A two-leg Strategy is cleared whole, through its first leg's row: its flatten and start reach both legs,
+        # it holds while either leg does, and archive puts both away (CR F283-2).
+        for s in store.sleeves(include_legs=False):
             if s.name in keep or (waiting and s.name not in waiting):
                 continue
-            qty = store.journal_book(s.name, s.starting_balance)["qty"]
-            if s.name in put_away and abs(qty) <= 1e-12 and s.name not in waiting:
+            legs = store.legs(s.name)
+            held = any(abs(store.journal_book(n, store.sleeve(n).starting_balance)["qty"]) > 1e-12 for n in legs)
+            qty = _held_words(store, s.name)
+            if s.name in put_away and not held and s.name not in waiting:
                 continue  # put away flat by an earlier slate
             # One archived while still holding (the 4 Oct slate, before holders were flattened first) is
             # flattened like any other holder: until it is flat it stays in the book's figures.
-            if abs(qty) > 1e-12:
+            if held:
                 holding.append(s.name)
                 why = f"{reason}: flattened so it can be archived"
                 if (not any(c["command"] == "flatten" for c in store.pending_commands(s.name))
@@ -790,7 +892,7 @@ def clear(store: Store, path: str) -> list[str]:
                     store.set_desired_state(s.name, "running")
                     store.decide("system", "start", f"{reason}: started only to flatten its position", s.name)
                 store.event(s.name, "warning", "clear_held",
-                            f"{reason}: not archived yet, it still holds {qty:.12g}; it is being flattened and "
+                            f"{reason}: not archived yet, it still holds {qty}; it is being flattened and "
                             "paused, and the next start archives it")
                 continue
             if s.desired_state != "stopped":
@@ -802,7 +904,10 @@ def clear(store: Store, path: str) -> list[str]:
             cleared.append(s.name)
         if holding:
             continue  # applied again on the next start, once those are flat
-        store.decide("system", "clear", f"{key}: {reason} ({len(cleared)} put away)")
+        # F286-4 (HoQA): a slate on an empty book drops the drawdown its emptying carried, as a book reset does
+        fresh = "; the drawdown the emptied book kept is dropped, so the next capital starts afresh" \
+            if store.drop_carried() else ""
+        store.decide("system", "clear", f"{key}: {reason} ({len(cleared)} put away{fresh})")
         store.event(None, "info", "book_cleared", f"{reason}: {', '.join(cleared) or 'nothing to put away'}")
         done.add(key)
     return cleared
@@ -826,16 +931,21 @@ def book_line(store: Store) -> str:
 
 def book_figures(store: Store) -> str:
     """The book's headline figures as the Portfolio counts them (every strategy not in an earlier book):
-    starting capital, equity, fees, open positions and the first mark, for the deploy log."""
+    starting capital, equity, fees, open positions and the first mark, for the deploy log. A Strategy outside the
+    fund's book (F229-6, outside_fund_book) is left out, as fund_equity leaves it out, and named after the figures
+    (F-HALTREF-4)."""
     earlier = store.previous_book()
-    current = [s for s in store.sleeves() if s.name not in earlier]
+    every = [s for s in store.sleeves() if s.name not in earlier]
+    outside = [s.name for s in every if outside_fund_book(store, s)]
+    current = [s for s in every if s.name not in outside]
     start = sum(s.starting_balance for s in current)
     equity = sum(float((store.last_equity(s.name) or {"equity": s.starting_balance})["equity"]) for s in current)
     fees = sum(float(f["fee"]) for s in current for f in store.fills(s.name, limit=1_000_000))
     held = [s.name for s in current if abs(store.journal_book(s.name, s.starting_balance)["qty"]) > 1e-12]
     firsts = [m["ts"] for s in current if (m := store.first_equity(s.name))]
     return (f"from {start:,.2f}, equity {equity:,.2f}, fees {fees:,.2f}, "
-            f"positions {', '.join(held) or 'none'}, first mark {min(firsts).isoformat() if firsts else 'none'}")
+            f"positions {', '.join(held) or 'none'}, first mark {min(firsts).isoformat() if firsts else 'none'}"
+            + (f"; outside the book (a test account): {', '.join(outside)}" if outside else ""))
 
 
 REBASE_KEY = "HALT-REF-1"
@@ -846,9 +956,9 @@ def capital_in(store: Store) -> Decimal:
     """The capital put into the fund's book: every Strategy's starting balance that fund_equity counts (a reset's run
     counts only its cash, its successor the capital). What the book is worth with no gain or loss since, the
     flow-corrected reference the re-base measures the drawdown from (Advisor, 14 Oct 09:10 UK)."""
-    runs = store.reset_runs()
+    runs, out = store.reset_runs(), store.withdrawn()
     return sum((to_decimal(s.starting_balance, "starting balance") for s in store.sleeves()
-                if s.name not in runs and not outside_fund_book(store, s)), Decimal(0))
+                if s.name not in runs and s.name not in out and not outside_fund_book(store, s)), Decimal(0))
 
 
 def could_trade(s: Sleeve) -> bool:
@@ -893,17 +1003,24 @@ def dust_holdings(store: Store) -> list[tuple[str, Decimal, Decimal]]:
     return held
 
 
+def _figure(v: Decimal | None) -> str:
+    return "no mark" if v is None else f"{v:,.2f}"
+
+
 def rebase_figures(store: Store) -> list[str]:
     """The re-base's figures line by line (F-HALTREF-5), printed by the dry run and the real run alike: every Strategy
     with whether the fund's book counts it and why, its starting balance, its journal's cash with the fills, fees,
     funding and insurance behind it, and what it adds to the true book and to the capital put in; each reset run's
-    fills; the dust held against the cap. Reads only. The two totals are fund_equity's and capital_in's."""
+    fills; the dust held against the cap. Reads only. The two totals are fund_equity's and capital_in's. A position
+    with no mark can't be valued (strategy_equity raises): its row, the total and the dust cap say "no mark" and the
+    rest still prints, so the dry run reaches its refusals (CR F285-1)."""
     from sleeve_fund.store import is_backtest
 
     runs = store.reset_runs()
     out = [("Strategy | book | starting balance | journal cash | fills | fees | funding | insurance | position | "
             "true book | capital")]
-    equity_sum = capital_sum = Decimal(0)
+    equity_sum: Decimal | None = Decimal(0)
+    capital_sum = Decimal(0)
     for s in store.sleeves():
         if is_backtest(s.name):
             continue
@@ -913,28 +1030,35 @@ def rebase_figures(store: Store) -> list[str]:
         qty = to_decimal(store.journal_book(s.name, s.starting_balance)["qty"], "qty")
         if outside_fund_book(store, s):
             where, equity, capital = "out: a test account (F229-6)", Decimal(0), Decimal(0)
-        elif s.name in runs:
-            where, capital = f"in: a reset's run ({runs[s.name]:%d %b %H:%M} UTC), its cash only", Decimal(0)
-            equity = strategy_equity(store, s, runs)
         else:
-            where, capital = "in", to_decimal(s.starting_balance, "starting balance")
-            equity = strategy_equity(store, s, runs)
-        equity_sum += equity
+            if s.name in runs:
+                where, capital = f"in: a reset's run ({runs[s.name]:%d %b %H:%M} UTC), its cash only", Decimal(0)
+            else:
+                where, capital = "in", to_decimal(s.starting_balance, "starting balance")
+            try:
+                equity = strategy_equity(store, s, runs)
+            except RuntimeError:  # F285-1: a position with no mark: the row says so and the rest still prints
+                equity = None
+        equity_sum = None if equity is None or equity_sum is None else equity_sum + equity
         capital_sum += capital
         out.append(f"{s.name} | {where} | {to_decimal(s.starting_balance, 'starting balance'):,.2f} | {cash:,.2f} | "
                    f"{len(fills)} | {fees:,.2f} | {store.funding_total(s.name):,.2f} | "
-                   f"{store.insurance_total(s.name):,.2f} | {qty.normalize():f} | {equity:,.2f} | {capital:,.2f}")
-    out.append(f"total | | | | | | | | | {equity_sum:,.2f} | {capital_sum:,.2f}")
+                   f"{store.insurance_total(s.name):,.2f} | {qty.normalize():f} | {_figure(equity)} | {capital:,.2f}")
+    out.append(f"total | | | | | | | | | {_figure(equity_sum)} | {capital_sum:,.2f}")
     for name in runs:
         for f in sorted(store.fills(name, limit=1_000_000), key=lambda f: (f["ts"], f["id"])):
             out.append(f"  {name} fill {f['id']} {f['ts']:%d %b %H:%M:%S} {f['side']} {to_decimal(f['qty'], 'qty').normalize():f} "
                        f"at {to_decimal(f['price'], 'price'):,.2f}, fee {to_decimal(f['fee'], 'fee'):,.4f}")
     dust = dust_holdings(store)
     total = sum((abs(v) for _, _, v in dust), Decimal(0))
-    book = fund_equity(store)
-    share = f"{total / book:.4%}" if book > 0 else "n/a"
+    try:
+        book: Decimal | None = fund_equity(store)
+    except RuntimeError:  # F285-1: as above, a position with no mark
+        book = None
+    share = f"{total / book:.4%}" if book is not None and book > 0 else "n/a"
+    cap = f"{book * DUST_SHARE:,.2f}" if book is not None else "n/a: the book can't be valued"
     out.append(f"dust: {len(dust)} holding(s) worth {total:,.4f}, {share} of the book "
-               f"(cap {DUST_SHARE:.1%}, {book * DUST_SHARE:,.2f})"
+               f"(cap {DUST_SHARE:.1%}, {cap})"
                + "".join(f"; {n} {q.normalize():f} worth {v:,.4f}" for n, q, v in dust))
     return out
 
@@ -1002,6 +1126,32 @@ def rebase_halt_ref_1(store: Store, actor: str, commit: str, now: datetime | Non
     return before, after, words
 
 
+def withdraw_archived(store: Store, actor: str, commit: str) -> list[str]:
+    """F-C3B-A's one-off for the Strategies archived before it landed, which still count in the book: each is put on
+    the supervisor's withdrawal (Store._put_away: WITHDRAWAL_DEFERRED), and its next poll takes each out with its own
+    flow after its own mark, so the drawdown and the P&L don't move (Advisor 14 Oct 09:45 UK; F286-CR1). A reset's
+    earlier run is not one: its cash stays in the book. Idempotent: one already out or already waiting is skipped.
+    Refused, with nothing written, while any of them holds a position; dust no order can close is flat, as for the
+    archive, and leaves with it (F286-2, Advisor D8b). Returns the names queued."""
+    from sleeve_fund.store import is_backtest
+
+    if not actor.strip() or not commit.strip():
+        raise ValueError("an actor and the deployed commit are required")
+    runs, out, waiting = store.reset_runs(), store.withdrawn(), set(store.withdrawal_pending())
+    # One already waiting (put away after F-C3B-A, or queued by an earlier run) is the poll's to take out.
+    due = [n for n in store.archived() if n not in runs and n not in out and not is_backtest(n) and n not in waiting]
+    held = [f"{n} holds {float(qty):g}" for n in due for qty, flat in [store.lifecycle_flat(n)] if not flat]
+    if held:
+        raise RuntimeError("withdraw-archived refused, nothing written: " + "; ".join(held)
+                           + " (flatten it first: a position has no settled equity to take out)")
+    for n in due:
+        with store._put_away(n, utcnow(), f"withdraw-archived by {actor.strip()} at {commit.strip()}"):
+            pass
+        store.decide(actor.strip(), "withdraw_archived", f"F-C3B-A: {n}'s equity taken out of the fund's book at "
+                                                         f"commit {commit.strip()}", n)
+    return due
+
+
 REBASE_PAUSE = f"{REBASE_KEY}: paused for the portfolio re-base; resumed at the first test start"
 
 
@@ -1059,6 +1209,9 @@ def main(argv: list[str] | None = None) -> int:
     cl = sub.add_parser("clear", help="stop and archive every strategy, once per entry in the file")
     cl.add_argument("path")
     sub.add_parser("book", help="print the book's strategies and headline figures")
+    wa = sub.add_parser("withdraw-archived", help="F-C3B-A only: take each Strategy archived before it out of the book")
+    wa.add_argument("--actor", required=True, help="who ran it, for the decision log")
+    wa.add_argument("--commit", required=True, help="the deployed commit, for the journal")
     rb = sub.add_parser("rebase", help=f"{REBASE_KEY} only: re-base the paper portfolio's state to the true book, once")
     rb.add_argument("--actor", required=True, help="who ran it, for the decision log")
     rb.add_argument("--commit", required=True, help="the deployed commit, for the journal")
@@ -1078,6 +1231,17 @@ def main(argv: list[str] | None = None) -> int:
         print("book figures:", book_figures(store))
     elif args.cmd == "rebase":
         return _rebase_command(store, args)
+    elif args.cmd == "withdraw-archived":
+        try:
+            done = withdraw_archived(store, args.actor, args.commit)
+        except RuntimeError as exc:
+            print(exc)
+            return 1
+        print(f"queued for the supervisor's next mark: {', '.join(done) or 'none (nothing archived still counted)'}")
+        if done:  # the book after it and the limits in use against it, as the dashboard shows them (F-C3B-A-UI)
+            from sleeve_fund.dashboard.withdrawal import limits_in_use, words
+
+            print(words(limits_in_use(store)))
     else:
         assert_portfolio_gate(store)
         Supervisor(store, clear_path=args.clear).run()

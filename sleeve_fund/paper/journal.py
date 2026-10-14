@@ -136,7 +136,8 @@ class MemoryJournal:
 
     def record_order(self, sleeve: str, *, order_id: str, side: str, qty: float, intent: str, reason: str,
                      signal: dict | None = None, order_type: str = "MARKET", ts: datetime | None = None,
-                     timing: dict | None = None) -> None:  # timing: a backtest keeps none (record_timing)
+                     timing: dict | None = None,  # timing: a backtest keeps none (record_timing)
+                     parent_trade_id: str | None = None) -> None:
         if intent not in INTENTS:
             raise ValueError(f"bad intent {intent!r}")
         now = ts or utcnow()
@@ -144,13 +145,14 @@ class MemoryJournal:
                                   "updated_at": now, "side": side, "order_type": order_type, "qty": qty,
                                   "status": "submitted", "filled_qty": 0.0, "avg_px": None, "fee": 0.0,
                                   "intent": intent, "reason": reason, "signal": signal or {}, "message": "",
-                                  "venue": venue_for(self.sleeve(sleeve).venue)}
+                                  "venue": venue_for(self.sleeve(sleeve).venue), "parent_trade_id": parent_trade_id}
 
     def rebook_liquidation(self, order_id: str, reason: str, signal: dict, ts: datetime | None = None) -> None:
         row = self.orders_.get(order_id)
         _check_rebook(order_id, row)
+        was = row["intent"]
         row.update(intent="liquidation", reason=reason, signal=signal)
-        self.event(row["sleeve"], "info", "order_rebooked", _rebook_words(order_id, reason), ts=ts)
+        self.event(row["sleeve"], "info", "order_rebooked", _rebook_words(order_id, was, reason), ts=ts)
 
     def last_order(self, sleeve: str, intents: tuple[str, ...]) -> dict | None:
         rows = [o for o in self.orders_.values() if o["intent"] in intents]

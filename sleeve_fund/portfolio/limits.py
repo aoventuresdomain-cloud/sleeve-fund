@@ -176,6 +176,76 @@ def decide(book: Book, intent: Intent, profile: PortfolioProfile) -> Decision:
                     f"Entry trimmed from {intent.qty.normalize():f} to {qty.normalize():f}: {what}", figures(qty))
 
 
+def decide_pair(book: Book, first: Intent, second: Intent, profile: PortfolioProfile) -> tuple[Decision, Decision]:
+    """A two-leg entry (P2-8) as one position: the same share of both legs, or neither (Advisor, 13 Oct 23:55 UK).
+    The second leg is held at its ratio to the first (second.qty / first.qty). Gross and margin count both legs; open
+    risk is the sum of the legs' own risk, with no hedge credit (ruling A); net exposure is per underlying, so two legs
+    on one underlying net against each other. The share is the largest that keeps every limit; the first leg is
+    rounded down to its step and the second sized from it at the ratio and rounded down to its own. Either leg below
+    its venue minimum rejects the pair whole. Inputs that can't be used fail closed."""
+    legs = (first, second)
+    if book.equity <= 0 or any(
+            i.qty <= 0 or i.price <= 0 or i.step <= 0 or i.side not in (1, -1) or i.margin_per_unit <= 0
+            or i.risk_per_unit <= 0 or i.min_qty < 0 for i in legs):
+        why = (f"Entry rejected: the book or a leg had a figure that can't be used (book {book.equity}, legs "
+               f"{first!r}, {second!r}), so neither leg is sent")
+        return rejected(first.qty, None, why), rejected(second.qty, None, why)
+    e, ratio = book.equity, second.qty / first.qty
+    unders = list(dict.fromkeys(i.underlying for i in legs))
+    used = {"gross": book.gross(), "margin": book.margin(), "open_risk": book.open_risk(),
+            **{f"net:{u}": book.net(u) for u in unders}}
+    caps = {"gross": scale(e, profile.gross), "margin": scale(e, profile.margin),
+            "open_risk": scale(e, profile.open_risk), **{f"net:{u}": scale(e, profile.net_instrument) for u in unders}}
+
+    def added(q1: Decimal, q2: Decimal) -> dict:
+        out = {"gross": q1 * first.price + q2 * second.price,
+               "margin": q1 * first.margin_per_unit + q2 * second.margin_per_unit,
+               "open_risk": q1 * first.risk_per_unit + q2 * second.risk_per_unit}
+        for u in unders:
+            out[f"net:{u}"] = sum((q * i.side * i.price for q, i in ((q1, first), (q2, second)) if i.underlying == u),
+                                  ZERO)
+        return out
+
+    whole = added(first.qty, second.qty)  # per unit of share: the share f adds f x whole to each figure
+    room = {k: (_net_room(used[k], caps[k], whole[k]) if k.startswith("net:") else _room(used[k], caps[k], whole[k]))
+            for k in used}
+    bound = [k for k in used if room[k] is not None and room[k] < 1]
+    limit = min(bound, key=lambda k: room[k]) if bound else None
+    share = Decimal(1) if limit is None else room[limit]
+    q1 = floor_to(first.qty * share, first.step)
+    q2 = floor_to(q1 * ratio, second.step)
+
+    def name(k: str) -> str:
+        return "net_instrument" if k.startswith("net:") else k
+
+    def figures(a1: Decimal, a2: Decimal) -> dict:
+        at = added(a1, a2)
+        return {k: {"before": float(used[k] / e), "after": float((used[k] + at[k]) / e), "cap": float(caps[k] / e)}
+                for k in used}
+
+    def both(outcome, a1, a2, limit_hit, reason, figs):
+        return (Decision(outcome, a1, first.qty, limit_hit, reason, figs),
+                Decision(outcome, a2, second.qty, limit_hit, reason, figs))
+
+    after = added(q1, q2)
+    over = [k for k in used if (abs(used[k] + after[k]) > max(caps[k], abs(used[k])) if k.startswith("net:")
+                                else after[k] > 0 and used[k] + after[k] > caps[k])]
+    small = [n for n, q, i in (("first", q1, first), ("second", q2, second)) if q <= 0 or q < i.min_qty]
+    if limit is None and not small and not over:
+        return both("approved", q1, q2, None, "Both legs within every portfolio limit", figures(q1, q2))
+    hit = name(limit) if limit is not None else ("below_min" if small else name(over[0]))
+    if small or over:
+        what = (f"the {' and '.join(small)} leg would be below its venue minimum" if small
+                else f"{name(over[0])} would pass its limit after rounding")
+        if limit is not None:
+            what = f"{WORDS[name(limit)].format(u=limit[4:]) if limit.startswith('net:') else WORDS[limit]} binds, " + what
+        return both("rejected", ZERO, ZERO, hit, f"Entry rejected: {what}, so neither leg is sent",
+                    figures(ZERO, ZERO))
+    word = WORDS["net_instrument"].format(u=limit[4:]) if limit.startswith("net:") else WORDS[limit]
+    return both("trimmed", q1, q2, hit, f"Both legs trimmed to {share:.1%} of the request: {word} would pass its "
+                                        f"limit with the whole pair", figures(q1, q2))
+
+
 @dataclass(frozen=True)
 class BookBreach:
     action: str  # "halt" | "pause"
