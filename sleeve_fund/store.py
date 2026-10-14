@@ -1158,7 +1158,7 @@ class Store:
             yield c
             if amount:
                 before = led.state().reference()
-                emptied = apply_flow(led, amount, self._nothing_open)
+                emptied = apply_flow(led, amount, self._nothing_open, ts)
                 if emptied is not None:  # the old figures stay in the journal (Advisor 14 Oct 10:00 UK)
                     tail = (f"which empties it, so the next mark starts it afresh (it was: high-water mark "
                             f"{_money2(emptied.hwm)}, the halt's reference {_money2(emptied.reference())}, the day's "

@@ -324,7 +324,8 @@ def resume_after_halt(ledger: Ledger) -> PortfolioState:
 EMPTY = Decimal("0.01")  # a book within a cent of nothing after a flow is empty (Advisor 14 Oct 10:00 UK)
 
 
-def apply_flow(ledger: Ledger, amount, idle: Callable[[], str | None] | None = None) -> PortfolioState | None:
+def apply_flow(ledger: Ledger, amount, idle: Callable[[], str | None] | None = None,
+               now: datetime | None = None) -> PortfolioState | None:
     """Capital added (> 0) or withdrawn (< 0), so a deposit isn't a gain and a withdrawal isn't a loss (Advisor 3).
     The book moves by it, and the HWM, the halt's reference and the day's start each scale by (book + amount) / book,
     so the drawdown and the day's change keep their percentages (Advisor MUST, 14 Oct 09:45 UK): a shift by the
@@ -333,10 +334,12 @@ def apply_flow(ledger: Ledger, amount, idle: Callable[[], str | None] | None = N
     marked: no ratio then, so the move fails closed; except a deposit into a book at 0 that never had a high-water
     mark (an empty fund, as a fresh stack marks it), which starts the book at the deposit.
 
-    A withdrawal that empties the book (within EMPTY of 0 after it) leaves it unmarked, so the next mark starts it
+    A withdrawal that empties the book (within EMPTY of 0 after it, either side: one that overshoots by under a cent
+    empties it too, rather than counting as below nothing) leaves it unmarked, so the next mark starts it
     afresh, as a first mark does; only when idle() says nothing is open (no position, no Strategy that could trade:
-    it returns why not, or None), no reservation is held and no day's pause is in force (a pause needs a mark, so
-    the withdrawal waits for 00:00 UTC); otherwise, and below 0, refused. A halt in force stays until the PM resumes
+    it returns why not, or None), no reservation is held and no day's pause is in force at `now` (a pause needs a
+    mark, so the withdrawal waits for 00:00 UTC; one that has ended is cleared with the marks); otherwise, and below
+    0, refused. A halt in force stays until the PM resumes
     it. Returns the state it emptied, for the caller's journal, else
     None (Advisor 14 Oct 10:00 UK)."""
     amount = money(amount, "amount")
@@ -356,7 +359,8 @@ def apply_flow(ledger: Ledger, amount, idle: Callable[[], str | None] | None = N
             busy = "no check of what is open was given" if idle is None else idle()
             if busy is None and ledger.reservations():
                 busy = "an order still holds room in the book"
-            if busy is None and st.paused_until is not None:
+            now = now or datetime.now(timezone.utc)
+            if busy is None and st.paused_until is not None and now < st.paused_until:
                 # a pause follows a mark (portfolio_state_marked), so the day's pause keeps the book marked: emptied
                 # from 00:00 UTC, when it ends (Advisor 14 Oct 10:10 UK; nothing can trade an empty book meanwhile).
                 # Said to the PM as it is (the dashboard shows the refusal), with when to try again in UK time.
@@ -368,8 +372,9 @@ def apply_flow(ledger: Ledger, amount, idle: Callable[[], str | None] | None = N
                                  f"by waiting. Please try again after {uk:%H:%M} UK ({st.paused_until:%H:%M} UTC).")
             if busy is not None:
                 raise ValueError(f"a flow of {amount:,.2f} would empty the book of {book:,.2f} while {busy}: refused")
+            # a pause that has ended goes with the marks: an unmarked row can't say paused (portfolio_state_marked)
             ledger.set_state(replace(st, equity=None, mark_ts=None, hwm=None, halt_reference=None, day=None,
-                                     day_start_equity=None))
+                                     day_start_equity=None, paused_until=None, paused=None))
             return st
         if book + amount <= 0:
             raise ValueError(f"a flow of {amount:,.2f} would take the book of {book:,.2f} below nothing: refused")

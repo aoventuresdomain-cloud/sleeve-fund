@@ -321,9 +321,29 @@ def test_e3b_a_days_pause_keeps_the_book_marked_so_emptying_it_waits_for_midnigh
         led.set_state(replace(led.state(), paused="the test's pause", paused_until=T0 + timedelta(hours=2)))
     said = r"paused for the day \(the test's pause\).*try again after 12:00 UK \(11:00 UTC\)"
     with pytest.raises(ValueError, match=said):
-        store.archive("a")
+        store.set_lifecycle("a", "retire", "pm", "done with it", now=T0 + timedelta(hours=1))
     st = _state(store)
     assert st.equity == D(10_000) and st.paused_until == T0 + timedelta(hours=2) and "a" not in store.archived()
+    assert store.sleeve("a").lifecycle == "active"
+
+
+def test_e3c_a_pause_that_has_ended_doesnt_hold_the_withdrawal_and_goes_with_the_marks(store):
+    """DA MUST (14 Oct): paused_until stays on the row after the pause ends; only one still in force refuses."""
+    from sqlalchemy import select
+
+    from sleeve_fund.store import portfolio_state_t
+
+    _make(store, "a", 10_000)
+    _mark(store, T0)
+    led = DbLedger(store, lambda: ())
+    with led.lock():
+        led.set_state(replace(led.state(), paused="the test's pause", paused_until=T0 + timedelta(hours=2)))
+    store.set_lifecycle("a", "retire", "pm", "done with it", now=T0 + timedelta(days=1))  # the pause ended at 00:00
+    st = _state(store)
+    assert st.equity is None and st.paused_until is None and st.paused is None and store.withdrawn() == {"a": D(10_000)}
+    with store.engine.connect() as c:
+        row = c.execute(select(portfolio_state_t)).one()
+    assert row.status == "ok" and row.marked_at is None and row.book_equity is None and row.hwm is None
 
 
 @pytest.mark.parametrize("why", ["could trade", "holds a position", "below nothing", "an order"])
