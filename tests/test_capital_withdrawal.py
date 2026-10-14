@@ -86,6 +86,7 @@ def test_w4_retiring_withdraws_in_the_lifecycle_moves_transaction(store, monkeyp
     assert _four(_mark(store, T0 + timedelta(seconds=5))) == (D(15_000),) * 4 and store.withdrawn() == {"b": D(5_000)}
     # A put-away that fails rolls the retire back: the row stays active and nothing is withdrawn or queued.
     _make(store, "c", 5_000)
+    _mark(store, T0 + timedelta(seconds=10))  # F-ASSIGN-STALE: c joins the book at the poll
     import sleeve_fund.portfolio.gate as gate
 
     monkeypatch.setattr(gate, "apply_flow", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no flow")))
@@ -156,6 +157,7 @@ def test_w8_withdraw_archived_takes_each_out_once_and_refuses_while_one_holds(st
     assert supervisor.withdraw_archived(store, "operator", "abc1234") == [] and len(_flows(store)) == 2
     # One archived while still holding (before holders were flattened first): nothing is withdrawn until it is flat.
     _make(store, "d", 1_000)
+    _mark(store, T0 + timedelta(seconds=10))  # F-ASSIGN-STALE: d joins the book at the poll, with its deposit
     store.record_fill("d", side="BUY", qty=0.5, price=1_000.0, fee=0.0, order_id="dh", trade_id="dh", ts=T0)
     _archived_before(store, "d")
     with pytest.raises(RuntimeError, match="d holds"):

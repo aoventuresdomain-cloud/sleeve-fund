@@ -5,7 +5,7 @@
 <div class="page-head">
   <h1>Portfolio compliance settings</h1>
   {% if mode == 'view' %}<div class="actions"><a class="button" href="/portfolio-settings?edit=1">Edit tests and groups</a></div>{% endif %}
-  {% set cur = v.history[0] if v.history else none %}<p class="lede">Version {{ v.version }}{% if cur %} · in force since {{ cur.created_at|ts }} · set by {{ cur.created_by }}{% endif %}. Every trade idea from every Strategy passes these tests before an order goes out, or it is refused and the test that refused it is recorded.</p>
+  {% set cur = v.history[0] if v.history else none %}<p class="lede">Version {{ v.version }}{% if cur %} · in force since {{ cur.created_at|uk }} · set by {{ cur.created_by }}{% endif %}. Every trade idea from every Strategy passes these tests before an order goes out, or it is refused and the test that refused it is recorded.</p>
 </div>
 {% if saved %}<div class="okbox" role="status">Saved as version {{ saved }}. It applies from the next trade idea.</div>{% endif %}
 <div class="warnbox"><b>Edits apply to new trades only.</b> Open positions and working orders are not changed. The whole-fund test and the loss brakes can be changed but not switched off. If the tests can't be read, no new trade goes out.</div>
@@ -62,7 +62,7 @@
   <h2 id="hist-h">Version history</h2>
   <table class="tbl">
     <thead><tr><th scope="col">Version</th><th scope="col">From</th><th scope="col">By</th><th scope="col">Change</th><th scope="col">Why</th></tr></thead>
-    <tbody>{% for h in v.history %}<tr><td>{{ h.version }}{% if loop.first %} <span class="chip">in force</span>{% endif %}</td><td>{{ h.created_at|ts }}</td><td>{{ h.created_by }}</td><td>{% for c in h.changes %}{{ c }}{% if not loop.last %}<br>{% endif %}{% endfor %}</td><td>{{ h.note or '–' }}</td></tr>{% endfor %}</tbody>
+    <tbody>{% for h in v.history %}<tr><td>{{ h.version }}{% if loop.first %} <span class="chip">in force</span>{% endif %}</td><td>{{ h.created_at|uk }}</td><td>{{ h.created_by }}</td><td>{% for c in h.changes %}{{ c }}{% if not loop.last %}<br>{% endif %}{% endfor %}</td><td>{{ h.note or '–' }}</td></tr>{% endfor %}</tbody>
   </table>
 </section>
 {% endblock %}
