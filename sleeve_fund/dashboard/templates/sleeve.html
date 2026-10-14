@@ -89,7 +89,7 @@
 <div class="ov-term">
   <div class="ov-price">{{ price_chart("pc", s.instrument, "") }}</div>
   <aside class="panel flush ov-side" data-subtabs aria-label="Signals and settings">
-    <div class="sub-tabs" role="tablist" aria-label="Signals and settings">
+    <div class="sub-tabs side" role="tablist" aria-label="Signals and settings">
       {% if signals %}<button type="button" role="tab" data-sub="signals" aria-selected="true">Signals</button>{% endif %}
       <button type="button" role="tab" data-sub="settings" aria-selected="{{ 'false' if signals else 'true' }}">Settings</button>
     </div>
