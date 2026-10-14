@@ -77,6 +77,7 @@
   {% if signals %}{{ signals_tab(signals) }}{% endif %}
   <a href="#positions" role="tab" data-tab="positions">Position<span class="n">{{ 1 if x.qty else 0 }}</span></a>
   <a href="#activity" role="tab" data-tab="activity">Activity</a>
+  {% if attr %}<a href="#attribution" role="tab" data-tab="attribution">Attribution{% if attr.refused %}<span class="n">{{ attr.refused|length }}</span>{% endif %}</a>{% endif %}
   {% if path %}<a href="#path" role="tab" data-tab="path">Path to live</a>{% endif %}
   <a href="#settings" role="tab" data-tab="settings">Settings</a>
 </nav>
@@ -266,6 +267,36 @@
   </ul>{% else %}<p class="empty">Nothing yet.</p>{% endif %}
 </section>
 </div>
+
+{% if attr %}
+<div class="tab-panel" id="tab-attribution" role="tabpanel" data-panel="attribution">
+<section class="panel" aria-labelledby="attr-h" style="margin-bottom:14px">
+  <div class="panel-head"><h2 id="attr-h">Attribution</h2>
+    <span class="right range" role="group" aria-label="Period">{% for k, label in attr.periods.items() %}<a class="button {{ '' if k == attr.period else 'secondary' }}" href="?attr={{ k }}#attribution">{{ label }}</a>{% endfor %}</span></div>
+  <table class="tbl" data-attribution>
+    <thead><tr><th scope="col" class="num">Money P&amp;L</th><th scope="col" class="num">Fees and funding</th><th scope="col" class="num">Closed trades</th><th scope="col" class="num">R per trade</th><th scope="col" class="num">Contribution to the fund's return</th><th scope="col" class="num">Refused ideas</th></tr></thead>
+    <tbody><tr>
+      <td class="num">{{ money_signed(attr.pnl) }}</td>
+      <td class="num">{{ money_signed(attr.funding - attr.fees) }}</td>
+      <td class="num">{{ attr.trades }}</td>
+      <td class="num">{% if attr.r_mean is not none %}{{ '%+.2f'|format(attr.r_mean) }}R{% if attr.r_trades < attr.trades %} <span class="faint">({{ attr.r_trades }} with a stop)</span>{% endif %}{% else %}<span class="muted">–</span>{% endif %}</td>
+      <td class="num">{% if attr.contribution is not none %}{{ '%+.2f'|format(attr.contribution * 100) }}%{% else %}<span class="muted" title="The fund's book has no mark yet">–</span>{% endif %}</td>
+      <td class="num">{{ attr.refused|length }}</td>
+    </tr></tbody>
+  </table>
+  <p class="faint">{{ attr.label }}. Money P&amp;L is the trades closed in the period, after fees and funding; the open position's is on Overview. Contribution is that P&amp;L as a share of the fund's book at the period's start{% if attr.fund_start %} ({{ attr.fund_start|money }}){% endif %}.</p>
+</section>
+<section class="panel" aria-labelledby="refused-h" style="margin-bottom:14px">
+  <div class="panel-head"><h2 id="refused-h">Refused ideas</h2><span class="right faint">the compliance tests' refusals and cuts, newest first</span></div>
+  {% if attr.refused %}<table class="tbl" data-refused>
+    <thead><tr><th scope="col">Time</th><th scope="col">Asset</th><th scope="col" class="num">Asked</th><th scope="col">Outcome</th><th scope="col">Test</th></tr></thead>
+    <tbody>{% for r in attr.refused %}<tr><td>{{ r.decided_at|ts }}</td><td>{{ r.underlying }}</td><td class="num">{{ r.requested_qty|float|qty }}</td>
+      <td>{% if r.outcome == 'rejected' %}<span class="loss">Refused</span>{% else %}<span class="warn">Cut to {{ r.approved_qty|float|qty }}</span>{% endif %}</td>
+      <td>{{ r.test }}</td></tr>{% endfor %}</tbody>
+  </table>{% else %}<p class="empty">No idea was refused or cut in this period.</p>{% endif %}
+</section>
+</div>
+{% endif %}
 
 {% if path %}{% set met = path|selectattr('ok')|list|length %}
 <div class="tab-panel" id="tab-path" role="tabpanel" data-panel="path">

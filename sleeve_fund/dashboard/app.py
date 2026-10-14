@@ -30,7 +30,7 @@ from fastapi.templating import Jinja2Templates
 from sleeve_fund import compliance_rules, lifecycle, liquidation, markets, open_risk
 from sleeve_fund.dashboard import book as bookm
 from sleeve_fund.dashboard import development as dev
-from sleeve_fund.dashboard import compliance, gates, reasons, reports, riskops, trading, withdrawal
+from sleeve_fund.dashboard import attribution, compliance, gates, reasons, reports, riskops, trading, withdrawal
 from sleeve_fund.dashboard.jobs import Jobs
 from sleeve_fund.dashboard.metrics import STALE, sleeve_summary
 from sleeve_fund.data import spec_minutes
@@ -582,7 +582,9 @@ def create_app(store: Store | None = None) -> FastAPI:
         positions = trading.book_positions(st(), [x])
         working = [trading.order_view(o) for o in st().orders(name, trading.STATUS_TABS["open"][1], limit=200)]
         fees_funding = x.get("costs", x["fees"] - (perp_x["funding_total"] if perp_x else 0.0))  # funding is + received
-        return page(request, "sleeve.html", x=x, fills=fills[:200], trips=trips, feed=feed, orders=recent,
+        attr = None if bt_id else attribution.strategy(st(), name, trips, utcnow(), q.get("attr") if q.get("attr")
+                                                       in attribution.PERIODS else "all")
+        return page(request, "sleeve.html", x=x, fills=fills[:200], trips=trips, feed=feed, orders=recent, attr=attr,
                     order_total=order_total, liquidated=liquidated, ral=ral, clearing=clearing,
                     reset_dropped=reset_dropped,
                     positions=positions, working=working, fees_funding=fees_funding,

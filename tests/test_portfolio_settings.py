@@ -6,13 +6,18 @@ unmapped assets counted as the strictest group; edits apply to new trades only."
 from __future__ import annotations
 
 import re
-from html import unescape
 from datetime import UTC, datetime
 from decimal import Decimal as D
+from html import unescape
 from types import SimpleNamespace
 
 import pytest
-from test_dashboard import AUTH, SAME, _strategy_accounts, client  # noqa: F401 - the fixtures
+from test_dashboard import (  # noqa: F401 - the fixtures
+    AUTH,
+    SAME,
+    _strategy_accounts,
+    client,
+)
 
 from sleeve_fund import compliance_rules as rules
 

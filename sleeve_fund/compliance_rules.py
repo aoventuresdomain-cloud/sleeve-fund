@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
+from itertools import pairwise
 
 
 @dataclass(frozen=True)
@@ -31,9 +32,9 @@ RULES = (
     Rule("fund_stop_loss", "T3", "Whole fund: loss if every stop is hit", "fund", "open_risk", "trim",
          Decimal("0.05"), Decimal("0.01"), Decimal("0.10"), locked=True),
     Rule("fund_gross", "T4", "Gross: every position's size added up", "fund", "gross", "trim",
-         Decimal("1.5"), Decimal("0.1"), Decimal("3"), unit="x"),
+         Decimal("1.5"), Decimal("0.1"), Decimal(3), unit="x"),
     Rule("asset_net", "T4", "Net per asset: long less short on one asset", "asset", "net", "trim",
-         Decimal("0.5"), Decimal("0.05"), Decimal("1"), unit="x"),
+         Decimal("0.5"), Decimal("0.05"), Decimal(1), unit="x"),
     Rule("fund_margin", "T4", "Margin posted", "fund", "margin", "trim",
          Decimal("0.5"), Decimal("0.10"), Decimal("0.80")),
     Rule("fund_day_loss", "T5", "Today's loss pauses new trades until 00:00 UTC", "fund", "day_loss", "pause",
@@ -99,7 +100,7 @@ def warnings(tests: dict[str, dict]) -> list[str]:
     above a wider one, so the wider one binds first. Shown in the confirm step; never a refusal."""
     out = []
     chain = [k for k in ("asset_stop_loss", "type_stop_loss", "fund_stop_loss") if tests.get(k, {}).get("enabled")]
-    for a, b in zip(chain, chain[1:]):
+    for a, b in pairwise(chain):
         la, lb = Decimal(str(tests[a]["limit"])), Decimal(str(tests[b]["limit"]))
         if la > lb:
             out.append(f"{TESTS[BY_KEY[a].test]} ({show(a, la)}) is above {TESTS[BY_KEY[b].test].lower()} "
@@ -133,3 +134,20 @@ def changes(old: dict[str, dict] | None, new: dict[str, dict], old_groups: dict[
 def defaults() -> dict[str, dict]:
     """Version 1 as the DA seeds it: the built tests on, per asset and per group off until the PM switches them on."""
     return {r.key: {"limit": r.default, "enabled": r.key not in ("asset_stop_loss", "type_stop_loss")} for r in RULES}
+
+
+# The gate's limit_hit before the versioned tests (portfolio.limits), as the test it now is; and its outcomes that
+# aren't a test, in the PM's words.
+LIMIT_HIT = {"gross": "fund_gross", "net_instrument": "asset_net", "margin": "fund_margin",
+             "open_risk": "fund_stop_loss", "halt": "fund_drawdown", "pause": "fund_day_loss"}
+NOT_A_TEST = {"below_min": "Below the smallest order the market takes",
+              "portfolio_state_stale": "The fund's book wasn't marked recently, so nothing new goes out",
+              "lock_error": "The check couldn't run, so the idea was refused"}
+
+
+def refused_by(hit: str | None) -> str:
+    """What refused or trimmed an idea, as the PM reads it: a test's name, or why no test was reached."""
+    if not hit:
+        return "Refused"
+    key = hit if hit in BY_KEY else LIMIT_HIT.get(hit)
+    return name(key) if key else NOT_A_TEST.get(hit, hit.replace("_", " ").capitalize())
