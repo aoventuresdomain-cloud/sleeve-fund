@@ -50,6 +50,7 @@ CLEAR_EVERY = 12  # polls between retries of a clean slate waiting on a flatten:
 TRUE_UP_EVERY = 12  # polls between true-ups for strategies with no process: about a minute
 HEARTBEAT_STALE = timedelta(minutes=3)
 STARTUP_GRACE = timedelta(minutes=3)
+MOVE_ALERT_POLLS = 3  # a create or move still waiting after this many polls is alerted (Advisor ADV-ASSIGN)
 HALT_RETELL = timedelta(minutes=1)  # a holder still holding under a portfolio halt is told to flatten again after this
 MAX_BACKOFF = 300
 # Flattens a reset or a clean slate queues for one strategy before it stops asking and says the PM must close
@@ -291,7 +292,11 @@ def outside_fund_book(store: Store, s, account: str | None = None) -> bool:
     venue names (CCY-8DP), is outside the fund's book. Neither its equity (fund_equity) nor its position (both
     fund_holdings) counts, and its entries don't reserve against the book gate (LongFlatStrategy._paper_gated); its own
     per-Strategy checks still apply. The one predicate all of those read. account: as if it were on this account (a
-    move about to be made), else the one it is on."""
+    move about to be made), else the one it is on. A Strategy created on a marked book is outside it until the
+    supervisor's poll lands its joining deposit (F-ASSIGN-STALE, Advisor ADV-ASSIGN); a waiting move leaves it on its
+    old account until then, so on its old side."""
+    if account is None and store.joining(s.name):
+        return True
     return (_quote_places(s)[1] < FILL_PLACES
             and is_test_currency_account(account or store.account_of(s.name), getattr(s, "venue", None)))
 
@@ -332,6 +337,8 @@ class Supervisor:
         self._holdings_failing = False  # so is a failed read of the book's holdings (F-BM-1)
         self._carried_told = False  # an emptied book's carried ratios that can't be restored, alerted once
         self._withdraw_told: dict[str, str] = {}  # a deferred withdrawal's refusal, said once while it lasts
+        self._move_polls: dict[int, int] = {}  # a waiting move's id: the polls it has waited through (F-ASSIGN-STALE)
+        self._move_told: dict[str, str] = {}  # a waiting move's refusal, said once while it lasts
         self._breach_told: set[str] = set()  # a withdrawn Strategy holding, alerted once per spell (F-C3B-A viii)
         self._flatten_told: dict[str, datetime] = {}  # when each holder was last told to flatten for a portfolio halt
         self._halt_tells: dict[str, int] = {}  # how often, this halt (F229-5: at most SYSTEM_FLATTENS)
@@ -646,7 +653,9 @@ class Supervisor:
                 self._flatten_told.clear()  # a new halt tells every holder at once
                 self._halt_tells.clear()
             self._withdraw_flat(now)  # after the mark: the flatten's P&L is judged at the book's scale before it
+            self._land_moves(now)  # after the mark, whatever it decided: a create or move judged at the fresh scale
         self._alert_withdrawn_holders(now)
+        self._count_waiting_moves(now)
         st = led.state()
         if st.halted:
             self._halt_every_strategy(st.halted, now)
@@ -676,6 +685,34 @@ class Supervisor:
                     self.store.event(name, "warning", "withdrawal_waits", f"{name} is flat, and its equity "
                                      f"couldn't leave the fund's book yet: {exc}")
                     self._withdraw_told[name] = str(exc)
+
+    def _land_moves(self, now: datetime) -> None:
+        """F-ASSIGN-STALE (Advisor ADV-ASSIGN, 14 Oct 17:41 UK): every create and account move asked for since the last
+        mark lands now, oldest first, after this poll's mark, whatever that mark decided (a Strategy joining a halted or
+        paused book is halted or paused with it), with its flow at the fresh scale (Store.land_move). A refusal is
+        said once and tried again next poll; one Strategy's failure never stops the rest."""
+        for name, move in self.store.book_moves_pending().items():
+            try:
+                self.store.land_move(name, now)
+                self._move_told.pop(name, None)
+            except Exception as exc:  # noqa: BLE001 - it waits, entries refused, and is tried again next poll
+                if self._move_told.get(name) != str(exc):
+                    self.store.event(name, "warning", "book_move_waits", f"{name}'s move to account "
+                                     f"{move['account']} couldn't land yet: {exc}")
+                    self._move_told[name] = str(exc)
+
+    def _count_waiting_moves(self, now: datetime) -> None:
+        """Every poll, whether it marked or not: a create or move still waiting after MOVE_ALERT_POLLS polls raises an
+        alert, once (Advisor ADV-ASSIGN), with the refusal it last met, if any."""
+        waiting = self.store.book_moves_pending()
+        for name, move in waiting.items():
+            polls = self._move_polls[move["id"]] = self._move_polls.get(move["id"], 0) + 1
+            if polls == MOVE_ALERT_POLLS:
+                why = self._move_told.get(name) or "the book hasn't been marked since it was asked for"
+                self.ledger.alert("book_move_stuck", f"{name}'s move to account {move['account']} has waited "
+                                  f"{polls} polls without landing, and its entries stay refused: {why}", now)
+        for gone in set(self._move_polls) - {m["id"] for m in waiting.values()}:
+            self._move_polls.pop(gone, None)
 
     def _alert_withdrawn_holders(self, now: datetime) -> None:
         """A withdrawn Strategy holding a position is a broken invariant (Advisor 14 Oct 10:45 UK): its exposure

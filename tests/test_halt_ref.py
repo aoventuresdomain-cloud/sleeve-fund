@@ -96,11 +96,14 @@ def test_c1_a_strategy_created_after_the_first_mark_is_a_deposit_not_a_gain(stor
     _make(store, "a", 20_000)
     assert _four(_mark(store, T0)) == (D(20_000),) * 4
     _make(store, "b", 5_000)
-    assert _four(_state(store)) == (D(25_000),) * 4  # moved with the Strategy's row, before any mark
-    assert len(_flows(store)) == 1 and "Strategy b created with 5,000.00: the fund's book moves by +5,000.00 and its " \
-        "high-water mark, the halt's reference and the day's start scale with it (the reference 20,000.00 -> " \
-        "25,000.00)" in _flows(store)[0]
+    # F-ASSIGN-STALE (Advisor ADV-ASSIGN): on a marked book it joins at the supervisor's next poll, after its mark
+    assert _four(_state(store)) == (D(20_000),) * 4 and _flows(store) == [] and store.joining("b")
     st = _mark(store, T0 + timedelta(minutes=1))
+    assert _four(st) == (D(25_000),) * 4 and not st.halted and st.paused_until is None and not store.joining("b")
+    assert len(_flows(store)) == 1 and "b joins the fund's book (account paper) at the supervisor's mark: the fund's " \
+        "book moves by +5,000.00 and its high-water mark, the halt's reference and the day's start scale with it (the " \
+        "reference 20,000.00 -> 25,000.00)" in _flows(store)[0]
+    st = _mark(store, T0 + timedelta(minutes=2))
     assert _four(st) == (D(25_000),) * 4 and not st.halted and st.paused_until is None
 
 
@@ -152,7 +155,7 @@ def test_a_deposit_on_a_book_10_percent_down_stays_10_percent_down(store):
     before = _mark(store, T0 + timedelta(minutes=1))
     assert before.equity == D(90_000) and _dd(before) == (D("0.1"), D("0.1"))
     _make(store, "b", 100_000)
-    st = _state(store)
+    st = _mark(store, T0 + timedelta(minutes=1, seconds=5))  # F-ASSIGN-STALE: it joins at the poll, after its mark
     assert st.equity == D(190_000) and abs(st.hwm - D("211111.111111111111111111")) < D("1e-9")
     assert st.reference() == st.hwm == st.day_start_equity and all(abs(x - D("0.1")) < D("1e-12") for x in _dd(st))
     st = _mark(store, T0 + timedelta(minutes=2))
@@ -169,7 +172,8 @@ def test_a_withdrawal_of_10k_after_a_1k_loss_on_20k_stays_5_percent_down(store):
     _trade(store, "fund", -1_000)
     assert _mark(store, T0 + timedelta(minutes=1)).equity == D(19_000)
     store.assign_account("test", "paper")
-    st = _state(store)
+    assert store.account_of("test") == "desk" and _state(store).equity == D(19_000)  # waits for the poll
+    st = _mark(store, T0 + timedelta(minutes=1, seconds=5))  # marked at 19,000, then the move lands
     assert st.equity == D(9_000) and abs(st.hwm - D("9473.684210526315789474")) < D("1e-9")
     assert all(abs(x - D("0.05")) < D("1e-12") for x in _dd(st))
     st = _mark(store, T0 + timedelta(minutes=2))
@@ -267,9 +271,12 @@ def test_a_deposit_into_a_book_at_0_below_its_hwm_is_refused(store):
     led = DbLedger(store, lambda: ())
     with led.lock():
         led.set_state(replace(led.state(), equity=D(0)))
-    with pytest.raises(ValueError, match="can't keep the book's percentages"):
-        _make(store, "b", 5_000)
-    assert "b" not in {s.name for s in store.sleeves()}
+    _make(store, "b", 5_000)  # F-ASSIGN-STALE: asked for, it waits for the poll, which refuses it there
+    assert store.joining("b") and _flows(store) == []
+    supervisor.Supervisor(store)._land_moves(T0)
+    assert store.joining("b") and _flows(store) == [] and _state(store).equity == D(0)
+    waits = [e["message"] for e in store.events("b", limit=10) if e["kind"] == "book_move_waits"]
+    assert len(waits) == 1 and "can't keep the book's percentages" in waits[0]
 
 
 def test_a_flow_that_leaves_no_book_is_refused_and_the_move_with_it(store):
@@ -280,11 +287,14 @@ def test_a_flow_that_leaves_no_book_is_refused_and_the_move_with_it(store):
     store.assign_account("test", "desk")
     _mark(store, T0)
     store.set_desired_state("test", "running")
-    with pytest.raises(ValueError, match="no capital while Strategy test can still trade"):
-        store.assign_account("test", "paper")
+    store.assign_account("test", "paper")  # F-ASSIGN-STALE: it waits for the poll, which refuses it there
+    sup = supervisor.Supervisor(store)
+    sup._land_moves(T0)
     assert store.account_of("test") == "desk" and _flows(store) == [] and _state(store).equity == D(20_000)
+    waits = [e["message"] for e in store.events("test", limit=10) if e["kind"] == "book_move_waits"]
+    assert len(waits) == 1 and "no capital while Strategy test can still trade" in waits[0]
     store.set_desired_state("test", "stopped")
-    store.assign_account("test", "paper")
+    sup._land_moves(T0)
     assert store.account_of("test") == "paper" and len(_flows(store)) == 1 and _state(store).equity is None
 
 
@@ -358,10 +368,11 @@ def test_c4_a_strategy_moving_out_of_the_book_is_a_withdrawal_not_a_loss(store):
     _make(store, "test", 20_000, instrument="BTC/USD", venue="KRAKEN")
     store.assign_account("test", "desk")  # into the book from the paper account (KRAKEN's named test account)
     assert _mark(store, T0).equity == D(30_000)
-    store.assign_account("test", "paper")  # back onto the test account: out of the book
-    assert _four(_state(store)) == (D(10_000),) * 4
-    assert "test moved out of the fund's book" in _flows(store)[0] and "-20,000.00" in _flows(store)[0]
+    store.assign_account("test", "paper")  # back onto the test account: out of the book, at the next poll
+    assert _four(_state(store)) == (D(30_000),) * 4 and _flows(store) == []
     st = _mark(store, T0 + timedelta(minutes=1))
+    assert _four(st) == (D(10_000),) * 4
+    assert "test moved out of the fund's book" in _flows(store)[0] and "-20,000.00" in _flows(store)[0]
     assert st.equity == D(10_000) and not st.halted and st.paused_until is None
 
 
@@ -371,7 +382,7 @@ def test_c4_a_strategy_moving_into_the_book_is_a_deposit_at_its_equity_then(stor
     _trade(store, "test", 250)
     _mark(store, T0)
     store.assign_account("test", "desk")
-    assert _four(_state(store)) == (D(15_250),) * 4
+    assert _four(_mark(store, T0 + timedelta(minutes=1))) == (D(15_250),) * 4  # lands at the poll
     assert "test moved into the fund's book" in _flows(store)[0] and "+5,250.00" in _flows(store)[0]
 
 
@@ -398,21 +409,24 @@ def test_c5_a_drop_of_15_percent_from_the_flowed_hwm_halts(store):
 
 
 def test_c5_a_day_drop_of_3_percent_from_the_flowed_start_pauses_and_a_loss_on_the_flows_mark_counts(store):
-    """The loss lands before the create and both before the next mark: 24,000 against the flowed 25,000 is 4% down
-    on the day. Without the flow it would read as a 4,000 gain."""
+    """The loss lands before the create and both before the next mark. The book really fell 5% on the day before b
+    joined (F-ASSIGN-STALE): the mark judges 19,000 against 20,000 first, then b's deposit scales the figures by
+    24/19, so it stays 5% down. Without the flow it would read as a 4,000 gain."""
     _make(store, "a", 20_000)
     _mark(store, T0)
     _trade(store, "a", -1_000)
     _make(store, "b", 5_000)
     st = _mark(store, T0 + timedelta(minutes=1))
-    assert (st.equity, st.hwm, st.day_start_equity) == (D(24_000), D(25_000), D(25_000))
+    scaled = D(20_000) * D(24_000) / D(19_000)
+    assert st.equity == D(24_000) and abs(st.hwm - scaled) < D("1e-9") and abs(st.day_start_equity - scaled) < D("1e-9")
     assert st.paused_until is not None and not st.halted
 
 
 def test_c6_a_mark_that_read_the_book_before_a_flow_landed_is_skipped_not_a_phantom_loss(store, monkeypatch):
-    """The race: the supervisor reads the book (20,000), a 5,000 Strategy is created and its flow lands, then the
-    supervisor takes the gate's lock to mark its stale read. Marked, 20,000 against the flowed 25,000 would be a 20%
-    phantom loss and halt; it is skipped, and the next mark reads the whole book."""
+    """The race: the supervisor reads the book (20,000), a 5,000 Strategy is created, then the supervisor takes the
+    gate's lock to mark its read. Before F-ASSIGN-STALE the create's flow landed in between, and the stale read was
+    skipped; now a create on a marked book waits for the poll (Advisor ADV-ASSIGN), so the read is true, the mark is
+    taken, and the deposit lands after it in the same poll. Never a 20% phantom loss."""
     _make(store, "a", 20_000)
     _mark(store, T0)
     real = supervisor.fund_equity
@@ -425,7 +439,7 @@ def test_c6_a_mark_that_read_the_book_before_a_flow_landed_is_skipped_not_a_phan
 
     monkeypatch.setattr(supervisor, "fund_equity", read_then_move)
     st = _mark(store, T0 + timedelta(minutes=1))
-    assert _four(st) == (D(25_000),) * 4 and not st.halted and st.mark_ts == T0  # skipped: the last mark stands
+    assert _four(st) == (D(25_000),) * 4 and not st.halted and st.mark_ts == T0 + timedelta(minutes=1)
     monkeypatch.setattr(supervisor, "fund_equity", real)
     st = _mark(store, T0 + timedelta(minutes=2))
     assert _four(st) == (D(25_000),) * 4 and not st.halted and st.paused_until is None
@@ -777,13 +791,14 @@ def test_f_haltref_5_the_dry_run_prints_every_strategy_its_run_and_the_dust_and_
     """HoQA F-HALTREF-5: what the re-base reads, row by row, from the dry run itself: a reset's run with its fills
     and fees, a test-account Strategy outside the book, dust against the cap; the rows sum to the two figures."""
     _make(store, "a", 10_000)
+    # F-ASSIGN-STALE: made before the book's first mark, so in it at once (made after it, they'd join at the next poll)
+    _make(store, "test", 10_000, instrument="BTC/USD", venue="KRAKEN")  # on "paper", its venue's test account
+    _make(store, "d", 10_000)
     _mark(store, T0)
     store.record_fill("a", side="BUY", qty=1.0, price=1_000.0, fee=1.5, order_id="r1", trade_id="r1", ts=T0)
     store.record_fill("a", side="SELL", qty=1.0, price=900.0, fee=1.25, order_id="r2", trade_id="r2", ts=T0)
     _settle(store, "a")
     run = _reset(store, "a")
-    _make(store, "test", 10_000, instrument="BTC/USD", venue="KRAKEN")  # on "paper", its venue's test account
-    _make(store, "d", 10_000)
     _dust(store, "d", T0 + timedelta(seconds=1))
     _incident(store, monkeypatch)
     assert supervisor.main(["rebase", "--actor", "HoE", "--commit", "abc1234"]) == 0

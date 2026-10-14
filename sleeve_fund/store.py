@@ -366,6 +366,26 @@ sleeve_accounts_t = Table(
     Column("account", String(41), ForeignKey("accounts.name"), nullable=False),
     Column("assigned_at", TS, nullable=False),
 )
+# F-ASSIGN-STALE (Advisor ADV-ASSIGN, 14 Oct 17:41 UK): a create or an account move asked for on a marked book waits
+# here for the supervisor's poll, which lands it after its own mark with its flow, so P&L made since the last mark is
+# judged at the book's scale first. At most one waiting row per Strategy (landed_at and superseded_at both NULL); a
+# later request supersedes it. A new table, so it arrives as CREATE TABLE.
+book_moves_t = Table(
+    "book_moves",
+    metadata,
+    Column("id", Integer, primary_key=True),
+    Column("sleeve", String(64), ForeignKey("sleeves.name"), nullable=False),
+    Column("account", String(41), ForeignKey("accounts.name"), nullable=False),  # where it lands
+    Column("kind", String(8), nullable=False),  # create | move
+    Column("requested_at", TS, nullable=False),
+    Column("landed_at", TS),
+    Column("superseded_at", TS),
+    CheckConstraint("kind IN ('create', 'move')", name="book_moves_kind"),
+    CheckConstraint("landed_at IS NULL OR superseded_at IS NULL", name="book_moves_one_end"),
+    Index("book_moves_waiting", "sleeve", unique=True,
+          postgresql_where=text("landed_at IS NULL AND superseded_at IS NULL"),
+          sqlite_where=text("landed_at IS NULL AND superseded_at IS NULL")),
+)
 # The venue a strategy trades on, where it isn't the default (sleeve_fund.venues). A table of its own, so
 # it arrives as CREATE TABLE: a strategy with no row here trades on the default venue, as every one did.
 sleeve_venues_t = Table(
@@ -885,6 +905,8 @@ OPEN_ORDER_STATUSES = ("submitted", "accepted", "partially_filled")
 # F-C3B-A: a Strategy archived while not yet flat waits for its withdrawal; one with nothing to withdraw says so
 WITHDRAWAL_DEFERRED, WITHDRAWAL_NONE = "withdrawal_deferred", "withdrawal_none"
 NEXT_MARK = "flat, waiting for the supervisor's next mark"  # why a flat Strategy put away is deferred (F286-CR1)
+# F-ASSIGN-STALE: a create or a move waiting for the poll (book_moves), and its landing
+BOOK_MOVE_WAITING, BOOK_MOVE_LANDED = "book_move_waiting", "book_move_landed"
 GATED_INTENTS = ("entry", "rebalance")  # the orders the portfolio gate reserves for (engine OPENING_INTENTS)
 INTENTS = ("entry", "exit", "stop_loss", "take_profit", "risk_halt", "risk_pause", "pm_flatten", "rebalance",
            "liquidation", "liquidation_cut", "wind_down", "wind_down_stop",  # the venue would take it; cut back before it does (String(16))
@@ -1260,7 +1282,15 @@ class Store:
             in_book = not is_backtest(name) and not _outside_book(self, made)  # no account row yet: it starts on paper
             return to_decimal(starting_balance) if in_book else Decimal(0)
 
-        with self._book_move(into, f"Strategy {name} created with {to_decimal(starting_balance):,.2f}", ts) as c:
+        def joins(c) -> None:
+            # F-ASSIGN-STALE (Advisor ADV-ASSIGN): on a marked book its capital joins at the supervisor's next poll,
+            # after that poll's mark; outside the book until then (supervisor.outside_fund_book), entries refused.
+            self._ensure_paper_account(c)
+            self._wait_move(c, name, "paper", "create", ts)
+
+        defer = None if is_backtest(name) else joins
+        with self._book_move(into, f"Strategy {name} created with {to_decimal(starting_balance):,.2f}", ts,
+                             defer=defer) as c:
             _insert_sleeve(c, ts, name=name, strategy=strategy, instrument=instrument, bar_spec=bar_spec,
                            params=params, starting_balance=starting_balance, risk_profile=risk_profile,
                            warmup_bars=warmup_bars, desired_state=desired_state, venue=venue)
@@ -1307,7 +1337,8 @@ class Store:
         return self.sleeve(name), self.sleeve(name + LEG)
 
     @contextmanager
-    def _book_move(self, amount, why, ts: datetime | None = None, leaving: str | None = None, carry: bool = True):
+    def _book_move(self, amount, why, ts: datetime | None = None, leaving: str | None = None, carry: bool = True,
+                   defer=None, waits_out: list | None = None):
         """A capital move into (amount() > 0) or out of (< 0) the fund's book (HALT-REF-1): the caller's writes, made on
         the connection this yields, and the flow they make commit together under the portfolio gate's lock, so the
         book moves by it and its HWM, the halt's reference and the day's start scale with it (portfolio.gate.apply_flow),
@@ -1316,7 +1347,12 @@ class Store:
         (Supervisor.mark_portfolio). Journaled as a portfolio_flow event. With no state ever marked there is nothing to
         move: the first mark reads the book as it is. leaving: the Strategy put away by this move, which never holds an
         emptied book open itself (supervisor.nothing_open, F286-1). carry: a move that empties the book carries its
-        drawdown and the day's change to the next capital's first mark (MUST-F286-H4); False for a clean slate's."""
+        drawdown and the day's change to the next capital's first mark (MUST-F286-H4); False for a clean slate's.
+        defer: on a marked book, a move that would flow waits for the supervisor's poll instead (F-ASSIGN-STALE,
+        Advisor ADV-ASSIGN: only the poll moves capital on a marked book): no flow now; defer(c) records the waiting
+        move after the caller's writes, on the same connection. A move that flows nothing (the same side of the book)
+        has no stale scale to fear, so it is made at once. waits_out: told (appended to) whether it waits, before the
+        caller's writes, which are then the waiting move's own (defer) rather than the move's."""
         from sleeve_fund.portfolio.gate import apply_flow
         from sleeve_fund.supervisor import nothing_open
 
@@ -1325,7 +1361,13 @@ class Store:
             c = led._local.conn
             marked = c.execute(select(portfolio_state_t.c.book_equity).where(portfolio_state_t.c.id == 1)).scalar()
             amount = amount() if marked is not None else Decimal(0)
+            waits = defer is not None and bool(amount)
+            amount = Decimal(0) if waits else amount
+            if waits_out is not None:
+                waits_out.append(waits)
             yield c
+            if waits:
+                defer(c)
             if amount:
                 before = led.state().reference()
                 emptied = apply_flow(led, amount, lambda: nothing_open(self, led, leaving), ts, carry=carry)
@@ -1852,13 +1894,24 @@ class Store:
 
     def assign_account(self, sleeve: str, account: str) -> None:
         """A move onto or off a test account its venue names moves the Strategy's equity out of or into the fund's
-        book (F229-6), with its flow (HALT-REF-1)."""
-        moved = []
+        book (F229-6), with its flow (HALT-REF-1).
+
+        F-ASSIGN-STALE (Advisor ADV-ASSIGN, 14 Oct 17:41 UK): on a marked book only the supervisor's poll (land_move),
+        after its own mark, moves capital, so P&L made since the last mark is judged at the book's scale first. Asked for
+        anywhere else, a move that would flow waits (book_moves) and the Strategy stays on its old account and its old
+        side of the book until the poll lands it (land_move); a later request replaces it. One whose create is still
+        waiting takes the new account as where it joins. A move that flows nothing is made at once, as is any move on
+        a book never marked."""
+        ts = utcnow()
+        joining = self.book_moves_pending().get(sleeve, {}).get("kind") == "create"
+        moved, waits = [], []
 
         def amount() -> Decimal:
             if is_backtest(sleeve) or sleeve in self.withdrawn():  # out of the book already (F-C3B-A)
                 return Decimal(0)
             s = self.sleeve(sleeve)
+            if joining:
+                return Decimal(1)  # its create waits: where it joins is this account, landed by the poll
             was = _outside_book(self, s)
             if was == _outside_book(self, s, account):
                 return Decimal(0)
@@ -1868,12 +1921,108 @@ class Store:
             part = strategy_equity(self, s)
             return part if was else -part
 
-        with self._book_move(amount, lambda: f"{sleeve} moved {moved[0]} the fund's book (account {account})") as c:
+        def wait(c) -> None:
+            self._wait_move(c, sleeve, account, "create" if joining else "move", ts)
+
+        with self._book_move(amount, lambda: f"{sleeve} moved {moved[0]} the fund's book (account {account})",
+                             defer=wait, waits_out=waits) as c:
             self._ensure_paper_account(c)
             if c.execute(select(accounts_t.c.name).where(accounts_t.c.name == account)).first() is None:
                 raise ValueError(f"no account called {account}")
-            c.execute(sleeve_accounts_t.delete().where(sleeve_accounts_t.c.sleeve == sleeve))
-            c.execute(insert(sleeve_accounts_t).values(sleeve=sleeve, account=account, assigned_at=utcnow()))
+            if not waits[0]:
+                c.execute(sleeve_accounts_t.delete().where(sleeve_accounts_t.c.sleeve == sleeve))
+                c.execute(insert(sleeve_accounts_t).values(sleeve=sleeve, account=account, assigned_at=ts))
+                self._end_waiting(c, sleeve, ts)  # a move made at once replaces any that waited
+
+    # --- F-ASSIGN-STALE: moves waiting for the supervisor's poll -------------------------------------------------
+
+    def _end_waiting(self, c, sleeve: str, ts: datetime) -> list:
+        """Supersede `sleeve`'s waiting move, if any; the rows superseded."""
+        rows = c.execute(select(book_moves_t).where(book_moves_t.c.sleeve == sleeve, book_moves_t.c.landed_at.is_(None),
+                                                    book_moves_t.c.superseded_at.is_(None))).all()
+        if rows:
+            c.execute(update(book_moves_t).where(book_moves_t.c.id.in_([r.id for r in rows]))
+                      .values(superseded_at=ts))
+        return rows
+
+    def _wait_move(self, c, sleeve: str, account: str, kind: str, ts: datetime) -> None:
+        """Record `sleeve`'s move to `account` as waiting for the poll (latest wins), journaled."""
+        before = self._end_waiting(c, sleeve, ts)
+        c.execute(insert(book_moves_t).values(sleeve=sleeve, account=account, kind=kind, requested_at=ts))
+        what = (f"{sleeve} joins the fund's book on account {account}" if kind == "create"
+                else f"{sleeve} moves to account {account}")
+        was = f" (replacing its move to account {before[-1].account})" if before and before[-1].account != account else ""
+        c.execute(insert(events_t).values(
+            sleeve=sleeve, ts=ts, level="info", kind=BOOK_MOVE_WAITING,
+            message=f"{what} at the supervisor's next mark{was}, so what the book made since its last mark counts "
+                    "first; its entries are refused until then"))
+
+    def book_moves_pending(self) -> dict[str, dict]:
+        """Each Strategy's waiting move: {name: {"id", "account", "kind", "requested_at"}}, oldest first."""
+        q = (select(book_moves_t).where(book_moves_t.c.landed_at.is_(None), book_moves_t.c.superseded_at.is_(None))
+             .order_by(book_moves_t.c.id))
+        with self.engine.connect() as c:
+            return {r.sleeve: {"id": r.id, "account": r.account, "kind": r.kind, "requested_at": _aware(r.requested_at)}
+                    for r in c.execute(q)}
+
+    def joining(self, sleeve: str) -> bool:
+        """Whether `sleeve` was created on a marked book and its joining deposit still waits for the poll."""
+        with self.engine.connect() as c:
+            return c.execute(select(book_moves_t.c.id).where(
+                book_moves_t.c.sleeve == sleeve, book_moves_t.c.kind == "create", book_moves_t.c.landed_at.is_(None),
+                book_moves_t.c.superseded_at.is_(None))).first() is not None
+
+    def land_move(self, sleeve: str, ts: datetime | None = None) -> bool:
+        """The supervisor's poll, after its mark: land `sleeve`'s waiting move with its flow at the fresh scale, in one
+        transaction with the account row and the landing (Advisor ADV-ASSIGN). A create joins the book with its
+        equity; a move goes as assign_account would. False when nothing waits."""
+        from sleeve_fund.supervisor import strategy_equity
+
+        ts = ts or utcnow()
+        got, moved, gone = [], [], []
+
+        def amount() -> Decimal:
+            with self.engine.connect() as r:
+                row = r.execute(select(book_moves_t).where(
+                    book_moves_t.c.sleeve == sleeve, book_moves_t.c.landed_at.is_(None),
+                    book_moves_t.c.superseded_at.is_(None))).first()
+            got.append(row)
+            if row is None:
+                return Decimal(0)
+            if sleeve in self.withdrawn() or sleeve in self.archived():
+                gone.append(True)  # put away while it waited: it never lands
+                return Decimal(0)
+            s = self.sleeve(sleeve)
+            into = not _outside_book(self, s, row.account)
+            was = True if row.kind == "create" else _outside_book(self, s)
+            if was == (not into):
+                return Decimal(0)
+            moved.append("joins" if row.kind == "create" else "moved into" if was else "moved out of")
+            part = strategy_equity(self, s)
+            return part if was else -part
+
+        def said() -> str:
+            return f"{sleeve} {moved[0]} the fund's book (account {got[0].account}) at the supervisor's mark"
+
+        with self._book_move(amount, said, ts) as c:
+            row = got[0] if got else None
+            if row is None:
+                return False
+            if gone:
+                c.execute(update(book_moves_t).where(book_moves_t.c.id == row.id).values(superseded_at=ts))
+                c.execute(insert(events_t).values(
+                    sleeve=sleeve, ts=ts, level="info", kind=BOOK_MOVE_LANDED,
+                    message=f"{sleeve} was put away while its move to account {row.account} waited, so it never lands"))
+                return True
+            if not (row.kind == "create" and row.account == "paper" and self.account_of(sleeve) == "paper"):
+                c.execute(sleeve_accounts_t.delete().where(sleeve_accounts_t.c.sleeve == sleeve))
+                c.execute(insert(sleeve_accounts_t).values(sleeve=sleeve, account=row.account, assigned_at=ts))
+            c.execute(update(book_moves_t).where(book_moves_t.c.id == row.id).values(landed_at=ts))
+            c.execute(insert(events_t).values(
+                sleeve=sleeve, ts=ts, level="info", kind=BOOK_MOVE_LANDED,
+                message=(f"{sleeve} joined the fund's book" if row.kind == "create" else f"{sleeve} moved to account "
+                         f"{row.account}") + " at the supervisor's mark"))
+        return True
 
     def archived(self) -> dict[str, datetime]:
         with self.engine.connect() as c:
