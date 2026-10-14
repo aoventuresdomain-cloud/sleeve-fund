@@ -126,3 +126,54 @@ def test_a_top_up_goes_through_the_compliance_tests_and_is_refused_on_a_full_boo
     assert top_ups and all(x["outcome"] == "rejected" and x["approved"] == 0 and x["limit"] == "net_instrument"
                            for x in top_ups)
     assert all(x["side"] == 1 for x in top_ups)  # only ever a long carried into step 0
+
+
+def _at_the_limit(**limits):
+    """Candle-step alone on a 100,000 book, flat prices, no fees or spread, Q asked at 0.6 of the book against
+    compliance limits of 0.5: every open is trimmed."""
+    import pandas as pd
+    from nautilus_trader.model import Venue
+
+    from sleeve_fund.fees import FeeSchedule
+    from sleeve_fund.instruments import spot_pair
+    from sleeve_fund.research.portfolio_run import LegSpec, run_portfolio
+    from sleeve_fund.risk import PortfolioProfile
+    from test_portfolio_run import _daily
+
+    idx = pd.date_range("2024-01-01 01:00", periods=24 * 30, freq="h", tz="UTC")
+    h = pd.DataFrame({"open": 100.0, "high": 100.0, "low": 100.0, "close": 100.0, "volume": 1e9}, index=idx)
+    d = _daily(h)
+    w, window = d.iloc[:20], d.iloc[20:]
+    free = FeeSchedule(D(0), D(0))
+    spec = LegSpec("cs", "candle_step", spot_pair("BTC", "USD", free, Venue("KRAKEN")), window,
+                   h[h.index > w.index[-1]], w, params={k: v for k, v in PARAMS.items() if k != "stop_loss"},
+                   capital=100_000.0, half_spread=0.0, fees=free)
+    profile = {"gross": 100, "net_instrument": 0.5, "margin": 0.5, "open_risk": 100, "drawdown": 0.99,
+               "daily_loss": 0.99, **limits}
+    return run_portfolio([spec], PortfolioProfile(**profile))
+
+
+def test_at_1x_net_and_margin_both_bind_and_the_trim_names_net():
+    """Design (g): at 1x a position's margin is its notional, so net per asset and margin bind at the same 50,000 on a
+    100,000 book; on the tie the trim names net, first in limits.LIMITS order. Margin alone binds at the same size."""
+    first = _at_the_limit().decisions[0]
+    assert (first["outcome"], first["approved"], first["limit"]) == ("trimmed", D(500), "net_instrument")
+    alone = _at_the_limit(net_instrument=100).decisions[0]
+    assert (alone["outcome"], alone["approved"], alone["limit"]) == ("trimmed", D(500), "margin")
+
+
+def test_must_2_a_flip_at_the_size_limit_closes_in_full_and_ends_short_exactly_at_the_limit():
+    """Advisor MUST 2: the flip's close is never gated or refused, so it sells all that is held; the open is then
+    gated on a flat book and trimmed to exactly the limit, 0.5 of the book the gate read (100,000 less the simulated
+    funding paid so far)."""
+    run = _at_the_limit()
+    fills = run.legs["cs"].fills.sort_values("ts_last")
+    sides = [(r["side"], D(str(r["filled_qty"]))) for _, r in fills.iterrows()]
+    assert sides[:4] == [("BUY", D(500)), ("SELL", D(200)), ("SELL", D(300)), ("SELL", sides[3][1])]
+    flip = run.decisions[1]
+    assert (flip["side"], flip["outcome"], flip["limit"]) == (-1, "trimmed", "net_instrument")
+    assert "(now 0.00x)" in flip["reason"]  # gated after the close filled: the book was flat
+    import pandas as pd
+
+    book = D(str(run.book.asof(pd.Timestamp(flip["ts"]))))
+    assert flip["approved"] * flip["price"] == book / 2 and sides[3][1] == flip["approved"]
