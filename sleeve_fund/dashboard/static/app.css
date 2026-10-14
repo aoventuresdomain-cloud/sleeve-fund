@@ -1291,3 +1291,7 @@ table.movers tbody tr.tot th, table.movers tbody tr.tot td { border-top: 1px sol
 @media (max-width: 1100px) { .ps-two { grid-template-columns: 1fr; } }
 .ps-two .tbl-wrap, .panel > .tbl-wrap { overflow-x: auto; }
 .ps-groups td { white-space: normal; }
+/* C7: the fund's state, one banner at the top of Portfolio, a Strategy and Portfolio Settings. */
+.fund-banner { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+.fund-banner form { margin: 0 0 0 auto; }
+.fund-banner > button { margin-left: auto; }

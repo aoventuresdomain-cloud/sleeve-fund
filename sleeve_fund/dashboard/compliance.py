@@ -6,11 +6,13 @@ through the Store only. Use now is the entry gate's own book (as withdrawal.limi
 from __future__ import annotations
 
 from decimal import Decimal, InvalidOperation
+from zoneinfo import ZoneInfo
 
 from sleeve_fund import compliance_rules as rules
 from sleeve_fund.dashboard.riskops import NEAR_LIMIT
 from sleeve_fund.store import Store
 
+UK = ZoneInfo("Europe/London")
 ACTION_WORDS = {"trim": "Refuse or trim", "refuse": "Refuse", "pause_day": "Pause new trades", "halt": "Flatten and halt"}
 
 
@@ -229,3 +231,40 @@ def refused(store: Store, sleeve: str | None = None, since=None, limit: int = 20
         out.append({**r, "test": words,
                     "side": {"BUY": "Buy", "SELL": "Sell", "long": "Long", "short": "Short"}.get(side, side)})
     return out
+
+
+def fund_state(store: Store) -> dict | None:
+    """The engine's fund state (PE2, Drop B): {state, since, until, reason}, or None until the engine has it. Display
+    only: nothing here works out a state on its own."""
+    try:
+        from sleeve_fund.gate_ledger import fund_state as engine  # PE2's, once it lands
+    except ImportError:
+        return None
+    try:
+        return engine(store)
+    except Exception:  # noqa: BLE001 - an unreadable state shows no banner here; the gate still refuses on its own
+        return None
+
+
+def fund_banner(store: Store) -> dict | None:
+    """C7: the one banner at the top of Portfolio Settings, a Strategy page and Portfolio, only when it applies:
+    the daily brake, the drawdown halt, a failed book check or a fund value out of date."""
+    s = fund_state(store)
+    if not s or s.get("state") in (None, "normal"):
+        return None
+    reason = s.get("reason")
+    state = s["state"]
+    if state == "brake":
+        until = s.get("until")
+        text = "New trades paused until the next day begins" + (f" ({until.astimezone(UK):%H:%M} UK)" if until else "")
+        return {"state": state, "tone": "warn", "text": text, "reason": reason}
+    if state == "halt":
+        return {"state": state, "tone": "loss", "text": "The fund is flattened and halted", "reason": reason,
+                "restart": s.get("restart_url")}
+    if state == "book_check":
+        return {"state": state, "tone": "loss", "text": "The book check failed, so new trades are blocked",
+                "reason": reason, "resume_off": reason or "The fund's book doesn't match the account"}
+    if state == "stale":
+        return {"state": state, "tone": "warn",
+                "text": "The fund's value is out of date, so new trades are refused until it updates", "reason": reason}
+    return None

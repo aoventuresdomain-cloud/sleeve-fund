@@ -66,6 +66,7 @@ ROOT = HERE.parent.parent
 TEARSHEETS = study_run.TEARSHEETS
 LEDGER = study_run.LEDGER
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,40}$")
+FUND_BANNER_PAGES = {"home.html", "sleeve.html", "portfolio_settings.html"}  # C7: Portfolio, a Strategy, Portfolio Settings
 VERSION = os.environ.get("APP_VERSION", "dev")[:12]
 ORDER_HISTORY_ROWS = 15  # the strategy page's Order history; the Blotter has the rest
 
@@ -233,6 +234,8 @@ def create_app(store: Store | None = None) -> FastAPI:
 
     def page(request: Request, name: str, **ctx) -> HTMLResponse:
         ctx.setdefault("shell", shell())
+        if name in FUND_BANNER_PAGES:  # C7: one banner at the top, only when it applies
+            ctx.setdefault("fund_banner", compliance.fund_banner(st()))
         return templates.TemplateResponse(request, name, ctx)
 
     def _saved_backtest_summary(name: str | None) -> dict | None:
