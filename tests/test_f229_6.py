@@ -214,3 +214,80 @@ def test_a3_a_flat_archived_run_put_away_by_a_reset_adds_nothing(tmp_path):
     assert run in store.reset_runs() and run in store.archived()
     assert portfolio_gate.fund_holdings(store, atr_pct=_atr) == ()
     assert open_risk.book_open_risk(store, _atr) == [] and open_risk.account_book(store, "x", 0.0, _atr)[1] == 0
+
+
+# --- F229-6-a (Advisor MUST, HoE 14 Oct 01:05 UK, HoQA cells C1-C3): the interim 5% check's readers (open_risk's
+# account_equity, account_book and book_open_risk) and the Open risk tile read the same set as the gate.
+
+def _perp(store, name, inst, venue, qty, *, archive=False):
+    """A perp Strategy on the default "paper" account, holding qty at 60,000 with a 1% stop (0: flat), marked."""
+    store.create_sleeve(name=name, strategy="ping_pong", instrument=inst, bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=10_000, venue=venue, params={"market": "perp"})
+    if qty:
+        side = "BUY" if qty > 0 else "SELL"
+        store.record_order(name, order_id=f"e-{name}", side=side, qty=abs(qty), intent="entry", reason="r",
+                           signal={"stop_frac": 0.01}, ts=T_MARK)
+        store.record_fill(name, side=side, qty=abs(qty), price=60_000.0, fee=0.0, order_id=f"e-{name}",
+                          trade_id=f"t-{name}", ts=T_MARK)
+    store.record_equity(name, equity=10_000.0, cash=10_000.0 - qty * 60_000.0, qty=qty, price=60_000.0,
+                        benchmark=10_000.0, ts=T_MARK + timedelta(minutes=1))
+    if archive:
+        store.set_desired_state(name, "stopped")
+        store.archive(name)
+
+
+def _fund(tmp_path, db, test_qty=None):
+    """Two fund Strategies on "paper" (one archived still holding, C3) and a flat one about to enter; with test_qty,
+    a USD test Strategy on "paper" too, outside the fund's book."""
+    store = Store(f"sqlite:///{tmp_path}/{db}.db", portfolio_gate=True)
+    _perp(store, "fund", "BTC/USDT", "BINANCE", 0.1)
+    _perp(store, "held", "ETH/USDT", "BINANCE", -0.1, archive=True)
+    _perp(store, "entry", "SOL/USDT", "BINANCE", 0)
+    if test_qty is not None:
+        _perp(store, "usd-test", "BTC/USD", "KRAKEN", test_qty)
+        assert supervisor.outside_fund_book(store, store.sleeve("usd-test"))
+    return store
+
+
+@pytest.mark.parametrize("test_qty", [0, 0.1])
+def test_c1_the_open_risk_tiles_percent_equals_the_gates_without_the_test_strategy(tmp_path, test_qty):
+    from sleeve_fund import open_risk
+    from sleeve_fund.dashboard import trading
+
+    store = _fund(tmp_path, "c1", test_qty)
+    rows = open_risk.book_open_risk(store, _atr)
+    assert [r["sleeve"] for r in rows] == ["fund", "held"]  # the archived holder counts (C3), the test one doesn't
+    book = open_risk.account_equity(store, "paper")
+    assert book == 30_000  # fund, held and entry: the test Strategy's equity is not in it
+    gate_book, gate_risk, _ = open_risk.account_book(store, "entry", 10_000.0, _atr)
+    positions = [{"sleeve": n, "perp_limit": True, "margin": 0.0} for n in ("fund", "held", "usd-test")]
+    tile = trading.open_risk(positions, store)
+    assert tile["book"] == gate_book == book
+    assert tile["open_risk"] / tile["book"] == pytest.approx(gate_risk / gate_book)
+    assert tile["left_out"] == ["usd-test"]  # named on the tile as not counted
+
+
+def test_c2_the_interim_5pct_check_decides_the_same_with_or_without_the_test_strategy(tmp_path):
+    from sleeve_fund import open_risk
+
+    without = open_risk.account_book(_fund(tmp_path, "c2a"), "entry", 10_000.0, _atr)
+    holding = open_risk.account_book(_fund(tmp_path, "c2b", 0.1), "entry", 10_000.0, _atr)
+    flat = open_risk.account_book(_fund(tmp_path, "c2c", 0), "entry", 10_000.0, _atr)
+    assert without == holding == flat
+    book, risk, _ = without
+    entry = 0.05 * book - risk + 1  # just over the limit
+    assert open_risk.check_entry(book, risk, entry) is not None
+    assert open_risk.check_entry(book, risk, entry - 2) is None
+
+
+def test_c3_an_archived_holder_counts_in_all_three_readers_until_flat(tmp_path):
+    from sleeve_fund import open_risk
+
+    store = _fund(tmp_path, "c3", 0.1)
+    before = open_risk.account_book(store, "entry", 10_000.0, _atr)
+    assert before[1] == pytest.approx(60.0 + 60.0)  # fund's and held's 1% stops
+    store.record_fill("held", side="BUY", qty=0.1, price=60_000.0, fee=0.0, order_id="x-held", trade_id="x-held",
+                      ts=T_MARK + timedelta(minutes=2))
+    assert [r["sleeve"] for r in open_risk.book_open_risk(store, _atr)] == ["fund"]
+    assert open_risk.account_equity(store, "paper") == 20_000  # fund and entry
+    assert open_risk.account_book(store, "entry", 10_000.0, _atr)[1] == pytest.approx(60.0)

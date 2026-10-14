@@ -315,7 +315,7 @@ def risk_cell(p: dict, row: dict | None) -> dict:
 
 # Why a part is left out of Open risk, by risk_cell kind, as the hover says it.
 LEFT_OUT = {"unknown": "no stop to measure and its daily ATR isn't known yet, so not counted",
-            "none": "not counted by the open-risk limit (archived)",
+            "none": "not counted by the open-risk limit (outside the fund's book)",
             "trailing": "trailing stop, level not shown, not counted",
             "unbounded": "no stop, so unbounded",
             "spot_through": "the price has gone through its stop and the position is still open, not counted"}
@@ -357,8 +357,10 @@ def open_risk(positions: list[dict], store: Store | None = None) -> dict:
     total, counted, estimated, through, left_out = _tally(perps)
     spot_total, spot_counted, _, _, spot_left = _tally(spots)
     trailing = [p["sleeve"] for p in positions if p.get("trailing_model")]
+    accounts = _by_account(store, perps) if store is not None else []
     return {
-        "accounts": _by_account(store, perps) if store is not None else [],
+        "accounts": accounts,
+        "book": _one_book(store, perps) if store is not None and not accounts else None,
         "margin": sum(p["margin"] for p in positions),
         "open_risk": total if counted or not left_out else None,
         "estimated": estimated,
@@ -398,6 +400,16 @@ def _by_account(store: Store, perps: list[tuple[str, dict]]) -> list[dict]:
                     "left_out": [n for names in left_out.values() for n in names],
                     "book": limit.account_equity(store, a["name"])})
     return out
+
+
+def _one_book(store: Store, perps: list[tuple[str, dict]]) -> float | None:
+    """The book the gate measures the Open risk tile's figure against when its perpetuals are on one account
+    (open_risk.account_equity), so the tile's % of book equals the gate's: neither a Strategy outside the fund's book
+    nor an archived, flat one counts (F229-6-a). None when there are none, or they span accounts."""
+    from sleeve_fund import open_risk as limit
+
+    names = {store.account_of(n) for n, _ in perps}
+    return limit.account_equity(store, names.pop()) if len(names) == 1 else None
 
 
 def open_risk_hint(estimated: list[str], through: list[str], left_out: dict[str, list[str]],

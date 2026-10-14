@@ -24,7 +24,7 @@
 {% macro _room(risk, left_out, equity, plain) %}{% if risk is not none and equity and equity > 0 %}{% set room = open_risk_limit * equity - risk %}{% if room >= 0 %}{{ 'at most ' if left_out }}{{ room|money }} headroom to the {{ open_risk_limit|pct0 }} limit · {{ (risk / equity)|pct1 }} of book{% else %}{% if not plain %}<span class="loss">{% endif %}over the {{ open_risk_limit|pct0 }} limit by {{ (-room)|money }}{% if not plain %}</span>{% endif %} · {{ (risk / equity)|pct1 }} of book{% endif %}{% endif %}{% endmacro %}
 {# With strategies on more than one account, each account holding a perpetual strategy gets its own line, against its
    own book, as the gate measures it (RR-1; a spot-only account has no 5% limit, QA-F215-1); with one, the book's. #}
-{% macro open_risk_room(r, equity, plain=False) %}{% if r.accounts %}{% set ns = namespace(n=0) %}{% for a in r.accounts %}{% set line = _room(a.open_risk, a.left_out, a.book, plain)|trim %}{% if line %}{{ ' · ' if ns.n }}{{ a.name }}: {{ line }}{% set ns.n = ns.n + 1 %}{% endif %}{% endfor %}{% else %}{{ _room(r.open_risk, r.left_out, equity, plain) }}{% endif %}{% endmacro %}
+{% macro open_risk_room(r, equity, plain=False) %}{% if r.accounts %}{% set ns = namespace(n=0) %}{% for a in r.accounts %}{% set line = _room(a.open_risk, a.left_out, a.book, plain)|trim %}{% if line %}{{ ' · ' if ns.n }}{{ a.name }}: {{ line }}{% set ns.n = ns.n + 1 %}{% endif %}{% endfor %}{% else %}{{ _room(r.open_risk, r.left_out, r.book if r.book else equity, plain) }}{% endif %}{% endmacro %}
 {# Spot, outside the 5% limit: its own line, the risk to its stops, with the same "+" and count for what it leaves out. #}
 {% macro spot_risk_text(r) %}spot, outside the limit: {% if r.spot_risk is none %}–{% else %}{{ r.spot_risk|money }}{% if r.spot_left_out %}+{% endif %}{% endif %} to stop{% if r.spot_left_out %} · {{ r.spot_left_out|length }} not counted{% endif %}{% endmacro %}
 {# The hover on an Open risk figure: each strategy whose part is estimated or left out, and why (trading.open_risk). #}
@@ -38,7 +38,7 @@
 {%- elif c.kind == 'trailing' %}<span class="faint" title="Its stop trails the highest close since entry, and the level isn't journaled yet, so its risk to the stop isn't shown or counted in Open risk">trailing · level not shown</span>
 {%- elif c.kind == 'spot_through' %}<span class="warn" title="The price has gone through its stop and the position is still open">past stop</span>
 {%- elif c.kind == 'unbounded' %}<span class="warn" title="No stop-loss, so the loss is not bounded by a stop">unbounded</span>
-{%- else %}<span class="faint" title="Not counted by the open-risk limit (archived)">–</span>{% endif %}{% endmacro %}
+{%- else %}<span class="faint" title="Not counted by the open-risk limit (outside the fund's book)">–</span>{% endif %}{% endmacro %}
 {# How far the stop sits from the mark towards liquidation (trading.stop_to_liquidation). Over half way breaks the
    half-way rule; at or past liquidation the venue would liquidate first (Advisor 7 Oct 18:50 UK). #}
 {# The stop's distance towards liquidation (trading.stop_to_liquidation), in words: faint within the half-way rule,

@@ -6,8 +6,8 @@ portfolio limits, P2-2, absorb it). A new entry is refused when the book's open 
   not its entry. One the price has already gone through, still open, counts as stopless (and alerts).
 - A position with no placed stop counts at notional x max(10%, 3 x the daily Wilder ATR(14) as a share of price). Full
   margin would assume a 100% move at 1x; the 1x cap on such a position (strategies.check_perp_stop) bounds the tail.
-- The book is the current equity of every paper strategy on the same account that isn't archived and flat, read from
-  the journal, and its open risk is theirs plus the entry's.
+- The book is the current equity of every paper strategy on the same account that isn't archived and flat or outside
+  the fund's book, read from the journal, and its open risk is theirs plus the entry's.
 
 Paper gates on it. A single-strategy backtest doesn't: its book would be the strategy's own equity, so research results
 would depend on how the book is made up. It counts how often the limit would have bound instead (BacktestResult).
@@ -140,16 +140,21 @@ def gapped(qty: float, mark: float, stop: float | None) -> bool:
     return bool(qty) and stop is not None and (mark - stop) * qty <= 0
 
 
-def _put_away(store, s, archived) -> bool:
-    """Archived and flat. One archived while still holding stays in the book's figures until it is flat, as on the
-    dashboard and in the portfolio gate (Advisor 14 Oct 00:15 UK, F229-6)."""
+def _left_out(store, s, archived) -> bool:
+    """Not in the book's figures: archived and flat, or outside the fund's book (a sub-8dp test Strategy,
+    supervisor.outside_fund_book), the same set the portfolio gate and fund_equity read. One archived while still
+    holding stays in until it is flat (Advisor 14 Oct 00:15 UK, F229-6 and F229-6-a)."""
+    from sleeve_fund.supervisor import outside_fund_book
+
+    if outside_fund_book(store, s):
+        return True
     return s.name in archived and abs(store.journal_book(s.name, s.starting_balance)["qty"]) <= 1e-12
 
 
 def book_open_risk(store, atr_pct, account: str | None = None) -> list[dict]:
     """Read-only, for the dashboard's Open risk (FE v2, signature agreed with PE2 7 Oct): what the limit counts for
     each open perp position, by the same rules as account_book, so the tile equals the gate. One row per strategy
-    that isn't archived and flat, is a perpetual and holds a position, in store.sleeves() order, on `account` (None:
+    that isn't left out (_left_out), is a perpetual and holds a position, in store.sleeves() order, on `account` (None:
     every account): {sleeve, risk, basis, atr_pct}. basis is "stop" (measured to its journaled stop), "stopless" (no
     placed stop, a close-checked trail included) or "gapped" (the price has gone through its stop, still open).
     `atr_pct(sleeve)` is asked only for stopless and gapped rows; risk is None when it gives nothing. Never raises."""
@@ -158,7 +163,7 @@ def book_open_risk(store, atr_pct, account: str | None = None) -> list[dict]:
     archived = store.archived()
     rows = []
     for s in store.sleeves():
-        if _put_away(store, s, archived) or (account is not None and store.account_of(s.name) != account):
+        if _left_out(store, s, archived) or (account is not None and store.account_of(s.name) != account):
             continue
         last = store.last_equity(s.name)
         if last is None or not last["qty"] or not markets.is_perp(s.params):
@@ -184,11 +189,11 @@ def book_open_risk(store, atr_pct, account: str | None = None) -> list[dict]:
 
 def account_equity(store, account: str) -> float:
     """The book the limit measures an account's open risk against: the current equity of every strategy on the
-    account that isn't archived and flat (its starting balance before its first mark), as account_book adds it up."""
+    account that isn't left out (_left_out; its starting balance before its first mark), as account_book adds it up."""
     archived = store.archived()
     book = 0.0
     for s in store.sleeves():
-        if _put_away(store, s, archived) or store.account_of(s.name) != account:
+        if _left_out(store, s, archived) or store.account_of(s.name) != account:
             continue
         last = store.last_equity(s.name)
         book += s.starting_balance if last is None else last["equity"]
@@ -205,7 +210,7 @@ def account_book(store, sleeve_name: str, own_equity: float, atr_pct) -> tuple[f
     archived = store.archived()
     book, risk, through = own_equity, 0.0, []
     for s in store.sleeves():
-        if s.name == sleeve_name or _put_away(store, s, archived) or store.account_of(s.name) != account:
+        if s.name == sleeve_name or _left_out(store, s, archived) or store.account_of(s.name) != account:
             continue
         last = store.last_equity(s.name)
         if last is None:
