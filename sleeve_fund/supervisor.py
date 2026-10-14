@@ -128,6 +128,29 @@ def fund_book(store: Store, since: datetime | None = None) -> FundBook:
     return FundBook(since, capital, pnl, positions)
 
 
+def sizing_equity(store: Store, now: datetime | None = None) -> Decimal | None:
+    """The fund equity a Strategy sizes off (Advisor Q5, CUT-A; QD's strategy.fund_equity): the book at its last
+    mark less every open position's unrealised gain, so a gain not yet taken never sizes anything, while a loss
+    counts in full. None when the book's mark is older than the gate's MARK_STALE (or never made): sizing then
+    refuses the entry as "fund equity stale", as the gate would."""
+    from sleeve_fund.portfolio.gate import MARK_STALE
+
+    now = now or utcnow()
+    st = DbLedger(store, lambda: ()).state()
+    if st.equity is None or st.mark_ts is None or now - st.mark_ts > MARK_STALE:
+        return None
+    gains = Decimal(0)
+    for s in store.sleeves():
+        if not _in_book(store, s):
+            continue
+        book = store.journal_book(s.name, s.starting_balance)
+        qty = to_decimal(book["qty"], "qty")
+        last = store.last_equity(s.name) if qty != 0 else None
+        if qty != 0 and last is not None and last["price"] and book["entry_px"]:
+            gains += max(qty * (to_decimal(last["price"], "mark") - to_decimal(book["entry_px"], "entry")), Decimal(0))
+    return st.equity - gains
+
+
 def book_part(store: Store, s) -> Decimal:
     """What moves into or out of the book when Strategy `s` joins or leaves it: its equity while it carries its own
     capital; nothing once the fund holds the cash (Bridge Drop A), when a create, a move or a put-away only changes

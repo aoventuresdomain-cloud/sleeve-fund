@@ -173,3 +173,27 @@ def test_empty_book_pockets_names_a_strategy_still_counted_and_none_when_empty(s
     _make(store, "a", 5_000)
     _settle(store, "a", T0)
     assert any(p.startswith("a 5,000.00") for p in supervisor.empty_book_pockets(store))
+
+
+def test_sizing_equity_is_the_marked_book_less_open_gains_and_none_when_stale(store):  # noqa: F811
+    _rebased(store)
+    _make(store, "x", 0)
+    store.record_fill("x", side="BUY", qty=1.0, price=1_000.0, fee=0.0, order_id="b1", trade_id="tb1", ts=T0 + MIN)
+    store.record_equity("x", equity=200.0, cash=-1_000.0, qty=1.0, price=1_200.0, benchmark=0.0, ts=T0 + MIN)
+    _mark(store, T0 + MIN)  # the book: 100,000 - 1,000 + 1,200 = 100,200, a 200 gain open
+    assert supervisor.sizing_equity(store, T0 + MIN) == D(100_000)
+    store.record_equity("x", equity=-300.0, cash=-1_000.0, qty=1.0, price=700.0, benchmark=0.0, ts=T0 + 2 * MIN)
+    _mark(store, T0 + 2 * MIN)  # a 300 loss open counts in full
+    assert supervisor.sizing_equity(store, T0 + 2 * MIN) == D(99_700)
+    assert supervisor.sizing_equity(store, T0 + 4 * MIN) is None  # the mark is over 60 s old
+
+
+def test_the_interim_open_risk_book_is_the_funds_once_it_holds_the_cash(store):  # noqa: F811
+    """CUT-A (d): open_risk.account_book reads no Strategy's own equity after the re-base."""
+    from sleeve_fund import open_risk
+
+    _rebased(store)
+    _make(store, "x", 0)
+    _make(store, "y", 0)
+    book, risk, through = open_risk.account_book(store, "x", 0.0, lambda s: None)
+    assert (book, risk, through) == (100_000.0, 0.0, [])

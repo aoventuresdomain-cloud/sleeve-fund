@@ -255,16 +255,22 @@ def account_book(store, sleeve_name: str, own_equity: float, atr_pct) -> tuple[f
     ValueError when a stopless position can't be measured."""
     from sleeve_fund import markets
 
+    from sleeve_fund import supervisor
+
     account = store.account_of(sleeve_name)
     earlier, runs, out = store.previous_book(), store.reset_runs(), store.withdrawn()
-    book, risk, through = own_equity, 0.0, []
+    # CUT-A (d): once the fund holds the cash no Strategy has equity of its own, so the book is the fund's (fund_book),
+    # never a sum of Strategies' marks
+    fund_held = supervisor.bridge_start(store) is not None
+    book, risk, through = (float(supervisor.fund_book(store).total) if fund_held else own_equity), 0.0, []
     for s in store.sleeves():
         if s.name == sleeve_name or store.account_of(s.name) != account:
             continue
         part = _book_part(store, s, earlier, runs, out)
         if part is None:
             continue
-        book += part
+        if not fund_held:
+            book += part
         last = store.last_equity(s.name)
         if s.name in earlier or last is None or not last["qty"] or not markets.is_perp(s.params):
             continue
