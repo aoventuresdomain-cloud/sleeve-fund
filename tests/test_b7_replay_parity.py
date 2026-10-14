@@ -161,6 +161,21 @@ def test_parity_lists_an_entry_sent_outside_a_bar_decision_without_comparing_it(
     assert "2 opening fill(s)" in out
 
 
+def test_parity_lists_a_strategy_outside_the_fund_s_book_without_comparing_it(capfd, monkeypatch):
+    # F277-QA1: a test-account Strategy outside the book (F229-6) reaches compare() as `outside`, so a backtest that
+    # decided differently is listed apart, not failed.
+    import sleeve_fund.supervisor as supervisor
+
+    monkeypatch.setattr(supervisor, "outside_fund_book", lambda store, s: s.name == NAME)
+    run = _backtest(_decided(requested=D("0.150"), approved=D("0.150")))
+    assert b7.parity(_journal(), NAME, T0, history=HISTORY, instrument=INST, run=run) == 0
+    out = capfd.readouterr().out
+    assert "decisions: paper 0, backtest 0, matched 0" in out
+    assert "outside the fund's book (listed, not compared): paper 1, backtest 1" in out
+    monkeypatch.setattr(supervisor, "outside_fund_book", lambda store, s: False)  # in the book: the same run fails
+    assert b7.parity(_journal(), NAME, T0, history=HISTORY, instrument=INST, run=run) == 1
+
+
 @pytest.mark.parametrize("case,why", [
     ("no-decision", "no gate decision on a bar journaled in the window"),
     ("held-before", "the replay starts only from flat"),
