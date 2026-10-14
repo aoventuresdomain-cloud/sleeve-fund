@@ -2291,22 +2291,19 @@ def test_no_venues_keeps_account_and_key_names():
     assert no_venues(None) is None and no_venues("") == ""
 
 
-def test_the_spot_cap_bar_reads_on_the_exposure_basis(client):
-    """P1-U17: on spot the limit bar uses the same basis as the Exposure figure (value at today's price against
-    the entry cap), so its hover and screen-reader text agree with it after the price has moved."""
+def test_the_spot_exposure_reads_on_its_own_with_no_entry_cap(client):
+    """TEC-FE-CAP (HoE, 14 Oct 2026): the per-Strategy position cap is gone from the engine, so no page shows one.
+    Exposure is still the value at today's price over the Strategy's equity (P1-U17's basis), with no cap beside it
+    and no cap bar."""
     c, store = client
     _new(c)
     store.record_fill("btc-test", side="BUY", qty=0.05, price=60_000, fee=2.4, order_id="o1", trade_id="t1")
     store.record_equity("btc-test", equity=5_600, cash=2_000, qty=0.05, price=72_000, benchmark=5_000)
     page = c.get("/sleeves/btc-test", auth=AUTH).text
-    shown, cap = map(float, re.search(r"<dt[^>]*>Exposure</dt><dd>([\d.]+)× equity <span class=\"faint\">· cap "
-                                      r"([\d.]+)×", page).groups())
-    bar = re.search(r'<div class="exposure-cap" title="([^"]+)"><span class="k">Exposure of cap</span>'
-                    r'<span class="meter[^"]*" role="img" aria-label="(\d+)% of the entry cap used"', page)
-    assert bar, "the spot limit bar is on the exposure basis"
-    assert f"Exposure {shown:.2f}× equity, against an entry cap of {cap:.2f}×" in bar.group(1)
-    assert int(bar.group(2)) == round(3_600 / 5_600 / cap * 100)
-    assert "Isolated margin of cap" not in page and "Position of cap" not in page
+    shown = float(re.search(r"<dt[^>]*>Exposure</dt><dd>([\d.]+)× equity</dd>", page).group(1))
+    assert shown == round(3_600 / 5_600, 2)
+    for gone in ("Exposure of cap", "exposure-cap", "entry cap", "· cap", "Isolated margin of cap", "Position of cap"):
+        assert gone not in page, gone
 
 
 def test_an_atr_stop_says_it_is_the_simple_atr_and_the_chart_draws_it(client):

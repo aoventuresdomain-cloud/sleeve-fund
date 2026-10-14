@@ -103,9 +103,8 @@ def test_fees_and_funding_as_a_share_of_gross_pnl(pages):
     assert flat["costs"] == 0.0 and flat["cost_share"] is None  # nothing made or paid yet
 
 
-def test_the_strategy_page_limit_bar_measures_margin_against_the_profile_cap(pages):
+def test_the_strategy_page_carries_its_margin_with_no_profile_cap(pages):
+    # TEC-FE-CAP (HoE, 14 Oct 2026): the per-Strategy position cap is gone from the engine, so no margin-of-cap bar.
     risk, x = pages["sleeve.html"]["risk"], pages["sleeve.html"]["x"]  # the last strategy page read: rsi-long
-    cap = profile("balanced").max_position_pct * x["equity"]
-    assert risk["margin"] == pytest.approx(1_500.0) and risk["margin_cap"] == pytest.approx(cap)
-    assert risk["margin_used"] == pytest.approx(1_500.0 / cap)
+    assert risk["margin"] == pytest.approx(1_500.0) and "margin_cap" not in risk and "margin_used" not in risk
     assert x["room"] > 0  # room to halt in money, as #116 left it
