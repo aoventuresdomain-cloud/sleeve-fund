@@ -6,8 +6,9 @@ portfolio limits, P2-2, absorb it). A new entry is refused when the book's open 
   not its entry. One the price has already gone through, still open, counts as stopless (and alerts).
 - A position with no placed stop counts at notional x max(10%, 3 x the daily Wilder ATR(14) as a share of price). Full
   margin would assume a 100% move at 1x; the 1x cap on such a position (strategies.check_perp_stop) bounds the tail.
-- The book is the current equity of every paper strategy on the same account that isn't archived, read from the
-  journal, and its open risk is theirs plus the entry's.
+- The book is the current equity of every paper strategy on the same account in the dashboard's current book (not an
+  earlier book's, Store.previous_book) and inside the fund's book, read from the journal, and its open risk is theirs
+  plus the entry's.
 
 Paper gates on it. A single-strategy backtest doesn't: its book would be the strategy's own equity, so research results
 would depend on how the book is made up. It counts how often the limit would have bound instead (BacktestResult).
@@ -19,6 +20,7 @@ import math
 from datetime import datetime, timedelta
 from decimal import Decimal
 
+import numpy as np
 import pandas as pd
 
 
@@ -76,11 +78,22 @@ def daily_atr_lookup(prices: pd.DataFrame) -> dict[int, float]:
     # A bar stamped at its close belongs to the day it closes in, less a nanosecond: the bar closing at 00:00 is the day before's.
     days = prices[["high", "low", "close"]].groupby((prices.index - pd.Timedelta(1, "ns")).floor("D")).agg(
         {"high": "max", "low": "min", "close": "last"})
+    # daily_atr_pct on each day's window, read from plain arrays: the same rows in the same order through the same Atr,
+    # so the same floats, without a DataFrame slice per day (PERF-ATR: it was ~90% of a perp backtest).
+    from sleeve_fund.strategies.indicators.averages import Atr
+
+    high, low, close = (days[c].to_numpy(dtype=float) for c in ("high", "low", "close"))
+    whole = ~(np.isnan(high) | np.isnan(low) | np.isnan(close))
+    starts = days.index + pd.Timedelta(days=1)
     out = {}
     for i in range(ATR_DAYS - 1, len(days)):
-        v = daily_atr_pct(days.iloc[max(0, i + 1 - ATR_WINDOW):i + 1])
-        if v is not None:
-            out[int((days.index[i] + pd.Timedelta(days=1)).value)] = v
+        rows = [j for j in range(max(0, i + 1 - ATR_WINDOW), i + 1) if whole[j]]
+        if len(rows) < ATR_DAYS or close[rows[-1]] <= 0:
+            continue
+        atr = Atr(ATR_DAYS)
+        for j in rows:
+            atr.update_raw(high[j], low[j], close[j])
+        out[int(starts[i].value)] = atr._outputs()["value"] / float(close[rows[-1]])
     return out
 
 
@@ -140,19 +153,50 @@ def gapped(qty: float, mark: float, stop: float | None) -> bool:
     return bool(qty) and stop is not None and (mark - stop) * qty <= 0
 
 
+def _left_out(store, s, earlier) -> bool:
+    """Not in the book's holdings or risk: a Strategy an earlier book put away (Store.previous_book, `earlier`), or
+    one outside the fund's book (a sub-8dp test Strategy, supervisor.outside_fund_book). The rest is the dashboard's
+    current book: one archived in it while still holding counts in full, and one archived flat keeps its equity in at
+    no risk (Advisor 14 Oct 00:15 UK and C3, F229-6 and F229-6-a)."""
+    from sleeve_fund.supervisor import outside_fund_book
+
+    return s.name in earlier or outside_fund_book(store, s)
+
+
+def _put_away_equity(store, s, runs) -> float:
+    """What a Strategy an earlier book put away still adds to the book, as supervisor.fund_equity counts it, so the
+    limit's book is the portfolio gate's and the tile's (Advisor C3b, option B): a reset's run its cash movement
+    only (its capital is its successor's), one a clean slate put away (flat) its capital and that movement."""
+    cash = float(store.strategy_cash_pnl(s.name))
+    return cash if s.name in runs else s.starting_balance + cash
+
+
+def _book_part(store, s, earlier, runs) -> float | None:
+    """A Strategy's part of its account's book, or None when it is outside the fund's book. Put away by an earlier
+    book: its put-away equity, at no risk. Otherwise its current equity (its starting balance before its first mark)."""
+    from sleeve_fund.supervisor import outside_fund_book
+
+    if outside_fund_book(store, s):
+        return None
+    if s.name in earlier:
+        return _put_away_equity(store, s, runs)
+    last = store.last_equity(s.name)
+    return s.starting_balance if last is None else last["equity"]
+
+
 def book_open_risk(store, atr_pct, account: str | None = None) -> list[dict]:
     """Read-only, for the dashboard's Open risk (FE v2, signature agreed with PE2 7 Oct): what the limit counts for
     each open perp position, by the same rules as account_book, so the tile equals the gate. One row per strategy
-    that isn't archived, is a perpetual and holds a position, in store.sleeves() order, on `account` (None: every
-    account): {sleeve, risk, basis, atr_pct}. basis is "stop" (measured to its journaled stop), "stopless" (no
+    that isn't left out (_left_out), is a perpetual and holds a position, in store.sleeves() order, on `account` (None:
+    every account): {sleeve, risk, basis, atr_pct}. basis is "stop" (measured to its journaled stop), "stopless" (no
     placed stop, a close-checked trail included) or "gapped" (the price has gone through its stop, still open).
     `atr_pct(sleeve)` is asked only for stopless and gapped rows; risk is None when it gives nothing. Never raises."""
     from sleeve_fund import markets
 
-    archived = store.archived()
+    earlier = store.previous_book()
     rows = []
     for s in store.sleeves():
-        if s.name in archived or (account is not None and store.account_of(s.name) != account):
+        if _left_out(store, s, earlier) or (account is not None and store.account_of(s.name) != account):
             continue
         last = store.last_equity(s.name)
         if last is None or not last["qty"] or not markets.is_perp(s.params):
@@ -177,15 +221,15 @@ def book_open_risk(store, atr_pct, account: str | None = None) -> list[dict]:
 
 
 def account_equity(store, account: str) -> float:
-    """The book the limit measures an account's open risk against: the current equity of every strategy on the
-    account that isn't archived (its starting balance before its first mark), as account_book adds it up."""
-    archived = store.archived()
+    """The book the limit measures an account's open risk against: every strategy on the account inside the fund's
+    book, as account_book adds it up (_book_part), so one account's book is supervisor.fund_equity."""
+    earlier, runs = store.previous_book(), store.reset_runs()
     book = 0.0
     for s in store.sleeves():
-        if s.name in archived or store.account_of(s.name) != account:
+        if store.account_of(s.name) != account:
             continue
-        last = store.last_equity(s.name)
-        book += s.starting_balance if last is None else last["equity"]
+        part = _book_part(store, s, earlier, runs)
+        book += part or 0.0
     return book
 
 
@@ -196,17 +240,17 @@ def account_book(store, sleeve_name: str, own_equity: float, atr_pct) -> tuple[f
     from sleeve_fund import markets
 
     account = store.account_of(sleeve_name)
-    archived = store.archived()
+    earlier, runs = store.previous_book(), store.reset_runs()
     book, risk, through = own_equity, 0.0, []
     for s in store.sleeves():
-        if s.name == sleeve_name or s.name in archived or store.account_of(s.name) != account:
+        if s.name == sleeve_name or store.account_of(s.name) != account:
             continue
+        part = _book_part(store, s, earlier, runs)
+        if part is None:
+            continue
+        book += part
         last = store.last_equity(s.name)
-        if last is None:
-            book += s.starting_balance
-            continue
-        book += last["equity"]
-        if not last["qty"] or not markets.is_perp(s.params):
+        if s.name in earlier or last is None or not last["qty"] or not markets.is_perp(s.params):
             continue
         stop = _journal_stop(store, s, last["qty"])
         if gapped(last["qty"], last["price"], stop):

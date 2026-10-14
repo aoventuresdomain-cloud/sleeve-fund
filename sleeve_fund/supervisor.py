@@ -21,10 +21,10 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
-from sleeve_fund import accounts, liquidation
+from sleeve_fund import accounts, lifecycle, liquidation
 from sleeve_fund.alerts import Forwarder
 from sleeve_fund.exact import float_view
 from sleeve_fund.money import to_decimal
@@ -33,6 +33,7 @@ from sleeve_fund.portfolio.gate import PortfolioState, mark_book, sweep
 from sleeve_fund.portfolio.limits import Book, Holding
 from sleeve_fund.risk import PORTFOLIO
 from sleeve_fund.paper.safety import assert_portfolio_gate, credential_var
+from sleeve_fund.paper.single_lock import EXIT_DUPLICATE
 from sleeve_fund.paper.config import check_hub_bar_spec, load_sleeve, to_store_kwargs
 from sleeve_fund.store import DUST_NOTIONAL, OPEN_ORDER_STATUSES, Sleeve, Store, is_dust, utcnow
 from sleeve_fund.strategies import check_perp_sizing, check_perp_stop
@@ -44,6 +45,7 @@ KEY_CHECK_EVERY = 12  # polls between key-presence checks: about a minute
 FEE_CHECK_EVERY = 720  # polls between fee-schedule reads from connected accounts: about an hour
 ALERT_EVERY = 12  # polls between alert sends and uptime pings: about a minute
 CLEAR_EVERY = 12  # polls between retries of a clean slate waiting on a flatten: about a minute
+TRUE_UP_EVERY = 12  # polls between true-ups for strategies with no process: about a minute
 HEARTBEAT_STALE = timedelta(minutes=3)
 STARTUP_GRACE = timedelta(minutes=3)
 HALT_RETELL = timedelta(minutes=1)  # a holder still holding under a portfolio halt is told to flatten again after this
@@ -62,32 +64,39 @@ def fund_equity(store: Store) -> Decimal:
     reader) and its journal position at its last mark. One the PM put away (archived, a clean slate) still counts in
     full: its cash is the fund's, unallocated, so archiving never moves the book. A run a reset put away counts only
     its cash movement: the strategy it came from starts again at the same capital, which it still counts (HoE 13 Oct).
-    Raises when a position has no mark, so the portfolio isn't marked and entries stop once its mark is stale."""
+    Raises when a position has no mark, so the portfolio isn't marked and entries stop once its mark is stale; dust
+    with no mark is held at its entry price (F229-7)."""
     from sleeve_fund.store import is_backtest
 
     runs = store.reset_runs()
     total = Decimal(0)
     for s in store.sleeves():
-        if is_backtest(s.name):
+        if is_backtest(s.name) or outside_fund_book(store, s):  # F229-6: a sub-8dp test Strategy isn't the fund's
             continue
         cash = to_decimal(store.strategy_cash_pnl(s.name), "cash")
         if s.name in runs:
             total += cash  # flat when put away (split_run): its capital is its successor's
             continue
         total += to_decimal(s.starting_balance, "starting balance") + cash
-        qty = to_decimal(store.journal_book(s.name, s.starting_balance)["qty"], "qty")
+        book = store.journal_book(s.name, s.starting_balance)
+        qty = to_decimal(book["qty"], "qty")
         if qty != 0:
             last = store.last_equity(s.name)
-            if last is None or not last["price"]:
+            if last is not None and last["price"]:
+                total += qty * to_decimal(last["price"], "mark")
+            elif is_dust(book) and book["entry_px"]:
+                # F229-7: dust no venue takes an order for, never marked, is held at its entry price (under
+                # DUST_NOTIONAL either way) rather than failing the whole fund closed over it
+                total += qty * to_decimal(book["entry_px"], "entry price")
+            else:
                 raise RuntimeError(f"{s.name} holds {qty} with no mark, so the fund can't be marked")
-            total += qty * to_decimal(last["price"], "mark")
     return total
 
 
 def fund_holdings(store: Store) -> tuple[Holding, ...]:
     """Every strategy's positions as the book's Holdings, for book_marks' figures. The paper gate's positions (P2-1b
     W2) build them; until then a fund that holds nothing has none, and one that holds anything raises."""
-    if any(_holding(store, s) for s in store.sleeves()):
+    if any(_holding(store, s) for s in store.sleeves() if not outside_fund_book(store, s)):
         raise NotImplementedError("the book's holdings come with the paper gate's positions (P2-1b W2)")
     return ()
 
@@ -119,7 +128,7 @@ class Proc:
 def decide(sleeve: Sleeve, proc: Proc, now: datetime, holds: bool = False) -> str:
     """One of: start, stop, restart_stale, crashed, wait, none. A stopped strategy that still `holds` a position is
     wanted running too, for its exits only (P1-U35)."""
-    want = sleeve.desired_state == "running" or holds
+    want = (sleeve.desired_state == "running" or holds) and sleeve.lifecycle != lifecycle.RETIRED  # P2-6: never again
     if want and not proc.alive:
         if proc.popen is not None:
             return "crashed"
@@ -149,9 +158,101 @@ def check_funding_schedule(s: Sleeve) -> None:
         raise ValueError(why)
 
 
+def true_up_stopped(store: Store, s: Sleeve, now: datetime | None = None) -> int:
+    """CASH-4: a strategy with no process (stopped, archived, retired, or a reset's earlier run) can't notice the
+    venue's rate arriving for a settlement it was charged the baseline for, so this trues it up from the stored rates:
+    settled - baseline, on the baseline's position and price, booked now (Store.record_true_up). A running strategy
+    does it itself; were both to, the journal books it once. Returns how many it booked."""
+    import pandas as pd
+
+    from sleeve_fund import funding, markets
+    from sleeve_fund.venues import DEFAULT_VENUE
+
+    owed = store.open_baselines(s.name)
+    if not owed:
+        return 0
+    try:
+        terms = markets.terms(s.params, getattr(s, "venue", None) or DEFAULT_VENUE)
+    except ValueError:
+        return 0
+    if terms is None or terms.funding_venue is None:
+        return 0
+    series, cap = funding.rates(terms.funding_venue, s.instrument), funding.cap_of(terms.funding_venue, s.instrument)
+    now, booked = now or utcnow(), 0
+    for row in owed:
+        ts = row["ts"] if row["ts"].tzinfo else row["ts"].replace(tzinfo=timezone.utc)
+        rate = funding.rate_at(series, pd.Timestamp(ts), cap)
+        if rate is None:
+            continue
+        settled = -float(row["qty"]) * float(row["price"]) * rate
+        done, up = store.record_true_up(s.name, ts, rate=rate, amount=round(settled, 8), arrived_at=now)
+        if done == "new":
+            booked += 1
+            store.event(s.name, "info", "funding_true_up",
+                        f"Funding trued up: the venue's rate for the {ts:%d %b %Y %H:%M} UTC settlement arrived "
+                        f"({rate:.4%}) while the strategy had no process, settling to {settled:+,.2f} against the "
+                        f"baseline charged; {up:+,.2f} booked now", ts=now)
+    return booked
+
+
 RESTING_OFF = ("its entries would rest at the venue as post-only limits (maker-first execution), and paper sends no "
                "resting entry until the orphan guard is in, which cancels one its process can no longer watch: set "
                "its execution to market to run it")
+
+
+# CCY-8DP (Advisor 13 Oct 16:15 and 16:25 UK): the journal books each fill's fee and cash leg at 8 dp, so a quote
+# currency the engine holds to fewer places (USD: 2) would book what the venue never charged. Only the test accounts
+# a venue profile names (VenueProfile.sub_8dp_test_accounts) may run on one, with a warning; every other account, a
+# future venue included, is refused. Their results are never Strategy evidence.
+FILL_PLACES = 8
+
+
+def _test_account_reason(account: str, venue: str | None) -> str | None:
+    """Why (account, venue) may run under 8 places, from the venue's profile; None when it may not (an unknown venue
+    included)."""
+    from sleeve_fund.venues import DEFAULT_VENUE, VENUES
+
+    profile = VENUES.get((venue or DEFAULT_VENUE).upper())
+    return None if profile is None else profile.sub_8dp_test_accounts.get(account)
+
+
+def is_test_currency_account(account: str, venue: str | None) -> bool:
+    """Whether (account, venue) is a named test account allowed under 8 places: its results are never Strategy
+    evidence (CCY-8DP-UI keys the PM's views on this, not on a copy of the list)."""
+    return _test_account_reason(account, venue) is not None
+
+
+def _quote_places(s) -> tuple[str, int]:
+    """The Strategy's quote currency and the places the engine holds it to (one it doesn't list it holds to 8)."""
+    from nautilus_trader.model import Currency
+
+    quote = s.instrument.split("/")[-1].split("-")[0].upper()
+    return quote, Currency.from_str(quote).precision
+
+
+def outside_fund_book(store: Store, s) -> bool:
+    """F229-6 (HoE 13 Oct 18:12 UK): a Strategy whose quote currency is held under 8 places, on the test account its
+    venue names (CCY-8DP), is outside the fund's book. Neither its equity (fund_equity) nor its position (both
+    fund_holdings) counts, and its entries don't reserve against the book gate (LongFlatStrategy._paper_gated); its own
+    per-Strategy checks still apply. The one predicate all of those read."""
+    return (_quote_places(s)[1] < FILL_PLACES
+            and is_test_currency_account(store.account_of(s.name), getattr(s, "venue", None)))
+
+
+def check_quote_places(s: Sleeve, account: str) -> str | None:
+    """Raises ValueError when the Strategy's quote currency is held to fewer than 8 places on an account its venue
+    doesn't name as a test account; returns the warning to log when it does; None when the currency holds 8. The
+    words name no venue (they reach the PM)."""
+    quote, places = _quote_places(s)
+    if places >= FILL_PLACES:
+        return None
+    why = _test_account_reason(account, getattr(s, "venue", None))
+    held = f"{places} places"
+    if why is None:
+        raise ValueError(f"its quote currency {quote} is held to {held}, and fills are booked to {FILL_PLACES}; only "
+                         f"named test accounts may run on it, and account {account} is not one on this venue")
+    return (f"Test account: its quote currency {quote} is held to {held}, under the {FILL_PLACES} fills are booked "
+            f"to, which only {why} may do. Its results are not Strategy evidence")
 
 
 def check_resting_entries(s: Sleeve) -> None:
@@ -197,6 +298,7 @@ class Supervisor:
             check_perp_stop(s.strategy, s.params, s.risk_profile)
             check_funding_schedule(s)
             check_resting_entries(s)
+            warn = check_quote_places(s, self.store.account_of(name))
         except ValueError as exc:
             if any(c["command"] == "flatten" for c in self.store.pending_commands(name)):
                 self.store.event(name, "warning", "start_refused", f"Started only to sell its position: {exc}. The "
@@ -208,6 +310,8 @@ class Supervisor:
             self.store.set_status(name, "stopped", f"not started: {exc}")
             self.store.event(name, "error", "start_refused", f"Not started: {exc}")
             return True
+        if warn:
+            self.store.event(name, "warning", "test_currency", warn)
         return False
 
     def _exits_only(self, s: Sleeve, why: str) -> bool:
@@ -358,6 +462,11 @@ class Supervisor:
                 proc.crashes += 1
                 delay = min(MAX_BACKOFF, 10 * 2 ** (proc.crashes - 1))
                 proc.next_start = now + timedelta(seconds=delay)
+                if code == EXIT_DUPLICATE:
+                    # SINGLE-LOCK: another live process holds the strategy's lock, so the strategy is still running there;
+                    # not a crash of it. Its refusal is journalled (duplicate_refused); tried again after the backoff,
+                    # and it takes over once that process is gone.
+                    continue
                 if sleeve.status in ("paused", "halted"):
                     # A crash must not lift a pause or a halt: the status (and a pause's end time) stays, and
                     # the restarted process keeps it (review round 10, B10-3). The crash is in the events.
@@ -391,6 +500,16 @@ class Supervisor:
                 self._start(sleeve.name, proc)
             elif action == "none" and proc.alive and proc.crashes and now - proc.started_at > STARTUP_GRACE:
                 proc.crashes = 0  # healthy again
+
+    def true_up_stopped(self) -> None:
+        """True up every strategy without a running process (true_up_stopped); one failing never holds up the rest."""
+        for s in self.store.sleeves():
+            if self.procs.get(s.name, Proc()).alive:
+                continue
+            try:
+                true_up_stopped(self.store, s)
+            except Exception as exc:  # noqa: BLE001 - the next minute tries again; the dashboard shows why
+                self.store.event(s.name, "error", "supervisor_error", f"funding true-up: {exc!r}")
 
     def mark_portfolio(self, now: datetime | None = None) -> None:
         """The portfolio's poll (v2 P2-2): mark the whole fund (portfolio.gate.mark_book), a book_marks row each minute
@@ -527,6 +646,8 @@ class Supervisor:
                     self.check_keys()
                 if loops % FEE_CHECK_EVERY == 0:
                     self.check_fees()
+                if loops % TRUE_UP_EVERY == 0:
+                    self.true_up_stopped()
                 if self.clear_path and loops % CLEAR_EVERY == 0 and os.path.exists(self.clear_path):
                     clear(self.store, self.clear_path)
                 loops += 1

@@ -21,7 +21,7 @@ AUTH = ("pm", "test-pw")
 
 def _hold(store, name, qty, price=60_000.0, entry=60_000.0, strategy="ping_pong", params=None, stop_frac=None):
     """A strategy holding qty at entry, marked at price, with the entry's stop journaled as stop_frac (None: none)."""
-    store.create_sleeve(name=name, strategy=strategy, instrument="BTC/USD", bar_spec="1-HOUR-LAST-INTERNAL",
+    store.create_sleeve(name=name, strategy=strategy, instrument="BTC/USDT", bar_spec="1-HOUR-LAST-INTERNAL",
                         starting_balance=10_000, params=PERP if params is None else params,
                         risk_profile="conservative")
     side = "BUY" if qty > 0 else "SELL"
@@ -71,10 +71,14 @@ def test_the_helper_never_raises_and_asks_the_atr_only_where_it_needs_it(store):
     assert row["risk"] is None and row["atr_pct"] is None  # never raises (PE2 review)
 
 
-def test_the_helper_leaves_out_archived_strategies_and_filters_by_account(store):
+def test_the_helper_leaves_out_archived_flat_strategies_and_filters_by_account(store):
     _hold(store, "a", 0.1)
     _hold(store, "b", 0.1)
     store.archived = lambda: {"b": None}  # archived while still holding (Store.archive refuses a holder)
+    # F229-6 (Advisor 14 Oct 00:15 UK; HoE OK): one still holding counts; once flat it is left out.
+    assert [r["sleeve"] for r in open_risk.book_open_risk(store, lambda s: 0.02)] == ["a", "b"]
+    store.record_fill("b", side="SELL", qty=0.1, price=60_000.0, fee=0.0, order_id="X-b", trade_id="x-b")
+    store.record_equity("b", equity=10_000, cash=10_000, qty=0.0, price=60_000.0, benchmark=10_000)  # marked flat
     assert [r["sleeve"] for r in open_risk.book_open_risk(store, lambda s: 0.02)] == ["a"]
     account = store.account_of("a")
     assert [r["sleeve"] for r in open_risk.book_open_risk(store, lambda s: 0.02, account)] == ["a"]

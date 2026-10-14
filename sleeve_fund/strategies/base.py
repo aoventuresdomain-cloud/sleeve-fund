@@ -31,11 +31,12 @@ from nautilus_trader.model import (Bar, BarType, ClientOrderId, InstrumentId, Mo
 from nautilus_trader.trading import Strategy
 
 from sleeve_fund import bars as bar_rule
-from sleeve_fund import markets, open_risk, risk
+from sleeve_fund import lifecycle, markets, open_risk, risk
 from sleeve_fund.data import bar_minutes
 from sleeve_fund.instruments import BOOK_SHARE, lot_decimals, pair_of, taker_slippage, target_fill_px
 from sleeve_fund.margin import entry_liquidation
 from sleeve_fund.paper.runtime import ENTRY_CANCELLED, EXITS_ONLY, RACED_FILL, RESUMABLE, WIPED_OUT, block_codes, liquidation_reason
+from sleeve_fund.paper.runtime import WIND_STOP as WIND_STOP_INTENT
 from sleeve_fund.store import DUST, OPEN_ORDER_STATUSES, replay_book
 from sleeve_fund.strategies.indicators import AtrSma, warmup_for
 from sleeve_fund.strategies.timeframes import Candle, SlowerCandles, bar_spec, span
@@ -654,6 +655,9 @@ class LongFlatStrategy(Strategy):
         # how many of its entries the limit would have refused, and the largest share of equity one of them put at
         # risk; a backtest doesn't gate on it.
         self._daily_atr: dict[int, float] = {}
+        # P2-6: the decision bars' (high, low, close), for the wind-down stop's Wilder ATR(14) (lifecycle.wind_down_stop)
+        self._wind_bars: deque = deque(maxlen=open_risk.ATR_WINDOW)
+        self._wind_missing_told = False
         self.open_risk_binds = 0
         self.open_risk_max = 0.0
         # After a restart, a position whose stop couldn't be restored, or one started for its exits only, works to a
@@ -1072,7 +1076,7 @@ class LongFlatStrategy(Strategy):
             self._publish_signals()
             return
         try:
-            if self._check_exits(self._last_close):
+            if self._check_exits(self._last_close) or self._check_wind_stop(self._last_close):
                 return
         finally:
             if self._pending_exit is None:
@@ -2330,10 +2334,21 @@ class LongFlatStrategy(Strategy):
             return fill if fill is not None else _ns(self._last_alive)
         return max(latest, fill) if fill is not None else latest
 
+    def _replayed_stop(self, side: int, own: float | None) -> float | None:
+        """The stop a replay rests for the position: its own, or the wind-down stop (P2-6), which the replay treats as
+        the strategy's own resting stop (Advisor 13 Oct 16:40, MUST), whichever the price reaches first."""
+        wind = getattr(self.runtime, "wind_stop", None)  # a runtime without the lifecycle (a test stub) has none
+        if wind is None or wind[0] != side:
+            return own
+        if own is None:
+            return wind[1]
+        return max(own, wind[1]) if side > 0 else min(own, wind[1])
+
     def _replay_watches(self) -> bool:
         """The open position has something a replay can act on: a stop or target, or on a perp its liquidation
         price and the risk guard."""
-        return self._margin or self._stop_frac is not None or bool(self._tp_frac)
+        return (self._margin or self._stop_frac is not None or bool(self._tp_frac)
+                or getattr(self.runtime, "wind_stop", None) is not None)
 
     def _note_trade(self, ts: int) -> None:
         """Paper: a trade at venue time ts. A stretch over UNSEEN_GAP_NS with no trade while in a position is
@@ -2371,7 +2386,7 @@ class LongFlatStrategy(Strategy):
         """The live check at the price now, its exit flagged as the market-on-return fallback (Advisor NA-1)."""
         self._outage_book = {"outage_fallback": f"market on return: {why}"}
         try:
-            return self._check_exits(self._last_close)
+            return self._check_exits(self._last_close) or self._check_wind_stop(self._last_close)
         finally:
             if self._pending_exit is None:
                 self._outage_book = None
@@ -2420,6 +2435,9 @@ class LongFlatStrategy(Strategy):
         venue, guards = {}, {}
         if self._stop_frac is not None:
             venue["stop_loss"] = entry * (1 - side * self._stop_frac)
+        stop = self._replayed_stop(side, venue.get("stop_loss"))
+        if stop is not None:
+            venue["stop_loss"] = stop
         target = entry * (1 + side * self._tp_frac) if self._tp_frac else None
         cash = qty = 0.0
         if self._margin and self.runtime is not None:
@@ -2429,7 +2447,7 @@ class LongFlatStrategy(Strategy):
                 d = self.runtime.profile.min_liquidation_distance
                 venue["liquidation"] = liq
                 guards["liquidation_cut"] = liq / (1 - d) if side > 0 else liq / (1 + d)
-            if qty:
+            if qty and self.runtime.halts:
                 p, day_open = self.runtime.profile, self.runtime._day_open or equity
                 guards["risk_halt"] = (max(self.runtime.peak, equity) * (1 - p.max_drawdown) - cash) / qty
                 guards["risk_pause"] = (day_open * (1 - p.daily_loss) - cash) / qty
@@ -2548,6 +2566,7 @@ class LongFlatStrategy(Strategy):
             self._end_late_run()
         self.log.info(f"bar {bar}")
         self._last_close = bar.close.as_double()
+        self._wind_bars.append((bar.high.as_double(), bar.low.as_double(), self._last_close))  # warm-up bars too
         if self.pessimistic and self._exec_type is None:
             self._levels_in_bar(bar)
             if self._stopped_in_entry_bar(bar):
@@ -2570,6 +2589,8 @@ class LongFlatStrategy(Strategy):
                 self._funding_skip = None
         if self._exec_type is None:
             self._rest_risk_stop()
+        if self._wind_down_bar(bar):
+            return
         if self._pending_exit is not None:
             return
         if self._replan_pending is not None and self._entry_px is not None:
@@ -2830,6 +2851,93 @@ class LongFlatStrategy(Strategy):
         self._exit_at_market(hit, reason, values, price)
         return True
 
+    # --- P2-6 lifecycle: winding down ------------------------------------------------
+
+    def _wind_down_bar(self, bar: Bar) -> bool:
+        """Paper, at each decision bar's close while the PM winds the strategy down (sleeve_fund.lifecycle): place
+        its one wind-down stop if it holds and has none, then lifecycle_due: the 75% notice, retire once flat, or
+        the deadline's flatten through the exit path, sent again each bar until flat. True if an exit was sent."""
+        rt = self.runtime
+        if rt is None or rt.lifecycle != lifecycle.WINDING_DOWN:  # a research backtest's is always active
+            return False
+        now = rt.now()
+        side = self._pos_side()
+        if side and (rt.wind_stop is None or rt.wind_stop_interim) and self._restore is None and rt.wind_deadline > now:
+            self._place_wind_stop(side, self._last_close)
+        busy = self._pending_exit is not None or bool(self._working())
+        why = rt.lifecycle_due(now, flat=side == 0, busy=busy)
+        if why is None:
+            return False
+        self._sell_all(*why, {"deadline": rt.wind_deadline.isoformat()})
+        return True
+
+    def _wind_atr(self, price: float) -> tuple[float, float | None, str]:
+        """The ATR the wind-down stop is set from, as (ATR in price, the strategy's own stop_atr or None, a note for
+        the journal): a strategy with its own stop_atr uses its own ATR (its own series and atr_bars); else 3 x Wilder
+        ATR(14) on the decision candles (warm-up candles count, so a restart's preloaded history does); only when
+        that is still short, 3 x the open-risk daily Wilder ATR(14), journaled "own ATR unavailable" (Advisor 13 Oct
+        16:40). Raises ValueError when there is none at all."""
+        c = self._cfg
+        if c.stop_atr and self._atr is not None and self._atr.initialized and self._atr.value > 0:
+            return self._atr.value, c.stop_atr, ""
+        if len(self._wind_bars) >= open_risk.ATR_DAYS:
+            from sleeve_fund.strategies.indicators.averages import Atr
+
+            atr = Atr(open_risk.ATR_DAYS)
+            for h, lo, cl in self._wind_bars:
+                atr.update_raw(h, lo, cl)
+            own = " (own ATR unavailable: its own average true range isn't ready)" if c.stop_atr else ""
+            return atr._outputs()["value"], None, own
+        from sleeve_fund.venues import venue as venue_profile
+
+        s = self.runtime.store.sleeve(self.runtime.name)
+        share = open_risk.history_atr_pct(venue_profile(s.venue).name, s.instrument, self.runtime.now())
+        if not share:
+            raise ValueError("no ATR yet: too few candles and no daily history")
+        return share * price, None, (f" (own ATR unavailable: {len(self._wind_bars)} of {open_risk.ATR_DAYS} candles "
+                                     "loaded, so the daily Wilder ATR(14) is used)")
+
+    def _place_wind_stop(self, side: int, price: float) -> None:
+        """The one wind-down stop, journaled by the runtime (place_wind_stop) and read back after a restart. With no
+        ATR at all yet it is tried again at every bar close, with one alert, never given up on (Advisor 16:40 MUST:
+        a winding-down holder is never left without a stop)."""
+        rt = self.runtime
+        liq = None
+        if self._margin:
+            _, cash, qty, _ = self._mark()
+            liq = self._liq(cash, qty) if qty else None
+        try:
+            atr, own, note = self._wind_atr(price)
+            if rt.wind_stop_interim:  # the interim stop gives way once, to an ATR stop only if tighter
+                level = float(lifecycle.wind_down_stop(side, repr(price), repr(atr), stop_atr=own,
+                                                       liquidation=None if liq is None else repr(liq)).level)
+                if side * (level - rt.wind_stop[1]) <= 0:
+                    rt.keep_wind_stop(f"the ATR stop at {level:,.6g} would be further from the price")
+                    return
+            rt.place_wind_stop(side, price, atr, stop_atr=own, liquidation=liq, note=note)
+        except ValueError as e:
+            if rt.wind_stop is None:  # Advisor 13 Oct 17:05, MUST: never unprotected while the ATR loads
+                rt.place_interim_wind_stop(side, price, liq)
+            if not self._wind_missing_told:
+                rt.store.event(rt.name, "error", "wind_down_stop_missing",
+                               f"Winding down with no ATR for its wind-down stop yet: {e}. An interim safety stop "
+                               "holds meanwhile, and the ATR stop is tried again at each candle close.", ts=rt.now())
+            self._wind_missing_told = True
+
+    def _check_wind_stop(self, price: float) -> bool:
+        """Paper, every trade: the wind-down stop, judged as the strategy's own stop is. True if an exit was sent."""
+        rt = self.runtime
+        if rt is None or rt.backtest or self._pending_exit is not None or self._busy() or not self._pos_side():
+            return False
+        if not rt.wind_stop_hit(price):
+            return False
+        side, level = rt.wind_stop
+        reason = f"Wind-down stop: price {price:,.6g} went past the {level:,.6g} stop placed when the wind-down began"
+        rt.store.event(rt.name, "info", "wind_down_stop_hit", f"exit at {price:,.4f}; {reason}", ts=rt.now())
+        self._lock_exit_leg(side if self._margin else True)
+        self._exit_at_market(WIND_STOP_INTENT, reason, {"wind_down_stop": level}, price)
+        return True
+
     def _exit_at_market(self, intent: str, reason: str, values: dict, price: float) -> None:
         """Send an exit at market. When it is the stop firing, the journal's watched stop ends "triggered", linked to
         the market stop-loss sent for it (Head of QA and HoE, 7 Oct); it ends "canceled" only when the position closes
@@ -3028,7 +3136,9 @@ class LongFlatStrategy(Strategy):
                 self._note(f"{what}_refused_by_portfolio", decision.decision.reason)
             return
         batch, name = self._portfolio
-        batch.post(self.clock, self.clock.timestamp_ns(), Pending(name, intent, send, lambda i, d: count("refused")))
+        bar = {"bar": self._deciding[0] if self._deciding else None}  # as paper's gate gets it: parity keys on it
+        batch.post(self.clock, self.clock.timestamp_ns(),
+                   Pending(name, {**intent, **bar}, send, lambda i, d: count("refused")))
 
     def _resting_entry_terms(self):
         """ORPHAN-GUARD og1 for a resting entry on paper: good-till-date to its decision bar's next close, clamped past
@@ -3052,9 +3162,12 @@ class LongFlatStrategy(Strategy):
             return None
         if self._paper_gate is None:
             from sleeve_fund.paper.portfolio_gate import paper_gate
+            from sleeve_fund.supervisor import outside_fund_book
 
-            self._paper_gate = paper_gate(rt.store)
-        return self._paper_gate
+            # F229-6: a sub-8dp test Strategy is outside the fund's book, so its entries reserve nothing against it
+            # (False: made once, not gated); its own per-Strategy checks still run.
+            self._paper_gate = False if outside_fund_book(rt.store, rt.store.sleeve(rt.name)) else paper_gate(rt.store)
+        return self._paper_gate or None
 
     def _cancel_gated_at_close(self, close_ns: int) -> None:
         """Paper with the portfolio gate: at each bar close, every gated entry or addition still resting that was sent
@@ -4109,13 +4222,15 @@ class LongFlatStrategy(Strategy):
 
         def arrived(when) -> bool:
             if when not in asked:
-                asked[when] = self._venue_rate(terms, pair, when) is not None
-            return asked[when]
+                asked[when] = self._venue_rate(terms, pair, when)
+            return asked[when] is not None
 
         if terms is not None:
             self._reverse_unsettled(terms)
         came = {when for when in sorted(self._funding_missing) if arrived(when)}
         self._funding_missing -= came
+        for when in sorted(came):
+            self._true_up(when, asked[when], now)
         try:
             state = funding.journal_state(rt.store, funding.stale_tag(venue, pair))
         except Exception:  # noqa: BLE001 - no database (locally), or a stub inbox: one episode, as before
@@ -4154,6 +4269,28 @@ class LongFlatStrategy(Strategy):
                 rt.store.event(None, "info", "funding_stale_cleared", f"{tag} The settled funding rate for {pair} has "
                                f"arrived from the venue for every settlement missing {funding.from_words(o)}"
                                + (f" ({len(came)} came in now)" if came else ""), ts=rt.now())
+
+    def _true_up(self, when, rate: float, now) -> None:
+        """Paper, CASH-4 (Advisor 8 Oct 04:10, ruling 2): the venue's rate for a settlement charged the baseline has
+        arrived. One journaled true-up of what it settles to less the baseline, on the position and price the
+        baseline was charged on, signed as the cash moves and moving cash now; the baseline is never edited. The
+        journal first and cash only for a movement it took, so a second process or a restart never books it twice."""
+        paid = self._funding_paid.pop(when, None)
+        if paid is None or self.runtime is None:
+            return
+        qty, px, _, _ = paid
+        settled = -float(qty) * float(px) * rate
+        ts = when.to_pydatetime() if hasattr(when, "to_pydatetime") else when
+        booked, up = self.runtime.store.record_true_up(self.runtime.name, ts, rate=rate, amount=round(settled, 8),
+                                                       arrived_at=now)
+        if booked != "new":
+            return
+        self._cash_adj += float(up)
+        self.funding_log.append((now, float(up), "true_up"))
+        self.runtime.store.event(self.runtime.name, "info", "funding_true_up",
+                                 f"Funding trued up: the venue's rate for the {ts:%d %b %Y %H:%M} UTC settlement "
+                                 f"arrived ({rate:.4%}), settling to {settled:+,.2f} against the baseline charged; "
+                                 f"{up:+,.2f} booked now", ts=now)
 
     def _is_settlement(self, terms, when) -> bool:
         """Whether `when` is still one of the venue's settlements as its records now read (markets.settlement_times)."""
@@ -4262,10 +4399,10 @@ class LongFlatStrategy(Strategy):
             ts = pd.Timestamp(row["ts"])
             rows.setdefault(ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC"), []).append(row)
         for ts, booked in rows.items():
-            # A settlement already reversed (its own reversal row, or rows netting to zero) is never watched again,
-            # so a restart can't refund it twice (CR, #163)
+            # A settlement already reversed (its own reversal row, or rows netting to zero) or trued up (CASH-4) is
+            # never watched again, so a restart can't refund or true it up twice (CR, #163)
             amounts = [r.get("amount") for r in booked]
-            if any(r.get("kind") == "reversal" for r in booked) or (
+            if any(r.get("kind") in ("reversal", "true_up") for r in booked) or (
                     None not in amounts and len(amounts) > 1 and abs(sum(amounts)) < 1e-9):
                 continue
             row = next((r for r in booked if r.get("kind") == "baseline"), None)
@@ -4309,7 +4446,7 @@ class LongFlatStrategy(Strategy):
         if risk.trading_day(now + step) != risk.trading_day(now):
             day_open = equity
         levels = [((peak * (1 - p.max_drawdown) - cash) / qty, "risk_halt"),
-                  ((day_open * (1 - p.daily_loss) - cash) / qty, "risk_pause")]
+                  ((day_open * (1 - p.daily_loss) - cash) / qty, "risk_pause")] if rt.halts else []
         liq = self._liq_now(cash, qty)
         if liq is not None:
             d = p.min_liquidation_distance
@@ -4667,7 +4804,8 @@ class LongFlatStrategy(Strategy):
         if equity <= 0:
             return True
         day_open = self.runtime._day_open or equity
-        if risk.check(self.runtime.profile, equity, max(self.runtime.peak, equity), day_open) is not None:
+        if risk.check(self.runtime.profile, equity, max(self.runtime.peak, equity), day_open,
+                      self.runtime.halts) is not None:
             return True
         liq = self._liq_now(cash, qty)
         return liq is not None and abs(price - liq) / price < self.runtime.profile.min_liquidation_distance

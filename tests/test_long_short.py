@@ -353,7 +353,7 @@ def test_the_dashboard_shows_a_short(client):  # noqa: F811
     from test_dashboard import AUTH
 
     c, store = client
-    store.create_sleeve(name="pp-ls", strategy="ping_pong", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
+    store.create_sleeve(name="pp-ls", strategy="ping_pong", instrument="BTC/USDT", bar_spec="1-MINUTE-LAST-INTERNAL",
                         starting_balance=10_000, params={"rise": 0.01, "dip": 0.005, **PERP, "stop_loss": 0.02})
     store.record_fill("pp-ls", side="BUY", qty=0.05, price=60_000.0, fee=1.5, order_id="o1", trade_id="t1")
     store.record_fill("pp-ls", side="SELL", qty=0.05, price=60_600.0, fee=1.5, order_id="o2", trade_id="t2")
@@ -371,7 +371,9 @@ def test_the_dashboard_shows_a_short(client):  # noqa: F811
     assert "of 0.66× cap" in html and "above entry cap" not in html
     # QA U2, the Advisor's wording: leverage is notional at entry over isolated margin (3,030 / 1,515), exposure
     # the notional at the mark over equity (3,007 / 10,050), so exposure / leverage is the margin's share (15%).
-    assert ">Leverage</dt><dd>2.00×" in html and "0.30× equity <span class=\"faint\">· cap 0.66×" in html
+    # UP-2: the leverage it opened at in the cap format, and the one from the mark (3,007 / 1,515) labelled effective.
+    assert ">Leverage</dt><dd>2× <span class=\"faint\">· effective 1.98×" in html
+    assert "0.30× equity <span class=\"faint\">· cap 0.66×" in html
     assert "Side and leverage" not in html
     assert "Tap a buy or sell arrow" not in html and "TradingView Lightweight Charts" in html  # QA U9: attribution in the rail
     # QA U12: the strategy's Fees and funding hover gives the costs' share of gross P&L, as the Portfolio's does.
@@ -817,8 +819,10 @@ def test_the_risk_page_stresses_a_short_book_both_ways(client):  # noqa: F811
         store.record_equity(name, equity=10_000.0, cash=10_000.0 - qty * px, qty=qty, price=px, benchmark=10_000)
     # Positions: -3,000, -3,000 and +1,200. Gross 7,200 (24% of 30,000); net -4,800 (-16%).
     page = c.get("/risk", auth=AUTH).text
-    # The Gross exposure tile is gone everywhere (UI v2, PM 5 Oct); gross and net stay on the Strategies header.
-    assert "Gross exposure" not in page and "Gross 24% · net 16% short" in page
+    # The Gross exposure tile is gone everywhere (UI v2, PM 5 Oct); net and total size stay on the Strategies header,
+    # total size against its limit (UP-1), here from the strategies' marks as the fund has no mark yet.
+    assert "Gross exposure" not in page and "Net 16% short · " in page
+    assert "Total size (long + short) 0.24x of book, limit 1.5x" in page
     # Down 20%: the shorts make 1,200, the long loses 240, so the book makes 960; up 20% it loses 960.
     assert "+960.00" in page and "−960.00" in page
     assert "+960" in page.split("Market down 20%")[1].split("</div></div>")[0]
@@ -881,7 +885,9 @@ def test_a_perp_shows_leverage_liquidation_and_funding(client):  # noqa: F811
     liq = markets.isolated_liquidation(cash, -0.1, 59_000.0, lev, markets.LOW_FEE_PERP.maintenance_margin)
     assert f"{0.1 * 59_000 / lev:,.2f}" in html  # isolated margin: the notional at entry over the leverage cap
     # QA U2: leverage is the position's own (notional at entry over its margin); exposure is at the mark over equity.
-    assert "Margin" in html and f">Leverage</dt><dd>{lev:.2f}×" in html and "0.59× equity" in html and f"{liq:,.2f}" in html and "above" in html
+    # UP-2: in the cap format, and the one from the mark (5,950 over the same margin) labelled effective.
+    assert "Margin" in html and f">Leverage</dt><dd>{lev:g}× <span class=\"faint\">· effective {lev * 59_500 / 59_000:.2f}×" in html
+    assert "0.59× equity" in html and f"{liq:,.2f}" in html and "above" in html
     assert "+0.59" in html and "+1.19" in html  # last payment and since start
     assert "funding +0.60" in html and "+98.60" in html  # the closed trip, after fees and funding
     # The Overview's position table, leverage in its own column: the isolated position's own (item 7) once

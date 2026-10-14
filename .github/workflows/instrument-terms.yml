@@ -1,0 +1,31 @@
+name: instrument-terms
+# B8 instrument terms (venue-swap plan, Advisor 14 Oct 2026): the engine's per-instrument terms beside the venue's
+# published ones, for every instrument a configured Strategy trades, with a PASS / MUST / FOLLOW-UP verdict per row
+# (scripts/b8_instrument_terms.py). Read-only: public endpoints, no key, writes nothing. It runs inside the venue's
+# hub container on the paper server, because the venue refuses the runners' region. Run it by hand from main (HoE);
+# it fails when any row is a MUST. Same secrets and variable as canon, parity and status.
+on:
+  workflow_dispatch:
+jobs:
+  terms:
+    runs-on: ubuntu-24.04
+    permissions: { contents: read }
+    if: ${{ vars.DEPLOY_ENABLED == 'true' && github.ref == 'refs/heads/main' }}
+    env:
+      USER_AT: ${{ vars.DEPLOY_USER || 'root' }}
+    steps:
+      - name: Configure SSH
+        env:
+          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/id_deploy && chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts
+      - name: Compare the instrument terms
+        # The server's own copy of the script, so the check runs the deployed code against the deployed configs.
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          ssh -i ~/.ssh/id_deploy -o ServerAliveInterval=30 -o ServerAliveCountMax=10 "$USER_AT@$HOST" \
+            "cd /opt/sleeve-fund && sudo cat .deployed_sha 2>/dev/null; sudo docker compose exec -T hub-binance python -u - < scripts/b8_instrument_terms.py"

@@ -50,6 +50,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.schema import DropConstraint
 
+from sleeve_fund import lifecycle
 from sleeve_fund.exact import EXACT
 from sleeve_fund.money import stored, to_decimal
 
@@ -65,6 +66,8 @@ COMMANDS = {"pause", "resume", "flatten", RAL, BOOK_RESET}
 # Applied by the supervisor, not the strategy: restart the process so it trades under settings the PM
 # changed (Store.change_settings).
 RELOAD = "reload"
+LIFECYCLE_ACTIONS = ("wind_down", "retire", "close_now")  # the PM's lifecycle moves (Store.set_lifecycle)
+LIFECYCLE_EVENT = "lifecycle"  # one event per lifecycle move, with what moved and why
 STATUSES = {"starting", "running", "paused", "halted", "stopped", "error"}
 LEVELS = ("info", "warning", "error")
 
@@ -98,6 +101,14 @@ sleeves_t = Table(
     # The CHECK holds the shape on both engines: "~" only as that suffix, one level, at most one leg.
     Column("parent", String(64), ForeignKey("sleeves.name", name="sleeves_parent_fk", ondelete="RESTRICT")),
     CheckConstraint(LEG_NAME, name="sleeves_leg_name"),
+    # P2-6: the PM's lifecycle, kept apart from running/stopped/paused (DA). The row holds the current state only;
+    # each move is journaled in events and decisions (Store.set_lifecycle, the one writer).
+    Column("lifecycle", String(16), nullable=False, default="active", server_default="active"),
+    Column("wind_down_started", TS),
+    Column("wind_down_deadline", TS),
+    CheckConstraint("lifecycle IN ('active', 'winding_down', 'retired')", name="sleeves_lifecycle"),
+    CheckConstraint("lifecycle <> 'winding_down' OR (wind_down_started IS NOT NULL AND wind_down_deadline IS NOT NULL "
+                    "AND wind_down_deadline >= wind_down_started)", name="sleeves_winding_down"),
 )
 
 equity_t = Table(
@@ -151,7 +162,11 @@ funding_t = Table(
     # How the rate was set: "settled" (the venue's), "baseline" (missing, charged adversely) or "true_up" (a later
     # correction to the venue's rate), QA P1-O17.
     Column("kind", String(16), nullable=False, server_default="settled"),
+    # CASH-4: when a true-up moved cash, the real rate's arrival (ts stays the settlement's), so an as-of read before
+    # it shows the baseline only (Advisor 8 Oct 04:10, ruling 2). Only a true-up has one; every other row moved cash at ts.
+    Column("arrived_at", TS),
     CheckConstraint("kind IN ('settled', 'baseline', 'true_up', 'reversal')", name="funding_kind"),
+    CheckConstraint("(kind = 'true_up') = (arrived_at IS NOT NULL)", name="funding_true_up_arrived"),
     Index("funding_sleeve_ts", "sleeve", "ts"),
     # CASH-1: a settlement is charged once (settled or baseline, never both), and reversed or trued up at most once.
     # The key is the settlement time, so a second process or a restart that forgot it is refused by the database.
@@ -730,7 +745,7 @@ FINISHED_ORDER_STATUSES = ("filled", "canceled", "rejected", "denied", "expired"
 OPEN_ORDER_STATUSES = ("submitted", "accepted", "partially_filled")
 GATED_INTENTS = ("entry", "rebalance")  # the orders the portfolio gate reserves for (engine OPENING_INTENTS)
 INTENTS = ("entry", "exit", "stop_loss", "take_profit", "risk_halt", "risk_pause", "pm_flatten", "rebalance",
-           "liquidation", "liquidation_cut")  # the venue would take it; cut back before it does (String(16))
+           "liquidation", "liquidation_cut", "wind_down", "wind_down_stop")  # the venue would take it; cut back before it does (String(16))
 
 
 def _check_rebook(order_id: str, row) -> None:
@@ -887,13 +902,17 @@ class Sleeve:
     heartbeat_at: datetime | None
     created_at: datetime
     updated_at: datetime
+    lifecycle: str = "active"  # P2-6: active, winding_down or retired (sleeve_fund.lifecycle)
+    wind_down_started: datetime | None = None
+    wind_down_deadline: datetime | None = None
     venue: str | None = None  # None: the default venue (sleeve_fund.venues.DEFAULT_VENUE)
     parent: str | None = None  # P2-8: on a two-leg Strategy's second leg row, the first leg's name
 
     @classmethod
     def from_row(cls, row, venue: str | None = None) -> "Sleeve":
         d = dict(row._mapping)
-        for k in ("paused_until", "heartbeat_at", "created_at", "updated_at"):
+        for k in ("paused_until", "heartbeat_at", "created_at", "updated_at", "wind_down_started",
+                  "wind_down_deadline"):
             d[k] = _aware(d[k])
         d["params"] = dict(d["params"] or {})
         # A configured balance, read by the engine's float figures: the journal (journal_book) takes it exactly.
@@ -1506,9 +1525,105 @@ class Store:
             c.execute(insert(sleeve_archive_t).values(sleeve=sleeve, archived_at=utcnow()))
 
     def unarchive(self, sleeve: str) -> None:
-        self.sleeve(sleeve)
+        if self.sleeve(sleeve).lifecycle == lifecycle.RETIRED:
+            raise ValueError("this strategy is retired, and a retired strategy can't be brought back")
         with self.engine.begin() as c:
             c.execute(sleeve_archive_t.delete().where(sleeve_archive_t.c.sleeve == sleeve))
+
+    # --- lifecycle (P2-6) ------------------------------------------------------------
+
+    def held_qty(self, sleeve: str) -> Decimal:
+        """The position the journal's fills add up to (the figure the flatten and archive checks read)."""
+        return to_decimal(self.journal_book(sleeve, self.sleeve(sleeve).starting_balance)["qty"])
+
+    def lifecycle_flat(self, sleeve: str) -> tuple[Decimal, bool]:
+        """(the position the journal holds, whether the lifecycle counts it flat): none, or dust too small for any
+        venue to take an order for (is_dust, as a reset judges it). The engine reads below its smallest order as flat,
+        so a remainder no flatten can close must never keep a strategy from retiring (HoQA P26-1)."""
+        book = self.journal_book(sleeve, self.sleeve(sleeve).starting_balance)
+        return to_decimal(book["qty"]), abs(book["qty"]) <= 1e-12 or is_dust(book)
+
+    def lifecycle_holds(self, sleeve: str) -> tuple[list[timedelta], list[timedelta], str]:
+        """The holding times a wind-down's deadline is set from, as (backtest, paper, where from). Paper: the
+        strategy's own closed round trips in the journal. Backtest: none yet, as no saved backtest is linked to the
+        strategy it came from, so lifecycle.window falls back to the longest hold (fewer than 20 backtest trades)."""
+        from sleeve_fund import markets
+        from sleeve_fund.research.metrics import trades
+
+        rows = list(reversed(self.fills(sleeve, limit=10_000_000)))
+        paper = [t["closed"] - t["opened"] for t in trades(rows, shorts=markets.is_perp(self.sleeve(sleeve).params))
+                 if t["opened"] and t["closed"]]
+        return [], paper, f"no linked backtest; {len(paper)} closed paper trade{'' if len(paper) == 1 else 's'}"
+
+    def set_lifecycle(self, sleeve: str, action: str, actor: str, reason: str, now: datetime | None = None) -> Sleeve:
+        """The PM's lifecycle move, and the one writer of it (the dashboard's lifecycle route is its one caller).
+        action: wind_down, retire or close_now; the rules are lifecycle.move and lifecycle.close_now, which refuse
+        anyone but the PM. Writes the row, a decision and a lifecycle event in one transaction; a strategy retired
+        here is also stopped and archived, so every reader of the archive sees it put away."""
+        if action not in LIFECYCLE_ACTIONS:
+            raise ValueError(f"bad lifecycle action {action!r}")
+        if is_backtest(sleeve):
+            raise ValueError("a saved backtest has no lifecycle")
+        now = now or utcnow()
+        s = self.sleeve(sleeve)
+        held, flat = self.lifecycle_flat(sleeve)
+        started, deadline_at, basis = s.wind_down_started, s.wind_down_deadline, ""
+        if action == "wind_down":
+            to = lifecycle.move(s.lifecycle, lifecycle.WINDING_DOWN, actor, flat=flat)
+            backtest, paper, basis = self.lifecycle_holds(sleeve)
+            started, deadline_at = now, lifecycle.deadline(now, backtest, paper)
+            basis = f" Window {lifecycle.span(lifecycle.window(backtest, paper))}, from the holds: {basis}."
+        elif action == "retire":
+            to = lifecycle.move(s.lifecycle, lifecycle.RETIRED, actor, flat=flat)
+        else:
+            m = lifecycle.close_now(s.lifecycle, actor, now, flat=flat)
+            to = m.lifecycle
+            if to == lifecycle.WINDING_DOWN:
+                started, deadline_at = started or now, now
+        text = lifecycle.moved_words(s.lifecycle, to, action, deadline_at, held) + basis
+        with self.engine.begin() as c:
+            values = {"lifecycle": to, "wind_down_started": started, "wind_down_deadline": deadline_at,
+                      "updated_at": now}
+            if to == lifecycle.RETIRED:
+                values["desired_state"] = "stopped"
+            # Only over the lifecycle this move was judged on: a retire the runtime completed meanwhile is never
+            # written back to winding down (CR F26-A); the PM sees the refusal and the row as it now stands.
+            done = c.execute(update(sleeves_t).where(sleeves_t.c.name == sleeve,
+                                                     sleeves_t.c.lifecycle == s.lifecycle).values(**values)).rowcount
+            if not done:
+                raise lifecycle.LifecycleError("This strategy's lifecycle changed meanwhile; look again and retry.")
+            if to == lifecycle.RETIRED:
+                c.execute(sleeve_archive_t.delete().where(sleeve_archive_t.c.sleeve == sleeve))
+                c.execute(insert(sleeve_archive_t).values(sleeve=sleeve, archived_at=now))
+            c.execute(insert(decisions_t).values(ts=now, actor="PM", action=action, sleeve=sleeve,
+                                                 reason=reason.strip()))
+            c.execute(insert(events_t).values(sleeve=sleeve, ts=now, level="info", kind=LIFECYCLE_EVENT, message=text))
+        return self.sleeve(sleeve)
+
+    def complete_retire(self, sleeve: str, now: datetime | None = None, how: str = "flat") -> bool:
+        """Retire a winding-down strategy once the journal shows it flat (dust counts as flat: lifecycle_flat): the end of the PM's own wind-down, never a
+        new move (lifecycle.due's RETIRE). False, and nothing written, unless it is winding down and flat. how: flat,
+        deadline or close_now, for the journal's words."""
+        now = now or utcnow()
+        s = self.sleeve(sleeve)
+        if s.lifecycle != lifecycle.WINDING_DOWN or not self.lifecycle_flat(sleeve)[1]:
+            return False
+        text = lifecycle.retired_words(how)
+        with self.engine.begin() as c:
+            done = c.execute(update(sleeves_t).where(sleeves_t.c.name == sleeve,
+                                                     sleeves_t.c.lifecycle == lifecycle.WINDING_DOWN)
+                             .values(lifecycle=lifecycle.RETIRED, desired_state="stopped", updated_at=now)).rowcount
+            if not done:  # another process retired it first
+                return False
+            c.execute(sleeve_archive_t.delete().where(sleeve_archive_t.c.sleeve == sleeve))
+            c.execute(insert(sleeve_archive_t).values(sleeve=sleeve, archived_at=now))
+            # The PM's wind-down, ended by the system once flat: the row names both, so it never reads as the PM
+            # pressing retire (Advisor 13 Oct 16:40)
+            c.execute(insert(decisions_t).values(ts=now, actor="PM", action="retire", sleeve=sleeve,
+                                                 reason="Triggered by the system once flat, ending the PM's "
+                                                        f"wind-down. {text}"))
+            c.execute(insert(events_t).values(sleeve=sleeve, ts=now, level="info", kind=LIFECYCLE_EVENT, message=text))
+        return True
 
     def report_keys(self, present: dict[str, bool]) -> None:
         """Supervisor only: whether each live account's key is on the server. Never the key itself."""
@@ -1689,17 +1804,25 @@ class Store:
         return replay_book(fills, starting_balance, self.funding_total(sleeve), self.insurance_total(sleeve))
 
     def record_funding(self, sleeve: str, *, qty: float, price: float, rate: float, amount: float,
-                       ts: datetime | None = None, kind: str = "settled") -> str:
+                       ts: datetime | None = None, kind: str = "settled", arrived_at: datetime | None = None) -> str:
         """Book a funding movement once (CASH-1): "new" when written; "same" when this settlement already holds it
         (a second process, a restart); "differs" when it holds another figure, or the other charge kind, which raises
-        an error event and moves nothing. Only "new" moved cash."""
+        an error event and moves nothing. Only "new" moved cash. A true-up moves cash at `arrived_at`, by default
+        when it is written; record_true_up works it out from the baseline (CASH-4)."""
         qty, price, amount = _exact(qty=qty, price=price, amount=amount)
         ts = ts or utcnow()
+        if kind == "true_up":
+            arrived_at = arrived_at or utcnow()
+        elif arrived_at is not None:
+            raise ValueError(f"only a true-up moves cash at an arrival time, not a {kind} row")
         key = (funding_t.c.sleeve == sleeve) & (funding_t.c.ts == ts)
         key &= funding_t.c.kind.in_(FUNDING_CHARGE_KINDS) if kind in FUNDING_CHARGE_KINDS else funding_t.c.kind == kind
-        booked = self._book_once(funding_t, key, dict(sleeve=sleeve, ts=ts, qty=qty, price=price, rate=rate,
-                                                      amount=amount, kind=kind),
-                                 lambda row: row.kind == kind and stored(row.amount) == stored(amount))
+        values = dict(sleeve=sleeve, ts=ts, qty=qty, price=price, rate=rate, amount=amount, kind=kind)
+        if arrived_at is not None:  # named only when set, so a journal from before 0016 still takes every other row
+            values["arrived_at"] = arrived_at
+        booked = self._book_once(funding_t, key, values,
+                                 lambda row: row.kind == kind and stored(row.amount) == stored(amount),
+                                 cols=(funding_t.c.kind, funding_t.c.amount))
         if booked == "differs":
             self.event(sleeve, "error", "funding_conflict",
                        f"Funding for the {ts:%d %b %H:%M} UTC settlement ({kind}, {amount:,.2f}) arrived again with "
@@ -1707,13 +1830,14 @@ class Store:
                        "before trusting this strategy's book", ts=ts)
         return booked
 
-    def _book_once(self, table, key, values: dict, same) -> str:
+    def _book_once(self, table, key, values: dict, same, cols=None) -> str:
         """Insert `values` unless a row matching `key` exists: "new", "same" (same(row) holds) or "differs". The
-        table's unique index makes a concurrent second writer fail; its retry reads the first writer's row."""
+        table's unique index makes a concurrent second writer fail; its retry reads the first writer's row. `cols`:
+        the columns same() reads, when not every column (one a later migration adds may not be there yet)."""
         for _ in range(2):
             try:
                 with self.engine.begin() as c:
-                    row = c.execute(select(table).where(key)).first()
+                    row = c.execute((select(*cols) if cols else select(table)).where(key)).first()
                     if row is not None:
                         return "same" if same(row) else "differs"
                     c.execute(insert(table).values(**values))
@@ -1721,6 +1845,58 @@ class Store:
             except IntegrityError:
                 continue
         raise RuntimeError(f"a {table.name} row of {values.get('sleeve')} could not be booked or read")
+
+    def record_true_up(self, sleeve: str, ts: datetime, *, rate: float, amount: float | Decimal,
+                       arrived_at: datetime) -> tuple[str, Decimal | None]:
+        """CASH-4 (Advisor 8 Oct 04:10, ruling 2): the venue's rate for settlement `ts`, charged at the baseline,
+        arrived at `arrived_at`; `amount` is what that rate settles to (signed as the cash moves). Books one true-up of
+        amount - baseline at the settlement's ts, moving cash at its arrival, and never edits the baseline. Returns
+        ("new", true-up) when written; ("same", true-up) when this settlement already holds that one (a second
+        process, a restart); ("differs", None) when it holds another, which raises an error event and moves nothing;
+        ("none", None) when there is nothing to true up: no baseline at ts (it was settled at the venue's rate) or
+        the baseline was reversed (no settlement after all). Only "new" moved cash."""
+        amount, = _exact(amount=amount)
+        at = (funding_t.c.sleeve == sleeve) & (funding_t.c.ts == ts)
+        for _ in range(2):
+            try:
+                with self.engine.begin() as c:
+                    rows = {r.kind: r for r in c.execute(select(funding_t).where(at))}
+                    base = rows.get("baseline")
+                    if base is None or "reversal" in rows:
+                        return "none", None
+                    up = amount - to_decimal(base.amount)
+                    if "true_up" in rows:
+                        if stored(rows["true_up"].amount) == stored(up):
+                            return "same", to_decimal(rows["true_up"].amount)
+                        break
+                    c.execute(insert(funding_t).values(sleeve=sleeve, ts=ts, qty=base.qty, price=base.price,
+                                                       rate=rate, amount=up, kind="true_up", arrived_at=arrived_at))
+                    return "new", up
+            except IntegrityError:
+                continue  # a second writer booked it first: read theirs
+        else:
+            raise RuntimeError(f"a funding true-up of {sleeve} could not be booked or read")
+        self.event(sleeve, "error", "funding_conflict",
+                   f"The true-up for the {ts:%d %b %H:%M} UTC settlement arrived again as {up:+,.2f}, not as booked. "
+                   "The booked true-up is kept and nothing moved; check the venue's record before trusting this "
+                   "strategy's book", ts=arrived_at)
+        return "differs", None
+
+    def open_baselines(self, sleeve: str) -> list[dict]:
+        """Settlements charged the baseline and neither trued up nor reversed yet, oldest first: what a strategy
+        with no process of its own is still owed a true-up on (Supervisor.true_up_stopped, CASH-4)."""
+        other = funding_t.alias("other")
+        done = (select(other.c.id).where(other.c.sleeve == funding_t.c.sleeve, other.c.ts == funding_t.c.ts,
+                                         other.c.kind.in_(("true_up", "reversal"))).exists())
+        q = (select(funding_t).where(funding_t.c.sleeve == sleeve, funding_t.c.kind == "baseline", ~done)
+             .order_by(funding_t.c.ts))
+        with self.engine.connect() as c:
+            return _rows(c.execute(q))
+
+    @staticmethod
+    def _cash_moved_at(t):
+        """When a row moved cash: a funding true-up at its arrival, everything else at its ts (CASH-4)."""
+        return func.coalesce(t.c.arrived_at, t.c.ts) if t is funding_t else t.c.ts
 
     def funding(self, sleeve: str, limit: int | None = 1000) -> list[dict]:
         """Newest first: the last `limit` rows, or all of them with limit=None, as a check that must see every
@@ -1730,12 +1906,16 @@ class Store:
             return _rows(c.execute(q))
 
     def funding_total(self, sleeve: str, before: datetime | None = None) -> Decimal:
-        """Funding booked to the strategy's cash, all of it or (before) only what settled before then."""
-        q = select(func.sum(funding_t.c.amount)).where(funding_t.c.sleeve == sleeve)
+        """Funding booked to the strategy's cash, all of it or (before) only what moved it before then: a true-up
+        from the arrival of the rate it corrects (CASH-4). Exact on either database, as strategy_cash_pnl: a true-up's
+        difference must not come back as a float's."""
+        w = funding_t.c.sleeve == sleeve
         if before is not None:
-            q = q.where(funding_t.c.ts < before)
+            w &= self._cash_moved_at(funding_t) < before
         with self.engine.connect() as c:
-            return to_decimal(c.execute(q).scalar() or 0)
+            if self.engine.dialect.name == "postgresql":
+                return to_decimal(c.execute(select(func.sum(funding_t.c.amount)).where(w)).scalar() or 0)
+            return sum((to_decimal(a) for a in c.execute(select(funding_t.c.amount).where(w)).scalars()), Decimal(0))
 
     def record_insurance(self, sleeve: str, *, price: float, amount: float, order_id: str | None = None,
                          trade_id: str | None = None, ts: datetime | None = None) -> str:
@@ -1777,14 +1957,15 @@ class Store:
         """The one cash reader (CASH-2): what the journal moved the strategy's cash by over (since, at], every row
         counted. That is each fill's cash leg less its fee, plus funding and the insurance fund's cover. since None
         is from the first row and at None is to the last; a row at `at` counts and a row at `since` does not, so
-        consecutive windows add up to the whole. Exact: summed by Postgres' NUMERIC, or row by row on SQLite, whose
-        own sum would be a float's."""
+        consecutive windows add up to the whole. A funding true-up counts from the arrival of the rate it corrects,
+        not its settlement's ts (CASH-4). Exact: summed by Postgres' NUMERIC, or row by row on SQLite, whose own sum
+        would be a float's."""
         def window(t):
-            w = t.c.sleeve == sleeve
+            w, moved = t.c.sleeve == sleeve, self._cash_moved_at(t)
             if since is not None:
-                w &= t.c.ts > since
+                w &= moved > since
             if at is not None:
-                w &= t.c.ts <= at
+                w &= moved <= at
             return w
 
         f = fills_t.c

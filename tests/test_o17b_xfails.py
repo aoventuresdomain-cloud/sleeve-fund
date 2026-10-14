@@ -144,7 +144,6 @@ def test_paper_does_not_block_when_the_venue_publishes_within_15_minutes(tmp_pat
 CASES = [(1, 0.0003), (1, -0.0002), (-1, 0.0003), (-1, -0.0002), (-1, 0.0)]
 
 
-@xfail
 @pytest.mark.parametrize("side, actual", CASES, ids=["long+3bp", "long-2bp", "short+3bp", "short-2bp", "short-zero"])
 def test_the_true_up_is_journalled_and_moves_pnl_by_exactly_the_difference(tmp_path, monkeypatch, binance, side, actual):
     """Held 07:52 -> 08:50 on `side`; the venue publishes 08:00's `actual` rate at 08:30 (store and venue), after the
@@ -174,7 +173,6 @@ def test_the_true_up_is_journalled_and_moves_pnl_by_exactly_the_difference(tmp_p
     assert late["equity"]["equity"] - never["equity"]["equity"] == pytest.approx(fix["amount"], abs=1e-6)
 
 
-@xfail
 def test_the_true_up_still_comes_after_the_position_is_closed(tmp_path, monkeypatch, binance):
     """Short 07:52 -> 08:20; baseline charged at 08:15; flat from 08:20; the rate (+0.03%) is published at 08:30. The
     short was owed +0.03% and was charged -0.01%: the correction, +n(r + b) at the settlement-time mark, is booked

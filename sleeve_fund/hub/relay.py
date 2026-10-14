@@ -9,7 +9,10 @@ arrives just after the boundary still lands in it. Nautilus's own time-bar aggre
 its build delay only shifts that window (and the bar's stamp), so the hub does not use it.
 
 A minute the hub missed (the venue connection dropped, or the hub was down) is announced as a gap and refilled
-from the venue's REST candles, flagged as refilled, on a worker thread so the venue connection never waits.
+from the venue's REST candles, flagged as refilled, on a worker thread so the venue connection never waits. At start
+the hub also refills the holes its store already has (a refill that failed or came back short before, or one a
+restart cut off), so a hole is never left for good while the venue still has its candles (HUB-RESTART-FILL). A minute
+the venue can't give is never made up: it stays a hole and is alerted.
 Writes to the store run on a thread of their own too, in the order the bars were seen."""
 
 from __future__ import annotations
@@ -177,18 +180,30 @@ class HubRelay(DataActor):
         # relay's subscription, _since): the report then says how long the counts cover (HUB-LATE-01).
         self.late: dict[str, list[int]] = {}
         self.late_path = None
+        self.holes: dict[str, list[tuple[int, int]]] = {}
+        self.alert: Callable[[str, str], None] = lambda key, message: print(message)
+        self.seed: Callable[[str], tuple[int | None, list[tuple[int, int]]]] | None = None
 
     def attach(self, fanout, sink=None, pairs: dict[str, str] | None = None, recent=None,
-               last_close: dict[str, int] | None = None, discover=None, late_path=None) -> "HubRelay":
+               last_close: dict[str, int] | None = None, discover=None, late_path=None,
+               holes: dict[str, list[tuple[int, int]]] | None = None, alert=None, seed=None) -> "HubRelay":
         """pairs: {instrument id: pair}, kept up to date in place (the sink may hold the same dict). last_close:
         per instrument, the close of the last bar already stored, so the minutes the hub was down are refilled
-        from its first bar. discover: () -> {instrument id: pair}, read every REFRESH_SECONDS, so a strategy
-        added while the hub runs is relayed and stored without a restart."""
+        from its first bar. holes: per instrument, (first, last) closes of the minutes the store is missing,
+        refilled at start (hub.__main__.start_holes). alert(key, message): a refill that failed or came back short
+        (the inbox, once a day per key). discover: () -> {instrument id: pair}, read every REFRESH_SECONDS, so a
+        strategy added while the hub runs is relayed and stored without a restart. seed(instrument id) -> (last
+        close, holes): the same two read from the store for an instrument relayed without them (one discover()
+        found after start, or one the store couldn't be read for at start), so its first bar refills what the
+        store is missing too (P1-L16)."""
         self.fanout, self.recent, self.discover = fanout, recent, discover
         self.sink = sink or self.sink
         self.pairs = pairs if pairs is not None else {}
         self.gaps.last.update(last_close or {})
         self.late_path = late_path
+        self.holes = dict(holes or {})
+        self.alert = alert or self.alert
+        self.seed = seed
         return self
 
     # --- the fan-out asks, from its own thread ------------------------------------------
@@ -213,6 +228,7 @@ class HubRelay(DataActor):
     def on_start(self) -> None:
         for iid in self._initial:
             self._relay(iid)
+        self._refill_holes()
         self.clock.set_timer("hub-refresh", pd.Timedelta(seconds=REFRESH_SECONDS).to_pytimedelta(),
                              callback=self._refresh)
         # Every minute, BAR_GRACE_SECONDS after it ends: the only wait the venue-time bars add (P1-1-DELAY).
@@ -242,11 +258,35 @@ class HubRelay(DataActor):
         self.subscribe_trades(inst)
         self.subscribe_quotes(inst)
         self._since[iid] = time.time_ns()
+        self._seed(iid)
         inst = self.cache.instrument(inst)
         with self._lock:
             self.relayed.add(iid)
             if inst is not None:  # sent to each client on connecting, so paper needs no venue connection of its own
                 self.definitions[iid] = inst.to_dict()
+
+    def _seed(self, iid: str) -> None:
+        """An instrument relayed without its store's last minute: read it (and the store's holes) now, so the
+        minutes the hub missed are refilled from its first bar, as for one known at start (P1-L16)."""
+        if self.seed is None or iid in self.gaps.last:
+            return
+        try:
+            last, holes = self.seed(iid)
+        except Exception as exc:  # noqa: BLE001 - the store unreadable: only the first bar's stand-in is refilled
+            print(f"hub: can't read the stored history of {iid}: {exc!r}")
+            return
+        if last is not None:
+            self.gaps.last.setdefault(iid, last)
+        for since, until in holes:
+            self._refill.submit(self._fill, iid, since, until, False)
+
+    def _refill_holes(self) -> None:
+        """The store's holes, refilled once at start. To the store only: they are minutes long gone, and a client
+        connected already has passed them (it reads its history from the store)."""
+        holes, self.holes = self.holes, {}
+        for iid, runs in sorted(holes.items()):
+            for since, until in runs:
+                self._refill.submit(self._fill, iid, since, until, False)
 
     def _write_late(self) -> None:
         if self.late_path is None:
@@ -304,9 +344,12 @@ class HubRelay(DataActor):
             self.fanout.publish(msg)
             self._store.submit(self._keep, [msg])
 
-    def _fill(self, iid: str, since_ns: int, until_ns: int) -> None:
+    def _fill(self, iid: str, since_ns: int, until_ns: int, publish: bool = True) -> None:
+        """Refill the minutes closing since_ns to until_ns from the venue's candles: to the clients (publish) and the
+        store. Minutes the venue didn't give (its REST down, or the stretch older than the candles it returns) are
+        alerted, never made up; the next hub start tries them again (_refill_holes)."""
         pair = self.pairs.get(iid)
-        bars = []
+        bars, failed = [], None
         try:
             if pair is not None and self.recent is not None:  # else nothing to refill from: still say filled
                 with self._lock:
@@ -314,13 +357,31 @@ class HubRelay(DataActor):
                 precision = (d["price_precision"], d["size_precision"]) if d else None
                 bars = refill_bars(self.recent, pair, iid, since_ns, until_ns, time.time_ns(), precision)
         except Exception as exc:  # noqa: BLE001 - the venue's REST down too: the gap stays announced
-            print(f"hub: refill of {iid} failed: {exc!r}")
-        for b in bars:
-            self.fanout.publish(b)
+            failed = repr(exc)
+        if publish:
+            for b in bars:
+                self.fanout.publish(b)
         if bars:
             self._store.submit(self._keep, bars)
-        # Done, found or not: a client holding the live bar for this refill (QA P1-L2) stops waiting.
-        self.fanout.publish({"t": "filled", "id": iid, "since": since_ns, "until": until_ns})
+        got = {b["ts"] for b in bars}
+        missing = [c for c in range(since_ns, until_ns + 1, MINUTE_NS) if c not in got]
+        if missing:
+            self._unfilled(iid, pair, missing, failed)
+        if publish:  # done, found or not: a client holding the live bar for this refill (QA P1-L2) stops waiting
+            self.fanout.publish({"t": "filled", "id": iid, "since": since_ns, "until": until_ns})
+
+    def _unfilled(self, iid: str, pair: str | None, missing: list[int], failed: str | None) -> None:
+        def at(close: int) -> str:  # a minute by its open, as the store and the history checks name it
+            return f"{pd.Timestamp(close - MINUTE_NS, unit='ns', tz='UTC'):%Y-%m-%d %H:%M} UTC"
+
+        span = at(missing[0]) if len(missing) == 1 else f"{at(missing[0])} to {at(missing[-1])}"
+        why = f"the refill failed ({failed})" if failed else "the venue's candles didn't cover them"
+        message = (f"hub {pair or iid}: {len(missing)} minute(s) {span} could not be refilled: {why}. They stay a gap "
+                   "in the history (never made up); the next hub start tries again")
+        try:
+            self.alert(f"hub refill {iid} {missing[0]} {missing[-1]}", message)
+        except Exception as exc:  # noqa: BLE001 - the inbox away: the log line still says it
+            print(f"{message} (alert not raised: {exc!r})")
 
     def _keep(self, msgs: list[dict]) -> None:
         try:

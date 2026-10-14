@@ -812,6 +812,28 @@ def _refresh_funding(profile, pair: str, root, since) -> None:
     _refresh_open_interest(profile, pair, root, funding_to)
 
 
+def funding_backfill(profile, pair: str, since: pd.Timestamp, root=None, pages: int = 50,
+                     dry_run: bool = False) -> dict:
+    """FUNDING-BACKFILL (START CHECKLIST 5): the settled funding the store lacks from `since` up to its newest kept
+    rate, asked of the venue's history (funding.backfill). Only adds: a kept rate is never changed or removed, and a
+    rate that can't be believed is left out and counted, so it stays a hole the coverage report shows. Not complete
+    when the pages ran out first. An instrument with no rates kept is left to the collector (refresh, from its
+    listing or history request)."""
+    from sleeve_fund import funding
+
+    kept = funding.rates(profile.name, pair, root)
+    out = {"pair": pair, "since": since.isoformat(), "dry_run": dry_run,
+           "first_kept": kept.index[0].isoformat() if len(kept) else None, "kept": len(kept)}
+    refused: list = []
+    report: dict = {"complete": not len(kept)}
+    n = funding.backfill(profile.name, pair, since, root=root, max_pages=pages, dry_run=dry_run, refused=refused,
+                         report=report) if len(kept) else 0
+    after = funding.rates(profile.name, pair, root)
+    out.update({"would_add" if dry_run else "added": n, "refused": len(refused), "complete": report["complete"],
+                "first_now": after.index[0].isoformat() if len(after) else None})
+    return out
+
+
 def _now() -> pd.Timestamp:
     return pd.Timestamp.now(tz="UTC")
 
@@ -1085,6 +1107,55 @@ def unwritable(path: Path) -> str | None:
         return f"cannot write {path} as uid {os.getuid()} ({owner} is {owned}): {exc!r}"
 
 
+def coverage_line(store: HistoryStore, venue: str, pair: str, start: pd.Timestamp, end: pd.Timestamp,
+                  perpetual: bool) -> str:
+    """One line on whether a test window is covered (Advisor 13 Oct 19:35 UK, PRE): the instrument's stored 1-minute
+    bars over [start, end) (first and last minute held, minutes missing inside the window, the longest run missing)
+    and, on a perpetual, its settled funding (first and last rate kept, holes and possible holes inside the window).
+    COVERED only when every minute and every settlement in the window is held. Read-only."""
+    from sleeve_fund import funding
+
+    if end <= start:
+        raise ValueError(f"the window must close after it opens: {start} .. {end}")
+    parts, whole = [f"{venue} {pair} {start:%Y-%m-%d %H:%M}..{end:%Y-%m-%d %H:%M}:"], True
+    cov = store.coverage(venue, pair)
+    if cov is None:
+        parts.append("1m none stored")
+        whole = False
+    else:
+        lo, hi = max(start, cov.first), min(end - pd.Timedelta(minutes=1), cov.closed or cov.last)
+        inside = [(max(a, start), min(b, end - pd.Timedelta(minutes=1))) for a, b in store.gaps(venue, pair)
+                  if b >= start and a < end]
+        missing = sum(int((b - a) / pd.Timedelta("1min")) + 1 for a, b in inside)
+        before = max(0, int((cov.first - start) / pd.Timedelta("1min")))
+        after = max(0, int((end - pd.Timedelta(minutes=1) - hi) / pd.Timedelta("1min")))
+        longest = max([int((b - a) / pd.Timedelta("1min")) + 1 for a, b in inside] + [0])
+        whole &= missing == 0 and before == 0 and after == 0
+        parts.append(f"1m {lo:%Y-%m-%d %H:%M}..{hi:%Y-%m-%d %H:%M}, missing {missing + before + after} min"
+                     + (f" ({before} before the first stored)" if before else "")
+                     + (f" ({after} after the last closed)" if after else "")
+                     + (f", longest gap {longest} min" if longest else ""))
+    if perpetual:
+        t = funding.rates(venue, pair, store.root).index
+        if not len(t):
+            parts.append("funding none stored")
+            whole = False
+        else:
+            holes, maybe = funding.settled_holes(venue, pair, store.root)
+            within = lambda spans: [g for g in spans if g[1] > start and g[0] < end]  # noqa: E731
+            h, m = within(holes), within(maybe)
+            # the instrument's own settlement interval (its shortest recent spacing; 8 hours with one rate), so a 1 or
+            # 4-hour instrument missing its first or last settlements in the window reads as such (CR COV-1)
+            steps = [b - a for a, b in zip(t[-6:], t[-5:])]
+            every = min(steps) if steps else pd.Timedelta(hours=8)
+            late, early = t[0] > start + every, t[-1] < end - every
+            whole &= not (h or m or late or early)
+            parts.append(f"funding {t[0]:%Y-%m-%d %H:%M}..{t[-1]:%Y-%m-%d %H:%M}, {len(h)} hole(s), "
+                         f"{len(m)} possible at an interval change" + (", starts after the window opens" if late else "")
+                         + (", ends before the window closes" if early else ""))
+    return ("COVERED " if whole else "GAPS ") + " ".join(parts)
+
+
 def main(argv: list[str] | None = None) -> int:
     import argparse
     import time
@@ -1110,6 +1181,18 @@ def main(argv: list[str] | None = None) -> int:
     can.add_argument("--dry-run", action="store_true", help="count the minutes it would replace and fill; write nothing")
     rep = sub.add_parser("report", help="what is stored, and any gaps or duplicates")
     rep.add_argument("--venue", default=None)
+    cv = sub.add_parser("coverage", help="one line per instrument: is a test window's 1m data and funding all held")
+    cv.add_argument("pairs", nargs="*", help="instruments (default: core list plus sleeves')")
+    cv.add_argument("--venue", default=None)
+    cv.add_argument("--start", required=True, help="UTC time the window opens, e.g. 2024-01-01")
+    cv.add_argument("--end", default=None, help="UTC time the window closes (default: now, to the minute)")
+    fb = sub.add_parser("funding-backfill",
+                        help="fetch the settled funding a perpetual's store lacks from a time up to its newest kept rate")
+    fb.add_argument("pairs", nargs="*", help="instruments (default: core list plus sleeves')")
+    fb.add_argument("--venue", default=None)
+    fb.add_argument("--since", required=True, help="UTC time to start from, e.g. 2024-01-01")
+    fb.add_argument("--pages", type=int, default=50, help="most venue pages per instrument")
+    fb.add_argument("--dry-run", action="store_true", help="count the settlements it would add; write nothing")
     exp = sub.add_parser("export", help="one instrument's stored 1-minute candles in a window, as CSV (read-only)")
     exp.add_argument("pair", help="instrument, e.g. BTC/USDT")
     exp.add_argument("--venue", default=None)
@@ -1123,7 +1206,8 @@ def main(argv: list[str] | None = None) -> int:
 
     store = HistoryStore(args.root)
     profile = venue_profile(args.venue)
-    if args.cmd in ("refresh", "run", "canon") and (problem := unwritable(store.root / profile.name.upper())):
+    writes = args.cmd in ("refresh", "run", "canon") or (args.cmd == "funding-backfill" and not args.dry_run)
+    if writes and (problem := unwritable(store.root / profile.name.upper())):
         print(f"{profile.name}: history store can't start: {problem}")
         return 2
     if args.cmd == "export":  # GOLDEN-VENUE: read-only, CSV to stdout, a refusal to stderr
@@ -1135,6 +1219,23 @@ def main(argv: list[str] | None = None) -> int:
             print(f"export refused: {exc}", file=sys.stderr)
             return 2
         return 0
+    if args.cmd == "coverage":  # read-only
+        start = pd.Timestamp(args.start, tz="UTC")
+        end = pd.Timestamp(args.end, tz="UTC") if args.end else pd.Timestamp.now(tz="UTC").floor("min")
+        for pair in args.pairs or [p for p, _ in _pairs_in_use(profile.name)]:
+            print(coverage_line(store, profile.name, pair, start, end, profile.funding_loader is not None))
+        return 0
+    if args.cmd == "funding-backfill":  # only adds settlements the store lacks; a kept rate is never changed
+        if profile.funding_loader is None:
+            print(f"{profile.name}: publishes no funding rates")
+            return 2
+        since = pd.Timestamp(args.since, tz="UTC")
+        failed = False
+        for pair in args.pairs or [p for p, _ in _pairs_in_use(profile.name)]:
+            out = funding_backfill(profile, pair, since, args.root, args.pages, args.dry_run)
+            print(out)
+            failed |= not out["complete"]
+        return 2 if failed else 0
     if args.cmd == "report":
         for v, pair in store.series():
             if v == profile.name:

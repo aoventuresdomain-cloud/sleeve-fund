@@ -13,32 +13,32 @@ the gate answers None for them and they are sent as they are, even while the por
 
 from __future__ import annotations
 
-import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
 
 from sqlalchemy import select
 
-from sleeve_fund.gate_ledger import DbLedger, TaggedIntent
+from sleeve_fund.gate_ledger import DbLedger
 from sleeve_fund.money import to_decimal
 from sleeve_fund.portfolio.gate import Checked, check_order
 from sleeve_fund.portfolio.holding import Position, holding_for, underlying
 from sleeve_fund.portfolio.limits import Holding, rejected
-from sleeve_fund.research.portfolio import Gated, _utc, gate_intent
+from sleeve_fund.research.portfolio import Gated, _utc, tagged_intent
 from sleeve_fund.risk import PORTFOLIO, PortfolioProfile
 from sleeve_fund.store import OPEN_ORDER_STATUSES, Store, gate_decisions_t, orders_t, utcnow
 
 # Orders that only ever reduce a position: never checked, never reserved (HoQA F208-1).
 NEVER_GATED = frozenset({"exit", "stop_loss", "take_profit", "pm_flatten", "risk_halt", "risk_pause", "liquidation",
-                         "liquidation_cut"})
+                         "liquidation_cut", "wind_down", "wind_down_stop"})
 
 
 def fund_holdings(store: Store, now: datetime | None = None, atr_pct=None) -> tuple[Holding, ...]:
-    """Every strategy's open position as the book's Holdings: its journal quantity (fills, the source of truth) at its
-    latest mark, measured to the stop its entry journaled, or with none by the stopless measure from the daily ATR
-    (`atr_pct(sleeve)`, the history store's by default). Leverage is the strategy's profile cap on a perpetual, None
-    on spot. Raises ValueError when a stopless position's ATR isn't known: the check then fails closed."""
+    """Every strategy's open position as the book's Holdings, archived ones still holding included: its journal
+    quantity (fills, the source of truth) at its latest mark, measured to the stop its entry journaled, or with none
+    by the stopless measure from the daily ATR (`atr_pct(sleeve)`, the history store's by default). Leverage is the
+    strategy's profile cap on a perpetual, None on spot. Raises ValueError when a stopless position's ATR isn't known:
+    the check then fails closed."""
     from sleeve_fund import markets, risk
     from sleeve_fund.open_risk import _journal_stop, history_atr_pct
 
@@ -47,9 +47,12 @@ def fund_holdings(store: Store, now: datetime | None = None, atr_pct=None) -> tu
         def atr_pct(s):
             return history_atr_pct(s.venue or "", s.instrument, now)
     out = []
-    archived = store.archived()
+    from sleeve_fund.supervisor import outside_fund_book
+
+    # Every Strategy whose journal holds a position counts, whatever its status: one archived while still holding is
+    # on the dashboard's book until flat, so it is in the gate's figures too (Advisor 14 Oct 00:15 UK, F229-6).
     for s in store.sleeves():
-        if s.name in archived:
+        if outside_fund_book(store, s):  # F229-6: a sub-8dp test Strategy isn't the fund's
             continue
         book = store.journal_book(s.name, s.starting_balance)
         qty = to_decimal(book["qty"], "qty")
@@ -91,12 +94,7 @@ class PaperGate:
             return None
         now = _utc(ts_ns)
         try:
-            order = gate_intent(intent)
-            bar = intent.get("bar")
-            tagged = TaggedIntent(**{f: getattr(order, f) for f in order.__dataclass_fields__},
-                                  intent_id=str(intent.get("intent_id") or uuid.uuid4().hex),
-                                  kind=str(intent.get("what") or "entry"),
-                                  bar_ts=_utc(int(bar)) if isinstance(bar, int) else now)
+            tagged = tagged_intent(intent, now)  # the portfolio backtest builds it the same way (P2-7)
         except Exception as e:  # noqa: BLE001 - an order the gate can't read is never sent
             why = f"Entry rejected: the portfolio check couldn't run ({type(e).__name__}: {e}), so nothing is sent"
             self.ledger.alert("portfolio_check_failed", f"{strategy}: {why}", now)
