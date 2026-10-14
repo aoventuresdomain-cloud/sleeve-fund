@@ -75,10 +75,13 @@ def trading_day(ts: datetime) -> date:
     return (ts - timedelta(microseconds=1)).date()
 
 
-def check(profile: RiskProfile, equity: float, peak: float, day_open: float) -> Breach | None:
-    """Return the breach to act on, worst first, or None. Bad inputs fail closed."""
+def check(profile: RiskProfile, equity: float, peak: float, day_open: float, halts: bool = True) -> Breach | None:
+    """Return the breach to act on, worst first, or None. Bad inputs fail closed. halts=False (an ablation's 1x pair
+    only, CR F235-5) leaves out the drawdown halt and the daily-loss pause; bad inputs still halt."""
     if not all(x == x and x > 0 for x in (equity, peak, day_open)):  # NaN or non-positive
         return Breach("halt", f"invalid equity data (equity={equity}, peak={peak}, day_open={day_open})")
+    if not halts:
+        return None
     drawdown = 1 - equity / max(peak, equity)
     if drawdown >= profile.max_drawdown:
         return Breach("halt", f"drawdown {drawdown:.1%} hit the {profile.max_drawdown:.0%} limit")

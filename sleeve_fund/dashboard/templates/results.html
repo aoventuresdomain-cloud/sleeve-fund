@@ -54,8 +54,17 @@
   </section>
 
   <section class="panel span-12" id="ablation" aria-labelledby="ab-h">
+    {% if ablation is not none %}
+    <div class="panel-head"><h2 id="ab-h">Ablation</h2><span class="right"><span class="chip paused">Not judged</span></span></div>
+    <p>Each block of the idea switched off in turn, settings otherwise unchanged, out of sample. Each figure's change against the base is in brackets. No variant here can be promoted.</p>
+    <table>
+      <thead><tr><th>Removed</th><th>Net return</th><th>Sharpe</th><th>Max drawdown</th><th>Trades</th><th>Time in market</th><th>Note</th></tr></thead>
+      <tbody>{% for row in ablation %}<tr>{% for cell in row %}<td>{{ cell }}</td>{% endfor %}</tr>{% endfor %}</tbody>
+    </table>
+    {% else %}
     <div class="panel-head"><h2 id="ab-h">Ablation</h2><span class="right"><span class="chip paused">Not run yet</span></span></div>
     <p>Each block of the idea switched off in turn, to show which pieces earn their place. This study has no ablation yet.</p>
+    {% endif %}
   </section>
 </div>
 {% endblock %}
