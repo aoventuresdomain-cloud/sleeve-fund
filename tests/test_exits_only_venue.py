@@ -335,3 +335,29 @@ def test_an_off_pin_holder_another_check_also_refuses_runs_under_the_venue_reaso
     store.record_fill("s", side="SELL", qty=1.0, price=101.0, fee=0.0, order_id="s-x", trade_id="t2")
     sup.step()
     assert [n for n, _ in stopped] == ["s"] and store.sleeve("s").desired_state == "stopped"
+
+
+# QA Box C hand cells for #277 (QT3, runs/r277/boxc/test_r277_hand.py), landed unchanged (F277-QA2): H1 catches a
+# clone of another venue read as the pin, H6 a float sum of the fills read as a position.
+@pytest.mark.parametrize("traded,holding,mode", [("KRAKEN_P1", True, router.EXITS_ONLY),
+                                                 ("KRAKEN_P1", False, router.REFUSE),
+                                                 ("BINANCE_P1", False, router.NORMAL)])
+def test_h1_a_clone_of_another_venue_is_that_venue(traded, holding, mode):
+    assert router.start_mode("binance", traded, holding) == mode
+
+
+def test_h6_a_float_sum_above_the_holding_threshold_is_still_flat(store):
+    assert abs(100000.1 - 100000.0 - 0.1) > 1e-12  # the float sum would read as a position
+    store.create_sleeve(name="s", strategy="buy_and_hold", instrument="BTC/USDT", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=10_000_000.0, venue="BINANCE")
+    for i, (side, qty) in enumerate((("BUY", 100000.1), ("SELL", 100000.0), ("SELL", 0.1))):
+        store.record_order("s", order_id=f"s-{i}", side=side, qty=qty, intent="entry" if side == "BUY" else "exit",
+                           reason="r")
+        store.record_fill("s", side=side, qty=qty, price=100.0, fee=0.0, order_id=f"s-{i}", trade_id=f"t{i}")
+    from sqlalchemy import text
+    with store.engine.begin() as c:
+        c.execute(text("UPDATE orders SET venue = 'KRAKEN' WHERE sleeve = 's'"))
+    assert store.position_venue("s") is None
+    assert store.venue_start(store.sleeve("s")) == (router.REFUSE, "KRAKEN")
+    store.record_order("s", order_id="s-n", side="BUY", qty=1.0, intent="entry", reason="r")
+    assert _venue(store, "s-n") == "BINANCE"
