@@ -30,7 +30,7 @@ from sleeve_fund.store import OPEN_ORDER_STATUSES, Store, gate_decisions_t, orde
 
 # Orders that only ever reduce a position: never checked, never reserved (HoQA F208-1).
 NEVER_GATED = frozenset({"exit", "stop_loss", "take_profit", "pm_flatten", "risk_halt", "risk_pause", "liquidation",
-                         "liquidation_cut"})
+                         "liquidation_cut", "wind_down", "wind_down_stop"})
 
 
 def fund_holdings(store: Store, now: datetime | None = None, atr_pct=None) -> tuple[Holding, ...]:

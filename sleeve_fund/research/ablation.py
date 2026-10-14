@@ -361,7 +361,7 @@ def _utc(x) -> pd.Timestamp:
 
 
 def backtest_evaluator(prices: pd.DataFrame, instrument, windows, *, bar_minutes: int, holdout_start,
-                       risk_profile: str | None = None, exec_prices: pd.DataFrame | None = None, half_spread=None,
+                       risk_profile: str, exec_prices: pd.DataFrame | None = None, half_spread=None,
                        starting_capital: float = 10_000.0, params: dict | None = None, locks=None,
                        idea_hash: str | None = None) -> Evaluate:
     """evaluate(definition, one_x) over the out-of-sample windows [(start, end), ...]: each window runs on the bars
@@ -374,7 +374,11 @@ def backtest_evaluator(prices: pd.DataFrame, instrument, windows, *, bar_minutes
     An ablation never reads the held-back period, so it can't spend or stale the holdout the edge test is judged on
     (CR pre-review, HoE 13 Oct): holdout_start is where the study's holdout begins (None only when the data keeps
     none back), and no bar from it on is read; a window reaching it is refused. With locks and idea_hash, a window
-    overlapping a period this idea has already opened on the underlying is refused too. Nothing here opens a lock."""
+    overlapping a period this idea has already opened on the underlying is refused too. Nothing here opens a lock.
+
+    risk_profile is required (F235-6): every row, the 1x pair included, runs under a risk profile's caps, so no
+    ablation result can come from an uncapped run. None or an unknown name is refused before anything runs."""
+    from sleeve_fund import risk
     from sleeve_fund.research.metrics import (
         daily_returns,
         fills_to_rows,
@@ -384,6 +388,9 @@ def backtest_evaluator(prices: pd.DataFrame, instrument, windows, *, bar_minutes
     from sleeve_fund.research.runner import run_backtest
     from sleeve_fund.strategies.definitions import to_params
 
+    if risk_profile is None:
+        raise ValueError("an ablation needs a risk profile: every row runs under its caps, so none runs uncapped")
+    risk.profile(risk_profile)  # raises on an unknown name
     if not windows:
         raise ValueError("an ablation needs at least one out-of-sample window")
     held = None if holdout_start is None else _utc(holdout_start)
@@ -416,10 +423,10 @@ def backtest_evaluator(prices: pd.DataFrame, instrument, windows, *, bar_minutes
             read = [f.index[0] for f in (df, fine) if f is not None and len(f)]
             first = min([first, *read]) if first is not None else min(read, default=None)
             p = {**(params or {}), **to_params(defn, str(instrument.id.venue)), "trade_from": start.value}
-            if one_x and risk_profile is not None:
+            if one_x:
                 run = {"runtime": one_x_runtime(instrument, bar_minutes, starting_capital, risk_profile, p)}
             else:
-                run = {"risk_profile": None if one_x else risk_profile}
+                run = {"risk_profile": risk_profile}
             res = run_backtest("rules", df, instrument, p, starting_capital=starting_capital, bar_minutes=bar_minutes,
                                exec_prices=fine, half_spread=half_spread, **run)
             eq = res.equity[res.equity.index >= start]

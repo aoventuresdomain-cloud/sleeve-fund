@@ -154,7 +154,11 @@ funding_t = Table(
     # How the rate was set: "settled" (the venue's), "baseline" (missing, charged adversely) or "true_up" (a later
     # correction to the venue's rate), QA P1-O17.
     Column("kind", String(16), nullable=False, server_default="settled"),
+    # CASH-4: when a true-up moved cash, the real rate's arrival (ts stays the settlement's), so an as-of read before
+    # it shows the baseline only (Advisor 8 Oct 04:10, ruling 2). Only a true-up has one; every other row moved cash at ts.
+    Column("arrived_at", TS),
     CheckConstraint("kind IN ('settled', 'baseline', 'true_up', 'reversal')", name="funding_kind"),
+    CheckConstraint("(kind = 'true_up') = (arrived_at IS NOT NULL)", name="funding_true_up_arrived"),
     Index("funding_sleeve_ts", "sleeve", "ts"),
     # CASH-1: a settlement is charged once (settled or baseline, never both), and reversed or trued up at most once.
     # The key is the settlement time, so a second process or a restart that forgot it is refused by the database.
@@ -1745,17 +1749,25 @@ class Store:
         return replay_book(fills, starting_balance, self.funding_total(sleeve), self.insurance_total(sleeve))
 
     def record_funding(self, sleeve: str, *, qty: float, price: float, rate: float, amount: float,
-                       ts: datetime | None = None, kind: str = "settled") -> str:
+                       ts: datetime | None = None, kind: str = "settled", arrived_at: datetime | None = None) -> str:
         """Book a funding movement once (CASH-1): "new" when written; "same" when this settlement already holds it
         (a second process, a restart); "differs" when it holds another figure, or the other charge kind, which raises
-        an error event and moves nothing. Only "new" moved cash."""
+        an error event and moves nothing. Only "new" moved cash. A true-up moves cash at `arrived_at`, by default
+        when it is written; record_true_up works it out from the baseline (CASH-4)."""
         qty, price, amount = _exact(qty=qty, price=price, amount=amount)
         ts = ts or utcnow()
+        if kind == "true_up":
+            arrived_at = arrived_at or utcnow()
+        elif arrived_at is not None:
+            raise ValueError(f"only a true-up moves cash at an arrival time, not a {kind} row")
         key = (funding_t.c.sleeve == sleeve) & (funding_t.c.ts == ts)
         key &= funding_t.c.kind.in_(FUNDING_CHARGE_KINDS) if kind in FUNDING_CHARGE_KINDS else funding_t.c.kind == kind
-        booked = self._book_once(funding_t, key, dict(sleeve=sleeve, ts=ts, qty=qty, price=price, rate=rate,
-                                                      amount=amount, kind=kind),
-                                 lambda row: row.kind == kind and stored(row.amount) == stored(amount))
+        values = dict(sleeve=sleeve, ts=ts, qty=qty, price=price, rate=rate, amount=amount, kind=kind)
+        if arrived_at is not None:  # named only when set, so a journal from before 0016 still takes every other row
+            values["arrived_at"] = arrived_at
+        booked = self._book_once(funding_t, key, values,
+                                 lambda row: row.kind == kind and stored(row.amount) == stored(amount),
+                                 cols=(funding_t.c.kind, funding_t.c.amount))
         if booked == "differs":
             self.event(sleeve, "error", "funding_conflict",
                        f"Funding for the {ts:%d %b %H:%M} UTC settlement ({kind}, {amount:,.2f}) arrived again with "
@@ -1763,13 +1775,14 @@ class Store:
                        "before trusting this strategy's book", ts=ts)
         return booked
 
-    def _book_once(self, table, key, values: dict, same) -> str:
+    def _book_once(self, table, key, values: dict, same, cols=None) -> str:
         """Insert `values` unless a row matching `key` exists: "new", "same" (same(row) holds) or "differs". The
-        table's unique index makes a concurrent second writer fail; its retry reads the first writer's row."""
+        table's unique index makes a concurrent second writer fail; its retry reads the first writer's row. `cols`:
+        the columns same() reads, when not every column (one a later migration adds may not be there yet)."""
         for _ in range(2):
             try:
                 with self.engine.begin() as c:
-                    row = c.execute(select(table).where(key)).first()
+                    row = c.execute((select(*cols) if cols else select(table)).where(key)).first()
                     if row is not None:
                         return "same" if same(row) else "differs"
                     c.execute(insert(table).values(**values))
@@ -1777,6 +1790,58 @@ class Store:
             except IntegrityError:
                 continue
         raise RuntimeError(f"a {table.name} row of {values.get('sleeve')} could not be booked or read")
+
+    def record_true_up(self, sleeve: str, ts: datetime, *, rate: float, amount: float | Decimal,
+                       arrived_at: datetime) -> tuple[str, Decimal | None]:
+        """CASH-4 (Advisor 8 Oct 04:10, ruling 2): the venue's rate for settlement `ts`, charged at the baseline,
+        arrived at `arrived_at`; `amount` is what that rate settles to (signed as the cash moves). Books one true-up of
+        amount - baseline at the settlement's ts, moving cash at its arrival, and never edits the baseline. Returns
+        ("new", true-up) when written; ("same", true-up) when this settlement already holds that one (a second
+        process, a restart); ("differs", None) when it holds another, which raises an error event and moves nothing;
+        ("none", None) when there is nothing to true up: no baseline at ts (it was settled at the venue's rate) or
+        the baseline was reversed (no settlement after all). Only "new" moved cash."""
+        amount, = _exact(amount=amount)
+        at = (funding_t.c.sleeve == sleeve) & (funding_t.c.ts == ts)
+        for _ in range(2):
+            try:
+                with self.engine.begin() as c:
+                    rows = {r.kind: r for r in c.execute(select(funding_t).where(at))}
+                    base = rows.get("baseline")
+                    if base is None or "reversal" in rows:
+                        return "none", None
+                    up = amount - to_decimal(base.amount)
+                    if "true_up" in rows:
+                        if stored(rows["true_up"].amount) == stored(up):
+                            return "same", to_decimal(rows["true_up"].amount)
+                        break
+                    c.execute(insert(funding_t).values(sleeve=sleeve, ts=ts, qty=base.qty, price=base.price,
+                                                       rate=rate, amount=up, kind="true_up", arrived_at=arrived_at))
+                    return "new", up
+            except IntegrityError:
+                continue  # a second writer booked it first: read theirs
+        else:
+            raise RuntimeError(f"a funding true-up of {sleeve} could not be booked or read")
+        self.event(sleeve, "error", "funding_conflict",
+                   f"The true-up for the {ts:%d %b %H:%M} UTC settlement arrived again as {up:+,.2f}, not as booked. "
+                   "The booked true-up is kept and nothing moved; check the venue's record before trusting this "
+                   "strategy's book", ts=arrived_at)
+        return "differs", None
+
+    def open_baselines(self, sleeve: str) -> list[dict]:
+        """Settlements charged the baseline and neither trued up nor reversed yet, oldest first: what a strategy
+        with no process of its own is still owed a true-up on (Supervisor.true_up_stopped, CASH-4)."""
+        other = funding_t.alias("other")
+        done = (select(other.c.id).where(other.c.sleeve == funding_t.c.sleeve, other.c.ts == funding_t.c.ts,
+                                         other.c.kind.in_(("true_up", "reversal"))).exists())
+        q = (select(funding_t).where(funding_t.c.sleeve == sleeve, funding_t.c.kind == "baseline", ~done)
+             .order_by(funding_t.c.ts))
+        with self.engine.connect() as c:
+            return _rows(c.execute(q))
+
+    @staticmethod
+    def _cash_moved_at(t):
+        """When a row moved cash: a funding true-up at its arrival, everything else at its ts (CASH-4)."""
+        return func.coalesce(t.c.arrived_at, t.c.ts) if t is funding_t else t.c.ts
 
     def funding(self, sleeve: str, limit: int | None = 1000) -> list[dict]:
         """Newest first: the last `limit` rows, or all of them with limit=None, as a check that must see every
@@ -1786,12 +1851,16 @@ class Store:
             return _rows(c.execute(q))
 
     def funding_total(self, sleeve: str, before: datetime | None = None) -> Decimal:
-        """Funding booked to the strategy's cash, all of it or (before) only what settled before then."""
-        q = select(func.sum(funding_t.c.amount)).where(funding_t.c.sleeve == sleeve)
+        """Funding booked to the strategy's cash, all of it or (before) only what moved it before then: a true-up
+        from the arrival of the rate it corrects (CASH-4). Exact on either database, as strategy_cash_pnl: a true-up's
+        difference must not come back as a float's."""
+        w = funding_t.c.sleeve == sleeve
         if before is not None:
-            q = q.where(funding_t.c.ts < before)
+            w &= self._cash_moved_at(funding_t) < before
         with self.engine.connect() as c:
-            return to_decimal(c.execute(q).scalar() or 0)
+            if self.engine.dialect.name == "postgresql":
+                return to_decimal(c.execute(select(func.sum(funding_t.c.amount)).where(w)).scalar() or 0)
+            return sum((to_decimal(a) for a in c.execute(select(funding_t.c.amount).where(w)).scalars()), Decimal(0))
 
     def record_insurance(self, sleeve: str, *, price: float, amount: float, order_id: str | None = None,
                          trade_id: str | None = None, ts: datetime | None = None) -> str:
@@ -1833,14 +1902,15 @@ class Store:
         """The one cash reader (CASH-2): what the journal moved the strategy's cash by over (since, at], every row
         counted. That is each fill's cash leg less its fee, plus funding and the insurance fund's cover. since None
         is from the first row and at None is to the last; a row at `at` counts and a row at `since` does not, so
-        consecutive windows add up to the whole. Exact: summed by Postgres' NUMERIC, or row by row on SQLite, whose
-        own sum would be a float's."""
+        consecutive windows add up to the whole. A funding true-up counts from the arrival of the rate it corrects,
+        not its settlement's ts (CASH-4). Exact: summed by Postgres' NUMERIC, or row by row on SQLite, whose own sum
+        would be a float's."""
         def window(t):
-            w = t.c.sleeve == sleeve
+            w, moved = t.c.sleeve == sleeve, self._cash_moved_at(t)
             if since is not None:
-                w &= t.c.ts > since
+                w &= moved > since
             if at is not None:
-                w &= t.c.ts <= at
+                w &= moved <= at
             return w
 
         f = fills_t.c
