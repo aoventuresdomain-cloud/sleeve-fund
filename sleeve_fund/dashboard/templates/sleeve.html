@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% from "_fields.html" import exit_fields %}
-{% from "_macros.html" import stop_words, trail_words, chip, test_chip, signed, money_signed, usage, tag, why, why_toggle, price_chart, help, cost_share, stop_liq %}
+{% from "_macros.html" import stop_words, trail_words, chip, test_chip, signed, money_signed, usage, tag, why, why_toggle, price_chart, help, cost_share, stop_liq, limits_after %}
 {% from "_signals.html" import signals_tab, signals_panel, signals_side %}
 {% from "_positions.html" import positions_table %}
 {% from "_reasons.html" import reason_picker %}
@@ -37,7 +37,8 @@
 <div data-live="banners">
 {% if backtest_id %}<div class="banner" role="status">Backtest run{% if tested %}, {{ tested }}{% endif %}. Not in the book.</div>{% endif %}
 {% if strategy_errors %}<div class="banner loss" role="alert">The strategy's code raised an error {{ strategy_errors }} time{{ 's' if strategy_errors != 1 }}{% if backtest_id %} during this run, so its results after that can't be relied on{% else %} since it last started; its orders after that may be wrong{% endif %}. The Activity tab has the details.</div>{% endif %}
-{% if archived %}<div class="banner" role="status">Archived.</div>{% endif %}
+{% if archived %}<div class="banner" role="status">Archived{% if waiting_flat %}, waiting to go flat: {{ waiting_flat }}. It stays in the fund's book in full until then{% elif nothing_out is not none %}, nothing to withdraw (equity {{ nothing_out|money }}). It stays in the fund's book at that figure{% endif %}.</div>{% endif %}
+{% if put_away_now %}<div class="banner" role="status">{{ 'Retired: its equity left the fund\'s book, which isn\'t a loss.' if put_away_done == 'retired' else 'Restored: its equity is back in the fund\'s book, which isn\'t a gain.' }}{{ limits_after(put_away_now) }}</div>{% endif %}
 {% if liquidated and s.status != 'halted' %}<div class="banner loss" role="alert"><strong>Liquidated:</strong> its position margin was lost, so it can't start, resume or be reset until you use Reset after liquidation, which asks for an incident note.</div>{% endif %}
 {% if s.status in ['halted', 'paused', 'error'] and s.status_reason %}
 <div class="banner {{ 'loss' if s.status != 'paused' else 'warn' }}" role="alert">
@@ -344,8 +345,8 @@
   'resume': ('Resume ' ~ s.name, ('Its position margin was lost (liquidated), so it stays halted: resuming doesn\'t restart it. It trades again only after you use Reset after liquidation, which asks for an incident note.' if liquidated else ('It has no equity left (wiped out), so it cannot open a trade: resuming only halts it again.' if x.equity <= 0 else 'The strategy trades again on its next signal.') ~ (' Its drawdown reference resets to today\'s equity of ' ~ (x.equity|money) ~ '.' if s.status == 'halted' else '')), 'Resume trading', ''),
   'flatten': ('Flatten ' ~ s.name, ('It is stopped, so it starts only to ' ~ ('buy back ' if held < 0 else 'sell ') ~ (held|abs|qty) ~ ' ' ~ base ~ ' (about ' ~ ((held * x.price)|abs|money) if s.desired_state != 'running' else ('Buys back ' if x.qty < 0 else 'Sells ') ~ (x.qty|abs|qty) ~ ' ' ~ base ~ ' (about ' ~ (x.position_value|abs|money)) ~ ' ' ~ quote ~ ') at market, paying the taker fee, then pauses the strategy.', 'Close to cash and pause' if x.qty < 0 or held < 0 else 'Sell to cash and pause', 'danger'),
   'stop': ('Stop ' ~ s.name, 'Shuts the strategy process down. ' ~ ('It keeps its ' ~ ('short of ' if x.qty < 0 else '') ~ (x.qty|abs|qty) ~ ' ' ~ base ~ ' unmanaged until restarted, so flatten first if you want cash.' if x.qty else 'It has no open position.'), 'Stop strategy', 'danger' if x.qty else ''),
-  'archive': ('Archive ' ~ s.name, 'Hides it from the strategy list on the home page. Nothing is deleted: its trades, orders and decisions stay, and you can restore it any time.', 'Archive strategy', ''),
-  'restore': ('Restore ' ~ s.name, 'Puts it back in the strategy list on the home page. It stays stopped until you start it.', 'Restore strategy', ''),
+  'archive': ('Archive ' ~ s.name, 'Hides it from the strategy list on the home page' ~ (', and its equity of ' ~ ((put_away.taken if put_away and put_away.taken is not none else x.equity)|money) ~ ' leaves the fund\'s book, which isn\'t a loss' if not (put_away and (put_away.taken == 0 or put_away.waiting)) else (', and its equity leaves the fund\'s book once it is flat' if put_away.waiting else '')) ~ '. Nothing is deleted: its trades, orders and decisions stay, and you can restore it any time.', 'Archive strategy', ''),
+  'restore': ('Restore ' ~ s.name, 'Puts it back in the strategy list on the home page, and its equity comes back into the fund\'s book. It stays stopped until you start it.', 'Restore strategy', ''),
   'start': ('Start ' ~ s.name, 'Its position margin was lost (liquidated), so it can\'t start. It trades again only after you use Reset after liquidation, which asks for an incident note.' if liquidated else 'Starts the strategy process. It picks up its journal and reconciles before trading.', 'Start strategy', ''),
 } %}
 {% if not backtest_id %}<div data-live="dialogs" data-live-forms>
@@ -357,6 +358,7 @@
     {% if cmd == 'stop' and x.qty %}<div class="warnbox"><b>The position stays open.</b> Once stopped, it runs for its exits only: {% if risk.stop_px %}the stop at {{ risk.stop_px|px }} still closes it{% else %}it has no stop, so a safety stop is set from the current price{% endif %}, nothing new opens, and it stops once it is flat. Usually you want Flatten and stop: it closes the position first, then asks you to stop it once it is flat.</div>{% endif %}
     {% if cmd == 'stop' and flatten_waits %}<div class="warnbox"><b>A flatten is still waiting.</b> Stopping now drops it: while it still holds, the strategy runs for its exits only, its stop still closing the position.</div>{% endif %}
     {% if cmd == 'pause' and x.qty and not risk.stop_px %}<div class="warnbox"><b>This position has no stop.</b> While paused, nothing will exit it. Consider Flatten instead, or add a stop in Settings first.</div>{% endif %}
+    {% if cmd == 'archive' and put_away %}{{ limits_after(put_away, preview=True) }}{% endif %}
     {% if cmd == 'close' %}<input type="hidden" name="reason_for" value="close">{% endif %}
     {% set refused = cmd in ['resume', 'start'] and liquidated %}{# nothing to offer: the server refuses it (QA P1-U25, U31) #}
     {% if not refused %}{{ reason_picker(cmd, 'r-' ~ cmd) }}{% endif %}

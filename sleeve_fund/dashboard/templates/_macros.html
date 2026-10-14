@@ -72,3 +72,14 @@
   <a href="/orders" {{ 'aria-current=page' if active == 'orders' }}>Orders</a>
 </nav>{% endmacro %}
 {% macro pts(x) %}<span class="{{ 'gain' if x > 0.00005 else ('loss' if x < -0.00005 else 'muted') }}">{{ '+' if x > 0.00005 else ('−' if x < -0.00005 else '') }}{{ '%.1f'|format((x * 100)|abs) }} pts</span>{% endmacro %}
+{# The fund's book after a Strategy is put away and the limits in use against it (F-C3B-A-UI): v is
+   withdrawal.limits_in_use(). preview: the confirm view ("would be"), else the book as it now is. Display only. #}
+{% macro limits_after(v, preview=False) %}<div class="limits-after{{ ' warnbox' if v.over or v.empty }}">
+{%- if v.source == 'unmarked' %}<p class="muted">The fund's book has no mark yet, so there are no limits in use to show.</p>
+{%- elif v.source == 'unreadable' %}<p class="muted">The limits in use can't be read now.</p>
+{%- elif v.empty %}<p><b>The fund's book {{ 'would be' if preview else 'is now' }} {{ v.after|money }}:</b> no capital, so nothing can trade until some is added.{% if preview %} It goes through only while nothing is open or holding room in the book and no day's pause is in force; otherwise it is refused, with the reason.{% endif %}</p>
+{%- else %}{% if preview and v.waiting %}<p>Nothing leaves the fund's book yet: {{ v.waiting.values()|join('; ') }}. It stays in the book in full until it is flat, and its equity leaves then.</p>{% endif %}
+  <p>The fund's book {{ 'would be' if preview and v.taken else 'is now' }} <b>{{ v.after|money }}</b>{% if preview and v.taken %}, {{ v.taken|money }} less{% endif %}. Limits in use against it:</p>
+  <ul class="limits-after-list">{% for x in v.limits %}<li><span>{{ x.words }}{% if x.what %} <span class="faint">{{ x.what }}</span>{% endif %}</span> <b class="{{ x.tone }}">{{ x.used|pct1 }}</b> <span class="faint">of {{ x.limit|pct0 }}</span></li>{% endfor %}</ul>
+  {%- if v.over %}<p><b>At or over the limit: {{ v.over|join(', ') }}.</b> {{ 'The withdrawal still goes through and closes nothing' if preview else 'Nothing open was closed' }}; new entries that add to it are blocked until it is back under.</p>{% endif %}
+{%- endif %}</div>{% endmacro %}

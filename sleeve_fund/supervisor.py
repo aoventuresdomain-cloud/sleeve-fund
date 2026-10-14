@@ -1153,6 +1153,10 @@ def main(argv: list[str] | None = None) -> int:
             print(exc)
             return 1
         print(f"withdrawn: {', '.join(done) or 'none (nothing archived still counted)'}")
+        if done:  # the book after it and the limits in use against it, as the dashboard shows them (F-C3B-A-UI)
+            from sleeve_fund.dashboard.withdrawal import limits_in_use, words
+
+            print(words(limits_in_use(store)))
     else:
         assert_portfolio_gate(store)
         Supervisor(store, clear_path=args.clear).run()

@@ -30,7 +30,7 @@ from fastapi.templating import Jinja2Templates
 from sleeve_fund import lifecycle, liquidation, markets, open_risk
 from sleeve_fund.dashboard import book as bookm
 from sleeve_fund.dashboard import development as dev
-from sleeve_fund.dashboard import gates, reasons, reports, riskops, trading
+from sleeve_fund.dashboard import gates, reasons, reports, riskops, trading, withdrawal
 from sleeve_fund.dashboard.jobs import Jobs
 from sleeve_fund.dashboard.metrics import STALE, sleeve_summary
 from sleeve_fund.data import spec_minutes
@@ -256,7 +256,25 @@ def create_app(store: Store | None = None) -> FastAPI:
                     book=book, alerts=st().alerts(limit=30), shell=shell(),
                     positions=positions, working=working, holdings=bookm.holdings(positions["rows"], book["equity"]),
                     book_fills=trading.book_fills(st(), sleeves), funding=funding,
-                    fill_count=sum(x["fills"] for x in summaries), tests=tests)
+                    fill_count=sum(x["fills"] for x in summaries), tests=tests,
+                    **_archived_now(request, put_away))
+
+    def _archived_now(request: Request, put_away) -> dict:
+        """F-C3B-A-UI on the Portfolio: right after an archive, which Strategy went and the fund's book as it now is
+        with the limits in use against it; and which archived Strategies still count in the book (archived before
+        their equity was taken out with it, until supervisor withdraw-archived; a reset's earlier run keeps its cash), and
+        which wait to go flat before theirs leaves (Store.withdrawal_pending), and which had nothing to withdraw
+        (Store.nothing_withdrawn)."""
+        gone = request.query_params.get("archived")
+        gone = gone if gone in put_away else None
+        out, runs, pending, none = st().withdrawn(), st().reset_runs(), st().withdrawal_pending(), st().nothing_withdrawn()
+        return {"archived_now": gone, "put_away_now": withdrawal.limits_in_use(app.state.store) if gone else None,
+                "still_counted": [n for n in put_away if n not in out and n not in runs and n not in pending
+                                  and n not in none],
+                # Settled at 0 or less: nothing withdrawn, in the book at that figure (Advisor 14 Oct 11:10 UK).
+                "nothing_out": none,
+                # Archived while not flat: in the book in full until it is (Advisor 14 Oct 10:45 UK), with why.
+                "waiting_flat": {n: st().withdrawal_blocker(n) or "settling" for n in pending}}
 
     def _recent_json(sleeves, days: int, daily) -> JSONResponse:
         """The last day or week at fine resolution, in the shape the charts read."""
@@ -496,6 +514,18 @@ def create_app(store: Store | None = None) -> FastAPI:
         clearing = None if bt_id else _clearing(s)
         reset_dropped = False if bt_id else _reset_dropped(name)
         q = request.query_params
+        archived = name in st().archived()
+        # F-C3B-A-UI: archiving takes its equity out of the fund's book, so its dialog shows the book after it and the
+        # limits in use against that, read when Archive is offered (stopped and flat); after a retire or a restore, the
+        # book as it now is.
+        put_away = None
+        if not bt_id and not archived and s.desired_state != "running" and not x["qty"]:
+            put_away = withdrawal.limits_in_use(app.state.store, [name])
+        put_away_done = q.get("put_away") if q.get("put_away") in ("retired", "restored") else None
+        # Archived while not flat: it stays in the book in full until it is, then the supervisor withdraws it.
+        waiting_flat = (st().withdrawal_blocker(name) or "") if archived and name in st().withdrawal_pending() else ""
+        # Archived with a settled equity of 0 or less: nothing withdrawn, it stays in the book at that (Advisor 11:10 UK).
+        nothing_out = st().nothing_withdrawn().get(name) if archived else None
         # The settings form: what was typed when a change was refused, else the settings as they are.
         typed = {k[2:]: v for k, v in q.items() if k.startswith("f_")}
         settings_pre = typed or {"risk_profile": s.risk_profile, **_risk_form(s.params)}
@@ -527,7 +557,9 @@ def create_app(store: Store | None = None) -> FastAPI:
                     feed_kind=request.query_params.get("feed", "all"), decisions=st().decisions(name, limit=50),
                     pending=st().pending_commands(name), risk=_risk_view(x, position),
                     resetting=None if bt_id else st().pending_reset(name),
-                    idea=_idea(s.strategy, s.params), archived=name in st().archived(),
+                    idea=_idea(s.strategy, s.params), archived=archived, put_away=put_away,
+                    put_away_done=put_away_done, waiting_flat=waiting_flat, nothing_out=nothing_out,
+                    put_away_now=withdrawal.limits_in_use(app.state.store) if put_away_done else None,
                     signals=None if bt_id else _signals_view(s, st().signal_state(name)),
                     timeline=_timeline(events, st().decisions(name, limit=50)),
                     pos_history=_position_history(events, funding, position),
@@ -993,7 +1025,10 @@ def create_app(store: Store | None = None) -> FastAPI:
             raise HTTPException(404, "no such strategy") from None
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from None
-        return RedirectResponse("/" if action == "archive" else f"/sleeves/{name}", status_code=303)
+        # The page after shows the fund's book as it now is and the limits in use against it (F-C3B-A-UI).
+        if action == "archive":
+            return RedirectResponse(f"/?{urlencode({'archived': name})}", status_code=303)
+        return RedirectResponse(f"/sleeves/{name}?put_away=restored", status_code=303)
 
     @app.post("/sleeves/{name}/lifecycle")
     def sleeve_lifecycle(name: str, action: str = Form(...), reason: str = Form(""),
@@ -1008,7 +1043,9 @@ def create_app(store: Store | None = None) -> FastAPI:
             raise HTTPException(404, "no such strategy") from None
         except (ValueError, PermissionError) as exc:
             raise HTTPException(400, getattr(exc, "reason", None) or str(exc)) from None
-        return RedirectResponse(f"/sleeves/{name}", status_code=303)
+        # A retire takes its equity out of the fund's book: the page after shows the book now (F-C3B-A-UI).
+        done = "?put_away=retired" if st().sleeve(name).lifecycle == lifecycle.RETIRED else ""
+        return RedirectResponse(f"/sleeves/{name}{done}", status_code=303)
 
     def research_page(request: Request, job=None, error: str = "", pre: dict | None = None,
                       notice: str = "", tab: str | None = None):

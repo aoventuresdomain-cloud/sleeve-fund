@@ -1,0 +1,98 @@
+"""The fund's limits in use against the book after a Strategy is put away (F-C3B-A-UI, a follow-up to QD's F-C3B-A).
+Display only.
+
+Archiving, retiring or a clean slate takes the Strategy's equity out of the fund's book as a flow (Store._put_away),
+and the portfolio limits are shares of that book, so the same positions use more of each limit afterwards (W10). The
+confirm view shows the book after the withdrawal and the limits in use against it; the page after shows them against
+the book as it now is. Every figure is the entry gate's own: its last mark less what _put_away takes out, and its
+book's gross, net, margin and open risk (portfolio.limits.Book, the one the gate checks an entry against)."""
+
+from __future__ import annotations
+
+from decimal import Decimal
+
+from sleeve_fund.dashboard.riskops import NEAR_LIMIT
+from sleeve_fund.portfolio.gate import EMPTY
+from sleeve_fund.portfolio.limits import Book
+from sleeve_fund.risk import PORTFOLIO
+from sleeve_fund.store import Store
+
+
+def waiting(store: Store, names) -> dict[str, str]:
+    """{name: why} for each of `names` not settled flat (Store.withdrawal_blocker): archived now, it stays in the book
+    in full and its equity leaves once it is flat (Advisor 14 Oct 10:45 UK), so nothing leaves at archive."""
+    out = store.withdrawn()
+    return {n: why for n in dict.fromkeys(names) if n not in out and (why := store.withdrawal_blocker(n))}
+
+
+def taken_out(store: Store, names) -> Decimal:
+    """What putting `names` away takes out of the fund's book now: each one's in-book equity (Store.in_book_equity),
+    as _put_away takes it; none for one already out, one not flat yet (waiting), a saved backtest or a test account."""
+    out, held = store.withdrawn(), waiting(store, names)
+    return sum((store.in_book_equity(n) for n in dict.fromkeys(names) if n not in out and n not in held), Decimal(0))
+
+
+def _limit(key: str, words: str, used: Decimal, limit: float, book: Decimal, what: str = "") -> dict:
+    share = used / book
+    cap = Decimal(repr(limit))  # compared exactly, as the gate compares (limits.decide)
+    tone = "loss" if share >= cap else "warn" if share >= cap * Decimal(repr(NEAR_LIMIT)) else ""
+    return {"key": key, "words": words, "what": what, "used": float(share), "limit": limit, "tone": tone}
+
+
+def limits_in_use(store: Store, put_away=()) -> dict:
+    """The fund's book after `put_away` leaves it (none: the book as it is) and the limits in use against it, from the
+    journal itself (the Store, not the dashboard's float view: the gate's figures are exact):
+    {source, book, taken, after, empty, waiting: {name: why}, limits: [{key, words, what, used, limit, tone}],
+    over: [words]}. One of `put_away` not flat yet is in `waiting` and takes nothing out.
+
+    source: "gate" when read from the entry gate; "unmarked" before the supervisor's first mark (the gate then takes
+    no entry); "unreadable" when its book couldn't be read (printed). tone: "loss" at or over a limit, where the gate takes no
+    entry that adds to it (the withdrawal itself is allowed and closes nothing: Advisor, W10), "warn" from NEAR_LIMIT
+    of it."""
+    from sleeve_fund.paper.portfolio_gate import PaperGate
+
+    view = {"source": "gate", "book": None, "taken": None, "after": None, "empty": False, "waiting": {}, "limits": [],
+            "over": []}
+    try:
+        view["waiting"] = waiting(store, put_away)
+        taken = taken_out(store, put_away)
+        ledger = PaperGate(store).ledger
+        book = ledger.state().equity
+        if book is None:
+            return {**view, "source": "unmarked", "taken": float(taken)}
+        _, held = ledger.positions()
+        held = (*held, *(r.holding for r in ledger.reservations()))
+    except Exception as exc:  # noqa: BLE001 - a book the gate can't read leaves the line out, said so
+        print(f"limits after withdrawal: can't read the entry gate's book: {exc!r}")
+        return {**view, "source": "unreadable"}
+    after = book - taken
+    view.update(book=float(book), taken=float(taken), after=float(after))
+    if after < EMPTY:  # what apply_flow empties: no book left to measure a share of
+        return {**view, "empty": True}
+    gate = Book(after, held)
+    nets = sorted(((abs(gate.net(u)), u) for u in {h.underlying for h in held}), reverse=True)
+    net, top = nets[0] if nets else (Decimal(0), "")
+    limits = [
+        _limit("gross", "Total size", gate.gross(), PORTFOLIO.gross, after),
+        _limit("net", "Largest net", net, PORTFOLIO.net_instrument, after, top),
+        _limit("margin", "Margin", gate.margin(), PORTFOLIO.margin, after),
+        _limit("open_risk", "Open risk", gate.open_risk(), PORTFOLIO.open_risk, after),
+    ]
+    return {**view, "limits": limits, "over": [x["words"] for x in limits if x["tone"] == "loss"]}
+
+
+def words(view: dict) -> str:
+    """The line as plain text, for the command line (supervisor withdraw-archived)."""
+    if view["source"] == "unmarked":
+        return "The fund's book has no mark yet, so there are no limits in use to show."
+    if view["source"] == "unreadable":
+        return "The limits in use can't be read now."
+    if view["empty"]:
+        return f"The fund's book is now {view['after']:,.2f}: no capital, so nothing can trade until some is added."
+    parts = [f"{x['words']}{' (' + x['what'] + ')' if x['what'] else ''} {x['used']:.1%} of {x['limit']:.0%}"
+             for x in view["limits"]]
+    line = f"The fund's book is now {view['after']:,.2f}. Limits in use: " + ", ".join(parts) + "."
+    if view["over"]:
+        line += (f" At or over the limit: {', '.join(view['over'])}. New entries that add to it are blocked until it is back"
+                 " under; nothing open is closed.")
+    return line
