@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% from "_fields.html" import exit_fields %}
 {% from "_macros.html" import stop_words, trail_words, chip, test_chip, signed, money_signed, usage, tag, why, why_toggle, price_chart, help, cost_share, stop_liq, leg_flag, limits_after %}
-{% from "_signals.html" import signals_side, signals_clock %}
+{% from "_signals.html" import signals_side, signals_clock, signals_lights %}
 {% from "_positions.html" import positions_table %}
 {% from "_reasons.html" import reason_picker %}
 {% set s = x.sleeve %}{% set t = x.trades %}
@@ -90,7 +90,7 @@
   <div class="ov-price">{{ price_chart("pc", s.instrument, "") }}</div>
   <aside class="panel flush ov-side" data-subtabs aria-label="Signals and settings">
     <div class="sub-tabs side" role="tablist" aria-label="Signals and settings">
-      {% if signals %}<button type="button" role="tab" data-sub="signals" aria-selected="true">Signals</button>{% endif %}
+      {% if signals %}<button type="button" role="tab" data-sub="signals" aria-selected="true">Signals{{ signals_lights(signals) }}</button>{% endif %}
       <button type="button" role="tab" data-sub="settings" aria-selected="{{ 'false' if signals else 'true' }}">Settings</button>
     </div>
     {% if signals %}<div data-sub-panel="signals" role="tabpanel" id="tab-signals">{{ signals_side(signals) }}{{ signals_clock() }}</div>{% endif %}

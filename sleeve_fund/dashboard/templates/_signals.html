@@ -2,8 +2,12 @@
    Built from one dict (app.py _signals_view) so it slots into any tab set: signals_tab() goes in the tab row,
    signals_panel() is the tab's panel with its own live region. #}
 
+{% macro signals_lights(sig) -%}
+<span class="sig-tab-lights" data-live="sig-tab"{% if sig.lights %} role="img" aria-label="Long side: {{ sig.lights|select|list|length }} of {{ sig.lights|length }} met"{% endif %}>{% for on in sig.lights %}<i class="sig-lamp {{ 'on' if on else 'off' }}"></i>{% endfor %}</span>
+{%- endmacro %}
+
 {% macro signals_tab(sig) -%}
-<a href="#signals" role="tab" data-tab="signals">Signals<span class="sig-tab-lights" data-live="sig-tab"{% if sig.lights %} role="img" aria-label="Long side: {{ sig.lights|select|list|length }} of {{ sig.lights|length }} met"{% endif %}>{% for on in sig.lights %}<i class="sig-lamp {{ 'on' if on else 'off' }}"></i>{% endfor %}</span></a>
+<a href="#signals" role="tab" data-tab="signals">Signals{{ signals_lights(sig) }}</a>
 {%- endmacro %}
 
 {# A stop or target not hit reads neutral, not red: nothing is wrong until it is. #}

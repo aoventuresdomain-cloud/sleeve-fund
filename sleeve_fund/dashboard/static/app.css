@@ -1014,9 +1014,9 @@ a.rh-pill:hover { border-color: var(--line-strong); text-decoration: none; }
 .sig-lamp.on { background: var(--gain); box-shadow: 0 0 7px var(--gain); }
 .sig-lamp.off, .sig-lamp.hit { background: var(--loss); box-shadow: 0 0 7px var(--loss); }
 .sig-lamp.idle { background: var(--muted); }
-nav.tabs .sig-tab-lights { display: inline-flex; gap: 4px; margin-left: 6px; vertical-align: 1px; }
-nav.tabs .sig-tab-lights:empty { display: none; }
-nav.tabs .sig-tab-lights .sig-lamp { width: 7px; height: 7px; box-shadow: none; }
+nav.tabs .sig-tab-lights, .sub-tabs .sig-tab-lights { display: inline-flex; gap: 4px; margin-left: 6px; vertical-align: 1px; }
+nav.tabs .sig-tab-lights:empty, .sub-tabs .sig-tab-lights:empty { display: none; }
+nav.tabs .sig-tab-lights .sig-lamp, .sub-tabs .sig-tab-lights .sig-lamp { width: 7px; height: 7px; box-shadow: none; }
 .sig-board { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
 .sig-card { padding: 14px 16px; }
 .sig-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 4px; }
