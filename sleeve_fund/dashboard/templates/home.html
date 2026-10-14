@@ -55,7 +55,8 @@
       </div></div>
     <div class="chart lw" id="eq" role="img" aria-label="Book value against its starting capital"></div>
   </section>
-  {# P&L by strategy for one period at a time; each period's rows add up to its Book row. #}
+  {# P&L by strategy for one period at a time, biggest contributor first by size (UP-3); each period's rows add up
+     to its Book row. #}
   <section class="panel span-4" aria-labelledby="move-h" data-periods>
     <div class="panel-head"><h2 id="move-h">P&amp;L by strategy</h2>
       <div class="right range" role="group" aria-label="Period"><button type="button" data-period="day" aria-pressed="true" title="Since 00:00 UTC">Today</button><button type="button" data-period="week" aria-pressed="false" title="Since Monday 00:00 UTC">Week</button><button type="button" data-period="mtd" aria-pressed="false" title="Since the 1st of the month">Month</button></div></div>
@@ -63,7 +64,7 @@
       <thead><tr><th>Strategy</th><th class="bar-col" aria-hidden="true"></th><th class="num">P&amp;L</th><th class="num">Share</th></tr></thead>
       {% for key in ['day', 'week', 'mtd'] %}
       {% set field = key ~ '_pnl' %}{% set total = book[field] %}
-      {% set movers = summaries|sort(attribute=field)|reverse|list %}
+      {% set movers = summaries|by_size(field) %}
       {% set scale = [movers|map(attribute=field)|map('abs')|max, 0.01]|max if movers else 1 %}
       <tbody data-period-rows="{{ key }}"{% if key != 'day' %} hidden{% endif %}>
       {% for x in movers %}{% set v = x[field] %}{% set w = (v|abs / scale * 50)|round(1) %}

@@ -21,7 +21,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from sleeve_fund import accounts, lifecycle, liquidation
@@ -45,6 +45,7 @@ KEY_CHECK_EVERY = 12  # polls between key-presence checks: about a minute
 FEE_CHECK_EVERY = 720  # polls between fee-schedule reads from connected accounts: about an hour
 ALERT_EVERY = 12  # polls between alert sends and uptime pings: about a minute
 CLEAR_EVERY = 12  # polls between retries of a clean slate waiting on a flatten: about a minute
+TRUE_UP_EVERY = 12  # polls between true-ups for strategies with no process: about a minute
 HEARTBEAT_STALE = timedelta(minutes=3)
 STARTUP_GRACE = timedelta(minutes=3)
 HALT_RETELL = timedelta(minutes=1)  # a holder still holding under a portfolio halt is told to flatten again after this
@@ -155,6 +156,43 @@ def check_funding_schedule(s: Sleeve) -> None:
     why = funding.schedule_mismatch(terms.funding_venue, s.instrument, terms.funding_hours, latest=True)
     if why:
         raise ValueError(why)
+
+
+def true_up_stopped(store: Store, s: Sleeve, now: datetime | None = None) -> int:
+    """CASH-4: a strategy with no process (stopped, archived, retired, or a reset's earlier run) can't notice the
+    venue's rate arriving for a settlement it was charged the baseline for, so this trues it up from the stored rates:
+    settled - baseline, on the baseline's position and price, booked now (Store.record_true_up). A running strategy
+    does it itself; were both to, the journal books it once. Returns how many it booked."""
+    import pandas as pd
+
+    from sleeve_fund import funding, markets
+    from sleeve_fund.venues import DEFAULT_VENUE
+
+    owed = store.open_baselines(s.name)
+    if not owed:
+        return 0
+    try:
+        terms = markets.terms(s.params, getattr(s, "venue", None) or DEFAULT_VENUE)
+    except ValueError:
+        return 0
+    if terms is None or terms.funding_venue is None:
+        return 0
+    series, cap = funding.rates(terms.funding_venue, s.instrument), funding.cap_of(terms.funding_venue, s.instrument)
+    now, booked = now or utcnow(), 0
+    for row in owed:
+        ts = row["ts"] if row["ts"].tzinfo else row["ts"].replace(tzinfo=timezone.utc)
+        rate = funding.rate_at(series, pd.Timestamp(ts), cap)
+        if rate is None:
+            continue
+        settled = -float(row["qty"]) * float(row["price"]) * rate
+        done, up = store.record_true_up(s.name, ts, rate=rate, amount=round(settled, 8), arrived_at=now)
+        if done == "new":
+            booked += 1
+            store.event(s.name, "info", "funding_true_up",
+                        f"Funding trued up: the venue's rate for the {ts:%d %b %Y %H:%M} UTC settlement arrived "
+                        f"({rate:.4%}) while the strategy had no process, settling to {settled:+,.2f} against the "
+                        f"baseline charged; {up:+,.2f} booked now", ts=now)
+    return booked
 
 
 RESTING_OFF = ("its entries would rest at the venue as post-only limits (maker-first execution), and paper sends no "
@@ -462,6 +500,16 @@ class Supervisor:
             elif action == "none" and proc.alive and proc.crashes and now - proc.started_at > STARTUP_GRACE:
                 proc.crashes = 0  # healthy again
 
+    def true_up_stopped(self) -> None:
+        """True up every strategy without a running process (true_up_stopped); one failing never holds up the rest."""
+        for s in self.store.sleeves():
+            if self.procs.get(s.name, Proc()).alive:
+                continue
+            try:
+                true_up_stopped(self.store, s)
+            except Exception as exc:  # noqa: BLE001 - the next minute tries again; the dashboard shows why
+                self.store.event(s.name, "error", "supervisor_error", f"funding true-up: {exc!r}")
+
     def mark_portfolio(self, now: datetime | None = None) -> None:
         """The portfolio's poll (v2 P2-2): mark the whole fund (portfolio.gate.mark_book), a book_marks row each minute
         and at every status change, act on a halt, and sweep orphaned reservations. The state row is written before
@@ -597,6 +645,8 @@ class Supervisor:
                     self.check_keys()
                 if loops % FEE_CHECK_EVERY == 0:
                     self.check_fees()
+                if loops % TRUE_UP_EVERY == 0:
+                    self.true_up_stopped()
                 if self.clear_path and loops % CLEAR_EVERY == 0 and os.path.exists(self.clear_path):
                     clear(self.store, self.clear_path)
                 loops += 1

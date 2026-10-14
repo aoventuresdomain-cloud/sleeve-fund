@@ -89,6 +89,7 @@ def test_the_helper_leaves_out_archived_flat_strategies_and_filters_by_account(s
     # F229-6 (Advisor 14 Oct 00:15 UK; HoE OK): one still holding counts; once flat it is left out.
     assert [r["sleeve"] for r in open_risk.book_open_risk(store, lambda s: 0.02)] == ["a", "b"]
     store.record_fill("b", side="SELL", qty=0.1, price=60_000.0, fee=0.0, order_id="X-b", trade_id="x-b")
+    store.record_equity("b", equity=10_000, cash=10_000, qty=0.0, price=60_000.0, benchmark=10_000)  # marked flat
     assert [r["sleeve"] for r in open_risk.book_open_risk(store, lambda s: 0.02)] == ["a"]
     account = store.account_of("a")
     assert [r["sleeve"] for r in open_risk.book_open_risk(store, lambda s: 0.02, account)] == ["a"]

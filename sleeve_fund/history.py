@@ -812,6 +812,28 @@ def _refresh_funding(profile, pair: str, root, since) -> None:
     _refresh_open_interest(profile, pair, root, funding_to)
 
 
+def funding_backfill(profile, pair: str, since: pd.Timestamp, root=None, pages: int = 50,
+                     dry_run: bool = False) -> dict:
+    """FUNDING-BACKFILL (START CHECKLIST 5): the settled funding the store lacks from `since` up to its newest kept
+    rate, asked of the venue's history (funding.backfill). Only adds: a kept rate is never changed or removed, and a
+    rate that can't be believed is left out and counted, so it stays a hole the coverage report shows. Not complete
+    when the pages ran out first. An instrument with no rates kept is left to the collector (refresh, from its
+    listing or history request)."""
+    from sleeve_fund import funding
+
+    kept = funding.rates(profile.name, pair, root)
+    out = {"pair": pair, "since": since.isoformat(), "dry_run": dry_run,
+           "first_kept": kept.index[0].isoformat() if len(kept) else None, "kept": len(kept)}
+    refused: list = []
+    report: dict = {"complete": not len(kept)}
+    n = funding.backfill(profile.name, pair, since, root=root, max_pages=pages, dry_run=dry_run, refused=refused,
+                         report=report) if len(kept) else 0
+    after = funding.rates(profile.name, pair, root)
+    out.update({"would_add" if dry_run else "added": n, "refused": len(refused), "complete": report["complete"],
+                "first_now": after.index[0].isoformat() if len(after) else None})
+    return out
+
+
 def _now() -> pd.Timestamp:
     return pd.Timestamp.now(tz="UTC")
 
@@ -1164,6 +1186,13 @@ def main(argv: list[str] | None = None) -> int:
     cv.add_argument("--venue", default=None)
     cv.add_argument("--start", required=True, help="UTC time the window opens, e.g. 2024-01-01")
     cv.add_argument("--end", default=None, help="UTC time the window closes (default: now, to the minute)")
+    fb = sub.add_parser("funding-backfill",
+                        help="fetch the settled funding a perpetual's store lacks from a time up to its newest kept rate")
+    fb.add_argument("pairs", nargs="*", help="instruments (default: core list plus sleeves')")
+    fb.add_argument("--venue", default=None)
+    fb.add_argument("--since", required=True, help="UTC time to start from, e.g. 2024-01-01")
+    fb.add_argument("--pages", type=int, default=50, help="most venue pages per instrument")
+    fb.add_argument("--dry-run", action="store_true", help="count the settlements it would add; write nothing")
     exp = sub.add_parser("export", help="one instrument's stored 1-minute candles in a window, as CSV (read-only)")
     exp.add_argument("pair", help="instrument, e.g. BTC/USDT")
     exp.add_argument("--venue", default=None)
@@ -1177,7 +1206,8 @@ def main(argv: list[str] | None = None) -> int:
 
     store = HistoryStore(args.root)
     profile = venue_profile(args.venue)
-    if args.cmd in ("refresh", "run", "canon") and (problem := unwritable(store.root / profile.name.upper())):
+    writes = args.cmd in ("refresh", "run", "canon") or (args.cmd == "funding-backfill" and not args.dry_run)
+    if writes and (problem := unwritable(store.root / profile.name.upper())):
         print(f"{profile.name}: history store can't start: {problem}")
         return 2
     if args.cmd == "export":  # GOLDEN-VENUE: read-only, CSV to stdout, a refusal to stderr
@@ -1195,6 +1225,17 @@ def main(argv: list[str] | None = None) -> int:
         for pair in args.pairs or [p for p, _ in _pairs_in_use(profile.name)]:
             print(coverage_line(store, profile.name, pair, start, end, profile.funding_loader is not None))
         return 0
+    if args.cmd == "funding-backfill":  # only adds settlements the store lacks; a kept rate is never changed
+        if profile.funding_loader is None:
+            print(f"{profile.name}: publishes no funding rates")
+            return 2
+        since = pd.Timestamp(args.since, tz="UTC")
+        failed = False
+        for pair in args.pairs or [p for p, _ in _pairs_in_use(profile.name)]:
+            out = funding_backfill(profile, pair, since, args.root, args.pages, args.dry_run)
+            print(out)
+            failed |= not out["complete"]
+        return 2 if failed else 0
     if args.cmd == "report":
         for v, pair in store.series():
             if v == profile.name:

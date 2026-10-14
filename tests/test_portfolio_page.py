@@ -204,10 +204,11 @@ def test_pnl_by_strategy_rows_add_up_to_the_book_row_for_each_period(client):  #
         *rows, total = vals
         assert len(rows) == 3 and abs(sum(rows) - total) < 0.011, key
         assert "<th scope=\"row\">Book</th>" in body
-    # Today shows first; the others wait behind the switch. Biggest contributor first.
+    # Today shows first; the others wait behind the switch. Biggest contributor first, by size (UP-3): the -31.20
+    # loss comes before the flat 0.00.
     assert 'data-period-rows="day">' in panel and 'data-period-rows="week" hidden' in panel
     day = panel.split('data-period-rows="day"')[1].split("</tbody>")[0]
-    assert day.index("pp-short") < day.index("flat-one") < day.index("rsi-long")
+    assert day.index("pp-short") < day.index("rsi-long") < day.index("flat-one")
 
 
 def test_an_archived_strategy_gets_one_row_so_the_rows_still_add_up_to_book(client):  # noqa: F811

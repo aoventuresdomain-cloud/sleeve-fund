@@ -403,9 +403,10 @@ def _by_account(store: Store, perps: list[tuple[str, dict]]) -> list[dict]:
 
 
 def _one_book(store: Store, perps: list[tuple[str, dict]]) -> float | None:
-    """The book the gate measures the Open risk tile's figure against when its perpetuals are on one account
-    (open_risk.account_equity), so the tile's % of book equals the gate's: neither a Strategy outside the fund's book
-    nor an archived, flat one counts (F229-6-a). None when there are none, or they span accounts."""
+    """The book the limit measures the Open risk tile's figure against when its perpetuals are on one account
+    (open_risk.account_equity, the fund's equity as supervisor.fund_equity counts it: cash a clean slate put away
+    included, a Strategy outside the fund's book not), so the tile's % of book equals the gate's (F229-6-a; Advisor
+    C3b, option B). None when there are none, or they span accounts (each has its own line)."""
     from sleeve_fund import open_risk as limit
 
     names = {store.account_of(n) for n, _ in perps}
@@ -482,7 +483,9 @@ def perp_view(x: dict, position: dict | None, funding: list[dict]) -> dict | Non
     """What a perpetual position adds to a spot one: leverage, exposure, isolated margin, how far it is from
     liquidation, and the funding it has paid or received. funding: newest first, as the store returns it.
     Leverage is the position's notional at entry over its isolated margin (the open position's own figure);
-    exposure is its notional at the mark over the strategy's equity (QA U2, as the Advisor worded them)."""
+    exposure is its notional at the mark over the strategy's equity (QA U2, as the Advisor worded them). Effective
+    leverage is the notional at the mark over the same margin: it moves with the price, so it is always labelled
+    "effective" and never shown in the leverage's own format (UP-2, Advisor ADV1940)."""
     t = markets.terms(x["sleeve"].params, getattr(x["sleeve"], "venue", None))
     if t is None:
         return None
@@ -494,6 +497,7 @@ def perp_view(x: dict, position: dict | None, funding: list[dict]) -> dict | Non
     return {
         "leverage": position["leverage"] if position else None,
         "exposure": notional / equity if equity > 0 else None,
+        "effective_leverage": notional / margin if position and margin else None,
         "margin": margin,
         "maintenance": notional * t.maintenance_margin,
         "maintenance_rate": t.maintenance_margin,

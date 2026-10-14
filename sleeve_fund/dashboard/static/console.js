@@ -1381,9 +1381,15 @@ window.Console = (() => {
       const line = fs.querySelector("[data-logline]");
       if (line) line.textContent = "Logged as: " + (pick ? pick + (note ? ": " + note : "") : "no reason yet");
     };
-    // The search box narrows the list; "+ Write your own reason" always stays.
+    // The list as a combo-box (UP-4), like the instrument field: shown until a reason is picked, then folded into the
+    // search box, which opens it again on the whole list; typing narrows it ("+ Write your own reason" always stays), the arrow keys move, Enter picks, Escape closes.
+    // A pick checks the reason's radio, so the form posts the same reason_pick as without JavaScript.
+    const state = new WeakMap();  // fieldset -> {typed, active}
+    const st = (fs) => state.get(fs) || state.set(fs, {typed: false, active: -1}).get(fs);
+    const box = (fs) => fs.querySelector("[data-reason-search]");
+    const opts = (fs) => [...fs.querySelectorAll("label.opt")].filter((l) => !l.hidden);
     const search = (fs) => {
-      const q = (fs.querySelector("[data-reason-search]")?.value || "").trim().toLowerCase();
+      const q = st(fs).typed ? (box(fs)?.value || "").trim().toLowerCase() : "";
       let shown = 0;
       fs.querySelectorAll("label.opt:not(.write)").forEach((l) => { l.hidden = Boolean(q) && !l.textContent.toLowerCase().includes(q); shown += !l.hidden; });
       fs.querySelectorAll(".reason-list .grp").forEach((g) => {
@@ -1394,21 +1400,87 @@ window.Console = (() => {
       const none = fs.querySelector("[data-reason-none]");
       if (none) none.hidden = shown > 0;
     };
-    const all = () => document.querySelectorAll("[data-reasons]").forEach(check);
+    const mark = (fs) => {
+      const s = st(fs), input = box(fs), shown = opts(fs);
+      fs.querySelectorAll("label.opt").forEach((l) => { l.classList.remove("act"); l.setAttribute("aria-selected", "false"); });
+      const l = shown[s.active];
+      if (l) {
+        l.classList.add("act"); l.setAttribute("aria-selected", "true"); l.scrollIntoView({block: "nearest"});
+        input.setAttribute("aria-activedescendant", l.id);
+      } else input.removeAttribute("aria-activedescendant");
+    };
+    const isOpen = (fs) => !fs.classList.contains("rp-closed");
+    const open = (fs) => {
+      if (isOpen(fs)) return;
+      const s = st(fs);
+      s.typed = false; search(fs);
+      fs.classList.remove("rp-closed"); box(fs).setAttribute("aria-expanded", "true");
+      const shown = opts(fs);
+      s.active = Math.max(0, shown.findIndex((l) => l.querySelector("input")?.checked)); mark(fs);
+    };
+    const close = (fs) => {
+      fs.classList.add("rp-closed"); box(fs).setAttribute("aria-expanded", "false"); box(fs).removeAttribute("aria-activedescendant");
+    };
+    const label = (l) => l.classList.contains("write") ? "" : (l.querySelector("span")?.firstChild?.textContent || "").trim();
+    const pick = (fs, l) => {
+      const radio = l.querySelector("input");
+      if (!radio) return;
+      radio.checked = true;
+      radio.dispatchEvent(new Event("change", {bubbles: true}));
+    };
+    const bind = (fs) => {
+      if (fs.dataset.rpBound || !box(fs)) return;
+      fs.dataset.rpBound = "1";
+      const list = fs.querySelector(".reason-list");
+      list.setAttribute("role", "listbox");
+      fs.querySelectorAll("label.opt").forEach((l, i) => {
+        l.setAttribute("role", "option"); l.id = `${list.id || "reasons"}-${i}`;
+        const radio = l.querySelector("input");
+        if (radio) radio.tabIndex = -1;  // the search box carries the focus; the radios only hold the pick
+      });
+      list.addEventListener("mousedown", (e) => e.preventDefault());  // a click picks without taking the focus away
+      // Nothing picked yet: the list shows, so a click is all it takes. Once picked, it folds into the box.
+      const picked = fs.querySelector("input[name=reason_pick]:checked");
+      if (picked) { box(fs).value = label(picked.closest("label.opt")); close(fs); } else box(fs).setAttribute("aria-expanded", "true");
+    };
+    const all = () => document.querySelectorAll("[data-reasons]").forEach((fs) => { bind(fs); check(fs); });
     once("reasonsBound", () => {
       const on = (e) => {
         const fs = e.target.closest && e.target.closest("[data-reasons]");
         if (!fs) return;
-        if (e.target.matches("[data-reason-search]")) search(fs);
+        if (e.target.matches("[data-reason-search]")) {
+          if (e.type === "input") { open(fs); st(fs).typed = true; search(fs); st(fs).active = 0; mark(fs); }
+        } else if (e.type === "change" && e.target.name === "reason_pick" && e.target.checked && fs.dataset.rpBound) {
+          box(fs).value = label(e.target.closest("label.opt")); close(fs);
+        }
         check(fs);
         if (e.type === "change" && e.target.value === "Other") fs.querySelector("textarea[name=reason_note]")?.focus();
       };
-      // Enter in the search box picks the first reason still shown, rather than submitting the dialog.
       document.addEventListener("keydown", (e) => {
-        if (e.key !== "Enter" || !e.target.matches || !e.target.matches("[data-reason-search]")) return;
-        e.preventDefault();
-        const first = [...e.target.closest("[data-reasons]").querySelectorAll("label.opt")].find((l) => !l.hidden)?.querySelector("input");
-        if (first) { first.checked = true; first.focus(); first.dispatchEvent(new Event("change", {bubbles: true})); }
+        if (!e.target.matches || !e.target.matches("[data-reason-search]")) return;
+        const fs = e.target.closest("[data-reasons]"), s = st(fs);
+        if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+          e.preventDefault();
+          if (!isOpen(fs)) return open(fs);
+          const n = opts(fs).length;
+          s.active = e.key === "ArrowDown" ? Math.min(s.active + 1, n - 1) : Math.max(s.active - 1, 0); mark(fs);
+        } else if (e.key === "Enter") {
+          e.preventDefault();  // never submits the dialog from the search box
+          const l = isOpen(fs) ? opts(fs)[Math.max(s.active, 0)] : null;
+          if (l) pick(fs, l); else open(fs);
+        } else if (e.key === "Escape" && isOpen(fs)) {
+          e.preventDefault(); e.stopPropagation(); close(fs);  // closes the list, not the dialog
+        }
+      });
+      document.addEventListener("focusin", (e) => {
+        if (!e.target.matches || !e.target.matches("[data-reason-search]")) return;
+        e.target.select(); open(e.target.closest("[data-reasons]"));  // typing replaces the reason shown
+      });
+      document.addEventListener("click", (e) => { if (e.target.matches && e.target.matches("[data-reason-search]")) open(e.target.closest("[data-reasons]")); });
+      document.addEventListener("focusout", (e) => {
+        if (!e.target.matches || !e.target.matches("[data-reason-search]")) return;
+        const fs = e.target.closest("[data-reasons]");
+        if (!fs.contains(e.relatedTarget) || e.relatedTarget?.matches("textarea")) close(fs);
       });
       document.addEventListener("change", on);
       document.addEventListener("input", on);

@@ -119,6 +119,8 @@ def create_app(store: Store | None = None) -> FastAPI:
     templates.env.filters["no_venues"] = no_venues  # stored reasons and messages name no venue (QA U18)
     templates.env.filters["pct"] = lambda x: f"{x:+.2%}"
     templates.env.filters["pct0"] = lambda x: f"{x:.0%}"
+    # Biggest contributor first, by size whatever its sign (UP-3): rows keep their sign colour and bar direction.
+    templates.env.filters["by_size"] = lambda rows, field: sorted(rows, key=lambda x: -abs(x[field]))
     templates.env.filters["money"] = lambda x: f"{x:,.2f}"
     # NaN-safe versions for stats that don't exist until a trade has closed.
     templates.env.filters["pctn"] = lambda x: "n/a" if x != x else f"{x:+.1%}"
@@ -300,7 +302,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         profiles = {x["profile"].name: x["profile"].max_drawdown for x in summaries}
         halt = next(iter(profiles.items())) if len(profiles) == 1 else None
         chart = riskops.drawdown_chart(bookm.book_curve(summaries, frames), halt=halt[1] if halt else None)
-        return page(request, "risk.html", book=book, risk=risk, health=health, chart=chart,
+        return page(request, "risk.html", book=book, risk=risk, health=health, chart=chart, size=riskops.gate_size(st(), book),
                     halt_name=halt[0] if halt else None, stress=riskops.stress_bars(risk["scenarios"]),
                     status=riskops.status_word(riskops.status_items(risk["rows"], health), running),
                     ops=riskops.ops_view(st(), summaries), shell=shell(sleeves), kill=kill,
@@ -1113,7 +1115,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         trades it (review round 8, R8-M6)."""
         form = dict((await request.form()).items())
         pair = str(form.get("instrument", "")).strip().upper()
-        # From a study's "Not stored: Collect", the answer shows in that study; else on the History tab.
+        # Asked from a study (from=study), the answer shows in that study; else on the History tab.
         tab = "development" if form.get("from") == "study" else "history"
 
         def page_(**kw):
