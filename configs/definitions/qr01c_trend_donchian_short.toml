@@ -1,0 +1,23 @@
+# QR #1 variant (bench): Donchian channel trend, short leg (half risk). Decision candle: 1d.
+version = 1
+name = "qr01c-trend-donchian-short"
+reason = """Mirror of the long leg: sell a close below the lowest low of the last 55 days, cover on a stop that only
+tightens at the highest high of the last 20 days."""
+
+[blocks.entry_dc]
+kind = "donchian"
+period = 55
+
+[blocks.exit_dc]
+kind = "donchian"
+period = 20
+
+[short]
+entry = { left = "close", op = "<", right = { prev = "entry_dc.lower" } }
+breakout = true
+
+[exits]
+trail = { level = "exit_dc.upper", ratchet = true }
+
+[costs]
+breakout_slippage_bp = 5

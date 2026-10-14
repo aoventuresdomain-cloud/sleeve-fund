@@ -1,0 +1,40 @@
+# QR bench: exhaustion reversal, long leg (the crash mirror). Decision candle: 15m, setup on 1h.
+version = 1
+name = "qr11-exhaustion-long"
+reason = """After an extreme fall (1h RSI(14) below 15 on 2 x normal 1h volume) sellers run out; buy when 15m RSI(14)
+climbs back above 30 within four hours of the setup. Out at the 15m Bollinger(20, 2) middle, or after 12 hours;
+stop 1.5 ATR(14) below the entry close."""
+
+[blocks.rsi1h]
+kind = "rsi"
+period = 14
+timeframe = "1h"
+
+[blocks.rvol1h]
+kind = "relative_volume"
+period = 20
+timeframe = "1h"
+
+[blocks.rsi]
+kind = "rsi"
+period = 14
+
+[blocks.bb]
+kind = "bollinger"
+period = 20
+k = 2.0
+
+[blocks.atr]
+kind = "atr"
+period = 14
+
+[long]
+entry = { setup = { all = [
+    { left = "rsi1h", op = "<", right = 15 },
+    { left = "rvol1h", op = ">=", right = 2.0 },
+] }, trigger = { left = "rsi", op = "crosses_above", right = 30 }, expire_after = { bars = 4, timeframe = "1h" } }
+exit = { left = "close", op = ">=", right = "bb.mid" }
+
+[exits]
+time_stop = { minutes = 720 }
+stop = { level = { sub = ["close", { mul = [1.5, "atr"] }] } }
