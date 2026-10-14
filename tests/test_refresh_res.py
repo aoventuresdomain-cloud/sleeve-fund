@@ -98,3 +98,17 @@ def test_a_live_accounts_orders_are_never_closed(store):
     store.assign_account("s", "live-a")
     with pytest.raises(ValueError, match="live account"):
         store.close_dead_orders("s", "refresh")
+
+
+def test_a_reservation_released_before_keeps_its_release(store):
+    """HoE F-RR-2: room already released (here as its order's fill) keeps when and why it was released."""
+    _make(store)
+    did = _reserve(store, "s", 1, order_id="o1")
+    store.release_reservation(did, "fill")
+    with store.engine.connect() as c:
+        before = c.execute(select(gate_reservations_t.c.released_at, gate_reservations_t.c.release_reason)).one()
+    assert before.release_reason == "fill"
+    store.close_dead_orders("s", "refresh")
+    with store.engine.connect() as c:
+        assert c.execute(select(gate_reservations_t.c.released_at, gate_reservations_t.c.release_reason)).one() \
+            == before
