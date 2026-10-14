@@ -359,6 +359,37 @@ sleeve_venues_t = Table(
     Column("sleeve", String(64), ForeignKey("sleeves.name"), primary_key=True),
     Column("venue", String(16), nullable=False),
 )
+# F-WED1-3 (Advisor, HoE 14 Oct): the pin is insert-only, held by the database itself. A venue is never changed; a pin is
+# deleted only with its saved backtest (prune_backtests); and a strategy that has an order or a fill can't be given one,
+# so nothing moves it off the venue its position and working orders are on. A new venue is a new strategy. Migration
+# 0020 writes the same triggers (spelled out there). They read orders, fills and backtests by name when they fire, so
+# it doesn't matter which create_all makes first.
+PIN_REFUSED = "a strategy''s venue is pinned: "  # quoted for SQL
+SLEEVE_VENUES_PG = (
+    "CREATE OR REPLACE FUNCTION sleeve_venue_pinned() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+    "IF TG_OP = 'UPDATE' THEN RAISE EXCEPTION USING ERRCODE = 'check_violation', "
+    f"MESSAGE = '{PIN_REFUSED}' || OLD.sleeve || ' cannot change venue'; END IF; "
+    "IF TG_OP = 'DELETE' THEN "
+    "IF substr(OLD.sleeve, 1, 3) <> 'bt:' OR NOT EXISTS (SELECT 1 FROM backtests WHERE sleeve = OLD.sleeve) THEN RAISE EXCEPTION USING "
+    f"ERRCODE = 'check_violation', MESSAGE = '{PIN_REFUSED}' || OLD.sleeve || "
+    "' is not a saved backtest, so its pin stays'; END IF; RETURN OLD; END IF; "
+    "IF EXISTS (SELECT 1 FROM orders WHERE sleeve = NEW.sleeve) OR EXISTS (SELECT 1 FROM fills WHERE sleeve = NEW.sleeve) "
+    "THEN RAISE EXCEPTION USING ERRCODE = 'check_violation', "
+    f"MESSAGE = '{PIN_REFUSED}' || NEW.sleeve || ' has traded, so it keeps its venue'; "
+    "END IF; RETURN NEW; END $$",
+    "CREATE TRIGGER sleeve_venue_pinned BEFORE INSERT OR UPDATE OR DELETE ON sleeve_venues FOR EACH ROW "
+    "EXECUTE FUNCTION sleeve_venue_pinned()",
+)
+SLEEVE_VENUES_SQLITE = (
+    "CREATE TRIGGER sleeve_venues_no_edit BEFORE UPDATE ON sleeve_venues BEGIN "
+    f"SELECT RAISE(ABORT, '{PIN_REFUSED}a venue cannot change'); END",
+    "CREATE TRIGGER sleeve_venues_no_delete BEFORE DELETE ON sleeve_venues "
+    "WHEN substr(OLD.sleeve, 1, 3) <> 'bt:' OR NOT EXISTS (SELECT 1 FROM backtests WHERE sleeve = OLD.sleeve) BEGIN "
+    f"SELECT RAISE(ABORT, '{PIN_REFUSED}only a saved backtest''s pin is deleted'); END",
+    "CREATE TRIGGER sleeve_venues_no_late_pin BEFORE INSERT ON sleeve_venues "
+    "WHEN EXISTS (SELECT 1 FROM orders WHERE sleeve = NEW.sleeve) OR EXISTS (SELECT 1 FROM fills WHERE sleeve = NEW.sleeve) "
+    f"BEGIN SELECT RAISE(ABORT, '{PIN_REFUSED}a strategy that has traded keeps its venue'); END",
+)
 account_keys_t = Table(
     "account_keys",
     metadata,
@@ -553,6 +584,10 @@ for _sql in TRIALS_WORM_PG:
     event.listen(trials_t, "after_create", DDL(_sql).execute_if(dialect="postgresql"))
 for _sql in TRIALS_WORM_SQLITE:
     event.listen(trials_t, "after_create", DDL(_sql).execute_if(dialect="sqlite"))
+for _sql in SLEEVE_VENUES_PG:
+    event.listen(sleeve_venues_t, "after_create", DDL(_sql).execute_if(dialect="postgresql"))
+for _sql in SLEEVE_VENUES_SQLITE:
+    event.listen(sleeve_venues_t, "after_create", DDL(_sql).execute_if(dialect="sqlite"))
 
 # The held-back period each idea has opened (v2 P1-7, C4): one per idea and underlying, at any timeframe or
 # venue, for ever. Append-only, and no strategy column, so a reset never touches it.
@@ -2160,11 +2195,13 @@ class Store:
             c.execute(insert(sleeves_t).values(**{**row, "name": run, "desired_state": "stopped", "status": "stopped",
                                                   "status_reason": f"run put away by a reset on {now:%d %b %Y %H:%M}",
                                                   "updated_at": now}))
-            for t in moved:
-                c.execute(update(t).where(t.c.sleeve == name).values(sleeve=run))
+            # The pin is copied before the orders and fills move: the database refuses a pin to a strategy that has
+            # traded (F-WED1-3), and the put-away run hasn't yet.
             for t in (sleeve_accounts_t, sleeve_venues_t):
                 for r in c.execute(select(t).where(t.c.sleeve == name)).all():
                     c.execute(insert(t).values(**{**dict(r._mapping), "sleeve": run}))
+            for t in moved:
+                c.execute(update(t).where(t.c.sleeve == name).values(sleeve=run))
             c.execute(feed_seen_t.delete().where(feed_seen_t.c.sleeve == name))
             # The old run's conditions on the Signals tab until the fresh process writes its own (m13-E2).
             c.execute(signal_state_t.delete().where(signal_state_t.c.sleeve == name))

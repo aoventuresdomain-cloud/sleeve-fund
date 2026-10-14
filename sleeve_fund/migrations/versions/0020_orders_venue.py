@@ -8,7 +8,9 @@ day. The default is spelled here as a literal (DA), so
 this migration's result never moves if the code's default does. Then the column is made NOT NULL.
 
 Each step is skipped when a Store on the same code built that shape first (create_all), as 0010 allows. SQLite adds the
-column, its CHECK and NOT NULL through a batch rebuild. Downgrade is refused: an order's venue is never dropped.
+column, its CHECK and NOT NULL through a batch rebuild. Last, the pin is made insert-only (F-WED1-3): a venue is never
+changed, a pin is deleted only with its saved backtest, and a strategy that has traded can't be given one. Downgrade is
+refused: an order's venue is never dropped.
 
 Revision ID: 0020
 Revises: 0018
@@ -32,6 +34,10 @@ DEFAULT_VENUE_THEN = 'KRAKEN'
 VENUES_THEN = ('KRAKEN', 'BINANCE')
 UPPER = 'venue = upper(venue)'
 
+# F-WED1-3: written out, not imported, as 0018's are: a migration is frozen at what it was when it ran
+PIN_PG = ("CREATE OR REPLACE FUNCTION sleeve_venue_pinned() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF TG_OP = 'UPDATE' THEN RAISE EXCEPTION USING ERRCODE = 'check_violation', MESSAGE = 'a strategy''s venue is pinned: ' || OLD.sleeve || ' cannot change venue'; END IF; IF TG_OP = 'DELETE' THEN IF substr(OLD.sleeve, 1, 3) <> 'bt:' OR NOT EXISTS (SELECT 1 FROM backtests WHERE sleeve = OLD.sleeve) THEN RAISE EXCEPTION USING ERRCODE = 'check_violation', MESSAGE = 'a strategy''s venue is pinned: ' || OLD.sleeve || ' is not a saved backtest, so its pin stays'; END IF; RETURN OLD; END IF; IF EXISTS (SELECT 1 FROM orders WHERE sleeve = NEW.sleeve) OR EXISTS (SELECT 1 FROM fills WHERE sleeve = NEW.sleeve) THEN RAISE EXCEPTION USING ERRCODE = 'check_violation', MESSAGE = 'a strategy''s venue is pinned: ' || NEW.sleeve || ' has traded, so it keeps its venue'; END IF; RETURN NEW; END $$", 'CREATE TRIGGER sleeve_venue_pinned BEFORE INSERT OR UPDATE OR DELETE ON sleeve_venues FOR EACH ROW EXECUTE FUNCTION sleeve_venue_pinned()')
+PIN_SQLITE = ("CREATE TRIGGER sleeve_venues_no_edit BEFORE UPDATE ON sleeve_venues BEGIN SELECT RAISE(ABORT, 'a strategy''s venue is pinned: a venue cannot change'); END", "CREATE TRIGGER sleeve_venues_no_delete BEFORE DELETE ON sleeve_venues WHEN substr(OLD.sleeve, 1, 3) <> 'bt:' OR NOT EXISTS (SELECT 1 FROM backtests WHERE sleeve = OLD.sleeve) BEGIN SELECT RAISE(ABORT, 'a strategy''s venue is pinned: only a saved backtest''s pin is deleted'); END", "CREATE TRIGGER sleeve_venues_no_late_pin BEFORE INSERT ON sleeve_venues WHEN EXISTS (SELECT 1 FROM orders WHERE sleeve = NEW.sleeve) OR EXISTS (SELECT 1 FROM fills WHERE sleeve = NEW.sleeve) BEGIN SELECT RAISE(ABORT, 'a strategy''s venue is pinned: a strategy that has traded keeps its venue'); END")
+
 
 def upgrade() -> None:
     bind = op.get_bind()
@@ -54,6 +60,7 @@ def upgrade() -> None:
                 batch_op.alter_column('venue', existing_type=sa.String(length=16), nullable=False)
             if not checked:
                 batch_op.create_check_constraint('orders_venue_upper', UPPER)
+    _pin_triggers(bind)
 
 
 def _backtest_venue(query: str | None) -> str:
@@ -76,6 +83,21 @@ def _backfill_backtests(bind, orders, pins) -> None:
         if len(ran_on) == 1:
             bind.execute(sa.update(orders).where(orders.c.sleeve == sleeve, orders.c.venue.is_(None))
                          .values(venue=ran_on.pop()))
+
+
+def _pin_triggers(bind) -> None:
+    """F-WED1-3 (Advisor, HoE 14 Oct): the pin is insert-only. Skipped when a Store on the same code built them."""
+    if bind.dialect.name == 'postgresql':
+        have = bind.execute(sa.text("SELECT 1 FROM pg_trigger WHERE tgname = 'sleeve_venue_pinned' "
+                                    "AND tgrelid = 'sleeve_venues'::regclass")).first()
+        statements = PIN_PG
+    else:
+        have = bind.execute(sa.text("SELECT 1 FROM sqlite_master WHERE type = 'trigger' "
+                                    "AND name = 'sleeve_venues_no_edit'")).first()
+        statements = PIN_SQLITE
+    if not have:
+        for sql in statements:
+            op.execute(sql)
 
 
 def downgrade() -> None:
