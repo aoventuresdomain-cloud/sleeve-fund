@@ -215,7 +215,8 @@ def create_app(store: Store | None = None) -> FastAPI:
             "attention": sum(1 for x in sleeves if x.status in ("halted", "error")),
             "unhealthy": sum(1 for x in wanted if not (x.heartbeat_at and now - x.heartbeat_at < STALE)),
             # The rail lists every strategy not put away, so each is one click from anywhere.
-            "strategies": [{"name": x.name, "status": x.status} for x in sleeves if x.name not in put_away],
+            "strategies": [{"name": x.name, "status": x.status, "test": bookm.is_test_account(st(), x)}
+                           for x in sleeves if x.name not in put_away],
         }
 
     def page(request: Request, name: str, **ctx) -> HTMLResponse:
@@ -235,10 +236,23 @@ def create_app(store: Store | None = None) -> FastAPI:
         return x
 
     def book_data():
+        """Every strategy in the current book, test accounts included: the kill switch, flatten and reset act on all
+        of them. The figures the PM reads come through shown_book."""
         sleeves = current_sleeves()
         frames = {s.name: bookm.daily(st(), s.name) for s in sleeves}
         summaries = [bookm.sleeve_extras(st(), sleeve_summary(st(), s), frames[s.name]) for s in sleeves]
         return sleeves, frames, summaries
+
+    def shown_book():
+        """The book as the PM's equity and P&L show it (CCY-8DP-UI): a Strategy outside the fund's book (a test
+        account, supervisor.outside_fund_book) is left out of those totals, as the gate and fund_equity leave it out
+        (F229-6 A4), and listed apart; its results are never Strategy evidence. Its position still shows on the
+        Positions tab, marked as not counted. Returns book_data's three plus the test ones."""
+        sleeves, frames, summaries = book_data()
+        tests = [x for x in summaries if x["test_account"]]
+        out = {x["sleeve"].name for x in tests}
+        return ([s for s in sleeves if s.name not in out], {k: v for k, v in frames.items() if k not in out},
+                [x for x in summaries if not x["test_account"]], tests)
 
     @app.get("/healthz", include_in_schema=False)
     def healthz() -> dict:
@@ -246,16 +260,16 @@ def create_app(store: Store | None = None) -> FastAPI:
 
     @app.get("/", response_class=HTMLResponse)
     def home(request: Request, _: str = Depends(require_pm)):
-        sleeves, frames, summaries = book_data()
+        sleeves, frames, summaries, tests = shown_book()
         put_away = st().archived()
         earlier = st().previous_book()
-        names = [s.name for s in sleeves]
+        names = [s.name for s in sleeves] + [x["sleeve"].name for x in tests]
         # The bottom tabs: the book's positions, working orders, latest fills and funding, from the same
         # journal the strategy pages read. Every strategy in the book counts, archived ones still holding too.
         working = [trading.order_view(o) for o in st().orders(None, trading.STATUS_TABS["open"][1], limit=200)
                    if o["sleeve"] in names]
         book = bookm.book_view(st(), summaries, frames)
-        positions = trading.book_positions(st(), summaries)
+        positions = trading.book_positions(st(), summaries + tests)  # shown; outside the book is marked not counted
         funding = trading.book_funding(st(), summaries)
         # Costs as money paid: fees plus funding paid (funding totals are + received, - paid).
         book["funding_paid"] = -funding["total"]
@@ -267,10 +281,10 @@ def create_app(store: Store | None = None) -> FastAPI:
                     archived=[x for x in summaries if x["sleeve"].name in put_away],
                     earlier=[st().sleeve(n) for n in earlier], book_start=st().book_start(),
                     earlier_resets=bool(set(earlier) & set(st().reset_runs())),
-                    book=book, alerts=st().alerts(limit=30), shell=shell(sleeves),
+                    book=book, alerts=st().alerts(limit=30), shell=shell(),
                     positions=positions, working=working, holdings=bookm.holdings(positions["rows"], book["equity"]),
                     book_fills=trading.book_fills(st(), sleeves), funding=funding,
-                    fill_count=sum(x["fills"] for x in summaries))
+                    fill_count=sum(x["fills"] for x in summaries), tests=tests)
 
     def _recent_json(sleeves, days: int, daily) -> JSONResponse:
         """The last day or week at fine resolution, in the shape the charts read."""
@@ -292,7 +306,7 @@ def create_app(store: Store | None = None) -> FastAPI:
 
     @app.get("/api/book/equity")
     def book_equity_json(days: int | None = None, _: str = Depends(require_pm)):
-        sleeves, frames, summaries = book_data()
+        sleeves, frames, summaries, _tests = shown_book()
         curve = bookm.book_curve(summaries, frames)  # every strategy, as the book figures count it
         if days:
             return _recent_json(sleeves, days, curve)
@@ -1261,7 +1275,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         """Performance and the decision log under one period and strategy filter, which the exports follow."""
         q = request.query_params
         now = utcnow()
-        sleeves, frames, summaries = book_data()
+        _, frames, summaries, _tests = shown_book()
         names = [s.name for s in st().sleeves()]
         chosen = q.get("sleeve") if q.get("sleeve") in names else ""
         if chosen and chosen not in frames:  # a strategy an earlier clean slate put away: its own figures
@@ -1305,7 +1319,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         return page(request, "records.html", perf=perf, m=m, w=w, chosen=chosen, sleeves=names,
                     periods=reports.PERIODS, log=log, latest=decisions[:5], total=len(decisions),
                     kind_filters=reports.KIND_FILTERS, kind_counts=kinds, kinds=reports.DECISION_KINDS,
-                    qs=qs, exports=exports, action=dq["action"], shell=shell(sleeves))
+                    qs=qs, exports=exports, action=dq["action"], shell=shell())
 
     @app.get("/exports/{kind}.csv")
     def export_csv(kind: str, sleeve: str = "", _: str = Depends(require_pm)):

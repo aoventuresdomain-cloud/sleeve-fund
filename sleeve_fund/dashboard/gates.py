@@ -32,7 +32,12 @@ def path_to_live(store: Store, x: dict, g1: str | None, accounts: list[dict], no
     profile = venue_profile(s.venue)
     keyed = [a["name"] for a in accounts if a["kind"] == "live" and a["key_present"]
              and (a.get("venue") or "").upper() == profile.name]
+    # A named test account's results are never Strategy evidence (CCY-8DP), whatever else the list shows.
+    test = ([{"label": "Runs on a Strategy account", "ok": False, "bad": True,
+              "detail": "it runs on a test account, so its results are not Strategy evidence"}]
+            if x.get("test_account") else [])
     return [
+        *test,
         {"label": "Strategy passed G1", "ok": g1 == "PASS",
          "detail": "on real data, out of sample, for this instrument and interval" if g1 == "PASS"
          else "not possible yet for a perpetual or long/short strategy: studies run spot, long only"

@@ -15,6 +15,17 @@ from sleeve_fund import open_risk
 from sleeve_fund.dashboard import trading
 from sleeve_fund.store import Store
 
+
+@pytest.fixture(autouse=True)
+def _strategy_accounts(monkeypatch):
+    """CCY-8DP-UI (HoE-approved set-up, 13 Oct): these fixtures' Strategies sit at the default venue on the paper
+    account at 2 places, outside the fund's book (F229-6), so they are read as in-book here; tests/test_ccy_8dp_ui.py pins the
+    test-account views."""
+    from sleeve_fund.dashboard import book
+
+    monkeypatch.setattr(book, "is_test_account", lambda store, sleeve: False)
+
+
 PERP = {"market": "perp", "allow_short": True}
 AUTH = ("pm", "test-pw")
 
