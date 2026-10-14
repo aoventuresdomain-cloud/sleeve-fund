@@ -164,11 +164,14 @@ def tagged_intent(d: dict, now: datetime):
     from sleeve_fund.gate_ledger import TaggedIntent
 
     order, bar = gate_intent(d), d.get("bar")
+    stop, target = (order.price - scale(order.price, order.side * f) if f else None
+                    for f in (d.get("stop_frac"), -(d.get("tp_frac") or 0)))
     kind = str(d.get("what") or "entry")
     kind = "add" if kind == "entry" and d.get("opens", True) is False else kind  # held when sent: an add (P2-5)
     return TaggedIntent(**{f: getattr(order, f) for f in order.__dataclass_fields__},
                         intent_id=str(d.get("intent_id") or uuid.uuid4().hex), kind=kind,
-                        bar_ts=_utc(int(bar)) if isinstance(bar, int) else now)
+                        bar_ts=_utc(int(bar)) if isinstance(bar, int) else now, planned_stop=stop,
+                        planned_target=target)
 
 
 def _utc(ts_ns: int) -> datetime:

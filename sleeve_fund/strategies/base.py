@@ -3333,7 +3333,7 @@ class LongFlatStrategy(Strategy):
         # What the gate's Intent needs (research.portfolio.gate_intent): the expected fill, not the raw close; the
         # leverage (None on spot); and, with no stop, the daily ATR the stopless measure takes.
         intent = {"side": s, "qty": qty, "close": close, "price": fill_price(close, s, self._half_spread()),
-                  "stop_frac": self._stop_frac, "what": what, "step": self._lot(), "min_qty": self._min_qty(),
+                  "stop_frac": self._stop_frac, "tp_frac": self._tp_frac, "what": what, "step": self._lot(), "min_qty": self._min_qty(),
                   "instrument": self._base_code(), "opens": self._position_qty() < self._min_qty(),
                   "leverage": LongFlatStrategy._max_leverage(self)
                   if self._margin else None,
