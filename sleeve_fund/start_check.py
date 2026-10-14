@@ -164,11 +164,17 @@ def check_books(store) -> Section:
         fills = store.fills(s.name, limit=1)
         # A fill in the mark's own second is late too: the runtime stamps both to the second, and the tick that sends
         # a flatten marks before its fill is booked (MARK-ON-STOP), so a tie can't show the mark saw the fill.
+        tie = bool(fills) and fills[0]["ts"] == last["ts"]
         late = "a fill" if fills and fills[0]["ts"] >= last["ts"] else _late_cash(store, s.name, last["ts"])
         if late:
+            at = f"{last['ts']:%H:%M:%S} UTC"
+            if tie:
+                late = "a fill in its latest mark's own second"
+                why = f"{late} ({at}), which the mark may predate"
+            else:
+                why = f"{late} landed after its latest mark ({at})"
             late_with_fills.append(f"{s.name} had {late}")
-            sec.add(NOTE, f"{s.name}: {late} landed after its latest mark ({last['ts']:%H:%M:%S} UTC); compare "
-                          "again after the next mark")
+            sec.add(NOTE, f"{s.name}: {why}; compare again after the next mark")
             continue
         compared += 1
         # The reconcile's tolerances (SleeveRuntime.reconcile): a cent per fill for cash, float steps for the qty.
@@ -182,7 +188,9 @@ def check_books(store) -> Section:
         equity_tol = cash_tol + qty_tol * abs(price) + 4 * math.ulp(max(abs(want), abs(equity)))
         what = (f"{s.name}: position {_qty(last['qty']):.12g} vs journal {_qty(book['qty']):.12g}; "
                 f"cash {last['cash']:,.2f} vs journal {book['cash']:,.2f} ({book['fills']} fills)")
-        if abs(d_qty) > qty_tol or abs(d_cash) > cash_tol:
+        if abs(d_qty) > qty_tol:
+            sec.add(FAIL, f"{what}: the mark doesn't hold the journal's position, so it predates a fill")
+        elif abs(d_cash) > cash_tol:
             sec.add(FAIL, what)
         elif equity == 0.0 and want < 0 and markets.is_perp(s.params):
             # Isolated margin: a Strategy wiped out can't lose more than it had, so its mark is floored at zero. A
