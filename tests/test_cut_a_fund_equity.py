@@ -16,17 +16,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from sleeve_fund import supervisor as _sup
 from sleeve_fund.gate_ledger import DbLedger
 from sleeve_fund.paper.runtime import SleeveRuntime
 from sleeve_fund.portfolio.gate import PortfolioState
 from sleeve_fund.store import Store
 from sleeve_fund.strategies.base import LongFlatStrategy
 
-# Red first until PE2's fund-held book is on the head (supervisor.sizing_equity, the simulated account's virtual
-# funding and the replay's netting of it); strict, so the merged head must pass them and drop nothing.
-PE2_BUILT = pytest.mark.xfail(not hasattr(_sup, "sizing_equity"), strict=True,
-                              reason="needs PE2's fund-held book (sizing_equity, virtual funding)")
 
 
 T0 = datetime(2025, 10, 3, 9, 0, tzinfo=timezone.utc)
@@ -126,7 +121,6 @@ def test_a_fund_held_strategy_never_falls_back_to_its_own_equity():
     assert LongFlatStrategy._sizing_base(s, 0.0) == 19_887.78
 
 
-@PE2_BUILT
 def test_a_gain_not_yet_taken_anywhere_in_the_fund_never_sizes_an_entry_up(tmp_path):
     """TEC-QD-CUTA (HoE): base = deposits net of withdrawals + realised + min(0, unrealised). A Strategy holding 10 from
     1,000, marked at 1,200, adds 2,000 of unrealised gain to the fund's mark; the next entry anywhere sizes off the
