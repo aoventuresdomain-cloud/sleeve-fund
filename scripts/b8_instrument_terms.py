@@ -1,6 +1,7 @@
 """B8 instrument terms (venue-swap plan §B, Advisor 14 Oct 2026 03:05 UK): for every instrument a configured
 Strategy trades on a perpetual venue with published terms, the engine's terms beside the venue's, with a verdict
-per row. Read-only: public endpoints, no key, writes nothing.
+per row. The engine side is the instrument paper builds (VenueProfile.instrument), its fallback included when the
+venue's contract can't be read; with no instrument compared at all the check fails (B8: NOTHING CHECKED). Read-only: public endpoints, no key, writes nothing.
 
 Runs where the venue's public API is reachable: on the paper server, inside the venue's hub container
 (.github/workflows/instrument-terms.yml). The instruments come from configs/sleeves/*.toml at run time, so a later
@@ -32,7 +33,6 @@ from sleeve_fund import markets
 from sleeve_fund.venues import (
     BINANCE_FAPI,
     DEFAULT_VENUE,
-    binance_contract,
     binance_symbol,
     venue,
 )
@@ -72,22 +72,34 @@ def _floor_row(name: str, v: Decimal, e: Decimal | None) -> tuple[str, object, o
     return name, v, e, "PASS" if e == v else "FOLLOW-UP"
 
 
-def rows(pair: str, info: dict, funding: dict) -> list[tuple[str, object, object, str]]:
+def _dec(x) -> Decimal | None:
+    """An instrument figure (Price, Quantity, Money or None) as a Decimal, None when the instrument has none."""
+    if x is None:
+        return None
+    return x.as_decimal() if hasattr(x, "as_decimal") else Decimal(str(x))
+
+
+def engine_instrument(pair: str):
+    """The instrument paper builds for the pair (VenueProfile.instrument, as paper's node does): the venue's contract
+    limits when it answers, otherwise the cautious fallback (size precision capped at 3, no minimum quantity,
+    minimum notional 5). Comparing this, not the contract parse alone, covers the fallback and perpetual()."""
+    base, quote = pair.split("/")
+    return venue("binance").instrument(base, quote)
+
+
+def rows(pair: str, info: dict, funding: dict, inst) -> list[tuple[str, object, object, str]]:
     sym = binance_symbol(pair)
     listing = next(s for s in info["symbols"] if s["symbol"] == sym and s["contractType"] == "PERPETUAL")
     f = {x["filterType"]: x for x in listing["filters"]}
     tick, step = Decimal(f["PRICE_FILTER"]["tickSize"]), Decimal(f["LOT_SIZE"]["stepSize"])
-    eng = binance_contract(pair, get_json=lambda _url: info)
-    eng_tick, eng_step = Decimal(1).scaleb(-eng["price_precision"]), Decimal(1).scaleb(-eng["size_precision"])
+    eng_tick = _dec(inst.price_increment)
     profile = venue("binance")
     fi = funding.get(sym, {})
     out = [
         ("tick", tick, eng_tick, "MUST" if not power_of_ten(tick) else _floor_row("", tick, eng_tick)[3]),
-        _floor_row("lot step", step, eng_step),
-        _floor_row("min quantity", Decimal(f["LOT_SIZE"]["minQty"]),
-                   Decimal(str(eng["min_quantity"])) if "min_quantity" in eng else None),
-        _floor_row("min notional", Decimal(f["MIN_NOTIONAL"]["notional"]),
-                   Decimal(str(eng["min_notional"])) if "min_notional" in eng else None),
+        _floor_row("lot step", step, _dec(inst.size_increment)),
+        _floor_row("min quantity", Decimal(f["LOT_SIZE"]["minQty"]), _dec(inst.min_quantity)),
+        _floor_row("min notional", Decimal(f["MIN_NOTIONAL"]["notional"]), _dec(inst.min_notional)),
     ]
     hours = int(fi.get("fundingIntervalHours", 8))  # a symbol missing from fundingInfo settles on the 8h default
     eng_hours = int(markets.funding_interval(profile.funding_hours).total_seconds() // 3600)
@@ -102,10 +114,11 @@ def rows(pair: str, info: dict, funding: dict) -> list[tuple[str, object, object
     return out
 
 
-def main(argv: list[str], get: Callable[[str], object] = get_json, pattern: str = "configs/sleeves/*.toml") -> int:
+def main(argv: list[str], get: Callable[[str], object] = get_json, pattern: str = "configs/sleeves/*.toml",
+         build: Callable[[str], object] = engine_instrument) -> int:
     pairs = configured(pattern) + [("BINANCE", a.upper()) for a in argv]
     fetched: dict[str, tuple[dict, dict]] = {}
-    must = 0
+    must = compared = 0
     print(f"{'instrument':14} {'term':22} {'venue':>14} {'engine':>14}  verdict")
     for name, pair in dict.fromkeys(pairs):
         if name not in READERS:
@@ -115,10 +128,14 @@ def main(argv: list[str], get: Callable[[str], object] = get_json, pattern: str 
         if name not in fetched:
             info_url, funding_url = READERS[name]
             fetched[name] = (get(info_url), {x["symbol"]: x for x in get(funding_url)})
-        for term, v, e, verdict in rows(pair, *fetched[name]):
+        for term, v, e, verdict in rows(pair, *fetched[name], build(pair)):
             must += verdict == "MUST"
+            compared += 1
             print(f"{pair:14} {term:22} {v!s:>14} {e!s:>14}  {verdict}")
-    print(f"B8: {'MUST' if must else 'PASS'} ({must} MUST row(s))")
+    if not compared:  # F267-1: no instrument on a venue with published terms; a PASS here would mean nothing
+        print("B8: NOTHING CHECKED")
+        return 1
+    print(f"B8: {'MUST' if must else 'PASS'} ({must} MUST row(s), {compared} row(s) compared)")
     return 1 if must else 0
 
 

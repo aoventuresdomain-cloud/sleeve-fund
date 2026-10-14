@@ -2,6 +2,7 @@
 
 import importlib.util
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -31,6 +32,24 @@ def _sleeve(tmp_path, name, instrument, venue=None, market="perp"):
                                            f'[params]\nmarket = "{market}"\n')
 
 
+@pytest.fixture(autouse=True)
+def contract(monkeypatch):
+    """Paper's instrument for a pair: the venue's contract answered offline, as the stub venue publishes it (tick 0.1,
+    lot 0.001, minimum 0.001 and 100). A cell sets `contract.limits` to a dict, or to an exception to raise."""
+    from sleeve_fund import venues
+
+    state = SimpleNamespace(limits={"price_precision": 1, "size_precision": 3, "min_quantity": 0.001,
+                                    "min_notional": 100.0})
+
+    def answer(pair):
+        if isinstance(state.limits, Exception):
+            raise state.limits
+        return state.limits
+
+    monkeypatch.setattr(venues.VENUES["BINANCE"], "contract", answer)
+    return state
+
+
 BTC_FUNDING = [{"symbol": "BTCUSDT", "adjustedFundingRateCap": "0.003", "fundingIntervalHours": 8}]
 
 
@@ -51,7 +70,7 @@ def test_terms_that_match_pass_with_only_the_hand_checks_left(tmp_path, capfd):
     _sleeve(tmp_path, "a", "BTC/USDT", "binance")
     assert b8.main([], get=_venue([_symbol("BTCUSDT")], BTC_FUNDING), pattern=str(tmp_path / "*.toml")) == 0
     out = capfd.readouterr().out
-    assert "MUST" not in out.replace("B8: PASS (0 MUST row(s))", "")
+    assert not [line for line in out.splitlines() if line.endswith("MUST")]
     assert out.count("FOLLOW-UP") == 2  # maintenance margin and half spread: one constant each, by hand
     assert "B8: PASS" in out
 
@@ -91,3 +110,33 @@ def test_a_simulated_perp_and_an_extra_pair_are_both_reported(tmp_path, capfd):
     out = capfd.readouterr().out
     assert "BTC/USD        (simulated perp)" in out and "FOLLOW-UP" in out
     assert "ETH/USDT       tick" in out
+
+
+def test_the_engine_side_is_the_instrument_paper_builds_so_a_contract_that_fails_shows_its_fallback(tmp_path, capfd,
+                                                                                                   contract):
+    _sleeve(tmp_path, "a", "BTC/USDT", "binance")
+    contract.limits = OSError("venue unreachable")  # paper then builds the cautious fallback
+    venue_terms = _venue([_symbol("BTCUSDT", min_qty="0.01")], BTC_FUNDING)
+    assert b8.main([], get=venue_terms, pattern=str(tmp_path / "*.toml")) == 1
+    got = {line[15:37].strip(): line for line in capfd.readouterr().out.splitlines()
+           if line.startswith("BTC/USDT")}
+    assert got["tick"].endswith("MUST")  # the fallback's 2-place tick, 0.01, is finer than the venue's 0.1
+    assert got["min quantity"].endswith("MUST")  # no minimum given: paper's is one lot, 0.001, under the venue's 0.01
+    assert got["min notional"].endswith("MUST")  # 5 under the venue's 100
+    assert got["lot step"].endswith("PASS")  # the fallback caps the size at 3 places: 0.001, the venue's own
+
+
+def test_a_finer_lot_than_the_venues_is_a_must(tmp_path, capfd, contract):
+    _sleeve(tmp_path, "a", "BTC/USDT", "binance")
+    contract.limits = {"price_precision": 1, "size_precision": 4, "min_quantity": 0.001, "min_notional": 100.0}
+    assert b8.main([], get=_venue([_symbol("BTCUSDT")], BTC_FUNDING), pattern=str(tmp_path / "*.toml")) == 1
+    assert any(line.startswith("BTC/USDT") and "lot step" in line and line.endswith("MUST")
+               for line in capfd.readouterr().out.splitlines())
+
+
+def test_nothing_compared_is_not_a_pass(tmp_path, capfd):
+    _sleeve(tmp_path, "a", "BTC/USD")  # only the simulated perp: no venue with published terms
+    assert b8.main([], get=_venue([], []), pattern=str(tmp_path / "*.toml")) == 1
+    out = capfd.readouterr().out
+    assert "B8: NOTHING CHECKED" in out and "B8: PASS" not in out
+    assert b8.main([], get=_venue([], []), pattern=str(tmp_path / "none-*.toml")) == 1  # no configs at all
