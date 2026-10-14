@@ -917,7 +917,7 @@ def run_study(
     leverage = risk_profile_of(risk_profile).max_leverage if risk_profile is not None else None
     result.by_regime = regime_split.split(
         trades(fills_to_rows(full_default.fills), full_default.shorts, full_default.funding),
-        research, bench.equity)
+        research, bench.equity, full_default.equity)
     result.random_entry, result.random_side = _benchmarks(
         research, folds, test_bars, float(run_fees.taker), series if series is not None else spread_used,
         full_default.shorts, leverage, market.get("market"))
