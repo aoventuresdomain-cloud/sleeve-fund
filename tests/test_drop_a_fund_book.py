@@ -229,7 +229,7 @@ def test_an_insurance_credit_naming_no_liquidation_fill_holds_entries_with_one_a
     _covered(store, "x", "stop_loss", T0 + MIN, "s1")
     _mark(store, T0 + 2 * MIN)
     _mark(store, T0 + 3 * MIN)
-    assert len(_alerts(store)) == 1 and "x: an insurance credit of 300.00 names no liquidation fill" in _alerts(store)[0]
+    assert len(_alerts(store)) == 1 and "x: an insurance credit of 300.00" in _alerts(store)[0]
     assert _entry(store, T0 + 3 * MIN).outcome == "rejected"
     with pytest.raises(ValueError, match="must name"):
         store.record_insurance("x", price=1.0, amount=1.0, ts=T0 + 3 * MIN)
@@ -238,12 +238,14 @@ def test_an_insurance_credit_naming_no_liquidation_fill_holds_entries_with_one_a
     assert _entry(store, T0 + 5 * MIN).outcome == "approved" and len(_alerts(store)) == 1
 
 
-def test_an_insurance_credit_for_a_liquidation_fill_is_no_break(store):  # noqa: F811
+def test_an_insurance_credit_even_for_a_liquidation_fill_holds_inside_the_fund(store):  # noqa: F811
+    """TEC-INSURE-ZERO (HoE): inside the fund every liquidation is booked at the bankruptcy price, so no credit is due."""
     _rebased(store)
     _make(store, "x", 0)
     _covered(store, "x", "liquidation", T0 + MIN, "l1")
     _mark(store, T0 + 2 * MIN)
-    assert _alerts(store) == [] and supervisor.insurance_breaks(store) == []
+    assert len(_alerts(store)) == 1 and "x: an insurance credit of 300.00" in _alerts(store)[0]
+    assert _entry(store, T0 + 2 * MIN).outcome == "rejected"
 
 
 def test_the_resume_identity_command_dry_runs_then_lifts_the_hold_on_the_pms_word(store, monkeypatch, capfd):  # noqa: F811
