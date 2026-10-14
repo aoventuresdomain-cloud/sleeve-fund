@@ -327,6 +327,7 @@ class LongFlatConfig(StrategyConfig):
         leg: dict | None = None,
         **kwargs: Any,
     ) -> None:
+        leg_spec = leg  # `leg` is reused below for a fee and a half spread
         unknown = set(kwargs) - _BASE_FIELDS
         if unknown:
             raise TypeError(f"unknown strategy parameters: {sorted(unknown)}")
@@ -401,14 +402,15 @@ class LongFlatConfig(StrategyConfig):
             if take_profit <= cost:
                 raise ValueError(f"Take-profit {take_profit:.2%} doesn't cover the round trip's fees and spread "
                                  f"({cost:.2%}), so every target hit would lose money")
-        if leg is not None:
-            if set(leg) != {"side", "ratio", "leverage"} or int(leg["side"]) not in (1, -1):
-                raise ValueError(f"a two-leg Strategy's leg is its side (+1 or -1), ratio and leverage, not {leg!r}")
-            if markets.is_perp({"market": market}) and not 0 < float(leg["leverage"]) <= 2:
-                raise ValueError(f"a perp leg's leverage is above 0 and at most 2x, not {leg['leverage']}")
+        if leg_spec is not None:
+            if set(leg_spec) != {"side", "ratio", "leverage"} or int(leg_spec["side"]) not in (1, -1):
+                raise ValueError("a two-leg Strategy's leg is its side (+1 or -1), ratio and leverage, not "
+                                 f"{leg_spec!r}")
+            if markets.is_perp({"market": market}) and not 0 < float(leg_spec["leverage"]) <= 2:
+                raise ValueError(f"a perp leg's leverage is above 0 and at most 2x, not {leg_spec['leverage']}")
         # A leg of a two-leg Strategy (P2-8; two_legs.leg_params): it trades only through its Pair, and with no Pair it
         # opens nothing (Advisor M4), whoever built it.
-        self.leg = dict(leg) if leg is not None else None
+        self.leg = dict(leg_spec) if leg_spec is not None else None
         self.instrument_id = instrument_id
         self.bar_type = bar_type
         # Backtest only: no trade on a bar that closes before this time (ns), so a study's out-of-sample window starts
