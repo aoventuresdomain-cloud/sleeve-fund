@@ -319,7 +319,8 @@ def test_e3b_a_days_pause_keeps_the_book_marked_so_emptying_it_waits_for_midnigh
     led = DbLedger(store, lambda: ())
     with led.lock():
         led.set_state(replace(led.state(), paused="the test's pause", paused_until=T0 + timedelta(hours=2)))
-    with pytest.raises(ValueError, match="the day's pause holds until 11:00 UTC"):
+    said = r"paused for the day \(the test's pause\).*try again after 12:00 UK \(11:00 UTC\)"
+    with pytest.raises(ValueError, match=said):
         store.archive("a")
     st = _state(store)
     assert st.equity == D(10_000) and st.paused_until == T0 + timedelta(hours=2) and "a" not in store.archived()

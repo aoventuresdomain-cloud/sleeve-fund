@@ -358,8 +358,14 @@ def apply_flow(ledger: Ledger, amount, idle: Callable[[], str | None] | None = N
                 busy = "an order still holds room in the book"
             if busy is None and st.paused_until is not None:
                 # a pause follows a mark (portfolio_state_marked), so the day's pause keeps the book marked: emptied
-                # from 00:00 UTC, when it ends (QD, 14 Oct; nothing can trade an empty book meanwhile)
-                busy = f"the day's pause holds until {st.paused_until:%H:%M} UTC"
+                # from 00:00 UTC, when it ends (Advisor 14 Oct 10:10 UK; nothing can trade an empty book meanwhile).
+                # Said to the PM as it is (the dashboard shows the refusal), with when to try again in UK time.
+                from zoneinfo import ZoneInfo
+
+                uk = st.paused_until.astimezone(ZoneInfo("Europe/London"))
+                raise ValueError(f"Not done: this would leave the fund with no capital while it is paused for the day "
+                                 f"({st.paused}), and the pause has to stay in force until it ends. Nothing is lost "
+                                 f"by waiting. Please try again after {uk:%H:%M} UK ({st.paused_until:%H:%M} UTC).")
             if busy is not None:
                 raise ValueError(f"a flow of {amount:,.2f} would empty the book of {book:,.2f} while {busy}: refused")
             ledger.set_state(replace(st, equity=None, mark_ts=None, hwm=None, halt_reference=None, day=None,
