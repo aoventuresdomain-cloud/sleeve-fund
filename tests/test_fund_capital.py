@@ -189,7 +189,7 @@ def _down(eng, rev):
 
 
 def test_0025_seeds_instruments_from_the_strategies_there_and_matches_the_code(engine):
-    _at(engine, "0022")
+    _at(engine, "0024")
     with engine.begin() as c:
         for name, inst, params in (("a", "XBT/USD", "{}"), ("b", "ETH/USDT", '{"market": "futures"}'),
                                    ("c", "ETH/USDT", '{"market": "futures"}'), ("bt:z", "ADA/USD", "{}")):
@@ -207,7 +207,7 @@ def test_0025_seeds_instruments_from_the_strategies_there_and_matches_the_code(e
 
 
 def test_0025_on_a_database_a_newer_store_already_opened_keeps_its_tables(engine):
-    _at(engine, "0022")
+    _at(engine, "0024")
     s = Store(engine=engine)
     s.settle_flow(s.fund_flow("deposit", "3", actor="pm", reason="r", now=T0), T0)
     _at(engine, "0025")
@@ -231,12 +231,12 @@ def test_0025_writes_the_same_write_once_rules_as_the_store(engine):
 
 def test_0025_goes_down_only_with_no_money_in_the_ledger(engine):
     _at(engine, "0025")
-    _down(engine, "0022")
+    _down(engine, "0024")
     assert not {"fund_flows", "instruments"} & set(inspect(engine).get_table_names())
     _at(engine, "0025")
     Store(engine=engine).fund_flow("deposit", "1", actor="pm", reason="r", now=T0)
     with pytest.raises(NotImplementedError, match="never dropped"):
-        _down(engine, "0022")
+        _down(engine, "0024")
     assert "fund_flows" in inspect(engine).get_table_names() and _count(engine) == 1
 
 

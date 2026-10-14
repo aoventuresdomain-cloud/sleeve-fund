@@ -323,6 +323,9 @@ orders_t = Table(
     # Bridge A (DA, 0026): the instrument it was in, so a Strategy on several assets reads per asset. Filled from the
     # Strategy's own instrument at the database when the writer names none (INSTRUMENT_FILL triggers below).
     Column("instrument", String(32), nullable=False, server_default=""),
+    # Bridge A (DA, 0026): what the order risks at entry, in money: qty x distance to its stop with fees, or the charged
+    # risk of a stopless one. Written by sizing; none on orders before it. R per trade = its P&L / this.
+    Column("entry_risk", EXACT),
     Index("orders_parent_trade_id", "parent_trade_id"),
     CheckConstraint("venue = upper(venue)", name="orders_venue_upper"),
 )
@@ -736,6 +739,9 @@ portfolio_state_t = Table(
     Column("carried_day_return", EXACT),  # book / day_start_equity - 1, for carried_day
     Column("carried_day", Date),  # the UTC day carried_day_return belongs to
     Column("profile_version", Integer, ForeignKey("portfolio_profile.version"), nullable=False),
+    # Bridge A (DA, 0027): the compliance tests' version this row was checked under. Nullable: rows before it have the
+    # profile only.
+    Column("compliance_version", Integer, ForeignKey("compliance_versions.version")),
     Column("updated_at", TS, nullable=False),
     CheckConstraint("id = 1", name="portfolio_state_one_row"),
     CheckConstraint("status IN ('ok', 'paused', 'halted')", name="portfolio_state_status"),
@@ -767,6 +773,9 @@ book_marks_t = Table(
     Column("day_start_equity", EXACT, nullable=False),
     Column("status", String(16), nullable=False),
     Column("profile_version", Integer, ForeignKey("portfolio_profile.version"), nullable=False),
+    # Bridge A (DA, 0027): the compliance tests' version this row was checked under. Nullable: rows before it have the
+    # profile only.
+    Column("compliance_version", Integer, ForeignKey("compliance_versions.version")),
 )
 # One row per check of an order that raises a position, at submit or as the backstop at fill. seq is the first-come
 # order, taken inside the gate's lock (Postgres: the gate_decision_seq sequence; SQLite: max + 1 under the lock).
@@ -826,6 +835,12 @@ gate_decisions_t = Table(
     Column("underlying", String(16), nullable=False),  # what net is counted by, e.g. BTC
     Column("order_id", String(64), ForeignKey("orders.order_id")),  # set with the order row when sent
     Column("profile_version", Integer, ForeignKey("portfolio_profile.version"), nullable=False),
+    # Bridge A (DA, 0027): the compliance tests' version this row was checked under. Nullable: rows before it have the
+    # profile only.
+    Column("compliance_version", Integer, ForeignKey("compliance_versions.version")),
+    # the test that refused or trimmed it, in that version (a trigger checks it is one); limit_hit keeps the outcomes
+    # that are not a test (lock_error, portfolio_state_stale, below_min)
+    Column("test_hit", String(32)),
     Column("outcome", String(24), nullable=False),
     Column("limit_hit", String(24)),
     Column("requested_qty", EXACT, nullable=False),
@@ -876,6 +891,118 @@ gate_reservations_t = Table(
     Index("gate_reservations_active_sleeve", "sleeve_id", sqlite_where=text("released_at IS NULL"),
           postgresql_where=text("released_at IS NULL")),  # the sweep, and DA-6's reset guard
 )
+# Bridge A (DA, 0027; Advisor BRIDGE-3): the PM's compliance tests, versioned whole. One version is every test and the
+# asset-group map together, so a decision that records its version re-checks exactly. Written only through
+# Store.add_compliance_version (the PM's Portfolio Settings, or a migration's seed); never updated or deleted. The gate
+# reads the latest version inside its lock, at evaluation, so an edit applies to the next order and never back.
+COMPLIANCE_SCOPES = ("fund", "asset", "asset_type", "strategy")
+COMPLIANCE_MEASURES = ("open_risk", "gross", "net", "margin", "day_loss", "drawdown", "strategy_risk", "contrib_dd")
+# trim: to fit, refused below the venue minimum; pause_day: no entries until 00:00 UTC; pause_pm: the Strategy holds
+# until the PM resumes it; halt: flatten everything and halt, only the PM restarts.
+COMPLIANCE_ACTIONS = ("refuse", "trim", "pause_day", "pause_pm", "halt")
+compliance_versions_t = Table(
+    "compliance_versions",
+    metadata,
+    Column("version", Integer, primary_key=True, autoincrement=False),
+    Column("created_at", TS, nullable=False),  # effective from: the next gate evaluation
+    Column("created_by", Text, nullable=False),  # 'pm', or 'migration 0027' for the seed
+    Column("note", Text),
+    CheckConstraint("created_by <> 'pm' OR (note IS NOT NULL AND note <> '')", name="compliance_versions_pm_note"),
+)
+compliance_tests_t = Table(
+    "compliance_tests",
+    metadata,
+    Column("version", Integer, ForeignKey("compliance_versions.version"), primary_key=True),
+    Column("test", String(32), primary_key=True),  # a fixed key, e.g. asset_stop_loss (compliance_rules.KEYS)
+    Column("label", Text, nullable=False),
+    Column("scope", String(12), nullable=False),
+    Column("measure", String(16), nullable=False),
+    Column("limit_value", LIMIT, nullable=False),  # a share of fund equity; gross and net: times the book
+    Column("action", String(12), nullable=False),
+    Column("enabled", Boolean, nullable=False),
+    CheckConstraint(_in("scope", COMPLIANCE_SCOPES), name="compliance_tests_scope"),
+    CheckConstraint(_in("measure", COMPLIANCE_MEASURES), name="compliance_tests_measure"),
+    CheckConstraint(_in("action", COMPLIANCE_ACTIONS), name="compliance_tests_action"),
+    CheckConstraint("limit_value > 0", name="compliance_tests_limit"),
+)
+compliance_asset_types_t = Table(
+    "compliance_asset_types",
+    metadata,
+    Column("version", Integer, ForeignKey("compliance_versions.version"), primary_key=True),
+    Column("underlying", String(16), primary_key=True),
+    Column("asset_type", String(32), nullable=False),  # the PM's group, e.g. large
+    CheckConstraint("underlying = upper(underlying)", name="compliance_asset_types_upper"),
+    CheckConstraint("asset_type <> ''", name="compliance_asset_types_named"),
+)
+COMPLIANCE_TABLES = ("compliance_versions", "compliance_tests", "compliance_asset_types")
+COMPLIANCE_WORM_PG = (
+    "CREATE OR REPLACE FUNCTION compliance_write_once() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+    "RAISE EXCEPTION USING ERRCODE = 'check_violation', "
+    "MESSAGE = TG_TABLE_NAME || ' is write-once: a version is never edited or deleted, a change is a new version'; "
+    "END $$",
+)
+
+
+def _compliance_worm_pg(table: str) -> str:
+    return (f"CREATE TRIGGER {table}_write_once BEFORE UPDATE OR DELETE ON {table} FOR EACH ROW "
+            "EXECUTE FUNCTION compliance_write_once()")
+
+
+def _compliance_worm_sqlite(table: str) -> tuple[str, str]:
+    return tuple(f"CREATE TRIGGER {table}_no_{op.lower()} BEFORE {op} ON {table} BEGIN SELECT RAISE(ABORT, "
+                 f"'{table} is write-once: a version is never edited or deleted, a change is a new version'); END"
+                 for op in ("UPDATE", "DELETE"))
+
+
+# A decision's test_hit names a test of the version it records (so never without a version). A trigger, not a composite
+# foreign key and a CHECK, so 0027 adds it without rebuilding gate_decisions on SQLite.
+GATE_TEST_HIT_PG = (
+    "CREATE OR REPLACE FUNCTION gate_test_hit_known() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+    "IF NEW.test_hit IS NOT NULL AND NOT EXISTS (SELECT 1 FROM compliance_tests WHERE version = NEW.compliance_version "
+    "AND test = NEW.test_hit) THEN RAISE EXCEPTION USING ERRCODE = 'foreign_key_violation', "
+    "MESSAGE = 'gate_decisions.test_hit ' || NEW.test_hit || ' is not a test of version ' "
+    "|| COALESCE(NEW.compliance_version::text, 'none'); END IF; RETURN NEW; END $$",
+    "CREATE TRIGGER gate_decisions_test_hit BEFORE INSERT OR UPDATE ON gate_decisions FOR EACH ROW "
+    "EXECUTE FUNCTION gate_test_hit_known()",
+)
+GATE_TEST_HIT_SQLITE = tuple(
+    f"CREATE TRIGGER gate_decisions_test_hit_{op.lower()} BEFORE {op} ON gate_decisions WHEN NEW.test_hit IS NOT NULL "
+    "AND NOT EXISTS (SELECT 1 FROM compliance_tests WHERE version = NEW.compliance_version AND test = NEW.test_hit) "
+    "BEGIN SELECT RAISE(ABORT, 'gate_decisions.test_hit is not a test of the version it records'); END"
+    for op in ("INSERT", "UPDATE"))
+for _t in (compliance_versions_t, compliance_tests_t, compliance_asset_types_t):
+    for _sql in COMPLIANCE_WORM_PG:
+        event.listen(_t, "after_create", DDL(_sql).execute_if(dialect="postgresql"))
+    event.listen(_t, "after_create", DDL(_compliance_worm_pg(_t.name)).execute_if(dialect="postgresql"))
+    for _sql in _compliance_worm_sqlite(_t.name):
+        event.listen(_t, "after_create", DDL(_sql).execute_if(dialect="sqlite"))
+for _sql in GATE_TEST_HIT_PG:
+    event.listen(gate_decisions_t, "after_create", DDL(_sql).execute_if(dialect="postgresql"))
+for _sql in GATE_TEST_HIT_SQLITE:
+    event.listen(gate_decisions_t, "after_create", DDL(_sql).execute_if(dialect="sqlite"))
+
+COMPLIANCE_V1_AT = datetime(2026, 10, 14, 21, 0, tzinfo=timezone.utc)
+COMPLIANCE_V1_NOTE = "the PM's defaults (DEFAULTS-2, 14 Oct 2026); Advisor BRIDGE-3"
+
+
+def _seed_compliance(target, conn, **kw) -> None:
+    """Version 1 on a store made by create_all, as migration 0027 seeds it, so no database has a gate without tests.
+    After every table is made (the map reads instruments), and only on an empty table."""
+    from sleeve_fund import compliance_rules as rules
+
+    if conn.execute(select(func.count()).select_from(compliance_versions_t)).scalar():
+        return
+    conn.execute(insert(compliance_versions_t).values(version=1, created_at=COMPLIANCE_V1_AT,
+                                                      created_by="migration 0027", note=COMPLIANCE_V1_NOTE))
+    conn.execute(insert(compliance_tests_t), [{"version": 1, "test": t["test"], "label": t["label"],
+                                               "scope": t["scope"], "measure": t["measure"],
+                                               "limit_value": t["limit"], "action": t["action"],
+                                               "enabled": t["enabled"]} for t in rules.default_tests()])
+    held = {u for (u,) in conn.execute(select(instruments_t.c.underlying).distinct())}
+    groups = rules.DEFAULT_GROUPS | {u: rules.OTHER_GROUP for u in held if u not in rules.DEFAULT_GROUPS}
+    conn.execute(insert(compliance_asset_types_t), [{"version": 1, "underlying": u, "asset_type": g}
+                                                    for u, g in sorted(groups.items())])
+
 # Bridge A (DA, 0025): the fund holds the capital, a Strategy none of its own. fund_flows is its only external capital,
 # append-only: a row is never deleted or edited, only ended once at the poll (applied, or refused with the reason), in
 # id order, so an inflow never overtakes a pending outflow (Advisor CAP5-RESET). rebase: the clean-slate deposit only,
@@ -946,6 +1073,7 @@ for _sql in FUND_FLOWS_WORM_PG:
     event.listen(fund_flows_t, "after_create", DDL(_sql).execute_if(dialect="postgresql"))
 for _sql in FUND_FLOWS_WORM_SQLITE:
     event.listen(fund_flows_t, "after_create", DDL(_sql).execute_if(dialect="sqlite"))
+event.listen(metadata, "after_create", _seed_compliance)
 
 # A row written without an instrument takes its Strategy's (bridge A, 0026): every writer today has one instrument per
 # Strategy, so none of them changes, and Drop B's multi-asset writers name theirs. Postgres fills it before the insert;
@@ -1387,6 +1515,42 @@ def _drop_carried(c) -> bool:
                           .where(st.id == 1, st.marked_at.is_(None), st.carried_hwm_drawdown.is_not(None))
                           .values(carried_hwm_drawdown=None, carried_reference_drawdown=None,
                                   carried_day_return=None, carried_day=None)).rowcount)
+
+
+@dataclass(frozen=True)
+class Compliance:
+    """One version of the PM's compliance tests: the tests (dicts: test, label, scope, measure, limit, action,
+    enabled) and the asset-group map (underlying -> group)."""
+    version: int
+    created_at: datetime
+    created_by: str
+    note: str | None
+    tests: list
+    asset_types: dict
+
+    def test(self, key: str) -> dict | None:
+        return next((t for t in self.tests if t["test"] == key), None)
+
+
+def _compliance_changes(old: Compliance | None, rows: list[dict], groups: dict[str, str]) -> str:
+    """What a new version changes, old -> new, for the decision log."""
+    if old is None:
+        return "first version"
+    was = {t["test"]: t for t in old.tests}
+    said = []
+    for r in rows:
+        o = was.get(r["test"])
+        if o is None:
+            said.append(f"{r['test']} added")
+            continue
+        if Decimal(o["limit"]) != r["limit_value"]:
+            said.append(f"{r['test']} {o['limit']:f} -> {r['limit_value']:f}")
+        if o["enabled"] != r["enabled"]:
+            said.append(f"{r['test']} {'on' if r['enabled'] else 'off'}")
+    for u in sorted(set(old.asset_types) | set(groups)):
+        if old.asset_types.get(u) != groups.get(u):
+            said.append(f"{u} group {old.asset_types.get(u) or 'none'} -> {groups.get(u) or 'none'}")
+    return ", ".join(said) or "no change"
 
 
 class Store:
@@ -3685,6 +3849,91 @@ class Store:
     def instruments(self) -> list[dict]:
         with self.engine.connect() as c:
             return _rows(c.execute(select(instruments_t).order_by(instruments_t.c.id)))
+
+    # --- compliance tests (bridge A, DA 0027; Advisor BRIDGE-3) -----------------------------------------------
+
+    def compliance(self, version: int | None = None, conn=None) -> Compliance:
+        """The tests and the asset-group map of one version, the latest by default. The gate calls this inside its
+        lock, at evaluation, with its conn, and records the version on the decision (BRIDGE-3-QA)."""
+        def read(c) -> Compliance:
+            v = version or c.execute(select(func.max(compliance_versions_t.c.version))).scalar()
+            head = c.execute(select(compliance_versions_t).where(compliance_versions_t.c.version == v)).first()
+            if head is None:
+                raise ValueError(f"no compliance version {v}")
+            t, m = compliance_tests_t, compliance_asset_types_t
+            tests = [{"test": r.test, "label": r.label, "scope": r.scope, "measure": r.measure,
+                      "limit": Decimal(r.limit_value).quantize(LIMIT_PLACES), "action": r.action,
+                      "enabled": bool(r.enabled)}
+                     for r in c.execute(select(t).where(t.c.version == v).order_by(t.c.test))]
+            groups = {r.underlying: r.asset_type for r in c.execute(select(m).where(m.c.version == v))}
+            return Compliance(head.version, _aware(head.created_at), head.created_by, head.note, tests, groups)
+
+        if conn is not None:
+            return read(conn)
+        with self.engine.connect() as c:
+            return read(c)
+
+    def compliance_versions(self, limit: int | None = None) -> list[dict]:
+        """Every version, newest first: version, created_at, created_by, note."""
+        q = select(compliance_versions_t).order_by(compliance_versions_t.c.version.desc())
+        with self.engine.connect() as c:
+            return _rows(c.execute(q.limit(limit) if limit else q))
+
+    def unmapped(self, version: int | None = None) -> list[str]:
+        """Underlyings in instruments that the version's map leaves out: the gate refuses their entries while the
+        asset-group test is on (Advisor BRIDGE-A-FE-2), and Portfolio Settings shows them in amber."""
+        groups = self.compliance(version).asset_types
+        return sorted({r["underlying"] for r in self.instruments()} - set(groups))
+
+    def add_compliance_version(self, tests: list[dict], asset_types: dict[str, str], *, expected_version: int,
+                               note: str, created_by: str = "pm", now: datetime | None = None) -> int:
+        """The PM's edit: a whole new version (every test and the whole map), written only if the latest is still
+        expected_version, so two open forms never overwrite each other. Refused with the reasons in the PM's words.
+        Journaled with what changed, old and new. It applies from the gate's next evaluation."""
+        from sleeve_fund import compliance_rules as rules
+
+        if created_by != "pm" and not created_by.startswith("migration "):
+            raise ValueError(f"compliance tests are changed by the PM only, not {created_by!r}")
+        if not (note or "").strip():
+            raise ValueError("say why the tests change")
+        errors = rules.validate(tests)
+        rows = []
+        for t in tests:
+            limit = to_decimal(t.get("limit", 0), "limit")
+            if limit != limit.quantize(LIMIT_PLACES):
+                errors.append(f"{t.get('label') or t.get('test')}: a limit has at most four decimal places")
+            rows.append({"test": t["test"], "label": rules.LABELS.get(t["test"], t.get("label") or t["test"]),
+                         "scope": t.get("scope"), "measure": t.get("measure"), "limit_value": limit,
+                         "action": t.get("action"), "enabled": bool(t.get("enabled"))})
+        groups = {}
+        for u, g in (asset_types or {}).items():
+            u, g = str(u).strip().upper(), str(g or "").strip()
+            if not u or not g:
+                errors.append(f"asset {u or '?'} needs a group name")
+            groups[u] = g
+        if errors:
+            raise ValueError("; ".join(errors))
+        now = now or utcnow()
+        try:
+            with self.engine.begin() as c:
+                latest = c.execute(select(func.max(compliance_versions_t.c.version))).scalar() or 0
+                if latest != expected_version:
+                    raise ValueError(f"the tests changed since this page was opened (now version {latest}): reload "
+                                     "and edit again")
+                old = self.compliance(latest, conn=c) if latest else None
+                v = latest + 1
+                c.execute(insert(compliance_versions_t).values(version=v, created_at=now, created_by=created_by,
+                                                               note=note.strip()))
+                c.execute(insert(compliance_tests_t), [r | {"version": v} for r in rows])
+                if groups:
+                    c.execute(insert(compliance_asset_types_t),
+                              [{"version": v, "underlying": u, "asset_type": g} for u, g in sorted(groups.items())])
+                c.execute(insert(decisions_t).values(
+                    ts=now, actor=created_by, action="compliance_version", sleeve=None,
+                    reason=f"compliance tests v{v} ({note.strip()}): {_compliance_changes(old, rows, groups)}"))
+        except IntegrityError as exc:  # another write took the same version number first
+            raise ValueError("the tests changed since this page was opened: reload and edit again") from exc
+        return v
 
     def prune_backtests(self, keep: int = 50) -> int:
         """Delete all but the latest `keep` saved backtests and their journals. Returns how many went."""

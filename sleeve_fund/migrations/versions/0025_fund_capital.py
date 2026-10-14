@@ -12,7 +12,7 @@ params.market. The asset type is not here: it is versioned with the compliance t
 Additive only: nothing existing is edited. Each part is skipped when a Store on the same code built it first.
 
 Revision ID: 0025
-Revises: 0022 (main's head at 76d7053: 0020, 0023, 0022; re-chains after 0024 book_moves if that merges first, per the register)
+Revises: 0024 (PE2's book_moves, on main's 0022)
 Create Date: 2026-10-14 22:00:00.000000
 """
 
@@ -53,7 +53,7 @@ SQLITE = (
 
 
 revision = '0025'
-down_revision = '0022'
+down_revision = '0024'
 branch_labels = None
 depends_on = None
 

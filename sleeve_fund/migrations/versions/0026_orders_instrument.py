@@ -1,4 +1,5 @@
-"""Bridge A (DA, 14 Oct): orders, fills, funding and insurance say which instrument they were in.
+"""Bridge A (DA, 14 Oct): orders, fills, funding and insurance say which instrument they were in; orders say what
+they risked at entry (entry_risk, nullable: sizing writes it; R per trade on the attribution page).
 
 A Strategy on several assets (Drop B) needs its fills, funding and insurance read per asset; today every row's
 instrument is its Strategy's, so the backfill copies sleeves.instrument through the row's sleeve. A writer that names
@@ -57,6 +58,8 @@ def upgrade() -> None:
         op.execute(f"UPDATE {table} SET instrument = COALESCE((SELECT s.instrument FROM sleeves s "
                    f"WHERE s.name = {table}.sleeve), '')")
         op.execute(_pg_trigger(table) if pg else _sqlite_trigger(table))
+    if 'entry_risk' not in {c['name'] for c in insp.get_columns('orders')}:
+        op.add_column('orders', sa.Column('entry_risk', sa.Numeric(38, 18)))
     if 'fills_sleeve_instrument_ts' not in {i['name'] for i in insp.get_indexes('fills')}:
         op.create_index('fills_sleeve_instrument_ts', 'fills', ['sleeve', 'instrument', 'ts'])
 
@@ -65,6 +68,7 @@ def downgrade() -> None:
     bind = op.get_bind()
     pg = bind.dialect.name == 'postgresql'
     op.drop_index('fills_sleeve_instrument_ts', table_name='fills')
+    op.drop_column('orders', 'entry_risk')
     for table in TABLES:
         op.execute(f"DROP TRIGGER IF EXISTS {table}_fill_instrument" + (f" ON {table}" if pg else ""))
         # A plain DROP COLUMN (SQLite 3.35+), not batch mode: batch rebuilds the table, and renaming it back trips
