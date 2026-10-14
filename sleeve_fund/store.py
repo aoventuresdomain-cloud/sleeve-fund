@@ -41,6 +41,7 @@ from sqlalchemy import (
     case,
     inspect,
     insert,
+    literal,
     or_,
     select,
     text,
@@ -649,6 +650,34 @@ GATE_RELEASES = ("fill", "reject", "cancel", "ttl")
 def _in(column: str, values: tuple[str, ...]) -> str:
     return f"{column} IN ({', '.join(repr(v) for v in values)})"
 
+
+PAIR_STATES = ("flat", "legging", "hedged", "closing")
+PAIR_FIGURES = ("reference_equity", "hwm", "day_start_equity", "day_start")
+PAIR_SHAPE = ("(state = 'flat' AND trade_id IS NULL AND deadline IS NULL) "
+              "OR (state = 'hedged' AND trade_id IS NOT NULL AND deadline IS NULL) "
+              "OR (state IN ('legging', 'closing') AND trade_id IS NOT NULL AND deadline IS NOT NULL)")
+# P2-8 (Advisor M3, DA 14 Oct 05:02 UK): a two-leg Strategy's coordinator, one row per parent (the first leg's row; a
+# leg never has one). Its state is a hint after a restart: the journal's fills by parent_trade_id are the truth. Its
+# figures are the summed guard's (ruling E), split as portfolio_state's are: the halt reference re-based at a Resume, and
+# the true high-water mark, only ever raised (reset by a book reset), with the UTC day's start.
+pair_state_t = Table(
+    "pair_state",
+    metadata,
+    Column("parent", String(64), ForeignKey("sleeves.name", name="pair_state_parent_fk", ondelete="RESTRICT"),
+           primary_key=True),
+    Column("state", String(8), nullable=False),
+    Column("trade_id", String(64)),  # the trade's parent_trade_id, while one is open
+    Column("deadline", TS),  # legging or closing: when the legged state is unwound by
+    Column("reference_equity", EXACT),
+    Column("hwm", EXACT),
+    Column("day_start_equity", EXACT),
+    Column("day_start", Date),
+    Column("marked_at", TS),
+    Column("updated_at", TS, nullable=False),
+    CheckConstraint(_in("state", PAIR_STATES), name="pair_state_values"),
+    CheckConstraint(PAIR_SHAPE, name="pair_state_shape"),
+    *(CheckConstraint(f"({c} IS NULL) = (marked_at IS NULL)", name=f"pair_state_{c}_marked") for c in PAIR_FIGURES),
+)
 
 gate_decisions_t = Table(
     "gate_decisions",
@@ -1717,6 +1746,81 @@ class Store:
         with self.engine.begin() as c:
             c.execute(insert(events_t).values(sleeve=sleeve, ts=ts or utcnow(), level=level, kind=kind, message=message,
                                               command_id=command_id))
+
+    # --- a two-leg Strategy's coordinator (P2-8, Advisor M3; DA 14 Oct 05:02 UK) ---------------------------------------
+
+    def pair_state(self, parent: str) -> dict | None:
+        with self.engine.connect() as c:
+            rows = _rows(c.execute(select(pair_state_t).where(pair_state_t.c.parent == parent)))
+        return rows[0] if rows else None
+
+    def set_pair_state(self, parent: str, *, expected: str | None, state: str, trade_id: str | None = None,
+                       deadline: datetime | None = None, ts: datetime | None = None) -> bool:
+        """Move the pair from `expected` (None: it has no row yet) to `state`, with one pair_state event in the same
+        transaction. A compare-and-set: False when the row wasn't in `expected` (another writer moved it first, or it
+        already exists), and nothing is written; re-read and decide again."""
+        ts = ts or utcnow()
+        values = dict(state=state, trade_id=trade_id, deadline=deadline, updated_at=ts)
+        try:
+            with self.engine.begin() as c:
+                row = c.execute(select(sleeves_t.c.parent).where(sleeves_t.c.name == parent)).first()
+                if row is None or row.parent is not None:
+                    raise ValueError(f"{parent!r} is not a two-leg Strategy's first leg")
+                if expected is None:
+                    c.execute(insert(pair_state_t).values(parent=parent, **values))
+                else:
+                    done = c.execute(update(pair_state_t).where(pair_state_t.c.parent == parent,
+                                                                pair_state_t.c.state == expected).values(**values))
+                    if done.rowcount != 1:
+                        return False
+                c.execute(insert(events_t).values(
+                    sleeve=parent, ts=ts, level="info", kind="pair_state",
+                    message=f"{expected or 'new'} -> {state}" + (f" ({trade_id})" if trade_id else "")))
+        except IntegrityError:
+            if expected is None:
+                return False  # it has a row already: another writer made it
+            raise
+        return True
+
+    def mark_pair(self, parent: str, equity, day, ts: datetime | None = None) -> dict:
+        """The summed guard's figures at the pair's first mark, all at once (reference, high-water mark and the day's
+        start at `equity`); kept as they are once set. Returns the row."""
+        ts, v = ts or utcnow(), stored(equity, "equity")
+        with self.engine.begin() as c:
+            c.execute(update(pair_state_t).where(pair_state_t.c.parent == parent, pair_state_t.c.marked_at.is_(None))
+                      .values(reference_equity=v, hwm=v, day_start_equity=v, day_start=day, marked_at=ts, updated_at=ts))
+        return self.pair_state(parent)
+
+    def raise_pair_peak(self, parent: str, equity, ts: datetime | None = None) -> None:
+        """A new summed high: the halt reference and the high-water mark rise to it, never fall (a stale writer's
+        lower figure changes nothing)."""
+        ts, v = ts or utcnow(), stored(equity, "equity")
+        t, e = pair_state_t, literal(v, EXACT)
+        with self.engine.begin() as c:
+            c.execute(update(t).where(t.c.parent == parent, t.c.marked_at.is_not(None),
+                                      or_(t.c.hwm < v, t.c.reference_equity < v))
+                      .values(hwm=case((t.c.hwm < v, e), else_=t.c.hwm),
+                              reference_equity=case((t.c.reference_equity < v, e), else_=t.c.reference_equity),
+                              marked_at=ts, updated_at=ts))
+
+    def set_pair_day(self, parent: str, day, equity, ts: datetime | None = None, *, rebase: bool = False) -> None:
+        """The UTC day's start at `equity`: once a day (a day already started keeps its figure), or on a Resume
+        (`rebase`), which re-bases it."""
+        ts, v = ts or utcnow(), stored(equity, "equity")
+        t = pair_state_t
+        q = update(t).where(t.c.parent == parent, t.c.marked_at.is_not(None))
+        if not rebase:
+            q = q.where(t.c.day_start < day)
+        with self.engine.begin() as c:
+            c.execute(q.values(day_start=day, day_start_equity=v, marked_at=ts, updated_at=ts))
+
+    def rebase_pair(self, parent: str, equity, ts: datetime | None = None, *, hwm: bool = False) -> None:
+        """A Resume after a halt re-bases the halt reference at `equity`; a book reset (`hwm`) the high-water mark too."""
+        ts, v = ts or utcnow(), stored(equity, "equity")
+        values = dict(reference_equity=v, marked_at=ts, updated_at=ts, **({"hwm": v} if hwm else {}))
+        with self.engine.begin() as c:
+            c.execute(update(pair_state_t).where(pair_state_t.c.parent == parent,
+                                                 pair_state_t.c.marked_at.is_not(None)).values(**values))
 
     def reset_for_command(self, command_id: int) -> dict | None:
         """The liquidation_reset journaled for this command (F217-3), else None."""

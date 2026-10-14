@@ -114,3 +114,44 @@ def test_0022_keeps_every_existing_row_and_its_children(engine):
     with engine.connect() as c:
         assert c.execute(text("SELECT name, parent FROM sleeves")).all() == [("s1", None)]
         assert c.execute(text("SELECT order_id, parent_trade_id FROM orders")).all() == [("o1", None)]
+
+
+def _pair(conn, state, trade=None, deadline=None, parent="carry", **figures):
+    cols = {"parent": parent, "state": state, "trade_id": trade, "deadline": deadline, "updated_at": T, **figures}
+    conn.execute(text(f"INSERT INTO pair_state ({', '.join(cols)}) VALUES ({', '.join(':' + k for k in cols)})"), cols)
+
+
+@pytest.mark.parametrize("row", [
+    dict(state="open"),  # not a state
+    dict(state="flat", trade="t1"),  # flat holds no trade
+    dict(state="hedged"),  # a hedged pair has its trade
+    dict(state="hedged", trade="t1", deadline=T),  # and no deadline
+    dict(state="legging", trade="t1"),  # legging has its deadline
+    dict(state="closing", deadline=T),  # closing has its trade
+    dict(state="flat", hwm=1, marked_at=T),  # the figures all set, or none
+    dict(state="flat", parent="nobody"),  # a Strategy that doesn't exist
+])
+def test_pair_state_refuses_every_shape_but_the_four_states(engine, row):
+    """DA 05:02 UK: the state's CHECKs and the parent FK, on both engines (migrated)."""
+    schema.migrate(engine, log=lambda _: None)
+    with engine.begin() as c:
+        _sleeve(c, "carry")
+        _pair(c, "flat")
+        c.execute(text("DELETE FROM pair_state"))
+        if engine.dialect.name == "sqlite":
+            c.execute(text("PRAGMA foreign_keys=ON"))
+    with pytest.raises(IntegrityError), engine.begin() as c:
+        if engine.dialect.name == "sqlite":
+            c.execute(text("PRAGMA foreign_keys=ON"))
+        _pair(c, **row)
+
+
+def test_pair_state_is_migrated_as_the_code_makes_it_and_holds_its_parent(engine):
+    schema.migrate(engine, log=lambda _: None)
+    assert schema.report(engine)[1] == []
+    with engine.begin() as c:
+        _sleeve(c, "carry")
+        _pair(c, "legging", "t1", T)
+    if engine.dialect.name == "postgresql":  # ON DELETE RESTRICT: a Strategy with a pair row isn't deleted under it
+        with pytest.raises(IntegrityError), engine.begin() as c:
+            c.execute(text("DELETE FROM sleeves WHERE name = 'carry'"))

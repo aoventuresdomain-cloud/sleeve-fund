@@ -65,6 +65,12 @@ def _allows_top_up(venue_name: str) -> bool:
         return False
 
 
+def _utc(ns: int):
+    from datetime import datetime, timezone
+
+    return datetime.fromtimestamp(ns / 1e9, tz=timezone.utc)
+
+
 def _side(s: int):
     return OrderSide.BUY if s > 0 else OrderSide.SELL
 
@@ -123,10 +129,70 @@ class Pair:
         if value == self._state:
             return
         self._state = value
-        if value != "legging":
+        if value in ("legging", "closing"):
+            # A legged or closing pair always has its trade and a time it must be flat by (pair_state's shape).
+            self.trade_id = self.trade_id or f"{self._name()}-{self._now()}"
+            if value == "closing" or self.deadline_ns is None:
+                self.deadline_ns = self._now() + self._leg_timeout()
+        else:
             self.deadline_ns = None
         if self.on_state is not None:
             self.on_state({"state": value, "trade_id": self.trade_id, "deadline_ns": self.deadline_ns})
+
+    # --- the journal's copy (Advisor M3; DA 14 Oct 05:02 UK) ------------------------------------------------------
+
+    def journal(self, store, parent: str) -> None:
+        """Paper: keep the pair's state in pair_state (`store`, the journal) for `parent`, the first leg's row, by
+        compare-and-set from the state last written; and read it back now, for recover()."""
+        self._store, self._parent = store, parent
+        row = store.pair_state(parent)
+        if row is None:
+            store.set_pair_state(parent, expected=None, state="flat", ts=_utc(self._now()))
+            row = store.pair_state(parent)
+        self._written = row["state"]
+        self._saved = row
+        self.on_state = self._write
+
+    def _write(self, st: dict) -> None:
+        deadline = _utc(st["deadline_ns"]) if st["deadline_ns"] is not None else None
+        trade = st["trade_id"] if st["state"] != "flat" else None
+        for _ in range(2):  # lost a race: re-read what is there and move from that
+            if self._store.set_pair_state(self._parent, expected=self._written, state=st["state"], trade_id=trade,
+                                          deadline=deadline, ts=_utc(self._now())):
+                self._written = st["state"]
+                return
+            row = self._store.pair_state(self._parent)
+            self._written = row["state"] if row is not None else None
+        self._alert("pair_state_unsaved", f"Two-leg trade {self.trade_id}: its state ({st['state']}) couldn't be "
+                                          "kept in the journal; a restart reads the fills instead")
+
+    def recover(self) -> None:
+        """Paper, once both legs hold what the journal says they hold (their restore filled): a pair the journal left
+        legged or closing is unwound now, whatever is held sold at market (the fills are the truth, the state only the
+        hint, DA); a hedged one with a leg missing likewise. Both legs flat: the state goes back to flat, no order."""
+        saved = getattr(self, "_saved", None)
+        if saved is None or saved["state"] == "flat":
+            return
+        self.trade_id = saved["trade_id"]
+        self._state = saved["state"]  # as the journal left it; the moves below are written from it
+        held = [leg for leg in (self.lead, self.follow) if not self._flat(leg)]
+        if saved["state"] == "hedged" and len(held) == 2:
+            return
+        if not held:
+            self._note("recovered_flat", f"{self.trade_id}: both legs flat at restart")
+            self._end()
+            return
+        late = saved["deadline"] is not None and saved["deadline"] < _utc(self._now())
+        self._alert(BROKEN, f"Two-leg trade {self.trade_id} was {saved['state']} when the process stopped"
+                            f"{' and its deadline has passed' if late else ''}; the leg held is unwound at market")
+        self.state = "closing"
+        for leg in held:
+            self.closing_from = leg
+            try:
+                leg._sell_all("leg_unwind", "Unwound at restart: the trade was left with one leg")
+            finally:
+                self.closing_from = None
+        self._maybe_flat()
 
     def _leg_timeout(self) -> int:
         return min(bar_minutes(self.lead._cfg.bar_type) * 60_000_000_000, LEG_TIMEOUT_NS)

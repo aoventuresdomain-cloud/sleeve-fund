@@ -5,6 +5,9 @@ ON DELETE RESTRICT. CHECK sleeves_leg_name holds the shape on both engines witho
 the "~2" suffix, never self, one level (a parent holds no "~"), and at most one leg (its name is fixed and unique).
 orders.parent_trade_id: one id for every order of a two-leg trade across both rows, indexed alone, since the restart
 check joins the two legs across two sleeve names.
+pair_state: a two-leg Strategy's coordinator, one row per parent (FK sleeves.name, ON DELETE RESTRICT): its state
+(a hint after a restart; the fills by parent_trade_id are the truth), the open trade's id and the legged state's
+deadline, and the summed guard's figures, split as portfolio_state's (Advisor M3; DA 14 Oct 05:02 UK).
 
 Additive only. Each step is skipped when a Store on the same code built that shape first (create_all), as 0017 does.
 A sleeve name holding "~" already would fail the CHECK: the migration stops and lists them (never edits or renames: PM
@@ -26,6 +29,13 @@ down_revision = '0016'
 branch_labels = None
 depends_on = None
 
+
+EXACT = sa.Numeric(38, 18)
+TS = sa.DateTime(timezone=True)
+FIGURES = ('reference_equity', 'hwm', 'day_start_equity', 'day_start')
+SHAPE = ("(state = 'flat' AND trade_id IS NULL AND deadline IS NULL) "
+         "OR (state = 'hedged' AND trade_id IS NOT NULL AND deadline IS NULL) "
+         "OR (state IN ('legging', 'closing') AND trade_id IS NOT NULL AND deadline IS NOT NULL)")
 
 # "parent IS NOT NULL" is needed: with a NULL parent the second term is NULL, and a CHECK passes on NULL.
 LEG_NAME = ("(parent IS NULL AND name NOT LIKE '%~%') "
@@ -49,6 +59,26 @@ def upgrade() -> None:
         with op.batch_alter_table('orders', schema=None) as batch_op:
             batch_op.add_column(sa.Column('parent_trade_id', sa.String(length=64), nullable=True))
             batch_op.create_index('orders_parent_trade_id', ['parent_trade_id'], unique=False)
+    if 'pair_state' not in have.get_table_names():
+        op.create_table(
+            'pair_state',
+            sa.Column('parent', sa.String(length=64), nullable=False),
+            sa.Column('state', sa.String(length=8), nullable=False),
+            sa.Column('trade_id', sa.String(length=64), nullable=True),
+            sa.Column('deadline', TS, nullable=True),
+            sa.Column('reference_equity', EXACT, nullable=True),
+            sa.Column('hwm', EXACT, nullable=True),
+            sa.Column('day_start_equity', EXACT, nullable=True),
+            sa.Column('day_start', sa.Date(), nullable=True),
+            sa.Column('marked_at', TS, nullable=True),
+            sa.Column('updated_at', TS, nullable=False),
+            sa.ForeignKeyConstraint(['parent'], ['sleeves.name'], name='pair_state_parent_fk', ondelete='RESTRICT'),
+            sa.PrimaryKeyConstraint('parent'),
+            sa.CheckConstraint("state IN ('flat', 'legging', 'hedged', 'closing')", name='pair_state_values'),
+            sa.CheckConstraint(SHAPE, name='pair_state_shape'),
+            *(sa.CheckConstraint(f'({c} IS NULL) = (marked_at IS NULL)', name=f'pair_state_{c}_marked')
+              for c in FIGURES),
+        )
 
 
 def downgrade() -> None:

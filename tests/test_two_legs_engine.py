@@ -466,3 +466,64 @@ def test_a_first_leg_that_cant_be_placed_ends_the_pair_and_the_next_signal_opens
     assert steps[:3] == ["entry", "first_unsent", "flat"]
     assert "hedged" in steps[3:]  # the next bar's signal opened it
     assert [o["intent"] for o in _orders(r, "follow")] == ["entry", "exit", "entry", "exit"]
+
+
+def test_the_pairs_moves_are_kept_in_the_journal_by_compare_and_set(monkeypatch, tmp_path):
+    """Advisor M3: a journaled pair writes each move to pair_state from the state last written, one event each; a
+    legged or closing state carries its trade and deadline (the table's shape holds it)."""
+    from sleeve_fund.store import Store
+
+    store = Store(f"sqlite:///{tmp_path}/pair.db")
+    store.create_two_legs(name="carry", strategy="window", bar_spec="1-DAY-LAST-EXTERNAL", starting_balance=10_000,
+                          first=SPOT, second=PERP)
+    import sleeve_fund.research.two_leg_run as tlr
+
+    made = tlr.Pair
+
+    def journaled(*a, **kw):
+        p = made(*a, **kw)
+        p.journal(store, "carry")
+        return p
+
+    monkeypatch.setattr(tlr, "Pair", journaled)
+    _carry((2, 6), (12, 16))
+    moves = [e["message"].split(" (")[0] for e in reversed(store.events("carry", limit=50)) if e["kind"] == "pair_state"]
+    assert moves == ["new -> flat"] + ["flat -> legging", "legging -> hedged", "hedged -> closing", "closing -> flat"] * 2
+    assert store.pair_state("carry")["state"] == "flat"
+
+
+def test_a_pair_restarted_with_one_leg_held_unwinds_it_from_the_journals_state(monkeypatch, tmp_path):
+    """G-2LEG cell, the coordinator restarting mid-pair (Advisor M3, M7): the process stops after the perp leg filled
+    and before the spot leg was sent. The new coordinator reads 'legging' from pair_state and unwinds what is held at
+    market, with the alert, and the journal's state goes back to flat."""
+    from sleeve_fund.store import Store
+    from sleeve_fund.strategies.pair import Pair
+
+    store = Store(f"sqlite:///{tmp_path}/pair.db")
+    store.create_two_legs(name="carry", strategy="window", bar_spec="1-DAY-LAST-EXTERNAL", starting_balance=10_000,
+                          first=SPOT, second=PERP)
+    import sleeve_fund.research.two_leg_run as tlr
+
+    made = tlr.Pair
+    crashed = []
+
+    def journaled(*a, **kw):
+        p = made(*a, **kw)
+        p.journal(store, "carry")
+        return p
+
+    def stop_between_legs(self, leg, coid, order, filled):
+        if not crashed:  # the process stops here: a new coordinator starts from the journal (journal() reads it)
+            crashed.append(1)
+            self.on_state, self._state, self.trade_id = None, "flat", None
+            self.lead.clock.set_time_alert_ns("restart", self._now() + 1,
+                                              callback=lambda _e: (self.journal(store, "carry"), self.recover()))
+
+    monkeypatch.setattr(tlr, "Pair", journaled)
+    monkeypatch.setattr(Pair, "_entry_closed", stop_between_legs)
+    r = _carry((2, 3))
+    assert [o["intent"] for o in _orders(r, "follow")] == ["entry", "leg_unwind"]
+    assert _orders(r, "lead") == []
+    assert any(e["kind"] == BROKEN and "legging when the process stopped" in e["message"] for e in r.lead.journal.events_)
+    moves = [e["message"].split(" (")[0] for e in reversed(store.events("carry", limit=50)) if e["kind"] == "pair_state"]
+    assert moves == ["new -> flat", "flat -> legging", "legging -> closing", "closing -> flat"]
