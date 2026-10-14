@@ -330,7 +330,7 @@ def test_paper_counts_a_gapped_through_position_at_the_stopless_measure_and_aler
     from test_long_short import _record
 
     store = Store.in_memory()
-    store.create_sleeve(name="other", strategy="ping_pong", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
+    store.create_sleeve(name="other", strategy="ping_pong", instrument="BTC/USDT", bar_spec="1-MINUTE-LAST-INTERNAL",
                         starting_balance=10_000, params={**PERP, "stop_loss": 0.05}, risk_profile="conservative")
     store.record_order("other", order_id="o-entry", side="BUY", qty=0.15, intent="entry", reason="held",
                        signal={"close": 60_000.0, "stop_frac": 0.05})  # its stop: 57,000
