@@ -1461,7 +1461,7 @@ class LongFlatStrategy(Strategy):
         side, entry = self._entry_side or 1, self._entry_px
         liq = None
         if self._margin:
-            lev = self._max_leverage()
+            lev = LongFlatStrategy._max_leverage(self)
             liq = markets.isolated_liquidation(cash, qty, entry, lev, self._cfg.perp.maintenance_margin)
         target = liq if liq is not None else 0.0
         if side * (mark - target) <= 0:
@@ -2099,7 +2099,7 @@ class LongFlatStrategy(Strategy):
             return
         fee = Decimal(str(self._cfg.assumed_taker_fee))
         room = Decimal(1) - Decimal(str(self._cfg.cash_buffer)) - fee
-        lev = self._max_leverage()
+        lev = LongFlatStrategy._max_leverage(self)
         limits = {f"{lev:g}x leverage cap": Decimal(str(equity * lev)) * room}
         if self.runtime is not None:
             limits[f"{self.runtime.profile.name} risk profile cap"] = Decimal(str(self.runtime.position_budget(equity)))
@@ -3177,7 +3177,7 @@ class LongFlatStrategy(Strategy):
         intent = {"side": s, "qty": qty, "close": close, "price": fill_price(close, s, self._half_spread()),
                   "stop_frac": self._stop_frac, "what": what, "step": self._lot(), "min_qty": self._min_qty(),
                   "instrument": self._base_code(),
-                  "leverage": self._max_leverage()
+                  "leverage": LongFlatStrategy._max_leverage(self)
                   if self._margin else None,
                   "atr_pct": None if self._stop_frac else self._entry_atr_pct()}
         return signal, intent
@@ -3248,7 +3248,7 @@ class LongFlatStrategy(Strategy):
             return Decimal(repr(float(equity))), None
         stop = (self._entry_px * (1 - (self._entry_side or 1) * self._stop_frac)
                 if self._entry_px and self._stop_frac is not None else None)
-        lev = self._max_leverage() if self._margin else None
+        lev = LongFlatStrategy._max_leverage(self) if self._margin else None
         pos = Position(name, underlying(self._base_code()), Decimal(repr(float(qty))),
                        None if stop is None else Decimal(repr(float(stop))), lev)
         return Decimal(repr(float(equity))), holding_for(pos, Decimal(repr(float(close))), atr_pct)
@@ -3374,8 +3374,9 @@ class LongFlatStrategy(Strategy):
         """The leverage cap this strategy's sizing, isolated margin and liquidation price use: its risk profile's, or a
         two-leg Strategy's perp leg's own, never above 2x or the profile's (P2-8, Advisor B; leg_leverage)."""
         profile = self.runtime.profile.max_leverage if self.runtime is not None else 1.0
-        if self.leg_leverage is not None:  # effective: min(the leg's setting, 2x, the profile's cap) (Advisor 05:35 UK)
-            return min(self.leg_leverage, 2.0, profile)
+        leg = getattr(self, "leg_leverage", None)  # called on a test's stand-in strategy too, which has none
+        if leg is not None:  # effective: min(the leg's setting, 2x, the profile's cap) (Advisor 05:35 UK)
+            return min(leg, 2.0, profile)
         return profile
 
     def _guard_book(self, equity: float, cash: float, qty: float, price: float) -> tuple[float, float | None, float | None]:
@@ -3681,7 +3682,7 @@ class LongFlatStrategy(Strategy):
     def _liq_from_entry(self, cash: float, qty: float) -> float | None:
         """From the position's average entry as the strategy (and the journal) keep it, never the simulated
         venue's, which after a restart is the restore's price (QA P1-L22)."""
-        lev = self._max_leverage()
+        lev = LongFlatStrategy._max_leverage(self)
         entry = self._entry_px if self._entry_px else self._net_position()[1]
         return markets.isolated_liquidation(cash, qty, entry, lev, self._cfg.perp.maintenance_margin)
 
@@ -4685,7 +4686,7 @@ class LongFlatStrategy(Strategy):
         the market's price px with the fee charged on that: the difference goes to cash beside it (_cash_adj), never
         as P&L. How far the market went past bankruptcy (the venue's insurance fund's) or stopped short of it (margin
         the venue kept) is journaled once the position is gone (_liquidation_diagnostic). Returns (price, fee)."""
-        lev = self._max_leverage()
+        lev = LongFlatStrategy._max_leverage(self)
         held = -sign
         bankrupt = markets.bankruptcy_price(held * qty, entry, lev)
         if self._liq_funded:
@@ -4795,7 +4796,7 @@ class LongFlatStrategy(Strategy):
         (liquidated): X, Y% of strategy equity at entry", X the position's isolated margin plus its entry and
         liquidation fees (18:17 point 4), Y its share of the strategy's equity when the position was opened, uncapped,
         to one decimal under 10% so a small loss never reads 0% (QA P1-D17, P1-D20)."""
-        lev = self._max_leverage()
+        lev = LongFlatStrategy._max_leverage(self)
         lost = markets.isolated_margin(qty, entry, lev) + fees
         if before is None:
             before = (self.runtime._last_equity or self.runtime.peak) if self.runtime is not None else 0.0
