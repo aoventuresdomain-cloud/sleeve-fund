@@ -758,6 +758,7 @@ class LongFlatStrategy(Strategy):
         # one of sent, trimmed (sent smaller), below_minimum (trimmed under the venue's minimum, not sent), refused.
         self.portfolio_gate: dict[str, int] = {}
         self._reserved: dict[str, Any] = {}  # order id -> its portfolio gate answer, whose reservation it holds
+        self.pair = None  # a two-leg Strategy's Pair (strategies.pair, P2-8): what spans both of its legs
         self._paper_gate = None  # paper's portfolio gate (paper.portfolio_gate.PaperGate), made at its first entry
         # Exceptions raised in these handlers, oldest first, as (handler, repr). See _reporting.
         self.handler_errors: list[tuple[str, str]] = []
@@ -3069,7 +3070,11 @@ class LongFlatStrategy(Strategy):
         run's gate pass at now + 1 ns (research.portfolio.CloseBatch) and send only what that approves, never more
         than was sized here, then call sent(trimmed). Exits and reductions never wait for it. On paper with the
         portfolio gate in force (Store.portfolio_gate) the same check runs at once over the journal (P2-1b W2), and
-        the order's journal row holds the reservation, so its fills and end settle it (Store._settle_reservation)."""
+        the order's journal row holds the reservation, so its fills and end settle it (Store._settle_reservation).
+        A two-leg Strategy's entry opens both legs through its Pair (strategies.pair), which sends each leg's own."""
+        if self.pair is not None and self.pair.sending is not self:
+            self.pair.entry(self, side, qty, reason, signal, what, sent)
+            return
         paper = self._paper_gated()
         if self._portfolio is None and paper is None:
             self._submit(side, qty, what, reason, signal)
@@ -3308,7 +3313,8 @@ class LongFlatStrategy(Strategy):
             self.runtime.on_order(order_id=coid, side="BUY" if side == OrderSide.BUY else "SELL",
                                   qty=float(qty), intent=intent, reason=reason, signal=signal,
                                   order_type="POST-ONLY LIMIT" if maker else "MARKET", timing=timing,
-                                  **({"reservation": reservation} if reservation is not None else {}))
+                                  **({"reservation": reservation} if reservation is not None else {}),
+                                  **self._pair_trade())
         if maker and self.simulated_venue:
             self._kept[coid] = {"order": order, "info": self.decisions[coid], "bar": None, "earned": 0.0,
                                 "sent": Decimal(0), "inflight": 0}
@@ -3326,6 +3332,10 @@ class LongFlatStrategy(Strategy):
                                       callback=self._maker_timeout)
         self._last_submitted = coid
         return True
+
+    def _pair_trade(self) -> dict:
+        """A two-leg Strategy's open trade id, journaled on every order of the trade on both legs (P2-8), or nothing."""
+        return {"parent_trade_id": self.pair.trade_id} if self.pair is not None and self.pair.trade_id else {}
 
     def _unsettled(self) -> bool:
         """Whether a decision now comes before the warm-up the model's indicators need (settle_bars_needed): today's
@@ -3727,6 +3737,8 @@ class LongFlatStrategy(Strategy):
         return self._position_qty() >= self._min_qty()
 
     def _sell_all(self, intent: str = "exit", reason: str = "Signal to be flat", values: dict | None = None) -> None:
+        if self.pair is not None:  # a two-leg Strategy's other leg closes with this one (strategies.pair)
+            self.pair.leg_closing(self, intent, reason)
         self._drop_kept(earn=self._pending_exit is None)
         working = self._working()
         if working:
@@ -4535,7 +4547,8 @@ class LongFlatStrategy(Strategy):
                                 if self.pessimistic else "")))
         intent = d["intent"]
         self.runtime.on_order(order_id=str(order.client_order_id), side=word.upper(), qty=float(order.quantity),
-                              intent=intent, reason=d["reason"], signal=d["signal"], order_type="STOP")
+                              intent=intent, reason=d["reason"], signal=d["signal"], order_type="STOP",
+                              **self._pair_trade())
 
     def _risk_stop_filled(self, done: bool, sign: int, price: float) -> None:
         """The risk stop traded: the guard acts as paper's would on that trade. A halt or pause is the
@@ -5146,13 +5159,16 @@ class LongFlatStrategy(Strategy):
         self._resize_if_due()
 
     def _resume_exit(self, coid: str) -> None:
-        """An order closed: if a sell was waiting for every working order to close, send it now."""
+        """An order closed: if a sell was waiting for every working order to close, send it now. A two-leg
+        Strategy's Pair hears of every order that closes (strategies.pair)."""
         self._release_reservation(coid)
         self._cancel_on_accept.discard(coid)
         if self._pending_exit is not None and not self._working():
             intent, reason, values = self._pending_exit
             self._pending_exit = None
             self._sell_all(intent, reason, values)
+        if self.pair is not None:
+            self.pair.order_closed(self, coid)
 
     def on_order_rejected(self, event) -> None:
         self._order_status(event, "rejected")
@@ -5523,7 +5539,8 @@ class LongFlatStrategy(Strategy):
             self.decisions[str(order.client_order_id)] = {"intent": intent, "reason": reason, "signal": signal}
             if self.runtime is not None:
                 self.runtime.on_order(order_id=str(order.client_order_id), side="SELL" if side > 0 else "BUY",
-                                      qty=float(qty), intent=intent, reason=reason, signal=signal, order_type=kind)
+                                      qty=float(qty), intent=intent, reason=reason, signal=signal, order_type=kind,
+                                      **self._pair_trade())
         for order, *_ in orders:
             self._open_target(str(order.client_order_id))
             self._sent.append(order.client_order_id)

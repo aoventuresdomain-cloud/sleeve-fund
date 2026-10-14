@@ -1,0 +1,282 @@
+"""P2-8 two legs in the engine: a two-leg Strategy runs as two strategies in one engine, one per leg, each on its own
+venue account with its own runtime (its own sleeves row), so every money path (fills, fees, marks, funding,
+liquidation, the journal's book) works per leg unchanged. A Pair couples them for what spans both legs (spec
+pe2-plans/p2-8-spec.md; Independent Quant Advisor, 13 Oct 23:55 UK):
+
+- The lead leg's model decides; the follower (LegFollower) has no signal of its own and only trades with it.
+- An entry opens both legs, the less liquid one first (by default the perp leg). The other is sent once the first has
+  filled, sized to what filled at the hedge ratio. Every order of the trade carries one parent_trade_id.
+- If the second leg doesn't fill it is sent once more; if that fails too, the first leg is unwound (intent
+  leg_unwind) with a warning alert (two_leg_broken), and the lead takes no new entry until its signal has moved off
+  its side, as after a stop. If the second leg fills in part, the first leg is trimmed to the ratio.
+- While one leg is held without the other (a legged state) no new entry is taken (ruling A).
+- When either leg exits, for any reason, the other is closed with it: a lone leg is never held."""
+
+from __future__ import annotations
+
+from decimal import ROUND_DOWN, Decimal
+
+from nautilus_trader.model import Bar, ClientOrderId, OrderSide
+
+from sleeve_fund.strategies.base import OPENING_INTENTS, LongFlatStrategy
+
+DELAY_NS = 1  # the first leg goes after every venue's bar for the close it was decided on, as a portfolio gate pass
+RETRIES = 1  # the second leg is sent once more before the first is unwound (Advisor C)
+BROKEN = "two_leg_broken"  # the alert raised when a pair can't be completed and its first leg is unwound
+
+
+class LegFollower(LongFlatStrategy):
+    """A two-leg Strategy's other leg: no signal of its own. It trades only when its Pair sends an order through it,
+    and keeps every per-leg duty of a strategy (its marks, funding, guards and journal)."""
+
+    def want_long(self, bar: Bar) -> bool | None:
+        return None
+
+    def want_side(self, bar: Bar) -> int | None:
+        return None
+
+    def target_weight(self, bar: Bar) -> float | None:
+        return None
+
+    def explain(self, bar: Bar, target) -> tuple[str, dict]:
+        return "The second leg trades with its Strategy's first leg", {}
+
+
+def _side(s: int):
+    return OrderSide.BUY if s > 0 else OrderSide.SELL
+
+
+class Pair:
+    """The two leg strategies of one two-leg Strategy, coupled. lead_side and follow_side: each leg's configured side
+    (+1 long, -1 short; the lead's model opens its side, the follower takes its own). ratio: the follower's notional
+    per unit of the lead's. first_out: which leg is sent first, "follow" or "lead" (default: the perp leg, the less
+    liquid one, when exactly one leg is a perp; else the lead)."""
+
+    def __init__(self, lead: LongFlatStrategy, follow: LongFlatStrategy, *, lead_side: int, follow_side: int,
+                 ratio: Decimal | float | str = 1, first_out: str | None = None, name: str | None = None) -> None:
+        self.lead, self.follow = lead, follow
+        self.sides = {id(lead): lead_side, id(follow): follow_side}
+        self.ratio = Decimal(str(ratio))
+        if first_out is None:
+            first_out = "follow" if follow._cfg.perp is not None and lead._cfg.perp is None else "lead"
+        if first_out not in ("lead", "follow"):
+            raise ValueError(f"first_out is 'lead' or 'follow', not {first_out!r}")
+        self.first_out = first_out
+        self.name = name
+        lead.pair = follow.pair = self
+        self.trade_id: str | None = None
+        self.trades = 0
+        self.state = "flat"  # flat, legging (one leg sent or held without the other), hedged, closing
+        self.second: dict | None = None  # the leg still to send: leg, qty, reason, signal, tries
+        self.sending: LongFlatStrategy | None = None  # the leg whose own _send_entry the pair is calling now
+        self.closing_from: LongFlatStrategy | None = None
+        self.log: list[tuple[int, str, str]] = []  # (ts, what, detail): the pair's own steps, for tests and reports
+
+    # --- helpers -----------------------------------------------------------------------------------------------------
+
+    def other(self, leg: LongFlatStrategy) -> LongFlatStrategy:
+        return self.follow if leg is self.lead else self.lead
+
+    def _name(self) -> str:
+        if self.name:
+            return self.name
+        rt = getattr(self.lead, "runtime", None)
+        return rt.name if rt is not None else "pair"
+
+    def _now(self) -> int:
+        return self.lead.clock.timestamp_ns()
+
+    def _note(self, what: str, detail: str) -> None:
+        self.log.append((self._now(), what, detail))
+
+    def _alert(self, kind: str, message: str) -> None:
+        self._note(kind, message)
+        for leg in (self.lead, self.follow):
+            if leg.runtime is not None:
+                leg.runtime.store.event(leg.runtime.name, "warning", kind, message, ts=leg.runtime.now())
+
+    def held(self, leg: LongFlatStrategy) -> Decimal:
+        return leg._position_qty() if leg.cache is not None and leg.instrument is not None else Decimal(0)
+
+    def _flat(self, leg: LongFlatStrategy) -> bool:
+        q = self.held(leg)
+        return q <= 0 or q < leg._min_qty()
+
+    def _sized(self, to: LongFlatStrategy, qty: Decimal, frm: LongFlatStrategy, px_from: float) -> Decimal:
+        """`to`'s quantity for `qty` of `frm` at the hedge ratio, matched in notional at each leg's last price."""
+        ratio = self.ratio if to is self.follow else 1 / self.ratio
+        px_to = to._price() or px_from
+        if not px_to:
+            return Decimal(0)
+        return (qty * ratio * Decimal(repr(px_from)) / Decimal(repr(px_to))).quantize(to._lot(), rounding=ROUND_DOWN)
+
+    def blocks_entry(self) -> str | None:
+        """Why the lead may not open now: a pair already open, being sent, or held on one leg only (ruling A)."""
+        if self.state == "legging":
+            return "one leg is held without the other: no new entry until it is hedged or unwound"
+        if self.state != "flat":
+            return None if self.state == "hedged" else "the pair is closing"
+        if not (self._flat(self.lead) and self._flat(self.follow)):
+            return "one leg is held without the other: no new entry until it is hedged or unwound"
+        return None
+
+    # --- entry -------------------------------------------------------------------------------------------------------
+
+    def entry(self, leg: LongFlatStrategy, side, qty: Decimal, reason: str, signal: dict, what: str = "entry",
+              sent=None) -> None:
+        """The lead decided to open (its _send_entry, sized on its own equity): open the pair. Only a lead entry on its
+        configured side starts a pair; anything else is refused with a note."""
+        s = 1 if side == OrderSide.BUY else -1
+        if leg is not self.lead or what != "entry":
+            leg._note("pair_entry_refused", f"Entry refused: a two-leg Strategy opens only through its first leg "
+                                            f"({what} on the {'first' if leg is self.lead else 'second'} leg)")
+            return
+        if s != self.sides[id(self.lead)]:
+            leg._note("pair_entry_refused", "Entry refused: the first leg's model asked for the side opposite the "
+                                            "one this pair is defined with")
+            return
+        if self.state == "hedged":
+            return  # both legs already held: an add is not part of a pair (a re-hedge is its own order)
+        if (why := self.blocks_entry()) is not None:
+            leg._note("pair_entry_held", f"Entry held: {why}")
+            return
+        self.trades += 1
+        self.trade_id = f"{self._name()}-{self._now()}"
+        px = float(signal.get("close") or leg._price())
+        f_qty = self._sized(self.follow, qty, self.lead, px)
+        lead_part = {"leg": self.lead, "qty": qty, "reason": reason, "signal": signal, "tries": 0}
+        follow_part = {"leg": self.follow, "qty": f_qty, "reason": f"Second leg of: {reason}",
+                       "signal": {**signal, "close": self.follow._price() or px, "pair_ratio": str(self.ratio)},
+                       "tries": 0}
+        first, self.second = (follow_part, lead_part) if self.first_out == "follow" else (lead_part, follow_part)
+        self.state = "legging"
+        self._note("entry", f"{self.trade_id}: {first['leg'] is self.lead and 'lead' or 'follow'} first")
+        # After every venue's bar for this close (as a portfolio gate pass), so each leg fills on its own latest bar.
+        self.lead.clock.set_time_alert_ns(f"pair-entry-{self.trades}", self._now() + DELAY_NS,
+                                          callback=lambda _e, part=first: self._send(part))
+
+    def _send(self, part: dict) -> bool:
+        leg = part["leg"]
+        qty = part["qty"]
+        if qty <= 0 or qty < leg._min_qty():
+            self._note("too_small", f"{qty} is below the smallest order the venue takes ({leg._min_qty()})")
+            return False
+        part["tries"] += 1
+        before = getattr(leg, "_last_submitted", None)
+        self.sending = leg
+        try:
+            leg._send_entry(_side(self.sides[id(leg)]), qty, part["reason"], part["signal"])
+        finally:
+            self.sending = None
+        coid = getattr(leg, "_last_submitted", None)
+        if coid is None or coid == before:
+            return False
+        part["coid"] = coid
+        self._note("sent", f"{'lead' if leg is self.lead else 'follow'} {qty} ({coid})")
+        return True
+
+    # --- what each leg's orders came to ------------------------------------------------------------------------------
+
+    def order_closed(self, leg: LongFlatStrategy, coid: str) -> None:
+        """A leg's order closed (filled, cancelled, rejected, denied or expired): carry the pair on."""
+        order = leg.cache.order(ClientOrderId(coid))
+        intent = (leg.decisions.get(coid) or {}).get("intent")
+        filled = order.filled_qty.as_decimal() if order is not None else Decimal(0)
+        if intent in OPENING_INTENTS and self.state == "legging":
+            self._entry_closed(leg, coid, order, filled)
+        elif intent not in OPENING_INTENTS and intent is not None:
+            if filled > 0 and self._flat(leg) and not self._flat(self.other(leg)) and self.closing_from is None:
+                # A resting order closed this leg at the venue (a stop, a target, a liquidation) without its own
+                # sell-all: the other leg goes with it.
+                self.leg_closing(leg, intent, (leg.decisions.get(coid) or {}).get("reason") or intent)
+            self._maybe_flat()
+
+    def _entry_closed(self, leg, coid, order, filled: Decimal) -> None:
+        second = self.second
+        if second is not None and second["leg"] is not leg:
+            # The first leg's order has closed: send the second for what filled, or end the pair if nothing did.
+            if filled <= 0:
+                self._note("first_unfilled", f"{coid} closed with nothing filled: no pair opened")
+                self._end()
+                return
+            px = float(order.avg_px) if order is not None and order.avg_px else leg._price()
+            second["qty"] = self._sized(second["leg"], filled, leg, px)
+            if not self._send(second):
+                self._broken(f"its second leg couldn't be sent ({second['qty']} is below the venue's minimum)")
+            return
+        if second is None or second["leg"] is not leg:
+            return
+        sent = order.quantity.as_decimal() if order is not None else second["qty"]
+        if filled >= sent:
+            self.state, self.second = "hedged", None
+            self._note("hedged", self.trade_id or "")
+            return
+        rest = sent - filled
+        if second["tries"] <= RETRIES and rest >= leg._min_qty():
+            second["qty"] = rest.quantize(leg._lot(), rounding=ROUND_DOWN)
+            if self._send(second):
+                return
+        if filled > 0:
+            self._trim_first(leg)
+            return
+        self._broken(f"its second leg was not filled after {second['tries']} tries")
+
+    def _trim_first(self, second_leg) -> None:
+        """The second leg filled in part: cut the first leg back to the hedge ratio, and hold the pair so."""
+        first = self.other(second_leg)
+        want = self._sized(first, self.held(second_leg), second_leg, second_leg._price())
+        cut = (self.held(first) - want).quantize(first._lot(), rounding=ROUND_DOWN)
+        self.state, self.second = "hedged", None
+        if cut > 0 and cut >= first._min_qty():
+            side = _side(-self.sides[id(first)])
+            first._submit(side, cut, "leg_unwind", f"Trimmed to the hedge ratio: the second leg filled "
+                                                   f"{self.held(second_leg)} of what was sent", {"pair": self.trade_id})
+        self._note("trimmed", f"first leg cut by {cut}")
+
+    def _broken(self, why: str) -> None:
+        """The pair can't be completed: unwind whatever leg is held, with a warning alert (two_leg_broken)."""
+        self._alert(BROKEN, f"Two-leg trade {self.trade_id} broken: {why}; the leg held is unwound at market, and no "
+                            "new entry is taken until the first leg's signal has moved off its side")
+        self.state, self.second = "closing", None
+        # As after a stop: the model's signal must reset before the pair is tried again, not every bar while it holds.
+        self.lead._exit_lock = self.sides[id(self.lead)] if self.lead._margin else True
+        for leg in (self.lead, self.follow):
+            if not self._flat(leg):
+                self.closing_from = leg
+                try:
+                    leg._sell_all("leg_unwind", f"Unwound: {why}")
+                finally:
+                    self.closing_from = None
+        self._maybe_flat()
+
+    # --- exits -------------------------------------------------------------------------------------------------------
+
+    def leg_closing(self, leg: LongFlatStrategy, intent: str, reason: str) -> None:
+        """A leg is selling all (its model's exit, a stop, a halt, a liquidation cut): close the other leg too, in the
+        same step. A lone leg is never held."""
+        if self.closing_from is not None:
+            return  # this is the pair's own close of the other leg
+        other = self.other(leg)
+        self.state = "closing" if self.state != "flat" or not self._flat(other) else self.state
+        self.second = None
+        if self._flat(other) and not other._working():
+            return
+        self.closing_from = leg
+        try:
+            other._sell_all("leg_unwind" if intent in ("liquidation", "liquidation_cut") else intent,
+                            f"The other leg closed: {reason}")
+        finally:
+            self.closing_from = None
+        if intent in ("liquidation", "liquidation_cut"):
+            self._alert(BROKEN, f"Two-leg trade {self.trade_id}: a leg was liquidated, so the other was closed at "
+                                "market")
+
+    def _maybe_flat(self) -> None:
+        if self.state in ("closing", "hedged") and self._flat(self.lead) and self._flat(self.follow) \
+                and not self.lead._working() and not self.follow._working():
+            self._end()
+
+    def _end(self) -> None:
+        self._note("flat", self.trade_id or "")
+        self.state, self.second, self.trade_id = "flat", None, None
+

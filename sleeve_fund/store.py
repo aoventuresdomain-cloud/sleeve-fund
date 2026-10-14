@@ -745,7 +745,8 @@ FINISHED_ORDER_STATUSES = ("filled", "canceled", "rejected", "denied", "expired"
 OPEN_ORDER_STATUSES = ("submitted", "accepted", "partially_filled")
 GATED_INTENTS = ("entry", "rebalance")  # the orders the portfolio gate reserves for (engine OPENING_INTENTS)
 INTENTS = ("entry", "exit", "stop_loss", "take_profit", "risk_halt", "risk_pause", "pm_flatten", "rebalance",
-           "liquidation", "liquidation_cut", "wind_down", "wind_down_stop")  # the venue would take it; cut back before it does (String(16))
+           "liquidation", "liquidation_cut", "wind_down", "wind_down_stop",  # the venue would take it; cut back before it does (String(16))
+           "leg_unwind")  # P2-8: a two-leg Strategy's leg closed because its other leg couldn't be held
 
 
 def _check_rebook(order_id: str, row) -> None:
