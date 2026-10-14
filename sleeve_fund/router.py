@@ -5,12 +5,16 @@ order path call it and keep no rule of their own. Nothing here reads the databas
   change here. It routes paper accounts only: paper trading only until G2.
 - check() refuses any order whose instrument isn't on the strategy's pinned venue. The caller logs the refusal as an
   error event and sends nothing.
+- venue_for() is the one place a strategy's stored pin becomes its venue: the node's config, the runtime and every
+  orders row (orders.venue) read it.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+
+from sleeve_fund.venues import DEFAULT_VENUE, base_venue
 
 PAPER = "paper"
 
@@ -49,6 +53,12 @@ def route(strategy: str, venue: str, profiles: Mapping[str, object], *, tag: str
     return Route(strategy=strategy, venue=name, account_id=f"{name}-PAPER-{tag[:20]}")
 
 
+def venue_for(pinned: str | None) -> str:
+    """A strategy's venue from its stored pin (sleeve_venues): the pin, or the default venue for a strategy saved
+    before strategies carried one; upper case, a portfolio run's clone (VENUE_P1) as its base venue."""
+    return base_venue(pinned or DEFAULT_VENUE).upper()
+
+
 def venue_of(instrument_id: str) -> str:
     """The venue an instrument id names: the part after its last dot, upper case."""
     symbol, dot, venue = str(instrument_id).rpartition(".")
@@ -59,7 +69,7 @@ def venue_of(instrument_id: str) -> str:
 
 def check(strategy: str, instrument_id: str, pinned_venue: str) -> None:
     """Refuse (VenueMismatch) an order whose instrument isn't on the strategy's pinned venue."""
-    got, want = venue_of(instrument_id), pinned_venue.upper()
+    got, want = base_venue(venue_of(instrument_id)), venue_for(pinned_venue)  # a run's clone is its base venue
     if got != want:
         raise VenueMismatch(f"Order refused: {strategy} trades on its own venue only, and this order was for "
                             f"another venue's instrument.")

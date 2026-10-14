@@ -108,8 +108,8 @@ def test_0022_keeps_every_existing_row_and_its_children(engine):
                        "('s1', 'buy_and_hold', 'BTC/USDT', '1-DAY-LAST-EXTERNAL', '{}', 1000, 'balanced', 0, "
                        "'stopped', 'stopped', '', :t, :t)"), {"t": T})
         c.execute(text("INSERT INTO orders (sleeve, order_id, ts, updated_at, side, order_type, qty, status, "
-                       "filled_qty, fee, intent, reason, signal, message) VALUES ('s1', 'o1', :t, :t, 'BUY', 'MARKET',"
-                       " 1, 'filled', 1, 0, 'entry', 'r', '{}', '')"), {"t": T})
+                       "filled_qty, fee, intent, reason, signal, message, venue) VALUES ('s1', 'o1', :t, :t, 'BUY', "
+                       "'MARKET', 1, 'filled', 1, 0, 'entry', 'r', '{}', '', 'KRAKEN')"), {"t": T})
     schema.migrate(engine, log=lambda _: None)
     with engine.connect() as c:
         assert c.execute(text("SELECT name, parent FROM sleeves")).all() == [("s1", None)]

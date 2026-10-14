@@ -16,7 +16,7 @@ rule), for the Data Architect and the HoE. On SQLite the CHECK rebuilds sleeves 
 onto whatever is main's head when its PR opens.
 
 Revision ID: 0022
-Revises: 0016 (main's head after P2-6 and the funding arrival time; re-chained per the register)
+Revises: 0020 (main's head after #259: TRIALS-WORM 0018 and orders.venue 0020)
 Create Date: 2026-10-14 00:10:00.000000
 """
 
@@ -25,7 +25,7 @@ import sqlalchemy as sa
 
 
 revision = '0022'
-down_revision = '0016'
+down_revision = '0020'
 branch_labels = None
 depends_on = None
 

@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 _spec = importlib.util.spec_from_file_location("b8_instrument_terms", ROOT / "scripts" / "b8_instrument_terms.py")
 b8 = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(b8)
+read_hub = b8.hub_instruments  # the real one; the autouse `hub` fixture stands in for it everywhere else
 
 
 def _symbol(sym, tick="0.10", step="0.001", min_qty="0.001", min_notional="100"):
@@ -47,6 +48,22 @@ def contract(monkeypatch):
         return state.limits
 
     monkeypatch.setattr(venues.VENUES["BINANCE"], "contract", answer)
+    return state
+
+
+@pytest.fixture(autouse=True)
+def hub(monkeypatch):
+    """The hub's hello, answered offline: by default it serves paper the instrument the stub contract builds. A cell
+    sets `hub.served` to {pair: instrument}, or to an exception to raise; `hub.asked` records the pairs asked for."""
+    state = SimpleNamespace(served=None, asked=[])
+
+    def answer(name, pairs):
+        state.asked.append((name, list(pairs)))
+        if isinstance(state.served, Exception):
+            raise state.served
+        return state.served if state.served is not None else {p: b8.engine_instrument(p) for p in pairs}
+
+    monkeypatch.setattr(b8, "hub_instruments", answer)
     return state
 
 
@@ -140,3 +157,85 @@ def test_nothing_compared_is_not_a_pass(tmp_path, capfd):
     out = capfd.readouterr().out
     assert "B8: NOTHING CHECKED" in out and "B8: PASS" not in out
     assert b8.main([], get=_venue([], []), pattern=str(tmp_path / "none-*.toml")) == 1  # no configs at all
+
+
+def _paper(got_lines, term):
+    return next(line for line in got_lines if line.startswith("BTC/USDT") and line[15:37].strip() == term)
+
+
+def test_paper_is_checked_on_the_hubs_definition_not_the_backtest_build(tmp_path, capfd, hub):
+    _sleeve(tmp_path, "a", "BTC/USDT", "binance")
+    from sleeve_fund.instruments import perpetual
+    from sleeve_fund.venues import venue
+
+    hub.served = {"BTC/USDT": perpetual("BTC", "USDT", fees=venue("binance").fees, venue=venue("binance").venue,
+                                        symbol="BTCUSDT-PERP", price_precision=1, size_precision=3,
+                                        min_quantity=0.001, min_notional=5.0)}
+    assert b8.main([], get=_venue([_symbol("BTCUSDT")], BTC_FUNDING), pattern=str(tmp_path / "*.toml")) == 1
+    lines = capfd.readouterr().out.splitlines()
+    assert _paper(lines, "min notional").endswith("PASS")  # the backtest build has the venue's 100
+    assert _paper(lines, "min notional (paper)").endswith("MUST")  # the hub gave paper 5
+    assert _paper(lines, "tick (paper)").endswith("PASS") and _paper(lines, "lot step (paper)").endswith("PASS")
+    assert hub.asked == [("BINANCE", ["BTC/USDT"])]
+
+
+@pytest.mark.parametrize("served,why", [(ConnectionRefusedError("refused"), "hub unreachable"),
+                                        ({}, "the hub doesn't serve it")], ids=["unreachable", "not-served"])
+def test_no_hub_definition_is_a_must_never_a_pass(tmp_path, capfd, hub, served, why):
+    _sleeve(tmp_path, "a", "BTC/USDT", "binance")
+    hub.served = served
+    assert b8.main([], get=_venue([_symbol("BTCUSDT")], BTC_FUNDING), pattern=str(tmp_path / "*.toml")) == 1
+    out = capfd.readouterr().out
+    assert _paper(out.splitlines(), "hub definition (paper)").endswith("MUST")
+    assert f"BTC/USDT: no paper terms to compare ({why}" in out and "B8: PASS" not in out
+
+
+def test_an_extra_pair_is_not_asked_of_the_hub(tmp_path, capfd, hub):
+    _sleeve(tmp_path, "a", "BTC/USDT", "binance")
+    get = _venue([_symbol("BTCUSDT"), _symbol("ETHUSDT", tick="0.01")], BTC_FUNDING)
+    assert b8.main(["eth/usdt"], get=get, pattern=str(tmp_path / "*.toml")) == 0
+    assert hub.asked == [("BINANCE", ["BTC/USDT"])]  # asked once, for the traded pair only
+    assert "ETH/USDT       tick (paper)" not in capfd.readouterr().out
+
+
+class _Socket:
+    def __init__(self, hello):
+        self.hello, self.sent = hello, []
+
+    def __call__(self, address, timeout):
+        self.address = address
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def sendall(self, b):
+        self.sent.append(b)
+
+    def makefile(self, mode):
+        import io
+
+        from sleeve_fund.hub import protocol
+        return io.BytesIO(protocol.encode(self.hello))
+
+
+def test_hub_instruments_reads_the_hello_definitions_of_the_ids_asked(monkeypatch):
+    from sleeve_fund.hub import protocol
+
+    monkeypatch.delenv("HUB_BINANCE", raising=False)
+    inst = b8.engine_instrument("BTC/USDT")
+    defn = inst.to_dict()  # as the relay keeps it (hub/relay.py)
+    other = dict(defn, id="ETHUSDT-PERP.BINANCE")  # served, but not asked for here
+    sock = _Socket({"t": "hello", "v": protocol.VERSION, "pending": [], "instruments": [defn, other]})
+    got = read_hub("BINANCE", ["BTC/USDT"], connect=sock)
+    assert sock.address == ("localhost", 7700)
+    assert b'"BTCUSDT-PERP.BINANCE"' in sock.sent[0]
+    assert list(got) == ["BTC/USDT"] and got["BTC/USDT"].min_notional == inst.min_notional
+    monkeypatch.setenv("HUB_BINANCE", "hub-binance:7700")
+    read_hub("BINANCE", ["BTC/USDT"], connect=sock)
+    assert sock.address == ("hub-binance", 7700)
+    with pytest.raises(RuntimeError, match="the hub answered"):
+        read_hub("BINANCE", ["BTC/USDT"], connect=_Socket({"t": "error", "message": "bad"}))

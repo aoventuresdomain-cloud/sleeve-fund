@@ -93,12 +93,13 @@ def fund_equity(store: Store) -> Decimal:
     return total
 
 
-def fund_holdings(store: Store) -> tuple[Holding, ...]:
-    """Every strategy's positions as the book's Holdings, for book_marks' figures. The paper gate's positions (P2-1b
-    W2) build them; until then a fund that holds nothing has none, and one that holds anything raises."""
-    if any(_holding(store, s) for s in store.sleeves() if not outside_fund_book(store, s)):
-        raise NotImplementedError("the book's holdings come with the paper gate's positions (P2-1b W2)")
-    return ()
+def fund_holdings(store: Store, now: datetime | None = None) -> tuple[Holding, ...]:
+    """Every strategy's positions as the book's Holdings, for book_marks' figures: the paper gate's own
+    (paper.portfolio_gate.fund_holdings, P2-1b W2), so a book mark records the book the gate checks entries against
+    (F-BM-1). Raises ValueError, as the gate's do, when a stopless position's daily ATR isn't known."""
+    from sleeve_fund.paper import portfolio_gate
+
+    return portfolio_gate.fund_holdings(store, now)
 
 
 def _holding(store: Store, s: Sleeve) -> bool:
@@ -272,6 +273,7 @@ class Supervisor:
         # The portfolio gate on the exact journal; the supervisor never runs an entry check, so it reads no positions
         self.ledger = DbLedger(store, lambda: (_ for _ in ()).throw(RuntimeError("the supervisor runs no entry check")))
         self._equity_failing = False  # a failed equity read is said once per spell
+        self._holdings_failing = False  # so is a failed read of the book's holdings (F-BM-1)
         self._flatten_told: dict[str, datetime] = {}  # when each holder was last told to flatten for a portfolio halt
         self._halt_tells: dict[str, int] = {}  # how often, this halt (F229-5: at most SYSTEM_FLATTENS)
 
@@ -535,9 +537,17 @@ class Supervisor:
             minute = now.replace(second=0, microsecond=0)
             if last is None or last.replace(second=0, microsecond=0) != minute or _status(before, now) != _status(st, now):
                 try:
-                    led.write_book_mark(now, Book(equity, fund_holdings(self.ledger.store)), st, PORTFOLIO.version)
-                except NotImplementedError:
-                    pass  # no holdings yet (P2-1b W2): the cache row waits; the state row above is the gate's
+                    held = fund_holdings(self.ledger.store, now)
+                except Exception as exc:  # noqa: BLE001 - the cache row waits; the state row above is the gate's
+                    # A warning, not an error: the row is a cache nothing trades on, and the gate's own check fails
+                    # closed on the same read (a stopless position whose daily ATR isn't known yet, as on a fresh stack).
+                    if not self._holdings_failing:
+                        self.store.event(None, "warning", "book_mark_skipped", f"the book's holdings couldn't be read, "
+                                         f"so the book's history (book_marks) isn't written until they can: {exc!r}")
+                    self._holdings_failing = True
+                else:
+                    self._holdings_failing = False
+                    led.write_book_mark(now, Book(equity, held), st, PORTFOLIO.version)
             if acted == "halt":
                 self._flatten_told.clear()  # a new halt tells every holder at once
                 self._halt_tells.clear()
