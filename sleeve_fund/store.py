@@ -1643,6 +1643,28 @@ def _compliance_changes(old: Compliance | None, rows: list[dict], groups: dict[s
     return ", ".join(said) or "no change"
 
 
+# DA-6 reset coverage: what a reset (Store.split_run) does with each table that names a Strategy (a sleeve, sleeve_id
+# or parent column, or a foreign key to sleeves). Every such table is in exactly one list, and a cell
+# (test_reset_coverage) fails when a new one is in none, so no new table silently mixes a put-away run with the fresh
+# one. The journal moves to the run's name; the venue and account pins are copied to it (the fresh run keeps them);
+# feed and signal state are the process's and go; everything else stays with the Strategy, for the reason given.
+RESET_MOVES = (decisions_t, events_t, commands_t, mirror_t, equity_t, exit_plans_t, fills_t, funding_t, insurance_t,
+               orders_t, order_timings_t, mirror_requests_t)
+RESET_COPIES = (sleeve_accounts_t, sleeve_venues_t)
+RESET_CLEARS = (feed_seen_t, signal_state_t)
+RESET_STAYS = {
+    sleeves_t: "the Strategy's own row; the run gets a new row (and a new id) made from it",
+    sleeve_archive_t: "written for the run, never for the Strategy",
+    resets_t: "the reset request itself, keyed to the Strategy that asked",
+    backtests_t: "a saved backtest is never reset; it keeps its own name",
+    book_moves_t: "the fund's record of the Strategy's capital landing in the book, not one run's",
+    pair_state_t: "a two-leg Strategy's coordinator; a reset happens only when flat, and the state is a hint",
+    gate_decisions_t: "keyed by the Strategy's id, which the reset keeps: the gate's record across runs",
+    gate_reservations_t: "keyed by the Strategy's id; a reset needs every order closed, so none is active",
+}
+STRATEGY_COLUMNS = frozenset({"sleeve", "sleeve_id", "parent", "strategy_id"})
+
+
 class Store:
     def __init__(self, url: str | None = None, engine: Engine | None = None, portfolio_gate: bool = False) -> None:
         """portfolio_gate: the portfolio gate is in force on this journal, and with no state row its entries are
@@ -3408,8 +3430,6 @@ class Store:
         if abs(book["qty"]) > 1e-12 and not (dust_ok and is_dust(book)):
             raise ValueError("a strategy still holding a position can't be reset; it is flattened first")
         run = f"{name[:46]}--{now:%Y%m%d%H%M%S}"
-        moved = (decisions_t, events_t, commands_t, mirror_t, equity_t, exit_plans_t, fills_t, funding_t,
-                 insurance_t, orders_t, order_timings_t, mirror_requests_t)
         with self.engine.begin() as c:
             # The reset row is locked before the hold is read, as Store.command locks it: a PM pause or flatten pressed
             # meanwhile is either in the hold read here or waits and stays a pending command of the fresh run.
@@ -3423,14 +3443,15 @@ class Store:
                                                   "updated_at": now}))
             # The pin is copied before the orders and fills move: the database refuses a pin to a strategy that has
             # traded (F-WED1-3), and the put-away run hasn't yet.
-            for t in (sleeve_accounts_t, sleeve_venues_t):
+            for t in RESET_COPIES:
                 for r in c.execute(select(t).where(t.c.sleeve == name)).all():
                     c.execute(insert(t).values(**{**dict(r._mapping), "sleeve": run}))
-            for t in moved:
+            for t in RESET_MOVES:
                 c.execute(update(t).where(t.c.sleeve == name).values(sleeve=run))
-            c.execute(feed_seen_t.delete().where(feed_seen_t.c.sleeve == name))
-            # The old run's conditions on the Signals tab until the fresh process writes its own (m13-E2).
-            c.execute(signal_state_t.delete().where(signal_state_t.c.sleeve == name))
+            # Feed state, and the old run's conditions on the Signals tab, until the fresh process writes its own
+            # (m13-E2).
+            for t in RESET_CLEARS:
+                c.execute(t.delete().where(t.c.sleeve == name))
             c.execute(insert(sleeve_archive_t).values(sleeve=run, archived_at=now))
             hold = c.execute(select(reset_holds_t).where(reset_holds_t.c.reset_id == request["id"])).first()
             # A strategy paused or halted before the reset starts afresh still paused or halted (U13-4): the paper
