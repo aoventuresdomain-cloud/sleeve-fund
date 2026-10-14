@@ -246,7 +246,8 @@ def _submitter(on_order):
         _outage_book=None, _deciding_bar=None, _margin=True, _book_stop_at=None, decisions={}, _unsettled=lambda: False,
         _backtest=False, fee_model=None, _deciding=None, simulated_venue=False, _sent=[], _kept={}, _maker={},
         order_factory=SimpleNamespace(market=lambda **k: SimpleNamespace(client_order_id="C-1", **k)),
-        runtime=SimpleNamespace(on_order=on_order, on_timing=lambda *a, **k: None), submit_order=sent.append)
+        runtime=SimpleNamespace(on_order=on_order, on_timing=lambda *a, **k: None), submit_order=sent.append,
+        _pair_trade=lambda: {})  # a single leg: no parent_trade_id (P2-8)
     return (lambda intent: LongFlatStrategy._submit(s, OrderSide.BUY, Decimal("1"), intent, "r", {})), sent
 
 
