@@ -18,6 +18,7 @@ from decimal import ROUND_DOWN, Decimal
 
 from nautilus_trader.model import Bar, ClientOrderId, OrderSide
 
+from sleeve_fund.data import bar_minutes
 from sleeve_fund.margin import entry_liquidation
 from sleeve_fund.strategies.base import OPENING_INTENTS, LongFlatStrategy
 
@@ -25,6 +26,10 @@ DELAY_NS = 1  # the first leg goes after every venue's bar for the close it was 
 RETRIES = 1  # the second leg is sent once more before the first is unwound (Advisor C)
 REHEDGE = 0.10  # the hedge leg is brought back to the ratio once it has drifted more than this (Advisor D)
 BROKEN = "two_leg_broken"  # the alert raised when a pair can't be completed and its first leg is unwound
+CLAMP = 0.5  # a perp leg's distance to liquidation below this share of its entry distance closes the pair (Advisor B)
+CLAMPED = "two_leg_liq_distance"  # the alert raised when it does
+# Ruling B's top-up (margin added from the perp leg's free cash) needs a venue profile that allows it; none does yet,
+# so the close is the path that runs (Advisor 14 Oct 05:35 UK).
 
 
 class LegFollower(LongFlatStrategy):
@@ -39,6 +44,10 @@ class LegFollower(LongFlatStrategy):
 
     def target_weight(self, bar: Bar) -> float | None:
         return None
+
+    def __init__(self, config) -> None:
+        super().__init__(config)
+        self.two_leg = True  # never opens on its own: only through its Pair, and nothing new without one (HoE pin)
 
     def explain(self, bar: Bar, target) -> tuple[str, dict]:
         return "The second leg trades with its Strategy's first leg", {}
@@ -79,6 +88,8 @@ class Pair:
         self.sending: LongFlatStrategy | None = None  # the leg whose own _send_entry the pair is calling now
         self.closing_from: LongFlatStrategy | None = None
         self._measured: int | None = None  # the last decision close the hedge was measured at
+        self._entry_dist: dict[int, float] = {}  # a perp leg's distance to liquidation as a share of its entry
+        self._clamped: int | None = None  # the bar the pair was last closed for its liquidation distance
         self.log: list[tuple[int, str, str]] = []  # (ts, what, detail): the pair's own steps, for tests and reports
 
     # --- helpers -----------------------------------------------------------------------------------------------------
@@ -283,6 +294,42 @@ class Pair:
                     self.closing_from = None
         self._maybe_flat()
 
+    # --- the liquidation-distance clamp (ruling B, amended 14 Oct 05:35 UK) -------------------------------------------
+
+    def distance_breached(self, leg: LongFlatStrategy, price: float, liq: float | None) -> bool:
+        """Whether a perp leg at `price` is nearer its liquidation price `liq` than CLAMP of the distance it was
+        entered at. Measured on every mark and fill of the leg (M5); the entry distance is taken at its first one."""
+        if self.state not in ("legging", "hedged") or liq is None or not price or leg._entry_px is None:
+            return False
+        entry = self._entry_dist.setdefault(id(leg), abs(leg._entry_px - liq) / leg._entry_px)
+        return entry > 0 and abs(price - liq) / price < CLAMP * entry
+
+    def check_distance(self, leg: LongFlatStrategy, price: float, liq: float | None) -> bool:
+        """Ruling B: below CLAMP of the entry distance, close the pair (no venue allows the top-up yet), with ungated
+        leg_unwind orders, at most once a bar. Unlike a broken pair it may re-enter on its model's next signal, gated
+        and freshly sized. True when it closed."""
+        if not self.distance_breached(leg, price, liq):
+            return False
+        bar = self._now() // (bar_minutes(self.lead._cfg.bar_type) * 60_000_000_000)  # the lead's decision bar
+        if self._clamped == bar:
+            return False
+        self._clamped = bar
+        entry = self._entry_dist[id(leg)]
+        self._alert(CLAMPED, f"Two-leg trade {self.trade_id}: the perp leg came within {abs(price - liq) / price:.1%} "
+                             f"of its liquidation price, under half the {entry:.1%} it was entered at; both legs "
+                             "were closed at market")
+        self.state, self.second = "closing", None
+        for each in (self.lead, self.follow):
+            if not self._flat(each):
+                self.closing_from = each
+                try:
+                    each._sell_all("leg_unwind", "Closed: the perp leg came within half its entry distance of "
+                                                 "its liquidation price")
+                finally:
+                    self.closing_from = None
+        self._maybe_flat()
+        return True
+
     # --- the hedge ----------------------------------------------------------------------------------------------------
 
     def bar_closed(self, leg: LongFlatStrategy, bar: Bar) -> None:
@@ -365,4 +412,5 @@ class Pair:
     def _end(self) -> None:
         self._note("flat", self.trade_id or "")
         self.state, self.second, self.trade_id = "flat", None, None
+        self._entry_dist.clear()
 

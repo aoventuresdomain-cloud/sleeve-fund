@@ -145,9 +145,11 @@ def test_a_stop_resting_on_one_leg_closes_the_other_leg_with_it():
     assert r.pair_log[-1][1] == "flat"
 
 
-def _rising(days=30, start=60_000.0, daily=0.03):
+def _rising(days=30, start=60_000.0, daily=0.03, jump: tuple[int, float] | None = None):
+    """Daily bars climbing `daily` a day; `jump` (day, factor) moves every close from that day on by the factor."""
     idx = pd.date_range("2024-01-02", periods=days, freq="D", tz="UTC")
-    close = pd.Series([start * (1 + daily) ** i for i in range(days)], index=idx)
+    close = pd.Series([start * (1 + daily) ** i * (jump[1] if jump and i >= jump[0] else 1) for i in range(days)],
+                      index=idx)
     open_ = close.shift(1).fillna(start)
     return pd.DataFrame({"open": open_, "high": pd.concat([open_, close], axis=1).max(axis=1) * 1.001,
                          "low": pd.concat([open_, close], axis=1).min(axis=1) * 0.999, "close": close,
@@ -155,9 +157,10 @@ def _rising(days=30, start=60_000.0, daily=0.03):
 
 
 def test_a_liquidated_perp_leg_closes_the_spot_leg_at_once_with_an_alert():
-    """The short perp leg at 2x is cut before liquidation as the price climbs: the spot leg is closed at once
-    (leg_unwind), with a warning alert, and the pair ends flat."""
-    bars = _rising()
+    """The price gaps 60% up in one bar, through the short perp leg's liquidation price at 2x, past the 50% clamp in
+    the same bar: the liquidation goes first, the spot leg is closed at once (leg_unwind) with a warning alert, and
+    the pair ends flat."""
+    bars = _rising(daily=0.0, jump=(6, 1.6))
     params = {"windows": [[int(bars.index[1].value), int(bars.index[-1].value)]]}
     r = run_two_legs("window", LegRun(SPOT, INST, bars), LegRun({**PERP, "leverage": 2}, INST), 10_000,
                      params=params, risk_profile="aggressive")
@@ -171,21 +174,23 @@ def test_a_liquidated_perp_leg_closes_the_spot_leg_at_once_with_an_alert():
 
 
 def _halts(res):
-    return [e for e in res.risk_events if "halt" in str(e).lower()]
+    return [e for e in res.risk_events if "halt" in str(e).lower() or "pause" in str(e).lower()]
 
 
-def test_the_drawdown_halt_judges_both_legs_summed_so_a_hedged_carry_isnt_halted_by_one_leg():
-    """Ruling E: the price climbs 1.6% a day for a month. The short perp leg alone loses past the 10% drawdown
-    limit, but the spot leg gains as much, so the pair isn't halted and both legs stay open to the window's end."""
-    bars = _rising(days=31, daily=0.016)
+def test_the_daily_pause_judges_both_legs_summed_so_a_hedged_carry_isnt_paused_by_one_leg():
+    """Ruling E: the price jumps 20% in a day. The short perp leg alone loses past the 3% daily-loss limit, but the
+    spot leg gains as much, so the pair isn't paused and both legs stay open to the window's end. (Under the
+    conservative profile a leg holds 20% of its balance: ruling B's clamp, at a third up for a 1x short, would close
+    the pair before one leg alone could reach the 10% drawdown limit, so the daily pause is the guard shown.)"""
+    bars = _rising(days=20, daily=0.0, jump=(8, 1.2))
     params = {"windows": [[int(bars.index[1].value), int(bars.index[-1].value) + 1]]}
     r = run_two_legs("window", LegRun(SPOT, INST, bars), LegRun(PERP, INST), 10_000, params=params,
                      risk_profile="conservative")
     follow = r.follow.equity
-    assert (follow.cummax() - follow).max() / follow.cummax().max() > 0.10  # alone, it would have halted
+    assert (follow.shift(1) - follow).max() / follow.max() > 0.03  # alone, it would have paused
     assert _halts(r.lead) == [] and _halts(r.follow) == []
     assert [o["intent"] for o in _orders(r, "follow")] == ["entry"]  # never closed
-    assert (r.equity.cummax() - r.equity).max() / r.equity.cummax().max() < 0.10
+    assert (r.equity.shift(1) - r.equity).max() / r.equity.max() < 0.03
 
 
 def test_a_pair_whose_summed_book_draws_down_past_the_limit_halts_and_flattens_both_legs():
@@ -218,8 +223,8 @@ def test_a_hedge_that_drifts_past_10_percent_is_brought_back_to_the_ratio_once_a
     """Ruling D: a pair whose second leg trades its own price. That price climbs 2% a day while the first leg's holds
     still, so the short leg's notional grows past the ratio; at the first close it has drifted more than 10% it is cut
     back (a rebalance, never gated), at most once a bar, under the trade's id."""
-    flat = _rising(days=30, daily=0.0)
-    climbing = _rising(days=30, start=3_000.0, daily=0.02)
+    flat = _rising(days=14, daily=0.0)  # 1.02^13 = 1.29: short of where ruling B's clamp closes the pair (1.33)
+    climbing = _rising(days=14, start=3_000.0, daily=0.02)
     eth = venue("kraken").instrument("ETH", "USDT")
     eth_perp = {"instrument": "ETH/USDT", "params": {"market": "perp"}, "venue": "KRAKEN", "side": -1}
     params = {"windows": [[int(flat.index[1].value), int(flat.index[-1].value) + 1]]}
@@ -234,3 +239,87 @@ def test_a_hedge_that_drifts_past_10_percent_is_brought_back_to_the_ratio_once_a
     steps = [d for _, what, d in r.pair_log if what == "rehedge"]
     assert steps and all("drifted 1" in d or "drifted" in d for d in steps)
     assert all(float(d.split("drifted ")[1].split("%")[0]) > 10 for d in steps)
+
+
+def test_the_perp_legs_leverage_never_exceeds_the_risk_profiles():
+    """Advisor 05:35 UK: effective leverage is min(the leg's, 2x, the profile's): a 2x leg under the conservative
+    profile (1x) is margined at 1x, its liquidation about twice the entry for a short."""
+    r = run_two_legs("window", LegRun(SPOT, INST, BARS), LegRun({**PERP, "leverage": 2}, INST), 10_000,
+                     params={"windows": [[_ns(2), _ns(10)]]}, risk_profile="conservative")
+    sig = next(o for o in _orders(r, "follow") if o["intent"] == "entry")["signal"]
+    assert sig["liquidation_px"] / sig["close"] == pytest.approx(2.0, rel=0.02)
+
+
+class _Eager(LegFollower):
+    """A follower that, against the rules, has a signal of its own."""
+
+    def want_long(self, bar):
+        return True
+
+    def want_side(self, bar):
+        return 1  # a long perp: its config allows no short
+
+
+def test_the_follower_never_opens_on_its_own_signal(monkeypatch):
+    """HoE pin: a second leg whose model would open is refused; only its Pair sends its orders."""
+    import sleeve_fund.research.two_leg_run as tlr
+
+    monkeypatch.setattr(tlr, "LegFollower", _Eager)
+    asked = []
+    entry = tlr.Pair.entry
+    monkeypatch.setattr(tlr.Pair, "entry", lambda self, leg, *a, **kw: (asked.append(leg is self.follow),
+                                                                         entry(self, leg, *a, **kw))[1])
+    r = _carry((30, 31))  # the lead's window opens late: until then nothing but the follower's own signal
+    assert True in asked  # the follower did ask
+    follow = _orders(r, "follow")
+    first_lead = min(o["ts"] for o in _orders(r, "lead"))
+    assert all(o["ts"] >= first_lead for o in follow)
+    assert {o["parent_trade_id"] for o in follow} == {_orders(r, "lead")[0]["parent_trade_id"]}
+
+
+class _Gone:
+    """A coordinator that never attached to its legs."""
+
+    def __init__(self, *a, **kw) -> None:
+        self.log, self.trades = [], 0
+
+
+def test_with_no_coordinator_neither_leg_opens_anything(monkeypatch):
+    """Advisor M4: a leg of a two-leg Strategy with no Pair opens nothing, the lead included; no order on either."""
+    import sleeve_fund.research.two_leg_run as tlr
+
+    monkeypatch.setattr(tlr, "Pair", _Gone)
+    monkeypatch.setattr(tlr, "LegFollower", _Eager)
+    r = _carry((2, 10))
+    assert _orders(r, "lead") == [] and _orders(r, "follow") == []
+
+
+def test_a_perp_leg_past_half_its_entry_distance_to_liquidation_closes_the_pair_within_the_bar():
+    """Ruling B (amended 14 Oct 05:35 UK), the G-2LEG clamp cell: no venue allows a top-up, so once the short perp
+    leg's price comes nearer its liquidation price than half the distance it was entered at, both legs are closed
+    with ungated leg_unwind orders on that bar, under the trade's id, with an alert and fees on both legs. It is not a
+    broken pair: the model may open again, freshly sized, under a new id."""
+    from sleeve_fund.strategies.pair import CLAMP, CLAMPED
+
+    bars = _rising(days=20, daily=0.03)
+    params = {"windows": [[int(bars.index[1].value), int(bars.index[-1].value) + 1]]}
+    r = run_two_legs("window", LegRun(SPOT, INST, bars), LegRun(PERP, INST), 10_000, params=params,
+                     risk_profile="balanced")
+    lead, follow = _orders(r, "lead"), _orders(r, "follow")
+    entry = follow[0]
+    liq, at = entry["signal"]["liquidation_px"], float(entry["avg_px"])
+    entered = (liq - at) / at
+    first = next(ts for ts, high in bars["high"].items() if (liq - high) / high < CLAMP * entered)
+    cut_f = next(o for o in follow if o["intent"] == "leg_unwind")
+    cut_l = next(o for o in lead if o["intent"] == "leg_unwind")
+    assert cut_f["parent_trade_id"] == cut_l["parent_trade_id"] == entry["parent_trade_id"]
+    assert pd.Timestamp(cut_f["ts"]) == pd.Timestamp(cut_l["ts"]) <= first + pd.Timedelta(days=1)
+    assert cut_f["side"] == "BUY" and cut_l["side"] == "SELL"
+    assert cut_f["filled_qty"] == pytest.approx(entry["filled_qty"]) and cut_l["filled_qty"] == pytest.approx(lead[0]["filled_qty"])
+    assert any(e["kind"] == CLAMPED for e in r.lead.journal.events_)
+    assert not any(e["kind"] == BROKEN for e in r.lead.journal.events_)
+    for res in (r.lead, r.follow):  # every fill, the unwind's included, paid its leg's fee
+        assert all(sum(float(str(m).split()[0]) for m in (c if isinstance(c, (list, tuple)) else [c])) > 0
+                   for c in res.fills["commissions"])
+    again = [o for o in follow if o["intent"] == "entry"][1:]
+    assert again and again[0]["parent_trade_id"] != entry["parent_trade_id"]

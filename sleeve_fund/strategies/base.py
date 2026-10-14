@@ -760,6 +760,8 @@ class LongFlatStrategy(Strategy):
         self._reserved: dict[str, Any] = {}  # order id -> its portfolio gate answer, whose reservation it holds
         self.leg_leverage: float | None = None  # a two-leg Strategy's perp leg: its own leverage cap (_max_leverage)
         self.pair = None  # a two-leg Strategy's Pair (strategies.pair, P2-8): what spans both of its legs
+        self.two_leg = False  # a leg of a two-leg Strategy: with no Pair it opens nothing (Advisor M4)
+        self._worst_px: float | None = None  # a backtest's worst price in the last bar, for the Pair's clamp
         self._paper_gate = None  # paper's portfolio gate (paper.portfolio_gate.PaperGate), made at its first entry
         # Exceptions raised in these handlers, oldest first, as (handler, repr). See _reporting.
         self.handler_errors: list[tuple[str, str]] = []
@@ -3079,6 +3081,10 @@ class LongFlatStrategy(Strategy):
         if self.pair is not None and self.pair.sending is not self:
             self.pair.entry(self, side, qty, reason, signal, what, sent)
             return
+        if self.pair is None and self.two_leg:
+            self._note("two_leg_no_pair", "Entry refused: this leg's two-leg Strategy has no coordinator, so neither "
+                                          "leg opens anything new; exits still run")
+            return
         paper = self._paper_gated()
         if self._portfolio is None and paper is None:
             self._submit(side, qty, what, reason, signal)
@@ -3339,10 +3345,11 @@ class LongFlatStrategy(Strategy):
 
     def _max_leverage(self) -> float:
         """The leverage cap this strategy's sizing, isolated margin and liquidation price use: its risk profile's, or a
-        two-leg Strategy's perp leg's own (P2-8, Advisor B: 1x by default, 2x at most; leg_leverage)."""
-        if self.leg_leverage is not None:
-            return self.leg_leverage
-        return self.runtime.profile.max_leverage if self.runtime is not None else 1.0
+        two-leg Strategy's perp leg's own, never above 2x or the profile's (P2-8, Advisor B; leg_leverage)."""
+        profile = self.runtime.profile.max_leverage if self.runtime is not None else 1.0
+        if self.leg_leverage is not None:  # effective: min(the leg's setting, 2x, the profile's cap) (Advisor 05:35 UK)
+            return min(self.leg_leverage, 2.0, profile)
+        return profile
 
     def _guard_book(self, equity: float, cash: float, qty: float, price: float) -> tuple[float, float | None, float | None]:
         """(equity, cash, qty) as the drawdown halt and the daily-loss pause judge them: this strategy's own, or a
@@ -4848,6 +4855,8 @@ class LongFlatStrategy(Strategy):
                       self.runtime.halts) is not None:
             return True
         liq = self._liq_now(cash, qty)
+        if self.pair is not None and self.pair.distance_breached(self, price, liq):
+            return True  # a two-leg Strategy's perp leg past half its entry distance (Advisor B)
         return liq is not None and abs(price - liq) / price < self.runtime.profile.min_liquidation_distance
 
     def _intrabar_guard(self, bar: Bar) -> None:
@@ -4859,6 +4868,7 @@ class LongFlatStrategy(Strategy):
             self._guard_equity = None
             return
         worst = bar.low.as_double() if qty > 0 else bar.high.as_double()
+        self._worst_px = worst  # a two-leg Strategy's liquidation-distance check reads it at the tick (Pair)
         _, cash, _, _ = self._mark()
         self._guard_equity = cash + qty * worst
         if self.pair is not None:
@@ -5049,6 +5059,11 @@ class LongFlatStrategy(Strategy):
                 self._sell_all(intent, reason, {"equity": equity, "peak": self.runtime.peak})
             elif self._margin:
                 self._liquidation_guard(cash, qty, worst or price)
+                if self.pair is not None and qty != 0 and self._pending_exit is None:
+                    # Ruling B: a two-leg Strategy's perp leg nearer its liquidation price than half its entry
+                    # distance closes the pair; a backtest judges the minute's worst price, as the guards do.
+                    self.pair.check_distance(self, self._worst_px or price, self._liq_now(cash, qty))
+            self._worst_px = None
             self._cancel_resting_entries()
             self._sync_watched_stop()
         except Exception as exc:  # never let bookkeeping kill the sleeve silently: counted, kept and journaled
