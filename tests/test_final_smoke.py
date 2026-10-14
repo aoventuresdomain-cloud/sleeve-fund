@@ -180,6 +180,8 @@ def _supervisor(store, name):
     exit once a flatten is waiting."""
     def sleep(_):
         rows = store.fills(name)
+        if store.sleeve(name).desired_state == "running" and store.sleeve(name).status != "running":
+            store.set_status(name, "running", "")  # the supervisor has started it (B3-1: the round trip checks)
         if store.sleeve(name).desired_state == "running" and not rows:
             _fill(store, name, "BUY", "e1", datetime.now(UTC))
         elif any(c["command"] == "flatten" for c in store.pending_commands(name)) and len(rows) == 1:
@@ -219,7 +221,7 @@ def test_round_trip_stops_the_strategy_on_an_error_and_on_a_timeout(monkeypatch,
     ticks = iter(range(0, 10_000, 100))
     assert rt.run(store, "ping-pong-ls-binance", 250, sleep=lambda s: None, clock=lambda: next(ticks)) == 1
     assert store.sleeve("ping-pong-ls-binance").desired_state == "stopped"
-    assert "B3 round trip: FAIL (fills on no side)" in capfd.readouterr().out
+    assert "B3 round trip: FAIL (fills on no side; it was never seen running)" in capfd.readouterr().out
 
 
 # --- B3-1 (14 Oct, run 38582237679): a start the supervisor refuses fails at once, never after the timeout -----------
@@ -264,7 +266,59 @@ def test_round_trip_puts_the_smoke_strategy_on_conservative_journaled_before_it_
     assert store.sleeve("ping-pong-ls-binance").risk_profile == "balanced"
     assert rt.run(store, "ping-pong-ls-binance", 600, sleep=_supervisor(store, "ping-pong-ls-binance")) == 0
     assert store.sleeve("ping-pong-ls-binance").risk_profile == "conservative"
-    assert "Risk profile: balanced to conservative (journaled)" in capfd.readouterr().out
+    out = capfd.readouterr().out
+    assert "Risk profile: balanced (2x) to conservative (1x) (journaled)" in out
+    assert out.index("(journaled)") < out.index("start sent") < out.index("started:")
     actions = [(d["action"], d["actor"]) for d in reversed(store.decisions(limit=10))]
     assert actions[:2] == [("change_settings", rt.ACTOR), ("start", rt.ACTOR)]
+    said = next(d["reason"] for d in store.decisions(limit=10) if d["action"] == "change_settings")
+    assert "balanced (2x) to conservative (1x)" in said  # the old and the new value, journaled
     assert store.pending_reload("ping-pong-ls-binance") is None  # stopped when changed: nothing restarts
+
+
+def test_round_trip_never_says_started_when_the_supervisor_refuses(monkeypatch, capfd):
+    from sleeve_fund.paper import runtime
+
+    monkeypatch.setattr(runtime, "entry_blocked", lambda *a, **k: (False, None))
+    store = Store.in_memory(portfolio_gate=True)
+    _perp(store)
+    store.event("ping-pong-ls-binance", "error", "start_refused", "Not started: an older refusal")  # before the start
+
+    def refuse(_):
+        store.event("ping-pong-ls-binance", "error", "start_refused", "Not started: the hub is down")
+
+    assert rt.run(store, "ping-pong-ls-binance", 1800, sleep=refuse) == 1
+    out = capfd.readouterr().out
+    assert "started: ping-pong-ls-binance running" not in out and "an older refusal" not in out
+    assert "FAIL (the supervisor refused the start: Not started: the hub is down" in out
+
+
+@pytest.mark.parametrize("case, why", [
+    ("other", "allowlist"), ("running", "starts only a stopped"), ("holding", "only from flat")])
+def test_the_conservative_step_refuses_any_other_strategy_a_running_one_or_one_holding(case, why):
+    store = Store.in_memory(portfolio_gate=True)
+    name = "rsi-bands-ls-binance" if case == "other" else "ping-pong-ls-binance"
+    _perp(store, name, "running" if case == "running" else "stopped")
+    if case == "holding":
+        _fill(store, name, "BUY", "o1", T0)
+    with pytest.raises(ValueError, match=why):
+        rt.to_conservative(store, name)
+    assert store.sleeve(name).risk_profile == "balanced" and store.decisions(limit=10) == []
+
+
+def test_the_conservative_step_leaves_every_other_strategy_byte_identical(monkeypatch):
+    from dataclasses import asdict
+
+    from sleeve_fund.paper import runtime
+
+    monkeypatch.setattr(runtime, "entry_blocked", lambda *a, **k: (False, None))
+    store = Store.in_memory(portfolio_gate=True)
+    _perp(store)
+    for other, desired in (("rsi-bands-ls-binance", "stopped"), ("trend-perp", "running")):
+        _perp(store, other, desired)
+    others = {s.name: repr(sorted(asdict(s).items())) for s in store.sleeves(include_backtests=True)
+              if s.name != "ping-pong-ls-binance"}
+    assert rt.run(store, "ping-pong-ls-binance", 600, sleep=_supervisor(store, "ping-pong-ls-binance")) == 0
+    assert {s.name: repr(sorted(asdict(s).items())) for s in store.sleeves(include_backtests=True)
+            if s.name != "ping-pong-ls-binance"} == others
+    assert {d["sleeve"] for d in store.decisions(limit=50)} == {"ping-pong-ls-binance"}
