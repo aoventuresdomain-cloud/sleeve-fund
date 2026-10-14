@@ -239,15 +239,18 @@ def test_a_retry_is_refused_once_the_journal_no_longer_holds_the_trade_legging(t
     assert "lost the trade" in Pair._retry_refusal(p, p.follow)
 
 
-def _paper_pair(lead_block=(False, None), follow_block=(False, None)):
-    """A pair whose two paper legs' runtimes say what CHOKE says (entry_blocked) and that each can open, no journal."""
-    def rt(name, block):
-        return SimpleNamespace(name=name, venue="KRAKEN", backtest=False, status="running", can_open=lambda: True,
-                               entry_blocked=lambda: block)
+def _paper_pair(lead_block=(False, None), follow_block=(False, None), lead_status="running",
+                follow_status="running"):
+    """A pair whose two paper legs' runtimes say what CHOKE says (entry_blocked) and the Strategy's own status
+    (can_open is true only while running, as SleeveRuntime.can_open), no journal."""
+    def rt(name, block, status):
+        return SimpleNamespace(name=name, venue="KRAKEN", backtest=False, status=status,
+                               can_open=lambda: status == "running", entry_blocked=lambda: block)
 
     p = Pair.__new__(Pair)
-    p.lead = SimpleNamespace(runtime=rt("carry", lead_block), _cfg=SimpleNamespace(instrument_id="BTC/USD.KRAKEN"))
-    p.follow = SimpleNamespace(runtime=rt("carry~2", follow_block),
+    p.lead = SimpleNamespace(runtime=rt("carry", lead_block, lead_status),
+                             _cfg=SimpleNamespace(instrument_id="BTC/USD.KRAKEN"))
+    p.follow = SimpleNamespace(runtime=rt("carry~2", follow_block, follow_status),
                                _cfg=SimpleNamespace(instrument_id="BTC/USD.KRAKEN"))
     p.lead.pair = p.follow.pair = p
     p._store = None
@@ -265,6 +268,69 @@ def test_a_retry_is_refused_on_stale_data_on_the_other_leg_though_it_can_open(mo
     assert Pair._retry_refusal(p, p.follow) == "Stale data: no trade or quote for 90 s"
     p = _paper_pair(follow_block=(True, "The portfolio is halted"))
     assert Pair._retry_refusal(p, p.follow) == "The portfolio is halted"
+
+
+@pytest.mark.parametrize("leg", ["lead", "follow"])
+@pytest.mark.parametrize("status", ["paused", "halted"])
+def test_a_retry_is_refused_on_a_strategy_pause_or_halt_on_either_paper_leg(monkeypatch, leg, status):
+    """Advisor leg-2 retry MUST 3 (14 Oct 12:20 UK): the Strategy's own pause or halt on either leg, not only the
+    portfolio's, refuses the retry, so the pair unwinds. CHOKE is clear here; can_open alone says no."""
+    from sleeve_fund.strategies import pair as pair_mod
+
+    monkeypatch.setattr(pair_mod.router, "check", lambda *a: None)
+    p = _paper_pair(**{f"{leg}_status": status})
+    assert Pair._retry_refusal(p, p.follow) == f"a leg is {status}"
+
+
+def _journal_pair(tmp_path):
+    from datetime import datetime, timezone
+
+    from sleeve_fund.store import Store
+
+    store = Store(f"sqlite:///{tmp_path}/t.db")
+    store.create_two_legs(name="carry", strategy="trend_filter", bar_spec="1-HOUR-LAST-INTERNAL",
+                          starting_balance=10_000,
+                          first={"instrument": "BTC/USD", "params": {}, "venue": "KRAKEN", "side": 1},
+                          second={"instrument": "BTC/USD", "params": {"market": "perp"}, "venue": "KRAKEN",
+                                  "side": -1})
+    now = datetime.now(timezone.utc)
+    store.set_pair_state("carry", expected=None, state="flat", ts=now)
+    store.set_pair_state("carry", expected="flat", state="legging", trade_id="carry-t1", deadline=now, ts=now)
+    p = Pair.__new__(Pair)
+    p.lead, p.follow = SimpleNamespace(runtime=None), SimpleNamespace(runtime=None)
+    p.lead.pair = p.follow.pair = p
+    p._store, p._parent, p.trade_id = store, "carry", "carry-t1"
+    assert Pair._retry_refusal(p, p.follow) is None  # its trade, legging: the retry may go
+    return store, p
+
+
+def test_a_retry_is_refused_when_the_pairs_state_cant_be_read(tmp_path, monkeypatch):
+    """Advisor leg-2 retry MUST 3 (14 Oct 12:20 UK): the persisted state unreadable at retry time (the journal
+    errors) is a lost coordinator: no retry, the pair unwinds, and the note says why."""
+    store, p = _journal_pair(tmp_path)
+
+    def unreadable(name):
+        raise RuntimeError("the journal is unreachable")
+
+    monkeypatch.setattr(store, "pair_state", unreadable)
+    why = Pair._retry_refusal(p, p.follow)
+    assert why is not None and "can't read the pair's state" in why and "unreachable" in why
+
+
+def test_a_retry_is_refused_when_the_pairs_state_row_is_gone(tmp_path, monkeypatch):
+    """Advisor leg-2 retry MUST 3: no persisted state at retry time is a lost coordinator too."""
+    store, p = _journal_pair(tmp_path)
+    monkeypatch.setattr(store, "pair_state", lambda name: None)
+    assert "lost the trade" in Pair._retry_refusal(p, p.follow)
+
+
+def test_a_retry_is_refused_when_either_legs_coordinator_is_gone():
+    """Advisor leg-2 retry MUST 3: a leg no longer coupled to this coordinator (the in-process side of a lost
+    coordinator) refuses the retry on paper as in the backtest (test_two_legs_engine, cause no_coordinator)."""
+    for leg in ("lead", "follow"):
+        p = _paper_pair()
+        getattr(p, leg).pair = None
+        assert Pair._retry_refusal(p, p.follow) == "its coordinator is gone"
 
 
 def test_a_retry_is_refused_when_the_legs_venue_pin_doesnt_match(monkeypatch):
