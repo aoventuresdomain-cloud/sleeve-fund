@@ -1,6 +1,6 @@
 """NIGHTLY-RECON (HoE 14 Oct): the start check's dashboard-against-the-journal comparison (start_check.check_books),
-run every night during Strategy testing for every Strategy the dashboard shows, archived ones and reset runs aside.
-Lifecycle isn't stored yet, so that is every Active Strategy and any winding down too.
+run every night during Strategy testing for every Strategy the dashboard shows, reset runs aside, to under a cent
+(start_check.CENT): any gap of a cent or more fails. A Strategy withdrawn with dust is listed as known.
 
 Each night after RECON_HOUR UTC the supervisor's alert thread (alerts.Forwarder.check_recon) runs it once and
 writes a dated record, RECON_DIR/recon-YYYY-MM-DD.txt, whose first line is PASS or FAIL. A FAIL, or a comparison
@@ -22,9 +22,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from sqlalchemy import make_url
-
-from sleeve_fund.start_check import FAIL, Section, check_books, read_only_store
+from sleeve_fund.start_check import FAIL, Section, check_books, journal_kind, read_only_store
 
 RECON_HOUR = 1  # UTC: 02:00 UK in summer time, after the day's last marks and clear of the evening's work
 
@@ -42,7 +40,7 @@ def compare(url: str) -> Section:
     """check_books against the journal at url, opened read-only."""
     store = read_only_store(url)
     try:
-        return check_books(store)
+        return check_books(store, cent=True)
     finally:
         store.engine.dispose()
 
@@ -58,8 +56,8 @@ def run(folder: Path, url: str, now: datetime) -> tuple[bool, Path, list[str]]:
         lines = [f"  FAIL  the comparison couldn't run: {type(exc).__name__}: {exc}"]
         fails = [f"the comparison couldn't run: {type(exc).__name__}"]
     ok = not fails
-    where = make_url(url).render_as_string(hide_password=True)
-    page = [f"{'PASS' if ok else 'FAIL'}", f"Nightly recon {now:%Y-%m-%d %H:%M} UTC, journal {where}, read-only", "",
+    page = [f"{'PASS' if ok else 'FAIL'}", f"Nightly recon {now:%Y-%m-%d %H:%M} UTC, {journal_kind(url)} journal, "
+            "read-only", "",
             "Dashboard against the journal:", *lines]
     path = record_path(folder, now)
     folder.mkdir(parents=True, exist_ok=True)

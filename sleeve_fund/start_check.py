@@ -147,16 +147,24 @@ def _qty(x):
     return 0 if x == 0 else float(x)
 
 
-def check_books(store) -> Section:
+CENT = 0.01  # NIGHTLY-RECON (Advisor): a gap of a cent or more between the dashboard and the journal alerts
+
+
+def check_books(store, cent: bool = False) -> Section:
     """The dashboard's figures against the journal, for exactly the Strategies the dashboard's book counts
     (app.current_sleeves: every one but an earlier book's, store.previous_book, which holds the reset runs; an archived
     Strategy still holding stays in the book and is checked). Position and cash come from the latest equity mark
     (book.sleeve_extras); Book, P&L and Return from that mark's own equity column (metrics.sleeve_summary), which must
-    be the journal's cash plus its position at the mark's price (the identity Strategy._mark writes)."""
+    be the journal's cash plus its position at the mark's price (the identity Strategy._mark writes).
+
+    cent (NIGHTLY-RECON): cash and equity must match the journal to under a CENT, not to the reconcile's cent per
+    fill. A Strategy withdrawn from the book with dust no order can close is listed as known (Advisor, FC3BA-28B):
+    the dust left with it, so it is no gap."""
     from sleeve_fund import markets
 
     sec = Section("Dashboard against the journal")
     earlier = store.previous_book()
+    withdrawn = store.withdrawn()
     checked = compared = 0
     late_with_fills = []
     for s in store.sleeves():
@@ -180,7 +188,7 @@ def check_books(store) -> Section:
                           "again after the next mark")
             continue
         # The reconcile's tolerances (SleeveRuntime.reconcile): a cent per fill for cash, float steps for the qty.
-        cash_tol = 0.01 * (1 + 2 * book["fills"])
+        cash_tol = CENT * (1 - 1e-6) if cent else 0.01 * (1 + 2 * book["fills"])
         scale = max(abs(float(last["qty"])), abs(float(book["qty"])))
         qty_tol = max(1e-8, (2 + book["fills"]) * math.ulp(scale))
         d_qty = float(Decimal(repr(float(last["qty"]))) - Decimal(repr(float(book["qty"]))))
@@ -197,6 +205,7 @@ def check_books(store) -> Section:
         price, equity = float(last["price"]), float(last["equity"])
         want = float(book["cash"]) + float(book["qty"]) * price
         equity_tol = cash_tol + qty_tol * abs(price) + 4 * math.ulp(max(abs(want), abs(equity)))
+        equity_tol = min(equity_tol, CENT * (1 - 1e-6)) if cent else equity_tol
         what = (f"{s.name}: position {_qty(last['qty']):.12g} vs journal {_qty(book['qty']):.12g}; "
                 f"cash {last['cash']:,.2f} vs journal {book['cash']:,.2f} ({book['fills']} fills)")
         if abs(d_qty) > qty_tol:
@@ -212,6 +221,9 @@ def check_books(store) -> Section:
                           f"{price:,.2f}): the Book and P&L shown are wrong")
         else:
             sec.add(PASS, f"{what}; equity {equity:,.2f}")
+        if s.name in withdrawn and abs(book["qty"]) > 1e-12:
+            sec.add(NOTE, f"{s.name}: known, it left the fund's book holding dust of {_qty(book['qty']):.12g} no "
+                          "order can close, which left with it")
     if not checked:
         sec.add(NOTE, "no Strategy to compare")
     elif not compared and late_with_fills:
