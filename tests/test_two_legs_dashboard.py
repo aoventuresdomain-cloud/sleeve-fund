@@ -167,3 +167,24 @@ def test_a_second_leg_whose_first_is_put_away_still_shows():
     leg = {"sleeve": NS(name="x~2", parent="x")}
     assert legs.fold(None, [leg]) == [leg]
     assert legs.label("x~2") == "x, leg 2" and legs.label("x") == "x"
+
+
+@pytest.mark.parametrize(("text", "reads"), [
+    ("BTCUSDT-PERP.BINANCE_P2 filled", "BTCUSDT-PERP filled"),  # an instrument id: the clone's suffix goes
+    ("ethusdt.binance_p2 stale", "ethusdt stale"),
+    ("an order on BINANCE_P2 was refused", "an order on the perpetual venue was refused"),  # the clone alone
+    ("BTCUSDT-PERP.BINANCE", "BTCUSDT-PERP"),  # the venue's own suffix, as before
+])
+def test_the_venue_clone_reads_as_its_venue(text, reads):
+    from sleeve_fund.wording import no_venues
+
+    assert no_venues(text) == reads
+
+
+def test_the_outside_alert_chat_never_names_the_venue_clone():
+    from sleeve_fund.alerts import message
+
+    out = message([{"level": "warning", "sleeve": "carry", "kind": "two_leg_broken",
+                    "message": "Two-leg trade T1: BTCUSDT-PERP.BINANCE_P2 couldn't fill on BINANCE_P2"}])
+    assert "_P2" not in out and "BINANCE" not in out.upper()
+    assert "BTCUSDT-PERP couldn't fill on the perpetual venue" in out
