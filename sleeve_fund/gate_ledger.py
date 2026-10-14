@@ -31,6 +31,7 @@ from sleeve_fund.money import money, stored
 from sleeve_fund.portfolio.gate import NEVER, RELEASE_REASONS, RESERVATION_TTL, PortfolioState, Reservation
 from sleeve_fund.portfolio.limits import Book, Decision, Holding, Intent
 from sleeve_fund.store import (
+    GATE_LIMITS,
     GATE_STAGES,
     Store,
     _aware,
@@ -190,18 +191,37 @@ class DbLedger:
         loc.pending = (rid, strategy, holding, at, abs(money(qty, "qty")))
         return rid
 
-    def record(self, strategy: str, at: datetime, intent: Intent, decision: Decision, version: int) -> int:
+    def compliance(self):
+        """The PM's compliance tests in force, as the gate applies them, read with the lock's own connection
+        (portfolio.compliance.load; Bridge Drop A)."""
+        from sleeve_fund.portfolio import compliance
+
+        return compliance.load(self.store, "paper", conn=getattr(self._local, "conn", None))
+
+    def record(self, strategy: str, at: datetime, intent: Intent, decision: Decision, version: int | None,
+               compliance_version: int | None = None) -> int:
+        """Journal one decision. compliance_version: the compliance tests it was checked under (Bridge Drop A); the row
+        then names the test that refused or trimmed it (test_hit), and profile_version, kept NOT NULL until Drop B,
+        is the latest portfolio profile's, as it is when no version is known. limit_hit keeps only the names its
+        CHECK allows (the tests that are not T1 and T2, and the outcomes that are not a test)."""
+        from sleeve_fund.portfolio.compliance import test_key
+
         tags = self._tags(strategy, at, intent)
         loc = self._local
         pending = getattr(loc, "pending", None)
+        limit_hit = decision.limit_hit if decision.limit_hit in GATE_LIMITS else None
+        test_hit = test_key(decision.limit_hit) if compliance_version is not None else None
         with self._tx(audit=decision.outcome == "error") as conn:
+            if compliance_version is not None or version is None:
+                version = conn.execute(select(func.max(portfolio_profile_t.c.version))).scalar()
             if self._pg:
                 seq = conn.execute(text("SELECT nextval('gate_decision_seq')")).scalar()
             else:
                 seq = (conn.execute(select(func.max(gate_decisions_t.c.seq))).scalar() or 0) + 1
             sid = self._sleeve_id(conn, strategy)
             row = {**tags, "seq": seq, "sleeve_id": sid, "underlying": intent.underlying, "profile_version": version,
-                   "outcome": decision.outcome, "limit_hit": decision.limit_hit,
+                   "compliance_version": compliance_version, "test_hit": test_hit,
+                   "outcome": decision.outcome, "limit_hit": limit_hit,
                    "requested_qty": stored(decision.requested_qty), "approved_qty": stored(decision.approved_qty),
                    "price": stored(intent.price), "decided_at": at, **self._figures(intent.underlying)}
             if pending is not None:
@@ -390,3 +410,21 @@ class DbLedger:
 
 def _num(x) -> Decimal | None:
     return None if x is None else money(x)
+
+
+def record_test_refusal(store: Store, sleeve: str, *, test: str, version: int, at: datetime, underlying: str,
+                        requested_qty: Decimal, price: Decimal) -> int:
+    """Journal one idea refused by compliance test `test` (its key) of `version`, as the gate writes it: for QA's cells
+    and the refused-ideas view's fixtures, without building a book. Returns the decision's seq."""
+    from sleeve_fund.portfolio.compliance import FIELD
+    from sleeve_fund.portfolio.limits import rejected
+
+    if test not in FIELD:
+        raise ValueError(f"{test!r} is not a compliance test")
+    qty, px = Decimal(str(requested_qty)), Decimal(str(price))
+    intent = TaggedIntent(underlying, 1, qty, px, px, px / 10, Decimal("0.001"), Decimal("0.001"),
+                          intent_id=f"refused-{sleeve}-{at.isoformat()}", kind="entry", bar_ts=at)
+    ledger = DbLedger(store, lambda: (Decimal(0), ()))
+    with ledger.lock():
+        return ledger.record(sleeve, at, intent, rejected(qty, FIELD[test], f"Entry rejected by {test}"), None,
+                             version)

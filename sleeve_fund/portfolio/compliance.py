@@ -1,132 +1,124 @@
-"""The portfolio compliance tests (Bridge Drop A; Advisor COMPLIANCE-5 and BRIDGE-3, 14 Oct 2026): the one set of rows
-backtest, portfolio_run and paper all read, as a risk.PortfolioProfile the gate (limits.decide) applies.
+"""The portfolio compliance tests (Bridge Drop A; Advisor COMPLIANCE-5 and BRIDGE-3, 14 Oct 2026) as the gate applies
+them: one version of the Data Architect's rows (Store.compliance, versioned, whole, write-once), which backtest,
+portfolio_run and paper all read, mapped to a risk.PortfolioProfile for limits.decide.
 
-The rows are the Data Architect's (store.compliance / store.add_compliance_version: versioned, whole, write-once); this
-module maps them to and from the profile, and holds the bounds a PM edit is checked against before it is saved.
-
-Tests and their keys (gate_decisions.test_hit, the FE's T1..T5b):
-  T1  asset_open_risk   loss if every stop is hit, per asset            trim
-  T2  group_open_risk   the same, per asset group (the PM's group map)  trim
-  T3  open_risk         the same, on the whole fund                     trim
-  T4a gross             sum of every position's notional               trim
-  T4b net_instrument    long less short notional in one asset          trim
-  T4c margin            posted isolated margin                         trim
-  T5a daily_loss        loss since 00:00 UTC: no new entries that day   pause
-  T5b drawdown          from the high-water mark: flatten and halt      halt
+The keys, labels, bounds and locks are compliance_rules' (the one source the Portfolio Settings form and the store's
+write share); this module only maps each key to the profile field the gate checks:
+  T1  asset_stop_loss  asset_open_risk   loss if every stop is hit, per asset            trim
+  T2  type_stop_loss   group_open_risk   the same, per asset group (the version's map)   trim
+  T3  fund_stop_loss   open_risk         the same, on the whole fund                     trim
+  T4a fund_gross       gross             sum of every position's notional               trim
+  T4b asset_net        net_instrument    long less short notional in one asset          trim
+  T4c fund_margin      margin            posted isolated margin                         trim
+  T5a fund_day_loss    daily_loss        loss since 00:00 UTC: no new entries that day   pause_day
+  T5b fund_drawdown    drawdown          from the high-water mark: flatten and halt      halt
 """
 
 from __future__ import annotations
 
 from dataclasses import fields, replace
+from decimal import Decimal
 
+from sleeve_fund import compliance_rules as rules
 from sleeve_fund.risk import PortfolioProfile
 
-# (scope, measure, action) of each test, as the DA's compliance_tests rows hold them
-SHAPE = {
-    "asset_open_risk": ("asset", "open_risk", "trim"),
-    "group_open_risk": ("asset_type", "open_risk", "trim"),
-    "open_risk": ("fund", "open_risk", "trim"),
-    "gross": ("fund", "gross", "trim"),
-    "net_instrument": ("asset", "net", "trim"),
-    "margin": ("fund", "margin", "trim"),
-    "daily_loss": ("fund", "day_loss", "pause"),
-    "drawdown": ("fund", "drawdown", "halt"),
+# profile field -> the test's key (gate_decisions.test_hit, compliance_tests.test)
+KEY = {
+    "asset_open_risk": "asset_stop_loss",
+    "group_open_risk": "type_stop_loss",
+    "open_risk": "fund_stop_loss",
+    "gross": "fund_gross",
+    "net_instrument": "asset_net",
+    "margin": "fund_margin",
+    "daily_loss": "fund_day_loss",
+    "drawdown": "fund_drawdown",
 }
-LABELS = {
-    "asset_open_risk": "Loss per asset if every stop is hit",
-    "group_open_risk": "Loss per asset group if every stop is hit",
-    "open_risk": "Loss for the whole fund if every stop is hit",
-    "gross": "Gross exposure",
-    "net_instrument": "Net exposure per asset",
-    "margin": "Margin in use",
-    "daily_loss": "Daily loss that pauses new trades",
-    "drawdown": "Drawdown that halts the fund",
-}
-# What the PM may set each to, inclusive, as a share of fund equity (x book for gross and net). T3 and T5 bounds are the
-# Advisor's (BRIDGE-3); the rest are wide guards against a slip of the finger, the Advisor's to tighten.
-BOUNDS = {
-    "asset_open_risk": (0.005, 0.10),
-    "group_open_risk": (0.005, 0.15),
-    "open_risk": (0.01, 0.10),
-    "gross": (0.1, 3.0),
-    "net_instrument": (0.05, 1.5),
-    "margin": (0.05, 1.0),
-    "daily_loss": (0.01, 0.05),
-    "drawdown": (0.05, 0.25),
-}
-LOCKED = ("open_risk", "daily_loss", "drawdown")  # T3 and T5 can't be switched off (BRIDGE-3)
-TESTS = tuple(SHAPE)
-# The PM's defaults (14 Oct ~22:45 UK): T1 4%, T2 6%, T3 10%; T4 and T5 as the accepted portfolio limits. The first
-# compliance version is seeded with these (the DA's migration), and a run with no journal of its own reads them.
-SEEDED = replace(PortfolioProfile(), asset_open_risk=0.04, group_open_risk=0.06, open_risk=0.10)
+FIELD = {k: f for f, k in KEY.items()}
+TESTS = tuple(KEY)
+LABELS = {f: rules.LABELS[k] for f, k in KEY.items()}
+BOUNDS = {f: (float(rules.BOUNDS[k][0]), float(rules.BOUNDS[k][1])) for f, k in KEY.items()}
+LOCKED = tuple(f for f, k in KEY.items() if k in rules.LOCKED)  # T3 and T5 can't be switched off (BRIDGE-3)
+# The seeded version 1's tests (PM DEFAULTS-2: T1 4%, T2 6%, T3 10%; T4 and T5 the accepted portfolio limits). Its
+# asset-group map lives with the version in the journal (compliance_rules.DEFAULT_GROUPS), not here.
+SEEDED = replace(PortfolioProfile(), **{f: float(rules.DEFAULTS[k]) for f, k in KEY.items()})
+
+
+def test_key(limit_hit: str | None) -> str | None:
+    """The compliance test a gate outcome names (limits.decide's limit_hit), or None for an outcome that isn't a test
+    (lock_error, portfolio_state_stale, below_min, a halt or pause already in force)."""
+    return KEY.get(limit_hit) if limit_hit else None
 
 
 def validate_tests(profile: PortfolioProfile) -> None:
-    """Refuse a test set the PM may not save, with plain words: a locked test switched off, a value outside its bounds,
+    """Refuse a test set the PM may not save, in plain words: a locked test switched off, a value outside its bounds,
     or a daily pause not below the drawdown halt."""
-    for key in TESTS:
-        value = getattr(profile, key)
+    for f in TESTS:
+        value = getattr(profile, f)
         if value is None:
-            if key in LOCKED:
-                raise ValueError(f"{LABELS[key]} can't be switched off")
+            if f in LOCKED:
+                raise ValueError(f"{LABELS[f]} can't be switched off")
             continue
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or value != value:
-            raise ValueError(f"{LABELS[key]} must be a number, not {value!r}")
-        low, high = BOUNDS[key]
-        if not low <= value <= high:
-            raise ValueError(f"{LABELS[key]} must be between {low:g} and {high:g}, not {value:g}")
+        if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)) or value != value:
+            raise ValueError(f"{LABELS[f]} must be a number, not {value!r}")
+        low, high = BOUNDS[f]
+        if not low <= float(value) <= high:
+            raise ValueError(f"{LABELS[f]} must be between {low:g} and {high:g}, not {float(value):g}")
     if profile.daily_loss >= profile.drawdown:
         raise ValueError("the daily loss pause must be below the drawdown halt")
 
 
-def _get(row, name):
-    return row[name] if isinstance(row, dict) else getattr(row, name)
+def from_compliance(comp) -> PortfolioProfile:
+    """A PortfolioProfile from one Store.compliance() version. A test the version holds disabled is off (None)."""
+    values = {f: None for f in TESTS}
+    for t in comp.tests:
+        f = FIELD.get(t["test"])
+        if f is not None and t["enabled"]:
+            values[f] = float(str(t["limit"]))
+    return PortfolioProfile(version=comp.version, groups=dict(comp.asset_types), **values)
 
 
-def from_rows(version: int, tests, asset_types) -> PortfolioProfile:
-    """A PortfolioProfile from one version's rows (tests: each with test, limit, enabled; asset_types: {underlying:
-    group} or rows of underlying, asset_type). A test the version doesn't hold, or holds disabled, is off."""
-    values = {key: None for key in TESTS}
-    for row in tests:
-        key = _get(row, "test")
-        if key in values and _get(row, "enabled"):
-            values[key] = float(str(_get(row, "limit")))
-    groups = (dict(asset_types) if isinstance(asset_types, dict)
-              else {_get(r, "underlying"): _get(r, "asset_type") for r in asset_types})
-    return PortfolioProfile(version=version, groups=groups, **values)
+def to_tests(profile: PortfolioProfile, current=None) -> list[dict]:
+    """The rows a version of `profile` is saved as: every test, a switched-off one kept disabled at its last limit (or
+    its default) so its history reads."""
+    out = []
+    for f, k in KEY.items():
+        value = getattr(profile, f)
+        scope, measure, action = rules.SHAPE[k]
+        was = current.test(k) if current is not None else None
+        limit = (Decimal(str(value)).quantize(Decimal("0.0001")) if value is not None
+                 else (was["limit"] if was is not None else rules.DEFAULTS[k]))
+        out.append({"test": k, "label": rules.LABELS[k], "scope": scope, "measure": measure, "limit": limit,
+                    "action": action, "enabled": value is not None})
+    return out
 
 
-def to_rows(profile: PortfolioProfile) -> tuple[list[dict], dict[str, str]]:
-    """The rows a version of `profile` is saved as: every test (a switched-off one kept, disabled, at its last bound
-    so its history reads) and the group map."""
-    tests = []
-    for key in TESTS:
-        value = getattr(profile, key)
-        scope, measure, action = SHAPE[key]
-        tests.append({"test": key, "label": LABELS[key], "scope": scope, "measure": measure, "action": action,
-                      "limit": value if value is not None else BOUNDS[key][1], "enabled": value is not None})
-    return tests, dict(profile.groups or {})
-
-
-def load(store, mode: str = "paper", version: int | None = None) -> PortfolioProfile:
+def load(store, mode: str = "paper", version: int | None = None, conn=None) -> PortfolioProfile:
     """The compliance tests in force (the latest version, or the one named) as the gate applies them. Every run mode
-    reads the same rows (BRIDGE-3); `mode` is the reader's name, for its error only. Raises LookupError when the
-    journal holds none, so no caller falls back to tests nobody accepted."""
+    reads the same rows (BRIDGE-3); `mode` names the reader in its error. conn: the gate's own, inside its lock.
+    Raises (never falls back to tests nobody accepted) when the journal holds none or they can't be read."""
     reader = getattr(store, "compliance", None)
-    if reader is None:  # a journal from before the compliance tables: the PM's portfolio limits, T1 and T2 off
+    if reader is None:  # a store from before the compliance tables: the PM's portfolio limits, T1 and T2 off
         p = store.portfolio_profile(version)
         return PortfolioProfile(**{f.name: getattr(p, f.name) for f in fields(p)
-                                   if f.name not in ("asset_open_risk", "group_open_risk")},
-                                asset_open_risk=None, group_open_risk=None)
-    got = reader(version)
-    if got is None:
-        raise LookupError(f"no compliance tests recorded for {mode}")
-    return from_rows(_get(got, "version"), _get(got, "tests"), _get(got, "asset_types"))
+                                   if f.name not in ("asset_open_risk", "group_open_risk")})
+    try:
+        comp = reader(version, conn=conn) if conn is not None else reader(version)
+    except Exception as e:  # noqa: BLE001 - said in words; the gate refuses on it
+        raise LookupError(f"the compliance tests couldn't be read for {mode}: {e}") from e
+    return from_compliance(comp)
 
 
 def save(store, profile: PortfolioProfile, changed_by: str, note: str | None = None) -> int:
-    """Record `profile` as the next version, after validate_tests; returns the version. PM only (the DA's write path
-    refuses anyone else)."""
+    """Record `profile` (its tests and its group map) as the next version, after validate_tests; returns the version.
+    A profile the latest version already holds, value for value, writes nothing and returns that version. PM only
+    (the store's write refuses anyone else)."""
     validate_tests(profile)
-    tests, groups = to_rows(profile)
-    return store.add_compliance_version(tests, groups, created_by=changed_by, note=note)
+    current = store.compliance()
+    tests = to_tests(profile, current)
+    groups = dict(profile.groups if profile.groups is not None else current.asset_types)
+    same = ({(t["test"], Decimal(str(t["limit"])), t["enabled"]) for t in tests}
+            == {(t["test"], Decimal(str(t["limit"])), t["enabled"]) for t in current.tests})
+    if same and groups == dict(current.asset_types):
+        return current.version
+    return store.add_compliance_version(tests, groups, expected_version=current.version,
+                                        note=note or f"compliance tests set by {changed_by}", created_by=changed_by)
