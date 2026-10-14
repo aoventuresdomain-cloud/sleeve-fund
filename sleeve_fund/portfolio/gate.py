@@ -63,6 +63,12 @@ class PortfolioState:
     paused_until: datetime | None = None
     paused: str | None = None
     stale_told: datetime | None = None  # the mark a stale-book alert was raised for, so it is raised once per spell
+    # MUST-F286-H4 (Advisor 14 Oct 13:35 UK): a withdrawal that empties the book carries its ratios, taken from the book
+    # before it, to the next capital's first mark (mark_book), which restores them: set only while unmarked.
+    carried_hwm_drawdown: Decimal | None = None  # 1 - book / HWM
+    carried_reference_drawdown: Decimal | None = None  # 1 - book / the halt's reference; None: the reference is the HWM
+    carried_day_return: Decimal | None = None  # book / the day's start - 1, for carried_day only
+    carried_day: object = None  # the UTC day carried_day_return belongs to
 
     def reference(self) -> Decimal | None:
         return self.halt_reference if self.halt_reference is not None else self.hwm
@@ -293,6 +299,8 @@ def mark_book(ledger: Ledger, equity, now: datetime, profile: PortfolioProfile) 
     with ledger.lock():
         st = ledger.state()
         day = trading_day(now)
+        if st.equity is None and st.carried_hwm_drawdown is not None:
+            st = _restored(st, equity, day)
         if st.day != day:
             st = replace(st, day=day, day_start_equity=st.equity if st.equity else equity)
         st = replace(st, equity=equity, mark_ts=now, hwm=max(st.hwm or equity, equity),
@@ -310,6 +318,61 @@ def mark_book(ledger: Ledger, equity, now: datetime, profile: PortfolioProfile) 
         return acted
 
 
+def _restored(st: PortfolioState, equity: Decimal, day) -> PortfolioState:
+    """MUST-F286-H4 (Advisor 14 Oct 13:35 UK): the first mark of new capital in a book a withdrawal emptied keeps the
+    drawdown and the day's change it had: the HWM at equity / (1 - d), the halt's reference likewise, and the day's
+    start at equity / (1 + r) on the same UTC day, else the equity (a new day starts at it). Exact, one rounding each,
+    as apply_flow; the carried figures are cleared in the same write (mark_book's one set_state)."""
+    if equity < EMPTY:
+        raise ValueError("an empty book's mark restores nothing: it is left unmarked (Supervisor.mark_portfolio)")
+    if (bad := unrestorable(st)) is not None:
+        raise ValueError(bad)
+    with localcontext() as ctx:
+        ctx.prec = 2 * PRECISION
+
+        def up(d):
+            return None if d is None else (equity / (1 - d)).quantize(QUANTUM, ROUND_HALF_EVEN)
+
+        same_day = st.carried_day == day and st.carried_day_return is not None
+        start = (equity / (1 + st.carried_day_return)).quantize(QUANTUM, ROUND_HALF_EVEN) if same_day else equity
+        return replace(st, hwm=up(st.carried_hwm_drawdown), halt_reference=up(st.carried_reference_drawdown), day=day,
+                       day_start_equity=start, carried_hwm_drawdown=None, carried_reference_drawdown=None,
+                       carried_day_return=None, carried_day=None)
+
+
+def unrestorable(st: PortfolioState) -> str | None:
+    """Why the carried ratios can't be restored, or None (Advisor MUST, 14 Oct 14:45 UK): restored only while 1 - d > 0
+    and 1 + r > 0, so never a division by 0. An emptying withdrawal always starts from a book above 0, so this never
+    fires; if it does, the book stays unmarked, entries stay blocked as stale, and the supervisor alerts once."""
+    if st.equity is not None or st.carried_hwm_drawdown is None:
+        return None
+    d, q, r = st.carried_hwm_drawdown, st.carried_reference_drawdown, st.carried_day_return
+    if 1 - d > 0 and (q is None or 1 - q > 0) and (r is None or 1 + r > 0):
+        return None
+    def pct(x):
+        return "none" if x is None else f"{x:.2%}"
+
+    return (f"the drawdown kept from when the fund's book was emptied can't be restored (from the high-water mark "
+            f"{pct(d)}, from the halt's reference {pct(q)}, the day's change {pct(r)}): the book stays unmarked and "
+            "entries stay blocked until it is fixed")
+
+
+def carried(st: PortfolioState) -> dict:
+    """The ratios an emptying withdrawal carries (MUST-F286-H4), from the book before it, never the ~0 after (DA)."""
+    if st.equity is None or st.equity <= 0 or not st.hwm:
+        return {}
+    with localcontext() as ctx:
+        ctx.prec = 2 * PRECISION
+
+        def down(ref):  # never below 0: a flow's rounding can leave the book a quantum over its HWM (hwm_range)
+            return None if not ref else max(Decimal(0), (1 - st.equity / ref).quantize(QUANTUM, ROUND_HALF_EVEN))
+
+        r = (None if not st.day_start_equity or st.day is None
+             else (st.equity / st.day_start_equity - 1).quantize(QUANTUM, ROUND_HALF_EVEN))
+        return {"carried_hwm_drawdown": down(st.hwm), "carried_reference_drawdown": down(st.halt_reference),
+                "carried_day_return": r, "carried_day": st.day if r is not None else None}
+
+
 def resume_after_halt(ledger: Ledger) -> PortfolioState:
     """The PM's Resume after a portfolio halt: clears it and re-bases the halt's reference to the book now, so it
     doesn't fire again at once; the next halt is the drawdown limit below this. A pause for the day stays until
@@ -322,7 +385,7 @@ def resume_after_halt(ledger: Ledger) -> PortfolioState:
 
 
 def apply_flow(ledger: Ledger, amount, idle: Callable[[], str | None] | None = None,
-               now: datetime | None = None) -> PortfolioState | None:
+               now: datetime | None = None, carry: bool = True) -> PortfolioState | None:
     """Capital added (> 0) or withdrawn (< 0), so a deposit isn't a gain and a withdrawal isn't a loss (Advisor 3).
     The book moves by it, and the HWM, the halt's reference and the day's start each scale by (book + amount) / book,
     so the drawdown and the day's change keep their percentages (Advisor MUST, 14 Oct 09:45 UK): a shift by the
@@ -338,7 +401,9 @@ def apply_flow(ledger: Ledger, amount, idle: Callable[[], str | None] | None = N
     mark, so the withdrawal waits for 00:00 UTC; one that has ended is cleared with the marks); otherwise, and below
     0, refused. A halt in force stays until the PM resumes
     it. Returns the state it emptied, for the caller's journal, else
-    None (Advisor 14 Oct 10:00 UK)."""
+    None (Advisor 14 Oct 10:00 UK). Emptied, it carries the drawdown and the day's change it had (carried) to the next
+    capital's first mark, which restores them (MUST-F286-H4, Advisor 14 Oct 13:35 UK); carry False (a clean slate's
+    withdrawal: a fresh book) carries nothing."""
     amount = money(amount, "amount")
     with ledger.lock():
         st = ledger.state()
@@ -367,11 +432,14 @@ def apply_flow(ledger: Ledger, amount, idle: Callable[[], str | None] | None = N
                 raise ValueError(f"Not done: this would leave the fund with no capital while it is paused for the day "
                                  f"({st.paused}), and the pause has to stay in force until it ends. Nothing is lost "
                                  f"by waiting. Please try again after {uk:%H:%M} UK ({st.paused_until:%H:%M} UTC).")
-            if busy is not None:
-                raise ValueError(f"a flow of {amount:,.2f} would empty the book of {book:,.2f} while {busy}: refused")
+            if busy is not None:  # said to the PM as it is, as the pause's is (F286-1)
+                raise ValueError(f"Not done: this would leave the fund with no capital while {busy}. Nothing is lost "
+                                 f"by waiting: try again once that has changed.")
             # a pause that has ended goes with the marks: an unmarked row can't say paused (portfolio_state_marked)
+            # MUST-F286-H4: its ratios carried to the next capital's first mark, unless a clean slate emptied it (carry)
             ledger.set_state(replace(st, equity=None, mark_ts=None, hwm=None, halt_reference=None, day=None,
-                                     day_start_equity=None, paused_until=None, paused=None))
+                                     day_start_equity=None, paused_until=None, paused=None,
+                                     **(carried(st) if carry else {})))
             return st
         if book + amount <= 0:
             raise ValueError(f"a flow of {amount:,.2f} would take the book of {book:,.2f} below nothing: refused")

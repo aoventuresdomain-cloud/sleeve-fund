@@ -3,6 +3,7 @@ same positions use more of each portfolio limit. The confirm view shows the book
 use against it; the page after shows them against the book as it now is. Display only: every figure is the entry
 gate's (its last mark less what Store._put_away takes, and its book's gross, net, margin and open risk)."""
 
+from datetime import timedelta
 from decimal import Decimal as D
 from html import unescape
 
@@ -53,6 +54,9 @@ def test_the_preview_is_what_the_gate_reads_once_the_strategy_is_archived(held):
     assert _used(preview)["gross"] == pytest.approx(0.6) and _used(preview)["net"] == pytest.approx(0.6)
     assert _used(preview)["margin"] == pytest.approx(0.6)  # spot at its full notional
     held.archive("b")
+    after = limits_in_use(held)  # waiting for the poll's mark (F286-CR1), shown as gone
+    assert after["after"] == preview["after"] and _used(after) == pytest.approx(_used(preview))
+    _mark(held, T0 + timedelta(seconds=5))
     after = limits_in_use(held)
     assert after["after"] == preview["after"] and _used(after) == pytest.approx(_used(preview))
     assert held.withdrawn() == {"b": D(10_000)}
@@ -131,7 +135,7 @@ def test_withdraw_archived_prints_the_book_after_it(held, monkeypatch, capfd):
     monkeypatch.setattr(supervisor, "Store", lambda **k: held)
     assert supervisor.main(["withdraw-archived", "--actor", "operator", "--commit", "abc1234"]) in (0, None)
     out = capfd.readouterr().out
-    assert "withdrawn: b" in out and "The fund's book is now 10,000.00. Limits in use: Total size 60.0% of 150%" in out
+    assert "queued for the supervisor's next mark: b" in out and "The fund's book is now 10,000.00. Limits in use: Total size 60.0% of 150%" in out
 
 
 def test_an_archive_that_would_empty_the_book_says_so_with_no_shares(store, monkeypatch):

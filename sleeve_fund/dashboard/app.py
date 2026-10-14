@@ -273,8 +273,9 @@ def create_app(store: Store | None = None) -> FastAPI:
                                   and n not in none],
                 # Settled at 0 or less: nothing withdrawn, in the book at that figure (Advisor 14 Oct 11:10 UK).
                 "nothing_out": none,
-                # Archived while not flat: in the book in full until it is (Advisor 14 Oct 10:45 UK), with why.
-                "waiting_flat": {n: st().withdrawal_blocker(n) or "settling" for n in pending}}
+                # Archived while not flat: in the book in full until it is (Advisor 14 Oct 10:45 UK), with why. One
+                # flat leaves at the supervisor's next mark, seconds on (F286-CR1), so it reads as out.
+                "waiting_flat": {n: why for n in pending if (why := st().withdrawal_blocker(n))}}
 
     def _recent_json(sleeves, days: int, daily) -> JSONResponse:
         """The last day or week at fine resolution, in the shape the charts read."""

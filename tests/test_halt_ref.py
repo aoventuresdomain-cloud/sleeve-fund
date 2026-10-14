@@ -242,7 +242,7 @@ def test_a_flow_that_leaves_no_book_is_refused_and_the_move_with_it(store):
     store.assign_account("test", "desk")
     _mark(store, T0)
     store.set_desired_state("test", "running")
-    with pytest.raises(ValueError, match="would empty the book of 20,000.00 while test could trade"):
+    with pytest.raises(ValueError, match="no capital while Strategy test can still trade"):
         store.assign_account("test", "paper")
     assert store.account_of("test") == "desk" and _flows(store) == [] and _state(store).equity == D(20_000)
     store.set_desired_state("test", "stopped")
@@ -306,8 +306,9 @@ def test_c2_a_clean_slate_takes_what_it_archives_out_of_the_book_with_a_flow(sto
     slate = tmp_path / "clear.toml"
     slate.write_text('[[clear]]\nid = "s1"\nreason = "fresh book"\nkeep = ["b"]\n')
     assert supervisor.clear(store, str(slate)) == ["a"]
-    assert store.withdrawn() == {"a": D(10_500)} and len(_flows(store)) == 1
+    assert store.withdrawal_pending() == ["a"]  # the poll takes it out after its own mark (F286-CR1)
     assert _four(_mark(store, T0 + timedelta(minutes=1))) == (D(10_000),) * 4
+    assert store.withdrawn() == {"a": D(10_500)} and len(_flows(store)) == 1
 
 
 # --- C4: onto or off a test account ------------------------------------------------------------------------------------

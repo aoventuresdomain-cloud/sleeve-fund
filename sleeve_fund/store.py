@@ -448,7 +448,8 @@ sleeve_archive_t = Table(
     Column("sleeve", String(64), ForeignKey("sleeves.name"), primary_key=True),
     Column("archived_at", TS, nullable=False),
     # F-C3B-A (0023): the equity it took out of the fund's book when it was put away, with its flow; NULL for an archive
-    # made before that (still counted until supervisor withdraw-archived) and for a reset's run (its cash stays).
+    # made before that (still counted until supervisor withdraw-archived), for a reset's run (its cash stays) and for one
+    # archived while not flat, until the supervisor withdraws it once flat. NULL always means it still counts in the book.
     Column("withdrawn", EXACT),
 )
 # When each paper strategy last saw a trade or quote from its venue: the price feed's age on its page.
@@ -650,6 +651,17 @@ event.listen(portfolio_profile_t, "after_create",
              lambda target, conn, **kw: conn.execute(insert(target), [PORTFOLIO_PROFILE_V1]))
 # The supervisor's one row: what the gate's entry block reads. Only the supervisor writes it, but for the PM's Resume.
 PORTFOLIO_STATE_FIGURES = ("reference_equity", "hwm", "day_start_equity", "day_start", "book_equity")
+# MUST-F286-H4 (DA, 14 Oct): the carried ratios, kept only across an unmarked book; the HWM's anchors the set.
+PORTFOLIO_STATE_CARRIED_CHECKS = (
+    ("unmarked", "marked_at IS NULL OR (carried_hwm_drawdown IS NULL AND carried_reference_drawdown IS NULL "
+                 "AND carried_day_return IS NULL AND carried_day IS NULL)"),
+    ("anchor", "carried_hwm_drawdown IS NOT NULL OR (carried_reference_drawdown IS NULL AND carried_day_return IS NULL)"),
+    ("day", "(carried_day_return IS NULL) = (carried_day IS NULL)"),
+    ("hwm_range", "carried_hwm_drawdown IS NULL OR (carried_hwm_drawdown >= 0 AND carried_hwm_drawdown < 1)"),
+    ("reference_range", "carried_reference_drawdown IS NULL OR "
+                        "(carried_reference_drawdown >= 0 AND carried_reference_drawdown < 1)"),
+    ("day_range", "carried_day_return IS NULL OR carried_day_return > -1"),
+)
 portfolio_state_t = Table(
     "portfolio_state",
     metadata,
@@ -666,6 +678,12 @@ portfolio_state_t = Table(
     Column("book_equity", EXACT),  # the last mark: the whole fund, unallocated cash included
     Column("marked_at", TS),  # older than 60 s: entries blocked as portfolio_state_stale
     Column("stale_told_at", TS),  # the mark a stale-book alert was raised for: once per spell, across processes (0011)
+    # MUST-F286-H4 (0023): what a withdrawal that emptied the book carries to the next capital's first mark, taken
+    # from the book before it; set only while unmarked, restored and cleared by that mark (portfolio.gate.mark_book).
+    Column("carried_hwm_drawdown", EXACT),  # 1 - book / hwm
+    Column("carried_reference_drawdown", EXACT),  # 1 - book / reference_equity; NULL when the reference was the HWM
+    Column("carried_day_return", EXACT),  # book / day_start_equity - 1, for carried_day
+    Column("carried_day", Date),  # the UTC day carried_day_return belongs to
     Column("profile_version", Integer, ForeignKey("portfolio_profile.version"), nullable=False),
     Column("updated_at", TS, nullable=False),
     CheckConstraint("id = 1", name="portfolio_state_one_row"),
@@ -679,6 +697,7 @@ portfolio_state_t = Table(
     # all of the book's figures set, or none (before the first mark): one CHECK per figure (DA, 0011)
     *(CheckConstraint(f"({c} IS NULL) = (marked_at IS NULL)", name=f"portfolio_state_{c}_marked")
       for c in PORTFOLIO_STATE_FIGURES),
+    *(CheckConstraint(sql, name=f"portfolio_state_carried_{name}") for name, sql in PORTFOLIO_STATE_CARRIED_CHECKS),
 )
 # The book's history: one mark a minute and one at every status change; a cache rebuilt from fills, which stay the
 # source of truth. The 5 s mark lives in portfolio_state only.
@@ -807,6 +826,7 @@ FINISHED_ORDER_STATUSES = ("filled", "canceled", "rejected", "denied", "expired"
 OPEN_ORDER_STATUSES = ("submitted", "accepted", "partially_filled")
 # F-C3B-A: a Strategy archived while not yet flat waits for its withdrawal; one with nothing to withdraw says so
 WITHDRAWAL_DEFERRED, WITHDRAWAL_NONE = "withdrawal_deferred", "withdrawal_none"
+NEXT_MARK = "flat, waiting for the supervisor's next mark"  # why a flat Strategy put away is deferred (F286-CR1)
 GATED_INTENTS = ("entry", "rebalance")  # the orders the portfolio gate reserves for (engine OPENING_INTENTS)
 INTENTS = ("entry", "exit", "stop_loss", "take_profit", "risk_halt", "risk_pause", "pm_flatten", "rebalance",
            "liquidation", "liquidation_cut", "wind_down", "wind_down_stop")  # the venue would take it; cut back before it does (String(16))
@@ -1142,14 +1162,16 @@ class Store:
         return self.sleeve(name)
 
     @contextmanager
-    def _book_move(self, amount, why, ts: datetime | None = None):
+    def _book_move(self, amount, why, ts: datetime | None = None, leaving: str | None = None, carry: bool = True):
         """A capital move into (amount() > 0) or out of (< 0) the fund's book (HALT-REF-1): the caller's writes, made on
         the connection this yields, and the flow they make commit together under the portfolio gate's lock, so the
         book moves by it and its HWM, the halt's reference and the day's start scale with it (portfolio.gate.apply_flow),
         so the move is never read as a gain or a loss. The amount is read under the lock, before the writes, so two moves never both
         count the same Strategy, and a supervisor mark that read the book while a move landed is skipped
         (Supervisor.mark_portfolio). Journaled as a portfolio_flow event. With no state ever marked there is nothing to
-        move: the first mark reads the book as it is."""
+        move: the first mark reads the book as it is. leaving: the Strategy put away by this move, which never holds an
+        emptied book open itself (supervisor.nothing_open, F286-1). carry: a move that empties the book carries its
+        drawdown and the day's change to the next capital's first mark (MUST-F286-H4); False for a clean slate's."""
         from sleeve_fund.portfolio.gate import apply_flow
         from sleeve_fund.supervisor import nothing_open
 
@@ -1161,9 +1183,19 @@ class Store:
             yield c
             if amount:
                 before = led.state().reference()
-                emptied = apply_flow(led, amount, lambda: nothing_open(self, led), ts)
+                emptied = apply_flow(led, amount, lambda: nothing_open(self, led, leaving), ts, carry=carry)
                 if emptied is not None:  # the old figures stay in the journal (Advisor 14 Oct 10:00 UK)
-                    tail = (f"which empties it, so the next mark starts it afresh (it was: high-water mark "
+                    kept = led.state()
+                    if kept.carried_hwm_drawdown is None:
+                        then = "so the next mark starts it afresh"
+                    else:  # MUST-F286-H4: what the next capital's first mark restores
+                        day = ("" if kept.carried_day_return is None else
+                               f" and the day's change of {kept.carried_day_return:.4%} on {kept.carried_day}")
+                        ref = ("" if kept.carried_reference_drawdown is None else
+                               f", {kept.carried_reference_drawdown:.4%} below the halt's reference")
+                        then = (f"so the next capital's first mark keeps its drawdown of "
+                                f"{kept.carried_hwm_drawdown:.4%}{ref}{day}")
+                    tail = (f"which empties it, {then} (it was: high-water mark "
                             f"{_money2(emptied.hwm)}, the halt's reference {_money2(emptied.reference())}, the day's "
                             f"start {_money2(emptied.day_start_equity)}); a halt in force stays until the PM resumes")
                 else:
@@ -1598,7 +1630,7 @@ class Store:
                 select(sleeve_archive_t).where(sleeve_archive_t.c.withdrawn.is_not(None)))}
 
     @contextmanager
-    def _put_away(self, sleeve: str, ts: datetime, why: str):
+    def _put_away(self, sleeve: str, ts: datetime, why: str, polled: bool = False):
         """F-C3B-A (Advisor 14 Oct 09:45 UK): a Strategy put away for good (archived, retired, or archived by a clean
         slate) takes its whole equity out of the fund's book, as a flow (_book_move), in the same transaction as its
         archive row, which this writes; the caller's own writes go on the connection this yields. One outside the book
@@ -1608,10 +1640,15 @@ class Store:
         out now: it stays in the book in full until it is flat (F229-6 C3), journaled as WITHDRAWAL_DEFERRED, and the
         supervisor's poll withdraws it then, after that poll's mark (Advisor 14 Oct 10:45 UK). A settled equity of 0 or
         less is never withdrawn: it stays in the book, journaled as WITHDRAWAL_NONE. Each is decided under the gate's
-        lock, so the poll and withdraw-archived racing take it out once."""
+        lock, so the poll and withdraw-archived racing take it out once.
+
+        Only the supervisor's poll (polled), after its own mark, takes equity out of a marked book (F286-CR1, HoE on the
+        Advisor's option (b)): put away anywhere else, flat or not, it is WITHDRAWAL_DEFERRED, so the P&L made since the
+        last mark is judged at the book's scale before its equity leaves, never landing on the Strategies that remain.
+        A book never marked has no scale to keep: it is taken out at once, with no flow."""
         seen: list[tuple[str, Decimal | str]] = []
 
-        def decide() -> tuple[str, Decimal | str]:
+        def decide(marked: bool) -> tuple[str, Decimal | str]:
             if sleeve in self.withdrawn():
                 return "out already", Decimal(0)
             if self._outside_or_backtest(sleeve):
@@ -1619,11 +1656,13 @@ class Store:
             blocked = self.withdrawal_blocker(sleeve)
             if blocked is not None:
                 return "deferred", blocked
+            if marked and not polled:
+                return "deferred", NEXT_MARK
             equity = self.in_book_equity(sleeve)
             return ("out", equity) if equity > 0 else ("none", equity)
 
         def amount() -> Decimal:
-            seen.append(decide())
+            seen.append(decide(True))
             kind, value = seen[0]
             return -value if kind == "out" else Decimal(0)
 
@@ -1632,21 +1671,27 @@ class Store:
             dust = f", with dust of {qty} no order can close, which leaves with it" if qty else ""
             return f"{sleeve} put away ({why}): its equity {seen[0][1]:,.2f} leaves the fund's book{dust}"
 
-        with self._book_move(amount, said, ts) as c:
+        # A clean slate's put-away (previous_book) starts a fresh book, so its emptying carries nothing (MUST-F286-H4)
+        with self._book_move(amount, said, ts, leaving=sleeve, carry=sleeve not in self.previous_book()) as c:
             yield c
             # Put away again (archived, then retired; a second archive): already out, so it keeps its row, its
             # amount and when it went, with no second flow (DA, 14 Oct).
             if c.execute(select(sleeve_archive_t.c.sleeve).where(sleeve_archive_t.c.sleeve == sleeve,
                                                                  sleeve_archive_t.c.withdrawn.is_not(None))).first():
                 return
-            kind, value = seen[0] if seen else decide()  # nothing marked yet: no flow, but decided all the same
+            kind, value = seen[0] if seen else decide(False)  # nothing marked yet: no flow, but decided all the same
             out = stored(value) if kind == "out" else None
             # An archive from before 0023 (withdraw-archived), or one waiting to go flat, keeps when it went:
             # previous_book reads archived_at against the clean slate's start (DA, 14 Oct). A fresh one is written now.
             if not c.execute(update(sleeve_archive_t).where(sleeve_archive_t.c.sleeve == sleeve)
                              .values(withdrawn=out)).rowcount:
                 c.execute(insert(sleeve_archive_t).values(sleeve=sleeve, archived_at=ts, withdrawn=out))
-            if kind == "deferred":
+            if kind == "deferred" and value == NEXT_MARK:
+                c.execute(insert(events_t).values(
+                    sleeve=sleeve, ts=ts, level="info", kind=WITHDRAWAL_DEFERRED,
+                    message=f"{sleeve} put away ({why}): it stays in the fund's book until the supervisor's next mark, "
+                            "and its equity leaves the book then, so what it made since the last mark counts first"))
+            elif kind == "deferred":
                 c.execute(insert(events_t).values(
                     sleeve=sleeve, ts=ts, level="info", kind=WITHDRAWAL_DEFERRED,
                     message=f"{sleeve} put away ({why}) while not yet flat ({value}): it stays in the fund's book in "
@@ -1667,7 +1712,7 @@ class Store:
         with no open order has them all."""
         qty, flat = self.lifecycle_flat(sleeve)
         if not flat:
-            return f"it holds {qty}"
+            return f"it holds {float(qty):g}"
         if self.orders(sleeve, statuses=OPEN_ORDER_STATUSES, limit=1):
             return "an order of it is still open"
         if any(r.strategy == sleeve for r in self._gate_ledger().reservations()):
@@ -2350,6 +2395,11 @@ class Store:
                 if not stopped:  # its process re-bases its own references too
                     c.execute(insert(commands_t).values(sleeve=s.name, command=BOOK_RESET, reason=reason.strip(),
                                                         created_at=now))
+            # MUST-F286-H4 (HoQA): a reset while the book is empty drops the ratios an emptying withdrawal carried
+            c.execute(update(portfolio_state_t)
+                      .where(portfolio_state_t.c.id == 1, portfolio_state_t.c.marked_at.is_(None))
+                      .values(carried_hwm_drawdown=None, carried_reference_drawdown=None, carried_day_return=None,
+                              carried_day=None))
             c.execute(insert(decisions_t).values(
                 ts=now, actor=actor, action=BOOK_RESET, sleeve=None,
                 reason=f"Book reset: {reason.strip()} (cleared: {', '.join(s.name for s, *_ in cleared) or 'none'})"))

@@ -29,7 +29,7 @@ from sleeve_fund.alerts import Forwarder
 from sleeve_fund.exact import float_view
 from sleeve_fund.money import to_decimal
 from sleeve_fund.gate_ledger import DbLedger
-from sleeve_fund.portfolio.gate import EMPTY, PortfolioState, mark_book, sweep
+from sleeve_fund.portfolio.gate import EMPTY, PortfolioState, mark_book, sweep, unrestorable
 from sleeve_fund.portfolio.limits import Book, Holding
 from sleeve_fund.risk import PORTFOLIO, trading_day
 from sleeve_fund.paper.safety import assert_portfolio_gate, credential_var
@@ -79,18 +79,22 @@ def fund_equity(store: Store) -> Decimal:
     return total
 
 
-def nothing_open(store: Store, ledger) -> str | None:
-    """Why the book isn't idle, or None when nothing is open: no reservation held, no Strategy that could trade
-    (could_trade), no position but dust. The one guard for an empty book (F282-3's no-op mark, F-C3B-A's emptying
-    flow)."""
+def nothing_open(store: Store, ledger, leaving: str | None = None) -> str | None:
+    """Why the book isn't idle, in the PM's words, or None when nothing is open: no reservation held, no Strategy that
+    could trade (could_trade), no position but dust. The one guard for an empty book (F282-3's no-op mark, F-C3B-A's
+    emptying flow). leaving: the Strategy whose withdrawal empties it, skipped (F286-1): it is stopped in the same
+    transaction, which this reads from outside, and found settled flat with no order open or room held before its
+    equity was taken out (Store.withdrawal_blocker)."""
     if ledger.reservations():
         return "an order still holds room in the book"
     for s in store.sleeves():
+        if s.name == leaving:
+            continue
         book = store.journal_book(s.name, s.starting_balance)
         if could_trade(s):
-            return f"{s.name} could trade"
+            return f"Strategy {s.name} can still trade"
         if abs(book["qty"]) > 1e-12 and not is_dust(book):
-            return f"{s.name} holds {book['qty']}"
+            return f"Strategy {s.name} still holds {book['qty']}"
     return None
 
 
@@ -304,6 +308,7 @@ class Supervisor:
         self.ledger = DbLedger(store, lambda: (_ for _ in ()).throw(RuntimeError("the supervisor runs no entry check")))
         self._equity_failing = False  # a failed equity read is said once per spell
         self._holdings_failing = False  # so is a failed read of the book's holdings (F-BM-1)
+        self._carried_told = False  # an emptied book's carried ratios that can't be restored, alerted once
         self._withdraw_told: dict[str, str] = {}  # a deferred withdrawal's refusal, said once while it lasts
         self._breach_told: set[str] = set()  # a withdrawn Strategy holding, alerted once per spell (F-C3B-A viii)
         self._flatten_told: dict[str, datetime] = {}  # when each holder was last told to flatten for a portfolio halt
@@ -572,6 +577,14 @@ class Supervisor:
                 # stay blocked as stale until the first capital's mark starts the book.
                 behind = behind or (st.equity is None and st.hwm is None and abs(equity) < EMPTY
                                     and nothing_open(self.store, led) is None)
+                # MUST-F286-H4: an emptied book's carried ratios wait for capital to restore them against, never ~0
+                behind = behind or (st.equity is None and st.carried_hwm_drawdown is not None and equity < EMPTY)
+                # Advisor MUST (14 Oct 14:45 UK): carried ratios that can't be restored fail closed, said once
+                if not behind:
+                    bad = unrestorable(st)
+                    if bad is not None and not self._carried_told:
+                        led.alert("portfolio_carried_invalid", f"Portfolio not marked: {bad}", now)
+                    self._carried_told = behind = bad is not None
                 acted = None if behind else mark_book(led, equity, now, PORTFOLIO)
         if not self._equity_failing and not behind:
             st = led.state()
@@ -607,16 +620,16 @@ class Supervisor:
         sweep(led, now, self._order_live, None, is_acked=self._order_acked)
 
     def _withdraw_flat(self, now: datetime) -> None:
-        """F-C3B-A (Advisor 14 Oct 10:45 UK): each Strategy archived while not flat (Store.withdrawal_pending) whose
-        withdrawal nothing blocks any more has its settled equity taken out of the book, with one journaled flow
-        under the gate's lock (Store._put_away, which withdraw-archived shares, so neither takes it out twice).
+        """F-C3B-A (Advisor 14 Oct 10:45 UK): each Strategy put away and waiting (Store.withdrawal_pending: not flat
+        then, or put away outside this poll, F286-CR1) whose withdrawal nothing blocks any more has its settled equity
+        taken out of the book, with one journaled flow under the gate's lock (Store._put_away), the one place it leaves.
         Called after this poll's mark. A refusal (a book a day's pause keeps marked) is said once and tried again
         on the next poll; one Strategy's failure never stops the rest."""
         for name in self.store.withdrawal_pending():
             if self.store.withdrawal_blocker(name) is not None:
                 continue
             try:
-                with self.store._put_away(name, now, "flat after it was archived"):
+                with self.store._put_away(name, now, "flat after it was put away", polled=True):
                     pass
                 self._withdraw_told.pop(name, None)
             except Exception as exc:  # noqa: BLE001 - kept in the book, tried again next poll
@@ -1041,21 +1054,20 @@ def rebase_halt_ref_1(store: Store, actor: str, commit: str, now: datetime | Non
 
 
 def withdraw_archived(store: Store, actor: str, commit: str) -> list[str]:
-    """F-C3B-A's one-off for the Strategies archived before it landed, which still count in the book: each is taken
-    out with its own flow (Store._put_away, under the gate's lock), so the drawdown and the P&L don't move (Advisor 14
-    Oct 09:45 UK). A reset's earlier run is not one: its cash stays in the book. Idempotent: one already out is skipped.
-    Refused, with nothing written, while any of them holds a position. Returns the names taken out."""
+    """F-C3B-A's one-off for the Strategies archived before it landed, which still count in the book: each is put on
+    the supervisor's withdrawal (Store._put_away: WITHDRAWAL_DEFERRED), and its next poll takes each out with its own
+    flow after its own mark, so the drawdown and the P&L don't move (Advisor 14 Oct 09:45 UK; F286-CR1). A reset's
+    earlier run is not one: its cash stays in the book. Idempotent: one already out or already waiting is skipped.
+    Refused, with nothing written, while any of them holds a position; dust no order can close is flat, as for the
+    archive, and leaves with it (F286-2, Advisor D8b). Returns the names queued."""
     from sleeve_fund.store import is_backtest
 
     if not actor.strip() or not commit.strip():
         raise ValueError("an actor and the deployed commit are required")
     runs, out, waiting = store.reset_runs(), store.withdrawn(), set(store.withdrawal_pending())
-    # One archived while not flat after F-C3B-A waits for the supervisor's poll, which takes it out once it is flat;
-    # flat already, it is taken out here, under the same lock and key, so not twice (Advisor 14 Oct 10:45 UK).
-    due = [n for n in store.archived() if n not in runs and n not in out and not is_backtest(n)
-           and not (n in waiting and store.withdrawal_blocker(n) is not None)]
-    held = [f"{n} holds {store.journal_book(n, store.sleeve(n).starting_balance)['qty']}" for n in due
-            if abs(store.journal_book(n, store.sleeve(n).starting_balance)["qty"]) > 1e-12]  # as previous_book
+    # One already waiting (put away after F-C3B-A, or queued by an earlier run) is the poll's to take out.
+    due = [n for n in store.archived() if n not in runs and n not in out and not is_backtest(n) and n not in waiting]
+    held = [f"{n} holds {float(qty):g}" for n in due for qty, flat in [store.lifecycle_flat(n)] if not flat]
     if held:
         raise RuntimeError("withdraw-archived refused, nothing written: " + "; ".join(held)
                            + " (flatten it first: a position has no settled equity to take out)")
@@ -1152,7 +1164,7 @@ def main(argv: list[str] | None = None) -> int:
         except RuntimeError as exc:
             print(exc)
             return 1
-        print(f"withdrawn: {', '.join(done) or 'none (nothing archived still counted)'}")
+        print(f"queued for the supervisor's next mark: {', '.join(done) or 'none (nothing archived still counted)'}")
         if done:  # the book after it and the limits in use against it, as the dashboard shows them (F-C3B-A-UI)
             from sleeve_fund.dashboard.withdrawal import limits_in_use, words
 

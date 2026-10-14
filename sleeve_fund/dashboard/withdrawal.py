@@ -54,6 +54,8 @@ def limits_in_use(store: Store, put_away=()) -> dict:
     view = {"source": "gate", "book": None, "taken": None, "after": None, "empty": False, "waiting": {}, "limits": [],
             "over": []}
     try:
+        # Put away and flat, its equity leaves at the supervisor's next mark, seconds on (F286-CR1): counted as gone.
+        put_away = [*put_away, *(n for n in store.withdrawal_pending() if store.withdrawal_blocker(n) is None)]
         view["waiting"] = waiting(store, put_away)
         taken = taken_out(store, put_away)
         ledger = PaperGate(store).ledger
