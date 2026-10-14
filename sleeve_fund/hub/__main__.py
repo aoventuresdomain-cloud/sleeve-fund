@@ -29,18 +29,67 @@ def instruments(profile, store=None) -> dict[str, str]:
     return {f"{profile.symbol_of(pair)}.{profile.name}": pair for pair, _ in _pairs_in_use(profile.name, store)}
 
 
-def last_closes(profile, pairs: dict[str, str], history=None) -> dict[str, int]:
+def last_closes(profile, pairs: dict[str, str], history=None, alert=None) -> dict[str, int]:
     """Per instrument, the close of the last minute the history store holds, so the hub refills what it missed
-    while it was down. Read only: the store's writer is the storage side's."""
+    while it was down. Read only: the store's writer is the storage side's. An instrument whose coverage can't be read
+    (a torn coverage.json after a crash) is left out and alerted, `alert(key, message)`: the hub starts anyway, and its
+    first live bar is relayed unseeded (F-HRF-1: no hub would cost every Strategy on the venue its data)."""
     from sleeve_fund.history import HistoryStore
 
     hs = history or HistoryStore()
     out = {}
     for iid, pair in pairs.items():
-        cov = hs.coverage(profile.name, pair)
+        try:
+            cov = hs.coverage(profile.name, pair)
+        except Exception as exc:  # noqa: BLE001 - an unreadable store never stops the hub; the alert says which
+            message = (f"hub {profile.name} {pair}: can't read the stored history's coverage ({exc!r}); the hub "
+                       f"started without it, so minutes missed while it was down are not refilled at start")
+            print(message)
+            if alert is not None:
+                alert(f"hub-coverage-unreadable:{profile.name}:{pair}", message)
+            continue
         if cov is not None:  # the last stored minute may still have been forming: count from the one before
             out[iid] = int(pd.Timestamp(cov.last).value)
     return out
+
+
+REFILL_LOOKBACK = pd.Timedelta(hours=24)  # holes this recent are refilled at start: about as far as venues' candles go
+
+
+def start_holes(profile, pairs: dict[str, str], history=None, now=None) -> dict[str, list[tuple[int, int]]]:
+    """Per instrument, the stored history's holes from the last REFILL_LOOKBACK, as (first, last) bar closes in ns,
+    for the relay to refill at start (HUB-RESTART-FILL). The stretch since the last stored minute isn't one: the first
+    live bar finds it (last_closes). Read only; a store it can't read is skipped, the hub starts anyway."""
+    from sleeve_fund.history import HistoryStore
+
+    hs = history or HistoryStore()
+    since = (now or pd.Timestamp.now(tz="UTC")) - REFILL_LOOKBACK
+    minute = pd.Timedelta(minutes=1)
+    out = {}
+    for iid, pair in pairs.items():
+        try:
+            runs = hs.gaps(profile.name, pair)
+        except Exception as exc:  # noqa: BLE001 - an unreadable month: the store's own checks report it
+            print(f"hub {profile.name} {pair}: can't read the history's gaps: {exc!r}")
+            continue
+        found = [(int((max(a, since) + minute).value), int((b + minute).value)) for a, b in runs if b >= since]
+        if found:
+            out[iid] = found
+    return out
+
+
+def seeder(profile, pairs: dict[str, str], history):
+    """relay.attach's seed: an instrument's last stored close and holes, read when it is first relayed."""
+
+    def seed(iid: str) -> tuple[int | None, list[tuple[int, int]]]:
+        pair = pairs.get(iid)
+        if pair is None:
+            return None, []
+        one = {iid: pair}
+        holes = start_holes(profile, one, history, now=history.clock())  # the store's clock: tests pass their own
+        return last_closes(profile, one, history).get(iid), holes.get(iid, [])
+
+    return seed
 
 
 def build(profile, port: int, sink=None):
@@ -54,12 +103,17 @@ def build(profile, port: int, sink=None):
     relay = HubRelay(HubRelayConfig(instrument_ids=tuple(sorted(pairs))))
     fanout = Fanout(profile.name, known=relay.known, want=relay.want, venue_up=relay.venue_up,
                     instruments=relay.instruments)
-    from sleeve_fund.history import HistoryStore
+    from sleeve_fund.history import HistoryStore, _alert
 
     store = HistoryStore()
     if sink is None:
         sink = store_sink(store, profile.name, pairs)  # the same dict the relay keeps up to date
-    relay.attach(fanout, sink=sink, pairs=pairs, recent=profile.ohlc_history, last_close=last_closes(profile, pairs),
+    relay.attach(fanout, sink=sink, pairs=pairs, recent=profile.ohlc_history,
+                 last_close=last_closes(profile, pairs, store, alert=lambda key, message: _alert(
+                     key, "warning", "hub_history_unreadable", message)),
+                 holes=start_holes(profile, pairs, store),
+                 alert=lambda key, message: _alert(key, "warning", "hub_refill_failed", message),
+                 seed=seeder(profile, pairs, store),
                  discover=lambda: instruments(profile), late_path=store.root / f"hub-late-{profile.name}.json")
     data_factory, data_config = profile.data_client()
     node = (

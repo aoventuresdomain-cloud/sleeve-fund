@@ -10,7 +10,8 @@ from sleeve_fund.store import LIQUIDATION_RESET, OPEN_ORDER_STATUSES, Store, utc
 
 INTENTS = {"entry": "Entry", "exit": "Signal exit", "stop_loss": "Stop-loss", "take_profit": "Take-profit",
            "risk_halt": "Risk halt", "risk_pause": "Daily-loss pause", "pm_flatten": "PM flatten",
-           "rebalance": "Rebalance", "liquidation": "Liquidated", "liquidation_cut": "Cut before liquidation"}
+           "rebalance": "Rebalance", "liquidation": "Liquidated", "liquidation_cut": "Cut before liquidation",
+           "wind_down": "Wind-down deadline", "wind_down_stop": "Wind-down stop"}
 # Exit events, for trades closed before orders were journaled with a reason.
 EXIT_EVENTS = {k: INTENTS[k] for k in ("stop_loss", "take_profit", "risk_halt", "risk_pause", "pm_flatten",
                                        "liquidation", "liquidation_cut")}
