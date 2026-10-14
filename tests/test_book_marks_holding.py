@@ -67,8 +67,9 @@ def test_fbm1_holdings_that_cant_be_read_skip_the_row_say_so_once_and_never_cras
     for m in (1, 2, 3):
         sup.mark_portfolio(T0 + timedelta(minutes=m))  # never raises out of the pass
     assert len(_marks(store)) == 1
-    said = _alerts(store, "supervisor_error")
+    said = _alerts(store, "book_mark_skipped")
     assert len(said) == 1 and "book_marks" in said[0].message and "ATR" in said[0].message
+    assert said[0].level == "warning"
     monkeypatch.setattr(portfolio_gate, "fund_holdings", real)
     sup.mark_portfolio(T0 + timedelta(minutes=4))
     assert len(_marks(store)) == 2  # written again once the holdings read
@@ -80,3 +81,16 @@ def test_fbm1_a_first_pass_writes_its_book_mark_held_or_not(store, held):  # noq
         _hold(store)
     portfolio_pass(store, T0, EQ)
     assert len(_marks(store)) == 1
+
+
+def test_fbm1_a_stopless_holder_with_no_atr_yet_records_no_error_event(store, monkeypatch):  # noqa: F811
+    """The stack e2e's case: a fresh stack's stopless position has no daily ATR yet. The cache row waits with a
+    warning; no error-level event is recorded (the e2e counts those as failures)."""
+    from sleeve_fund import open_risk
+
+    _hold(store, stop_frac=None)
+    monkeypatch.setattr(open_risk, "history_atr_pct", lambda *a, **k: None)
+    portfolio_pass(store, T0, EQ)
+    assert not _marks(store)
+    assert not [e for e in _alerts(store, "book_mark_skipped") if e.level == "error"]
+    assert len(_alerts(store, "book_mark_skipped")) == 1 and not _alerts(store, "supervisor_error")

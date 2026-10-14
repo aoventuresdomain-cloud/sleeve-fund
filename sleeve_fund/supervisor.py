@@ -432,9 +432,11 @@ class Supervisor:
                 try:
                     held = fund_holdings(self.ledger.store, now)
                 except Exception as exc:  # noqa: BLE001 - the cache row waits; the state row above is the gate's
+                    # A warning, not an error: the row is a cache nothing trades on, and the gate's own check fails
+                    # closed on the same read (a stopless position whose daily ATR isn't known yet, as on a fresh stack).
                     if not self._holdings_failing:
-                        self.store.event(None, "error", "supervisor_error", f"the book's holdings couldn't be read, so "
-                                         f"the book's history (book_marks) isn't written until they can: {exc!r}")
+                        self.store.event(None, "warning", "book_mark_skipped", f"the book's holdings couldn't be read, "
+                                         f"so the book's history (book_marks) isn't written until they can: {exc!r}")
                     self._holdings_failing = True
                 else:
                     self._holdings_failing = False
