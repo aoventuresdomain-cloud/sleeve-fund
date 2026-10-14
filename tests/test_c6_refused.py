@@ -13,14 +13,14 @@ from test_dashboard import AUTH, client  # noqa: F401 - the fixture
 from sleeve_fund.store import gate_decisions_t, sleeves_t, utcnow
 
 
-def _versioned(store):
+def _versioned(store, would_be=None, side=None):
     with store.engine.begin() as conn:
         sid = conn.execute(sleeves_t.select().where(sleeves_t.c.name == "btc-test")).first().id
         conn.execute(insert(gate_decisions_t), [{
             "sleeve_id": sid, "bar_ts": utcnow(), "intent": "entry", "underlying": "BTC", "profile_version": 1,
             "price": D(50000), "stage": "submit", "seq": 9, "intent_id": "i9", "outcome": "rejected",
             "test_hit": "asset_stop_loss", "compliance_version": 1, "requested_qty": D("0.2"), "approved_qty": D(0),
-            "decided_at": utcnow()}])
+            "decided_at": utcnow(), "would_be": would_be, "side": side}])
 
 
 def test_portfolio_settings_lists_every_refused_idea_with_its_strategy_test_and_version(client):  # noqa: F811
@@ -37,23 +37,16 @@ def test_portfolio_settings_lists_every_refused_idea_with_its_strategy_test_and_
     assert first.count("<td>–</td>") == 1  # no side journaled yet: a dash, never a guess
 
 
-def test_a_refusal_shows_the_tests_numbers_when_the_gate_journaled_them(client, monkeypatch):  # noqa: F811
+def test_a_refusal_shows_the_tests_numbers_and_side_the_gate_journaled(client):  # noqa: F811
     c, store = client
     _traded(c, store)
-    _versioned(store)
-    real = store.refused_ideas
-
-    def with_would_be(*a, **k):
-        return [{**r, "would_be": D("0.046"), "side": 1} if r.get("test_hit") == "asset_stop_loss" else r
-                for r in real(*a, **k)]
-
-    monkeypatch.setattr(store, "refused_ideas", with_would_be)
-    limit = store.compliance(1)
-    t1 = next(t for t in limit.tests if t["test"] == "asset_stop_loss")["limit"]
+    _versioned(store, would_be=D("0.046"), side=-1)
+    t1 = next(t for t in store.compliance(1).tests if t["test"] == "asset_stop_loss")["limit"]
     from sleeve_fund import compliance_rules as rules
 
     want = f"T1 Per asset: 4.6% would exceed {rules.show('asset_stop_loss', t1)}"
     page = c.get("/portfolio-settings", auth=AUTH).text
-    assert want in page and "<td>Buy</td>" in page
+    first = page.split('id="refused-h"')[1].split("<tbody>")[1].split("</tr>")[0]
+    assert want in first and "<td>Short</td>" in first
     tab = c.get("/sleeves/btc-test", auth=AUTH).text.split('id="tab-refused"')[1]
     assert want in tab and "<th scope=\"col\">Strategy</th>" not in tab.split("</table>")[0]

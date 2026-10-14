@@ -260,7 +260,7 @@ def refused(store: Store, sleeve: str | None = None, since=None, limit: int = 20
                 words = f"{words}: {rules.show(key, would)} would exceed {rules.show(key, lim)}"
         side = r.get("side")
         out.append({**r, "test": words,
-                    "side": {1: "Buy", -1: "Sell"}.get(int(side)) if side is not None else None})
+                    "side": {1: "Long", -1: "Short"}.get(int(side)) if side is not None else None})
     return out
 
 
