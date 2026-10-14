@@ -260,3 +260,39 @@ def test_paper_applies_the_limit_with_the_daily_atr_read_from_real_history(tmp_p
         assert entries == [] and notes and "over 5% of the book" in notes[0], notes
     else:
         assert entries and notes == [], notes
+
+
+def _atr_lookup_per_day_slice(prices):
+    """daily_atr_lookup as first written (before PERF-ATR): daily_atr_pct on a DataFrame slice per day. The oracle."""
+    days = prices[["high", "low", "close"]].groupby((prices.index - pd.Timedelta(1, "ns")).floor("D")).agg(
+        {"high": "max", "low": "min", "close": "last"})
+    out = {}
+    for i in range(open_risk.ATR_DAYS - 1, len(days)):
+        v = open_risk.daily_atr_pct(days.iloc[max(0, i + 1 - open_risk.ATR_WINDOW):i + 1])
+        if v is not None:
+            out[int((days.index[i] + pd.Timedelta(days=1)).value)] = v
+    return out
+
+
+@pytest.mark.parametrize("seed", range(12))
+def test_the_backtest_atr_lookup_equals_daily_atr_pct_on_each_days_window(seed):
+    """PERF-ATR (HoE): the array rewrite gives the same days and the same shares as daily_atr_pct on each day's window
+    (paper's own reading), to 8 dp and in fact exactly, on random series with missing days, NaN fields and a
+    non-positive last close."""
+    import numpy as np
+
+    rng = np.random.default_rng(seed)
+    per_day = int(rng.choice([1, 6, 24]))
+    idx = pd.date_range("2024-01-01", periods=int(rng.integers(5, 200)) * per_day, freq=f"{24 // per_day}h", tz="UTC")
+    c = 100 * np.exp(np.cumsum(rng.normal(0, 0.02, len(idx))))
+    prices = pd.DataFrame({"high": c * (1 + rng.uniform(0, 0.03, len(idx))),
+                           "low": c * (1 - rng.uniform(0, 0.03, len(idx))), "close": c}, index=idx)
+    prices = prices[rng.uniform(size=len(idx)) > rng.uniform(0, 0.5)]  # gaps, whole days among them
+    for col in ("high", "low", "close"):
+        prices.loc[rng.uniform(size=len(prices)) < 0.05, col] = np.nan
+    if seed % 4 == 0 and len(prices):
+        prices.iloc[-1, prices.columns.get_loc("close")] = 0.0
+    want, got = _atr_lookup_per_day_slice(prices), open_risk.daily_atr_lookup(prices)
+    assert got.keys() == want.keys()
+    assert all(round(got[k], 8) == round(want[k], 8) and got[k] == want[k] for k in want), \
+        {k: (got[k], want[k]) for k in want if got[k] != want[k]}

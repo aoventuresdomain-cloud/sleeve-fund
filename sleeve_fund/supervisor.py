@@ -63,7 +63,8 @@ def fund_equity(store: Store) -> Decimal:
     reader) and its journal position at its last mark. One the PM put away (archived, a clean slate) still counts in
     full: its cash is the fund's, unallocated, so archiving never moves the book. A run a reset put away counts only
     its cash movement: the strategy it came from starts again at the same capital, which it still counts (HoE 13 Oct).
-    Raises when a position has no mark, so the portfolio isn't marked and entries stop once its mark is stale."""
+    Raises when a position has no mark, so the portfolio isn't marked and entries stop once its mark is stale; dust
+    with no mark is held at its entry price (F229-7)."""
     from sleeve_fund.store import is_backtest
 
     runs = store.reset_runs()
@@ -76,12 +77,18 @@ def fund_equity(store: Store) -> Decimal:
             total += cash  # flat when put away (split_run): its capital is its successor's
             continue
         total += to_decimal(s.starting_balance, "starting balance") + cash
-        qty = to_decimal(store.journal_book(s.name, s.starting_balance)["qty"], "qty")
+        book = store.journal_book(s.name, s.starting_balance)
+        qty = to_decimal(book["qty"], "qty")
         if qty != 0:
             last = store.last_equity(s.name)
-            if last is None or not last["price"]:
+            if last is not None and last["price"]:
+                total += qty * to_decimal(last["price"], "mark")
+            elif is_dust(book) and book["entry_px"]:
+                # F229-7: dust no venue takes an order for, never marked, is held at its entry price (under
+                # DUST_NOTIONAL either way) rather than failing the whole fund closed over it
+                total += qty * to_decimal(book["entry_px"], "entry price")
+            else:
                 raise RuntimeError(f"{s.name} holds {qty} with no mark, so the fund can't be marked")
-            total += qty * to_decimal(last["price"], "mark")
     return total
 
 
