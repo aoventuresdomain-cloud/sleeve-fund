@@ -110,6 +110,8 @@ class Pair:
         # Called with the pair's state (state, trade_id, deadline_ns) whenever it changes: paper keeps it in the journal
         # so a restart recovers it (Advisor M3); a backtest has none.
         self.on_state = None
+        # Paper with a journal: False until recover() has run, on the first tick both legs are back and priced (ready).
+        self.recovered = True
         self.second: dict | None = None  # the leg still to send: leg, qty, reason, signal, tries
         self.sending: LongFlatStrategy | None = None  # the leg whose own _send_entry the pair is calling now
         self.closing_from: LongFlatStrategy | None = None
@@ -152,6 +154,16 @@ class Pair:
         self._written = row["state"]
         self._saved = row
         self.on_state = self._write
+        self.recovered = False
+
+    def ready(self) -> None:
+        """Paper, on each leg's tick until it has run: recover() once both legs hold what the journal says (no restore
+        pending) and have a price to unwind at."""
+        if self.recovered:
+            return
+        if any(leg._restore is not None or not leg._price() > 0 for leg in (self.lead, self.follow)):
+            return
+        self.recover()
 
     def _write(self, st: dict) -> None:
         deadline = _utc(st["deadline_ns"]) if st["deadline_ns"] is not None else None
@@ -170,7 +182,8 @@ class Pair:
         """Paper, once both legs hold what the journal says they hold (their restore filled): a pair the journal left
         legged or closing is unwound now, whatever is held sold at market (the fills are the truth, the state only the
         hint, DA); a hedged one with a leg missing likewise. Both legs flat: the state goes back to flat, no order."""
-        saved = getattr(self, "_saved", None)
+        self.recovered = True
+        saved, self._saved = getattr(self, "_saved", None), None  # once: what the journal said at start
         if saved is None or saved["state"] == "flat":
             return
         self.trade_id = saved["trade_id"]
@@ -248,7 +261,10 @@ class Pair:
         return (qty * ratio * Decimal(repr(px_from)) / Decimal(repr(px_to))).quantize(to._lot(), rounding=ROUND_DOWN)
 
     def blocks_entry(self) -> str | None:
-        """Why the lead may not open now: a pair already open, being sent, or held on one leg only (ruling A)."""
+        """Why the lead may not open now: a pair already open, being sent, or held on one leg only (ruling A), or one
+        not yet recovered after a restart."""
+        if not self.recovered:
+            return "the pair is still being checked after the restart: no new entry until it is"
         if self.state == "legging":
             return "one leg is held without the other: no new entry until it is hedged or unwound"
         if self.state != "flat":

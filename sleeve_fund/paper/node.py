@@ -201,18 +201,7 @@ def build_node(sleeve: SleeveConfig, log_level: str = "INFO", runtime: SleeveRun
         data_factory, data_config = profile.data_client()
     fee_model = ScheduleFeeModel(sleeve.fees)
     perp = markets.is_perp(sleeve.params)
-    balances = [Money(sleeve.starting_balance, Currency.from_str(quote_code))]
-    if runtime is not None:  # rebuild the paper book from the journal so a restart carries positions over
-        book = runtime.book
-        if perp:
-            # A margin account holds the quote currency only. The position is put back by a restore order
-            # at start (LongFlatStrategy._send_restore); the account opens with the cash it had when the
-            # position was opened, so after that restore its cash equals the journal's.
-            balances = [Money(book["cash"] + book["qty"] * (book["entry_px"] or 0.0), Currency.from_str(quote_code))]
-        else:
-            balances = [Money(book["cash"], Currency.from_str(quote_code))]
-            if book["qty"] > 0:
-                balances.append(Money(book["qty"], Currency.from_str(base_code)))
+    balances = _balances(sleeve, runtime, base_code, quote_code)
     node = (
         LiveNode.builder(f"PAPER-{tag}", TraderId.from_str(f"PAPER-{tag[:20]}"), Environment.SANDBOX)
         .with_logging(LoggerConfig(stdout_level=getattr(LogLevel, log_level)))
@@ -220,28 +209,10 @@ def build_node(sleeve: SleeveConfig, log_level: str = "INFO", runtime: SleeveRun
         # The hub may take a minute to pick up an instrument it doesn't relay yet.
         .with_timeout_connection(120 if hub is not None else 60)
         .add_data_client("HUB" if hub is not None else None, data_factory, data_config)
-        .add_simulated_exec_client(
-            profile.name,
-            SandboxExecutionClientFactory(),
-            SandboxExecutionClientConfig(
-                venue=venue,
-                starting_balances=balances,
-                account_id=AccountId.from_str(f"{profile.name}-PAPER-{tag[:20]}"),
-                oms_type=OmsType.NETTING,
-                # A perpetual trades on margin so it can go short; our own guards set its leverage.
-                account_type=AccountType.MARGIN if perp else AccountType.CASH,
-                default_leverage=markets.VENUE_LEVERAGE if perp else None,
-                fee_model=fee_model,
-                fill_model=fill_model(),
-                # A hub-fed node fills from trades and quotes only: its bars are EXTERNAL, which the matching
-                # engine would otherwise replay through the book a minute late, at their receive time. A node on
-                # its own venue connection keeps the engine's default until it moves to the hub.
-                bar_execution=hub is None,
-            ),
-        )
+        .add_simulated_exec_client(profile.name, SandboxExecutionClientFactory(),
+                                   _sandbox(venue, balances, f"{profile.name}-PAPER-{tag[:20]}", perp, fee_model, hub))
         .build()
     )
-    strategy_cls, config_cls = REGISTRY[sleeve.strategy]
     if recorder is not None:  # what a replay needs to rebuild this run exactly (sleeve_fund.research.replay)
         recorder.meta = {
             "balances": [str(b) for b in balances],
@@ -252,10 +223,139 @@ def build_node(sleeve: SleeveConfig, log_level: str = "INFO", runtime: SleeveRun
                        "taker_fee": str(sleeve.fees.taker),
                        "tick_seconds": runtime.tick_seconds if runtime is not None else None},
         }
+    node.add_strategy(_strategy(sleeve, profile, REGISTRY[sleeve.strategy], sleeve.instrument_id, bar_type, fee_model,
+                                runtime=runtime, recorder=recorder, history=history, hub=hub,
+                                hub_status=hub_status if hub is not None else None))
+    return node
+
+
+
+# P2-8 (HoE Option A, 14 Oct): a two-leg Strategy's second leg trades on this clone of its venue, an account of its own
+# beside the first leg's in the same node. Only the simulated matching engine ever sees the clone's name.
+LEG_CLONE = 2
+
+
+def build_two_leg_node(lead: SleeveConfig, follow: SleeveConfig, log_level: str = "INFO",
+                       runtimes: tuple[SleeveRuntime | None, SleeveRuntime | None] = (None, None), asset_fetch=None,
+                       history=None, hub: tuple[str, int] | None = None):
+    """One paper node for a two-leg Strategy (P2-8): the first leg (`lead`, the parent row) on its venue's own
+    simulated account and the second (`follow`, its "~2" row) on the venue's clone, each with its account type,
+    fees and terms from the real venue's profile and its own journal (runtimes), both fed by the one hub
+    connection: the second leg's instrument handed on again as the clone's, in the same step. Returns (node, pair).
+
+    Refused: a node without the venue's hub, legs on two venues or bar sizes, a leg on a venue clone already."""
+    from sleeve_fund.paper.hub_client import HubDataClientConfig, HubDataClientFactory, HubStatus, hub_bar_spec
+    from sleeve_fund.research.portfolio import clone_venue
+    from sleeve_fund.strategies.base import LongFlatConfig
+    from sleeve_fund.strategies.pair import LegFollower, Pair
+
+    assert_keyless()
+    profile = venue_profile(lead.venue)
+    if venue_profile(follow.venue).name != profile.name:
+        raise ValueError(f"a two-leg Strategy's legs trade on one venue, not {lead.venue} and {follow.venue}")
+    if lead.bar_spec != follow.bar_spec:
+        raise ValueError(f"a two-leg Strategy's legs share one bar size, not {lead.bar_spec} and {follow.bar_spec}")
+    if lead.params.get("leg") is None or follow.params.get("leg") is None:
+        raise ValueError("both legs need their side, ratio and leverage (two_legs.leg_params)")
+    hub = hub or hub_address(profile.name)
+    if hub is None:
+        raise ValueError(f"a two-leg Strategy is fed by its venue's market data hub; HUB_{profile.name} isn't set")
+    clone = clone_venue(profile.venue, LEG_CLONE)
+    follow_iid = f"{InstrumentId.from_str(follow.instrument_id).symbol}.{clone}"
+    tag = _tag(lead.name)
+    spec = hub_bar_spec(lead.bar_spec)
+    lead_runtime, follow_runtime = runtimes
+    sources = tuple(dict.fromkeys((lead.instrument_id, follow.instrument_id)))  # one feed when both legs share it
+    minutes = {lead.instrument_id: stored_minutes(profile.name, lead.instrument),
+               follow.instrument_id: stored_minutes(profile.name, follow.instrument)}
+    hub_status = HubStatus()
+    data_config = HubDataClientConfig(
+        venue=profile.name, instrument_ids=sources, host=hub[0], port=hub[1], bar_spec=spec, status=hub_status,
+        recover=lambda iid, after, before: minutes[iid](iid, after, before),
+        report=None if lead_runtime is None else
+        lambda level, kind, message: lead_runtime.store.event(lead.name, level, kind, message),
+        aliases=((follow.instrument_id, follow_iid),))
+    accounts = []
+    for sleeve, runtime, venue, name in ((lead, lead_runtime, profile.venue, profile.name),
+                                         (follow, follow_runtime, clone, str(clone))):
+        base_code, quote_code = profile.asset_codes(sleeve.instrument, fetch=asset_fetch)
+        fee_model = ScheduleFeeModel(sleeve.fees)  # the real venue's schedule for the leg's own market
+        perp = markets.is_perp(sleeve.params)
+        balances = _balances(sleeve, runtime, base_code, quote_code)
+        accounts.append((name, fee_model, _sandbox(venue, balances, f"{name}-PAPER-{_tag(sleeve.name)[:20]}", perp,
+                                                   fee_model, hub)))
+    builder = (
+        LiveNode.builder(f"PAPER-{tag}", TraderId.from_str(f"PAPER-{tag[:20]}"), Environment.SANDBOX)
+        .with_logging(LoggerConfig(stdout_level=getattr(LogLevel, log_level)))
+        .with_reconciliation(reconciliation=False)
+        .with_timeout_connection(120)
+        .add_data_client("HUB", HubDataClientFactory(), data_config)
+    )
+    for name, _, config in accounts:
+        builder = builder.add_simulated_exec_client(name, SandboxExecutionClientFactory(), config)
+    node = builder.build()
+    legs = []
+    for sleeve, runtime, iid, classes, status, (_, fee_model, _) in (
+            (lead, lead_runtime, lead.instrument_id, REGISTRY[lead.strategy], hub_status, accounts[0]),
+            (follow, follow_runtime, follow_iid, (LegFollower, LongFlatConfig),
+             hub_status.view({follow_iid: follow.instrument_id}), accounts[1])):
+        legs.append(_strategy(sleeve, profile, classes, iid, BarType.from_str(f"{iid}-{spec}"), fee_model,
+                              runtime=runtime, recorder=None, history=history, hub=hub, hub_status=status))
+    pair = Pair(legs[0], legs[1], lead_side=lead.params["leg"]["side"], follow_side=follow.params["leg"]["side"],
+                ratio=follow.params["leg"]["ratio"], name=lead.name)
+    for strategy in legs:
+        node.add_strategy(strategy)
+    if lead_runtime is not None:  # its state kept in the journal; a trade left open by a restart is recovered (M3)
+        pair.journal(lead_runtime.store, lead.name)  # after add_strategy: it reads the clock the node gives the legs
+    return node, pair
+
+def _balances(sleeve: SleeveConfig, runtime: SleeveRuntime | None, base_code: str, quote_code: str) -> list[Money]:
+    """The paper account's opening balances: the sleeve's, or rebuilt from the journal so a restart carries its
+    position over."""
+    balances = [Money(sleeve.starting_balance, Currency.from_str(quote_code))]
+    if runtime is not None:  # rebuild the paper book from the journal so a restart carries positions over
+        book = runtime.book
+        if markets.is_perp(sleeve.params):
+            # A margin account holds the quote currency only. The position is put back by a restore order
+            # at start (LongFlatStrategy._send_restore); the account opens with the cash it had when the
+            # position was opened, so after that restore its cash equals the journal's.
+            balances = [Money(book["cash"] + book["qty"] * (book["entry_px"] or 0.0), Currency.from_str(quote_code))]
+        else:
+            balances = [Money(book["cash"], Currency.from_str(quote_code))]
+            if book["qty"] > 0:
+                balances.append(Money(book["qty"], Currency.from_str(base_code)))
+    return balances
+
+
+def _sandbox(venue, balances: list[Money], account_id: str, perp: bool, fee_model,
+             hub) -> SandboxExecutionClientConfig:
+    """The simulated venue's account: the only kind of execution client a paper node has."""
+    return SandboxExecutionClientConfig(
+        venue=venue,
+        starting_balances=balances,
+        account_id=AccountId.from_str(account_id),
+        oms_type=OmsType.NETTING,
+        # A perpetual trades on margin so it can go short; our own guards set its leverage.
+        account_type=AccountType.MARGIN if perp else AccountType.CASH,
+        default_leverage=markets.VENUE_LEVERAGE if perp else None,
+        fee_model=fee_model,
+        fill_model=fill_model(),
+        # A hub-fed node fills from trades and quotes only: its bars are EXTERNAL, which the matching
+        # engine would otherwise replay through the book a minute late, at their receive time. A node on
+        # its own venue connection keeps the engine's default until it moves to the hub.
+        bar_execution=hub is None,
+    )
+
+
+def _strategy(sleeve: SleeveConfig, profile, classes, instrument_id: str, bar_type: BarType, fee_model, *, runtime,
+              recorder, history, hub, hub_status):
+    """The sleeve's strategy, on instrument_id (its own, or a two-leg Strategy's second leg's on the venue clone),
+    with what a paper strategy is given. Everything read by venue (history, spreads) is read at the real venue."""
+    strategy_cls, config_cls = classes
     strategy = (
         strategy_cls(
             config_cls(
-                instrument_id=InstrumentId.from_str(sleeve.instrument_id),
+                instrument_id=InstrumentId.from_str(instrument_id),
                 bar_type=bar_type,
                 max_notional=sleeve.max_notional,
                 assumed_taker_fee=float(sleeve.fees.taker),
@@ -282,16 +382,15 @@ def build_node(sleeve: SleeveConfig, log_level: str = "INFO", runtime: SleeveRun
     if hub is None:  # its first bar after a start is built from the stored minutes, as the hub client's is (R1)
         strategy.attach_minutes(stored_minutes(profile.name, sleeve.instrument))
     strategy.hub_fed = hub is not None
-    strategy.hub_status = hub_status if hub is not None else None
+    strategy.hub_status = hub_status
     if hub is not None and hasattr(strategy, "minute_source"):
         # first_touch (R2): the minutes the hub client built each bar from, as a backtest judges the store's
-        iid = sleeve.instrument_id
+        iid = instrument_id
         strategy.minute_source = lambda after, until: hub_status.minutes_of(iid, after, until)
     # Post-only orders fill in slices as the tape earns them, as a backtest fills them (review round 9, M9-3).
     strategy.simulated_venue = True
     strategy.fee_model = fee_model
-    node.add_strategy(strategy)
-    return node
+    return strategy
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -305,6 +404,7 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     runtime = None
+    leg = None  # a two-leg Strategy's second leg (P2-8): (its config, its runtime), run in this process
     if args.db_sleeve:
         from sleeve_fund.store import Store
 
@@ -322,15 +422,25 @@ def main(argv: list[str] | None = None) -> int:
                     "holds its single-instance lock")
         assert_portfolio_gate(store)
         row = store.sleeve(args.db_sleeve)
-        quote = resolve(getattr(row, "venue", None), store)
-        sleeve = from_store(row, fee_schedule=quote.fees)
+        if row.parent is not None:  # the supervisor never starts one: its first leg's process trades it
+            raise SystemExit(f"{row.name} is the second leg of {row.parent}: it runs in {row.parent}'s process")
         from sleeve_fund.paper.queued import QueuedStore
+        from sleeve_fund.store import LEG
 
-        runtime = SleeveRuntime(QueuedStore(store), sleeve.name)  # journal writes off the decision path
-        perp = markets.terms(sleeve.params, sleeve.venue)
-        store.event(sleeve.name, "info", "fees", f"Charging {quote.text}" if perp is None or perp.fees is None else
-                    f"Charging {perp.label}: {perp.fees.maker:.2%} maker, {perp.fees.taker:.2%} taker, on the venue's "
-                    "live prices; funding every 8 hours from our own ledger")
+        journal = QueuedStore(store)  # journal writes off the decision path; one writer keeps both legs' in order
+        try:
+            second = store.sleeve(row.name + LEG)
+        except KeyError:
+            second = None
+        configs = []
+        for r in (row,) if second is None else (row, second):
+            quote = resolve(getattr(r, "venue", None), store)
+            configs.append((from_store(r, fee_schedule=quote.fees), SleeveRuntime(journal, r.name)))
+            perp = markets.terms(configs[-1][0].params, configs[-1][0].venue)
+            store.event(r.name, "info", "fees", f"Charging {quote.text}" if perp is None or perp.fees is None else
+                        f"Charging {perp.label}: {perp.fees.maker:.2%} maker, {perp.fees.taker:.2%} taker, on the "
+                        "venue's live prices; funding every 8 hours from our own ledger")
+        (sleeve, runtime), leg = configs[0], (configs[1] if second is not None else None)
     else:
         sleeve = load_sleeve(args.sleeve)
         check_perp_sizing(sleeve.strategy, sleeve.params)  # a strategy in the store is refused by the supervisor
@@ -342,7 +452,12 @@ def main(argv: list[str] | None = None) -> int:
         from sleeve_fund.paper.recorder import Recorder
 
         recorder = Recorder(args.record)
-    node = build_node(sleeve, log_level=args.log_level, runtime=runtime, recorder=recorder)
+    if leg is not None:
+        if recorder is not None:
+            ap.error("--record isn't built for a two-leg Strategy yet")
+        node, _ = build_two_leg_node(sleeve, leg[0], log_level=args.log_level, runtimes=(runtime, leg[1]))
+    else:
+        node = build_node(sleeve, log_level=args.log_level, runtime=runtime, recorder=recorder)
     if args.minutes > 0:
         handle = node.handle()
         timer = threading.Timer(args.minutes * 60, handle.stop)

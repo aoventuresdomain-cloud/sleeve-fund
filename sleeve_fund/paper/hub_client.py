@@ -499,7 +499,10 @@ class HubDataClientConfig(DataClientConfig):
 
 class HubDataClient(MarketDataClient):
     def __init__(self, *, name: str, config: HubDataClientConfig, cache, clock) -> None:
-        super().__init__(name=name, config=config, cache=cache, clock=clock, venue=Venue(config.venue))
+        # With clones it serves their venues too: registered under no venue, it is the node's routing client, so a
+        # clone's subscription reaches it (it already sends the clone's data); without, exactly as before.
+        venue = None if getattr(config, "aliases", ()) else Venue(config.venue)
+        super().__init__(name=name, config=config, cache=cache, clock=clock, venue=venue)
         self.cfg = config
         self._report = config.report or self._log_report
         self.decode = Decoder(config.bar_spec, self.report, config.recover, getattr(config, "status", None))

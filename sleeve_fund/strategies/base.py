@@ -40,6 +40,7 @@ from sleeve_fund.paper.runtime import WIND_STOP as WIND_STOP_INTENT
 from sleeve_fund.store import DUST, OPEN_ORDER_STATUSES, replay_book
 from sleeve_fund.strategies.indicators import AtrSma, warmup_for
 from sleeve_fund.strategies.timeframes import Candle, SlowerCandles, bar_spec, span
+from sleeve_fund.venues import base_venue
 
 # Orders the signal asks for may wait for a maker fill; protective exits (stop-loss, take-profit,
 # risk halts, PM flatten) always go at market, because getting out matters more than the fee.
@@ -1121,7 +1122,7 @@ class LongFlatStrategy(Strategy):
         if not self._backtest and self._resting_openers():
             self._cancel_resting_entries()  # P1-SG15: as on a trade (on_trade); a quote can fill a resting order too
         if self.runtime is not None:
-            fresh = self.runtime.on_quote(bid, ask, venue=str(self._cfg.instrument_id.venue))
+            fresh = self.runtime.on_quote(bid, ask, venue=base_venue(str(self._cfg.instrument_id.venue)))
             if fresh is not None:  # the hour's spread measurements, reloaded (SPREAD-PIT)
                 self.spread_series = fresh
         if self._restore is not None:
@@ -5017,6 +5018,9 @@ class LongFlatStrategy(Strategy):
             # against the journal until it is, but the strategy is alive.
             self.runtime.store.heartbeat(self.runtime.name, self.runtime.now())
             return
+        pair = getattr(self, "pair", None)
+        if pair is not None and not pair.recovered:  # a two-leg Strategy's trade left open by a restart (P2-8, M3)
+            pair.ready()
         try:
             if self._margin:
                 self._apply_funding(self._price())
