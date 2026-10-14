@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {# Where the header's total size comes from (UP-1). #}
 {% macro size_title(size) %}{% if size.source == 'gate' %}As the entry gate reads the book: every position and resting entry, against the fund's last mark. Amber from {{ '%.1f'|format(size.limit * 0.8) }}x; at {{ '%.1f'|format(size.limit) }}x no entry that adds to it is taken.{% elif size.source == 'unreadable' %}From the strategies' own marks: the entry gate's book couldn't be read just now.{% else %}From the strategies' own marks: the fund has no mark yet, and the entry gate takes no entry until it has one.{% endif %}{% endmacro %}
-{% from "_macros.html" import chip, usage, help, stop_words, trail_words, open_risk_hint, open_risk_text, open_risk_room, spot_risk_text, open_risk_warn, risk_cell, stop_liq %}
+{% from "_macros.html" import chip, usage, help, stop_words, trail_words, open_risk_hint, open_risk_text, open_risk_room, spot_risk_text, open_risk_warn, risk_cell, stop_liq, test_chip %}
 {% from "_reasons.html" import reason_picker %}
 {# A stop in a word or two, for the strategy list's chip; the Limits tab spells it out. #}
 {% macro stop_short(p) %}{% if p.stop_loss %}{{ (p.stop_loss * 100)|round(1) }}%{% elif p.stop_atr %}{{ '%g'|format(p.stop_atr) }} simple ATR{% elif p.stop_swing_bars %}Swing low{% endif %}{% endmacro %}
@@ -66,7 +66,7 @@
     <div class="srow h" aria-hidden="true"><span>Strategy</span><span class="r">Exposure</span><span class="r">Today</span><span>Room before halt</span><span class="r">Stop</span></div>
     {% for r in risk.rows %}{% set x = r.x %}{% set s = x.sleeve %}{% set left = [x.profile.max_drawdown - x.drawdown, 0]|max %}
     <div class="srow">
-      <div class="nm"><span class="rh-dot {{ tone_of(s.status) }}" title="{{ s.status|capitalize }}"></span><div><a href="/sleeves/{{ s.name }}">{{ s.name }}</a><span>{{ s.instrument }} · {{ s.status|capitalize }}</span></div></div>
+      <div class="nm"><span class="rh-dot {{ tone_of(s.status) }}" title="{{ s.status|capitalize }}"></span><div><a href="/sleeves/{{ s.name }}">{{ s.name }}</a><span>{{ s.instrument }} · {{ s.status|capitalize }}{% if x.test_account %} · {{ test_chip() }}{% endif %}</span></div></div>
       <span class="num r ex" title="Position value at the current price ÷ the strategy's equity">{{ '%.2f'|format(x.exposure|abs) }}×{% if x.exposure < -0.0005 %} <span class="faint">short</span>{% endif %}</span>
       <span class="num r td {{ 'gain' if x.day_ret > 0.00005 else ('loss' if x.day_ret < -0.00005 else 'muted') }}">{{ x.day_ret|pct1s }}</span>
       <div class="room" role="img" aria-label="{{ (r.dd_used * 100)|round(0)|int }}% of the drawdown limit used, {{ left|pct1 }} left before halt">
@@ -75,6 +75,7 @@
       </div>
       <span class="r stop">{% if r.has_stop %}<span class="rh-chip ok" title="{{ live_stop_title(r) }}">{% if r.stop_dist is not none %}{{ r.stop_dist|pct1 }}{% else %}{{ stop_short(s.params) }}{% endif %}</span>{% elif trail_words(s)|trim %}<span class="rh-chip" title="{{ trail_words(s) }}; trail level not shown">Trailing</span>{% else %}<span class="rh-chip warn">None</span>{% endif %}</span>
     </div>{% else %}<p class="empty" style="padding:4px 18px 16px">No strategies in the book yet.</p>{% endfor %}
+    {% if risk.rows|selectattr('x.test_account')|list %}<p class="faint rh-note">A Strategy on a test account is outside the fund's book: its own limits still apply, but it is left out of the book's size, drawdown and market-move figures.</p>{% endif %}
   </section>
 
   <section class="panel rh-stress" aria-labelledby="move-h">
@@ -110,7 +111,7 @@
     <thead><tr><th>Strategy</th><th>Drawdown</th><th>Today's loss</th><th title="Position value at the current price ÷ the strategy's equity, against the cap that applies when a position is opened">Exposure</th><th class="num" title="Further loss before the drawdown limit halts the strategy">Room to halt</th><th>Stop</th><th class="num" title="Isolated margin the open position has put up">Margin</th><th class="num">Liq. price</th><th class="num" title="Money lost if the stop is hit">Risk to stop</th></tr></thead>
     <tbody>{% for r in risk.rows %}{% set x = r.x %}{% set s = x.sleeve %}
     <tr>
-      <td class="cell-name" title="{{ x.profile.name|capitalize }} risk profile"><a href="/sleeves/{{ s.name }}">{{ s.name }}</a> {{ chip(s.status) }}</td>
+      <td class="cell-name" title="{{ x.profile.name|capitalize }} risk profile"><a href="/sleeves/{{ s.name }}">{{ s.name }}</a> {{ chip(s.status) }}{% if x.test_account %} {{ test_chip() }}{% endif %}</td>
       <td data-label="Drawdown">{{ usage(r.dd_used) }} <span class="muted">{{ x.drawdown|pct1 }} of {{ x.profile.max_drawdown|pct0 }}</span></td>
       <td data-m="hide">{{ usage(r.day_used) }} <span class="muted">{{ [0 - x.day_ret, 0]|max|pct1 }} of {{ x.profile.daily_loss|pct0 }}</span></td>
       <td data-m="hide">{{ usage(r.cap_used, drift=True) }} <span class="muted">{{ '%.2f'|format(x.exposure|abs) }}× of {{ '%.2f'|format(x.cap) }}×</span></td>

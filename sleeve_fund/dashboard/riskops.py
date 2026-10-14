@@ -56,7 +56,9 @@ def risk_view(store: Store, summaries: list[dict], book: dict) -> dict:
     equity = book["equity"] or 1.0
     scenarios = []
     for i, shock in enumerate(SHOCKS):
-        loss = sum(r["shocks"][i]["loss"] for r in rows if r["x"]["sleeve"].desired_state == "running")
+        # The book's P&L is the fund's: a test-account Strategy is outside its book (it still halts on its own limit).
+        loss = sum(r["shocks"][i]["loss"] for r in rows
+                   if r["x"]["sleeve"].desired_state == "running" and not r["x"].get("test_account"))
         scenarios.append({"shock": shock, "loss": loss, "pnl": -loss, "loss_pct": loss / equity,
                           "breaches": [r["x"]["sleeve"].name for r in rows if r["shocks"][i]["breach"]]})
     largest = largest_asset(book["allocation"], book["equity"])
