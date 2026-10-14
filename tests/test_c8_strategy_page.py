@@ -25,7 +25,7 @@ def test_the_page_has_one_position_view_and_its_views_in_one_panel(client):  # n
     side = page.split('class="sub-tabs side"')[1].split("</div>")[0]
     assert re.findall(r'data-sub="(\w+)"', side) == ["signals", "settings"]
     settings = page.split('id="tab-settings-side"')[1].split("</aside>")[0]
-    assert "Risk per trade: 1% of the fund" in settings and "Leverage at most 1× · SL required" in settings
+    assert "Position size</dt><dd>33% of the fund<div>Risk per trade: 1% of the fund</div>" in settings and "Leverage at most 1× · SL required" in settings
     assert " cap" not in settings.lower() and "limit" not in settings.lower()
     assert 'data-open="dlg-settings"' in settings and 'id="dlg-settings"' in page and 'id="settings-form"' in page
 
@@ -73,3 +73,24 @@ def test_a_dropped_take_profit_shows_struck_through_with_its_reason(client):  # 
     store.heartbeat("btc-x")
     pos = c.get("/sleeves/btc-x", auth=AUTH).text.split('data-sub-panel="pos"')[1]
     assert "Take-profit <s>0.10%</s> dropped: below round-trip cost (break-even 0.11%)" in pos
+
+
+def _change_button(page: str) -> str:
+    return re.search(r'<button type="button" class="secondary" data-open="dlg-settings"[^>]*>', page).group(0)
+
+
+def test_change_settings_is_disabled_with_the_reason_while_stopped_or_the_fund_is_halted(client, monkeypatch):  # noqa: F811
+    from sleeve_fund.dashboard import compliance
+
+    c, store = client
+    _sleeve(store)
+    store.set_desired_state("btc-x", "stopped")
+    assert 'disabled title="It is stopped: start it to change its settings"' in _change_button(
+        c.get("/sleeves/btc-x", auth=AUTH).text)
+    store.set_desired_state("btc-x", "running")
+    page = c.get("/sleeves/btc-x", auth=AUTH).text
+    assert "disabled" not in _change_button(page)
+    assert ">Apply from the next trade</button>" in page.split('id="dlg-save"')[1]  # the confirm, with the reason pick
+    monkeypatch.setattr(compliance, "fund_halt", lambda store: "drawdown 15% from the peak")
+    assert 'disabled title="The fund is halted: drawdown 15% from the peak"' in _change_button(
+        c.get("/sleeves/btc-x", auth=AUTH).text)

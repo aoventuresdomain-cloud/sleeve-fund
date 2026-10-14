@@ -97,13 +97,15 @@
     <div data-sub-panel="settings" role="tabpanel" id="tab-settings-side"{% if signals %} hidden{% endif %}>
       {# Read only. The size setting is never called a cap or a limit (C8). #}
       <dl class="side-kv">
-        <div><dt>Position size</dt><dd>{% if rules.risk_pct is not none %}Risk per trade: {{ '%g'|format(rules.risk_pct) }}% of the fund{% else %}<span class="muted">–</span>{% endif %}</dd></div>
+        <div><dt>Position size</dt><dd>{{ x.profile.max_position_pct|pct0 }} of the fund{% if rules.risk_pct is not none %}<div>Risk per trade: {{ '%g'|format(rules.risk_pct) }}% of the fund</div>{% endif %}</dd></div>
         <div><dt>Order rules</dt><dd>Leverage at most {{ '%g'|format(rules.leverage) }}× · {{ 'SL required' if rules.stop else 'No stop: 1× only' }}</dd></div>
         <div><dt>Model</dt><dd>{{ s.strategy|replace('_', ' ') }}</dd></div>
         <div><dt>Asset and bars</dt><dd>{{ s.instrument }}, {{ bar_label(s.bar_spec) }}</dd></div>
         {% if not backtest_id %}<div><dt>Account</dt><dd><a href="/accounts#acct-{{ account }}">{{ account }}</a></dd></div>{% endif %}
       </dl>
-      {% if not backtest_id and not (two and two.of) %}<p class="side-acts"><button type="button" class="secondary" data-open="dlg-settings">Change settings</button></p>{% endif %}
+      {# Disabled, the reason on hover, while it is stopped or the fund is halted (HoE and Designer, 14 Oct 2026). #}
+      {% if not backtest_id and not (two and two.of) %}{% set no_edit = 'The fund is halted: ' ~ fund_halt if fund_halt else ('It is stopped: start it to change its settings' if s.desired_state != 'running' else '') %}
+      <p class="side-acts"><button type="button" class="secondary" data-open="dlg-settings"{% if no_edit %} disabled title="{{ no_edit }}"{% endif %}>Change settings</button></p>{% endif %}
     </div>
   </aside>
 </div>
@@ -343,7 +345,7 @@
       <div class="eff" data-diff-rows></div>
       <div class="warnbox" data-diff-warn hidden><b>Risk profile change.</b> <span></span> Drawdown so far counts against the new limit.</div>
       {{ reason_picker('save', 'r-save') }}
-      <div class="dlg-actions"><button type="button" class="secondary" data-close>Cancel</button><button data-needs-reason data-needs-change disabled>Save</button></div>
+      <div class="dlg-actions"><button type="button" class="secondary" data-close>Cancel</button><button data-needs-reason data-needs-change disabled>Apply from the next trade</button></div>
     </dialog>
     {% endif %}
   </form>

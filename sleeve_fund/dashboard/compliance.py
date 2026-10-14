@@ -42,6 +42,16 @@ def _gate_book(store: Store):
         return "unreadable"
 
 
+def fund_halt(store: Store) -> str | None:
+    """Why the fund is halted (the gate's own state, until the PM resumes), or None; None too when it can't be read."""
+    from sleeve_fund.paper.portfolio_gate import PaperGate
+
+    try:
+        return PaperGate(store).ledger.state().halted
+    except Exception:  # noqa: BLE001 - unread is not halted; the page's banners say when the book can't be read
+        return None
+
+
 def use_now(store: Store, groups: dict[str, str]) -> dict:
     """{key: {used, what, tone}} for each test against the entry gate's last mark, or {} with `source` unmarked /
     unreadable. Open risk by asset and by group is the gate's own per-holding risk summed; an unmapped asset is in no

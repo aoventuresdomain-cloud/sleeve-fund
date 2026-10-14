@@ -632,6 +632,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                     path=path, journey=None if bt_id else _journey(s, x, path, st().mirror_rows(name, limit=200)),
                     rules=_order_rules(s, x), tp_drop=None if bt_id else _tp_drop(recent, x),
                     contribution=None if bt_id else _contribution(st(), x),
+                    fund_halt=None if bt_id else compliance.fund_halt(st()),
                     bars=[] if bt_id else compliance.strategy_bars(
                         st(), s.instrument.split("/")[0], _risk_to_stop(x, position), s.params.get("risk_per_trade")))
 
