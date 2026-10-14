@@ -162,7 +162,9 @@ def check_books(store) -> Section:
                 sec.add(NOTE, f"{s.name}: not marked yet; the journal is flat with no fills")
             continue
         fills = store.fills(s.name, limit=1)
-        late = "a fill" if fills and fills[0]["ts"] > last["ts"] else _late_cash(store, s.name, last["ts"])
+        # A fill in the mark's own second is late too: the runtime stamps both to the second, and the tick that sends
+        # a flatten marks before its fill is booked (MARK-ON-STOP), so a tie can't show the mark saw the fill.
+        late = "a fill" if fills and fills[0]["ts"] >= last["ts"] else _late_cash(store, s.name, last["ts"])
         if late:
             late_with_fills.append(f"{s.name} had {late}")
             sec.add(NOTE, f"{s.name}: {late} landed after its latest mark ({last['ts']:%H:%M:%S} UTC); compare "
