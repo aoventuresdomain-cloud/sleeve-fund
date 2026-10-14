@@ -768,6 +768,9 @@ class LongFlatStrategy(Strategy):
         self._fills_read: tuple[int, list] | None = None  # (last fill id, the journal's fills then): _position_at
         self._filling = 0.0  # a fill the venue has booked and the journal not yet: on_order_filled, _apply_funding
         self._portfolio = None  # (CloseBatch, name) in a portfolio run (P2-7): opening orders wait for its gate pass
+        # BRIDGE-3 (Advisor 14 Oct ~21:55 UK): the fund's equity an entry is sized from, () -> float, set where the fund
+        # holds the cash (paper's book, a portfolio run). Unset, the Strategy is the whole fund: its own equity.
+        self.fund_equity = None
         # In a portfolio run, what its gate did to each opening order: "<entry|rebalance>_<outcome>" -> count, outcome
         # one of sent, trimmed (sent smaller), below_minimum (trimmed under the venue's minimum, not sent), refused.
         self.portfolio_gate: dict[str, int] = {}
@@ -2164,14 +2167,15 @@ class LongFlatStrategy(Strategy):
         room = Decimal(1) - Decimal(str(self._cfg.cash_buffer)) - fee
         lev = LongFlatStrategy._max_leverage(self)
         limits = {f"{lev:g}x leverage cap": Decimal(str(equity * lev)) * room}
+        base = self._sizing_base(equity)
         if self.runtime is not None:
-            limits[f"{self.runtime.profile.name} risk profile cap"] = Decimal(str(self.runtime.position_budget(equity)))
+            limits[f"{self.runtime.profile.name} risk profile cap"] = Decimal(str(self.runtime.position_budget(base)))
         elif self._cfg.position_cap_pct is not None:
-            limits["risk profile cap"] = Decimal(str(equity * self._cfg.position_cap_pct))
+            limits["risk profile cap"] = Decimal(str(base * self._cfg.position_cap_pct))
         if self._cfg.max_notional is not None:
             limits["largest order cap"] = Decimal(str(self._cfg.max_notional))
         if self._cfg.risk_per_trade and self._stop_frac:
-            limits["risk per trade"] = Decimal(str(equity * self._cfg.risk_per_trade / self._loss_at_stop(side)))
+            limits["risk per trade"] = Decimal(str(base * self._cfg.risk_per_trade / self._loss_at_stop(side)))
         if (cap := self._volume_cap(bar)) is not None:
             limits["share of the bar's volume"] = cap
         size_by = min(limits, key=limits.get)
@@ -3064,15 +3068,14 @@ class LongFlatStrategy(Strategy):
             limits["target weight"] = Decimal(str((self._mark()[0] or float(free.as_decimal())) * weight))
         if self._cfg.max_notional is not None:
             limits["largest order cap"] = Decimal(str(self._cfg.max_notional))
+        base = self._sizing_base(self._mark()[0] or float(free.as_decimal()))
         if self.runtime is not None:
             limits[f"{self.runtime.profile.name} risk profile cap"] = Decimal(
-                str(self.runtime.position_budget(self._mark()[0])))
+                str(self.runtime.position_budget(self._sizing_base(self._mark()[0]))))
         elif self._cfg.position_cap_pct is not None:
-            equity = self._mark()[0] or float(free.as_decimal())
-            limits["risk profile cap"] = Decimal(str(equity * self._cfg.position_cap_pct))
+            limits["risk profile cap"] = Decimal(str(base * self._cfg.position_cap_pct))
         if self._cfg.risk_per_trade:
-            equity = self._mark()[0] or float(free.as_decimal())
-            limits["risk per trade"] = Decimal(str(equity * self._cfg.risk_per_trade / self._loss_at_stop()))
+            limits["risk per trade"] = Decimal(str(base * self._cfg.risk_per_trade / self._loss_at_stop()))
         if (cap := self._volume_cap(bar)) is not None:
             limits["share of the bar's volume"] = cap
         size_by = min(limits, key=limits.get)
@@ -5035,6 +5038,18 @@ class LongFlatStrategy(Strategy):
         if account is None:  # live sandbox: ask the cache directly
             account = self.cache.account_for_venue(self._cfg.instrument_id.venue)
         return account
+
+    def _sizing_base(self, equity: float) -> float:
+        """BRIDGE-3: the equity an entry's size is a share of: the fund's when the fund holds the cash (fund_equity),
+        else this Strategy's own, which is then the whole fund; in both without a gain not yet taken (+ min(0,
+        unrealised)), so a winning position never sizes the next order up. The leverage cap and free cash stay on the
+        Strategy's own margin: they are order-validity rules, not sizing."""
+        if self.fund_equity is not None:
+            return float(self.fund_equity())
+        if self._entry_px is None or not self._entry_qty:
+            return equity
+        gain = (self._entry_side or 1) * self._entry_qty * (self._price() - self._entry_px)
+        return equity - max(gain, 0.0)
 
     def _mark(self, price: float | None = None) -> tuple[float, float, float, float]:
         """(equity, cash, position qty, price) in the quote currency, at `price` (default: the last price)."""
