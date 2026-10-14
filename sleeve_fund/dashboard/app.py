@@ -1731,6 +1731,10 @@ def create_app(store: Store | None = None) -> FastAPI:
             reason = _reason("compliance", form.get("reason", ""), form.get("reason_pick"), form.get("reason_note", ""))
             if not reason:
                 errors.append("a reason is required")
+            if not errors:
+                cur = compliance.as_set(st().compliance())
+                if not compliance_rules.changes(cur[0], tests, cur[1], groups):  # F-LOCKED-OFF: no no-op version
+                    errors.append(f"Nothing changes from version {st().compliance().version}, so nothing was saved")
             if errors:
                 raise ValueError("; ".join(errors))
             version = st().add_compliance_version(compliance.rows(tests), groups, created_by="pm", note=reason,

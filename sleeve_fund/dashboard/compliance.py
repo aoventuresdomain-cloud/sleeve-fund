@@ -178,7 +178,9 @@ def from_form(form) -> tuple[dict[str, dict], dict[str, str], list[str]]:
             errors.append(f"{rules.name(r.key)}: '{raw}' isn't a number.")
             continue
         tests[r.key] = {"limit": v / 100 if r.unit == "%" else v,
-                        "enabled": r.locked or form.get(f"{r.key}.enabled") in ("on", "1", "true")}
+                        # As asked, locked or not: a locked test asked off is refused by validate(), never quietly put back on
+                        # (F-LOCKED-OFF). The page sends a locked test's on as a hidden field.
+                        "enabled": form.get(f"{r.key}.enabled") in ("on", "1", "true")}
     groups = {}
     for key in form:
         if key.startswith("group.") and form.get(key) in rules.GROUPS:

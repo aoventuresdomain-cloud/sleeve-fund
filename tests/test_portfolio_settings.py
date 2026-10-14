@@ -38,7 +38,9 @@ def _form(**over) -> dict:
     f = {"expected_version": "1", "asset_stop_loss.limit": "4", "type_stop_loss.limit": "6",
          "fund_stop_loss.limit": "10", "asset_stop_loss.enabled": "on", "type_stop_loss.enabled": "on", "fund_gross.limit": "1.5", "asset_net.limit": "0.5", "fund_margin.limit": "50",
          "fund_day_loss.limit": "3", "fund_drawdown.limit": "15", "fund_gross.enabled": "on", "asset_net.enabled": "on",
-         "fund_margin.enabled": "on", "group.BTC": "large", "group.ETH": "large", "group.SOL": "mid", "group.XRP": "mid"}
+         "fund_margin.enabled": "on",
+         # The locked tests: the page sends their on as a hidden field (F-LOCKED-OFF).
+         "fund_stop_loss.enabled": "on", "fund_day_loss.enabled": "on", "fund_drawdown.enabled": "on", "group.BTC": "large", "group.ETH": "large", "group.SOL": "mid", "group.XRP": "mid"}
     f.update(over)
     return {k: v for k, v in f.items() if v is not None}
 
@@ -103,7 +105,7 @@ def test_locked_tests_and_bounds_are_refused_on_the_form_and_on_the_server(ps):
 
 def test_a_stale_form_is_refused_rather_than_overwrite_a_newer_version(ps):
     c, store = ps
-    ok = c.post("/portfolio-settings/apply", data={**_form(), "reason_pick": "New asset or group"}, auth=AUTH,
+    ok = c.post("/portfolio-settings/apply", data={**_form(**{"group.ADA": "small"}), "reason_pick": "New asset or group"}, auth=AUTH,
                 headers=SAME, follow_redirects=False)
     assert ok.status_code == 303
     again = c.post("/portfolio-settings/apply", data={**_form(**{"fund_gross.limit": "1.2"}),
@@ -167,3 +169,22 @@ def test_each_row_carries_the_share_of_its_limit_used_as_a_number():
     with mock.patch.object(compliance, "use_now", return_value=use):
         rows = {r["key"]: r for g in compliance.page(store)["tests"] for r in g["rows"]}
     assert rows["fund_gross"]["fill"] == 50.0 and rows["asset_net"]["fill"] is None
+
+
+def test_asking_a_locked_test_off_is_refused_in_words_and_writes_nothing(ps):
+    """F-LOCKED-OFF (Box C): the form quietly put a locked test back on, and Apply then wrote a version that changed
+    nothing. A locked test asked off is refused, by name, and no version is written; nor is a set that changes nothing."""
+    c, store = ps
+    edit = c.get("/portfolio-settings?edit=1", auth=AUTH).text
+    for key in ("fund_stop_loss", "fund_day_loss", "fund_drawdown"):
+        assert f'<input type="hidden" name="{key}.enabled" value="on">' in edit
+    off = _form(**{"fund_drawdown.enabled": None})
+    r = c.post("/portfolio-settings/review", data=off, auth=AUTH, headers=SAME)
+    assert "T5 Drawdown halt can be changed, but it can&#39;t be switched off." in r.text and "Not saved." in r.text
+    r = c.post("/portfolio-settings/apply", data={**off, "reason_pick": "Tighter while testing"}, auth=AUTH,
+               headers=SAME, follow_redirects=False)
+    assert r.status_code == 400 and "T5 Drawdown halt can be changed, but it can't be switched off." in r.text
+    same = c.post("/portfolio-settings/apply", data={**_form(), "reason_pick": "Tighter while testing"}, auth=AUTH,
+                  headers=SAME, follow_redirects=False)
+    assert same.status_code == 400 and "Nothing changes from version 1, so nothing was saved" in same.text
+    assert _n(store) == 1
