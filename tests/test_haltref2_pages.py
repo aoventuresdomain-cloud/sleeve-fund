@@ -5,6 +5,9 @@ import re
 from html import unescape
 
 import pytest
+from test_dashboard import (
+    _strategy_accounts,  # noqa: F401 - in the book, as on the paper account (F229-6)
+)
 from test_f_haltref_2 import HALT_FLATTEN, HELD, WHY, T, _runtime, store  # noqa: F401
 
 PAGES = ("/", "/sleeves/s1", "/orders", "/alerts", "/records", "/risk", "/trades")
@@ -39,7 +42,8 @@ def test_a_halt_flatten_reads_as_the_portfolio_halt_on_every_page(pages):
     for path, words in out.items():
         assert "flattened by PM" not in words and "Flattened by PM" not in words and "Pm flatten" not in words, path
     assert f"Paused: flattened by the portfolio halt: {WHY}. " in out["/sleeves/s1"]  # the banner: one full stop
-    assert f"s1 is paused: flattened by the portfolio halt: {WHY}. " in out["/risk"]
+    # Main's Action needed list ends its lines without a full stop: the halt's words, never two stops.
+    assert f"s1 is paused: flattened by the portfolio halt: {WHY}" in out["/risk"] and f"{WHY}.." not in out["/risk"]
     assert f"Flattened by the portfolio halt {HALT_FLATTEN}{WHY}" in out["/sleeves/s1"]  # the activity row
 
 
