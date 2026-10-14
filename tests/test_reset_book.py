@@ -201,3 +201,13 @@ def test_the_dry_run_names_what_leaves_the_old_book(store):
     lines = reset_book.plan(store, SLATE, D(100_000))
     (taken,) = [line for line in lines if line.startswith("would take out of the old book")]
     assert sorted(taken.split(": ", 1)[1].split(", ")) == sorted(["old 5,000.00", f"{run} 250.00"])
+
+
+def test_the_dry_run_names_a_put_away_still_waiting_to_leave_the_book(store):
+    """HoQA R1: what the deposit waits on is in the preview the PM signs off, as the run says it."""
+    _book(store)
+    with store._put_away("rsi-bands-ls-binance", T0 + timedelta(minutes=3), "put away before the reset"):
+        pass
+    lines = reset_book.plan(store, SLATE, D(100_000))
+    assert "waiting to leave the book first, at the supervisor's next mark: rsi-bands-ls-binance 10,000.00" in lines
+    assert lines[2] == "would put away: ping-pong-ls-binance"
