@@ -41,10 +41,18 @@ def stored(tmp_path, monkeypatch):
     return store, bars, hole
 
 
+def _hours_back(bars: pd.DataFrame) -> pd.Timedelta:
+    """3 hours back, or 4 when a 30-minute hole 3 hours back would straddle midnight UTC, so the hole's text names one
+    day whenever CI runs (F-SG-MIDNIGHT: these failed on every run between 02:30 and 03:00 UTC)."""
+    start = bars.index[-1] - pd.Timedelta(hours=3)
+    same_day = start.date() == (start + pd.Timedelta(minutes=29)).date()
+    return pd.Timedelta(hours=3 if same_day else 4)
+
+
 def test_a_new_strategy_is_refused_while_its_warm_up_window_has_a_gap(client, stored):  # noqa: F811
     c, store = client
-    _, _, hole = stored
-    start = hole(pd.Timedelta(hours=3))
+    _, bars, hole = stored
+    start = hole(_hours_back(bars))
     r = _new(c)
     where = r.headers["location"]
     assert r.status_code == 303 and where.startswith("/sleeves/new?")
@@ -55,6 +63,27 @@ def test_a_new_strategy_is_refused_while_its_warm_up_window_has_a_gap(client, st
     assert error == (f"history gaps in warm-up window: BTC/USD {start:%d %b %H:%M}-{end:%H:%M} UTC; "
                      "it can start once they are filled")  # names the hole, by its missing minutes
     assert [s.name for s in store.sleeves()] == []  # nothing was created
+
+
+def test_a_hole_across_midnight_names_its_end_date(client, stored):  # noqa: F811
+    """The other side of F-SG-MIDNIGHT: a hole from 23:40 to 00:09 UTC reads "23:40 to <day> 00:09", whenever CI
+    runs (the most recent midnight at least an hour back, so the whole hole is stored history)."""
+    c, store = client
+    hs, bars, hole = stored
+    midnight = bars.index[-1].normalize()
+    if bars.index[-1] - midnight < pd.Timedelta(hours=1):
+        midnight -= pd.Timedelta(days=1)
+    start = hole(bars.index[-1] - (midnight - pd.Timedelta(minutes=20)))
+    end = start + pd.Timedelta(minutes=29)
+    if end.month != start.month:  # the hole's last minutes are in the next month's file
+        _hole(hs, VENUE, PAIR, end.strftime("%Y-%m"), start, 30)
+    from urllib.parse import parse_qs, urlparse
+
+    error = parse_qs(urlparse(_new(c).headers["location"]).query)["error"][0]
+    assert (start.hour, start.minute, end.hour, end.minute) == (23, 40, 0, 9)
+    assert error == (f"history gaps in warm-up window: BTC/USD {start:%d %b} 23:40 to {end:%d %b} 00:09 UTC; "
+                     "it can start once they are filled")
+    assert [s.name for s in store.sleeves()] == []
 
 
 def test_a_gap_older_than_the_warm_up_window_holds_nothing_back(client, stored):  # noqa: F811
@@ -71,7 +100,7 @@ def test_a_start_is_refused_and_journaled_while_the_window_has_a_gap_and_starts_
     hs, bars, hole = stored
     assert _new(c).headers["location"] == "/sleeves/btc-test"  # created on clean history
     c.post("/sleeves/btc-test/command", data={"command": "stop", "reason": "x"}, auth=AUTH, headers=SAME)
-    gap = hole(pd.Timedelta(hours=3))
+    gap = hole(_hours_back(bars))
 
     def start():
         return c.post("/sleeves/btc-test/command", data={"command": "start", "reason": "go"}, auth=AUTH,
@@ -110,7 +139,7 @@ def test_a_model_registered_without_a_module_of_its_own_starts_on_its_own_settin
     from sleeve_fund.strategies import REGISTRY
 
     c, store = client
-    _, _, hole = stored
+    _, bars, hole = stored
     monkeypatch.setitem(REGISTRY, "regonly", REGISTRY["trend_filter"])
     store.create_sleeve(name="reg-only", strategy="regonly", instrument=PAIR, bar_spec="1-HOUR-LAST-INTERNAL",
                         starting_balance=5000, params={"fast": 10, "slow": 30}, warmup_bars=40,
@@ -122,7 +151,7 @@ def test_a_model_registered_without_a_module_of_its_own_starts_on_its_own_settin
 
     assert "command_error" not in command("start") and store.sleeve("reg-only").desired_state == "running"
     command("stop")
-    gap = hole(pd.Timedelta(hours=3))
+    gap = hole(_hours_back(bars))
     assert "command_error=history" in command("start") and store.sleeve("reg-only").desired_state == "stopped"
     (ev,) = [e for e in store.events("reg-only") if e["kind"] == "start_refused"]
     assert ev["message"].startswith(f"history gaps in warm-up window: BTC/USD {gap:%d %b %H:%M}-")

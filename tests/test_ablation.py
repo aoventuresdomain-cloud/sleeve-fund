@@ -206,7 +206,7 @@ def test_on_real_backtests_the_report_runs_and_is_repeatable(prices, instrument)
     days = prices.index
     windows = [(days[400], days[599]), (days[600], days[799])]
     evaluate = ablation.backtest_evaluator(prices, instrument, windows, bar_minutes=1440, half_spread=0,
-                                           holdout_start=days[800])
+                                           holdout_start=days[800], risk_profile="balanced")
     defn = REAL
     one, two = ablate(defn, evaluate), ablate(defn, evaluate)
     assert section(one) == section(two)
@@ -253,7 +253,8 @@ def test_the_1x_pair_keeps_the_profiles_caps_and_drops_only_its_halts(prices, in
     one_x = run(True, "tight")
     assert not any(e["kind"] in halts for e in one_x.risk_events)
     assert 0 < one_x.exposure.max() < 0.4  # sized at the 33% cap (the marks drift with the price after entry)
-    assert run(True, None).exposure.max() > 0.5  # without a profile it would not
+    with pytest.raises(ValueError, match="an ablation needs a risk profile"):
+        run(True, None)  # F235-6: never uncapped
 
     # CR F235-5: a 1x short on a perp. The switch is explicit, so no halt or pause level is priced at all: the run
     # never halts, every fill is at a finite price, and the short stays within the cap.
@@ -279,7 +280,7 @@ def test_an_ablation_window_reaching_the_holdout_is_refused(prices, instrument):
     days = prices.index
     with pytest.raises(ValueError, match="never reads the held-back period"):
         ablation.backtest_evaluator(prices, instrument, [(days[600], days[800])], bar_minutes=1440,
-                                    holdout_start=days[800])
+                                    holdout_start=days[800], risk_profile="balanced")
 
 
 def test_an_ablation_reads_no_bar_of_the_holdout(prices, instrument):
@@ -289,9 +290,9 @@ def test_an_ablation_reads_no_bar_of_the_holdout(prices, instrument):
     changed = prices.copy()
     changed.loc[changed.index >= days[800], ["open", "high", "low", "close"]] *= 3
     one = ablation.backtest_evaluator(prices, instrument, windows, bar_minutes=1440, half_spread=0,
-                                      holdout_start=days[800])(REAL, False)
+                                      holdout_start=days[800], risk_profile="balanced")(REAL, False)
     two = ablation.backtest_evaluator(changed, instrument, windows, bar_minutes=1440, half_spread=0,
-                                      holdout_start=days[800])(REAL, False)
+                                      holdout_start=days[800], risk_profile="balanced")(REAL, False)
     assert one == two
 
 
@@ -304,9 +305,9 @@ def test_an_ablation_overlapping_an_opened_holdout_is_refused_and_opens_no_lock(
     before = locks.store.holdout_locks("idea")
     with pytest.raises(ValueError, match="overlaps this idea's opened holdout"):
         ablation.backtest_evaluator(prices, instrument, [(days[550], days[650])], bar_minutes=1440,
-                                    holdout_start=None, locks=locks, idea_hash="idea")
+                                    holdout_start=None, locks=locks, idea_hash="idea", risk_profile="balanced")
     ablation.backtest_evaluator(prices, instrument, [(days[600], days[699])], bar_minutes=1440,
-                                holdout_start=None, locks=locks, idea_hash="idea")  # after it: fine
+                                holdout_start=None, locks=locks, idea_hash="idea", risk_profile="balanced")  # after it
     assert locks.store.holdout_locks("idea") == before
     assert locks.store.holdout_locks() == before
 
@@ -318,3 +319,29 @@ def test_f235_5_halts_off_drops_only_the_drawdown_halt_and_the_daily_pause():
     assert risk.check(p, 50.0, 100.0, 100.0).action == "halt"  # 50% down: the halt
     assert risk.check(p, 50.0, 100.0, 100.0, halts=False) is None
     assert risk.check(p, 0.0, 100.0, 100.0, halts=False).action == "halt"  # a book that can't be valued still halts
+
+
+@pytest.mark.parametrize("engine", ["sqlite", "postgres"])
+@pytest.mark.parametrize("profile", [None, "no_such_profile"])
+def test_f235_6_an_ablation_with_no_risk_profile_is_refused_before_anything_runs(prices, instrument, tmp_path,
+                                                                                  monkeypatch, engine, profile):
+    """F235-6: no ablation row runs uncapped. None, or a name with no profile, is refused when the evaluator is built,
+    before a backtest runs or a lock is read, on either engine."""
+    import os
+
+    from sleeve_fund.research import runner
+    from sleeve_fund.research.holdout import HoldoutLocks
+
+    url = os.environ.get("TEST_DATABASE_URL") if engine == "postgres" else f"sqlite:///{tmp_path}/t.db"
+    if not url:
+        pytest.skip("Postgres only: TEST_DATABASE_URL")
+    locks = HoldoutLocks(Store(url))
+    monkeypatch.setattr(runner, "run_backtest", lambda *a, **k: pytest.fail("a backtest ran"))
+    monkeypatch.setattr(locks, "lock", lambda *a, **k: pytest.fail("a lock was read"))
+    days = prices.index
+    with pytest.raises(ValueError, match="needs a risk profile|unknown risk profile"):
+        ablation.backtest_evaluator(prices, instrument, [(days[400], days[599])], bar_minutes=1440, half_spread=0,
+                                    holdout_start=days[800], locks=locks, idea_hash="idea", risk_profile=profile)
+    with pytest.raises(TypeError, match="risk_profile"):
+        ablation.backtest_evaluator(prices, instrument, [(days[400], days[599])], bar_minutes=1440,
+                                    holdout_start=days[800])  # left out: no default to fall back on

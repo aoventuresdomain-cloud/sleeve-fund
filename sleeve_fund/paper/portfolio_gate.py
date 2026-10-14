@@ -13,19 +13,18 @@ the gate answers None for them and they are sent as they are, even while the por
 
 from __future__ import annotations
 
-import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
 
 from sqlalchemy import select
 
-from sleeve_fund.gate_ledger import DbLedger, TaggedIntent
+from sleeve_fund.gate_ledger import DbLedger
 from sleeve_fund.money import to_decimal
 from sleeve_fund.portfolio.gate import Checked, check_order
 from sleeve_fund.portfolio.holding import Position, holding_for, underlying
 from sleeve_fund.portfolio.limits import Holding, rejected
-from sleeve_fund.research.portfolio import Gated, _utc, gate_intent
+from sleeve_fund.research.portfolio import Gated, _utc, tagged_intent
 from sleeve_fund.risk import PORTFOLIO, PortfolioProfile
 from sleeve_fund.store import OPEN_ORDER_STATUSES, Store, gate_decisions_t, orders_t, utcnow
 
@@ -95,12 +94,7 @@ class PaperGate:
             return None
         now = _utc(ts_ns)
         try:
-            order = gate_intent(intent)
-            bar = intent.get("bar")
-            tagged = TaggedIntent(**{f: getattr(order, f) for f in order.__dataclass_fields__},
-                                  intent_id=str(intent.get("intent_id") or uuid.uuid4().hex),
-                                  kind=str(intent.get("what") or "entry"),
-                                  bar_ts=_utc(int(bar)) if isinstance(bar, int) else now)
+            tagged = tagged_intent(intent, now)  # the portfolio backtest builds it the same way (P2-7)
         except Exception as e:  # noqa: BLE001 - an order the gate can't read is never sent
             why = f"Entry rejected: the portfolio check couldn't run ({type(e).__name__}: {e}), so nothing is sent"
             self.ledger.alert("portfolio_check_failed", f"{strategy}: {why}", now)
