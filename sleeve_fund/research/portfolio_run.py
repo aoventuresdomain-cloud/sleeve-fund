@@ -72,6 +72,7 @@ class LegSpec:
     capital: float = 10_000.0
     half_spread: float | None = None
     fees: FeeSchedule | None = None
+    risk_profile: str | None = None  # paper's: its position cap and leverage, as run_backtest's (B7 replays paper)
 
 
 @dataclass
@@ -201,9 +202,12 @@ def run_portfolio(specs: list[LegSpec], profile: PortfolioProfile = PORTFOLIO, u
     (Done-when 3)."""
     _check(specs)
     order = tuple(s.name for s in specs)
+    # A Strategy deciding on bars as short as its execution bars is fed its decision bars alone (run_backtest's
+    # own rule); its exec_prices still mark it every hour.
     plans = [plan_run(s.strategy, s.prices, s.instrument, s.params, s.capital, bar_minutes=s.bar_minutes,
-                      exec_prices=s.exec_prices, exec_minutes=s.exec_minutes, half_spread=s.half_spread, fees=s.fees,
-                      warmup_prices=s.warmup_prices) for s in specs]
+                      exec_prices=None if s.exec_minutes == s.bar_minutes else s.exec_prices,
+                      exec_minutes=s.exec_minutes, half_spread=s.half_spread, fees=s.fees,
+                      warmup_prices=s.warmup_prices, risk_profile=s.risk_profile) for s in specs]
     hours = {s.name: _closes(s.exec_prices) for s in specs}
     grid = sorted(set().union(*(h.index for h in hours.values())))
     window = int(min(s.prices.index[0] for s in specs).value)
@@ -224,7 +228,12 @@ def run_portfolio(specs: list[LegSpec], profile: PortfolioProfile = PORTFOLIO, u
             h = hours[spec.name]
             at = h.index.searchsorted(pd.Timestamp(ts_ns, tz="UTC"), side="right") - 1
             if at < 0:
-                continue
+                # Before the window's first hourly close (a window opening inside an hour, as B7's replay of paper):
+                # its last execution bar's close, so the Strategy's own equity is in the book from its first decision.
+                h = spec.exec_prices
+                at = h.index.as_unit("ns").searchsorted(pd.Timestamp(ts_ns, tz="UTC"), side="right") - 1
+                if at < 0:
+                    continue
             close = float(h["close"].iloc[at])
             atr = leg.strategy._daily_atr.get((ts_ns - 1) // DAY_NS * DAY_NS)
             try:
