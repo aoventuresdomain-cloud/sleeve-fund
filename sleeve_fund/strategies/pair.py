@@ -312,6 +312,13 @@ class Pair:
         if self.lead._portfolio is not None or self.follow._portfolio is not None:
             leg._note("pair_entry_refused", "Entry refused: a two-leg Strategy doesn't run in a portfolio run yet")
             return
+        if (cant := self._cant_open()) is not None:
+            # Either leg blocked (liquidated, halted, paused, stale data...): no order on either, in that leg's own
+            # words, rather than one leg sent and filled and then unwound (HoQA F283-L1).
+            each, why = cant
+            leg._note("pair_entry_refused", f"Entry refused: the {'first' if each is self.lead else 'second'} leg "
+                                            f"can't open: {why}")
+            return
         px = float(signal.get("close") or leg._price())
         f_qty = self._sized(self.follow, qty, self.lead, px)
         lead_part = {"leg": self.lead, "qty": qty, "reason": reason, "signal": signal, "tries": 0}
@@ -373,26 +380,32 @@ class Pair:
         if part.get("held") is not None:
             part["leg"].runtime.store.release_held(part.pop("held"))
 
-    def _retry_refusal(self, leg: LongFlatStrategy) -> str | None:
-        """Why the second leg's retry is not sent and the pair unwinds instead (Advisor, leg-2 retry MUST 3): a halt,
-        pause or stale data on either leg, its venue pin not matching, or the coordinator gone: on paper, also when the
-        journal no longer holds this trade legging (another writer moved it, so this coordinator lost it) or its state
-        can't be read (Advisor 14 Oct 12:20 UK)."""
+    def _cant_open(self) -> tuple[LongFlatStrategy, str] | None:
+        """The first leg that may not open now, and why, else None: a halt, pause or liquidation (can_open), and on
+        paper CHOKE too (runtime.entry_blocked: stale data, a degraded candle, the portfolio's block; CR F283-4). Asked
+        before a pair's entry sends anything (HoQA F283-L1) and before a second leg's retry (Advisor leg-2 MUST 3)."""
         for each in (self.lead, self.follow):
-            if each.pair is not self:
-                return "its coordinator is gone"
             rt = each.runtime
             if rt is None:
                 continue
             if rt.backtest:
                 if not rt.can_open():
-                    return f"a leg is {rt.status}"
+                    return each, f"a leg is {rt.status}"
                 continue
-            # CHOKE on each leg, not can_open alone: stale data, a degraded candle or the portfolio's block on the
-            # other leg unwinds the pair too (CR F283-4).
             blocked, why = rt.entry_blocked()
             if blocked or not rt.can_open():
-                return why or f"a leg is {rt.status}"
+                return each, why or f"a leg is {rt.status}"
+        return None
+
+    def _retry_refusal(self, leg: LongFlatStrategy) -> str | None:
+        """Why the second leg's retry is not sent and the pair unwinds instead (Advisor, leg-2 retry MUST 3): a halt,
+        pause or stale data on either leg, its venue pin not matching, or the coordinator gone: on paper, also when the
+        journal no longer holds this trade legging (another writer moved it, so this coordinator lost it) or its state
+        can't be read (Advisor 14 Oct 12:20 UK)."""
+        if any(each.pair is not self for each in (self.lead, self.follow)):
+            return "its coordinator is gone"
+        if (cant := self._cant_open()) is not None:
+            return cant[1]
         if getattr(self, "_store", None) is not None:
             try:
                 row = self._store.pair_state(self._parent)

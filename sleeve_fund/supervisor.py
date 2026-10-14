@@ -886,6 +886,52 @@ def dust_holdings(store: Store) -> list[tuple[str, Decimal, Decimal]]:
     return held
 
 
+def rebase_figures(store: Store) -> list[str]:
+    """The re-base's figures line by line (F-HALTREF-5), printed by the dry run and the real run alike: every Strategy
+    with whether the fund's book counts it and why, its starting balance, its journal's cash with the fills, fees,
+    funding and insurance behind it, and what it adds to the true book and to the capital put in; each reset run's
+    fills; the dust held against the cap. Reads only. The two totals are fund_equity's and capital_in's."""
+    from sleeve_fund.store import is_backtest
+
+    runs = store.reset_runs()
+    out = [("Strategy | book | starting balance | journal cash | fills | fees | funding | insurance | position | "
+            "true book | capital")]
+    equity_sum = capital_sum = Decimal(0)
+    for s in store.sleeves():
+        if is_backtest(s.name):
+            continue
+        fills = store.fills(s.name, limit=1_000_000)
+        fees = sum((to_decimal(f["fee"], "fee") for f in fills), Decimal(0))
+        cash = to_decimal(store.strategy_cash_pnl(s.name), "cash")
+        qty = to_decimal(store.journal_book(s.name, s.starting_balance)["qty"], "qty")
+        if outside_fund_book(store, s):
+            where, equity, capital = "out: a test account (F229-6)", Decimal(0), Decimal(0)
+        elif s.name in runs:
+            where, capital = f"in: a reset's run ({runs[s.name]:%d %b %H:%M} UTC), its cash only", Decimal(0)
+            equity = strategy_equity(store, s, runs)
+        else:
+            where, capital = "in", to_decimal(s.starting_balance, "starting balance")
+            equity = strategy_equity(store, s, runs)
+        equity_sum += equity
+        capital_sum += capital
+        out.append(f"{s.name} | {where} | {to_decimal(s.starting_balance, 'starting balance'):,.2f} | {cash:,.2f} | "
+                   f"{len(fills)} | {fees:,.2f} | {store.funding_total(s.name):,.2f} | "
+                   f"{store.insurance_total(s.name):,.2f} | {qty.normalize():f} | {equity:,.2f} | {capital:,.2f}")
+    out.append(f"total | | | | | | | | | {equity_sum:,.2f} | {capital_sum:,.2f}")
+    for name in runs:
+        for f in sorted(store.fills(name, limit=1_000_000), key=lambda f: (f["ts"], f["id"])):
+            out.append(f"  {name} fill {f['id']} {f['ts']:%d %b %H:%M:%S} {f['side']} {to_decimal(f['qty'], 'qty').normalize():f} "
+                       f"at {to_decimal(f['price'], 'price'):,.2f}, fee {to_decimal(f['fee'], 'fee'):,.4f}")
+    dust = dust_holdings(store)
+    total = sum((abs(v) for _, _, v in dust), Decimal(0))
+    book = fund_equity(store)
+    share = f"{total / book:.4%}" if book > 0 else "n/a"
+    out.append(f"dust: {len(dust)} holding(s) worth {total:,.4f}, {share} of the book "
+               f"(cap {DUST_SHARE:.1%}, {book * DUST_SHARE:,.2f})"
+               + "".join(f"; {n} {q.normalize():f} worth {v:,.4f}" for n, q, v in dust))
+    return out
+
+
 def rebase_halt_ref_1(store: Store, actor: str, commit: str, now: datetime | None = None
                       ) -> tuple[PortfolioState, PortfolioState, str]:
     """HALT-REF-1's one-off clean-up (Advisor, 14 Oct 09:00 and 09:10 UK): the paper portfolio's state missed every
@@ -965,6 +1011,8 @@ def _rebase_command(store: Store, args) -> int:
     others = [w for w in refusals if "could trade once the halt clears" not in w]  # what a pause can't answer
     if not others:
         print(f"true book (fund equity): {fund_equity(store)}; capital put in: {capital_in(store)}")
+    for line in rebase_figures(store):
+        print(line)
     for why in refusals:
         print(f"refused: {why}")
     if not args.yes:
