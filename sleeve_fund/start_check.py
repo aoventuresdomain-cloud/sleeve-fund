@@ -117,6 +117,25 @@ def check_venues(engine: Engine) -> Section:
     return sec
 
 
+def _late_cash(store, name: str, since) -> str | None:
+    """A funding settlement or true-up, or an insurance-fund cover, that moved the journal's cash after the latest
+    mark (CR F276-1): the mark's cash is behind it until the next mark, as with a late fill."""
+    from sleeve_fund.store import funding_t, insurance_t
+
+    with store.engine.connect() as c:
+        for what, t in (("a funding payment", funding_t), ("an insurance-fund cover", insurance_t)):
+            moved = store._cash_moved_at(t)  # a true-up moves cash at its arrival (CASH-4)
+            if c.execute(select(t.c.id).where(t.c.sleeve == name, moved > since).limit(1)).first() is not None:
+                return what
+    return None
+
+
+def _qty(x):
+    """A position for the page (F276-4): Postgres NUMERIC hands it back as a Decimal at its full scale, so a flat one
+    would read 0e-18 and 0.1 would read 0.100000000000; a float's -0 reads 0."""
+    return 0 if x == 0 else float(x)
+
+
 def check_books(store) -> Section:
     """The dashboard's figures against the journal, for exactly the Strategies the dashboard's book counts
     (app.current_sleeves: every one but an earlier book's, store.previous_book, which holds the reset runs; an archived
@@ -137,15 +156,16 @@ def check_books(store) -> Section:
         last = store.last_equity(s.name)
         if last is None:
             if abs(book["qty"]) > 1e-12 or book["fills"]:
-                sec.add(FAIL, f"{s.name}: the journal has {book['fills']} fills and holds {book['qty']:.12g}, and "
-                              "the dashboard has no mark to show it")
+                sec.add(FAIL, f"{s.name}: the journal has {book['fills']} fills and holds "
+                              f"{_qty(book['qty']):.12g}, and the dashboard has no mark to show it")
             else:
                 sec.add(NOTE, f"{s.name}: not marked yet; the journal is flat with no fills")
             continue
         fills = store.fills(s.name, limit=1)
-        if fills and fills[0]["ts"] > last["ts"]:
-            late_with_fills.append(s.name)
-            sec.add(NOTE, f"{s.name}: a fill landed after its latest mark ({last['ts']:%H:%M:%S} UTC); compare "
+        late = "a fill" if fills and fills[0]["ts"] > last["ts"] else _late_cash(store, s.name, last["ts"])
+        if late:
+            late_with_fills.append(f"{s.name} had {late}")
+            sec.add(NOTE, f"{s.name}: {late} landed after its latest mark ({last['ts']:%H:%M:%S} UTC); compare "
                           "again after the next mark")
             continue
         compared += 1
@@ -158,8 +178,8 @@ def check_books(store) -> Section:
         price, equity = float(last["price"]), float(last["equity"])
         want = float(book["cash"]) + float(book["qty"]) * price
         equity_tol = cash_tol + qty_tol * abs(price) + 4 * math.ulp(max(abs(want), abs(equity)))
-        what = (f"{s.name}: position {last['qty']:.12g} vs journal {book['qty']:.12g}; cash {last['cash']:,.2f} vs "
-                f"journal {book['cash']:,.2f} ({book['fills']} fills)")
+        what = (f"{s.name}: position {_qty(last['qty']):.12g} vs journal {_qty(book['qty']):.12g}; "
+                f"cash {last['cash']:,.2f} vs journal {book['cash']:,.2f} ({book['fills']} fills)")
         if abs(d_qty) > qty_tol or abs(d_cash) > cash_tol:
             sec.add(FAIL, what)
         elif equity == 0.0 and want < 0 and markets.is_perp(s.params):
@@ -175,8 +195,8 @@ def check_books(store) -> Section:
         sec.add(NOTE, "no Strategy to compare")
     elif not compared and late_with_fills:
         # Every Strategy with a book was skipped: nothing was actually checked, which is not a pass.
-        sec.add(FAIL, f"nothing was compared: {', '.join(late_with_fills)} had a fill after the latest mark; run "
-                      "again after the next mark")
+        sec.add(FAIL, f"nothing was compared: {'; '.join(late_with_fills)} after the latest mark; run again after "
+                      "the next mark")
     return sec
 
 

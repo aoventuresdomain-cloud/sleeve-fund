@@ -14,6 +14,8 @@ interface (Ledger) so the Data Architect's tables can replace the in-memory one 
 - mark_book: the supervisor's mark of the whole fund, every few seconds: rolls the day, keeps the high-water mark and
   the halt's reference, and sets the halt or the pause (Advisor 9).
 - resume_after_halt: the PM's Resume re-bases the halt's reference to the book then; the true HWM is kept.
+- apply_flow: capital into or out of the book moves the book by it, and scales the HWM, the reference and the day's
+  start with it, so the drawdown and the day's change keep their percentages.
 
 Money is Decimal throughout (sleeve_fund.money); a float for money fails closed here as a rejected entry."""
 
@@ -25,10 +27,10 @@ from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, ExitStack, contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import ROUND_HALF_EVEN, Decimal, localcontext
 from typing import Protocol
 
-from sleeve_fund.money import money
+from sleeve_fund.money import PRECISION, QUANTUM, money
 from sleeve_fund.portfolio.limits import Book, Decision, Holding, Intent, book_breach, decide, decide_pair, rejected
 from sleeve_fund.risk import PortfolioProfile, trading_day
 
@@ -372,17 +374,35 @@ def resume_after_halt(ledger: Ledger) -> PortfolioState:
 
 
 def apply_flow(ledger: Ledger, amount) -> None:
-    """Capital added (> 0) or withdrawn (< 0): the book, the HWM, the halt's reference and the day's start move by
-    it, so a deposit isn't a gain and a withdrawal isn't a loss (Advisor 3)."""
+    """Capital added (> 0) or withdrawn (< 0), so a deposit isn't a gain and a withdrawal isn't a loss (Advisor 3).
+    The book moves by it, and the HWM, the halt's reference and the day's start each scale by (book + amount) / book,
+    so the drawdown and the day's change keep their percentages (Advisor MUST, 14 Oct 09:45 UK): a shift by the
+    amount would dilute a drawdown on a deposit (90 against 100 is 10% down; 190 against 200, 5%) and deepen it on a
+    withdrawal. Exact, to the column's 18 places. Refused (ValueError) on a book of 0 or less before or after, or one
+    never marked: no ratio then, so the move fails closed; except a deposit into a book at 0 that never had a
+    high-water mark (an empty fund, as a fresh stack marks it), which starts the book at the deposit."""
     amount = money(amount, "amount")
     with ledger.lock():
         st = ledger.state()
+        book = st.equity
+        if book is not None and book == 0 and not st.hwm and amount > 0:
+            # An empty fund's first capital (a fresh stack marks 0 before any Strategy is made): there was never a
+            # high-water mark, so no drawdown to keep, and the book starts at the deposit. A book at 0 below a HWM
+            # is a real loss and is still refused below.
+            ledger.set_state(replace(st, equity=amount, hwm=amount, halt_reference=None, day_start_equity=amount))
+            return
+        if book is None or book <= 0 or book + amount <= 0:
+            raise ValueError(f"a flow of {amount:,.2f} on a book of {'none' if book is None else f'{book:,.2f}'} "
+                             "can't keep the book's percentages: refused")
+        with localcontext() as ctx:
+            ctx.prec = 2 * PRECISION  # each product is exact before its one rounding to the column's scale
 
-        def moved(x):
-            return None if x is None else x + amount
+            def scaled(x):
+                return None if x is None else (x * (book + amount) / book).quantize(QUANTUM, ROUND_HALF_EVEN)
 
-        ledger.set_state(replace(st, equity=moved(st.equity), hwm=moved(st.hwm),
-                                 halt_reference=moved(st.halt_reference), day_start_equity=moved(st.day_start_equity)))
+            ledger.set_state(replace(st, equity=book + amount, hwm=scaled(st.hwm),
+                                     halt_reference=scaled(st.halt_reference),
+                                     day_start_equity=scaled(st.day_start_equity)))
 
 
 def sweep(ledger: Ledger, now: datetime, is_live: Callable[[str], bool], cancel: Callable[[str], None] | None,
