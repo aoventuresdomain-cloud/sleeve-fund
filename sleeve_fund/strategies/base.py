@@ -289,6 +289,11 @@ def _hhmm(ns: int) -> str:
     return f"{datetime.fromtimestamp(ns / 1e9, tz=timezone.utc):%H:%M}"
 
 
+def _step_values(values: dict, qty: Decimal | None) -> dict:
+    """A STEPPED model's open: its step's quantity as a limit in _open (none on the cycle's first, sized by share)."""
+    return values if qty is None else {**values, "step_qty": float(qty)}
+
+
 def _side_word(side: int) -> str:
     return "long" if side > 0 else "short" if side < 0 else "flat"
 
@@ -521,6 +526,7 @@ class LongFlatStrategy(Strategy):
     want_long() for all-or-nothing, or target_weight() for anything in between."""
 
     REENTER_AFTER_EXIT_LEG = False  # True: a stop or target ends the model's leg, not locks its side (_lock_exit_leg)
+    STEPPED = False  # True: a perp model that trades by step_orders (part opens and reduces), not want_side
 
     def __init__(self, config: LongFlatConfig) -> None:
         super().__init__(config)
@@ -1846,6 +1852,15 @@ class LongFlatStrategy(Strategy):
     def exit_leg_closed(self) -> None:
         """For a model with REENTER_AFTER_EXIT_LEG: its stop or target closed the position."""
 
+    def step_orders(self, bar: Bar, held: Decimal) -> tuple[list[tuple[str, int, Decimal | None]], str, dict]:
+        """For a STEPPED model: the orders this bar asks for, given the signed quantity held, as (kind, side, qty),
+        kind "close" (all of it, then any open once it fills), "reduce" or "open" (qty None: sized by the limits
+        alone), with the reason and values to journal (_on_bar_stepped)."""
+        raise NotImplementedError
+
+    def entry_sent(self, qty: Decimal, values: dict) -> None:
+        """An opening order of `qty` went out from _open with these values (a STEPPED model reads its size here)."""
+
     def _lock_resumed(self, r: dict) -> None:
         self._exit_lock = r["side"] if self._margin else True
         r["lock_ns"] = None
@@ -2125,6 +2140,37 @@ class LongFlatStrategy(Strategy):
             return
         self._open(side, bar, reason, values)
 
+    def _on_bar_stepped(self, bar: Bar) -> None:
+        """A STEPPED model's decision (the candle-step test): part opens and reduces, from step_orders. A reduce is
+        an exit for what it asks (reduce-only, never gated) and never adds. A flip is two orders, never one double-size
+        order: everything held closes first and the open goes out once the close has filled (_flip, on_order_filled).
+        An open is gated and sized like any entry, with the step's quantity as one more limit."""
+        if self._busy() or self._pending_exit is not None:
+            return  # the last step is still being carried out
+        orders, reason, values = self.step_orders(bar, self._signed_qty())
+        if not orders:
+            return
+        values = {**values, "close": bar.close.as_double()}
+        kind, side, qty = orders[0]
+        opening = next(((s, q) for k, s, q in orders if k == "open"), None)
+        if kind == "close":
+            flip = opening is not None and not self._entry_held(bar, f"{_side_word(opening[0])} entry after closing "
+                                                                     f"the {_side_word(-side)}")
+            self._flip = (opening[0], bar, reason, _step_values(values, opening[1])) if flip else None
+            self._sell_all("exit", reason, values)
+            return
+        if kind == "reduce":
+            qty = qty.quantize(self._lot(), rounding=ROUND_DOWN)
+            if qty <= 0 or qty < self._min_qty():
+                self._note("step_skipped", f"Step skipped: its reduce of {qty} is below the smallest order the venue "
+                           f"takes ({self._min_qty()})", level="info")
+                return
+            self._submit(OrderSide.BUY if side > 0 else OrderSide.SELL, qty, "exit", reason, values)
+            return
+        if self._entry_held(bar, f"{_side_word(side)} entry"):
+            return
+        self._open(side, bar, reason, _step_values(values, qty))
+
     def _open(self, side: int, bar: Bar, reason: str, values: dict) -> None:
         """Open a position on a perpetual, all of it at market: long (side 1) or short (-1). Sized by the
         smallest of the leverage cap, the risk profile's position cap, the largest order cap, the risk per
@@ -2189,6 +2235,10 @@ class LongFlatStrategy(Strategy):
             limits["risk per trade"] = Decimal(str(base * self._cfg.risk_per_trade / self._loss_at_stop(side)))
         if (cap := self._volume_cap(bar)) is not None:
             limits["share of the bar's volume"] = cap
+        if (share := values.get("size_share")) is not None:  # a STEPPED model's first open (candle-step Q)
+            limits["the Strategy's size share"] = Decimal(str(base * share))
+        if (step := values.get("step_qty")) is not None:  # a STEPPED model's later open: Q, never more
+            limits["the step's size"] = Decimal(str(step)) * bar.close.as_decimal()
         size_by = min(limits, key=limits.get)
         budget = limits[size_by]
         qty = (budget / bar.close.as_decimal()).quantize(self._lot(), rounding=ROUND_DOWN)
@@ -2231,6 +2281,7 @@ class LongFlatStrategy(Strategy):
             return
         self._noted.discard("entry_refused_open_risk")
         self._send_entry(OrderSide.BUY if side > 0 else OrderSide.SELL, qty, reason, signal)
+        self.entry_sent(qty, values)
 
     def on_bar(self, bar: Bar) -> None:
         self._deciding = self._deciding_bar = None
@@ -2710,7 +2761,7 @@ class LongFlatStrategy(Strategy):
                 # Funding moves the liquidation price: a stop that never moves is held inside its cap again here.
                 if self._stop_frac is not None and self._hold_stop_capped(self._stop_frac) and self._backtest:
                     self._rest_exits()
-                self._on_bar_sided(bar)
+                (self._on_bar_stepped if self.STEPPED else self._on_bar_sided)(bar)
             return
         raw = self.target_weight(bar)
         if raw is None:
