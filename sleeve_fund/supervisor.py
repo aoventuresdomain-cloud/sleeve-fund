@@ -1084,7 +1084,11 @@ def clear(store: Store, path: str) -> list[str]:
     flatten can trade, and the entry stays open to finish once it is flat: the supervisor retries it about
     every minute, and a retry touches only the strategies it was waiting on, never one added since."""
     with open(path, "rb") as fh:
-        entries = tomllib.load(fh).get("clear", [])
+        return clear_entries(store, tomllib.load(fh).get("clear", []))
+
+
+def clear_entries(store: Store, entries: list[dict]) -> list[str]:
+    """clear's work on its [[clear]] entries, read from a file or given by the PM's reset workflow (CAP5-RESET)."""
     done = {d["reason"].split(":", 1)[0] for d in store.decisions(action="clear", limit=10_000)}
     cleared = []
     for entry in entries:
@@ -1452,9 +1456,19 @@ def main(argv: list[str] | None = None) -> int:
     rb.add_argument("--commit", required=True, help="the deployed commit, for the journal")
     rb.add_argument("--yes", action="store_true", help="pause what could trade, then write it; else a dry run")
     rb.add_argument("--wait", type=float, default=120.0, help="seconds to wait for the pauses to apply")
+    rs = sub.add_parser("reset-book", help="CAP5-RESET only: the PM's clean slate of the paper book, then a fresh deposit")
+    rs.add_argument("--actor", required=True, help="who ran it on the PM's word, for the decision log")
+    rs.add_argument("--commit", required=True, help="the deployed commit, for the journal")
+    rs.add_argument("--id", required=True, help="the reset's id, e.g. 2026-10-21-reset; a second run of it carries on")
+    rs.add_argument("--deposit", default="100000", help="the fund's fresh capital, deposited once the book is empty")
+    rs.add_argument("--dry-run", action="store_true", help="print the book, the steps and what would hold them")
     rn = sub.add_parser("run", help="supervise sleeve processes until stopped")
     rn.add_argument("--clear", help="clean slates file to retry while one waits on a flatten")
     args = ap.parse_args(argv)
+    if args.cmd == "reset-book":
+        from sleeve_fund import reset_book
+
+        return reset_book.main(args)
     store = Store(portfolio_gate=True)
     if args.cmd == "seed":
         print("added:", seed(store, args.paths) or "nothing new")
