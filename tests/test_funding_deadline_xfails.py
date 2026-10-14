@@ -70,9 +70,6 @@ GATE = pytest.mark.xfail(strict=True, raises=AssertionError,
 REVERSAL = pytest.mark.xfail(strict=True, raises=AssertionError,
                              reason="QA FUNDING-DEFER reversal (Advisor 00:40): may follow the gate; must land before "
                                     "paper results are used as G2 evidence")
-TRUE_UP = pytest.mark.xfail(strict=True, raises=AssertionError,
-                            reason="QA O17b true-up (rulings 76/82, with 00:40's never-edit rule): a rate arriving "
-                                   "after the deadline booking is trued up by its own journaled row; not gate 6")
 
 EVENT = "funding_deadline_booked"  # PROVISIONAL name: PE1 to confirm
 DIAG = "funding_charged_while_flat"  # the Advisor's name (00:40)
@@ -529,7 +526,6 @@ def test_a_booking_made_on_time_journals_no_deadline_event(monkeypatch):
 # ======================================================= 9. the true rate after the deadline booking (was Needs-Advisor)
 
 
-@TRUE_UP
 def test_a_true_rate_arriving_after_the_deadline_booking_is_trued_up_by_its_own_row(tmp_path, monkeypatch, binance):
     """The 08:00 rate (0.03%) is published at 08:30, after the bound booked the 0.01% baseline. Rulings 76/82 (O17):
     the baseline is trued up to the actual rate by a journaled correction, its own row on the settlement it corrects,
