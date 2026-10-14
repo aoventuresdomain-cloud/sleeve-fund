@@ -13,7 +13,7 @@
 {% block content %}
 {# The strategy page (combined build F2): header, seven figures, then the desk in tabs. #}
 <div class="page-head" data-live="head">
-  <h1>{{ s.name|leg_label }}</h1> {% if two and two.legs %}{{ leg_flag(two.flags) }} {% endif %}{% if backtest_id %}<span class="chip">Backtest</span>{% else %}{# Until the supervisor catches up, a strategy the PM stopped reads as stopping, not running (round 10, m5). #}{{ chip('stopping' if s.desired_state != 'running' and s.status in ['running', 'starting'] else s.status) }} <span class="chip {{ x.mode }}">{{ x.mode|capitalize }}</span>{% if fill_hold %} <span class="chip paused fill-hold" title="A fill wasn't handled, so its book may be off: it opens nothing new until you resume it. Its stop and exits still work.">Fill hold</span>{% endif %}{% if x.test_account %} {{ test_chip() }}{% endif %}{% endif %}
+  <h1>{{ s.name|leg_label }}</h1> {% if two and two.legs %}{{ leg_flag(two.flags) }} {% endif %}{% if backtest_id %}<span class="chip">Backtest</span>{% else %}{# Until the supervisor catches up, a strategy the PM stopped reads as stopping, not running (round 10, m5). #}{{ chip('stopping' if s.desired_state != 'running' and s.status in ['running', 'starting'] else s.status) }} <span class="chip {{ x.mode }}">{{ x.mode|capitalize }}</span>{% if fill_hold %} <span class="chip paused fill-hold" title="A fill wasn't handled, so its book may be off: it opens nothing new until you resume it. Its stop and exits still work.">Fill hold</span>{% endif %}{% if resetting %} <span class="chip paused" title="A reset is under way: the supervisor closes it and starts it again">Resetting…</span>{% endif %}{% if x.test_account %} {{ test_chip() }}{% endif %}{% endif %}
   {# A second leg takes no command of its own: its Strategy's reach both legs (P2-8, Advisor M2). #}
   {% if not (two and two.of) %}<div class="actions">
     {% set flattening = pending|selectattr('command', 'equalto', 'flatten')|list %}
@@ -76,7 +76,7 @@
 
 {# Six figures (C8). A Strategy holds no capital of its own (CUT-A), so there is no equity tile. #}
 <section class="kpis" aria-label="Strategy figures">
-  <div class="kpi lead" title="{{ x.pnl|smoney }} since start, {{ x.ret|pct1s }} · buy-and-hold, {% if x.cap > 1 %}unlevered{% else %}{{ x.cap|pct0 }} invested{% endif %}: {{ x.bench_ret|pct1s }}"><div class="k">P&amp;L since start</div><div class="v">{{ money_signed(x.pnl) }}</div></div>
+  <div class="kpi lead" title="{% if s.starting_balance > 0 %}{{ x.pnl|smoney }} since start, {{ x.ret|pct1s }} · buy-and-hold, {% if x.cap > 1 %}unlevered{% else %}{{ x.cap|pct0 }} invested{% endif %}: {{ x.bench_ret|pct1s }}{% else %}{{ x.pnl|smoney }} since start, in money: the fund holds the capital{% endif %}"><div class="k">P&amp;L since start</div><div class="v">{{ money_signed(x.pnl) }}</div></div>
   {% if not backtest_id %}<div class="kpi" title="Since 00:00 UTC · {{ x.day_ret|pct1s }}"><div class="k">Today</div><div class="v">{{ money_signed(x.day_pnl) }}</div></div>{% endif %}
   {% if not backtest_id %}<div class="kpi" title="Its P&amp;L since start over the fund's book at its first mark{% if contribution is none %}; the fund's book has no mark yet{% endif %}"><div class="k">Contribution to fund</div><div class="v">{% if contribution is not none %}{{ '%+.2f'|format(contribution * 100) }}%{% else %}<span class="muted">–</span>{% endif %}</div></div>{% endif %}
   <div class="kpi" title="{% if x.entry_px %}On the open position, entered at {{ x.entry_px|px }}{% else %}No open position{% endif %}"><div class="k">Unrealised</div><div class="v">{{ money_signed(x.unrealised) }}</div></div>
@@ -161,7 +161,7 @@
     <div class="pos-card"><h3>P&amp;L <span class="faint">{{ quote }}</span></h3><dl>
       <div><dt>Unrealised</dt><dd>{{ money_signed(x.unrealised) }}{% if position %} <span class="faint">{{ position.unrealised_ret|pct1s }}</span>{% endif %}</dd></div>
       <div><dt>Realised {{ help('realised') }}</dt><dd>{{ money_signed(realised) }}</dd></div>
-      <div class="total"><dt>Total</dt><dd>{{ money_signed(x.pnl) }} <span class="faint">{{ x.ret|pct1s }}</span></dd></div>
+      <div class="total"><dt>Total</dt><dd>{{ money_signed(x.pnl) }}{% if s.starting_balance > 0 %} <span class="faint">{{ x.ret|pct1s }}</span>{% endif %}</dd></div>
     </dl></div>
   </div>
   {% if perp %}<div class="pos-grid two">

@@ -213,7 +213,7 @@ def test_archive_and_reset_are_fenced_for_a_two_leg_strategy(carry):
     fenced = "disabled title=\"Archiving isn't built for a two-leg Strategy yet\">Archive"
     head = _get(client, "/sleeves/carry").split('class="page-head"')[1].split("</div>")[0].replace("&#39;", "'")
     assert fenced in head
-    assert "disabled title=\"A reset isn't built for a two-leg Strategy yet\"" in head
+    assert "Reset" not in head  # TEC-FE-C8: Reset is off the Strategy page
     for name, side, px in (("carry", "SELL", 61_000), ("carry~2", "BUY", 61_000)):
         store.record_fill(name, side=side, qty=0.05, price=px, fee=0.0, order_id=f"{name}-o2", trade_id=f"{name}-t2")
         store.record_equity(name, equity=5_000, cash=5_000, qty=0.0, price=61_000, benchmark=5_000)

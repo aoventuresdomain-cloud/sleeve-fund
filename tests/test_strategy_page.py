@@ -194,27 +194,26 @@ def test_strategy_page_tabs_in_order_with_six_figures(client):
     c, store = client
     _sleeve(store, held=0.01)
     page = c.get("/sleeves/btc-x", auth=AUTH).text
-    nav = page[page.index("data-tabs>"):page.index("</nav>", page.index("data-tabs>"))]
-    tabs = re.findall(r'data-tab="([a-z]+)"', nav)
-    # Trades and Orders leave the top row for the panel under the chart; Signals and Position stay (UI v2).
-    assert tabs == ["overview", "signals", "positions", "activity", "path", "settings"]
-    assert ">Path to live<" in nav
+    # C8 (PM look, 14 Oct): no top tab row. Signals and Settings beside the chart; Path to live and the settings form
+    # open from buttons; every other view a tab of the panel under the chart.
+    assert "data-tabs>" not in page and ">Path to live <" in page
+    side = page[page.index('class="sub-tabs side"'):page.index("</div>", page.index('class="sub-tabs side"'))]
+    assert re.findall(r'data-sub="(\w+)"', side) == ["signals", "settings"]
     figures = page[page.index('aria-label="Strategy figures"'):page.index("</section>", page.index('aria-label="Strategy figures"'))]
     assert [k.strip() for k in re.findall(r'<div class="k">([^<{]+)', figures)] == [
-        "Equity", "Today", "Since start", "Unrealised", "Realised", "Fees and funding"]
+        "P&amp;L since start", "Today", "Contribution to fund", "Unrealised", "Realised", "Fees and funding"]
     assert 'class="s"' not in figures and figures.count(' title="') == 6
-    overview = page[page.index('id="tab-overview"'):page.index('id="tab-signals"')]
-    # The price chart only, with the signal lamps beside it; no Price / Equity switch.
-    assert "data-mode-to" not in overview and 'id="pc"' in overview and 'class="ov-signals"' in overview
-    assert 'data-live="sig-side"' in overview
-    # Under the chart: Position, Trades, Open orders and Order history, the position's Close on the first.
-    assert re.findall(r'data-sub="(\w+)"', overview) == ["pos", "trades", "open", "history"]
+    overview = page[page.index('class="ov-term"'):page.index('id="tab-activity"')]
+    # The price chart only; no Price / Equity switch.
+    assert "data-mode-to" not in overview and 'id="pc"' in overview
+    # Under the chart: Position, Trades, Open orders, Order history, Refused ideas and Activity, Close on the first.
+    lower = page[page.index('class="sub-tabs" role="tablist"'):page.index("</div>", page.index('class="sub-tabs" role="tablist"'))]
+    assert re.findall(r'data-sub="(\w+)"', lower) == ["pos", "trades", "open", "history", "refused", "activity"]
     assert 'data-open="dlg-close"' in overview and "Room to halt" in overview and "Today's loss" in overview
-    path = page[page.index('id="tab-path"'):page.index('id="tab-settings"')]
+    path = page[page.index('id="dlg-path"'):page.index("</dialog>", page.index('id="dlg-path"'))]
     assert "Research" in path and "Demo check" in path and "G2 approval" in path and "Your G2 approval" in path
-    activity = page[page.index('id="tab-activity"'):page.index('id="tab-path"')]
+    activity = page[page.index('id="tab-activity"'):]
     assert [k for k in re.findall(r'data-chip="([a-z]+)"', activity)] == ["all", "decisions", "risk", "system"]
-
 
 def test_open_orders_counts_working_orders_only(client):
     c, store = client
@@ -239,3 +238,19 @@ def test_settings_save_opens_a_confirm_with_the_changes(client):
     assert "data-diff-open" in form and 'id="dlg-save"' in form and "data-diff-rows" in form
     assert "Research recommendation" in form and "Risk profile change." in form
     assert 'data-limits="Conservative: halts at' in form
+
+
+def test_a_strategy_with_no_capital_of_its_own_shows_its_pnl_in_money_not_a_return(client):
+    # HoE 14 Oct (QD's starting_balance crash): the fund holds the capital, so nothing on the page is a share of the
+    # Strategy's own starting balance; Since start reads its money P&L and no return percentage is shown.
+    c, store = client
+    store.create_sleeve(name="fund-x", strategy="rsi_bands", instrument="BTC/USD", bar_spec="15-MINUTE-LAST-INTERNAL",
+                        starting_balance=0, params={"stop_loss": 0.02})
+    store.record_fill("fund-x", side="BUY", qty=0.01, price=60_000, fee=4.8, order_id="E-1", trade_id="T-1")
+    store.record_equity("fund-x", equity=95.2, cash=-600, qty=0.01, price=70_000, benchmark=0)
+    r = c.get("/sleeves/fund-x", auth=AUTH)
+    assert r.status_code == 200 and "inf" not in r.text.lower().replace("info", "") and "nan%" not in r.text.lower()
+    figures = r.text[r.text.index('aria-label="Strategy figures"'):r.text.index("</section>", r.text.index('aria-label="Strategy figures"'))]
+    since = figures.split('<div class="k">P&amp;L since start</div>')[1].split("</div>")[0]
+    assert "95.20" in since and "%" not in since
+    assert "the fund holds the capital" in figures and "Started with 0.00" not in figures
