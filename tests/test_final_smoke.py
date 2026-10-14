@@ -294,16 +294,35 @@ def test_round_trip_never_says_started_when_the_supervisor_refuses(monkeypatch, 
 
 
 @pytest.mark.parametrize("case, why", [
-    ("other", "allowlist"), ("running", "starts only a stopped"), ("holding", "only from flat")])
-def test_the_conservative_step_refuses_any_other_strategy_a_running_one_or_one_holding(case, why):
+    ("other", "allowlist"), ("running", "starts only a stopped"), ("holding", "only from flat"),
+    ("off-paper", "not paper")])
+def test_the_conservative_step_refuses_any_other_strategy_a_running_one_one_holding_or_one_off_paper(case, why):
     store = Store.in_memory(portfolio_gate=True)
     name = "rsi-bands-ls-binance" if case == "other" else "ping-pong-ls-binance"
     _perp(store, name, "running" if case == "running" else "stopped")
     if case == "holding":
         _fill(store, name, "BUY", "o1", T0)
+    if case == "off-paper":
+        store.create_account("smoke-other", "paper")
+        store.assign_account(name, "smoke-other")
     with pytest.raises(ValueError, match=why):
         rt.to_conservative(store, name)
-    assert store.sleeve(name).risk_profile == "balanced" and store.decisions(limit=10) == []
+    assert store.sleeve(name).risk_profile == "balanced"
+    assert [d for d in store.decisions(limit=10) if d["action"] == "change_settings"] == []
+    assert [e for e in store.events(name, limit=50) if e["kind"] == "settings_change"] == []
+
+
+def test_the_conservative_step_on_a_conservative_strategy_writes_nothing():
+    from dataclasses import asdict
+
+    store = Store.in_memory(portfolio_gate=True)
+    _perp(store)
+    store._update_sleeve("ping-pong-ls-binance", risk_profile="conservative")
+    before = repr(sorted(asdict(store.sleeve("ping-pong-ls-binance")).items()))
+    rt.to_conservative(store, "ping-pong-ls-binance")
+    assert repr(sorted(asdict(store.sleeve("ping-pong-ls-binance")).items())) == before
+    assert store.decisions(limit=10) == []
+    assert [e for e in store.events("ping-pong-ls-binance", limit=50) if e["kind"] == "settings_change"] == []
 
 
 def test_the_conservative_step_leaves_every_other_strategy_byte_identical(monkeypatch):
