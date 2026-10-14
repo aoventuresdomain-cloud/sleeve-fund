@@ -1647,7 +1647,9 @@ class Store:
 
         first, second = two_legs.check_legs(first, second)
         _no_own_capital(self, name, starting_balance)
-        shares = two_legs.split_capital(starting_balance, (first, second))
+        # F-PAIR-IN-FUND: once the fund holds the cash both legs are made with 0, as any Strategy is (CUT-A (a)).
+        shares = ((Decimal(0), Decimal(0)) if not is_backtest(name) and to_decimal(starting_balance or 0) == 0
+                  and _fund_held(self) else two_legs.split_capital(starting_balance, (first, second)))
         if trial is not None:
             check_trial(trial)
         ts = utcnow()
