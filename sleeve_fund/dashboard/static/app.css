@@ -165,6 +165,10 @@ th[aria-sort] { color: var(--text); }
 th[aria-sort="ascending"]::after { content: " ↑"; } th[aria-sort="descending"]::after { content: " ↓"; }
 .cell-name a { font-weight: 550; color: var(--text); }
 .cell-name .sub2 { display: block; color: var(--faint); font-size: 12px; }
+.cell-name .legs, .pair-legs { list-style: none; margin: 4px 0 0; padding: 0 0 0 10px; border-left: 2px solid var(--line); font-size: 12px; color: var(--muted); }
+.cell-name .legs li, .pair-legs li { white-space: nowrap; }
+tr.leg-row td { font-size: 12px; color: var(--muted); }
+tr.leg-row td.cell-name { padding-left: 22px; }
 
 /* --- status: a dot and a word, like a desk's order states ------------------- */
 .chip { display: inline-flex; align-items: center; gap: 6px; padding: 1px 8px 1px 7px; border-radius: 6px; font-size: 12px; font-weight: 500;

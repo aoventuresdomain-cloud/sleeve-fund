@@ -75,6 +75,12 @@
   <a href="/orders" {{ 'aria-current=page' if active == 'orders' }}>Orders</a>
 </nav>{% endmacro %}
 {% macro pts(x) %}<span class="{{ 'gain' if x > 0.00005 else ('loss' if x < -0.00005 else 'muted') }}">{{ '+' if x > 0.00005 else ('−' if x < -0.00005 else '') }}{{ '%.1f'|format((x * 100)|abs) }} pts</span>{% endmacro %}
+{# A two-leg Strategy (P2-8 step 7): the red flag while one of its pair's alerts is waiting to be acknowledged (M4),
+   and its legs nested under its row, each with its own figures (legs.fold). #}
+{% macro leg_flag(found) %}{% if found %}<a class="chip halted" href="/alerts" title="Waiting to be acknowledged: {{ found|map(attribute='words')|unique|join(', ') }}">Legs need you</a>{% endif %}{% endmacro %}
+{% macro legs_list(x) %}{% if x.legs %}<ul class="legs" aria-label="Its legs">{% for g in x.legs %}
+  <li><a href="/sleeves/{{ g.name }}">Leg {{ g.n }}</a> · {{ g.instrument }} {{ 'perp' if g.perp else 'spot' }} · {% if g.held %}<span class="side {{ 'sell' if g.short else 'buy' }}">{{ 'Short' if g.short else 'Long' }}</span> {{ g.qty|abs|qty }}{% else %}<span class="muted">flat, {{ 'short' if g.short else 'long' }} leg</span>{% endif %} · P&amp;L {{ money_signed(g.pnl) }} · fees {{ g.fees|money }}{% if g.perp %} · funding {{ g.funding|smoney }}{% endif %}</li>{% endfor %}
+</ul>{% endif %}{% endmacro %}
 {# The fund's book after a Strategy is put away and the limits in use against it (F-C3B-A-UI): v is
    withdrawal.limits_in_use(). preview: the confirm view ("would be"), else the book as it now is. Display only. #}
 {% macro limits_after(v, preview=False) %}{% set soon = v.leaving and not preview %}{% set book_is = 'would be about' if preview and v.taken else ('will be about' if soon else 'is now') %}{% set once = (' once ' ~ (v.leaving|join(', ')) ~ (' leaves' if v.leaving|length == 1 else ' leave') ~ ' it at the supervisor\'s next mark') if soon else '' %}<div class="limits-after{{ ' warnbox' if v.over or v.empty }}">
