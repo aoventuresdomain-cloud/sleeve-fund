@@ -62,7 +62,7 @@ jobs:
         run: |
           # A run that waited behind another deploy ships main's newest green commit, not nothing; never an
           # in-flight commit, nor one older than the server's (deploy/pick_commit.sh). An unreachable server fails here.
-          deployed=$(ssh -i ~/.ssh/id_deploy "$USER_AT@$HOST" 'sudo cat /opt/sleeve-fund/.deployed_sha 2>/dev/null || true')
+          deployed=$(ssh -i ~/.ssh/id_deploy "$USER_AT@$HOST" 'if sudo test -f /opt/sleeve-fund/.deployed_sha; then sudo cat /opt/sleeve-fund/.deployed_sha; fi')
           pick=$(bash deploy/pick_commit.sh "$SHIP" "$(printf '%s' "$deployed" | tr -d '[:space:]')")
           if [ -n "$pick" ]; then
             git checkout -q --detach "$pick"

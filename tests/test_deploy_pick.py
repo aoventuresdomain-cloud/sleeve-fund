@@ -99,6 +99,12 @@ def test_never_a_commit_not_descended_from_the_servers(repo):
     assert (out, code) == ("", 0) and "does not descend" in err
 
 
+def test_a_record_naming_an_unknown_commit_fails_the_run(repo):
+    c = repo["shas"]
+    out, err, code = pick(repo, c[4], deployed="a" * 40)
+    assert code == 1 and out == "" and "not a commit in this repository" in err
+
+
 def test_no_record_on_the_server_ships_with_a_notice(repo):
     c = repo["shas"]
     out, err, code = pick(repo, c[4])

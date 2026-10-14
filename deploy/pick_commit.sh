@@ -6,6 +6,8 @@
 # - main moved past it: the newest commit on main whose tests passed on a push to main (gh run list), never one
 #   whose run is in flight or failed; the commit its own run would ship, so a run that waited behind another
 #   deploy ships what is green now instead of nothing.
+# "Green" is gh's run-level success, which means every shard ran green: tests.yml's shard matrix has no job-level `if`
+# and its pytest job fails unless needs.shard.result == success. Adding a job-level `if` there weakens this gate.
 # - never the commit the server already runs, nor one that doesn't descend from it (no rollback): a run that
 #   lost the race to a newer deploy stops.
 set -euo pipefail
@@ -34,6 +36,10 @@ if [ "$tip" != "$ship" ]; then
   echo "::notice::main is at $tip, past $ship; shipping $pick, main's newest commit with green tests." >&2
 fi
 
+if [ -n "$deployed" ] && ! git cat-file -e "$deployed^{commit}" 2>/dev/null; then
+  echo "::error::the server's deployed-commit record $deployed is not a commit in this repository; fix the record by hand" >&2
+  exit 1
+fi
 if [ -z "$deployed" ]; then
   echo "::notice::the server has no record of the commit it runs (first deploy with the record)." >&2
 elif [ "$deployed" = "$pick" ]; then
