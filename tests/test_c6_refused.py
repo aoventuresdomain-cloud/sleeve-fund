@@ -44,7 +44,7 @@ def test_a_refusal_shows_the_tests_numbers_when_the_gate_journaled_them(client, 
     real = store.refused_ideas
 
     def with_would_be(*a, **k):
-        return [{**r, "would_be": D("0.046"), "side": "BUY"} if r.get("test_hit") == "asset_stop_loss" else r
+        return [{**r, "would_be": D("0.046"), "side": 1} if r.get("test_hit") == "asset_stop_loss" else r
                 for r in real(*a, **k)]
 
     monkeypatch.setattr(store, "refused_ideas", with_would_be)

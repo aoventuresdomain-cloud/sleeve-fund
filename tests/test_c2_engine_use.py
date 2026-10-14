@@ -7,7 +7,7 @@ from decimal import Decimal as D
 
 from test_dashboard import AUTH, client  # noqa: F401 - the fixture
 
-from sleeve_fund import gate_ledger
+from sleeve_fund import supervisor
 
 
 def _use(**over):
@@ -23,7 +23,7 @@ def test_the_bars_read_the_engines_use_with_the_largest_asset_and_the_rest_on_ho
     use = _use(asset_stop_loss={"used": D(3600), "limit": D(4000), "share": 0.9, "enabled": True, "version": 1,
                                 "by_asset": {"BTC": 0.9, "ETH": 0.25}},
                fund_gross={"used": D(75000), "limit": D(150000), "share": 0.5, "enabled": True, "version": 1})
-    monkeypatch.setattr(gate_ledger, "compliance_use", lambda store: use, raising=False)
+    monkeypatch.setattr(supervisor, "compliance_use", lambda store: use, raising=False)
     t1 = next(t for t in store.compliance().tests if t["test"] == "asset_stop_loss")["limit"]
     page = c.get("/portfolio-settings", auth=AUTH).text
     row = page.split('data-test="asset_stop_loss"')[1].split("</tr>")[0]
@@ -37,7 +37,7 @@ def test_the_bars_read_the_engines_use_with_the_largest_asset_and_the_rest_on_ho
 
 def test_a_stale_book_shows_a_dash_not_room(client, monkeypatch):  # noqa: F811
     c, _ = client
-    monkeypatch.setattr(gate_ledger, "compliance_use", lambda store: {"stale": True}, raising=False)
+    monkeypatch.setattr(supervisor, "compliance_use", lambda store: {"stale": True}, raising=False)
     page = c.get("/portfolio-settings", auth=AUTH).text
     row = page.split('data-test="fund_gross"')[1].split("</tr>")[0]
     assert '<span class="muted">–</span>' in row and "The fund's book has no mark yet" in page

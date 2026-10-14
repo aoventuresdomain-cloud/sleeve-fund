@@ -59,7 +59,7 @@ def engine_use(store: Store, tests: dict[str, dict]) -> dict | None:
     engine has it. Its share is used over the limit; as a share of the book that is share x the limit's percentage
     (the limit is that percentage of the book). The largest asset or group is the headline, the rest on hover."""
     try:
-        from sleeve_fund.gate_ledger import compliance_use  # PE2's, once it lands
+        from sleeve_fund.supervisor import compliance_use  # PE2's, once it lands
     except ImportError:
         return None
     try:
@@ -258,7 +258,7 @@ def refused(store: Store, sleeve: str | None = None, since=None, limit: int = 20
                 words = f"{words}: {rules.show(key, would)} would exceed {rules.show(key, lim)}"
         side = r.get("side")
         out.append({**r, "test": words,
-                    "side": {"BUY": "Buy", "SELL": "Sell", "long": "Long", "short": "Short"}.get(side, side)})
+                    "side": {1: "Buy", -1: "Sell"}.get(int(side)) if side is not None else None})
     return out
 
 
@@ -266,7 +266,7 @@ def fund_state(store: Store) -> dict | None:
     """The engine's fund state (PE2, Drop B): {state, since, until, reason}, or None until the engine has it. Display
     only: nothing here works out a state on its own."""
     try:
-        from sleeve_fund.gate_ledger import fund_state as engine  # PE2's, once it lands
+        from sleeve_fund.supervisor import fund_state as engine  # PE2's, once it lands
     except ImportError:
         return None
     try:
