@@ -111,3 +111,35 @@ def test_the_reset_lists_are_the_ones_split_run_uses():
     src = inspect.getsource(store_mod.Store.split_run)
     assert all(n in src for n in ("RESET_MOVES", "RESET_COPIES", "RESET_CLEARS"))
     assert "fills_t" not in src and "signal_state_t" not in src
+
+
+def test_no_reservation_from_before_a_reset_counts_against_the_tests_after_it(store):
+    """HoE 15 Oct ~00:15 UK: a reservation is a live claim on the fund's room (T1-T4 count every active one). A reset
+    puts the run away with its process stopped, so an entry still holding room can never fill: the reset releases it,
+    and the gate's book after it holds no claim from before. The decision itself stays (the tests' audit trail)."""
+    from datetime import timedelta
+
+    from sqlalchemy import insert
+
+    from sleeve_fund.store import gate_decisions_t, gate_reservations_t
+
+    store.create_sleeve(name="s", strategy="buy_and_hold", instrument="BTC/USDT", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=10_000.0)
+    with store.engine.begin() as c:
+        sid = c.execute(select(sleeves_t.c.id).where(sleeves_t.c.name == "s")).scalar()
+        did = c.execute(insert(gate_decisions_t).values(
+            seq=1, sleeve_id=sid, bar_ts=T, intent_id="i1", intent="entry", underlying="BTC", profile_version=1,
+            compliance_version=1, outcome="approved", requested_qty=1, approved_qty=1, price=100, stage="submit",
+            decided_at=T)).inserted_primary_key[0]
+        c.execute(insert(gate_reservations_t).values(
+            decision_id=did, sleeve_id=sid, underlying="BTC", remaining_qty=1, notional=100, margin=100,
+            open_risk=5, created_at=T, expires_at=T + timedelta(minutes=5)))
+    ledger = store._gate_ledger()
+    assert [r.strategy for r in ledger.reservations()] == ["s"]
+    store.request_reset("s", "Settings changed")
+    store.split_run(store.pending_resets()[0])
+    assert ledger.reservations() == []
+    with store.engine.connect() as c:
+        row = c.execute(select(gate_reservations_t)).one()
+        assert row.release_reason == "cancel" and row.released_at is not None and row.sleeve_id == sid
+        assert c.execute(select(func.count()).select_from(gate_decisions_t)).scalar() == 1  # the audit trail stays
