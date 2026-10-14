@@ -1517,6 +1517,14 @@ def _drop_carried(c) -> bool:
                                   carried_day_return=None, carried_day=None)).rowcount)
 
 
+def _fund_held(store) -> bool:
+    """Whether the fund holds the cash (Bridge Drop A: the PM's re-base deposit applied), so a Strategy made, moved or
+    put away moves no capital (supervisor.bridge_start)."""
+    from sleeve_fund.supervisor import bridge_start
+
+    return bridge_start(store) is not None
+
+
 @dataclass(frozen=True)
 class Compliance:
     """One version of the PM's compliance tests: the tests (dicts: test, label, scope, measure, limit, action,
@@ -1600,7 +1608,7 @@ class Store:
 
         def into() -> Decimal:  # its capital comes into the fund's book: a deposit, not a gain (HALT-REF-1)
             in_book = not is_backtest(name) and not _outside_book(self, made)  # no account row yet: it starts on paper
-            return to_decimal(starting_balance) if in_book else Decimal(0)
+            return to_decimal(starting_balance) if in_book and not _fund_held(self) else Decimal(0)
 
         def joins(c) -> None:
             # F-ASSIGN-STALE (Advisor ADV-ASSIGN): on a marked book its capital joins at the supervisor's next poll,
@@ -1641,6 +1649,8 @@ class Store:
                 name=leg_name, instrument=leg["instrument"], venue=(leg.get("venue") or "").upper() or None))
 
         def into() -> Decimal:  # each leg's share in the fund's book comes in as a deposit (HALT-REF-1)
+            if _fund_held(self):
+                return Decimal(0)
             return sum((to_decimal(share) for leg_name, leg, share, _ in legs if in_book(leg_name, leg)), Decimal(0))
 
         def joins(c) -> None:
@@ -2244,10 +2254,10 @@ class Store:
             was = _outside_book(self, s)
             if was == _outside_book(self, s, account):
                 return Decimal(0)
-            from sleeve_fund.supervisor import strategy_equity
+            from sleeve_fund.supervisor import book_part
 
             moved.append("into" if was else "out of")
-            part = strategy_equity(self, s)
+            part = book_part(self, s)
             return part if was else -part
 
         def wait(c) -> None:
@@ -2313,7 +2323,7 @@ class Store:
         with its equity; a move goes as assign_account would. A two-leg Strategy's create lands both legs together, on
         its first leg's call, with one flow of their sum; its second leg's own call leaves it to the first. False when
         nothing (of its own) waits."""
-        from sleeve_fund.supervisor import strategy_equity
+        from sleeve_fund.supervisor import book_part
 
         ts = ts or utcnow()
         got, moved, gone, on = [], [], [], {}
@@ -2349,7 +2359,7 @@ class Store:
                 if was == (not into):
                     continue
                 moved.append("joins" if w.kind == "create" else "moved into" if was else "moved out of")
-                part = strategy_equity(self, s)
+                part = book_part(self, s)
                 total += part if was else -part
             return total
 
@@ -2517,9 +2527,9 @@ class Store:
         s = self.sleeve(sleeve)
         if is_backtest(sleeve) or _outside_book(self, s):
             return Decimal(0)
-        from sleeve_fund.supervisor import strategy_equity
+        from sleeve_fund.supervisor import book_part
 
-        return strategy_equity(self, s)
+        return book_part(self, s)
 
     def book_start(self) -> datetime | None:
         """When the current book began: the latest clean slate (supervisor.clear), or None if never cleared."""
