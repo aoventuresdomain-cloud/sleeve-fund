@@ -6,51 +6,60 @@ from __future__ import annotations
 from decimal import Decimal as D
 
 import pandas as pd
-
 import pytest
 from test_exposure_gate_xfails import _offline  # noqa: F401
 
+from sleeve_fund import supervisor as _sup
 from sleeve_fund.gate_ledger import DbLedger
 from sleeve_fund.portfolio.gate import PortfolioState
 from sleeve_fund.store import Store
 
+# Red first until PE2's fund-held book is on the head (supervisor.sizing_equity, the simulated account's virtual
+# funding and the replay's netting of it); strict, so the merged head must pass them and drop nothing.
+PE2_BUILT = pytest.mark.xfail(not hasattr(_sup, "sizing_equity"), strict=True,
+                              reason="needs PE2's fund-held book (sizing_equity, virtual funding)")
+
 
 # ---- End to end: a Strategy with a starting balance of 0 inside the fund ---------------------------------------------
-@pytest.mark.xfail(strict=True, reason="needs PE2's funding of the simulated account from the fund (SIZE-FUND Q3): "
-                   "until then the reconcile reads its journal cash of 0 against the account's 20,000 and halts it")
-def test_a_zero_balance_strategy_sizes_off_the_fund_fills_pays_its_fee_marks_and_renders(tmp_path, monkeypatch):
-    """mark -> idea -> size -> fill -> fee -> next mark -> page. Its simulated account posts margin from the fund's free
-    cash (PE2, SIZE-FUND Q3), here 20,000; its journal starts at 0. Never halted, paused or refused for a reason of its
-    own, and every mark keeps equity = cash + what its position is worth."""
+@PE2_BUILT
+@pytest.mark.parametrize("headroom", [10, 1])
+def test_a_zero_balance_strategy_sizes_off_the_fund_fills_pays_its_fee_marks_and_renders(tmp_path, monkeypatch,
+                                                                                         headroom):
+    """mark -> idea -> size -> fill -> fee -> next mark -> page. The fund holds the 20,000 (the PM's re-base deposit);
+    the Strategy starts at 0 and its simulated account is funded virtually from the fund (PE2, x10 headroom as paper,
+    x1 too: no decision reads the funding). Never halted, paused or refused for a reason of its own, and every mark
+    keeps its own equity (from 0) = journal cash + its position at the mark."""
     import test_exposure_gate_xfails as h
     from fastapi.testclient import TestClient
     from test_portfolio_paper_entry import END
 
     from sleeve_fund.dashboard import app as app_mod
+    from sleeve_fund.supervisor import Supervisor
 
     store = Store(f"sqlite:///{tmp_path}/e2e.db", portfolio_gate=True)
-    fund = D(20_000)
-    DbLedger(store, lambda: None).set_state(PortfolioState(mark_ts=END, equity=fund, hwm=fund, day=END.date(),
-                                                           day_start_equity=fund))
     params = {**h.PERP, "stop_loss": h.STOP}
     store.create_sleeve(name=h.NAME, strategy="egx", instrument=h.PAIR, bar_spec="1-MINUTE-LAST-INTERNAL",
                         starting_balance=0, risk_profile="balanced", params=params)
-    plan = h.Plan(t0=h.STD_T0, minutes=6, windows=[(h.M(h.STD_T0, 2), h.M(h.STD_T0, 6), 1)], balance=20_000.0)
+    before = h.STD_T0.to_pydatetime() - pd.Timedelta(hours=1)  # the PM's re-base, before the session
+    store.settle_flow(store.fund_flow("deposit", 20_000, actor="pm", reason="QA: the fund's capital", rebase=True,
+                                      now=before), before)
+    Supervisor(store).mark_portfolio(END)  # one mark covers the session (fresh: it is never older than the decision)
+    plan = h.Plan(t0=h.STD_T0, minutes=6, windows=[(h.M(h.STD_T0, 2), h.M(h.STD_T0, 6), 1)],
+                  balance=20_000.0 * headroom)
     h.run(tmp_path, store, plan, monkeypatch)
 
+    kinds = {e["kind"] for e in h._events(store)}
+    assert not kinds & {"risk_halt", "risk_pause", "reconcile_mismatch", "entry_refused_fund_equity",
+                        "entry_refused_open_risk", "handler_failed"}, kinds
     entries = [o for o in h._orders(store) if o["intent"] == "entry"]
     assert entries and entries[0]["status"] == "filled", entries
-    signal = entries[0]["signal"]
-    budget = float(signal["budget"])
-    assert budget > 0.3 * 20_000, signal  # off the fund's 20,000, never a starting balance of 0
+    assert float(entries[0]["signal"]["budget"]) > 0.3 * 20_000, entries[0]["signal"]  # off the fund, never 0
     fills = h._fills(store)
     assert fills and float(fills[0]["fee"]) > 0, fills
-    kinds = {e["kind"] for e in h._events(store)}
-    assert not kinds & {"risk_halt", "risk_pause", "entry_refused_fund_equity"}, kinds
-    assert store.sleeve(h.NAME).status == "running"
+    assert store.sleeve(h.NAME).status == "stopped"  # the replay's end stops it; never halted or paused on the way
     book, last = store.journal_book(h.NAME, 0), store.last_equity(h.NAME)
-    unrealised = float(book["qty"]) * (float(last["price"]) - float(book["entry_px"] or 0.0))
-    assert float(last["equity"]) - 20_000 == pytest.approx(float(book["cash"]) + unrealised, abs=0.05), (last, book)
+    held = float(book["qty"]) * float(last["price"])  # the journal keeps spot-style cash: the buy's notional came out
+    assert float(last["equity"]) == pytest.approx(float(book["cash"]) + held, abs=0.05), (last, book)
     monkeypatch.setenv("DASHBOARD_PASSWORD", "test-pw")
     monkeypatch.setattr(app_mod, "TEARSHEETS", tmp_path)
     page = TestClient(app_mod.create_app(store)).get(f"/sleeves/{h.NAME}", auth=("pm", "test-pw"))
