@@ -1085,8 +1085,10 @@ class LongFlatStrategy(Strategy):
         finally:
             if self._pending_exit is None:
                 self._outage_book = None  # a fallback flag the live check didn't use
-        if self._margin and self._guard_breached(self._last_close):
-            self._on_tick()  # leveraged: the guards act on the trade, not on the next 30-second tick
+        if (self._margin or self.pair is not None) and self._guard_breached(self._last_close):
+            # Leveraged, or a leg of a two-leg Strategy (Advisor M5): the guards act on the trade, not on the next
+            # 30-second tick.
+            self._on_tick()
             return
         self._maybe_tick()
         self._publish_signals()
@@ -5516,6 +5518,8 @@ class LongFlatStrategy(Strategy):
                 side, bar, reason, values = self._flip
                 self._flip = None
                 self._open(side, bar, reason, values)
+        if getattr(self, "pair", None) is not None and not self._backtest:
+            self.pair.on_mark(self, px)  # Advisor M5: a two-leg Strategy's guards run on every fill of either leg
 
     def _track_entry(self, sign: int, filled: Decimal, qty: float, px: float) -> bool:
         """Perp: the entry book after a fill, read from the venue's position (already updated when the fill

@@ -375,6 +375,15 @@ class Pair:
         self._maybe_flat()
         return True
 
+    def on_mark(self, leg: LongFlatStrategy, price: float) -> None:
+        """Paper, a fill of either leg (Advisor M5): each leg's guards (the summed halt and pause, the liquidation
+        guard and ruling B's clamp) judged at once, as on a trade, not left to the next 30-second tick."""
+        for each in (leg, self.other(leg)):
+            if each.runtime is None or each._pending_exit is not None:
+                continue
+            if each._guard_breached(price if each is leg else each._price()):
+                each._on_tick()
+
     # --- the hedge ----------------------------------------------------------------------------------------------------
 
     def bar_closed(self, leg: LongFlatStrategy, bar: Bar) -> None:
