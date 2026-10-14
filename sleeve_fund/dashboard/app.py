@@ -269,13 +269,16 @@ def create_app(store: Store | None = None) -> FastAPI:
         gone = gone if gone in put_away else None
         out, runs, pending, none = st().withdrawn(), st().reset_runs(), st().withdrawal_pending(), st().nothing_withdrawn()
         return {"archived_now": gone, "put_away_now": withdrawal.limits_in_use(app.state.store) if gone else None,
+                "archived_words": withdrawal.state_words(app.state.store, gone) if gone else "",
                 "still_counted": [n for n in put_away if n not in out and n not in runs and n not in pending
                                   and n not in none],
                 # Settled at 0 or less: nothing withdrawn, in the book at that figure (Advisor 14 Oct 11:10 UK).
                 "nothing_out": none,
                 # Archived while not flat: in the book in full until it is (Advisor 14 Oct 10:45 UK), with why. One
                 # flat leaves at the supervisor's next mark, seconds on (F286-CR1), so it reads as out.
-                "waiting_flat": {n: why for n in pending if (why := st().withdrawal_blocker(n))}}
+                "waiting_flat": {n: why for n in pending if (why := st().withdrawal_blocker(n))},
+                # Put away and flat: leaving at the supervisor's next mark, with its word if one held it (F286-CR1).
+                "leaving": withdrawal.leaving(app.state.store)}
 
     def _recent_json(sleeves, days: int, daily) -> JSONResponse:
         """The last day or week at fine resolution, in the shape the charts read."""
@@ -523,10 +526,9 @@ def create_app(store: Store | None = None) -> FastAPI:
         if not bt_id and not archived and s.desired_state != "running" and not x["qty"]:
             put_away = withdrawal.limits_in_use(app.state.store, [name])
         put_away_done = q.get("put_away") if q.get("put_away") in ("retired", "restored") else None
-        # Archived while not flat: it stays in the book in full until it is, then the supervisor withdraws it.
-        waiting_flat = (st().withdrawal_blocker(name) or "") if archived and name in st().withdrawal_pending() else ""
-        # Archived with a settled equity of 0 or less: nothing withdrawn, it stays in the book at that (Advisor 11:10 UK).
-        nothing_out = st().nothing_withdrawn().get(name) if archived else None
+        # Put away: whether its equity left, leaves at the supervisor's next mark (F286-CR1), waits for it to go flat,
+        # or had nothing to withdraw (Advisor 14 Oct 10:45 and 11:10 UK).
+        away = withdrawal.state_words(app.state.store, name) if archived else ""
         # The settings form: what was typed when a change was refused, else the settings as they are.
         typed = {k[2:]: v for k, v in q.items() if k.startswith("f_")}
         settings_pre = typed or {"risk_profile": s.risk_profile, **_risk_form(s.params)}
@@ -559,7 +561,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                     pending=st().pending_commands(name), risk=_risk_view(x, position),
                     resetting=None if bt_id else st().pending_reset(name),
                     idea=_idea(s.strategy, s.params), archived=archived, put_away=put_away,
-                    put_away_done=put_away_done, waiting_flat=waiting_flat, nothing_out=nothing_out,
+                    put_away_done=put_away_done, away=away,
                     put_away_now=withdrawal.limits_in_use(app.state.store) if put_away_done else None,
                     signals=None if bt_id else _signals_view(s, st().signal_state(name)),
                     timeline=_timeline(events, st().decisions(name, limit=50)),
@@ -2197,7 +2199,7 @@ KIND_WORDS = {"handler_failed": "Strategy error", "maker_fill_above_tape": "Make
               "backup_problem": "Backup problem", "exits_change": "Exits changed", "settings_applied": "Settings applied",
               "stop_rejected": "Stop refused", "stop_reset": "Stop reset", "exits_applied": "Exits applied", "warmup_short": "Short warm-up",
               "start_refused": "Start refused",
-              "account_move": "Moved account"}
+              "account_move": "Moved account", "portfolio_carried_invalid": "Portfolio not marked"}
 
 
 def action_words(action: str) -> str:

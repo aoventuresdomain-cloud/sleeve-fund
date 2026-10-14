@@ -87,8 +87,8 @@ def test_emptying_the_book_or_no_mark_yet_says_so_instead_of_shares(store):
 def test_the_archive_dialog_previews_the_book_and_the_page_after_shows_it(held, client):
     page = _get(client, "/sleeves/b")
     dialog = page.split('id="dlg-archive"')[1].split("</dialog>")[0]
-    assert "its equity of 10,000.00 leaves the fund's book, which isn't a loss" in dialog
-    assert "The fund's book would be <b>10,000.00</b>, 10,000.00 less. Limits in use against it:" in dialog
+    assert "its equity of 10,000.00 leaves the fund's book at the supervisor's next mark, which isn't a loss" in dialog
+    assert "The fund's book would be about <b>10,000.00</b>, 10,000.00 less. Limits in use against it:" in dialog
     assert '<b class="loss">60.0%</b> <span class="faint">of 50%</span>' in dialog
     assert "The withdrawal still goes through and closes nothing" in dialog
     assert 'class="limits-after' not in _get(client, "/sleeves/a")  # holding: Archive isn't offered
@@ -96,10 +96,16 @@ def test_the_archive_dialog_previews_the_book_and_the_page_after_shows_it(held, 
                     headers=HDR, follow_redirects=False)
     assert r.status_code == 303 and r.headers["location"] == "/?archived=b"
     home = _get(client, r.headers["location"])
-    assert "Archived b: its equity left the fund's book, which isn't a loss." in home
-    assert "The fund's book is now <b>10,000.00</b>. Limits in use against it:" in home
-    assert "their equity is out of the fund's book</span>" in home
-    assert "Archived b:" not in _get(client, "/")  # only right after
+    # Only the supervisor's poll withdraws (F286-CR1): until its next mark, the book after it, about.
+    assert "Archived b, its equity leaves the fund's book at the supervisor's next mark, which isn't a loss." in home
+    assert ("The fund's book will be about <b>10,000.00</b> once b leaves it at the supervisor's next mark. Limits in "
+            "use against it:") in home
+    assert '<span class="muted">leaving the fund\'s book at the supervisor\'s next mark</span>' in home
+    assert "Archived b," not in _get(client, "/")  # only right after
+    assert "Archived, its equity leaves the fund's book at the supervisor's next mark" in _get(client, "/sleeves/b")
+    _mark(held, T0 + timedelta(seconds=5))
+    assert "Archived, its equity left the fund's book, which isn't a loss." in _get(client, "/sleeves/b")
+    assert "their equity is out of the fund's book</span>" in _get(client, "/")
     r = client.post("/sleeves/b/archive", data={"action": "restore", "reason": "back"}, auth=AUTH, headers=HDR,
                     follow_redirects=False)
     assert r.headers["location"] == "/sleeves/b?put_away=restored"
@@ -121,8 +127,10 @@ def test_a_retire_shows_the_book_after_it(held, client):
                     follow_redirects=False)
     assert r.status_code == 303 and r.headers["location"] == "/sleeves/b?put_away=retired"
     page = _get(client, r.headers["location"])
-    assert "Retired: its equity left the fund's book, which isn't a loss." in page
-    assert "The fund's book is now <b>10,000.00</b>" in page
+    assert "Retired, its equity leaves the fund's book at the supervisor's next mark, which isn't a loss." in page
+    assert "The fund's book will be about <b>10,000.00</b> once b leaves it" in page
+    _mark(held, T0 + timedelta(seconds=5))
+    assert "Retired, its equity left the fund's book, which isn't a loss." in _get(client, "/sleeves/b")
     r = client.post("/sleeves/a/lifecycle", data={"action": "wind_down", "reason": "rotate"}, auth=AUTH,
                     headers=HDR, follow_redirects=False)
     assert r.headers["location"] == "/sleeves/a"  # not put away: no line
@@ -135,7 +143,8 @@ def test_withdraw_archived_prints_the_book_after_it(held, monkeypatch, capfd):
     monkeypatch.setattr(supervisor, "Store", lambda **k: held)
     assert supervisor.main(["withdraw-archived", "--actor", "operator", "--commit", "abc1234"]) in (0, None)
     out = capfd.readouterr().out
-    assert "queued for the supervisor's next mark: b" in out and "The fund's book is now 10,000.00. Limits in use: Total size 60.0% of 150%" in out
+    assert "queued for the supervisor's next mark: b" in out and ("The fund's book will be about 10,000.00 once b leaves it at the supervisor's next mark. Limits in use: Total "
+                     "size 60.0% of 150%") in out
 
 
 def test_an_archive_that_would_empty_the_book_says_so_with_no_shares(store, monkeypatch):
@@ -147,7 +156,7 @@ def test_an_archive_that_would_empty_the_book_says_so_with_no_shares(store, monk
     _make(store, "solo", 5_000)
     _mark(store, T0)
     dialog = _get(TestClient(dash.create_app(store)), "/sleeves/solo").split('id="dlg-archive"')[1].split("</dialog>")[0]
-    assert "The fund's book would be 0.00:</b> no capital, so nothing can trade until some is added." in dialog
+    assert "The fund's book would be about 0.00:</b> no capital, so nothing can trade until some is added." in dialog
     assert "otherwise it is refused, with the reason" in dialog and "Limits in use against it" not in dialog
 
 
@@ -189,3 +198,31 @@ def test_a_strategy_with_nothing_to_withdraw_says_so_and_stays_in_the_book(store
     assert "nothing to withdraw (equity -4.00)" in home and "except 1 still in it<" in home
     assert "Archived, nothing to withdraw (equity -4.00). It stays in the fund's book at that figure." in _get(
         client, "/sleeves/b")
+
+
+def test_every_put_away_reads_as_leaving_until_the_poll_and_says_why_when_it_waits(held, client):
+    """F286-CR1: archive, retire, a clean slate and the end of a wind-down all go through the poll. Until its next mark
+    the Strategy reads as leaving the book; a poll that couldn't take it out says why, in the supervisor's words."""
+    held.set_lifecycle("b", "wind_down", "pm", "rotate", now=T0)
+    assert held.complete_retire("b", T0 + timedelta(minutes=1))
+    page = _get(client, "/sleeves/b")
+    assert "Retired, its equity leaves the fund's book at the supervisor's next mark, which isn't a loss." in page
+    why = "b is flat, and its equity couldn't leave the fund's book yet: Not done: the fund is paused for the day."
+    held.event("b", "warning", "withdrawal_waits", why)
+    assert f"which isn't a loss. {why}</p>" in _get(client, "/sleeves/b")  # one full stop
+    assert f'<span class="warn">{why}</span>' in _get(client, "/")
+    _mark(held, T0 + timedelta(minutes=2))
+    assert "Retired, its equity left the fund's book, which isn't a loss." in _get(client, "/sleeves/b")
+    assert why not in _get(client, "/").split('id="archived"')[1].split("</details>")[0]
+
+
+def test_a_carried_drawdown_that_cant_be_restored_shows_on_alerts_with_its_figures(client, held):
+    """The Advisor's fail-closed guard (F286-H4): it should never fire; if it does, the alert names its figures."""
+    from sleeve_fund.gate_ledger import DbLedger
+
+    said = ("Portfolio not marked: the drawdown kept from when the fund's book was emptied can't be restored (from the "
+            "high-water mark 1.2, from the halt's reference None, the day's change None): the book stays unmarked and "
+            "entries stay blocked until it is fixed")
+    DbLedger(held, lambda: ()).alert("portfolio_carried_invalid", said, T0)
+    page = _get(client, "/alerts")
+    assert "Portfolio not marked" in page and said in page

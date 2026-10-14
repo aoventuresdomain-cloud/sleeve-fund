@@ -1225,3 +1225,4 @@ table.movers tbody tr.tot th, table.movers tbody tr.tot td { border-top: 1px sol
 .limits-after-list li { display: flex; gap: 6px; align-items: baseline; }
 .limits-after-list b { font-variant-numeric: tabular-nums; }
 .banner .limits-after { margin: 6px 0 0; }
+.banner-note { margin: -6px 0 12px; font-size: 13px; color: var(--muted); }
