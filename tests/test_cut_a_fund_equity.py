@@ -188,3 +188,31 @@ def test_a_book_below_zero_once_flat_is_covered_only_outside_the_bridged_fund(mo
                             record_insurance=lambda *a, **k: rows.append(k) or "new", event=lambda *a, **k: None)))
     LongFlatStrategy._cover_shortfall(s, 60_000.0, ("o1", "t1"))
     assert s._cash_adj == credit and len(rows) == (1 if credit else 0)
+
+
+# ---- MARK-ON-STOP inside the fund: the stop marks a Strategy whose own equity is below zero --------------------------
+@pytest.mark.parametrize("funded, marked", [(200_000.0, True), (0.0, False)])
+def test_the_stop_marks_a_fund_held_strategy_below_zero_and_skips_a_wiped_out_one(funded, marked):
+    """A fund-held Strategy's own equity starts at 0, so after a loss it is below zero: its P&L, not a book that can't
+    be valued. Its simulated account (with the fund's virtual funding back in) is what has to be above zero, so its
+    stop still leaves a last mark holding every fill (no tie for the start check). Outside the fund an account at or
+    below zero is wiped out and is not marked, as before."""
+    got = []
+    s = SimpleNamespace(_restore=None, _mark=lambda: (-1_716.15, -1_716.15, 0.0, 58_000.0),
+                        log=SimpleNamespace(warning=print),
+                        runtime=SimpleNamespace(backtest=False, funded=funded, final_mark=lambda **k: got.append(k)))
+    LongFlatStrategy._final_mark(s)
+    assert got == ([{"equity": -1_716.15, "cash": -1_716.15, "qty": 0.0, "price": 58_000.0}] if marked else [])
+
+
+@pytest.mark.parametrize("held, funded, breached", [(True, 200_000.0, False), (False, 0.0, True)])
+def test_a_trade_calls_the_guards_off_the_account_and_inside_the_fund_never_off_its_own_equity(held, funded, breached):
+    """Paper on a perp, on every trade (_guard_breached): a fund-held Strategy holding a position is below zero after
+    its entry's fee alone, and its own halt and pause don't act inside the fund, so neither may call a tick on every
+    trade; its account (the fund's funding back in) and its liquidation distance still do. Outside the fund an
+    account at or below zero still acts at once."""
+    s = SimpleNamespace(_entry_px=60_000.0, _mark=lambda: (-30.0, -6_030.0, 0.1, 60_000.0), pair=None,
+                        _guard_book=lambda e, c, q, p: (e, c, q), _liq_now=lambda c, q: None,
+                        runtime=SimpleNamespace(status="running", fund_held=held, funded=funded, _day_open=0.0, peak=0.0,
+                                                halts=True, profile=SimpleNamespace(min_liquidation_distance=0.1)))
+    assert LongFlatStrategy._guard_breached(s, 60_000.0) is breached

@@ -5001,13 +5001,17 @@ class LongFlatStrategy(Strategy):
         if self.runtime is None or self._entry_px is None or self.runtime.status != "running":
             return False
         equity, cash, qty, _ = self._mark()
-        if equity <= 0:
+        # CUT-A: the simulated account (the fund's virtual funding back in) is what is wiped out at zero; inside the
+        # fund the Strategy's own drawdown halt and daily pause don't act (SleeveRuntime.tick), so they never call a
+        # tick on every trade off its own equity, which is below zero after any loss (it starts at 0).
+        if equity + LongFlatStrategy._funded(self) <= 0:
             return True
-        judged = self._guard_book(equity, cash, qty, price)[0]  # a two-leg Strategy: both legs summed (Advisor E)
-        day_open = self.runtime._day_open or judged
-        if risk.check(self.runtime.profile, judged, max(self.runtime.peak, judged), day_open,
-                      self.runtime.halts) is not None:
-            return True
+        if not getattr(self.runtime, "fund_held", False):
+            judged = self._guard_book(equity, cash, qty, price)[0]  # a two-leg Strategy: both legs summed (Advisor E)
+            day_open = self.runtime._day_open or judged
+            if risk.check(self.runtime.profile, judged, max(self.runtime.peak, judged), day_open,
+                          self.runtime.halts) is not None:
+                return True
         liq = self._liq_now(cash, qty)
         if self.pair is not None and self.pair.distance_breached(self, price, liq):
             return True  # a two-leg Strategy's perp leg past half its entry distance (Advisor B)
@@ -6026,7 +6030,9 @@ class LongFlatStrategy(Strategy):
             return
         try:
             equity, cash, qty, price = self._mark()
-            if equity > 0:
+            # CUT-A: the simulated account (the fund's virtual funding back in, which _mark nets out) is what is wiped
+            # out at zero; a fund-held Strategy's own equity below zero is its P&L, and its stop still marks it.
+            if equity + LongFlatStrategy._funded(self) > 0:
                 self.runtime.final_mark(equity=equity, cash=cash, qty=qty, price=price)
         except Exception as e:  # noqa: BLE001 - the stop goes on; the next start marks again
             self.log.warning(f"no final mark on stop: {e}")
