@@ -315,6 +315,75 @@ def build_two_leg_node(lead: SleeveConfig, follow: SleeveConfig, log_level: str 
         pair.journal(lead_runtime.store, lead.name)  # after add_strategy: it reads the clock the node gives the legs
     return node, pair
 
+def build_legs_node(legs: list[SleeveConfig], log_level: str = "INFO",
+                    runtimes: list[SleeveRuntime | None] | None = None, asset_fetch=None, history=None,
+                    hub: tuple[str, int] | None = None):
+    """One paper node for a multi-asset Strategy (multi-asset spec §1): the parent row (`legs[0]`, its first asset) on
+    its venue's own simulated account and each asset leg ("<name>~<ASSET>") on a clone of it (2, 3, ...), every leg its
+    model's own strategy with its own journal, all fed by the one hub connection. Legs are independent ideas, never a
+    pair: no Pair, no follower. Returns the node.
+
+    Refused: fewer than two legs, a node without the venue's hub, legs on two venues or bar sizes, a pair's leg."""
+    from sleeve_fund.paper.hub_client import HubDataClientConfig, HubDataClientFactory, HubStatus, hub_bar_spec
+    from sleeve_fund.research.portfolio import clone_venue
+
+    assert_keyless()
+    if len(legs) < 2:
+        raise ValueError("a multi-asset Strategy has at least two legs")
+    runtimes = list(runtimes or [None] * len(legs))
+    lead = legs[0]
+    profile = venue_profile(lead.venue)
+    for leg in legs[1:]:
+        if venue_profile(leg.venue).name != profile.name:
+            raise ValueError(f"a multi-asset Strategy's legs trade on one venue, not {lead.venue} and {leg.venue}")
+        if leg.bar_spec != lead.bar_spec:
+            raise ValueError(f"a multi-asset Strategy's legs share one bar size, not {lead.bar_spec} and "
+                             f"{leg.bar_spec}")
+    if any(leg.params.get("leg") is not None for leg in legs):
+        raise ValueError("a pair's leg is never a multi-asset leg (build_two_leg_node)")
+    hub = hub or hub_address(profile.name)
+    if hub is None:
+        raise ValueError(f"a multi-asset Strategy is fed by its venue's market data hub; HUB_{profile.name} isn't set")
+    tag = _tag(lead.name)
+    spec = hub_bar_spec(lead.bar_spec)
+    venues = [profile.venue] + [clone_venue(profile.venue, LEG_CLONE + i) for i in range(len(legs) - 1)]
+    iids = [lead.instrument_id] + [f"{InstrumentId.from_str(leg.instrument_id).symbol}.{v}"
+                                   for leg, v in zip(legs[1:], venues[1:])]
+    minutes = {leg.instrument_id: stored_minutes(profile.name, leg.instrument) for leg in legs}
+    hub_status = HubStatus()
+    data_config = HubDataClientConfig(
+        venue=profile.name, instrument_ids=tuple(leg.instrument_id for leg in legs), host=hub[0], port=hub[1],
+        bar_spec=spec, status=hub_status, recover=lambda iid, after, before: minutes[iid](iid, after, before),
+        report=None if runtimes[0] is None else
+        lambda level, kind, message: runtimes[0].store.event(lead.name, level, kind, message),
+        aliases=tuple((leg.instrument_id, iid) for leg, iid in zip(legs[1:], iids[1:])))
+    accounts = []
+    for sleeve, runtime, venue in zip(legs, runtimes, venues):
+        route = router.route(sleeve.name, router.venue_for(sleeve.venue), VENUES, tag=_tag(sleeve.name))
+        base_code, quote_code = profile.asset_codes(sleeve.instrument, fetch=asset_fetch)
+        fee_model = ScheduleFeeModel(sleeve.fees)
+        perp = markets.is_perp(sleeve.params)
+        balances = _balances(sleeve, runtime, base_code, quote_code)
+        account = route.account_id if venue == profile.venue else f"{venue}-PAPER-{_tag(sleeve.name)[:20]}"
+        accounts.append((str(venue), fee_model, _sandbox(venue, balances, account, perp, fee_model, hub)))
+    builder = (
+        LiveNode.builder(f"PAPER-{tag}", TraderId.from_str(f"PAPER-{tag[:20]}"), Environment.SANDBOX)
+        .with_logging(LoggerConfig(stdout_level=getattr(LogLevel, log_level)))
+        .with_reconciliation(reconciliation=False)
+        .with_timeout_connection(120)
+        .add_data_client("HUB", HubDataClientFactory(), data_config)
+    )
+    for name, _, config in accounts:
+        builder = builder.add_simulated_exec_client(name, SandboxExecutionClientFactory(), config)
+    node = builder.build()
+    for i, (sleeve, runtime, iid, (_, fee_model, _)) in enumerate(zip(legs, runtimes, iids, accounts)):
+        status = hub_status if i == 0 else hub_status.view({iid: sleeve.instrument_id})
+        node.add_strategy(_strategy(sleeve, profile, REGISTRY[sleeve.strategy], iid,
+                                    BarType.from_str(f"{iid}-{spec}"), fee_model, runtime=runtime, recorder=None,
+                                    history=history, hub=hub, hub_status=status))
+    return node
+
+
 VIRTUAL_HEADROOM = 10  # the simulated account's funding, in fund equities: no order is ever short of balance there
 
 
@@ -453,6 +522,7 @@ def main(argv: list[str] | None = None) -> int:
 
     runtime = None
     leg = None  # a two-leg Strategy's second leg (P2-8): (its config, its runtime), run in this process
+    many = None  # a multi-asset Strategy's legs, the parent first: [(config, runtime)], run in this process
     if args.db_sleeve:
         from sleeve_fund.store import Store
 
@@ -487,8 +557,11 @@ def main(argv: list[str] | None = None) -> int:
             second = venue_start(store, second)
             if second is None:
                 return 1
+        assets = [] if second is not None else [venue_start(store, store.sleeve(n)) for n in store._asset_legs(row.name)]
+        if any(a is None for a in assets):
+            return 1
         configs = []
-        for r in (row,) if second is None else (row, second):
+        for r in (row,) + ((second,) if second is not None else tuple(assets)):
             quote = resolve(getattr(r, "venue", None), store)
             configs.append((from_store(r, fee_schedule=quote.fees), SleeveRuntime(journal, r.name)))
             configs[-1][1].venue = configs[-1][0].venue  # its pin's, or the one its open position is on (venue_start)
@@ -497,6 +570,7 @@ def main(argv: list[str] | None = None) -> int:
                         f"Charging {perp.label}: {perp.fees.maker:.2%} maker, {perp.fees.taker:.2%} taker, on the "
                         "venue's live prices; funding every 8 hours from our own ledger")
         (sleeve, runtime), leg = configs[0], (configs[1] if second is not None else None)
+        many = configs if assets else None
     else:
         sleeve = load_sleeve(args.sleeve)
         check_perp_sizing(sleeve.strategy, sleeve.params)  # a strategy in the store is refused by the supervisor
@@ -508,7 +582,11 @@ def main(argv: list[str] | None = None) -> int:
         from sleeve_fund.paper.recorder import Recorder
 
         recorder = Recorder(args.record)
-    if leg is not None:
+    if many is not None:
+        if recorder is not None:
+            ap.error("--record isn't built for a multi-asset Strategy yet")
+        node = build_legs_node([c for c, _ in many], log_level=args.log_level, runtimes=[r for _, r in many])
+    elif leg is not None:
         if recorder is not None:
             ap.error("--record isn't built for a two-leg Strategy yet")
         node, _ = build_two_leg_node(sleeve, leg[0], log_level=args.log_level, runtimes=(runtime, leg[1]))
