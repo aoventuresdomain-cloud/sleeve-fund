@@ -130,7 +130,11 @@ def backfill(venue: str, pair: str, after: pd.Timestamp, root: str | Path | None
         with _lock, _writing(path.parent):  # one writer per instrument, across processes too (CANON-F3)
             kept = _kept(path)  # as it is now
             have = {t for t, _ in kept}
-            added = [tr for tr in found if tr[0] not in have]
+            added = []
+            for t, r in found:  # each settlement once, the first a page gave (CR F270-1), as the dry run counts
+                if t not in have:
+                    have.add(t)
+                    added.append([t, r])
             if added:
                 _keep(path, sorted(kept + added, key=lambda tr: tr[0]))
                 _cache.pop((str(path.parent.parent.parent), venue.upper(), pair.upper()), None)

@@ -103,3 +103,18 @@ def test_the_command_prints_one_line_per_instrument_and_a_spot_venue_is_refused(
     line = capfd.readouterr().out.strip().splitlines()[-1]
     assert "'pair': 'BTC/USDT'" in line and "'added': 30" in line and "'complete': True" in line
     assert main(["--root", str(tmp_path), "funding-backfill", "--venue", "kraken", "--since", "2024-01-01"]) == 2
+
+
+def test_a_settlement_a_page_repeats_is_added_once_and_the_dry_run_agrees(binance, tmp_path, monkeypatch):
+    """CR F270-1: a venue page that gives one settlement twice writes it once, the first rate given."""
+    history = _venue()
+    repeated = history[:3] + [(history[2][0], 0.0002)] + history[3:]
+    monkeypatch.setattr(binance, "funding_loader", _loader(repeated))
+    _keep(binance, tmp_path, [(t, r) for t, r in history if t >= KEPT_FROM])
+    since = pd.Timestamp("2024-01-01", tz="UTC")
+    dry = funding_backfill(binance, "BTC/USDT", since, tmp_path, dry_run=True)
+    real = funding_backfill(binance, "BTC/USDT", since, tmp_path)
+    assert dry["would_add"] == real["added"] == 30
+    rows = json.loads(funding._path(binance.name, "BTC/USDT", tmp_path).read_text())["rates"]
+    assert [t for t, _ in rows] == [t for t, _ in history]
+    assert dict(rows)[history[2][0]] == history[2][1]
