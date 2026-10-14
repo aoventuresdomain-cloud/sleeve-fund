@@ -701,6 +701,24 @@ def test_a_move_whose_own_write_fails_leaves_no_flow_and_no_event(store):
     assert _four(_state(store)) == before and _flows(store) == [] and store.account_of("test") == "paper"
 
 
+def test_f_haltref_4_the_book_figures_leave_a_test_account_out_as_fund_equity_does(store):
+    """F-HALTREF-4: the status command's book figures count what fund_equity counts; a USD Strategy on its venue's test
+    account (F229-6, as deniz-yolo-test on paper) is left out of the figures and named apart."""
+    _make(store, "a", 20_000)
+    _make(store, "deniz-yolo-test", 10_000, instrument="BTC/USD", venue="KRAKEN")  # on "paper", its test account
+    store.record_fill("deniz-yolo-test", side="BUY", qty=1.0, price=1_000.0, fee=2.0, order_id="y1", trade_id="y1",
+                      ts=T0)
+    store.record_equity("deniz-yolo-test", equity=9_500.0, cash=9_000.0, qty=1.0, price=500.0, benchmark=10_000.0,
+                        ts=T0)
+    assert supervisor.fund_equity(store) == D(20_000)
+    figures = supervisor.book_figures(store)
+    assert figures.startswith("from 20,000.00, equity 20,000.00, fees 0.00, positions none, first mark none")
+    assert figures.endswith("; outside the book (a test account): deniz-yolo-test")
+    store.assign_account("deniz-yolo-test", "desk")  # on an account no venue names as a test account: in the book
+    assert supervisor.book_figures(store).startswith("from 30,000.00, equity 29,500.00, fees 2.00, positions "
+                                                     "deniz-yolo-test, first mark ")
+
+
 def test_f285_1_a_position_with_no_mark_doesnt_stop_the_dry_run_reaching_its_refusals(store, monkeypatch, capfd):
     """CR F285-1: strategy_equity raises for a position never marked; the dry run still prints every row, says
     "no mark" where a value can't be had, and reaches its refusals."""

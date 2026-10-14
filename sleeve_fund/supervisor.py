@@ -826,16 +826,21 @@ def book_line(store: Store) -> str:
 
 def book_figures(store: Store) -> str:
     """The book's headline figures as the Portfolio counts them (every strategy not in an earlier book):
-    starting capital, equity, fees, open positions and the first mark, for the deploy log."""
+    starting capital, equity, fees, open positions and the first mark, for the deploy log. A Strategy outside the
+    fund's book (F229-6, outside_fund_book) is left out, as fund_equity leaves it out, and named after the figures
+    (F-HALTREF-4)."""
     earlier = store.previous_book()
-    current = [s for s in store.sleeves() if s.name not in earlier]
+    every = [s for s in store.sleeves() if s.name not in earlier]
+    outside = [s.name for s in every if outside_fund_book(store, s)]
+    current = [s for s in every if s.name not in outside]
     start = sum(s.starting_balance for s in current)
     equity = sum(float((store.last_equity(s.name) or {"equity": s.starting_balance})["equity"]) for s in current)
     fees = sum(float(f["fee"]) for s in current for f in store.fills(s.name, limit=1_000_000))
     held = [s.name for s in current if abs(store.journal_book(s.name, s.starting_balance)["qty"]) > 1e-12]
     firsts = [m["ts"] for s in current if (m := store.first_equity(s.name))]
     return (f"from {start:,.2f}, equity {equity:,.2f}, fees {fees:,.2f}, "
-            f"positions {', '.join(held) or 'none'}, first mark {min(firsts).isoformat() if firsts else 'none'}")
+            f"positions {', '.join(held) or 'none'}, first mark {min(firsts).isoformat() if firsts else 'none'}"
+            + (f"; outside the book (a test account): {', '.join(outside)}" if outside else ""))
 
 
 REBASE_KEY = "HALT-REF-1"

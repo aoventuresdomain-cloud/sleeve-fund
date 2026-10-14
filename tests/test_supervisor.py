@@ -168,6 +168,10 @@ def test_a_strategy_archived_while_still_holding_is_flattened_and_leaves_the_boo
     store.decide("system", "clear", "2026-10-04: first slate (1 put away)")
     store.create_sleeve(name="kept", strategy="buy_and_hold", instrument="ETH/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
                         starting_balance=500, desired_state="stopped")
+    # In the fund's book: USD Strategies on their venue's test account are outside it (F229-6, F-HALTREF-4)
+    store.create_account("desk", "paper")
+    for name in ("s", "kept"):
+        store.assign_account(name, "desk")
     path = tmp_path / "clear.toml"
     path.write_text('[[clear]]\nid = "2026-10-04"\nreason = "first slate"\n'
                     '[[clear]]\nid = "flat"\nreason = "fresh book"\nkeep = ["kept"]\n')
