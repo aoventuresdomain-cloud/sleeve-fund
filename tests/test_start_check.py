@@ -5,6 +5,7 @@ import hashlib
 import os
 import socket
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 
 import pytest
 from sqlalchemy import insert, text
@@ -208,3 +209,42 @@ def test_funding_booked_before_the_latest_mark_is_compared(tmp_path):
     store.engine.dispose()
     ok, page = start_check.run(url, environ={})
     assert ok and "landed after" not in page
+
+
+def test_a_key_the_supervisor_reports_fails_on_its_own(tmp_path):
+    """F276-2: a key the supervisor reports present fails the keys section by itself, with only the paper account and no
+    credential in the environment, so the venues section passes; reported absent, it passes."""
+    url, store = _journal(tmp_path)
+    store.accounts()  # the paper account's row, which the key row refers to
+    with store.engine.begin() as c:
+        c.execute(insert(account_keys_t).values(account="paper", present=0, checked_at=T0))
+    store.engine.dispose()
+    ok, page = start_check.run(url, environ={})
+    assert ok and "Live API keys: PASS" in page, page
+    with store.engine.begin() as c:
+        c.execute(account_keys_t.update().values(present=1))
+    store.engine.dispose()
+    ok, page = start_check.run(url, environ={})
+    assert not ok and "Live API keys: FAIL" in page and "Venues and accounts: PASS" in page
+    assert "  FAIL  the supervisor reports a live key for account paper" in page
+    assert "Dashboard against the journal: PASS" in page
+
+
+@pytest.mark.parametrize("flat", [Decimal("0E-18"), Decimal("-0E-18"), -0.0, 0.0])
+def test_a_flat_position_shows_as_0(flat):
+    """F276-4: Postgres NUMERIC hands a flat position back as 0E-18, which formats as 0e-18, and pads the rest."""
+    assert f"{start_check._qty(flat):.12g}" == "0"
+    assert f"{start_check._qty(Decimal('0.100000000000000000')):.12g}" == "0.1"
+
+
+def test_a_flat_position_on_the_page_is_0(tmp_path, monkeypatch):
+    url, store = _journal(tmp_path, mark_qty=0.0, mark_cash=9_994.0)
+    store.record_fill("s1", side="SELL", qty=0.1, price=60_000.0, fee=3.0, order_id="o2", trade_id="t2",
+                      ts=T0 + timedelta(seconds=30))
+    store.engine.dispose()
+    book, last = Store.journal_book, Store.last_equity
+    monkeypatch.setattr(Store, "journal_book", lambda *a: {**book(*a), "qty": Decimal("0E-18")})
+    monkeypatch.setattr(Store, "last_equity", lambda *a: {**last(*a), "qty": Decimal("-0E-18")})
+    ok, page = start_check.run(url, environ={})
+    assert ok and "s1: position 0 vs journal 0; cash 9,994.00" in page, page
+    assert "e-18" not in page
