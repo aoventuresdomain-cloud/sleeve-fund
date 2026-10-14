@@ -1,0 +1,34 @@
+# QR bench (long shot): 10-day-high breakout held only overnight. Decision candle: 1h.
+version = 1
+name = "qr12-overnight-breakout-long"
+reason = """Breakouts may hold better through the quieter hours. Between 21:00 and 06:00 London time, buy a close above
+the highest high of the last 10 daily candles; out at 08:00 London or on a 2 ATR(14) stop."""
+
+[blocks.dc]
+kind = "donchian"
+period = 10
+timeframe = "1d"
+
+[blocks.atr]
+kind = "atr"
+period = 14
+
+[long]
+entry = { all = [
+    { left = "close", op = ">", right = "dc.upper" },
+    { any = [
+        { left = { time = "hour", tz = "Europe/London" }, op = ">=", right = 21 },
+        { left = { time = "hour", tz = "Europe/London" }, op = "<", right = 6 },
+    ] },
+] }
+exit = { all = [
+    { left = { time = "hour", tz = "Europe/London" }, op = ">=", right = 8 },
+    { left = { time = "hour", tz = "Europe/London" }, op = "<", right = 21 },
+] }
+breakout = true
+
+[exits]
+stop = { level = { sub = ["close", { mul = [2.0, "atr"] }] } }
+
+[costs]
+breakout_slippage_bp = 5
