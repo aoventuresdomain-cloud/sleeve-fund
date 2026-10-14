@@ -7,6 +7,7 @@ import os
 
 import pandas as pd
 import pytest
+from decimal import Decimal as D
 
 os.environ.setdefault("BACKTEST_ISOLATE", "0")
 
@@ -323,3 +324,56 @@ def test_a_perp_leg_past_half_its_entry_distance_to_liquidation_closes_the_pair_
                    for c in res.fills["commissions"])
     again = [o for o in follow if o["intent"] == "entry"][1:]
     assert again and again[0]["parent_trade_id"] != entry["parent_trade_id"]
+
+
+class _Answer:
+    def __init__(self, qty) -> None:
+        self.approved_qty, self.released = qty, []
+        self.checked = type("C", (), {"reservation": None})()
+        self.decision = type("Dn", (), {"reason": "Entry rejected: the book is full"})()
+
+    def release(self, why) -> None:
+        self.released.append(why)
+
+
+class _Gate:
+    """Paper's portfolio gate as the legs see it: a pair check, and a one-leg check that must never be asked."""
+
+    def __init__(self, share) -> None:
+        self.share, self.pairs, self.singles = share, [], []
+
+    def pair(self, names, intents, ts):
+        self.pairs.append((names, intents))
+        return tuple(_Answer((i["qty"] * self.share).quantize(i["step"])) for i in intents)
+
+    def __call__(self, *a):
+        self.singles.append(a)
+        return _Answer(0)
+
+
+def _gated(monkeypatch, share):
+    gate = _Gate(share)
+    monkeypatch.setattr(LongFlatStrategy, "_paper_gated", lambda self: gate)
+    monkeypatch.setattr(LongFlatStrategy, "_entry_atr_pct", lambda self: 0.03)  # paper reads it from the history
+    return gate, _carry((2, 10))
+
+
+def test_on_paper_both_legs_are_checked_at_once_and_cut_by_one_share(monkeypatch):
+    """Advisor M1: the pair's entry is one check of both legs (PaperGate.pair); neither leg is checked alone, and each
+    is sent for what that check allowed."""
+    gate, r = _gated(monkeypatch, D("0.5"))
+    assert len(gate.pairs) == 1 and gate.singles == []
+    names, (lead_i, follow_i) = gate.pairs[0]
+    assert (lead_i["side"], follow_i["side"]) == (1, -1) and follow_i["leverage"] == 1.0
+    lead, follow = _orders(r, "lead"), _orders(r, "follow")
+    assert lead[0]["intent"] == follow[0]["intent"] == "entry"
+    # The perp leg goes first for what the check allowed; the spot leg is sized from what that filled, within its own.
+    assert float(follow[0]["qty"]) == pytest.approx(float((follow_i["qty"] * D("0.5")).quantize(follow_i["step"])))
+    assert float(lead[0]["qty"]) <= float(lead_i["qty"] * D("0.5"))
+    assert lead[0]["parent_trade_id"] == follow[0]["parent_trade_id"]
+
+
+def test_on_paper_a_pair_the_gate_refuses_sends_neither_leg(monkeypatch):
+    gate, r = _gated(monkeypatch, D(0))
+    assert gate.pairs and gate.singles == []
+    assert _orders(r, "lead") == [] and _orders(r, "follow") == [] and r.trades == 0

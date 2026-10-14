@@ -21,7 +21,7 @@ from sqlalchemy import select
 
 from sleeve_fund.gate_ledger import DbLedger
 from sleeve_fund.money import to_decimal
-from sleeve_fund.portfolio.gate import Checked, check_order
+from sleeve_fund.portfolio.gate import Checked, check_order, check_pair
 from sleeve_fund.portfolio.holding import Position, holding_for, underlying
 from sleeve_fund.portfolio.limits import Holding, rejected
 from sleeve_fund.research.portfolio import Gated, _utc, tagged_intent
@@ -30,7 +30,7 @@ from sleeve_fund.store import OPEN_ORDER_STATUSES, Store, gate_decisions_t, orde
 
 # Orders that only ever reduce a position: never checked, never reserved (HoQA F208-1).
 NEVER_GATED = frozenset({"exit", "stop_loss", "take_profit", "pm_flatten", "risk_halt", "risk_pause", "liquidation",
-                         "liquidation_cut", "wind_down", "wind_down_stop"})
+                         "liquidation_cut", "wind_down", "wind_down_stop", "leg_unwind"})
 
 
 def fund_holdings(store: Store, now: datetime | None = None, atr_pct=None) -> tuple[Holding, ...]:
@@ -102,6 +102,24 @@ class PaperGate:
             return Gated(Checked(rejected(qty if isinstance(qty, Decimal) else Decimal(0), None, why), None, None),
                          self)
         return Gated(check_order(self.ledger, strategy, tagged, self.profile, now), self)
+
+    def pair(self, names: tuple[str, str], intents: tuple[dict, dict], ts_ns: int) -> tuple[Gated, Gated]:
+        """A two-leg Strategy's entry (P2-8, Advisor M1): both legs checked under the one lock by check_pair, one share
+        for both or neither, each reserved and journaled under its own row; neither leg is ever checked alone."""
+        now = _utc(ts_ns)
+        try:
+            tagged = tuple(tagged_intent(i, now) for i in intents)
+        except Exception as e:  # noqa: BLE001 - an order the gate can't read is never sent, nor its other leg
+            why = f"Entry rejected: the portfolio check couldn't run ({type(e).__name__}: {e}), so neither leg is sent"
+            self.ledger.alert("portfolio_check_failed", f"{names[0]}: {why}", now)
+            out = []
+            for i in intents:
+                qty = i.get("qty")
+                out.append(Gated(Checked(rejected(qty if isinstance(qty, Decimal) else Decimal(0), None, why), None,
+                                         None), self))
+            return out[0], out[1]
+        a, b = check_pair(self.ledger, names, tagged[0], tagged[1], self.profile, now)
+        return Gated(a, self), Gated(b, self)
 
 
 def paper_gate(store: Store) -> PaperGate:

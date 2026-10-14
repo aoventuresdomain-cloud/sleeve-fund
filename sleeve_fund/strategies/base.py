@@ -3071,13 +3071,15 @@ class LongFlatStrategy(Strategy):
         self._portfolio = (batch, name)
         return self
 
-    def _send_entry(self, side, qty: Decimal, reason: str, signal: dict, what: str = "entry", sent=None) -> None:
+    def _send_entry(self, side, qty: Decimal, reason: str, signal: dict, what: str = "entry", sent=None,
+                    gated=None) -> None:
         """Send an opening order (`what`: an entry, or a rebalance that adds), or in a portfolio run post it to the
         run's gate pass at now + 1 ns (research.portfolio.CloseBatch) and send only what that approves, never more
         than was sized here, then call sent(trimmed). Exits and reductions never wait for it. On paper with the
         portfolio gate in force (Store.portfolio_gate) the same check runs at once over the journal (P2-1b W2), and
         the order's journal row holds the reservation, so its fills and end settle it (Store._settle_reservation).
-        A two-leg Strategy's entry opens both legs through its Pair (strategies.pair), which sends each leg's own."""
+        A two-leg Strategy's entry opens both legs through its Pair (strategies.pair), which sends each leg's own,
+        checked for both legs at once on paper (`gated`: this leg's answer from PaperGate.pair, Advisor M1)."""
         if self.pair is not None and self.pair.sending is not self:
             self.pair.entry(self, side, qty, reason, signal, what, sent)
             return
@@ -3089,19 +3091,9 @@ class LongFlatStrategy(Strategy):
         if self._portfolio is None and paper is None:
             self._submit(side, qty, what, reason, signal)
             return
-        from sleeve_fund.research.portfolio import Pending, fill_price
+        from sleeve_fund.research.portfolio import Pending
 
-        if self._deciding_bar is not None:
-            signal = {**signal, "bar": self._deciding_bar}  # the gate pass runs after this bar's decision has ended
-        s, close = 1 if side == OrderSide.BUY else -1, Decimal(repr(float(signal["close"])))
-        # What the gate's Intent needs (research.portfolio.gate_intent): the expected fill, not the raw close; the
-        # leverage (None on spot); and, with no stop, the daily ATR the stopless measure takes.
-        intent = {"side": s, "qty": qty, "close": close, "price": fill_price(close, s, self._half_spread()),
-                  "stop_frac": self._stop_frac, "what": what, "step": self._lot(), "min_qty": self._min_qty(),
-                  "instrument": self._base_code(),
-                  "leverage": self._max_leverage()
-                  if self._margin else None,
-                  "atr_pct": None if self._stop_frac else self._entry_atr_pct()}
+        signal, intent = self._gate_intent(side, qty, signal, what)
 
         def count(outcome: str) -> None:
             key = f"{what}_{outcome}"
@@ -3130,6 +3122,9 @@ class LongFlatStrategy(Strategy):
             if sent is not None:
                 sent(trimmed)
 
+        if gated is not None:  # a two-leg entry, checked for both legs at once (strategies.pair)
+            send(intent, gated)
+            return
         if paper is not None and intent["atr_pct"] is None and not self._stop_frac:
             # No stop and no daily ATR (a pair with under 14 whole days of history): the entry's risk can't be
             # measured, so it is refused here as the interim open-risk check refuses it (QA P1-S3), a warning while it
@@ -3154,6 +3149,23 @@ class LongFlatStrategy(Strategy):
         bar = {"bar": self._deciding[0] if self._deciding else None}  # as paper's gate gets it: parity keys on it
         batch.post(self.clock, self.clock.timestamp_ns(),
                    Pending(name, {**intent, **bar}, send, lambda i, d: count("refused")))
+
+    def _gate_intent(self, side, qty: Decimal, signal: dict, what: str) -> tuple[dict, dict]:
+        """(the signal with its decision bar, the intent the portfolio gate reads) for an opening order."""
+        from sleeve_fund.research.portfolio import fill_price
+
+        if self._deciding_bar is not None:
+            signal = {**signal, "bar": self._deciding_bar}  # the gate pass runs after this bar's decision has ended
+        s, close = 1 if side == OrderSide.BUY else -1, Decimal(repr(float(signal["close"])))
+        # What the gate's Intent needs (research.portfolio.gate_intent): the expected fill, not the raw close; the
+        # leverage (None on spot); and, with no stop, the daily ATR the stopless measure takes.
+        intent = {"side": s, "qty": qty, "close": close, "price": fill_price(close, s, self._half_spread()),
+                  "stop_frac": self._stop_frac, "what": what, "step": self._lot(), "min_qty": self._min_qty(),
+                  "instrument": self._base_code(),
+                  "leverage": self._max_leverage()
+                  if self._margin else None,
+                  "atr_pct": None if self._stop_frac else self._entry_atr_pct()}
+        return signal, intent
 
     def _resting_entry_terms(self):
         """ORPHAN-GUARD og1 for a resting entry on paper: good-till-date to its decision bar's next close, clamped past
@@ -5219,7 +5231,7 @@ class LongFlatStrategy(Strategy):
             intent, reason, values = self._pending_exit
             self._pending_exit = None
             self._sell_all(intent, reason, values)
-        if self.pair is not None:
+        if getattr(self, "pair", None) is not None:  # a test's stand-in strategy has none
             self.pair.order_closed(self, coid)
 
     def on_order_rejected(self, event) -> None:

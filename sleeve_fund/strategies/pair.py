@@ -166,14 +166,16 @@ class Pair:
         if (why := self.blocks_entry()) is not None:
             leg._note("pair_entry_held", f"Entry held: {why}")
             return
-        self.trades += 1
-        self.trade_id = f"{self._name()}-{self._now()}"
         px = float(signal.get("close") or leg._price())
         f_qty = self._sized(self.follow, qty, self.lead, px)
         lead_part = {"leg": self.lead, "qty": qty, "reason": reason, "signal": signal, "tries": 0}
         follow_part = {"leg": self.follow, "qty": f_qty, "reason": f"Second leg of: {reason}",
                        "signal": {**signal, "close": self.follow._price() or px, "pair_ratio": str(self.ratio)},
                        "tries": 0}
+        if not self._gate_both(lead_part, follow_part):
+            return
+        self.trades += 1
+        self.trade_id = f"{self._name()}-{self._now()}"
         first, self.second = (follow_part, lead_part) if self.first_out == "follow" else (lead_part, follow_part)
         self.state = "legging"
         self._note("entry", f"{self.trade_id}: {first['leg'] is self.lead and 'lead' or 'follow'} first")
@@ -181,18 +183,57 @@ class Pair:
         self.lead.clock.set_time_alert_ns(f"pair-entry-{self.trades}", self._now() + DELAY_NS,
                                           callback=lambda _e, part=first: self._send(part))
 
+    def _gate_both(self, lead_part: dict, follow_part: dict) -> bool:
+        """Paper with the portfolio gate (Advisor M1): both legs checked at once under the one lock, one share for both
+        or neither, each reserved under its own row before either is sent; each part keeps its leg's answer (`gated`)
+        and is cut to what it allows. Elsewhere (a backtest) there is nothing to check. False when refused."""
+        gate = self.lead._paper_gated()
+        if gate is None or self.follow._paper_gated() is None:
+            return True
+        intents = []
+        for part in (lead_part, follow_part):
+            leg = part["leg"]
+            part["signal"], intent = leg._gate_intent(_side(self.sides[id(leg)]), part["qty"], part["signal"], "entry")
+            if intent["atr_pct"] is None and not leg._stop_frac:
+                self.lead._note("entry_refused_by_portfolio", "Entry refused: a leg's open risk can't be measured "
+                                "(no stop, and the daily ATR isn't known), so neither leg is sent")
+                return False
+            intents.append(intent)
+        answers = gate.pair((self.lead.runtime.name, self.follow.runtime.name), tuple(intents), self._now())
+        if any(a.approved_qty <= 0 for a in answers):
+            for a in answers:
+                a.release("cancel")
+            self.lead._note("entry_refused_by_portfolio", answers[0].decision.reason or "Entry refused by the "
+                            "portfolio limits, for both legs")
+            return False
+        self.lead._noted.discard("entry_refused_by_portfolio")
+        for part, answer in zip((lead_part, follow_part), answers):
+            leg = part["leg"]
+            part["qty"] = min(part["qty"], Decimal(str(answer.approved_qty))).quantize(leg._lot(),
+                                                                                         rounding=ROUND_DOWN)
+            part["gated"], part["cap"] = answer, part["qty"]
+        return True
+
+    def _release(self, part: dict | None) -> None:
+        """A checked part never sent: its reservation goes back to the book."""
+        if part is not None and part.get("gated") is not None:
+            part.pop("gated").release("cancel")
+
     def _send(self, part: dict) -> bool:
         leg = part["leg"]
         qty = part["qty"]
         if qty <= 0 or qty < leg._min_qty():
             self._note("too_small", f"{qty} is below the smallest order the venue takes ({leg._min_qty()})")
+            self._release(part)
             return False
         part["tries"] += 1
         before = getattr(leg, "_last_submitted", None)
         signal = {**part["signal"], **self._margin_signal(leg, qty)}
+        # The pair's check is spent on its first send; a retry is a fresh check of that leg alone (Advisor C's retry).
+        gated = part.pop("gated", None)
         self.sending = leg
         try:
-            leg._send_entry(_side(self.sides[id(leg)]), qty, part["reason"], signal)
+            leg._send_entry(_side(self.sides[id(leg)]), qty, part["reason"], signal, gated=gated)
         finally:
             self.sending = None
         coid = getattr(leg, "_last_submitted", None)
@@ -246,6 +287,8 @@ class Pair:
                 return
             px = float(order.avg_px) if order is not None and order.avg_px else leg._price()
             second["qty"] = self._sized(second["leg"], filled, leg, px)
+            if "cap" in second:  # never more than the pair's check reserved for it
+                second["qty"] = min(second["qty"], second["cap"])
             if not self._send(second):
                 self._broken(f"its second leg couldn't be sent ({second['qty']} is below the venue's minimum)")
             return
@@ -282,6 +325,7 @@ class Pair:
         """The pair can't be completed: unwind whatever leg is held, with a warning alert (two_leg_broken)."""
         self._alert(BROKEN, f"Two-leg trade {self.trade_id} broken: {why}; the leg held is unwound at market, and no "
                             "new entry is taken until the first leg's signal has moved off its side")
+        self._release(self.second)
         self.state, self.second = "closing", None
         # As after a stop: the model's signal must reset before the pair is tried again, not every bar while it holds.
         self.lead._exit_lock = self.sides[id(self.lead)] if self.lead._margin else True
@@ -318,6 +362,7 @@ class Pair:
         self._alert(CLAMPED, f"Two-leg trade {self.trade_id}: the perp leg came within {abs(price - liq) / price:.1%} "
                              f"of its liquidation price, under half the {entry:.1%} it was entered at; both legs "
                              "were closed at market")
+        self._release(self.second)
         self.state, self.second = "closing", None
         for each in (self.lead, self.follow):
             if not self._flat(each):
@@ -390,6 +435,7 @@ class Pair:
             return  # this is the pair's own close of the other leg
         other = self.other(leg)
         self.state = "closing" if self.state != "flat" or not self._flat(other) else self.state
+        self._release(self.second)
         self.second = None
         if self._flat(other) and not other._working():
             return
@@ -410,6 +456,7 @@ class Pair:
             self._end()
 
     def _end(self) -> None:
+        self._release(self.second)
         self._note("flat", self.trade_id or "")
         self.state, self.second, self.trade_id = "flat", None, None
         self._entry_dist.clear()
