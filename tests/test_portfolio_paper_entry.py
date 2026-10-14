@@ -46,8 +46,12 @@ def test_a_paper_entry_is_checked_its_order_holds_the_reservation_and_its_fill_r
 
 
 def test_a_paper_entry_the_portfolio_refuses_is_never_sent_and_says_why(tmp_path, store, monkeypatch):  # noqa: F811
-    paper = _gated(store, equity=D(1))  # a book this small has no room for the smallest order
-    run(tmp_path, paper, Plan(t0=STD_T0, minutes=6, windows=[(M(STD_T0, 2), M(STD_T0, 6), 1)]), monkeypatch)
+    paper = _gated(store)
+    # A book this small has no room for the smallest order. Set once the replay has created the Strategy, whose
+    # capital is a deposit into a marked book (HALT-REF-1) and would otherwise make the room.
+    shrink = (M(STD_T0, 1), lambda rt, kw: _gated(paper, equity=D(1)))
+    run(tmp_path, paper, Plan(t0=STD_T0, minutes=6, windows=[(M(STD_T0, 2), M(STD_T0, 6), 1)], hooks=[shrink]),
+        monkeypatch)
     assert not [o for o in _orders(paper) if o["intent"] == "entry"]
     assert _decisions(paper), "the entry never reached the gate"
     told = [e["message"] for e in _events(paper) if e["kind"] == "entry_refused_by_portfolio"]

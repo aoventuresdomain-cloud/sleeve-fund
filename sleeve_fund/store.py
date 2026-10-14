@@ -13,7 +13,9 @@ from decimal import ROUND_CEILING, ROUND_HALF_UP, Decimal
 import json
 import math
 import os
+from contextlib import contextmanager
 from dataclasses import dataclass
+from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import (
@@ -925,6 +927,13 @@ def fill_cash(side: str, qty, price, fee) -> Decimal:
     return (-leg if side == "BUY" else leg) - per_fill(D(fee, "fee"))
 
 
+def _outside_book(store: "Store", s, account: str | None = None) -> bool:
+    """supervisor.outside_fund_book, the one predicate (imported late: the supervisor imports this module)."""
+    from sleeve_fund.supervisor import outside_fund_book
+
+    return outside_fund_book(store, s) if account is None else outside_fund_book(store, s, account)
+
+
 def is_backtest(name: str | None) -> bool:
     return bool(name) and name.startswith(BACKTEST_PREFIX)
 
@@ -1125,7 +1134,13 @@ class Store:
         if trial is not None:
             check_trial(trial)
         ts = utcnow()
-        with self.engine.begin() as c:
+        made = SimpleNamespace(name=name, instrument=instrument, venue=venue.upper() if venue else None)
+
+        def into() -> Decimal:  # its capital comes into the fund's book: a deposit, not a gain (HALT-REF-1)
+            in_book = not is_backtest(name) and not _outside_book(self, made)  # no account row yet: it starts on paper
+            return to_decimal(starting_balance) if in_book else Decimal(0)
+
+        with self._book_move(into, f"Strategy {name} created with {to_decimal(starting_balance):,.2f}", ts) as c:
             c.execute(insert(sleeves_t).values(
                 name=name, strategy=strategy, instrument=instrument, bar_spec=bar_spec, params=params or {},
                 starting_balance=starting_balance, risk_profile=risk_profile, warmup_bars=warmup_bars,
@@ -1137,6 +1152,33 @@ class Store:
             if trial is not None:
                 _put_trial_in(c, trial)
         return self.sleeve(name)
+
+    @contextmanager
+    def _book_move(self, amount, why, ts: datetime | None = None):
+        """A capital move into (amount() > 0) or out of (< 0) the fund's book (HALT-REF-1): the caller's writes, made on
+        the connection this yields, and the flow they make commit together under the portfolio gate's lock, so the
+        book moves by it and its HWM, the halt's reference and the day's start scale with it (portfolio.gate.apply_flow),
+        so the move is never read as a gain or a loss. The amount is read under the lock, before the writes, so two moves never both
+        count the same Strategy, and a supervisor mark that read the book while a move landed is skipped
+        (Supervisor.mark_portfolio). Journaled as a portfolio_flow event. With no state ever marked there is nothing to
+        move: the first mark reads the book as it is."""
+        from sleeve_fund.portfolio.gate import apply_flow
+
+        led = self._gate_ledger()
+        with led.lock():
+            c = led._local.conn
+            marked = c.execute(select(portfolio_state_t.c.book_equity).where(portfolio_state_t.c.id == 1)).scalar()
+            amount = amount() if marked is not None else Decimal(0)
+            yield c
+            if amount:
+                before = led.state().reference()
+                apply_flow(led, amount)
+                after = led.state().reference()
+                c.execute(insert(events_t).values(
+                    sleeve=None, ts=ts or utcnow(), level="info", kind="portfolio_flow",
+                    message=f"{why() if callable(why) else why}: the fund's book moves by {amount:+,.2f} and its "
+                            f"high-water mark, the halt's reference and the day's start scale with it (the reference "
+                            f"{before:,.2f} -> {after:,.2f}), so it isn't a gain or a loss"))
 
     def sleeve(self, name: str) -> Sleeve:
         with self.engine.connect() as c:
@@ -1158,6 +1200,8 @@ class Store:
         return [Sleeve.from_row(r, venues.get(r.name)) for r in rows]
 
     def _update_sleeve(self, name: str, **values) -> None:
+        if "starting_balance" in values:  # HALT-REF-1: capital into or out of the book only with its flow
+            raise ValueError("a Strategy's starting balance is set when it is created and never edited")
         with self.engine.begin() as c:
             c.execute(update(sleeves_t).where(sleeves_t.c.name == name).values(updated_at=utcnow(), **values))
 
@@ -1556,7 +1600,24 @@ class Store:
         return row[0] if row else "paper"
 
     def assign_account(self, sleeve: str, account: str) -> None:
-        with self.engine.begin() as c:
+        """A move onto or off a test account its venue names moves the Strategy's equity out of or into the fund's
+        book (F229-6), with its flow (HALT-REF-1)."""
+        moved = []
+
+        def amount() -> Decimal:
+            if is_backtest(sleeve):
+                return Decimal(0)
+            s = self.sleeve(sleeve)
+            was = _outside_book(self, s)
+            if was == _outside_book(self, s, account):
+                return Decimal(0)
+            from sleeve_fund.supervisor import strategy_equity
+
+            moved.append("into" if was else "out of")
+            part = strategy_equity(self, s)
+            return part if was else -part
+
+        with self._book_move(amount, lambda: f"{sleeve} moved {moved[0]} the fund's book (account {account})") as c:
             self._ensure_paper_account(c)
             if c.execute(select(accounts_t.c.name).where(accounts_t.c.name == account)).first() is None:
                 raise ValueError(f"no account called {account}")

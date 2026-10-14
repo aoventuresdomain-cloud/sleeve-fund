@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "_macros.html" import chip, signed, money_signed, usage, spark, pts, tag, cost_share, open_risk_text, open_risk_hint, open_risk_warn, open_risk_room %}
+{% from "_macros.html" import chip, test_chip, signed, money_signed, usage, spark, pts, tag, cost_share, open_risk_text, open_risk_hint, open_risk_warn, open_risk_room %}
 {% from "_reasons.html" import reason_picker %}
 {% from "_positions.html" import positions_table %}
 {% block title %}Portfolio · Multi-Strategy Fund{% endblock %}
@@ -169,6 +169,15 @@
   <summary><strong>Archived strategies ({{ archived|length }})</strong> <span class="muted">stopped and put away; their cash still counts in the book</span></summary>
   <ul class="feed" style="margin-top:10px">{% for x in archived %}{% set s = x.sleeve %}
     <li><span class="when">{{ x.equity|money }}</span><span class="what"><a href="/sleeves/{{ s.name }}">{{ s.name }}</a> <span class="muted">{{ s.instrument }} · {{ s.strategy|replace('_', ' ') }} · {{ signed(x.ret) }} since start</span></span></li>{% endfor %}
+  </ul>
+</details>
+{% endif %}
+
+{% if tests %}
+<details class="panel archived" id="test-accounts" open>
+  <summary><strong>Test accounts ({{ tests|length }})</strong> <span class="muted">strategies on a test account, outside the fund's book: left out of its equity, P&amp;L and open risk, as the limits leave them out, and never Strategy evidence. Their positions show under Positions, marked as not counted.</span></summary>
+  <ul class="feed" style="margin-top:10px">{% for x in tests %}{% set s = x.sleeve %}
+    <li><span class="when">{{ x.equity|money }}</span><span class="what"><a href="/sleeves/{{ s.name }}">{{ s.name }}</a> {{ chip(s.status) }} {{ test_chip() }} <span class="muted">{{ s.instrument }} · {{ s.strategy|replace('_', ' ') }} · {{ signed(x.ret) }} since start</span></span></li>{% endfor %}
   </ul>
 </details>
 {% endif %}
