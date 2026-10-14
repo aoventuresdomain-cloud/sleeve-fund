@@ -1,0 +1,32 @@
+# QR bench: liquidity-level continuation, short leg (half risk). Decision candle: 1h. Same approximation as the long.
+version = 1
+name = "qr13-level-continuation-short"
+reason = """Mirror of the long leg: when price breaks last week's low and reaches 1 ATR(14) beyond it before coming back
+to the level, the stops below have fired and the fall tends to continue. Out on a close back above the level, after
+48 hours, or on a stop 1 ATR above the level."""
+
+[blocks.wk]
+kind = "donchian"
+period = 7
+timeframe = "1d"
+
+[blocks.atr]
+kind = "atr"
+period = 14
+
+[short]
+# Only from a previous close between the level and 1 ATR beyond it (Quant Developer review, 14 Oct).
+entry = { all = [
+    { left = { prev = "close" }, op = "<", right = { prev = "wk.lower" } },
+    { left = { prev = "close" }, op = ">", right = { sub = [{ prev = "wk.lower" }, { prev = "atr" }] } },
+    { first_touch = { reach = { sub = ["wk.lower", "atr"] }, before = "wk.lower" } },
+] }
+exit = { left = "close", op = ">", right = "wk.lower" }
+breakout = true
+
+[exits]
+time_stop = { minutes = 2880 }
+stop = { level = { add = ["wk.lower", "atr"] } }
+
+[costs]
+breakout_slippage_bp = 5
