@@ -40,7 +40,8 @@ def test_a_three_asset_strategy_is_one_parent_and_two_asset_legs():
 
 
 @pytest.mark.parametrize("assets, why", [
-    (["BTC/USDT"], "at least two"), (["BTC/USDT", "BTC/USDT"], "twice"), (["BTC/USDT", "BTC/USD"], "twice")])
+    (["BTC/USDT"], "at least two"), (["BTC/USDT", "BTC/USDT"], "twice"), (["BTC/USDT", "BTC/USD"], "twice"),
+    (["BTC/USDT", "ETH-X/USDT"], "letters or digits")])  # 0028's leg-name check
 def test_an_asset_list_with_one_asset_or_a_repeat_is_refused(assets, why):
     with pytest.raises(ValueError, match=why):
         _make(_fund(Store.in_memory()), assets=assets)
