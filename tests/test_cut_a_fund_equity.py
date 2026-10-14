@@ -10,26 +10,19 @@ Red first on 3a272149 (the per-Strategy halt in force; paper sized off its own e
 from __future__ import annotations
 
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal as D
 from types import SimpleNamespace
 
 import pytest
 
-from sleeve_fund import supervisor as _sup
 from sleeve_fund.gate_ledger import DbLedger
 from sleeve_fund.paper.runtime import SleeveRuntime
 from sleeve_fund.portfolio.gate import PortfolioState
 from sleeve_fund.store import Store
 from sleeve_fund.strategies.base import LongFlatStrategy
 
-# Red first until PE2's fund-held book is on the head (supervisor.sizing_equity, the simulated account's virtual
-# funding and the replay's netting of it); strict, so the merged head must pass them and drop nothing.
-PE2_BUILT = pytest.mark.xfail(not hasattr(_sup, "sizing_equity"), strict=True,
-                              reason="needs PE2's fund-held book (sizing_equity, virtual funding)")
-
-
-T0 = datetime(2025, 10, 3, 9, 0, tzinfo=timezone.utc)
+T0 = datetime(2025, 10, 3, 9, 0, tzinfo=UTC)
 HELD = {"cash": 0.0, "qty": 1.0}
 
 
@@ -126,7 +119,6 @@ def test_a_fund_held_strategy_never_falls_back_to_its_own_equity():
     assert LongFlatStrategy._sizing_base(s, 0.0) == 19_887.78
 
 
-@PE2_BUILT
 def test_a_gain_not_yet_taken_anywhere_in_the_fund_never_sizes_an_entry_up(tmp_path):
     """TEC-QD-CUTA (HoE): base = deposits net of withdrawals + realised + min(0, unrealised). A Strategy holding 10 from
     1,000, marked at 1,200, adds 2,000 of unrealised gain to the fund's mark; the next entry anywhere sizes off the
@@ -158,14 +150,13 @@ def test_the_fund_figure_is_pe2s_reader_once_it_is_there(tmp_path, monkeypatch):
     import sleeve_fund.supervisor as sup
 
     s = SimpleNamespace(runtime=SimpleNamespace(store=None, now=lambda: T0), log=SimpleNamespace(warning=print))
-    monkeypatch.setattr(sup, "sizing_equity", lambda store, now=None: D("18000"), raising=False)
+    monkeypatch.setattr(sup, "sizing_equity", lambda store, now=None: D(18000), raising=False)
     assert LongFlatStrategy._paper_fund_equity(s) == 18_000.0
     monkeypatch.setattr(sup, "sizing_equity", lambda store, now=None: None, raising=False)
     assert LongFlatStrategy._paper_fund_equity(s) is None
 
 
 # ---- MUST-FUNDCASH-LOSS: who keeps the shortfall cover (CR F-FC-1, F-FC-2) ------------------------------------------
-@PE2_BUILT
 @pytest.mark.parametrize("held, rebased, bridged", [(True, True, True), (True, False, False), (False, True, False),
                                                     (False, False, False)])
 def test_only_a_fund_held_strategy_after_the_re_base_loses_its_own_shortfall_cover(tmp_path, held, rebased, bridged):
