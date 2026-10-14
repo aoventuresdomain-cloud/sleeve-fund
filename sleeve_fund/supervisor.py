@@ -911,16 +911,21 @@ def book_line(store: Store) -> str:
 
 def book_figures(store: Store) -> str:
     """The book's headline figures as the Portfolio counts them (every strategy not in an earlier book):
-    starting capital, equity, fees, open positions and the first mark, for the deploy log."""
+    starting capital, equity, fees, open positions and the first mark, for the deploy log. A Strategy outside the
+    fund's book (F229-6, outside_fund_book) is left out, as fund_equity leaves it out, and named after the figures
+    (F-HALTREF-4)."""
     earlier = store.previous_book()
-    current = [s for s in store.sleeves() if s.name not in earlier]
+    every = [s for s in store.sleeves() if s.name not in earlier]
+    outside = [s.name for s in every if outside_fund_book(store, s)]
+    current = [s for s in every if s.name not in outside]
     start = sum(s.starting_balance for s in current)
     equity = sum(float((store.last_equity(s.name) or {"equity": s.starting_balance})["equity"]) for s in current)
     fees = sum(float(f["fee"]) for s in current for f in store.fills(s.name, limit=1_000_000))
     held = [s.name for s in current if abs(store.journal_book(s.name, s.starting_balance)["qty"]) > 1e-12]
     firsts = [m["ts"] for s in current if (m := store.first_equity(s.name))]
     return (f"from {start:,.2f}, equity {equity:,.2f}, fees {fees:,.2f}, "
-            f"positions {', '.join(held) or 'none'}, first mark {min(firsts).isoformat() if firsts else 'none'}")
+            f"positions {', '.join(held) or 'none'}, first mark {min(firsts).isoformat() if firsts else 'none'}"
+            + (f"; outside the book (a test account): {', '.join(outside)}" if outside else ""))
 
 
 REBASE_KEY = "HALT-REF-1"
@@ -978,17 +983,24 @@ def dust_holdings(store: Store) -> list[tuple[str, Decimal, Decimal]]:
     return held
 
 
+def _figure(v: Decimal | None) -> str:
+    return "no mark" if v is None else f"{v:,.2f}"
+
+
 def rebase_figures(store: Store) -> list[str]:
     """The re-base's figures line by line (F-HALTREF-5), printed by the dry run and the real run alike: every Strategy
     with whether the fund's book counts it and why, its starting balance, its journal's cash with the fills, fees,
     funding and insurance behind it, and what it adds to the true book and to the capital put in; each reset run's
-    fills; the dust held against the cap. Reads only. The two totals are fund_equity's and capital_in's."""
+    fills; the dust held against the cap. Reads only. The two totals are fund_equity's and capital_in's. A position
+    with no mark can't be valued (strategy_equity raises): its row, the total and the dust cap say "no mark" and the
+    rest still prints, so the dry run reaches its refusals (CR F285-1)."""
     from sleeve_fund.store import is_backtest
 
     runs = store.reset_runs()
     out = [("Strategy | book | starting balance | journal cash | fills | fees | funding | insurance | position | "
             "true book | capital")]
-    equity_sum = capital_sum = Decimal(0)
+    equity_sum: Decimal | None = Decimal(0)
+    capital_sum = Decimal(0)
     for s in store.sleeves():
         if is_backtest(s.name):
             continue
@@ -998,28 +1010,35 @@ def rebase_figures(store: Store) -> list[str]:
         qty = to_decimal(store.journal_book(s.name, s.starting_balance)["qty"], "qty")
         if outside_fund_book(store, s):
             where, equity, capital = "out: a test account (F229-6)", Decimal(0), Decimal(0)
-        elif s.name in runs:
-            where, capital = f"in: a reset's run ({runs[s.name]:%d %b %H:%M} UTC), its cash only", Decimal(0)
-            equity = strategy_equity(store, s, runs)
         else:
-            where, capital = "in", to_decimal(s.starting_balance, "starting balance")
-            equity = strategy_equity(store, s, runs)
-        equity_sum += equity
+            if s.name in runs:
+                where, capital = f"in: a reset's run ({runs[s.name]:%d %b %H:%M} UTC), its cash only", Decimal(0)
+            else:
+                where, capital = "in", to_decimal(s.starting_balance, "starting balance")
+            try:
+                equity = strategy_equity(store, s, runs)
+            except RuntimeError:  # F285-1: a position with no mark: the row says so and the rest still prints
+                equity = None
+        equity_sum = None if equity is None or equity_sum is None else equity_sum + equity
         capital_sum += capital
         out.append(f"{s.name} | {where} | {to_decimal(s.starting_balance, 'starting balance'):,.2f} | {cash:,.2f} | "
                    f"{len(fills)} | {fees:,.2f} | {store.funding_total(s.name):,.2f} | "
-                   f"{store.insurance_total(s.name):,.2f} | {qty.normalize():f} | {equity:,.2f} | {capital:,.2f}")
-    out.append(f"total | | | | | | | | | {equity_sum:,.2f} | {capital_sum:,.2f}")
+                   f"{store.insurance_total(s.name):,.2f} | {qty.normalize():f} | {_figure(equity)} | {capital:,.2f}")
+    out.append(f"total | | | | | | | | | {_figure(equity_sum)} | {capital_sum:,.2f}")
     for name in runs:
         for f in sorted(store.fills(name, limit=1_000_000), key=lambda f: (f["ts"], f["id"])):
             out.append(f"  {name} fill {f['id']} {f['ts']:%d %b %H:%M:%S} {f['side']} {to_decimal(f['qty'], 'qty').normalize():f} "
                        f"at {to_decimal(f['price'], 'price'):,.2f}, fee {to_decimal(f['fee'], 'fee'):,.4f}")
     dust = dust_holdings(store)
     total = sum((abs(v) for _, _, v in dust), Decimal(0))
-    book = fund_equity(store)
-    share = f"{total / book:.4%}" if book > 0 else "n/a"
+    try:
+        book: Decimal | None = fund_equity(store)
+    except RuntimeError:  # F285-1: as above, a position with no mark
+        book = None
+    share = f"{total / book:.4%}" if book is not None and book > 0 else "n/a"
+    cap = f"{book * DUST_SHARE:,.2f}" if book is not None else "n/a: the book can't be valued"
     out.append(f"dust: {len(dust)} holding(s) worth {total:,.4f}, {share} of the book "
-               f"(cap {DUST_SHARE:.1%}, {book * DUST_SHARE:,.2f})"
+               f"(cap {DUST_SHARE:.1%}, {cap})"
                + "".join(f"; {n} {q.normalize():f} worth {v:,.4f}" for n, q, v in dust))
     return out
 
