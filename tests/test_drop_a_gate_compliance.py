@@ -108,3 +108,12 @@ def test_a_halted_book_refuses_and_names_the_drawdown_test():
     assert c.decision.outcome == "rejected"
     r = _rows(ledger)[-1]
     assert (r.limit_hit, r.test_hit, r.compliance_version) == ("halt", "fund_drawdown", 1)
+
+
+def test_paper_and_a_backtest_at_the_same_moment_check_against_the_same_version():
+    """HoE: paper's gate journals the version it read; a backtest started then loads the same one."""
+    ledger = _marked()
+    compliance.save(ledger.store, replace(compliance.load(ledger.store), asset_open_risk=0.03), "pm", note="QA")
+    check_order(ledger, "a", _wide("0.001"), None, T0)
+    backtest = compliance.load(ledger.store, "backtest")
+    assert _rows(ledger)[-1].compliance_version == backtest.version == 2 and backtest.asset_open_risk == 0.03

@@ -28,7 +28,7 @@ from sleeve_fund import accounts, lifecycle, liquidation, router
 from sleeve_fund.alerts import Forwarder
 from sleeve_fund.exact import float_view
 from sleeve_fund.money import to_decimal
-from sleeve_fund.gate_ledger import DbLedger
+from sleeve_fund.gate_ledger import IDENTITY_HOLD_ACTION, IDENTITY_RESUME_ACTION, DbLedger
 from sleeve_fund.portfolio.gate import EMPTY, PortfolioState, apply_flow, mark_book, sweep, unrestorable
 from sleeve_fund.portfolio.limits import Book, Holding
 from sleeve_fund.risk import PORTFOLIO, trading_day
@@ -169,6 +169,22 @@ def empty_book_pockets(store: Store) -> list[str]:
             if abs(eq) >= CENT:
                 out.append(f"{s.name} {eq:,.2f}")
     return out
+
+
+def resume_identity_hold(store: Store, actor: str, reason: str, now: datetime | None = None) -> str:
+    """The PM's Resume of a book-check hold (RECON-B): refused while the book still doesn't add up, else journaled, and
+    new entries may go out again. Returns the words journaled."""
+    led = DbLedger(store, lambda: ())
+    if not led.identity_hold():
+        raise ValueError("the fund's book check isn't holding entries: nothing to resume")
+    if not actor.strip() or not reason.strip():
+        raise ValueError("a Resume names who and why")
+    gap = identity_gap(store)
+    if abs(gap) > CENT:
+        raise ValueError(f"the book still doesn't add up by {gap:,.2f}: fix it before resuming")
+    words = f"book check resumed: the book adds up again (gap {gap:,.2f}); {reason.strip()}"
+    store.decide(actor.strip(), IDENTITY_RESUME_ACTION, words, ts=now)
+    return words
 
 
 def free_cash(store: Store, led) -> Decimal:
@@ -464,7 +480,6 @@ class Supervisor:
         self._breach_told: set[str] = set()  # a withdrawn Strategy holding, alerted once per spell (F-C3B-A viii)
         self._flatten_told: dict[str, datetime] = {}  # when each holder was last told to flatten for a portfolio halt
         self._halt_tells: dict[str, int] = {}  # how often, this halt (F229-5: at most SYSTEM_FLATTENS)
-        self._identity_told = False  # a broken book identity (RECON-B), alerted once per spell
         self._flow_told: dict[int, str] = {}  # a fund flow's wait, said once while it lasts
 
     def _refused(self, name: str) -> bool:
@@ -729,8 +744,8 @@ class Supervisor:
         led.ensure_state()
         before, behind = led.state(), False
         try:
-            equity = fund_equity(self.ledger.store)
             self._check_identity(now)
+            equity = fund_equity(self.ledger.store)
         except Exception as exc:  # noqa: BLE001 - no mark: the book goes stale and entries stop (fail closed)
             if not self._equity_failing:
                 self.store.event(None, "error", "supervisor_error", f"the fund's equity couldn't be read, so the "
@@ -795,22 +810,24 @@ class Supervisor:
         sweep(led, now, self._order_live, None, is_acked=self._order_acked)
 
     def _check_identity(self, now: datetime) -> None:
-        """RECON-B (Advisor MUST): once the fund holds the cash, every poll checks cash + P&L + positions against the
-        book read the other way (identity_gap). Past a cent it raises, so this poll marks nothing and entries stop once
-        the mark is 60 s old, with one alert per spell naming the gap."""
+        """RECON-B (Advisor MUST, IDENT-STICKY): once the fund holds the cash, every poll checks cash + P&L + positions
+        against the book read the other way (identity_gap). Past a cent, read twice so a fill landing between the reads
+        isn't a break, it holds every new entry at once (identity_hold, journaled; the gate reads it), with one alert.
+        The hold is latched: a clean poll doesn't lift it, only the PM's Resume (resume_identity_hold). The mark, exits,
+        stops and close-now carry on."""
         store = self.ledger.store
-        if bridge_start(store) is None:
+        if bridge_start(store) is None or self.ledger.identity_hold():
             return
         gap = identity_gap(store)
         if abs(gap) <= CENT:
-            self._identity_told = False
             return
-        if not self._identity_told:
-            self.ledger.alert("book_identity_broken", f"The fund's book doesn't add up: cash + Strategy P&L + "
-                              f"positions differs from the journal by {gap:,.2f}, so new entries stop until it does",
-                              now)
-            self._identity_told = True
-        raise RuntimeError(f"the book's identity is off by {gap:,.2f}")
+        gap = identity_gap(store)  # once more: a fill between the first reads moves both sides by the time of this one
+        if abs(gap) <= CENT:
+            return
+        why = f"cash + Strategy P&L + positions differs from the journal by {gap:,.2f}"
+        store.decide("supervisor", IDENTITY_HOLD_ACTION, why, ts=now)
+        self.ledger.alert("book_identity_broken", f"The fund's book doesn't add up: {why}. New entries are held until "
+                          "the PM resumes; exits and stops still go out", now)
 
     def _apply_flows(self, now: datetime) -> None:
         """The fund's deposits and withdrawals (DA fund_flows), in journal order, after this poll's mark: an inflow

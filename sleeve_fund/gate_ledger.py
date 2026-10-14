@@ -36,6 +36,7 @@ from sleeve_fund.store import (
     Store,
     _aware,
     book_marks_t,
+    decisions_t,
     events_t,
     gate_decisions_t,
     gate_reservations_t,
@@ -46,6 +47,7 @@ from sleeve_fund.store import (
     utcnow,
 )
 
+IDENTITY_HOLD_ACTION, IDENTITY_RESUME_ACTION = "book_identity_hold", "book_identity_resume"
 LOCK_SQL = text("SELECT pg_advisory_xact_lock(hashtext('portfolio_gate'))")
 # A stalled holder (a slow read, a hung connection) must not hold every strategy's entry checks without bound: past
 # this the lock raises and check_order fails closed as lock_error (HoQA F219-Q1). Exits never take this lock.
@@ -190,6 +192,20 @@ class DbLedger:
             rid = (conn.execute(select(func.max(gate_decisions_t.c.id))).scalar() or 0) + 1
         loc.pending = (rid, strategy, holding, at, abs(money(qty, "qty")))
         return rid
+
+    def identity_hold(self) -> str | None:
+        """Why the fund's book check holds every entry (supervisor's RECON-B check), or None: the latest hold or
+        resume in the decisions log, so it survives a restart and lifts only on the PM's journaled Resume."""
+        q = (select(decisions_t.c.action, decisions_t.c.reason)
+             .where(decisions_t.c.action.in_((IDENTITY_HOLD_ACTION, IDENTITY_RESUME_ACTION)))
+             .order_by(decisions_t.c.id.desc()).limit(1))
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            row = conn.execute(q).first()
+        else:
+            with self.engine.connect() as c:
+                row = c.execute(q).first()
+        return row.reason if row is not None and row.action == IDENTITY_HOLD_ACTION else None
 
     def compliance(self):
         """The PM's compliance tests in force, as the gate applies them, read with the lock's own connection

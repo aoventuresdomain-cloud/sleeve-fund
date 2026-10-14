@@ -8,6 +8,8 @@ from __future__ import annotations
 from datetime import timedelta
 from decimal import Decimal as D
 
+import pytest
+
 from test_halt_ref import T0, _make, _mark, _settle, _state, _trade, store  # noqa: F401
 
 from sleeve_fund import supervisor
@@ -56,7 +58,7 @@ def test_a_plain_flow_before_the_reset_is_refused(store):  # noqa: F811
 
 def test_a_strategy_made_after_the_reset_books_from_0_and_moves_no_capital(store):  # noqa: F811
     _rebased(store)
-    _make(store, "x", 10_000)  # its starting balance is not the fund's capital any more
+    _make(store, "x", 0)  # no capital of its own: the fund holds the cash
     assert not store.joining("x") and store.fund_capital() == D(100_000)
     _trade(store, "x", 250.37, T0 + MIN)
     book = supervisor.fund_book(store)
@@ -83,19 +85,87 @@ def test_an_inflow_never_overtakes_a_pending_outflow(store):  # noqa: F811
     assert len(waits) == 1 and "every flow after it" in waits[0]
 
 
-def test_a_broken_identity_marks_nothing_and_alerts_once(store, monkeypatch):  # noqa: F811
-    _rebased(store)
-    _make(store, "x", 10_000)
-    _trade(store, "x", 100, T0 + MIN)
-    _mark(store, T0 + MIN)
+def _entry(store, at):
+    """One entry idea through the journal's gate, as paper sends it."""
+    from sleeve_fund.gate_ledger import DbLedger, TaggedIntent
+    from sleeve_fund.portfolio.gate import check_order
+
+    px = D(60_000)
+    it = TaggedIntent("BTC", 1, D("0.001"), px, px, px / 50, D("0.001"), D("0.001"), intent_id=f"i{at:%H%M%S}",
+                      kind="entry", bar_ts=at)
+    return check_order(DbLedger(store, lambda: (supervisor.fund_book(store).total, ())), "x", it, None, at).decision
+
+
+def _broken(store, monkeypatch):
     real = store.strategy_cash_pnl
     monkeypatch.setattr(store, "strategy_cash_pnl", lambda name, since=None, at=None: real(name, since, at) + D("0.02"))
-    sup = supervisor.Supervisor(store)
-    for i in (2, 3):
-        sup.mark_portfolio(T0 + i * MIN)
-        assert _state(store).mark_ts == T0 + MIN  # not marked: entries stop once the mark is 60 s old
-    alerts = [e["message"] for e in store.events(None, limit=50) if e["kind"] == "book_identity_broken"]
-    assert len(alerts) == 1 and "0.02" in alerts[0]
+    return lambda: monkeypatch.setattr(store, "strategy_cash_pnl", real)
+
+
+def _alerts(store):
+    return [e["message"] for e in store.events(None, limit=100) if e["kind"] == "book_identity_broken"]
+
+
+def test_a_broken_identity_holds_entries_on_the_same_poll_with_one_alert_and_exits_still_go(store, monkeypatch):
+    from sleeve_fund.paper.portfolio_gate import paper_gate
+
+    _rebased(store)
+    _make(store, "x", 0)
+    _trade(store, "x", 100, T0 + MIN)
+    _mark(store, T0 + MIN)
+    assert _entry(store, T0 + MIN).outcome == "approved"
+    _broken(store, monkeypatch)
+    st = _mark(store, T0 + 2 * MIN)
+    assert st.mark_ts == T0 + 2 * MIN  # the book is still marked: exits, stops and close-now run on it
+    d = _entry(store, T0 + 2 * MIN)  # the same poll's next entry
+    assert d.outcome == "rejected" and "book check failed" in d.reason and "0.02" in d.reason
+    assert paper_gate(store)("x", {"reduce_only": True, "what": "exit"}, 0) is None  # an exit is never gated
+    _mark(store, T0 + 3 * MIN)
+    assert len(_alerts(store)) == 1
+
+
+def test_the_hold_is_latched_survives_a_restart_and_only_a_resume_on_a_whole_book_lifts_it(store, monkeypatch):
+    from sleeve_fund.store import Store
+
+    _rebased(store)
+    _make(store, "x", 0)
+    _trade(store, "x", 100, T0 + MIN)
+    fix = _broken(store, monkeypatch)
+    _mark(store, T0 + MIN)
+    with pytest.raises(ValueError, match="still doesn't add up by"):
+        supervisor.resume_identity_hold(store, "pm", "checked it")
+    fix()
+    _mark(store, T0 + 2 * MIN)  # a clean poll alone
+    again = Store(engine=store.engine, portfolio_gate=True)  # a restart
+    assert _entry(again, T0 + 2 * MIN).outcome == "rejected"
+    words = supervisor.resume_identity_hold(again, "pm", "the double count was the test's", now=T0 + 3 * MIN)
+    assert "resumed" in words and again.decisions(action="book_identity_resume")
+    _mark(again, T0 + 3 * MIN)
+    assert _entry(again, T0 + 3 * MIN).outcome == "approved"
+    assert len(_alerts(again)) == 1
+
+
+def test_a_create_with_its_own_capital_is_refused_once_the_fund_holds_the_cash(store):
+    """CUT-A (a): from the PM's re-base on, a Strategy has no capital of its own."""
+    _rebased(store)
+    with pytest.raises(ValueError, match="no capital of its own"):
+        _make(store, "x", 10_000)
+    _make(store, "y", 0)
+
+
+def test_the_bridge_switches_once_at_the_rebase_and_not_before(store):  # noqa: F811
+    _make(store, "a", 10_000)
+    _settle(store, "a", T0)
+    assert supervisor.bridge_start(store) is None and supervisor.fund_equity(store) == D(10_000)  # legacy, unchanged
+    assert supervisor.book_part(store, store.sleeve("a")) == D(10_000)
+    store.archive("a")
+    _mark(store, T0)
+    _mark(store, T0 + MIN)  # the poll takes "a" out of the book
+    st = _rebased(store, at=T0 + 2 * MIN)
+    assert supervisor.bridge_start(store) == T0 + 2 * MIN and st.equity == D(100_000)
+    _flow(store, "deposit", 5_000, T0 + 3 * MIN, rebase=True)  # a second re-base onto a book that isn't empty
+    _mark(store, T0 + 3 * MIN)
+    assert supervisor.bridge_start(store) == T0 + 2 * MIN and store.fund_flows()[-1]["refused_at"] is not None
 
 
 def test_empty_book_pockets_names_a_strategy_still_counted_and_none_when_empty(store):  # noqa: F811

@@ -1525,6 +1525,13 @@ def _fund_held(store) -> bool:
     return bridge_start(store) is not None
 
 
+def _no_own_capital(store, name: str, starting_balance) -> None:
+    """CUT-A (a) (HoE, Advisor): once the fund holds the cash, a Strategy is made with no capital of its own."""
+    if not is_backtest(name) and to_decimal(starting_balance or 0) != 0 and _fund_held(store):
+        raise ValueError(f"Strategy {name} can't be made with {to_decimal(starting_balance):,.2f}: the fund holds the "
+                         "cash, so a Strategy has no capital of its own; make it with 0")
+
+
 @dataclass(frozen=True)
 class Compliance:
     """One version of the PM's compliance tests: the tests (dicts: test, label, scope, measure, limit, action,
@@ -1603,6 +1610,7 @@ class Store:
         never made without being counted, nor counted without being made (QA P1-T8)."""
         if trial is not None:
             check_trial(trial)
+        _no_own_capital(self, name, starting_balance)
         ts = utcnow()
         made = SimpleNamespace(name=name, instrument=instrument, venue=venue.upper() if venue else None)
 
@@ -1638,6 +1646,7 @@ class Store:
         from sleeve_fund import two_legs
 
         first, second = two_legs.check_legs(first, second)
+        _no_own_capital(self, name, starting_balance)
         shares = two_legs.split_capital(starting_balance, (first, second))
         if trial is not None:
             check_trial(trial)

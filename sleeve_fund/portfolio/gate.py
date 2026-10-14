@@ -222,8 +222,17 @@ def stale_untold(st: PortfolioState) -> bool:
     return st.stale_told != (st.mark_ts or NEVER)
 
 
+IDENTITY_HOLD = "identity_hold"  # the decision's reason kind while the fund's book check holds entries (RECON-B)
+
+
 def _block(ledger: Ledger, now: datetime) -> tuple[str, str] | None:
-    """entry_block's answer; the caller holds the ledger's lock."""
+    """entry_block's answer; the caller holds the ledger's lock. A ledger on the journal also holds every entry while
+    the fund's book check has failed (identity_hold: latched until the PM's Resume, Advisor RECON-B)."""
+    held = getattr(ledger, "identity_hold", None)
+    why = held() if callable(held) else None
+    if why:
+        return IDENTITY_HOLD, (f"No new entries: the fund's book check failed ({why}); exits and stops still go out, "
+                               "and only the PM's Resume lifts it")
     st = ledger.state()
     hit = block_reason(st, now)
     if hit is not None and hit[0] == "portfolio_state_stale" and stale_untold(st):
