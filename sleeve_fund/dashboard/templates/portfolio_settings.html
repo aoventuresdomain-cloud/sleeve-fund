@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% from "_reasons.html" import reason_picker %}
+{% block title %}Portfolio Settings · Multi-Strategy Fund{% endblock %}
+{% block content %}
+<div class="page-head">
+  <h1>Portfolio Settings: compliance tests</h1>
+  {% if mode == 'view' %}<div class="actions"><a class="button" href="/portfolio-settings?edit=1">Edit tests and groups</a></div>{% endif %}
+  <p class="lede">Every trade idea from every Strategy passes these tests before an order goes out, or it is refused and the test that refused it is recorded. Version {{ v.version }}.</p>
+</div>
+{% if saved %}<div class="okbox" role="status">Saved as version {{ saved }}. It applies from the next trade idea.</div>{% endif %}
+<div class="warnbox"><b>Edits apply to new trades only.</b> Open positions and working orders are not changed. The whole-fund test and the loss brakes can be changed but not switched off. If the tests can't be read, no new trade goes out.</div>
+{% if errors %}<div class="warnbox" role="alert"><b>Not saved.</b><ul>{% for e in errors %}<li>{{ e }}</li>{% endfor %}</ul></div>{% endif %}
+
+{% if mode == 'review' %}
+<section class="panel" aria-labelledby="review-h">
+  <h2 id="review-h">Apply these changes from the next trade?</h2>
+  {% if changes %}<ul>{% for c in changes %}<li>{{ c }}</li>{% endfor %}</ul>{% else %}<p>Nothing changes from version {{ v.version }}.</p>{% endif %}
+  {% for w in warnings %}<p class="warn">{{ w }}</p>{% endfor %}
+  <p class="muted">Open positions and working orders are not changed.</p>
+  <form method="post" action="/portfolio-settings/apply">
+    {% for k, val in carry %}<input type="hidden" name="{{ k }}" value="{{ val }}">{% endfor %}
+    <input type="hidden" name="expected_version" value="{{ expected }}">
+    {{ reason_picker('compliance', 'r-compliance') }}
+    <div class="dlg-actions"><a class="button secondary" href="/portfolio-settings">Cancel</a>
+      <button class="primary" data-needs-reason{% if not changes %} disabled{% endif %}>Apply from the next trade</button></div>
+  </form>
+</section>
+{% endif %}
+
+{% set editing = mode == 'edit' %}
+{% if editing %}<form method="post" action="/portfolio-settings/review"><input type="hidden" name="expected_version" value="{{ v.version }}">{% endif %}
+<section class="panel" aria-labelledby="tests-h">
+  <h2 id="tests-h">The five tests</h2>
+  {% if v.source == 'unmarked' %}<p class="muted">The fund's book has no mark yet, so there is no use to show.</p>{% elif v.source == 'unreadable' %}<p class="muted">The use now can't be read.</p>{% endif %}
+  <table class="tbl">
+    <thead><tr><th scope="col">Test</th><th scope="col">Limit, share of the fund</th><th scope="col" class="num">Use now</th><th scope="col">State</th></tr></thead>
+    <tbody>{% for g in v.tests %}{% for r in g.rows %}
+      <tr data-test="{{ r.key }}">
+        <td>{% if loop.first %}<b>{{ g.test }} {{ g.name }}</b>{% if g.rows|length > 1 %}<br>{% endif %}{% endif %}{% if g.rows|length > 1 or not loop.first %}<span class="sub">{{ r.label }}</span>{% else %}<div class="sub">{{ r.label.split(': ')[1] if ': ' in r.label else r.label }}</div>{% endif %}</td>
+        <td>{% if editing %}{% set fv = (form.get(r.key ~ '.limit') if form else none) %}<input name="{{ r.key }}.limit" value="{{ fv if fv is not none else (r.shown[:-1]) }}" inputmode="decimal" size="6" aria-label="{{ r.label }}, in {{ r.unit }}"> {{ r.unit }} <span class="faint">{{ r.low }} to {{ r.high }}</span>{% else %}{{ r.shown }}{% if r.key == 'asset_net' %} <span class="faint">(on a 100,000 fund, at most {{ (100000 * r.limit)|money }} net on one asset)</span>{% endif %}{% endif %}</td>
+        <td class="num {{ r.tone }}">{% if r.used is not none %}{{ r.used }}{% if r.what %} <span class="faint">{{ r.what }}</span>{% endif %}{% else %}<span class="muted">–</span>{% endif %}</td>
+        <td>{% if r.locked %}<span class="chip">Always on</span>{% elif editing %}<label><input type="checkbox" name="{{ r.key }}.enabled"{{ ' checked' if (form.get(r.key ~ '.enabled') if form else r.enabled) }}> On</label>{% else %}<span class="chip">{{ 'On' if r.enabled else 'Off' }}</span>{% endif %}</td>
+      </tr>{% endfor %}{% endfor %}</tbody>
+  </table>
+</section>
+
+<section class="panel" aria-labelledby="groups-h">
+  <h2 id="groups-h">Asset groups</h2>
+  <p class="muted">The per-group test adds up each group's loss if every stop is hit. An asset with no group counts as {{ v.strictest }}, the strictest group.</p>
+  <table class="tbl">
+    <thead><tr><th scope="col">Asset</th><th scope="col">Group</th></tr></thead>
+    <tbody>{% for a in v.groups %}<tr data-asset="{{ a.asset }}"><td>{{ a.asset }}</td>
+      <td>{% if editing %}{% set fg = (form.get('group.' ~ a.asset) if form else a.group) %}<select name="group.{{ a.asset }}" aria-label="{{ a.asset }} group"><option value="">No group (counts as {{ v.strictest }})</option>{% for g in v.group_names %}<option value="{{ g }}"{{ ' selected' if fg == g }}>{{ g|capitalize }}</option>{% endfor %}</select>
+      {% elif a.group %}{{ a.group|capitalize }}{% else %}<span class="warn">{{ v.strictest|capitalize }} (no group set)</span>{% endif %}</td></tr>
+    {% else %}<tr><td colspan="2" class="empty">No assets yet.</td></tr>{% endfor %}</tbody>
+  </table>
+</section>
+{% if editing %}<div class="dlg-actions"><a class="button secondary" href="/portfolio-settings">Cancel</a> <button class="primary">Review changes</button></div></form>{% endif %}
+
+<section class="panel" aria-labelledby="hist-h">
+  <h2 id="hist-h">Version history</h2>
+  <table class="tbl">
+    <thead><tr><th scope="col">Version</th><th scope="col">From</th><th scope="col">By</th><th scope="col">Change</th><th scope="col">Why</th></tr></thead>
+    <tbody>{% for h in v.history %}<tr><td>{{ h.version }}</td><td>{{ h.created_at|ts }}</td><td>{{ h.created_by }}</td><td>{% for c in h.changes %}{{ c }}{% if not loop.last %}<br>{% endif %}{% endfor %}</td><td>{{ h.note or '–' }}</td></tr>{% endfor %}</tbody>
+  </table>
+</section>
+{% endblock %}

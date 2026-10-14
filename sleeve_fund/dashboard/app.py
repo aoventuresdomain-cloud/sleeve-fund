@@ -27,10 +27,10 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from sleeve_fund import lifecycle, liquidation, markets, open_risk
+from sleeve_fund import compliance_rules, lifecycle, liquidation, markets, open_risk
 from sleeve_fund.dashboard import book as bookm
 from sleeve_fund.dashboard import development as dev
-from sleeve_fund.dashboard import gates, reasons, reports, riskops, trading, withdrawal
+from sleeve_fund.dashboard import compliance, gates, reasons, reports, riskops, trading, withdrawal
 from sleeve_fund.dashboard.jobs import Jobs
 from sleeve_fund.dashboard.metrics import STALE, sleeve_summary
 from sleeve_fund.data import spec_minutes
@@ -1643,6 +1643,56 @@ def create_app(store: Store | None = None) -> FastAPI:
     @app.get("/settings")
     def settings_page(request: Request, _: str = Depends(require_pm)):
         return _moved(request, "/setup", "#settings")
+
+    @app.get("/portfolio-settings", response_class=HTMLResponse)
+    def portfolio_settings(request: Request, _: str = Depends(require_pm), edit: str = "", saved: str = ""):
+        """Portfolio Settings (Bridge Drop A): the five compliance tests, their use now, the asset groups and the
+        history of versions; ?edit=1 opens the form."""
+        return page(request, "portfolio_settings.html", v=compliance.page(st()), mode="edit" if edit else "view",
+                    saved=saved, errors=[], form=None)
+
+    def _compliance_form(request_form) -> tuple[dict, dict, list[str], int]:
+        tests, groups, errors = compliance.from_form(request_form)
+        errors += compliance_rules.validate(tests) if not errors else []
+        try:
+            expected = int(request_form.get("expected_version", ""))
+        except ValueError:
+            errors.append("The page is out of date; open Portfolio Settings again.")
+            expected = 0
+        return tests, groups, errors, expected
+
+    @app.post("/portfolio-settings/review", response_class=HTMLResponse)
+    async def portfolio_settings_review(request: Request, _: str = Depends(require_pm),
+                                        _o: None = Depends(same_origin)):
+        """The confirm step: what the new version changes, old -> new, and any warning, before anything is written."""
+        form = await request.form()
+        tests, groups, errors, expected = _compliance_form(form)
+        v = compliance.page(st())
+        if errors:
+            return page(request, "portfolio_settings.html", v=v, mode="edit", saved="", errors=errors, form=form)
+        cur = v["current"]
+        lines = compliance_rules.changes(cur["tests"], tests, cur["groups"], groups)
+        return page(request, "portfolio_settings.html", v=v, mode="review", saved="", errors=[], form=form,
+                    changes=lines, warnings=compliance_rules.warnings(tests), expected=expected,
+                    carry=compliance.to_form(tests, groups))
+
+    @app.post("/portfolio-settings/apply")
+    async def portfolio_settings_apply(request: Request, actor: str = Depends(require_pm),
+                                       _o: None = Depends(same_origin)):
+        """Writes the reviewed set as one new version (Store.add_compliance_version), applied from the next idea."""
+        form = await request.form()
+        tests, groups, errors, expected = _compliance_form(form)
+        try:
+            reason = _reason("compliance", form.get("reason", ""), form.get("reason_pick"), form.get("reason_note", ""))
+            if not reason:
+                errors.append("a reason is required")
+            if errors:
+                raise ValueError("; ".join(errors))
+            version = st().add_compliance_version(compliance.rows(tests), groups, created_by=actor, note=reason,
+                                                  expected_version=expected)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from None
+        return RedirectResponse(f"/portfolio-settings?saved={version}", status_code=303)
 
     @app.get("/setup", response_class=HTMLResponse)
     def setup_page(request: Request, _: str = Depends(require_pm), error: str = ""):

@@ -56,6 +56,12 @@ ACTION_REASONS: dict[str, list[tuple[str, str]]] = {
         ("Running it again", "Back in the list, ready to start"),
         ("Archived by mistake", "It shouldn't have been put away"),
     ],
+    "compliance": [
+        ("Advisor's recommendation", "The Independent Quant Advisor proposed these numbers"),
+        ("Tighter while testing", "Less room while the first Strategies run"),
+        ("Looser after review", "The tests refused ideas they shouldn't have"),
+        ("New asset or group", "An asset added, or its group changed"),
+    ],
     "save": [
         ("Research recommendation", "The researcher proposed these settings"),
         ("Fix after reviewing trades", "A trade review showed the setting was wrong"),
