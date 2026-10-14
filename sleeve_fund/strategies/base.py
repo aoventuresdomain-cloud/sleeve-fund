@@ -777,6 +777,9 @@ class LongFlatStrategy(Strategy):
         # BRIDGE-3 (Advisor 14 Oct ~21:55 UK): the fund's equity an entry is sized from, () -> float, set where the fund
         # holds the cash (paper's book, a portfolio run). Unset, the Strategy is the whole fund: its own equity.
         self.fund_equity = None
+        # A multi-asset Strategy's legs on paper (paper.leg_batch): same-close entries wait for every leg, then are
+        # gated strongest first and by asset place. None for every other Strategy: its entries are gated at once.
+        self.leg_batch = None
         # In a portfolio run, what its gate did to each opening order: "<entry|rebalance>_<outcome>" -> count, outcome
         # one of sent, trimmed (sent smaller), below_minimum (trimmed under the venue's minimum, not sent), refused.
         self.portfolio_gate: dict[str, int] = {}
@@ -2294,7 +2297,10 @@ class LongFlatStrategy(Strategy):
         try:
             self._on_bar(bar)
         finally:
+            decided = self._deciding
             self._deciding = self._deciding_bar = self._lag = None
+            if self.leg_batch is not None and decided is not None:
+                self.leg_batch.decide(decided[0], self.runtime.name)  # this leg has decided on that close
         if self._waiting is not None and not self._still_missing():
             self._decide_waiting()  # every minute missing before it has landed: decide on it now, in order
         if self.pair is not None and str(bar.bar_type) == str(self._cfg.bar_type).split("@")[0]:
@@ -3288,16 +3294,29 @@ class LongFlatStrategy(Strategy):
                        "(no stop, and the daily ATR isn't known)")
             return
         if paper is not None:
-            # The check reads the supervisor's last mark of the fund (never marks it, HoQA w2d) and journals its
-            # decision; a refusal's reason is on that row and in the strategy's events.
-            decision = paper(self.runtime.name, {**intent, "bar": self._deciding[0] if self._deciding else None},
-                             self.clock.timestamp_ns())
-            if decision.approved_qty > 0:
-                self._noted.discard(f"{what}_refused_by_portfolio")
-                send(intent, decision)
+            deciding, deciding_bar = self._deciding, self._deciding_bar
+
+            def gate_now() -> None:
+                # The check reads the supervisor's last mark of the fund (never marks it, HoQA w2d) and journals its
+                # decision; a refusal's reason is on that row and in the strategy's events. Held for a multi-asset
+                # Strategy's pass (leg_batch), it runs on this decision's own bar, whoever's callback runs the pass.
+                held, self._deciding, self._deciding_bar = (self._deciding, self._deciding_bar), deciding, deciding_bar
+                try:
+                    decision = paper(self.runtime.name, {**intent, "bar": deciding[0] if deciding else None},
+                                     self.clock.timestamp_ns())
+                    if decision.approved_qty > 0:
+                        self._noted.discard(f"{what}_refused_by_portfolio")
+                        send(intent, decision)
+                    else:
+                        count("refused")
+                        self._note(f"{what}_refused_by_portfolio", decision.decision.reason)
+                finally:
+                    self._deciding, self._deciding_bar = held
+
+            if self.leg_batch is not None and deciding is not None:
+                self.leg_batch.post(self.clock, deciding[0], self.runtime.name, self.idea_strength(), gate_now)
             else:
-                count("refused")
-                self._note(f"{what}_refused_by_portfolio", decision.decision.reason)
+                gate_now()
             return
         batch, name = self._portfolio
         bar = {"bar": self._deciding[0] if self._deciding else None}  # as paper's gate gets it: parity keys on it

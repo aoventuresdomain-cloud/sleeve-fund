@@ -376,11 +376,16 @@ def build_legs_node(legs: list[SleeveConfig], log_level: str = "INFO",
     for name, _, config in accounts:
         builder = builder.add_simulated_exec_client(name, SandboxExecutionClientFactory(), config)
     node = builder.build()
+    from sleeve_fund.paper.leg_batch import LegBatch
+
+    batch = LegBatch(tuple(leg.name for leg in legs))  # same-close ideas: every leg's, strongest first (spec §4)
     for i, (sleeve, runtime, iid, (_, fee_model, _)) in enumerate(zip(legs, runtimes, iids, accounts)):
         status = hub_status if i == 0 else hub_status.view({iid: sleeve.instrument_id})
-        node.add_strategy(_strategy(sleeve, profile, REGISTRY[sleeve.strategy], iid,
-                                    BarType.from_str(f"{iid}-{spec}"), fee_model, runtime=runtime, recorder=None,
-                                    history=history, hub=hub, hub_status=status))
+        strategy = _strategy(sleeve, profile, REGISTRY[sleeve.strategy], iid, BarType.from_str(f"{iid}-{spec}"),
+                             fee_model, runtime=runtime, recorder=None, history=history, hub=hub, hub_status=status)
+        if runtime is not None:
+            strategy.leg_batch = batch
+        node.add_strategy(strategy)
     return node
 
 
