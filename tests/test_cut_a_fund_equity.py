@@ -118,3 +118,23 @@ def test_a_fund_held_strategy_never_falls_back_to_its_own_equity():
     s._paper_fund_equity = lambda: 19_887.78
     assert LongFlatStrategy._sizing_base(s, 0.0) == 19_887.78
 
+
+
+@pytest.mark.xfail(strict=True, reason="needs PE2's fund-equity reader with min(0, unrealised) (SIZE-FUND Q5); the "
+                   "supervisor's mark counts a gain not yet taken")
+def test_a_gain_not_yet_taken_anywhere_in_the_fund_never_sizes_an_entry_up(tmp_path):
+    """TEC-QD-CUTA (HoE): base = deposits net of withdrawals + realised + min(0, unrealised). A Strategy holding 10 from
+    1,000, marked at 1,200, adds 2,000 of unrealised gain to the fund's mark; the next entry anywhere sizes off the
+    fund without it (20,000 less the entry's fee), not 22,000."""
+    from sleeve_fund.supervisor import fund_equity
+
+    store = _store(tmp_path, True)
+    store.create_sleeve(name="a", strategy="buy_and_hold", instrument="BTC/USDT", bar_spec="1-DAY-LAST-EXTERNAL",
+                        starting_balance=20_000, risk_profile="balanced")
+    store.record_fill("a", side="BUY", qty=10, price=1_000, fee=5.0, order_id="o1", trade_id="t1", ts=T0)
+    store.record_equity("a", equity=21_995, cash=9_995, qty=10, price=1_200, benchmark=20_000, ts=T0)
+    marked = fund_equity(store)
+    DbLedger(store, lambda: None).set_state(PortfolioState(mark_ts=T0, equity=marked, hwm=marked, day=T0.date(),
+                                                           day_start_equity=marked))
+    s = SimpleNamespace(runtime=SimpleNamespace(store=store, now=lambda: T0), log=SimpleNamespace(warning=print))
+    assert LongFlatStrategy._paper_fund_equity(s) == pytest.approx(19_995.0)
