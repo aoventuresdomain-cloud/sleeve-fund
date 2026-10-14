@@ -20,6 +20,7 @@ import math
 from datetime import datetime, timedelta
 from decimal import Decimal
 
+import numpy as np
 import pandas as pd
 
 
@@ -77,11 +78,22 @@ def daily_atr_lookup(prices: pd.DataFrame) -> dict[int, float]:
     # A bar stamped at its close belongs to the day it closes in, less a nanosecond: the bar closing at 00:00 is the day before's.
     days = prices[["high", "low", "close"]].groupby((prices.index - pd.Timedelta(1, "ns")).floor("D")).agg(
         {"high": "max", "low": "min", "close": "last"})
+    # daily_atr_pct on each day's window, read from plain arrays: the same rows in the same order through the same Atr,
+    # so the same floats, without a DataFrame slice per day (PERF-ATR: it was ~90% of a perp backtest).
+    from sleeve_fund.strategies.indicators.averages import Atr
+
+    high, low, close = (days[c].to_numpy(dtype=float) for c in ("high", "low", "close"))
+    whole = ~(np.isnan(high) | np.isnan(low) | np.isnan(close))
+    starts = days.index + pd.Timedelta(days=1)
     out = {}
     for i in range(ATR_DAYS - 1, len(days)):
-        v = daily_atr_pct(days.iloc[max(0, i + 1 - ATR_WINDOW):i + 1])
-        if v is not None:
-            out[int((days.index[i] + pd.Timedelta(days=1)).value)] = v
+        rows = [j for j in range(max(0, i + 1 - ATR_WINDOW), i + 1) if whole[j]]
+        if len(rows) < ATR_DAYS or close[rows[-1]] <= 0:
+            continue
+        atr = Atr(ATR_DAYS)
+        for j in rows:
+            atr.update_raw(high[j], low[j], close[j])
+        out[int(starts[i].value)] = atr._outputs()["value"] / float(close[rows[-1]])
     return out
 
 
