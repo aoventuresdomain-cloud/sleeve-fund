@@ -293,15 +293,15 @@ def test_c3b_a_reset_after_a_loss_keeps_the_drawdown(store):
 
 def test_c2_a_clean_slate_takes_what_it_archives_out_of_the_book_with_a_flow(store, tmp_path):
     """F-C3B-A inverts this cell (HoE OK 14 Oct 10:00 UK): the slate's archive takes a's 10,500 out with its flow, and
-    a later Strategy's capital is the whole book."""
+    the Strategy it keeps is the whole book."""
     _make(store, "a", 10_000)
+    _make(store, "b", 10_000)
     _trade(store, "a", 500)
     _mark(store, T0)
     slate = tmp_path / "clear.toml"
-    slate.write_text('[[clear]]\nid = "s1"\nreason = "fresh book"\n')
+    slate.write_text('[[clear]]\nid = "s1"\nreason = "fresh book"\nkeep = ["b"]\n')
     assert supervisor.clear(store, str(slate)) == ["a"]
     assert store.withdrawn() == {"a": D(10_500)} and len(_flows(store)) == 1
-    _make(store, "b", 10_000)
     assert _four(_mark(store, T0 + timedelta(minutes=1))) == (D(10_000),) * 4
 
 
