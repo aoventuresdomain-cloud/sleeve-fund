@@ -105,7 +105,7 @@ def test_paper_reads_no_daily_atr_when_the_store_has_none_in_the_window(monkeypa
 
 def test_another_strategy_past_its_stop_counts_as_stopless_and_is_named(monkeypatch):
     store = Store.in_memory()
-    store.create_sleeve(name="other", strategy="ping_pong", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
+    store.create_sleeve(name="other", strategy="ping_pong", instrument="BTC/USDT", bar_spec="1-MINUTE-LAST-INTERNAL",
                         starting_balance=10_000, params=PERP, risk_profile="conservative")
     store.record_equity("other", equity=10_000, cash=4_000, qty=0.1, price=60_000, benchmark=10_000)
     monkeypatch.setattr(open_risk, "_journal_stop", lambda store, s, qty: 61_000.0)  # a long's stop above the mark
@@ -143,6 +143,9 @@ def test_a_gated_paper_entry_with_no_stop_and_no_daily_atr_is_refused_as_a_warni
     from test_replay import START
 
     monkeypatch.setattr(gate, "MARK_STALE", timedelta(days=1))  # one mark covers the replay
+    # The recorded pair quotes in USD on the hub-fed venue's paper account, a test account outside the fund's book
+    # (F229-6) that the gate never sees; this pin is about a Strategy the gate does see.
+    monkeypatch.setattr("sleeve_fund.supervisor.outside_fund_book", lambda store, s: False)
     store = Store.in_memory(portfolio_gate=True)
     marked, book = pd.Timestamp(START, tz="UTC").to_pydatetime(), Decimal(20_000)
     DbLedger(store, lambda: None).set_state(PortfolioState(mark_ts=marked, equity=book, hwm=book, day=marked.date(),
@@ -165,7 +168,7 @@ def test_paper_refuses_an_entry_that_takes_the_accounts_open_risk_over_5_percent
     """ping_pong at 1x opens about 2,000 notional (200 at risk). Another stopless strategy on the account holding
     0.15 at 60,000 (9,000 notional, 900 at risk) takes the book of 20,000 past 1,000, so the entry is refused."""
     store = Store.in_memory()
-    store.create_sleeve(name="other", strategy="ping_pong", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
+    store.create_sleeve(name="other", strategy="ping_pong", instrument="BTC/USDT", bar_spec="1-MINUTE-LAST-INTERNAL",
                         starting_balance=10_000, params=PERP, risk_profile="conservative")
     store.record_equity("other", equity=10_000, cash=10_000 - other_qty * 60_000, qty=other_qty, price=60_000,
                         benchmark=10_000)
