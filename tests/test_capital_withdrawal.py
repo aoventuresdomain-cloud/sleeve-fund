@@ -409,7 +409,7 @@ def test_d1_archiving_a_holder_moves_nothing_and_it_counts_in_full(store):
     before = _four(_mark(store, T0))
     store.archive("b")
     assert _four(_state(store)) == before and _flows(store) == [] and store.withdrawn() == {}
-    assert store.withdrawal_pending() == ["b"] and "b" in store.archived()
+    assert store.withdrawal_pending() == ["b"] and "b" in store.archived() and store.nothing_withdrawn() == {}
     assert supervisor.fund_equity(store) == D(30_000)
     st = _poll(store, T0 + timedelta(minutes=1))  # still holding: the poll takes nothing out
     assert st.equity == D(30_000) and _flows(store) == [] and store.withdrawal_pending() == ["b"]
@@ -473,6 +473,7 @@ def test_d6_a_settled_equity_of_nothing_or_less_is_never_withdrawn_and_is_journa
     said = [e["message"] for e in store.events_of(("withdrawal_none",))]
     assert len(said) == 1 and "-4.00" in said[0] and "never negative" in said[0]
     assert st.equity == D(19_996)  # it stays in the book at that
+    assert store.nothing_withdrawn() == {"b": D(-4)}
     _poll(store, T0 + timedelta(minutes=2))
     assert len(store.events_of(("withdrawal_none",))) == 1
 

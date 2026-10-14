@@ -1677,13 +1677,24 @@ class Store:
     def withdrawal_pending(self) -> list[str]:
         """Strategies archived while not flat whose equity waits to leave the book (WITHDRAWAL_DEFERRED, and no
         WITHDRAWAL_NONE since): the supervisor's poll withdraws each once it is flat. The dashboard shows them as
-        archived, waiting to go flat."""
+        archived, waiting to go flat. Every archive since F-C3B-A either withdraws (withdrawn) or journals one of the
+        two, so the latest of them is the current archive's, whatever clocks wrote them."""
         archived, out = self.archived(), self.withdrawn()
         last: dict[str, tuple] = {}
         for e in self.events_of((WITHDRAWAL_DEFERRED, WITHDRAWAL_NONE), limit=10_000):  # newest first
             last.setdefault(e["sleeve"], (e["kind"], e["ts"]))
-        return [n for n, (kind, at) in last.items()
-                if kind == WITHDRAWAL_DEFERRED and n in archived and n not in out and _aware(at) >= archived[n]]
+        return [n for n, (kind, _) in last.items() if kind == WITHDRAWAL_DEFERRED and n in archived and n not in out]
+
+    def nothing_withdrawn(self) -> dict[str, Decimal]:
+        """Strategies archived with a settled equity of 0 or less, so nothing left the book (WITHDRAWAL_NONE since
+        their archive): {name: that equity, as the book still counts it}. For the dashboard's "archived, nothing to
+        withdraw" (Advisor 14 Oct 11:10 UK)."""
+        archived, out = self.archived(), self.withdrawn()
+        last: dict[str, tuple] = {}
+        for e in self.events_of((WITHDRAWAL_DEFERRED, WITHDRAWAL_NONE), limit=10_000):  # newest first
+            last.setdefault(e["sleeve"], (e["kind"], e["ts"]))
+        return {n: self.in_book_equity(n) for n, (kind, _) in last.items()
+                if kind == WITHDRAWAL_NONE and n in archived and n not in out}
 
     def in_book_equity(self, sleeve: str) -> Decimal:
         """`sleeve`'s equity as the fund's book counts it (supervisor.strategy_equity), or nothing when it sits outside
