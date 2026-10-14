@@ -5014,6 +5014,9 @@ class LongFlatStrategy(Strategy):
         # the same objects as the sandbox account's, so balance_total(currency) can miss.
         totals = {str(cur.code): m.as_double() for cur, m in account.balances_total().items()}
         cash = sum(totals.get(c, 0.0) for c in self._codes("quote"))
+        # CUT-A: the simulated account's virtual funding from the fund (paper.node.virtual_funding) is not this
+        # Strategy's cash: the journal's starts at 0, so marks and reconcile see it netted out
+        cash -= getattr(self.runtime, "funded", 0.0) or 0.0
         if self._margin:
             # A margin account holds realised money only; the journal keeps spot-style cash (a short holds
             # its sale's proceeds), so take the open position's cost back out: cash = balance - qty x entry.

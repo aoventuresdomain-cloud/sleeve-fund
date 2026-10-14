@@ -110,7 +110,8 @@ class Ledger(Protocol):
     def cancel_sent(self, reservation_id: int, at: datetime) -> None: ...
     def reduce(self, reservation_id: int, filled_qty: Decimal) -> None: ...
     def release(self, reservation_id: int, reason: str) -> None: ...
-    def record(self, strategy: str, at: datetime, intent: Intent, decision: Decision, version: int) -> int: ...
+    def record(self, strategy: str, at: datetime, intent: Intent, decision: Decision, version: int | None,
+               compliance_version: int | None = None) -> int: ...
     def state(self) -> PortfolioState: ...
     def set_state(self, state: PortfolioState) -> None: ...
     def alert(self, kind: str, message: str, at: datetime) -> None: ...
@@ -179,7 +180,7 @@ class MemoryLedger:
         if self.reserved.pop(reservation_id, None) is not None:
             self.released.append((reservation_id, reason))
 
-    def record(self, strategy, at, intent, decision, version):
+    def record(self, strategy, at, intent, decision, version, compliance_version=None):
         seq = len(self.records) + 1
         self.records.append(Record(seq, strategy, at, intent, decision, version))
         return seq
@@ -221,8 +222,17 @@ def stale_untold(st: PortfolioState) -> bool:
     return st.stale_told != (st.mark_ts or NEVER)
 
 
+IDENTITY_HOLD = "identity_hold"  # the decision's reason kind while the fund's book check holds entries (RECON-B)
+
+
 def _block(ledger: Ledger, now: datetime) -> tuple[str, str] | None:
-    """entry_block's answer; the caller holds the ledger's lock."""
+    """entry_block's answer; the caller holds the ledger's lock. A ledger on the journal also holds every entry while
+    the fund's book check has failed (identity_hold: latched until the PM's Resume, Advisor RECON-B)."""
+    held = getattr(ledger, "identity_hold", None)
+    why = held() if callable(held) else None
+    if why:
+        return IDENTITY_HOLD, (f"No new entries: the fund's book check failed ({why}); exits and stops still go out, "
+                               "and only the PM's Resume lifts it")
     st = ledger.state()
     hit = block_reason(st, now)
     if hit is not None and hit[0] == "portfolio_state_stale" and stale_untold(st):
@@ -240,15 +250,35 @@ def entry_block(ledger: Ledger, now: datetime) -> tuple[str, str] | None:
         return _block(ledger, now)
 
 
-def check_order(ledger: Ledger, strategy: str, intent: Intent, profile: PortfolioProfile, now: datetime) -> Checked:
+def _tests(ledger: Ledger, profile: PortfolioProfile | None) -> tuple[PortfolioProfile, int | None]:
+    """The tests an idea is checked against, and the compliance version to record: `profile` as given (no version),
+    or with None the PM's compliance tests in force, read through the ledger inside its lock at evaluation, so an edit
+    between the idea and the gate applies (Bridge Drop A; BRIDGE-3-QA). A read that fails raises: no entry."""
+    if profile is not None:
+        return profile, None
+    tests = ledger.compliance()
+    return tests, tests.version
+
+
+def _record(ledger: Ledger, strategy: str, now: datetime, intent: Intent, decision: Decision, version: int | None,
+            cv: int | None) -> int:
+    """ledger.record, naming the compliance version only when there is one (a Ledger from before Drop A takes five)."""
+    if cv is None:
+        return ledger.record(strategy, now, intent, decision, version)
+    return ledger.record(strategy, now, intent, decision, None, cv)
+
+
+def check_order(ledger: Ledger, strategy: str, intent: Intent, profile: PortfolioProfile | None,
+                now: datetime) -> Checked:
     """One order that raises `strategy`'s position. While the portfolio blocks entries it is rejected outright, never
     trimmed. Otherwise it is decided against the whole book with every unreleased reservation counted as filled, and
     the approved quantity is reserved before the lock is let go, so the next strategy sees it. Every check is
     recorded. Any error, the lock's included, fails closed: no entry, with the reason, an alert, and an 'error' row
     in the journal (limit 'lock_error' when the lock itself failed), written on its own after the check rolled back
     (p2-2-tables.md, Concurrency). The returned Checked has no seq. The error row takes one, outside the lock, so
-    it holds no place in the first-come order: a replay in seq order skips outcome 'error' (CR F219-2)."""
-    lock_failed = False
+    it holds no place in the first-come order: a replay in seq order skips outcome 'error' (CR F219-2). profile None:
+    the compliance tests in force (_tests)."""
+    lock_failed, version, cv = False, getattr(profile, "version", None), None
     try:
         with ExitStack() as held:
             try:
@@ -256,19 +286,20 @@ def check_order(ledger: Ledger, strategy: str, intent: Intent, profile: Portfoli
             except Exception:
                 lock_failed = True
                 raise
+            tests, cv = _tests(ledger, profile)
             block = _block(ledger, now)
             if block is not None:
                 decision = rejected(intent.qty, block[0], f"Entry rejected: {block[1]}")
             else:
                 equity, held_now = ledger.positions()
                 book = Book(equity, (*held_now, *(r.holding for r in ledger.reservations())))
-                decision = decide(book, intent, profile)
+                decision = decide(book, intent, tests)
             rid = None
             if decision.approved_qty > 0:
                 q = decision.approved_qty
                 rid = ledger.reserve(strategy, Holding(intent.underlying, intent.side * q * intent.price,
                                                        q * intent.margin_per_unit, q * intent.risk_per_unit), now, q)
-            seq = ledger.record(strategy, now, intent, decision, profile.version)
+            seq = _record(ledger, strategy, now, intent, decision, tests.version, cv)
             return Checked(decision, seq, rid)
     except Exception as e:  # noqa: BLE001 - any failure here means no entry
         why = f"Entry rejected: the portfolio check couldn't run ({type(e).__name__}: {e}), so nothing is sent"
@@ -279,23 +310,22 @@ def check_order(ledger: Ledger, strategy: str, intent: Intent, profile: Portfoli
         qty = getattr(intent, "qty", Decimal(0))
         qty = qty if isinstance(qty, Decimal) else Decimal(0)
         try:
-            ledger.record(strategy, now, intent, Decision("error", Decimal(0), qty,
-                                                          "lock_error" if lock_failed else None, why),
-                          profile.version)
+            _record(ledger, strategy, now, intent, Decision("error", Decimal(0), qty,
+                                                            "lock_error" if lock_failed else None, why), version, cv)
         except Exception:  # noqa: BLE001 - as for the alert
             pass
         return Checked(rejected(qty, None, why), None, None)
 
 
 def check_pair(ledger: Ledger, strategy: str | tuple[str, str], first: Intent, second: Intent,
-               profile: PortfolioProfile, now: datetime) -> tuple[Checked, Checked]:
+               profile: PortfolioProfile | None, now: datetime) -> tuple[Checked, Checked]:
     """A two-leg entry (P2-8) as one position: both legs decided together under the one lock (limits.decide_pair), the
     same share of each or neither, and both reservations written before the lock is let go, so no other strategy's
     check lands between them (Advisor M1). Each leg's decision is recorded, under its own row's name when `strategy`
     names the two legs. Any failure fails closed for both legs, as check_order does for one."""
     names = (strategy, strategy) if isinstance(strategy, str) else tuple(strategy)
     strategy = names[0]
-    lock_failed = False
+    lock_failed, version, cv = False, getattr(profile, "version", None), None
     try:
         with ExitStack() as held:
             try:
@@ -303,6 +333,7 @@ def check_pair(ledger: Ledger, strategy: str | tuple[str, str], first: Intent, s
             except Exception:
                 lock_failed = True
                 raise
+            tests, cv = _tests(ledger, profile)
             block = _block(ledger, now)
             if block is not None:
                 why = f"Entry rejected: {block[1]}"
@@ -310,7 +341,7 @@ def check_pair(ledger: Ledger, strategy: str | tuple[str, str], first: Intent, s
             else:
                 equity, held_now = ledger.positions()
                 book = Book(equity, (*held_now, *(r.holding for r in ledger.reservations())))
-                decisions = decide_pair(book, first, second, profile)
+                decisions = decide_pair(book, first, second, tests)
             out = []
             for name, intent, decision in zip(names, (first, second), decisions):
                 rid = None
@@ -318,7 +349,7 @@ def check_pair(ledger: Ledger, strategy: str | tuple[str, str], first: Intent, s
                     q = decision.approved_qty
                     rid = ledger.reserve(name, Holding(intent.underlying, intent.side * q * intent.price,
                                                        q * intent.margin_per_unit, q * intent.risk_per_unit), now, q)
-                out.append(Checked(decision, ledger.record(name, now, intent, decision, profile.version), rid))
+                out.append(Checked(decision, _record(ledger, name, now, intent, decision, tests.version, cv), rid))
             return out[0], out[1]
     except Exception as e:  # noqa: BLE001 - any failure here means neither leg is sent
         why = f"Entry rejected: the portfolio check couldn't run ({type(e).__name__}: {e}), so neither leg is sent"
@@ -331,9 +362,8 @@ def check_pair(ledger: Ledger, strategy: str | tuple[str, str], first: Intent, s
             qty = getattr(intent, "qty", Decimal(0))
             qty = qty if isinstance(qty, Decimal) else Decimal(0)
             try:
-                ledger.record(name, now, intent, Decision("error", Decimal(0), qty,
-                                                              "lock_error" if lock_failed else None, why),
-                              profile.version)
+                _record(ledger, name, now, intent, Decision("error", Decimal(0), qty,
+                                                            "lock_error" if lock_failed else None, why), version, cv)
             except Exception:  # noqa: BLE001 - as for the alert
                 pass
             out.append(Checked(rejected(qty, None, why), None, None))

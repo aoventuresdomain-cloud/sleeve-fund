@@ -486,6 +486,9 @@ class SleeveRuntime:
         # The paper engine keeps fills in memory, so a restart rebuilds the book from the journal.
         self.book = self.store.journal_book(sleeve_name, sleeve.starting_balance)
         self.last_reconciled = None
+        # CUT-A (Advisor Q3-MARGIN): what the simulated account was funded with beyond the journal's own cash, a view
+        # of the fund's equity so isolated margin can be posted; never journaled, never in the book, netted out here.
+        self.funded = 0.0
         self._day = None
         self._day_open = None
         self._last_equity = None
@@ -1291,7 +1294,7 @@ class SleeveRuntime:
         book = self.store.journal_book(self.name, self.starting_balance)
         # Each fill can round the cash by up to a cent (notional and fee), so allow for that.
         cash_tol = 0.01 * (1 + 2 * book["fills"])
-        d_cash = cash - book["cash"]
+        d_cash = cash - book["cash"]  # cash: the engine's net of its virtual funding (LongFlatStrategy._equity)
         # Compared in Decimal, each side as written, so float noise can't tip a one-lot gap into a halt.
         d_qty = float(Decimal(repr(float(qty))) - Decimal(repr(float(book["qty"]))))
         # Neither side holds more figures than a float does: at 1.6e8 units one float step is 3e-8, wider than two
