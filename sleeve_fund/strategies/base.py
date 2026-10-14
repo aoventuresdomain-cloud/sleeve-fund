@@ -1518,7 +1518,8 @@ class LongFlatStrategy(Strategy):
         liq = None
         if self._margin:
             lev = LongFlatStrategy._max_leverage(self)
-            liq = markets.isolated_liquidation(cash, qty, entry, lev, self._cfg.perp.maintenance_margin)
+            liq = markets.isolated_liquidation(cash + self._funded(), qty, entry, lev,
+                                               self._cfg.perp.maintenance_margin)
         target = liq if liq is not None else 0.0
         if side * (mark - target) <= 0:
             return  # already through liquidation: the liquidation guard closes it
@@ -1636,6 +1637,8 @@ class LongFlatStrategy(Strategy):
             if open_risk.check_entry(equity, 0.0, risk):
                 self.open_risk_binds += 1
             return None
+        if self._fund_held():
+            return None  # CUT-A (d): the fund's own open-risk limit (the gate's T3) judges it, never this Strategy's book
         from sleeve_fund.venues import venue as venue_profile
 
         now = self.runtime.now()
@@ -2175,7 +2178,7 @@ class LongFlatStrategy(Strategy):
         lev = LongFlatStrategy._max_leverage(self)
         limits = {f"{lev:g}x leverage cap": Decimal(str(base * lev)) * room}  # SIZE-FUND Q3: on fund equity
         if self._fund_held():  # the margin the simulated account can post (PE2 funds it from the fund's free cash)
-            limits["margin account"] = Decimal(str(max(cash, 0.0) * lev)) * room
+            limits["margin account"] = Decimal(str(max(cash + self._funded(), 0.0) * lev)) * room
         if self.runtime is not None:
             limits[f"{self.runtime.profile.name} risk profile cap"] = Decimal(str(self.runtime.position_budget(base)))
         elif self._cfg.position_cap_pct is not None:
@@ -2197,11 +2200,12 @@ class LongFlatStrategy(Strategy):
         signal = {**values, "close": close, "side": _side_word(side), "sized_by": size_by,
                   "budget": round(float(budget), 2)}
         notional = float(qty) * close
-        liq, distance = entry_liquidation(cash, float(qty), close, side, self._cfg.assumed_taker_fee,
+        # CUT-A: the simulated account posts the margin, with the fund's virtual funding back in (_mark nets it out)
+        liq, distance = entry_liquidation(cash + self._funded(), float(qty), close, side, self._cfg.assumed_taker_fee,
                                           self._cfg.perp.maintenance_margin, lev)
         if liq is not None:
             signal["liquidation_px"] = round(liq, 8)
-            signal["leverage"] = round(notional / equity, 4)
+            signal["leverage"] = round(notional / base, 4)  # of what it was sized off: the fund's equity inside it
             share = self.runtime.profile.stop_to_liquidation if self.runtime is not None else 0.5
             if self._stop_frac and self._stop_frac > share * distance:
                 self._note("entry_refused_liquidation",
@@ -3774,7 +3778,7 @@ class LongFlatStrategy(Strategy):
             return None
         lev = LongFlatStrategy._max_leverage(self)
         entry = self._entry_px if self._entry_px else self._net_position()[1]
-        return markets.isolated_liquidation(cash, qty, entry, lev, self._cfg.perp.maintenance_margin)
+        return markets.isolated_liquidation(cash + self._funded(), qty, entry, lev, self._cfg.perp.maintenance_margin)
 
     def _position_opened(self, fills: list[dict]) -> int:
         """When the position held now opened (ns): its first fill since the journal was last flat or went through
@@ -5051,6 +5055,11 @@ class LongFlatStrategy(Strategy):
             account = self.cache.account_for_venue(self._cfg.instrument_id.venue)
         return account
 
+    def _funded(self) -> float:
+        """What the simulated account was funded with from the fund beyond the journal's cash (PE2, runtime.funded;
+        0 outside the fund), which _mark nets out: added back wherever the account's own balance is what counts."""
+        return float(getattr(self.runtime, "funded", 0.0) or 0.0)
+
     def _fund_held(self) -> bool:
         """Paper inside the fund (the portfolio gate on, and in the fund's book): the fund holds the cash, so the
         Strategy's own equity (its P&L, from a starting balance of 0) never sizes, halts or pauses it (Advisor CUT-A
@@ -5062,10 +5071,19 @@ class LongFlatStrategy(Strategy):
         """Paper's fund equity: the supervisor's last portfolio mark, or None when it is stale by the book's own rule
         (gate.MARK_STALE, the one that already blocks entries) or can't be read (Advisor SIZE-FUND Q5: stale is
         refused, never sized off)."""
+        from sleeve_fund import supervisor
         from sleeve_fund.gate_ledger import DbLedger
         from sleeve_fund.paper.runtime import _no_positions
         from sleeve_fund.portfolio import gate
 
+        reader = getattr(supervisor, "sizing_equity", None)  # PE2's fund figure (Q5: + min(0, unrealised)), once merged
+        if reader is not None:
+            try:
+                fund = reader(self.runtime.store, self.runtime.now())
+            except Exception as exc:  # noqa: BLE001 - fail closed: an unread book sizes nothing
+                self.log.warning(f"fund equity unreadable: {type(exc).__name__}: {exc}")
+                return None
+            return None if fund is None else float(fund)
         try:
             st = DbLedger(self.runtime.store, _no_positions).state()
         except Exception as exc:  # noqa: BLE001 - fail closed: an unread book sizes nothing
@@ -5181,19 +5199,22 @@ class LongFlatStrategy(Strategy):
             if self._margin:
                 self._apply_funding(self._price())
             equity, cash, qty, price = self._mark()
+            # CUT-A: inside the fund the Strategy's own equity starts at 0; its simulated account, with the fund's
+            # virtual funding back in (runtime.funded, which _mark nets out), is what can be underwater or wiped out.
+            account = equity + self._funded()
             # A perp position valued at or below zero equity is past its liquidation price (a gap the guards
             # couldn't trade inside), not a book that can't be valued: liquidate it, and the risk check halts.
-            underwater = self._margin and qty != 0 and price > 0 and equity <= 0
+            underwater = self._margin and qty != 0 and price > 0 and account <= 0
             # Flat with nothing left after a gap past the bankruptcy price (the insurance fund took the rest): a
             # strategy that was wiped out, not one that can't be valued. It is marked at zero and halted
             # (review round 12, B12-1: it kept its last mark before the gap and stayed running).
-            ruined = (self._margin and qty == 0 and price > 0 and equity <= 0
+            ruined = (self._margin and qty == 0 and price > 0 and account <= 0
                       and self._account() is not None and self.instrument is not None)
             # Flat after a wipe-out the PM resumed, with what wasn't margined kept (P1-D3): still a wipe-out, so it
             # halts again, marked at what it kept (HoE and QA, 6 Oct).
-            kept = (self._margin and qty == 0 and price > 0 and equity > 0
+            kept = (self._margin and qty == 0 and price > 0 and account > 0
                     and (self.runtime.wiped_out or self._liquidated is not None))
-            if price <= 0 or (equity <= 0 and not underwater and not ruined):
+            if price <= 0 or (account <= 0 and not underwater and not ruined):
                 # Still alive, just can't value the book yet: heartbeat, and say why once.
                 self.runtime.store.heartbeat(self.runtime.name, self.runtime.now())
                 if not self._mark_warned:
