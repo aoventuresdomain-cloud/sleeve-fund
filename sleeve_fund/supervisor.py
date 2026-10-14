@@ -970,7 +970,7 @@ def withdraw_archived(store: Store, actor: str, commit: str) -> list[str]:
     runs, out = store.reset_runs(), store.withdrawn()
     due = [n for n in store.archived() if n not in runs and n not in out and not is_backtest(n)]
     held = [f"{n} holds {store.journal_book(n, store.sleeve(n).starting_balance)['qty']}" for n in due
-            if store.journal_book(n, store.sleeve(n).starting_balance)["qty"] != 0]
+            if abs(store.journal_book(n, store.sleeve(n).starting_balance)["qty"]) > 1e-12]  # as previous_book
     if held:
         raise RuntimeError("withdraw-archived refused, nothing written: " + "; ".join(held)
                            + " (flatten it first: a position has no settled equity to take out)")

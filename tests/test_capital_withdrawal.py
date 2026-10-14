@@ -243,6 +243,28 @@ def test_w13_withdraw_archived_keys_on_reset_runs_so_never_takes_a_runs_cash_out
     assert _four(_mark(store, T0 + timedelta(minutes=3))) == before
 
 
+
+def test_w14_withdraw_archived_keeps_when_an_old_archive_went_so_it_stays_an_earlier_books(store, tmp_path):
+    """DA MUST (14 Oct): previous_book reads archived_at against the clean slate's start, so the one-off writes only
+    the amount on an archive from before 0023, never a new date."""
+    from sqlalchemy import insert
+
+    from sleeve_fund.store import sleeve_archive_t
+
+    _make(store, "a", 15_000)
+    _make(store, "b", 5_000)
+    went = T0 - timedelta(days=30)
+    with store.engine.begin() as c:
+        c.execute(insert(sleeve_archive_t).values(sleeve="b", archived_at=went))
+    slate = tmp_path / "clear.toml"
+    slate.write_text('[[clear]]\nid = "s1"\nreason = "fresh book"\nkeep = ["a"]\n')
+    supervisor.clear(store, str(slate))
+    assert "b" in store.previous_book()
+    _mark(store, T0)
+    assert supervisor.withdraw_archived(store, "operator", "abc1234") == ["b"]
+    assert store.archived()["b"] == went and "b" in store.previous_book() and store.withdrawn() == {"b": D(5_000)}
+
+
 # --- E1-E4: a withdrawal that empties the book (Advisor 14 Oct 10:00 UK, on QD's proposal) ------------------------------
 
 def test_e1_emptying_the_book_leaves_it_unmarked_and_the_next_capital_starts_it_afresh(store):

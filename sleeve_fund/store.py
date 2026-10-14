@@ -1632,8 +1632,11 @@ class Store:
                                                                  sleeve_archive_t.c.withdrawn.is_not(None))).first():
                 return
             out = taken[0] if taken else part()  # nothing marked yet: no flow, but out of the book all the same
-            c.execute(sleeve_archive_t.delete().where(sleeve_archive_t.c.sleeve == sleeve))
-            c.execute(insert(sleeve_archive_t).values(sleeve=sleeve, archived_at=ts, withdrawn=stored(out)))
+            # An archive from before 0023 (withdraw-archived) keeps when it went: previous_book reads archived_at
+            # against the clean slate's start (DA, 14 Oct). A fresh one is written now.
+            if not c.execute(update(sleeve_archive_t).where(sleeve_archive_t.c.sleeve == sleeve)
+                             .values(withdrawn=stored(out))).rowcount:
+                c.execute(insert(sleeve_archive_t).values(sleeve=sleeve, archived_at=ts, withdrawn=stored(out)))
 
     def _in_book_equity(self, sleeve: str) -> Decimal:
         """`sleeve`'s equity as the fund's book counts it (supervisor.strategy_equity), or nothing when it sits outside
