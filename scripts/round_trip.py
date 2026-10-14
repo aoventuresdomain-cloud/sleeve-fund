@@ -7,8 +7,12 @@ Runs over stdin in the supervisor container (.github/workflows/final-smoke.yml, 
     python -u - --strategy ping-pong-ls-binance [--timeout-min 30]
 
 Guards: the Strategy must be on the allowlist, on the paper account, a perpetual on the hub-fed venue, stopped and
-flat. It is stopped again whatever happens (an error, a timeout, an interrupt). Exit 0 only for one entry fill,
-one exit fill and a flat book; the fills are printed for final_smoke journal and HoQA."""
+flat. Ping pong places no stop, so on a perpetual it may run at 1x only (strategies.check_perp_stop): the round trip
+puts the smoke Strategy on the conservative profile first, journaled and printed (B3-1, 14 Oct). It then runs the
+supervisor's own start checks on the model, and once started it fails at once on the supervisor's start_refused
+event rather than waiting out the timeout. It is stopped again whatever happens (an error, a timeout, an interrupt).
+Exit 0 only for one entry fill, one exit fill and a flat book; the fills are printed for final_smoke journal and
+HoQA."""
 
 from __future__ import annotations
 
@@ -44,6 +48,40 @@ def guard(store, name: str) -> str | None:
     return None
 
 
+def to_conservative(store, name: str) -> None:
+    """The smoke Strategy on the conservative profile (1x), as the dashboard's settings change saves and journals it,
+    with only the profile changed. Called only after guard (allowlisted, stopped, flat), so nothing restarts."""
+    s = store.sleeve(name)
+    if s.risk_profile == "conservative":
+        return
+    text = f"Risk profile: {s.risk_profile} to conservative"
+    store.change_settings(name, risk_profile="conservative", params=s.params, warmup_bars=s.warmup_bars)
+    store.decide(ACTOR, "change_settings", f"{text}. Final-head smoke: ping pong places no stop, so a perpetual runs "
+                 "at 1x only", name)
+    store.event(name, "info", "settings_change", f"Settings changed by {ACTOR}: {text}. They apply when it next starts.")
+    print(f"{name}: {text} (journaled)")
+
+
+def start_check(store, name: str) -> str | None:
+    """The supervisor's model checks at start (strategies.check_perp_sizing and check_perp_stop), so a refusal
+    fails before the start rather than after the timeout."""
+    from sleeve_fund.strategies import check_perp_sizing, check_perp_stop
+
+    s = store.sleeve(name)
+    try:
+        check_perp_sizing(s.strategy, s.params)
+        check_perp_stop(s.strategy, s.params, s.risk_profile)
+    except ValueError as e:
+        return str(e)
+    return None
+
+
+def refused(store, name: str, since: datetime) -> str | None:
+    """The supervisor's start_refused event for this start, if it has refused it."""
+    return next((e["message"] for e in store.events(name, limit=50)
+                 if e["kind"] == "start_refused" and e["ts"] >= since), None)
+
+
 def stop(store, name: str, reason: str) -> None:
     """The dashboard's Stop (dashboard.app command handler), in its order."""
     accepted = datetime.now(UTC)
@@ -54,12 +92,17 @@ def stop(store, name: str, reason: str) -> None:
     store.apply_waiting_ral(name)
 
 
-def run(store, name: str, timeout: float, sleep=time.sleep, clock=time.monotonic) -> int:
+def run(store, name: str, timeout: float, sleep=time.sleep, clock=time.monotonic, conservative: bool = True) -> int:
     from sleeve_fund.paper.runtime import entry_blocked
     from sleeve_fund.store import utcnow
 
     if why := guard(store, name):
         print(f"B3 round trip: FAIL (refused: {why})")
+        return 1
+    if conservative:
+        to_conservative(store, name)
+    if why := start_check(store, name):
+        print(f"B3 round trip: FAIL (the supervisor would refuse it: {why})")
         return 1
     blocked, why = entry_blocked(store, name, utcnow(), starting=True)  # the dashboard's start check (CHOKE)
     if blocked:
@@ -69,12 +112,15 @@ def run(store, name: str, timeout: float, sleep=time.sleep, clock=time.monotonic
     since = utcnow()
     fills: list[dict] = []
     flattened = False
+    why = None
     try:
         store.set_desired_state(name, "running")
         store.decide(ACTOR, "start", "final-head smoke: one paper round trip", name)
         print(f"started {name} at {since:%H:%M:%S} UTC")
         end = clock() + timeout
         while clock() < end:
+            if why := refused(store, name, since):
+                break
             fills = sorted((f for f in store.fills(name, limit=50) if f["ts"] >= since), key=lambda f: f["ts"])
             qty = Decimal(str(store.journal_book(name, s.starting_balance)["qty"]))
             if fills and not flattened and qty != 0:
@@ -92,7 +138,8 @@ def run(store, name: str, timeout: float, sleep=time.sleep, clock=time.monotonic
         print(f"fill {f['trade_id']} {f['ts']:%H:%M:%S} {f['side']:4} qty {f['qty']} @ {f['price']} fee {f['fee']}")
     qty = Decimal(str(store.journal_book(name, s.starting_balance)["qty"]))
     sides = {f["side"] for f in fills}
-    fails = [] if len(sides) == 2 else [f"fills on {sorted(sides) or 'no side'}"]
+    fails = [f"the supervisor refused the start: {why}"] if why else []
+    fails += [] if len(sides) == 2 else [f"fills on {sorted(sides) or 'no side'}"]
     fails += [f"still holding {qty}: it rests on its stop, exits only"] if qty else []
     print(f"since {since.isoformat()}")
     print("B3 round trip: PASS" if not fails else f"B3 round trip: FAIL ({'; '.join(fails)})")

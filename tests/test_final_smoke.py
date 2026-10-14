@@ -193,6 +193,7 @@ def test_round_trip_starts_flattens_after_the_entry_and_stops_again(monkeypatch,
     monkeypatch.setattr(runtime, "entry_blocked", lambda *a, **k: (False, None))
     store = Store.in_memory(portfolio_gate=True)
     _perp(store)
+    store._update_sleeve("ping-pong-ls-binance", risk_profile="conservative")  # as after its first round trip (B3-1)
     assert rt.run(store, "ping-pong-ls-binance", 600, sleep=_supervisor(store, "ping-pong-ls-binance")) == 0
     out = capfd.readouterr().out
     assert "flatten sent" in out and "B3 round trip: PASS" in out
@@ -219,3 +220,51 @@ def test_round_trip_stops_the_strategy_on_an_error_and_on_a_timeout(monkeypatch,
     assert rt.run(store, "ping-pong-ls-binance", 250, sleep=lambda s: None, clock=lambda: next(ticks)) == 1
     assert store.sleeve("ping-pong-ls-binance").desired_state == "stopped"
     assert "B3 round trip: FAIL (fills on no side)" in capfd.readouterr().out
+
+
+# --- B3-1 (14 Oct, run 38582237679): a start the supervisor refuses fails at once, never after the timeout -----------
+
+def test_round_trip_fails_before_the_start_when_the_supervisor_would_refuse_the_model(capfd):
+    """Ping pong places no stop: on the balanced profile (2x) the supervisor refuses it at start (check_perp_stop).
+    The round trip says so before starting it, and waits for nothing."""
+    store = Store.in_memory(portfolio_gate=True)
+    _perp(store)
+    assert rt.run(store, "ping-pong-ls-binance", 1800, sleep=lambda s: pytest.fail("waited"), conservative=False) == 1
+    out = capfd.readouterr().out
+    assert "B3 round trip: FAIL (the supervisor would refuse it:" in out and "places no stop" in out
+    assert store.sleeve("ping-pong-ls-binance").desired_state == "stopped" and store.decisions(limit=10) == []
+
+
+def test_round_trip_fails_at_once_on_the_supervisors_start_refused_event(monkeypatch, capfd):
+    from sleeve_fund.paper import runtime
+
+    monkeypatch.setattr(runtime, "entry_blocked", lambda *a, **k: (False, None))
+    store = Store.in_memory(portfolio_gate=True)
+    _perp(store)
+    waits = []
+
+    def supervisor_refuses(_):
+        waits.append(1)
+        if len(waits) > 1:
+            pytest.fail("waited on after the refusal")
+        store.event("ping-pong-ls-binance", "error", "start_refused", "Not started: the hub is down")
+
+    assert rt.run(store, "ping-pong-ls-binance", 1800, sleep=supervisor_refuses) == 1
+    out = capfd.readouterr().out
+    assert "B3 round trip: FAIL (the supervisor refused the start: Not started: the hub is down" in out
+    assert store.sleeve("ping-pong-ls-binance").desired_state == "stopped"
+
+
+def test_round_trip_puts_the_smoke_strategy_on_conservative_journaled_before_it_starts(monkeypatch, capfd):
+    from sleeve_fund.paper import runtime
+
+    monkeypatch.setattr(runtime, "entry_blocked", lambda *a, **k: (False, None))
+    store = Store.in_memory(portfolio_gate=True)
+    _perp(store)
+    assert store.sleeve("ping-pong-ls-binance").risk_profile == "balanced"
+    assert rt.run(store, "ping-pong-ls-binance", 600, sleep=_supervisor(store, "ping-pong-ls-binance")) == 0
+    assert store.sleeve("ping-pong-ls-binance").risk_profile == "conservative"
+    assert "Risk profile: balanced to conservative (journaled)" in capfd.readouterr().out
+    actions = [(d["action"], d["actor"]) for d in reversed(store.decisions(limit=10))]
+    assert actions[:2] == [("change_settings", rt.ACTOR), ("start", rt.ACTOR)]
+    assert store.pending_reload("ping-pong-ls-binance") is None  # stopped when changed: nothing restarts
