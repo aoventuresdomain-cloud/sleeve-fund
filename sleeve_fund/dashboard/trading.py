@@ -200,8 +200,9 @@ def open_lot(fills: list[dict], shorts: bool = False) -> dict | None:
 def liquidated_since_reset(store: Store, sleeve: str) -> bool:
     """Whether the strategy's position margin was lost with no reset after liquidation since: the engine's own rule
     (runtime.liquidation_head), so the dashboard and the gate can't disagree (CR 7). Read from the journal, not the
-    latest halt: a Stop/Start that halts it again on drawdown must not make a Resume restart it (QA P1-U22)."""
-    return liquidation_head(store, sleeve) is not None
+    latest halt: a Stop/Start that halts it again on drawdown must not make a Resume restart it (QA P1-U22). A two-leg
+    Strategy is liquidated while either leg is (F283-O3): each liquidated leg needs its own reset after liquidation."""
+    return any(liquidation_head(store, n) is not None for n in store.legs(sleeve))
 
 
 def stop_basis(params: dict, signal: dict | None, plan: dict | None = None, side: int = 1) -> str | None:

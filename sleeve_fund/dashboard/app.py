@@ -54,7 +54,8 @@ from sleeve_fund.research.holdout import HoldoutLocks
 from sleeve_fund.research.trials import TrialsRegister
 from sleeve_fund.risk import PROFILES, leverage_cap
 from sleeve_fund.store import BACKTEST_PREFIX, LIQUIDATION_RESET, RAL, Store, is_backtest, utcnow
-from sleeve_fund.paper.runtime import EXITS_ONLY, RESUMABLE, clearing_action, entry_blocked, liquidation_event
+from sleeve_fund.paper.runtime import (EXITS_ONLY, RESUMABLE, clearing_action, entry_blocked, liquidation_event,
+                                      pair_ral_figures)
 from sleeve_fund.strategies import REGISTRY, check_perp_sizing, check_perp_stop
 from sleeve_fund.strategies.base import exit_warmup, maker_orders_enabled
 from sleeve_fund.wording import no_venues
@@ -816,14 +817,16 @@ def create_app(store: Store | None = None) -> FastAPI:
 
     @app.post("/sleeves/{name}/incident-note")
     def incident_note(name: str, incident: str = Form(""), author: str = Form(""),
-                      why_stop_did_not_protect: str = Form(""), actor: str = Depends(require_pm),
-                      _o: None = Depends(same_origin)):
-        """The note on a liquidation's incident that a reset after liquidation needs (P1-RAL, Advisor 18:17)."""
+                      why_stop_did_not_protect: str = Form(""), why_clamp_did_not_prevent: str = Form(""),
+                      actor: str = Depends(require_pm), _o: None = Depends(same_origin)):
+        """The note on a liquidation's incident that a reset after liquidation needs (P1-RAL, Advisor 18:17). A two-leg
+        Strategy's page takes the note on either leg's incident, with the pair's own cause too (F283-O3)."""
         try:
             ev = st().event_by_id(int(incident)) if incident.strip().isdigit() else None
-            if ev is None or ev["sleeve"] != name:
+            if ev is None or ev["sleeve"] not in st().legs(name):
                 raise ValueError("that incident is not this strategy's")
-            st().write_incident_note(ev["id"], author=author, why_stop_did_not_protect=why_stop_did_not_protect)
+            st().write_incident_note(ev["id"], author=author, why_stop_did_not_protect=why_stop_did_not_protect,
+                                     why_clamp_did_not_prevent=why_clamp_did_not_prevent)
         except ValueError as exc:
             return RedirectResponse(f"/sleeves/{name}?{urlencode({'command_error': str(exc)})}", status_code=303)
         return RedirectResponse(f"/sleeves/{name}?{urlencode({'done': 'Incident note saved.'})}", status_code=303)
@@ -2055,6 +2058,21 @@ def _ral_view(store, name: str) -> dict | None:
     liquidation's incident (the newest since it) and its note; X and Y% read from the liquidation halt's own words
     ("... lost (liquidated): X, Y% of strategy equity at entry", with "includes adds" when the position was added
     to); and the equity left, the journal's cash. Whatever isn't there reads as None, and the dialog says so."""
+    legs = store.legs(name)
+    if len(legs) > 1:
+        # A two-leg Strategy (F283-O3): the first liquidated leg's reset, with the pair's figures (Advisor (d) 1); a
+        # second liquidated leg is offered once this one is reset.
+        for leg in legs:
+            if (view := _one_ral_view(store, leg)) is not None:
+                liq = view["liquidation"]
+                view.update(leg=leg, pair=pair_ral_figures(store, leg, liq),
+                            others=[n for n in legs if n != leg and liquidation_event(store, n) is not None])
+                return view
+        return None
+    return _one_ral_view(store, name)
+
+
+def _one_ral_view(store, name: str) -> dict | None:
     liq = liquidation_event(store, name)
     if liq is None:
         return None

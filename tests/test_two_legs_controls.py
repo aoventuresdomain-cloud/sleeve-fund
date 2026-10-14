@@ -58,11 +58,13 @@ def test_start_and_stop_set_both_rows(tmp_path):
     assert store.sleeve("carry~2").desired_state == "running"
 
 
-def test_a_reset_after_liquidation_is_refused_on_either_leg(tmp_path):
+def test_a_reset_after_liquidation_with_no_liquidation_is_refused_on_either_leg(tmp_path):
+    """F283-O3 built it (tests/test_two_legs_ral.py): sent to the Strategy, it answers a liquidated leg's incident; with
+    no leg liquidated there is nothing to answer, and a second leg's row takes none of its own."""
     store = Store(f"sqlite:///{tmp_path}/t.db")
     _carry(store)
-    for name in ("carry", "carry~2"):
-        with pytest.raises(ValueError, match="isn't built for a two-leg Strategy"):
+    for name, words in (("carry", "isn't halted after a liquidation"), ("carry~2", "second leg of carry")):
+        with pytest.raises(ValueError, match=words):
             store.command(name, RAL, "after the liquidation", incident=1)
     assert _pending(store, "carry") == _pending(store, "carry~2") == []
 

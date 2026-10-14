@@ -367,8 +367,9 @@
 </dialog>
 {% endfor %}
 {% if ral and not archived %}<dialog id="dlg-ral" aria-labelledby="dlg-ral-h">
-  <h2 id="dlg-ral-h">Reset after liquidation: {{ s.name }}</h2>
-  <p>{% if ral.x %}Its position margin was lost: {{ ral.x }} {{ quote }}, {{ ral.y }}% of its equity when the position was opened{% if ral.adds %} (includes adds){% endif %}.{% else %}Its position margin was lost.{% endif %} It has {{ ral.left|money }} {{ quote }} left.</p>
+  <h2 id="dlg-ral-h">Reset after liquidation: {{ s.name }}{% if ral.leg and ral.leg != s.name %}, its leg {{ ral.leg }}{% endif %}</h2>
+  {% if ral.pair %}<p>Its leg {{ ral.leg }} was liquidated: it lost {{ ral.pair.x|money }} {{ quote }}, {{ '%.1f'|format(ral.pair.y) }}% of both legs' equity just before ({{ ral.pair.before|money }} {{ quote }}). The other leg's forced close made {{ '%+.2f'|format(ral.pair.unwind) }} {{ quote }}, so the pair lost {{ ral.pair.net|money }} {{ quote }} in all and has {{ ral.pair.after|money }} {{ quote }} left.{% if ral.others %} {{ ral.others|join(', ') }} was liquidated too and needs its own reset after this one.{% endif %}</p>
+  {% else %}<p>{% if ral.x %}Its position margin was lost: {{ ral.x }} {{ quote }}, {{ ral.y }}% of its equity when the position was opened{% if ral.adds %} (includes adds){% endif %}.{% else %}Its position margin was lost.{% endif %} It has {{ ral.left|money }} {{ quote }} left.</p>{% endif %}
   {% if not ral.incident %}<div class="warnbox"><b>No incident is open for this liquidation yet.</b> The engine opens one; the reset needs it, and its note, before it will go ahead.</div>
   {% else %}
   <form method="post" action="/sleeves/{{ s.name }}/incident-note">
@@ -376,13 +377,15 @@
     <h3>1. The incident note{% if ral.note %} <span class="chip ok">Written by {{ ral.note.author }}</span>{% endif %}</h3>
     <label>Written by <input name="author" required maxlength="80" value="{{ ral.note.author if ral.note else '' }}"></label>
     <label>Why the half-liquidation stop did not protect the position <textarea name="why_stop_did_not_protect" required maxlength="2000" rows="4"></textarea></label>
+    {% if ral.pair or ral.leg %}<label>Why closing the pair at half its distance to liquidation did not prevent it <textarea name="why_clamp_did_not_prevent" required maxlength="2000" rows="4"></textarea></label>{% endif %}
     <div class="dlg-actions"><button>{{ 'Replace the note' if ral.note else 'Save the note' }}</button></div>
   </form>
   <form method="post" action="/sleeves/{{ s.name }}/command">
     <input type="hidden" name="incident" value="{{ ral.incident.id }}">
     <h3>2. Reset it</h3>
     <ul class="reset-plan">
-      <li>Its drawdown reference and the day's loss baseline start again from the {{ ral.left|money }} {{ quote }} left, and it trades again.</li>
+      {% if ral.leg %}<li>The pair's drawdown reference and the day's loss baseline start again from both legs' {{ (ral.pair.after if ral.pair else ral.left)|money }} {{ quote }} left, and it trades again once every liquidated leg is reset and nothing else holds it.</li>
+      {% else %}<li>Its drawdown reference and the day's loss baseline start again from the {{ ral.left|money }} {{ quote }} left, and it trades again.</li>{% endif %}
       <li>Nothing else is reset: the book's limits, its track record, its trades and the old high-water mark stay as they are.</li>
       <li>The incident stays open until the note is written and you acknowledge it.</li>
     </ul>

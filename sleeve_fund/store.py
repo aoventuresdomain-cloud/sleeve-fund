@@ -839,6 +839,14 @@ LIQUIDATION_RESET = "liquidation_reset"
 # "Incident #<id> note by <author>: ...", so the incident it answers is in its words.
 INCIDENT_NOTE = "incident_note"
 WHY_STOP_FIELD = "why the half-liquidation stop did not protect the position"
+# A two-leg Strategy's leg (Advisor F283-O3, 14 Oct 13:15 UK): its incident also says why ruling B's close of the pair
+# at half its entry distance to liquidation didn't prevent it; its reset after liquidation is refused until it does.
+WHY_CLAMP_FIELD = "why closing the pair at half its distance to liquidation did not prevent it"
+# The other leg's half of a two-leg Strategy's reset after liquidation: the summed figures re-based, nothing reset.
+PAIR_REBASE = "pair re-base"
+# Its journal kind on the other leg: never LIQUIDATION_RESET, which would answer that leg's own liquidation (each
+# liquidated leg needs its own reset, Advisor F283-O3 (a)). It still starts a fresh run there (RAL-ANCHOR).
+PAIR_REBASED = "pair_rebase"
 # Backtest names can't collide with a strategy's: those are lower-case letters, digits and dashes.
 BACKTEST_PREFIX = "bt:"
 # "triggered": paper's watched stop (not an order at the venue) when it fired, its market stop-loss sent for it.
@@ -1957,10 +1965,11 @@ class Store:
 
     def event(self, sleeve: str | None, level: str, kind: str, message: str, ts: datetime | None = None,
               command_id: int | None = None) -> None:
-        """`command_id`: only on a liquidation_reset, the command it carries out (unique: a second raises)."""
+        """`command_id`: only on a liquidation_reset (or a pair's re-base with one, PAIR_REBASED), the command it carries
+        out (unique: a second raises)."""
         if level not in LEVELS:
             raise ValueError(f"bad level {level!r}")
-        if command_id is not None and kind != LIQUIDATION_RESET:
+        if command_id is not None and kind not in (LIQUIDATION_RESET, PAIR_REBASED):
             raise ValueError("only a liquidation_reset names the command it carries out")
         with self.engine.begin() as c:
             c.execute(insert(events_t).values(sleeve=sleeve, ts=ts or utcnow(), level=level, kind=kind, message=message,
@@ -2050,9 +2059,10 @@ class Store:
             c.execute(update(pair_state_t).where(pair_state_t.c.parent == parent,
                                                  pair_state_t.c.marked_at.is_not(None)).values(**values))
 
-    def reset_for_command(self, command_id: int) -> dict | None:
-        """The liquidation_reset journaled for this command (F217-3), else None."""
-        q = select(events_t).where(events_t.c.command_id == command_id, events_t.c.kind == LIQUIDATION_RESET)
+    def reset_for_command(self, command_id: int, kind: str = LIQUIDATION_RESET) -> dict | None:
+        """The liquidation_reset journaled for this command (F217-3), else None. kind=PAIR_REBASED: the other leg's
+        half of a two-leg Strategy's reset after liquidation."""
+        q = select(events_t).where(events_t.c.command_id == command_id, events_t.c.kind == kind)
         with self.engine.connect() as c:
             rows = _rows(c.execute(q))
         return rows[0] if rows else None
@@ -2672,10 +2682,14 @@ class Store:
             rows = _rows(c.execute(select(events_t).where(events_t.c.id == event_id)))
         return rows[0] if rows else None
 
-    def write_incident_note(self, incident_id: int, *, author: str, why_stop_did_not_protect: str) -> None:
+    def write_incident_note(self, incident_id: int, *, author: str, why_stop_did_not_protect: str,
+                            why_clamp_did_not_prevent: str = "") -> None:
         """The note on a liquidation's incident (Advisor 18:17): why the half-liquidation stop did not protect the
-        position, and who wrote it. Both are required. A later note on the same incident replaces it."""
+        position, and who wrote it. Both are required. A later note on the same incident replaces it. A two-leg
+        Strategy's leg's note also says why closing the pair at half its distance to liquidation didn't prevent it
+        (WHY_CLAMP_FIELD, Advisor F283-O3): its reset after liquidation is refused without it."""
         why, author = (why_stop_did_not_protect or "").strip(), (author or "").strip()
+        clamp = (why_clamp_did_not_prevent or "").strip()
         if not why:
             raise ValueError(f"the note needs {WHY_STOP_FIELD}")
         if not author:
@@ -2684,7 +2698,8 @@ class Store:
         if ev is None or ev["kind"] != "incident" or ev["sleeve"] is None:
             raise ValueError(f"#{incident_id} is not a strategy's incident")
         self.event(ev["sleeve"], "info", INCIDENT_NOTE,
-                   f"Incident #{incident_id} note by {author}: {WHY_STOP_FIELD}: {why}")
+                   f"Incident #{incident_id} note by {author}: {WHY_STOP_FIELD}: {why}"
+                   + (f" | {WHY_CLAMP_FIELD}: {clamp}" if clamp else ""))
 
     def incident_note(self, incident_id: int) -> dict | None:
         """The latest note on an incident (write_incident_note), with its author, else None."""
@@ -2698,6 +2713,8 @@ class Store:
             return None
         note = notes[-1]
         note["author"] = note["message"][len(head):].split(f": {WHY_STOP_FIELD}: ", 1)[0]
+        clamp = note["message"].split(f" | {WHY_CLAMP_FIELD}: ", 1)
+        note["clamp"] = clamp[1] if len(clamp) == 2 else None
         return note
 
     def incident_is_open(self, incident_id: int) -> bool:
@@ -2974,8 +2991,13 @@ class Store:
         if is_backtest(sleeve):
             raise ValueError("a saved backtest takes no commands")
         row = self.sleeve(sleeve)  # raises if unknown
-        if command in (RAL, BOOK_RESET) and (row.parent is not None or self._leg_of(sleeve) is not None):
+        two_leg = row.parent is not None or self._leg_of(sleeve) is not None
+        if command == BOOK_RESET and two_leg:
             raise ValueError("a reset isn't built for a two-leg Strategy yet, so nothing was changed")  # P2-8
+        pair = None  # a two-leg Strategy's reset after liquidation: the leg it resets and the leg re-based with it
+        if command == RAL and two_leg:
+            pair = self._pair_ral(row, incident, actor)
+            sleeve = pair["leg"]  # journaled on the liquidated leg's row, so one reset per incident still holds
         here = None  # a reset after liquidation applied here, as no process will apply it
         if command == RAL:
             from sleeve_fund.paper.runtime import ral_refusal  # the engine's liquidation rule (liquidation_head)
@@ -2983,7 +3005,7 @@ class Store:
             if (why := ral_refusal(self, sleeve, incident, actor)) is not None:
                 raise ValueError(why)
             reason = f"{reason.strip()} (incident #{incident})"
-            here = self._ral_here(sleeve, reason, incident)
+            here = self._ral_here(sleeve, reason, incident, pair)
         elif incident is not None:
             raise ValueError("only a reset after liquidation names an incident")
         now = utcnow()
@@ -3006,8 +3028,17 @@ class Store:
                                                         created_at=now))
                     if holds_through_reset and command in ("pause", "flatten"):
                         self._hold_on_reset(c, leg, command, reason)
+                if pair:
+                    # The other leg's half (Advisor F283-O3 (b)): its process re-bases the pair's summed figures and
+                    # its own with the liquidated leg's; it resets nothing and lifts no halt of its own.
+                    pair["companion"] = c.execute(insert(commands_t).values(
+                        sleeve=pair["other"], command=RAL, created_at=now,
+                        reason=f"{PAIR_REBASE}: {sleeve}'s reset after liquidation (command #{cid})"
+                    )).inserted_primary_key[0]
                 if here:
                     self._apply_ral(c, sleeve, cid, here, now)
+                    if pair:
+                        self._apply_pair_rebase(c, pair, pair["companion"], now)
         except IntegrityError:
             if incident is None:
                 raise
@@ -3015,12 +3046,98 @@ class Store:
                              "liquidation") from None
         if here:
             self._lapse_resets_before(sleeve, now)
-        self.decide(actor, command, reason, sleeve)
+        self.decide(actor, command, reason, pair["parent"] if pair else sleeve)
+
+    def _pair_ral(self, row: Sleeve, incident: int | None, actor: str) -> dict:
+        """A two-leg Strategy's reset after liquidation (Advisor F283-O3, 14 Oct 13:15 UK), sent to the Strategy (its
+        first leg's row) naming a liquidated leg's incident. Raises ValueError, in words naming what is in the way,
+        unless: that leg takes it under the one-leg rule (ral_refusal); its incident's note also says why the pair's
+        close at half its distance to liquidation didn't prevent it (WHY_CLAMP_FIELD); the pair is flat in its journal
+        (pair_state); neither leg holds anything but dust; and neither has an order working. Returns the parent, the
+        liquidated leg and the other. A leg liquidated too needs its own reset, naming its own incident: the pair stays
+        blocked until each liquidated leg has one."""
+        from sleeve_fund.paper.runtime import liquidation_head, ral_refusal
+
+        if row.parent is not None:
+            raise ValueError(f"this is the second leg of {row.parent}: send the reset after liquidation to {row.parent}, "
+                             "naming the liquidated leg's incident")
+        parent, legs = row.name, self.legs(row.name)
+        ev = self.event_by_id(incident) if incident is not None else None
+        # The leg the incident is on; else (none named, or not a leg's) the one liquidated leg, so the refusal is
+        # its own (name the incident, or not this liquidation's), not "nothing to clear" from the leg that is fine.
+        liquidated = [n for n in legs if liquidation_head(self, n) is not None]
+        leg = (ev["sleeve"] if ev is not None and ev["sleeve"] in legs else
+               liquidated[0] if len(liquidated) == 1 else parent)
+        if (why := ral_refusal(self, leg, incident, actor)) is not None:
+            raise ValueError(why)
+        if (self.incident_note(incident) or {}).get("clamp") is None:
+            raise ValueError(f"incident #{incident}'s note needs {WHY_CLAMP_FIELD} too, as {leg} is a leg of the "
+                             f"two-leg Strategy {parent}: write it first")
+        state = self.pair_state(parent)
+        if state is not None and state["state"] != "flat":
+            raise ValueError(f"the pair is still {state['state']}: a reset after liquidation waits until both legs "
+                             "are closed")
+        for name in legs:
+            book = self.journal_book(name, self.sleeve(name).starting_balance)
+            if abs(book["qty"]) > 1e-12 and not is_dust(book):
+                raise ValueError(f"{name} still holds {book['qty']}: a reset after liquidation waits until both legs "
+                                 "are closed")
+            if self.orders(name, statuses=OPEN_ORDER_STATUSES, limit=1):
+                raise ValueError(f"{name} has an order working: a reset after liquidation waits until it is done")
+        return {"parent": parent, "leg": leg, "other": next(n for n in legs if n != leg)}
+
+    def pair_rebase_words(self, parent: str, leg: str, old, equity) -> str:
+        """What the other leg's half of a pair's reset after liquidation journals."""
+        return (f"Pair re-base with {leg}'s reset after liquidation: {parent}'s high-water mark {to_decimal(old):,.2f} "
+                f"becomes {to_decimal(equity):,.2f}, both legs' equity summed, which is also the day's loss baseline. "
+                "Nothing of this leg is reset and no halt of its own is lifted.")
+
+    def pair_figures(self, pair: dict, now: datetime) -> dict:
+        """What a stopped pair's re-base writes, read before its transaction: each leg's cash (both flat), their sum,
+        the pair's high-water mark before, and the other leg's last mark (its price and benchmark)."""
+        cash = {n: to_decimal(self.journal_book(n, self.sleeve(n).starting_balance)["cash"], "cash")
+                for n in (pair["leg"], pair["other"])}
+        summed = sum(cash.values(), Decimal(0))
+        state = self.pair_state(pair["parent"])
+        return {"cash": cash, "summed": summed,
+                "old": state["hwm"] if state is not None and state["hwm"] is not None else summed,
+                "last": self.equity_at_or_before(pair["other"], now)}
+
+    def _apply_pair_rebase(self, c, pair: dict, command_id: int, now: datetime) -> bool:
+        """A stopped two-leg Strategy's reset after liquidation, the other leg's half, in the command's transaction (as
+        _apply_ral is the liquidated leg's): the pair's summed high-water mark, halt reference and day's start re-based
+        at both legs' equity now (both flat: their cash), a mark of this leg's at it, and the re-base journaled, so a
+        Start restores the summed figures (_pair_first_mark). The book-level figures are not touched."""
+        took = c.execute(update(commands_t).where(commands_t.c.id == command_id, commands_t.c.applied_at.is_(None))
+                         .values(applied_at=now)).rowcount
+        if not took:
+            return False
+        other, f = pair["other"], pair["figures"]
+        c.execute(insert(events_t).values(sleeve=other, ts=now, level="info", kind=PAIR_REBASED,
+                                          message=self.pair_rebase_words(pair["parent"], pair["leg"], f["old"],
+                                                                         f["summed"]),
+                                          command_id=command_id))
+        if f["last"] is not None:
+            v = float(f["cash"][other])
+            c.execute(insert(equity_t).values(sleeve=other, ts=now, equity=v, cash=v, qty=0.0,
+                                              price=f["last"]["price"], benchmark=f["last"]["benchmark"]))
+        from sleeve_fund import risk
+
+        v = stored(f["summed"], "equity")
+        c.execute(update(pair_state_t).where(pair_state_t.c.parent == pair["parent"],
+                                             pair_state_t.c.marked_at.is_not(None))
+                  .values(reference_equity=v, hwm=v, day_start=risk.trading_day(now), day_start_equity=v,
+                          marked_at=now, updated_at=now))
+        return True
 
     def apply_waiting_ral(self, sleeve: str) -> bool:
         """A reset after liquidation still waiting when its strategy was stopped (QA RAL-F2: Stop after the RAL): no
         process will apply it once the strategy is stopped and flat, so it is applied here as Store.command applies
-        one sent to a stopped strategy. True if one was applied; a process that got there first wins."""
+        one sent to a stopped strategy. True if one was applied; a process that got there first wins. A two-leg
+        Strategy: each leg's waiting reset, with the other leg's half that came with it (PAIR_REBASE)."""
+        legs = self.legs(sleeve)
+        if len(legs) > 1:
+            return any([self._apply_waiting_pair_ral(legs, leg) for leg in legs])
         waiting = [c for c in self.pending_commands(sleeve) if c["command"] == RAL]
         if not waiting or (here := self._ral_here(sleeve, waiting[-1]["reason"], waiting[-1]["incident"])) is None:
             return False
@@ -3029,6 +3146,25 @@ class Store:
             if not self._apply_ral(c, sleeve, waiting[-1]["id"], here, now):
                 return False
         self._lapse_resets_before(sleeve, now)
+        return True
+
+    def _apply_waiting_pair_ral(self, legs: list[str], leg: str) -> bool:
+        waiting = [c for c in self.pending_commands(leg) if c["command"] == RAL and c["incident"] is not None]
+        if not waiting:
+            return False
+        cmd, other = waiting[-1], next(n for n in legs if n != leg)
+        half = [c for c in self.pending_commands(other) if c["command"] == RAL and c["incident"] is None
+                and c["reason"].endswith(f"(command #{cmd['id']})")]
+        pair = {"parent": legs[0], "leg": leg, "other": other}
+        if (here := self._ral_here(leg, cmd["reason"], cmd["incident"], pair)) is None:
+            return False
+        now = utcnow()
+        with self.engine.begin() as c:
+            if not self._apply_ral(c, leg, cmd["id"], here, now):
+                return False
+            if half:
+                self._apply_pair_rebase(c, pair, half[-1]["id"], now)
+        self._lapse_resets_before(leg, now)
         return True
 
     def _apply_ral(self, c, sleeve: str, command_id: int, here: dict, now: datetime) -> bool:
@@ -3054,11 +3190,13 @@ class Store:
                 self.refuse_reset(request, "lapsed: asked before the liquidation, which the reset after "
                                   "liquidation answered")
 
-    def _ral_here(self, sleeve: str, reason: str, incident: int) -> dict | None:
+    def _ral_here(self, sleeve: str, reason: str, incident: int, pair: dict | None = None) -> dict | None:
         """A reset after liquidation for a strategy no process will apply it for (CR on #193): stopped and flat, so
         the supervisor runs nothing, and Start is refused while it is liquidated. Returns what Store.command journals
         for it in the command's own transaction (the engine's words, and a mark at the remaining equity, so a later
-        Start restores the new high-water mark and day baseline from it), else None for the process to apply."""
+        Start restores the new high-water mark and day baseline from it), else None for the process to apply. A
+        two-leg Strategy's leg (`pair`, from _pair_ral): the words carry the pair's summed figures, and the figures
+        the other leg's half writes (pair_figures) are read into `pair` here, before the transaction."""
         from sleeve_fund.paper.runtime import SleeveRuntime, liquidation_event, ral_words
 
         s = self.sleeve(sleeve)
@@ -3069,7 +3207,11 @@ class Store:
         equity = book["cash"]
         last = self.equity_at_or_before(sleeve, utcnow())
         cmd = {"incident": incident, "reason": reason}
-        words = ral_words(self, sleeve, cmd, liq, SleeveRuntime(self, sleeve).peak, equity)
+        if pair is not None:
+            pair["figures"] = self.pair_figures(pair, utcnow())
+            words = ral_words(self, sleeve, cmd, liq, pair["figures"]["old"], pair["figures"]["summed"])
+        else:
+            words = ral_words(self, sleeve, cmd, liq, SleeveRuntime(self, sleeve).peak, equity)
         mark = (None if last is None else
                 {"equity": equity, "cash": equity, "qty": 0.0, "price": last["price"], "benchmark": last["benchmark"]})
         return {"words": words, "mark": mark}
@@ -3156,6 +3298,11 @@ class Store:
                     self.decide("system", f"drop {cmd['command']}", f"{why} ({cmd['reason']})", name)
             n += len(pending)
         return n
+
+    def command_by_id(self, command_id: int) -> dict | None:
+        with self.engine.connect() as c:
+            rows = _rows(c.execute(select(commands_t).where(commands_t.c.id == command_id)))
+        return rows[0] if rows else None
 
     def mark_applied(self, command_id: int) -> None:
         with self.engine.begin() as c:
