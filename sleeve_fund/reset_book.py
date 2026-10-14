@@ -111,6 +111,10 @@ def plan(store: Store, slate: str, deposit: Decimal) -> list[str]:
     lines = [f"reset {slate}: {'already deposited' if _done(store, slate) else 'not run'}",
              f"the book now: {supervisor.fund_equity(store):,.2f}",
              f"would put away: {', '.join(names) or 'nothing'}"]
+    if waiting := store.withdrawal_pending():  # a put-away still in the book: the deposit waits for it (HoQA R1)
+        runs, by_name = store.reset_runs(), {s.name: s for s in store.sleeves()}
+        lines.append("waiting to leave the book first, at the supervisor's next mark: " + ", ".join(
+            f"{n} {supervisor.strategy_equity(store, by_name[n], runs):,.2f}" for n in waiting))
     if holders := _holding(store, names):
         lines.append(f"would flatten first: {'; '.join(holders)}")
     if old := {n: eq for n, eq in _old_pockets(store).items() if eq > 0}:
