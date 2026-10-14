@@ -239,6 +239,50 @@ def test_a_retry_is_refused_once_the_journal_no_longer_holds_the_trade_legging(t
     assert "lost the trade" in Pair._retry_refusal(p, p.follow)
 
 
+def _paper_pair(lead_block=(False, None), follow_block=(False, None)):
+    """A pair whose two paper legs' runtimes say what CHOKE says (entry_blocked) and that each can open, no journal."""
+    def rt(name, block):
+        return SimpleNamespace(name=name, venue="KRAKEN", backtest=False, status="running", can_open=lambda: True,
+                               entry_blocked=lambda: block)
+
+    p = Pair.__new__(Pair)
+    p.lead = SimpleNamespace(runtime=rt("carry", lead_block), _cfg=SimpleNamespace(instrument_id="BTC/USD.KRAKEN"))
+    p.follow = SimpleNamespace(runtime=rt("carry~2", follow_block),
+                               _cfg=SimpleNamespace(instrument_id="BTC/USD.KRAKEN"))
+    p.lead.pair = p.follow.pair = p
+    p._store = None
+    return p
+
+
+def test_a_retry_is_refused_on_stale_data_on_the_other_leg_though_it_can_open(monkeypatch):
+    """CR F283-4 (Advisor leg-2 retry MUST 3): leg 1 filled, its feed goes stale, leg 2 is refused once: can_open is
+    still true on both, but CHOKE on the other leg blocks, so the retry is not sent and the pair unwinds."""
+    from sleeve_fund.strategies import pair as pair_mod
+
+    monkeypatch.setattr(pair_mod.router, "check", lambda *a: None)
+    assert Pair._retry_refusal(_paper_pair(), _paper_pair().follow) is None
+    p = _paper_pair(lead_block=(True, "Stale data: no trade or quote for 90 s"))
+    assert Pair._retry_refusal(p, p.follow) == "Stale data: no trade or quote for 90 s"
+    p = _paper_pair(follow_block=(True, "The portfolio is halted"))
+    assert Pair._retry_refusal(p, p.follow) == "The portfolio is halted"
+
+
+def test_a_retry_is_refused_when_the_legs_venue_pin_doesnt_match(monkeypatch):
+    """CR F283-4: the venue-pin trigger of MUST 3, pinned: a pin mismatch on the retried leg unwinds the pair."""
+    from sleeve_fund.strategies import pair as pair_mod
+
+    seen = []
+
+    def mismatch(name, instrument, venue):
+        seen.append((name, instrument, venue))
+        raise ValueError("carry~2 is pinned to another venue")
+
+    monkeypatch.setattr(pair_mod.router, "check", mismatch)
+    p = _paper_pair()
+    assert Pair._retry_refusal(p, p.follow) == "carry~2 is pinned to another venue"
+    assert seen == [("carry~2", "BTC/USD.KRAKEN", "KRAKEN")]
+
+
 def test_a_restarted_pair_is_recovered_once_both_legs_are_back_and_priced_and_opens_nothing_before():
     p = Pair.__new__(Pair)
     p.lead, p.follow, p.recovered = _Leg(restore={"qty": 1}), _Leg(price=0.0), False
@@ -376,9 +420,17 @@ def test_a_spot_and_perp_pair_judges_its_guards_on_every_spot_trade_and_fill_wit
         judged.append(self.runtime.name)
         return real_book(self, *a, **k)
 
+    marked = []
+    real_mark = Pair.on_mark
+
+    def on_mark(self, leg, price):  # CR F283-6: Advisor M5's call on each fill, pinned
+        marked.append(leg.runtime.name)
+        return real_mark(self, leg, price)
+
     monkeypatch.setitem(REGISTRY, "driven", (Driven, LongFlatConfig))
     monkeypatch.setattr(LongFlatStrategy, "_entry_atr_pct", lambda self: 0.05)
     monkeypatch.setattr(LongFlatStrategy, "_guard_book", guard_book)
+    monkeypatch.setattr(Pair, "on_mark", on_mark)
     inst = venue("kraken").instrument("BTC", "USDT")
     insts = {str(inst.id): inst}
     hub = Fanout("KRAKEN", known=lambda: set(insts), log=lambda *a: None,
@@ -424,5 +476,28 @@ def test_a_spot_and_perp_pair_judges_its_guards_on_every_spot_trade_and_fill_wit
         assert pair.state == "hedged"
         # Held, the spot leg is judged on its own prints (well over the 30-second tick's once) and on the fills.
         assert judged.count("carry") >= 10 and judged.count("carry~2") >= 2
+        # Advisor M5 (CR F283-6): each leg's own entry fill ran both legs' guards there and then (Pair.on_mark).
+        assert {"carry", "carry~2"} <= set(marked)
     finally:
         node.dispose()
+
+
+def test_an_outage_replays_risk_guard_judges_a_pair_on_both_legs_summed_as_the_live_tick_does():
+    """CR F283-5: the outage replay's risk-guard branch judges the equity at the minute's worst price through
+    _guard_book, as the live tick does. A hedged 5k + 5k carry whose spot leg fell from 50,000 to 40,000 is still worth
+    10,000 summed, not the spot leg's 4,000 against the summed peak (a false 60% drawdown halt)."""
+    from sleeve_fund.strategies.base import LongFlatStrategy
+
+    seen = []
+
+    def other_book(leg, price):
+        seen.append(price)
+        return 6_000.0, 10_000.0, -0.1  # the perp short, marked at the same worst price
+
+    spot = SimpleNamespace(pair=SimpleNamespace(same_prices=True, other_book=other_book))
+    spot._guard_book = lambda *a: LongFlatStrategy._guard_book(spot, *a)
+    assert LongFlatStrategy._replayed_guard_equity(spot, 0.0, 0.1, 40_000.0) == 10_000.0
+    assert seen == [40_000.0]
+    single = SimpleNamespace(pair=None)
+    single._guard_book = lambda *a: LongFlatStrategy._guard_book(single, *a)
+    assert LongFlatStrategy._replayed_guard_equity(single, 0.0, 0.1, 40_000.0) == 4_000.0
