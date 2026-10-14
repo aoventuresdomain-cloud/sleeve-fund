@@ -114,14 +114,36 @@ def test_iv_a_backtest_takes_no_mark_on_stop():
 
 
 def test_v_without_the_stops_mark_the_start_check_names_the_tie(monkeypatch):
-    """A process killed, not stopped: the flatten tick's mark is the latest, in the fill's own second. It can't show the
-    fill, so it is not compared, and the check says why."""
+    """A process killed, not stopped: the flatten tick's mark is the latest, in the fill's own second, and doesn't hold
+    it. Not compared, never a FAIL, and not on its own "nothing compared" (HoQA, #289): a NOTE naming the tie."""
     monkeypatch.setattr(SleeveRuntime, "final_mark", lambda self, **k: None, raising=False)
     _, _, store = _stopped_after(monkeypatch, flatten)
     lines = check_books(store).lines
-    assert [r[0] for r in lines] == [NOTE, FAIL], lines
-    assert "a fill in its latest mark's own second" in lines[0][1] and "may predate" in lines[0][1]
-    assert "nothing was compared" in lines[1][1]
+    assert [r[0] for r in lines] == [NOTE], lines
+    assert "a fill in its latest mark's own second" in lines[0][1] and "which the mark predates" in lines[0][1]
+
+
+def _tie(tmp_path, held: float):
+    """A BUY of 0.1 at 16:56:09 and a mark in the same second holding `held`."""
+    store = Store(f"sqlite:///{tmp_path}/t.db")
+    store.create_sleeve(name="s1", strategy="ping_pong", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=10_000)
+    t = datetime(2026, 10, 14, 16, 56, 9, tzinfo=UTC)
+    store.record_fill("s1", side="BUY", qty=0.1, price=100.0, fee=0.0, order_id="o1", trade_id="t1", ts=t)
+    cash = 10_000.0 - 10.0 * (held > 0)
+    store.record_equity("s1", equity=cash + held * 100.0, cash=cash, qty=held, price=100.0, benchmark=10_000.0, ts=t)
+    return store
+
+
+def test_v_a_tie_the_mark_holds_is_compared_and_passes(tmp_path):
+    """The usual case (a tick books a fill, then marks, in one second): HALT-REF-1's re-base reads check_books on it."""
+    lines = check_books(_tie(tmp_path, 0.1)).lines
+    assert [r[0] for r in lines] == [PASS], lines
+
+
+def test_v_a_tie_the_mark_doesnt_hold_is_a_note_not_a_fail(tmp_path):
+    lines = check_books(_tie(tmp_path, 0.0)).lines
+    assert [r[0] for r in lines] == [NOTE], lines
 
 
 def test_v_a_mark_short_of_a_fill_before_it_names_the_position(tmp_path):
@@ -133,7 +155,7 @@ def test_v_a_mark_short_of_a_fill_before_it_names_the_position(tmp_path):
     store.record_equity("s1", equity=10_000.0, cash=10_000.0, qty=0.0, price=100.0, benchmark=10_000.0,
                         ts=t + timedelta(seconds=1))
     lines = check_books(store).lines
-    assert lines[0][0] == FAIL and "doesn't hold the journal's position, so it predates a fill" in lines[0][1]
+    assert lines[0][0] == FAIL and "doesn't hold the journal's position: it predates or misses a fill" in lines[0][1]
 
 
 def test_vi_the_stops_mark_never_pauses_or_halts_on_its_own(tmp_path):
