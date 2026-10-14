@@ -3,7 +3,7 @@ strategy page, Risk & health and Trades show the same figures for the same posit
 
 import pytest
 from fastapi.templating import Jinja2Templates
-from test_dashboard import AUTH, client  # noqa: F401 - the fixture
+from test_dashboard import AUTH, _strategy_accounts, client  # noqa: F401 - the fixtures
 from test_portfolio_page import _book
 
 from sleeve_fund import markets

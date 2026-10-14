@@ -41,6 +41,15 @@ def _equity_at(store: Store, sleeve, ts: datetime) -> float:
     return row["equity"] if row else sleeve.starting_balance
 
 
+def is_test_account(store: Store, sleeve) -> bool:
+    """Whether the Strategy is outside the fund's book: its quote currency held under 8 places, on the test account its
+    venue names (CCY-8DP, F229-6). Its results are never Strategy evidence and the gate leaves it out, so the PM's
+    figures list it apart (CCY-8DP-UI). The supervisor's one predicate decides, never a copy of it."""
+    from sleeve_fund.supervisor import outside_fund_book
+
+    return outside_fund_book(store, sleeve)
+
+
 def sleeve_extras(store: Store, x: dict, frame: pd.DataFrame) -> dict:
     """Adds day/MTD P&L, open position, sparkline and last activity to a sleeve_summary dict."""
     s, now = x["sleeve"], utcnow()
@@ -57,6 +66,7 @@ def sleeve_extras(store: Store, x: dict, frame: pd.DataFrame) -> dict:
     tail = frame["equity"].tail(60).tolist() if len(frame) else []
     x.update(
         mode="paper",
+        test_account=is_test_account(store, s),
         day_pnl=x["equity"] - day_open,
         day_ret=x["equity"] / day_open - 1 if day_open else 0.0,
         week_pnl=x["equity"] - week_open,

@@ -176,6 +176,8 @@ th[aria-sort="ascending"]::after { content: " ↑"; } th[aria-sort="descending"]
 .chip.paper::before { display: none; }
 .chip.paper { color: var(--muted); padding: 1px 7px; }
 .chip.live { color: var(--live); box-shadow: inset 0 0 0 1px var(--live); }
+.chip.test::before { display: none; }
+.chip.test { color: var(--warn); box-shadow: inset 0 0 0 1px var(--warn); padding: 1px 7px; }
 .dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--faint); margin-right: 6px; vertical-align: 1px; }
 .dot.ok { background: var(--gain); } .dot.stale { background: var(--loss); }
 
