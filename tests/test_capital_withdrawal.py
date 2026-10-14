@@ -933,3 +933,81 @@ def test_f286_3_the_open_risk_book_is_the_funds_book_once_a_strategy_is_withdraw
     assert open_risk.account_equity(store, account) == 15_000 == float(supervisor.fund_equity(store))
     book, _, _ = open_risk.account_book(store, "a", 15_000.0, lambda s: 0.02)
     assert book == 15_000
+
+
+# --- CR delta follow-ups on a2c0b8b (F286-3 survivors M12, M16, M17, M23; the guards N12, N15) -------------------------
+
+def test_cr_m17_an_open_order_keeps_a_flat_put_away_in_the_book(store):
+    _make(store, "a", 10_000)
+    _make(store, "b", 5_000)
+    _mark(store, T0)
+    store.record_order("b", order_id="b-open", side="SELL", qty=0.1, intent="exit", reason="r", ts=T0)
+    store.archive("b")
+    assert store.withdrawal_blocker("b") == "an order of it is still open"
+    assert _poll(store, T0 + timedelta(seconds=5)).equity == D(15_000) and store.withdrawn() == {}
+
+
+def test_cr_m16_room_an_order_holds_in_the_gate_keeps_a_flat_put_away_in_the_book(store, monkeypatch):
+    from types import SimpleNamespace
+
+    _make(store, "a", 10_000)
+    _make(store, "b", 5_000)
+    _mark(store, T0)
+    store.archive("b")
+    led = store._gate_ledger()
+    monkeypatch.setattr(led, "reservations", lambda: [SimpleNamespace(strategy="b")])
+    assert store.withdrawal_blocker("b") == "an order of it still holds room in the book"
+    assert store.withdrawal_blocker("a") is None
+
+
+def test_cr_m23_a_withdrawn_strategy_moved_onto_or_off_a_test_account_moves_nothing(store):
+    _make(store, "a", 10_000)
+    _make(store, "b", 5_000, instrument="BTC/USD", venue="KRAKEN")
+    store.assign_account("b", "desk")  # in the book on this venue's desk account, as halt_ref's leaves_no_book
+    _mark(store, T0)
+    assert _state(store).equity == D(15_000)
+    store.archive("b")
+    _poll(store, T0 + timedelta(seconds=5))
+    assert store.withdrawn() == {"b": D(5_000)} and _state(store).equity == D(10_000)
+    store.assign_account("b", "paper")  # off the book's account: already out, so no second withdrawal
+    assert _state(store).equity == D(10_000)
+    store.assign_account("b", "desk")
+    assert _state(store).equity == D(10_000) and len(_flows(store)) == 1
+
+
+def test_cr_m12_a_retire_another_process_undid_meanwhile_writes_nothing(store, monkeypatch):
+    """complete_retire read it winding down; by its write the row is active again: the put-away's archive row rolls
+    back with it (_NotRetired), never left as a withdrawal waiting for a Strategy that isn't retired."""
+    from sqlalchemy import update
+
+    from sleeve_fund.store import sleeves_t
+
+    _make(store, "a", 10_000)
+    _make(store, "b", 5_000)
+    _mark(store, T0)
+    real = store.sleeve
+    monkeypatch.setattr(store, "sleeve", lambda n: replace(real(n), lifecycle="winding_down") if n == "b" else real(n))
+    with store.engine.begin() as c:
+        c.execute(update(sleeves_t).where(sleeves_t.c.name == "b").values(lifecycle="active"))
+    assert store.complete_retire("b", now=T0) is False
+    monkeypatch.undo()
+    assert "b" not in store.archived() and store.withdrawal_pending() == [] and store.sleeve("b").lifecycle == "active"
+
+
+def test_cr_n15_restoring_against_an_empty_mark_is_refused_by_restore_itself():
+    from sleeve_fund.portfolio.gate import PortfolioState, _restored
+
+    st = PortfolioState(carried_hwm_drawdown=D("0.1"), carried_day_return=D(0), carried_day=T0.date())
+    with pytest.raises(ValueError, match="restores nothing"):
+        _restored(st, D("0.001"), T0.date())
+    assert _restored(st, D(9_000), T0.date()).hwm == D(10_000)
+
+
+def test_cr_n12_a_book_over_its_hwm_carries_a_drawdown_of_0_never_below():
+    from sleeve_fund.money import QUANTUM
+    from sleeve_fund.portfolio.gate import PortfolioState, carried
+
+    st = PortfolioState(equity=D(10_000) + 1_000 * QUANTUM, hwm=D(1), halt_reference=D(1), day=T0.date(),
+                        day_start_equity=D(10_000))  # far over: the clamp, not the rounding, keeps it at 0
+    kept = carried(st)
+    assert kept["carried_hwm_drawdown"] == 0 and kept["carried_reference_drawdown"] == 0
