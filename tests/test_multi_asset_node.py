@@ -51,3 +51,28 @@ def test_a_pair_leg_or_a_second_venue_is_refused(built):
         node_mod.build_legs_node([legs[0], other], log_level="ERROR", asset_fetch=dict, hub=HUB)
     with pytest.raises(ValueError, match="at least two"):
         node_mod.build_legs_node(legs[:1], log_level="ERROR", asset_fetch=dict, hub=HUB)
+
+
+def test_one_assets_stale_data_holds_only_that_legs_entries(built, tmp_path):
+    """Done-when 4: each leg runs on its own runtime, so a hold is that leg's alone. Stale data is measured on each
+    leg's own instrument (test_stale_data: another instrument's prints never keep it fresh) and a clone is stale exactly
+    when its source is (test_two_legs_hub_alias); here, the stale hold one leg's watchdog sets blocks that leg's entries
+    and no other leg's."""
+    from datetime import UTC, datetime, timedelta
+
+    from sleeve_fund.paper.runtime import SleeveRuntime, block_codes
+    from sleeve_fund.store import Store
+
+    store = Store(f"sqlite:///{tmp_path}/ma.db")
+    at = datetime.now(UTC) - timedelta(minutes=5)
+    store.settle_flow(store.fund_flow("deposit", 100_000, actor="pm", reason="test", rebase=True, now=at), at)
+    store.create_legs(name="trend-x", strategy="trend_filter", bar_spec="15-MINUTE-LAST-INTERNAL",
+                      assets=["BTC/USD", "ETH/USD", "SOL/USD"], params={}, starting_balance=0,
+                      universe_date="2026-10-15", venue="kraken")
+    runtimes = [SleeveRuntime(store, n) for n in store.legs("trend-x")]
+    node = node_mod.build_legs_node(_legs(), log_level="ERROR", asset_fetch=dict, hub=HUB, runtimes=runtimes)
+    assert [s.runtime for s in built["strategies"]] == runtimes
+    runtimes[1].holds["stale_data"] = "last price 400 s old. It clears when data resumes"
+    assert "stale_data" in block_codes(runtimes[1].entry_blocked()[1])
+    assert all("stale_data" not in block_codes(r.entry_blocked()[1]) for r in (runtimes[0], runtimes[2]))
+    node.dispose()
