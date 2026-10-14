@@ -159,7 +159,6 @@ def test_the_fund_figure_is_pe2s_reader_once_it_is_there(tmp_path, monkeypatch):
 
 
 # ---- MUST-FUNDCASH-LOSS: who keeps the shortfall cover (CR F-FC-1, F-FC-2) ------------------------------------------
-@PE2_BUILT
 @pytest.mark.parametrize("held, rebased, bridged", [(True, True, True), (True, False, False), (False, True, False),
                                                     (False, False, False)])
 def test_only_a_fund_held_strategy_after_the_re_base_loses_its_own_shortfall_cover(tmp_path, held, rebased, bridged):
