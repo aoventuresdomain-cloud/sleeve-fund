@@ -85,7 +85,7 @@ def _drop_schemas():
 
 def _strategies(store: Store) -> None:
     for name in STRATEGIES:
-        store.create_sleeve(name=name, strategy="buy_and_hold", instrument="BTC/USD", bar_spec="1-HOUR-LAST-INTERNAL",
+        store.create_sleeve(name=name, strategy="buy_and_hold", instrument="BTC/USDT", bar_spec="1-HOUR-LAST-INTERNAL",
                             starting_balance=1_000)
 
 

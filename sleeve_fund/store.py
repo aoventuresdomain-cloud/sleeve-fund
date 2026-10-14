@@ -20,6 +20,7 @@ from sqlalchemy import (
     JSON,
     BigInteger,
     CheckConstraint,
+    DDL,
     Column,
     Date,
     DateTime,
@@ -53,6 +54,7 @@ from sqlalchemy.schema import DropConstraint
 from sleeve_fund import lifecycle
 from sleeve_fund.exact import EXACT
 from sleeve_fund.money import stored, to_decimal
+from sleeve_fund.router import venue_for
 
 DEFAULT_URL = "sqlite:///data/sleeve_fund.db"
 
@@ -289,7 +291,9 @@ orders_t = Table(
     Column("reason", Text, nullable=False),  # plain English, e.g. "10-bar average crossed above 30-bar"
     Column("signal", JSON, nullable=False, default=dict),  # indicator values and price at the decision
     Column("message", Text, nullable=False, default=""),  # venue or risk-engine text on reject/cancel
+    Column("venue", String(16), nullable=False),  # where it was sent: the strategy's one venue (router, P2-4)
     Index("orders_sleeve_ts", "sleeve", "ts"),
+    CheckConstraint("venue = upper(venue)", name="orders_venue_upper"),
 )
 # When each paper or live order's decision bar closed and arrived, the decision, the send, the venue's acceptance
 # and its fills, to the microsecond (v2 P1-2): close-to-fill per strategy. Our clock throughout, except venue_ts,
@@ -354,6 +358,37 @@ sleeve_venues_t = Table(
     metadata,
     Column("sleeve", String(64), ForeignKey("sleeves.name"), primary_key=True),
     Column("venue", String(16), nullable=False),
+)
+# F-WED1-3 (Advisor, HoE 14 Oct): the pin is insert-only, held by the database itself. A venue is never changed; a pin is
+# deleted only with its saved backtest (prune_backtests); and a strategy that has an order or a fill can't be given one,
+# so nothing moves it off the venue its position and working orders are on. A new venue is a new strategy. Migration
+# 0020 writes the same triggers (spelled out there). They read orders, fills and backtests by name when they fire, so
+# it doesn't matter which create_all makes first.
+PIN_REFUSED = "a strategy''s venue is pinned: "  # quoted for SQL
+SLEEVE_VENUES_PG = (
+    "CREATE OR REPLACE FUNCTION sleeve_venue_pinned() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+    "IF TG_OP = 'UPDATE' THEN RAISE EXCEPTION USING ERRCODE = 'check_violation', "
+    f"MESSAGE = '{PIN_REFUSED}' || OLD.sleeve || ' cannot change venue'; END IF; "
+    "IF TG_OP = 'DELETE' THEN "
+    "IF substr(OLD.sleeve, 1, 3) <> 'bt:' OR NOT EXISTS (SELECT 1 FROM backtests WHERE sleeve = OLD.sleeve) THEN RAISE EXCEPTION USING "
+    f"ERRCODE = 'check_violation', MESSAGE = '{PIN_REFUSED}' || OLD.sleeve || "
+    "' is not a saved backtest, so its pin stays'; END IF; RETURN OLD; END IF; "
+    "IF EXISTS (SELECT 1 FROM orders WHERE sleeve = NEW.sleeve) OR EXISTS (SELECT 1 FROM fills WHERE sleeve = NEW.sleeve) "
+    "THEN RAISE EXCEPTION USING ERRCODE = 'check_violation', "
+    f"MESSAGE = '{PIN_REFUSED}' || NEW.sleeve || ' has traded, so it keeps its venue'; "
+    "END IF; RETURN NEW; END $$",
+    "CREATE TRIGGER sleeve_venue_pinned BEFORE INSERT OR UPDATE OR DELETE ON sleeve_venues FOR EACH ROW "
+    "EXECUTE FUNCTION sleeve_venue_pinned()",
+)
+SLEEVE_VENUES_SQLITE = (
+    "CREATE TRIGGER sleeve_venues_no_edit BEFORE UPDATE ON sleeve_venues BEGIN "
+    f"SELECT RAISE(ABORT, '{PIN_REFUSED}a venue cannot change'); END",
+    "CREATE TRIGGER sleeve_venues_no_delete BEFORE DELETE ON sleeve_venues "
+    "WHEN substr(OLD.sleeve, 1, 3) <> 'bt:' OR NOT EXISTS (SELECT 1 FROM backtests WHERE sleeve = OLD.sleeve) BEGIN "
+    f"SELECT RAISE(ABORT, '{PIN_REFUSED}only a saved backtest''s pin is deleted'); END",
+    "CREATE TRIGGER sleeve_venues_no_late_pin BEFORE INSERT ON sleeve_venues "
+    "WHEN EXISTS (SELECT 1 FROM orders WHERE sleeve = NEW.sleeve) OR EXISTS (SELECT 1 FROM fills WHERE sleeve = NEW.sleeve) "
+    f"BEGIN SELECT RAISE(ABORT, '{PIN_REFUSED}a strategy that has traded keeps its venue'); END",
 )
 account_keys_t = Table(
     "account_keys",
@@ -521,6 +556,39 @@ trials_t = Table(
     Index("trials_idea_hash", "idea_hash"),
     Index("trials_definition_dataset", "definition_hash", "dataset"),
 )
+# TRIALS-WORM (QD #238, HoE): the register is write-once. A row is never deleted, and an UPDATE may change only status
+# and error (a failed count re-counted); anything else, created_at, definition_hash, settings or the data range above
+# all, is refused by the database itself, so N, the earliest-row rule and the holdout check can't be edited after the
+# fact. Migration 0018 writes the same triggers (spelled out there: a migration is frozen at what it ran).
+TRIALS_FROZEN = ("id", "definition_hash", "idea_hash", "code_version", "definition_name", "family", "settings",
+                 "dataset", "stage", "source", "sharpe", "trades", "oos_trades", "backtest_id", "created_at",
+                 "data_start", "data_end", "kind")
+TRIALS_WORM_PG = (
+    "CREATE OR REPLACE FUNCTION trials_write_once() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+    "IF TG_OP = 'DELETE' THEN RAISE EXCEPTION USING ERRCODE = 'check_violation', "
+    "MESSAGE = 'trials are write-once: ' || OLD.id || ' cannot be deleted'; END IF; "
+    f"IF ({', '.join('NEW.' + c for c in TRIALS_FROZEN)}) IS DISTINCT FROM ({', '.join('OLD.' + c for c in TRIALS_FROZEN)}) "
+    "THEN RAISE EXCEPTION USING ERRCODE = 'check_violation', "
+    "MESSAGE = 'trials are write-once: only status and error of ' || OLD.id || ' may change'; END IF; "
+    "RETURN NEW; END $$",
+    "CREATE TRIGGER trials_write_once BEFORE UPDATE OR DELETE ON trials FOR EACH ROW EXECUTE FUNCTION trials_write_once()",
+)
+TRIALS_WORM_SQLITE = (
+    "CREATE TRIGGER trials_no_delete BEFORE DELETE ON trials BEGIN "
+    "SELECT RAISE(ABORT, 'trials are write-once: a row cannot be deleted'); END",
+    "CREATE TRIGGER trials_no_edit BEFORE UPDATE ON trials WHEN "
+    + " OR ".join(f"NEW.{c} IS NOT OLD.{c}" for c in TRIALS_FROZEN)
+    + " BEGIN SELECT RAISE(ABORT, 'trials are write-once: only status and error may change'); END",
+)
+for _sql in TRIALS_WORM_PG:
+    event.listen(trials_t, "after_create", DDL(_sql).execute_if(dialect="postgresql"))
+for _sql in TRIALS_WORM_SQLITE:
+    event.listen(trials_t, "after_create", DDL(_sql).execute_if(dialect="sqlite"))
+for _sql in SLEEVE_VENUES_PG:
+    event.listen(sleeve_venues_t, "after_create", DDL(_sql).execute_if(dialect="postgresql"))
+for _sql in SLEEVE_VENUES_SQLITE:
+    event.listen(sleeve_venues_t, "after_create", DDL(_sql).execute_if(dialect="sqlite"))
+
 # The held-back period each idea has opened (v2 P1-7, C4): one per idea and underlying, at any timeframe or
 # venue, for ever. Append-only, and no strategy column, so a reset never touches it.
 holdout_locks_t = Table(
@@ -1160,10 +1228,12 @@ class Store:
             raise ValueError(f"bad intent {intent!r}")
         now = ts or utcnow()
         with self.engine.begin() as c:
+            # The venue is the router's, never the caller's (P2-4): read with the order, in its transaction.
+            venue = c.execute(select(sleeve_venues_t.c.venue).where(sleeve_venues_t.c.sleeve == sleeve)).scalar()
             c.execute(insert(orders_t).values(sleeve=sleeve, order_id=order_id, ts=now, updated_at=now, side=side,
                                               order_type=order_type, qty=qty, status="submitted", filled_qty=0.0,
                                               fee=0.0, intent=intent, reason=reason, signal=signal or {},
-                                              message=""))
+                                              message="", venue=venue_for(venue)))
             if timing:
                 c.execute(insert(order_timings_t).values(order_id=order_id, sleeve=sleeve, **{
                     k: _from_ns(v) for k, v in timing.items() if v is not None}))
@@ -2125,11 +2195,13 @@ class Store:
             c.execute(insert(sleeves_t).values(**{**row, "name": run, "desired_state": "stopped", "status": "stopped",
                                                   "status_reason": f"run put away by a reset on {now:%d %b %Y %H:%M}",
                                                   "updated_at": now}))
-            for t in moved:
-                c.execute(update(t).where(t.c.sleeve == name).values(sleeve=run))
+            # The pin is copied before the orders and fills move: the database refuses a pin to a strategy that has
+            # traded (F-WED1-3), and the put-away run hasn't yet.
             for t in (sleeve_accounts_t, sleeve_venues_t):
                 for r in c.execute(select(t).where(t.c.sleeve == name)).all():
                     c.execute(insert(t).values(**{**dict(r._mapping), "sleeve": run}))
+            for t in moved:
+                c.execute(update(t).where(t.c.sleeve == name).values(sleeve=run))
             c.execute(feed_seen_t.delete().where(feed_seen_t.c.sleeve == name))
             # The old run's conditions on the Signals tab until the fresh process writes its own (m13-E2).
             c.execute(signal_state_t.delete().where(signal_state_t.c.sleeve == name))

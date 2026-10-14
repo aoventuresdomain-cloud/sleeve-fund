@@ -444,3 +444,23 @@ def test_f237_1_while_open_risk_is_unmarked_the_gate_refuses_every_entry_and_sti
     assert gate.ledger.alerts[-1][0] == "portfolio_check_failed"
     equity["now"] = D(800)
     assert gate.mark(t0 + 2 * 10**9) == "halt"  # 20% down: the halt fires though open risk is unmarked
+
+
+def test_a_strategy_on_1_minute_bars_runs_under_its_risk_profile():
+    """A Strategy deciding on the minutes it executes on is fed those bars alone, and its risk profile sizes it as
+    paper's runtime does (B7 replays paper): balanced posts at most 33% margin at 2x, not all its cash. The window
+    opens inside an hour, so the book counts the Strategy from its last bar before the first hourly close: with no
+    unallocated cash it is the whole book, and a book read as 0 would halt the run on its first entry."""
+    m = _hourly(15, 4, minutes=1)
+    warm, window = m.iloc[:-30], m.iloc[-30:]
+    inst = spot_pair("BTC", "USD", FEES, Venue("KRAKEN"))
+
+    def first(risk_profile):
+        spec = LegSpec("a", "ping_pong", inst, window, window, warm, exec_minutes=1, bar_minutes=1, params=dict(PERP),
+                       risk_profile=risk_profile)
+        d = run_portfolio([spec], LOOSE).decisions[0]
+        assert (d["bar_ts"], d["outcome"]) == (window.index[0].to_pydatetime(), "approved")
+        return float(d["requested"]) * float(window["close"].iloc[0])
+
+    assert first(None) > 9_000  # its cash, less the fee buffer
+    assert 6_000 < first("balanced") < 6_700  # 66% of its 10,000, not all of it
