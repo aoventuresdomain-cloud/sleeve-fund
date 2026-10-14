@@ -200,7 +200,8 @@ def test_funding_or_insurance_booked_after_the_latest_mark_is_a_note_not_a_fail(
     ok, page = start_check.run(url, environ={})
     assert f"  NOTE  s1: {'an insurance-fund cover' if cash == 'insurance' else 'a funding payment'} landed after " \
            "its latest mark" in page
-    assert "  FAIL  nothing was compared" in page and not ok  # s1 was the only one: nothing was checked
+    what = "an insurance-fund cover" if cash == "insurance" else "a funding payment"
+    assert f"  FAIL  nothing was compared: s1 had {what} after the latest mark" in page and not ok  # nothing checked
 
 
 def test_funding_booked_before_the_latest_mark_is_compared(tmp_path):

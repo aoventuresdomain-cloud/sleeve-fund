@@ -164,7 +164,7 @@ def check_books(store) -> Section:
         fills = store.fills(s.name, limit=1)
         late = "a fill" if fills and fills[0]["ts"] > last["ts"] else _late_cash(store, s.name, last["ts"])
         if late:
-            late_with_fills.append(s.name)
+            late_with_fills.append(f"{s.name} had {late}")
             sec.add(NOTE, f"{s.name}: {late} landed after its latest mark ({last['ts']:%H:%M:%S} UTC); compare "
                           "again after the next mark")
             continue
@@ -195,8 +195,8 @@ def check_books(store) -> Section:
         sec.add(NOTE, "no Strategy to compare")
     elif not compared and late_with_fills:
         # Every Strategy with a book was skipped: nothing was actually checked, which is not a pass.
-        sec.add(FAIL, f"nothing was compared: {', '.join(late_with_fills)} had a fill after the latest mark; run "
-                      "again after the next mark")
+        sec.add(FAIL, f"nothing was compared: {'; '.join(late_with_fills)} after the latest mark; run again after "
+                      "the next mark")
     return sec
 
 
