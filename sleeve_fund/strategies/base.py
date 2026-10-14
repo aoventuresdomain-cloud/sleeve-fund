@@ -4850,6 +4850,12 @@ class LongFlatStrategy(Strategy):
         """Once flat, equity never ends below zero: a liquidation is booked at the bankruptcy price, so it loses
         its isolated margin and fees and no more (_book_liquidation); should this book's own arithmetic still leave
         it below zero, the difference comes back to cash, journaled as the venue's insurance fund's."""
+        if self._fund_bridged():
+            # MUST-FUNDCASH-LOSS (HoE, Advisor 14 Oct): inside the fund a Strategy's own equity starts at 0, so any
+            # loss takes it below zero, and that loss is the fund's, never the insurance fund's. Its own equity feeds
+            # no money decision: a liquidation is booked at the bankruptcy price (_book_liquidation), so it loses its
+            # margin and fees, no more, and only the gap past bankruptcy is the venue's (_liquidation_diagnostic).
+            return
         credit = max(-self._mark()[0], 0.0)
         if credit <= 0:
             return
@@ -5060,6 +5066,17 @@ class LongFlatStrategy(Strategy):
         0 outside the fund), which _mark nets out: added back wherever the account's own balance is what counts."""
         return float(getattr(self.runtime, "funded", 0.0) or 0.0)
 
+    def _fund_bridged(self) -> bool:
+        """Paper inside the fund's book once the PM's re-base deposit has landed (the bridge): the fund holds the
+        cash. Before it each Strategy still carries its own capital and keeps its own shortfall cover."""
+        rt = self.runtime
+        if rt is None or not getattr(rt, "fund_held", False):
+            return False
+        from sleeve_fund import supervisor
+
+        start = getattr(supervisor, "bridge_start", None)
+        return start is not None and start(rt.store) is not None
+
     def _fund_held(self) -> bool:
         """Paper inside the fund (the portfolio gate on, and in the fund's book): the fund holds the cash, so the
         Strategy's own equity (its P&L, from a starting balance of 0) never sizes, halts or pauses it (Advisor CUT-A
@@ -5250,7 +5267,7 @@ class LongFlatStrategy(Strategy):
                 fees, taken, before, _ = self._liquidation_figures(None, abs(qty) * (at or price))
                 self._liquidated = self._margin_lost(abs(qty) + taken, self._entry_px or price, fees, before)
             if underwater or ruined:  # isolated margin: the strategy can't lose more than it has
-                wiped = self._wiped_out_why(max(-equity, 0.0) if underwater else 0.0)
+                wiped = self._wiped_out_why(max(-account, 0.0) if underwater else 0.0)
                 equity = 0.0
                 cash = 0.0 if ruined else cash
             elif kept and (self.runtime.status != "halted" or self.runtime.liquidated is None):
