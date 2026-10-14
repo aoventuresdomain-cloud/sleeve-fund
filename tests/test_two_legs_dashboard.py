@@ -224,3 +224,25 @@ def test_archive_and_reset_follow_the_whole_strategy(carry):
     shelf = home.split('id="archived"')[1].split("</details>")[0]
     assert shelf.count('href="/sleeves/carry"') == 1 and "carry~2" not in _visible(shelf)
     assert ">10,000.00<" in shelf  # both legs' 5,000
+
+
+@pytest.mark.parametrize("leg", ["carry", "carry~2"])
+def test_a_pairs_refused_entry_reads_without_the_venue_or_the_legs_row_name(carry, leg):
+    """F283-L1: "Entry refused: the first/second leg can't open: <reason>", the reason in that leg's own words, which
+    may name its instrument on the venue clone. Every page and the outside alert chat read it without the clone or the
+    second leg's row name."""
+    from sleeve_fund.alerts import message
+
+    client, store = carry
+    said = ("Entry refused: the second leg can't open: no fresh price for BTCUSDT-PERP.BINANCE_P2 from BINANCE_P2 in "
+            "the last minute")
+    store.event(leg, "warning", "pair_entry_refused", said)
+    reads = "Entry refused: the second leg can't open: no fresh price for BTCUSDT-PERP from the perpetual venue"
+    for path in ("/", "/alerts", "/sleeves/carry", "/sleeves/carry~2"):
+        words = " ".join(_visible(_get(client, path)).split())
+        assert "_P2" not in words and "carry~2" not in words, path
+    from html import unescape
+
+    assert reads in " ".join(unescape(re.sub(r"<[^>]+>", " ", _get(client, f"/sleeves/{leg}"))).split())
+    out = message([{"level": "warning", "sleeve": leg, "kind": "pair_entry_refused", "message": said}])
+    assert reads in out and "_P2" not in out and "~2" not in out
