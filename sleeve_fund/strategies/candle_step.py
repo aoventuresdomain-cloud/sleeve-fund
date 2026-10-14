@@ -189,6 +189,8 @@ class CandleStep(LongFlatStrategy):
         steps = [o for o in rows if "cycle" in (o["signal"] or {})]
         if not steps:
             return
+        if (started := steps[0]["signal"].get("run_started")) is not None:
+            self._started = _ts(datetime.fromisoformat(started))  # the run window counts from the first start
         cycle = steps[0]["signal"]["cycle"]
         mine = [o for o in steps if o["signal"]["cycle"] == cycle]
         q = next((D_(o["signal"]["q"]) for o in mine if o["signal"].get("q") is not None), None)
@@ -228,7 +230,7 @@ class CandleStep(LongFlatStrategy):
             plan = self._plan = Plan(cycle, q, self._started, self.c.run_for_hours, exited=ended)
             if q is not None:
                 self._last_q = q
-        values = {"cycle": cycle, "step": step}
+        values = {"cycle": cycle, "step": step, "run_started": self._started.isoformat()}
         if plan.q is not None:
             values["q"] = float(plan.q)
         if plan.expired(close):

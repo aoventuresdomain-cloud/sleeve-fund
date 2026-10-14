@@ -64,3 +64,14 @@ def test_a_restart_over_the_flip_never_doubles_and_carries_on():
     nxt = close + timedelta(minutes=4)  # step 0 of the next cycle
     tail = lambda s: [(o["side"], o["filled_qty"], o["intent"]) for o in _orders(s) if o["ts"] >= nxt]
     assert tail(b) == tail(a)
+
+
+def test_a_restart_after_the_run_window_opens_nothing():
+    """The window counts from the first start, journaled with every step: B, restarted after it has passed, only
+    closes what it holds and opens nothing (design: run_for_hours)."""
+    hours = 9 / 60  # ends before the second flip's close; B is down over that close
+    a, b, close, (restart, _) = _ab("candle_step", {**PARAMS, "run_for_hours": hours}, FLAT, lambda a: _step_close(1))
+    opened = [o for o in _orders(b) if o["ts"] >= restart and o["intent"] == "entry"]
+    assert opened == [], [(o["ts"], o["side"], o["filled_qty"]) for o in opened]
+    assert _path(b)[-1] == 0  # flat once the window is over
+    assert _path(a)[-1] == 0
