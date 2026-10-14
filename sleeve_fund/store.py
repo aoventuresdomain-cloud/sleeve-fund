@@ -915,17 +915,22 @@ def _position_venue(c, sleeve: str) -> str | None:
     return _traded_venue(c, sleeve) if holding(net) else None
 
 
+# The closes a fill at or past the liquidation price re-books as a liquidation (F283-P1, GAP-LIQ on every exit path):
+# every intent but an opening one or a liquidation, exactly as the engine's _gap_liquidation relabels (T-FIX7).
+REBOOKABLE = tuple(i for i in INTENTS if i not in GATED_INTENTS and i != "liquidation")
+
+
 def _check_rebook(order_id: str, row) -> None:
-    """Refuse any re-booking but a filled stop-loss becoming a liquidation (Store/MemoryJournal.rebook_liquidation)."""
+    """Refuse any re-booking but a filled close becoming a liquidation (Store/MemoryJournal.rebook_liquidation)."""
     if row is None:
         raise ValueError(f"no order {order_id!r} to re-book")
-    if row["intent"] != "stop_loss" or not row["filled_qty"]:
-        raise ValueError(f"order {order_id!r} can't be re-booked as a liquidation: only a filled stop-loss can "
+    if row["intent"] not in REBOOKABLE or not row["filled_qty"]:
+        raise ValueError(f"order {order_id!r} can't be re-booked as a liquidation: only a filled close can "
                          f"(it is {row['intent']}, {row['filled_qty']:g} filled)")
 
 
-def _rebook_words(order_id: str, reason: str) -> str:
-    return f"Order {order_id} re-booked from stop_loss to liquidation: {reason}"
+def _rebook_words(order_id: str, intent: str, reason: str) -> str:
+    return f"Order {order_id} re-booked from {intent} to liquidation: {reason}"
 
 
 def exact_sum(a: float, b: float) -> float:
@@ -1686,14 +1691,14 @@ class Store:
 
     def rebook_liquidation(self, order_id: str, reason: str, signal: dict, ts: datetime | None = None) -> None:
         """GAP-LIQ (Advisor): a resting stop whose fill was at or past the liquidation price is re-booked as the
-        liquidation it was. The only intent change the journal allows (Data Architect): stop_loss to liquidation, on
-        an order that has filled; its fills stay as they are, and an order_rebooked event keeps the lineage."""
+        liquidation it was; since F283-P1 any close filled there is (REBOOKABLE). The only intent change the journal
+        allows (Data Architect): a close to liquidation, on an order that has filled; its fills stay as they are, and an order_rebooked event keeps the lineage."""
         with self.engine.begin() as c:
             row = c.execute(select(orders_t).where(orders_t.c.order_id == order_id)).first()
             _check_rebook(order_id, row and row._mapping)
             c.execute(update(orders_t).where(orders_t.c.order_id == order_id)
                       .values(intent="liquidation", reason=reason, signal=signal, updated_at=utcnow()))
-        self.event(row.sleeve, "info", "order_rebooked", _rebook_words(order_id, reason), ts=ts)
+        self.event(row.sleeve, "info", "order_rebooked", _rebook_words(order_id, row.intent, reason), ts=ts)
     def merge_order_signal(self, order_id: str, values: dict) -> None:
         """Add to an order's signal what was known only once it filled (an entry's liquidation price). Unknown ids
         are ignored, as in update_order."""
