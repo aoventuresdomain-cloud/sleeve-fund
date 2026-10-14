@@ -54,6 +54,7 @@ from sqlalchemy.schema import DropConstraint
 from sleeve_fund import lifecycle
 from sleeve_fund.exact import EXACT
 from sleeve_fund.money import stored, to_decimal
+from sleeve_fund import router
 from sleeve_fund.router import venue_for
 
 DEFAULT_URL = "sqlite:///data/sleeve_fund.db"
@@ -805,17 +806,21 @@ INTENTS = ("entry", "exit", "stop_loss", "take_profit", "risk_halt", "risk_pause
            "liquidation", "liquidation_cut", "wind_down", "wind_down_stop")  # the venue would take it; cut back before it does (String(16))
 
 
-def _position_venue(c, sleeve: str) -> str | None:
-    """F-WED1-3: the venue the journal says the strategy's open position is on: that of the order behind its latest
-    fill, while its fills net to a position; None when flat. Read on the caller's connection."""
-    net = c.execute(select(func.sum(case((fills_t.c.side == "BUY", fills_t.c.qty), else_=-fills_t.c.qty)))
-                    .where(fills_t.c.sleeve == sleeve)).scalar()
-    if not net:
-        return None
+def _traded_venue(c, sleeve: str) -> str | None:
+    """F-WED1-3: the venue the strategy last traded on, as its journal holds it: that of the order behind its latest
+    fill; None when it has no fills. Read on the caller's connection."""
     return c.execute(select(orders_t.c.venue).join(fills_t, (fills_t.c.order_id == orders_t.c.order_id)
                                                    & (fills_t.c.sleeve == orders_t.c.sleeve))
                      .where(fills_t.c.sleeve == sleeve).order_by(fills_t.c.ts.desc(), fills_t.c.id.desc())
                      .limit(1)).scalar()
+
+
+def _position_venue(c, sleeve: str) -> str | None:
+    """F-WED1-3: the venue the journal says the strategy's open position is on (_traded_venue) while its fills net to
+    a position; None when flat. Read on the caller's connection."""
+    net = c.execute(select(func.sum(case((fills_t.c.side == "BUY", fills_t.c.qty), else_=-fills_t.c.qty)))
+                    .where(fills_t.c.sleeve == sleeve)).scalar()
+    return _traded_venue(c, sleeve) if net else None
 
 
 def _check_rebook(order_id: str, row) -> None:
@@ -1268,6 +1273,22 @@ class Store:
         """The venue the strategy's open position is on, as the journal holds it (_position_venue); None when flat."""
         with self.engine.connect() as c:
             return _position_venue(c, sleeve)
+
+    def traded_venue(self, sleeve: str) -> str | None:
+        """The venue the strategy last traded on, as the journal holds it (_traded_venue); None with no fills."""
+        with self.engine.connect() as c:
+            return _traded_venue(c, sleeve)
+
+    def venue_start(self, sleeve) -> tuple[str, str | None]:
+        """How `sleeve` (a Sleeve) may start, by the venue its journal last traded on against its pin
+        (router.start_mode), as (mode, that venue). Holding means a position no flatten leaves as dust (is_dust), as
+        the supervisor's exits-only start reads it. One answer for the supervisor and the paper process (F-WED1-3)."""
+        traded = self.traded_venue(sleeve.name)
+        if traded is None:
+            return router.NORMAL, None
+        book = self.journal_book(sleeve.name, sleeve.starting_balance)
+        holding = abs(book["qty"]) > 1e-12 and not is_dust(book)
+        return router.start_mode(venue_for(sleeve.venue), traded, holding), traded
 
     def record_timing(self, sleeve: str, order_id: str, *, fill: int | None = None, **stamps: int | None) -> None:
         """An order's timing stamps (UNIX ns, kept to the microsecond), filled in as they come (the send, the

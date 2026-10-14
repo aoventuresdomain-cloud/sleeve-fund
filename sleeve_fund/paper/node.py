@@ -8,6 +8,7 @@ There is deliberately no code path here that adds a venue execution client.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import hashlib
 import os
 import re
@@ -36,7 +37,7 @@ from nautilus_trader.model import (
 from sleeve_fund import markets, router, spreads
 from sleeve_fund.instruments import ScheduleFeeModel, fill_model
 from sleeve_fund.paper.config import SleeveConfig, from_store, load_sleeve
-from sleeve_fund.paper.runtime import SleeveRuntime
+from sleeve_fund.paper.runtime import EXITS_ONLY, SleeveRuntime
 from sleeve_fund.paper.safety import assert_keyless, assert_portfolio_gate
 from sleeve_fund.strategies import REGISTRY, check_perp_sizing, check_perp_stop
 from sleeve_fund.venues import VENUES
@@ -297,6 +298,27 @@ def build_node(sleeve: SleeveConfig, log_level: str = "INFO", runtime: SleeveRun
     return node
 
 
+def venue_start(store, row):
+    """F-WED1-3 (Advisor 14 Oct 03:35 UK): the stored strategy `row` to build, by the venue its journal last traded on
+    against its pin (Store.venue_start); None when it is refused. Its pin's venue, or no fills: `row` as it is.
+    Holding on another venue: `row` on that venue, paused for its exits only (the supervisor's own status when it
+    started it), so its stop and target close the position where it is and nothing opens. Flat on another venue: one
+    error event, and None. The events name no venue; the log line does."""
+    mode, traded = store.venue_start(row)
+    if mode == router.NORMAL:
+        return row
+    print(f"{row.name}: venue {mode}: journal {traded}, pin {router.venue_for(row.venue)}", flush=True)
+    why = router.VENUE_MOVED[mode]
+    if mode == router.REFUSE:
+        store.event(row.name, "error", "venue_mismatch", f"{row.name} won't start: {why}")
+        return None
+    reason = f"{EXITS_ONLY}: {why}"
+    if row.status != "paused" or row.status_reason != reason:  # not the supervisor's start: said here, once
+        store.set_status(row.name, "paused", reason)
+        store.event(row.name, "error", "venue_mismatch_exits_only", f"{row.name} started for its exits only: {why}")
+    return dataclasses.replace(row, venue=traded, status="paused", status_reason=reason)
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="python -m sleeve_fund.paper", description="Run one paper sleeve")
     src = ap.add_mutually_exclusive_group(required=True)
@@ -324,12 +346,15 @@ def main(argv: list[str] | None = None) -> int:
         store.event(args.db_sleeve, "info", INSTANCE_LOCK, f"this process (pid {os.getpid()}) runs the strategy: it "
                     "holds its single-instance lock")
         assert_portfolio_gate(store)
-        row = store.sleeve(args.db_sleeve)
+        row = venue_start(store, store.sleeve(args.db_sleeve))
+        if row is None:
+            return 1
         quote = resolve(getattr(row, "venue", None), store)
         sleeve = from_store(row, fee_schedule=quote.fees)
         from sleeve_fund.paper.queued import QueuedStore
 
         runtime = SleeveRuntime(QueuedStore(store), sleeve.name)  # journal writes off the decision path
+        runtime.venue = sleeve.venue  # its pin's, or the one its open position is on (venue_start)
         perp = markets.terms(sleeve.params, sleeve.venue)
         store.event(sleeve.name, "info", "fees", f"Charging {quote.text}" if perp is None or perp.fees is None else
                     f"Charging {perp.label}: {perp.fees.maker:.2%} maker, {perp.fees.taker:.2%} taker, on the venue's "
