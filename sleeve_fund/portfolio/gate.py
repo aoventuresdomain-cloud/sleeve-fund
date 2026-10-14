@@ -34,6 +34,7 @@ from sleeve_fund.money import PRECISION, QUANTUM, money
 from sleeve_fund.portfolio.limits import Book, Decision, Holding, Intent, book_breach, decide, rejected
 from sleeve_fund.risk import PortfolioProfile, trading_day
 
+EMPTY = Decimal("0.01")  # a book worth under a cent holds nothing: empty (F282-3, F-C3B-A)
 MARK_STALE = timedelta(seconds=60)  # a book mark older than this blocks new entries (PM yes, 6 Oct)
 RESERVATION_TTL = timedelta(minutes=10)  # past this, a reservation is checked for an orphan (sweep)
 CANCEL_CONFIRM = timedelta(seconds=60)  # a sweep's cancel unconfirmed this long is sent again, with an alert

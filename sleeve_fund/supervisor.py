@@ -29,7 +29,7 @@ from sleeve_fund.alerts import Forwarder
 from sleeve_fund.exact import float_view
 from sleeve_fund.money import to_decimal
 from sleeve_fund.gate_ledger import DbLedger
-from sleeve_fund.portfolio.gate import PortfolioState, mark_book, sweep
+from sleeve_fund.portfolio.gate import EMPTY, PortfolioState, mark_book, sweep
 from sleeve_fund.portfolio.limits import Book, Holding
 from sleeve_fund.risk import PORTFOLIO, trading_day
 from sleeve_fund.paper.safety import assert_portfolio_gate, credential_var
@@ -75,6 +75,21 @@ def fund_equity(store: Store) -> Decimal:
             continue
         total += strategy_equity(store, s, runs)
     return total
+
+
+def nothing_open(store: Store, ledger) -> str | None:
+    """Why the book isn't idle, or None when nothing is open: no reservation held, no Strategy that could trade
+    (could_trade), no position but dust. The one guard for an empty book (F282-3's no-op mark, F-C3B-A's emptying
+    flow)."""
+    if ledger.reservations():
+        return "an order still holds room in the book"
+    for s in store.sleeves():
+        book = store.journal_book(s.name, s.starting_balance)
+        if could_trade(s):
+            return f"{s.name} could trade"
+        if abs(book["qty"]) > 1e-12 and not is_dust(book):
+            return f"{s.name} holds {book['qty']}"
+    return None
 
 
 def _flowed(st: PortfolioState) -> tuple:
@@ -546,7 +561,13 @@ class Supervisor:
             with led.lock():
                 # HALT-REF-1: a capital move whose flow (Store._book_move) landed while the book was read left that read
                 # behind it, a phantom gain or loss; this mark is skipped and the next one, seconds on, reads it all.
-                behind = _flowed(led.state()) != _flowed(before)
+                st = led.state()
+                behind = _flowed(st) != _flowed(before)
+                # F282-3 (Advisor, 14 Oct 10:20 UK): an empty book never marked, with nothing open, has nothing to
+                # mark. It writes, raises and clears nothing (a halt or pause in force stays for the PM), and entries
+                # stay blocked as stale until the first capital's mark starts the book.
+                behind = behind or (st.equity is None and st.hwm is None and abs(equity) < EMPTY
+                                    and nothing_open(self.store, led) is None)
                 acted = None if behind else mark_book(led, equity, now, PORTFOLIO)
         if not self._equity_failing and not behind:
             st = led.state()
