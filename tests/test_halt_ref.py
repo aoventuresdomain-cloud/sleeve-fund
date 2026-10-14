@@ -661,3 +661,15 @@ def test_a_move_whose_own_write_fails_leaves_no_flow_and_no_event(store):
     with pytest.raises(ValueError, match="no account called"):
         store.assign_account("test", "nope")
     assert _four(_state(store)) == before and _flows(store) == [] and store.account_of("test") == "paper"
+
+
+def test_f282_2_the_rebase_values_dust_at_its_mark_not_its_entry(store):
+    """CR F282-2: 0.00001 bought at 60,000 (0.60) and marked at 70,000 is journaled at 0.70, its mark."""
+    _make(store, "a", 30_000)
+    store.record_fill("a", side="BUY", qty=0.00001, price=60_000.0, fee=0.0, order_id="d1", trade_id="d1", ts=T0)
+    cash = float(store.journal_book("a", 30_000)["cash"])
+    store.record_equity("a", equity=cash + 0.7, cash=cash, qty=0.00001, price=70_000.0, benchmark=30_000.0, ts=T0)
+    _mark(store, T0 + timedelta(seconds=1))
+    _incident(store)
+    _, _, words = supervisor.rebase_halt_ref_1(store, "HoE", "abc1234")
+    assert "dust counted as flat: a 0.00001 worth 0.7000;" in words
