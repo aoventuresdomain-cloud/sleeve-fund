@@ -12,6 +12,7 @@ Postgres it runs inside a READ ONLY transaction, so even a bug here cannot write
 from __future__ import annotations
 
 import sys
+import warnings
 
 from pathlib import Path
 
@@ -42,7 +43,12 @@ def _include(obj, name, type_, reflected, compare_to):
 def differences(conn: Connection) -> list[str]:
     """Each way the connected database differs from store.py's tables, as one line, empty when they match."""
     ctx = MigrationContext.configure(conn, opts={"compare_type": _same_type, "include_object": _include})
-    return [_describe(d) for d in compare_metadata(ctx, metadata)]
+    with warnings.catch_warnings():
+        # SQLite can't reflect an index on an expression (0028's sleeves_strategy_asset), so alembic skips comparing
+        # it there and says so on every check; Postgres compares it
+        warnings.filterwarnings("ignore", message="autogenerate skipping metadata-specified expression-based index")
+        warnings.filterwarnings("ignore", message="Skipped unsupported reflection of expression-based index")
+        return [_describe(d) for d in compare_metadata(ctx, metadata)]
 
 
 def _describe(diff) -> str:

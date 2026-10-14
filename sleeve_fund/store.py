@@ -34,6 +34,7 @@ from sqlalchemy import (
     MetaData,
     Numeric,
     Sequence,
+    SmallInteger,
     String,
     Table,
     Text,
@@ -83,9 +84,16 @@ LEVELS = ("info", "warning", "error")
 metadata = MetaData()
 TS = DateTime(timezone=True)
 LEG = "~2"  # a two-leg Strategy's second leg row: "<name>~2" (P2-8)
-# "parent IS NOT NULL" is needed: with a NULL parent the second term is NULL, and a CHECK passes on NULL.
-LEG_NAME = ("(parent IS NULL AND name NOT LIKE '%~%') "
-            "OR (parent IS NOT NULL AND name = parent || '~2' AND parent NOT LIKE '%~%')")
+# Drop B (DA, 0028): a multi-asset Strategy's leg rows are "<name>~<ASSET>" (e.g. trend-x~ETH), many under one parent;
+# "~2" still fits. The suffix is 1-16 upper-case letters or digits, and a parent holds no "~", so legs are one level
+# deep. substr, not LIKE: a parent's own "_" or "%" would be a wildcard. "parent IS NOT NULL" is needed: with a NULL
+# parent the second term is NULL, and a CHECK passes on NULL. Spelled per engine (Postgres regex, SQLite GLOB).
+_LEG_HEAD = ("(parent IS NULL AND name NOT LIKE '%~%') "
+             "OR (parent IS NOT NULL AND parent NOT LIKE '%~%' AND substr(name, 1, length(parent) + 1) = parent || '~' "
+             "AND ")
+_LEG_SUFFIX = "substr(name, length(parent) + 2)"
+LEG_NAME_PG = _LEG_HEAD + f"{_LEG_SUFFIX} ~ '^[A-Z0-9]{{1,16}}$')"
+LEG_NAME_SQLITE = _LEG_HEAD + (f"length({_LEG_SUFFIX}) BETWEEN 1 AND 16 AND {_LEG_SUFFIX} NOT GLOB '*[^A-Z0-9]*')")
 
 sleeves_t = Table(
     "sleeves",
@@ -107,9 +115,11 @@ sleeves_t = Table(
     Column("created_at", TS, nullable=False),
     Column("updated_at", TS, nullable=False),
     # P2-8 two legs (DA, 0022): a two-leg Strategy's second leg is its own row, "<name>~2", whose parent is the first.
-    # The CHECK holds the shape on both engines: "~" only as that suffix, one level, at most one leg.
+    # Drop B (0028): a multi-asset Strategy's legs, "<name>~<ASSET>", many under one parent. The CHECK holds the shape
+    # on both engines: "~" only as that suffix, one level.
     Column("parent", String(64), ForeignKey("sleeves.name", name="sleeves_parent_fk", ondelete="RESTRICT")),
-    CheckConstraint(LEG_NAME, name="sleeves_leg_name"),
+    CheckConstraint(LEG_NAME_PG, name="sleeves_leg_name").ddl_if(dialect="postgresql"),
+    CheckConstraint(LEG_NAME_SQLITE, name="sleeves_leg_name").ddl_if(dialect="sqlite"),
     # P2-6: the PM's lifecycle, kept apart from running/stopped/paused (DA). The row holds the current state only;
     # each move is journaled in events and decisions (Store.set_lifecycle, the one writer).
     Column("lifecycle", String(16), nullable=False, default="active", server_default="active"),
@@ -119,6 +129,12 @@ sleeves_t = Table(
     CheckConstraint("lifecycle <> 'winding_down' OR (wind_down_started IS NOT NULL AND wind_down_deadline IS NOT NULL "
                     "AND wind_down_deadline >= wind_down_started)", name="sleeves_winding_down"),
 )
+# Drop B (DA, 0028): one row per (Strategy, asset). The Strategy is the parent's name on a leg row and the row's own
+# name otherwise, so no multi-asset leg trades its parent's instrument or another leg's. A two-leg "~2" row is left out:
+# a carry trades one symbol on two markets (spot and perp), which the market in params tells apart, not the row.
+STRATEGY_ASSET_ROWS = "parent IS NULL OR name <> parent || '~2'"
+Index("sleeves_strategy_asset", func.coalesce(sleeves_t.c.parent, sleeves_t.c.name), sleeves_t.c.instrument,
+      unique=True, sqlite_where=text(STRATEGY_ASSET_ROWS), postgresql_where=text(STRATEGY_ASSET_ROWS))
 
 equity_t = Table(
     "equity",
@@ -856,6 +872,13 @@ gate_decisions_t = Table(
     Column("regime_state", Text),
     Column("stage", String(8), nullable=False),
     Column("decided_at", TS, nullable=False),
+    # Drop B (DA, 0028), written by the gate inside its lock; nullable, so rows before it stay as they are.
+    Column("planned_stop", EXACT),  # the idea's stop and target prices: a refusal's shadow outcome replays them
+    Column("planned_target", EXACT),
+    # the refused or trimmed test's measure had the idea gone through at the requested size, as a share of
+    # book_equity (T1-T3 loss if stops are hit, T4 gross or net); NULL for T5 and when no test bound it
+    Column("would_be", EXACT),
+    Column("side", SmallInteger),  # +1 long, -1 short; requested_qty stays unsigned
     CheckConstraint(_in("outcome", GATE_OUTCOMES), name="gate_decisions_outcome"),
     CheckConstraint(_in("limit_hit", GATE_LIMITS), name="gate_decisions_limit_hit"),
     CheckConstraint(_in("stage", GATE_STAGES), name="gate_decisions_stage"),
@@ -890,6 +913,27 @@ gate_reservations_t = Table(
           postgresql_where=text("released_at IS NULL")),
     Index("gate_reservations_active_sleeve", "sleeve_id", sqlite_where=text("released_at IS NULL"),
           postgresql_where=text("released_at IS NULL")),  # the sweep, and DA-6's reset guard
+)
+# Drop B (DA, 0028; Advisor MA-SPEC): what a trimmed or refused idea would have made, filled in after the trade it was
+# part of (a trim) or a replay of its own stop, target and model exit at the asked size (a refusal, hypothetical). The
+# idea itself (asked, approved, the test, the planned stop and target) is its gate_decisions row. One outcome per
+# decision; write-once. A refusal's outcome never feeds the leg's real later entries.
+SHADOW_KINDS = ("trim", "refusal")
+SHADOW_METHODS = ("trade_scaled", "replay")  # trim: the real trade's per-unit P&L x (asked - approved); refusal: replay
+shadow_outcomes_t = Table(
+    "shadow_outcomes",
+    metadata,
+    Column("decision_id", BIG_ID, ForeignKey("gate_decisions.id", ondelete="RESTRICT"), primary_key=True,
+           autoincrement=False),
+    Column("kind", String(8), nullable=False),
+    Column("pnl", EXACT, nullable=False),  # net of fees and slippage, in the fund's cash
+    Column("hypothetical", Boolean, nullable=False),
+    Column("method", String(16), nullable=False),
+    Column("computed_at", TS, nullable=False),
+    CheckConstraint(_in("kind", SHADOW_KINDS), name="shadow_outcomes_kind"),
+    CheckConstraint(_in("method", SHADOW_METHODS), name="shadow_outcomes_method"),
+    CheckConstraint("(kind = 'refusal' AND hypothetical AND method = 'replay') "
+                    "OR (kind = 'trim' AND NOT hypothetical AND method = 'trade_scaled')", name="shadow_outcomes_shape"),
 )
 # Bridge A (DA, 0027; Advisor BRIDGE-3): the PM's compliance tests, versioned whole. One version is every test and the
 # asset-group map together, so a decision that records its version re-checks exactly. Written only through
@@ -980,6 +1024,52 @@ for _sql in GATE_TEST_HIT_PG:
     event.listen(gate_decisions_t, "after_create", DDL(_sql).execute_if(dialect="postgresql"))
 for _sql in GATE_TEST_HIT_SQLITE:
     event.listen(gate_decisions_t, "after_create", DDL(_sql).execute_if(dialect="sqlite"))
+
+# Drop B (DA, 0028): the idea's columns on gate_decisions. Triggers, not CHECKs, so 0028 adds them without rebuilding
+# gate_decisions on SQLite (as 0027's test_hit). would_be only with the test it measures.
+GATE_IDEA_BAD = ("(NEW.side IS NOT NULL AND NEW.side NOT IN (-1, 1)) "
+                 "OR (NEW.would_be IS NOT NULL AND NEW.test_hit IS NULL) "
+                 "OR NEW.planned_stop <= 0 OR NEW.planned_target <= 0")
+GATE_IDEA_PG = (
+    "CREATE OR REPLACE FUNCTION gate_idea_shape() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+    f"IF {GATE_IDEA_BAD} THEN RAISE EXCEPTION USING ERRCODE = 'check_violation', "
+    "MESSAGE = 'gate_decisions: side is +1 or -1, would_be needs test_hit, a planned stop or target is above 0'; "
+    "END IF; RETURN NEW; END $$",
+    "CREATE TRIGGER gate_decisions_idea BEFORE INSERT OR UPDATE ON gate_decisions FOR EACH ROW "
+    "EXECUTE FUNCTION gate_idea_shape()",
+)
+GATE_IDEA_SQLITE = tuple(
+    f"CREATE TRIGGER gate_decisions_idea_{op.lower()} BEFORE {op} ON gate_decisions WHEN {GATE_IDEA_BAD} "
+    "BEGIN SELECT RAISE(ABORT, 'gate_decisions: side is +1 or -1, would_be needs test_hit, a planned stop or target "
+    "is above 0'); END"
+    for op in ("INSERT", "UPDATE"))
+# A shadow outcome is write-once, and its kind is its decision's outcome: a trim of a trimmed idea, a refusal of a
+# rejected one.
+SHADOW_WRONG_KIND = ("NOT EXISTS (SELECT 1 FROM gate_decisions WHERE id = NEW.decision_id AND outcome = "
+                     "CASE NEW.kind WHEN 'trim' THEN 'trimmed' WHEN 'refusal' THEN 'rejected' END)")
+SHADOW_PG = (
+    "CREATE OR REPLACE FUNCTION shadow_outcome_write_once() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+    "RAISE EXCEPTION USING ERRCODE = 'check_violation', MESSAGE = 'shadow_outcomes is write-once'; END $$",
+    "CREATE TRIGGER shadow_outcomes_write_once BEFORE UPDATE OR DELETE ON shadow_outcomes FOR EACH ROW "
+    "EXECUTE FUNCTION shadow_outcome_write_once()",
+    "CREATE OR REPLACE FUNCTION shadow_outcome_kind() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+    f"IF {SHADOW_WRONG_KIND} THEN RAISE EXCEPTION USING ERRCODE = 'check_violation', "
+    "MESSAGE = 'a shadow outcome is a trim of a trimmed decision or a refusal of a rejected one'; "
+    "END IF; RETURN NEW; END $$",
+    "CREATE TRIGGER shadow_outcomes_kind BEFORE INSERT ON shadow_outcomes FOR EACH ROW "
+    "EXECUTE FUNCTION shadow_outcome_kind()",
+)
+SHADOW_SQLITE = (
+    *(f"CREATE TRIGGER shadow_outcomes_no_{op.lower()} BEFORE {op} ON shadow_outcomes BEGIN "
+      "SELECT RAISE(ABORT, 'shadow_outcomes is write-once'); END" for op in ("UPDATE", "DELETE")),
+    f"CREATE TRIGGER shadow_outcomes_kind BEFORE INSERT ON shadow_outcomes WHEN {SHADOW_WRONG_KIND} BEGIN "
+    "SELECT RAISE(ABORT, 'a shadow outcome is a trim of a trimmed decision or a refusal of a rejected one'); END",
+)
+for _t, _pg, _lite in ((gate_decisions_t, GATE_IDEA_PG, GATE_IDEA_SQLITE), (shadow_outcomes_t, SHADOW_PG, SHADOW_SQLITE)):
+    for _sql in _pg:
+        event.listen(_t, "after_create", DDL(_sql).execute_if(dialect="postgresql"))
+    for _sql in _lite:
+        event.listen(_t, "after_create", DDL(_sql).execute_if(dialect="sqlite"))
 
 COMPLIANCE_V1_AT = datetime(2026, 10, 14, 21, 0, tzinfo=timezone.utc)
 COMPLIANCE_V1_NOTE = "the PM's defaults (DEFAULTS-2, 14 Oct 2026); Advisor BRIDGE-3"
@@ -3852,6 +3942,102 @@ class Store:
     def instruments(self) -> list[dict]:
         with self.engine.connect() as c:
             return _rows(c.execute(select(instruments_t).order_by(instruments_t.c.id)))
+
+    # --- (Strategy, asset): multi-asset Strategies (Drop B, DA 0028; PE1 multi-asset-spec) ---------------------
+
+    def strategy_assets(self, name: str) -> list[dict]:
+        """Every asset of the Strategy `name` (its own row's name, or any of its legs'), one row each: the parent row
+        first, then its legs in the order they were made (the definition's asset order). A one-asset Strategy is one
+        row. Each row: sleeve (the row trading it), instrument, underlying, venue and whether it is a leg."""
+        from sleeve_fund.portfolio.holding import underlying
+        from sleeve_fund.venues import DEFAULT_VENUE
+
+        t, v = sleeves_t, sleeve_venues_t
+        with self.engine.connect() as c:
+            row = c.execute(select(t.c.name, t.c.parent).where(t.c.name == name)).first()
+            if row is None:
+                raise KeyError(f"no strategy {name!r}")
+            strategy = row.parent or row.name
+            rows = c.execute(select(t.c.name, t.c.instrument, t.c.parent, v.c.venue)
+                             .select_from(t.outerjoin(v, v.c.sleeve == t.c.name))
+                             .where(or_(t.c.name == strategy, t.c.parent == strategy))
+                             .order_by(t.c.parent.is_not(None), t.c.id)).all()
+        return [{"strategy": strategy, "sleeve": r.name, "instrument": r.instrument,
+                 "underlying": underlying(r.instrument), "venue": (r.venue or DEFAULT_VENUE).upper(),
+                 "leg": r.parent is not None} for r in rows]
+
+    def asset_book(self, strategy: str) -> dict:
+        """The Strategy's book per asset and in total, rebuilt from the journal (fills are the truth): each asset's
+        row is journal_book of the row trading it, and the total is their exact sum, so per-asset P&L, fees and
+        funding add up to the Strategy's to the last digit (nightly rebuild, Drop B Done-when 6). Position and entry
+        are per asset only: a total of BTC and ETH units means nothing."""
+        assets = []
+        for a in self.strategy_assets(strategy):
+            book = self.journal_book(a["sleeve"], self.sleeve(a["sleeve"]).starting_balance)
+            fees = self._fees(a["sleeve"])
+            assets.append(a | {"starting_balance": to_decimal(self.sleeve(a["sleeve"]).starting_balance),
+                               "cash": book["cash"], "qty": book["qty"], "entry_px": book["entry_px"],
+                               "fills": book["fills"], "fees": fees, "funding": book["funding"],
+                               "insurance": book["insurance"]})
+        total = {k: sum((a[k] for a in assets), Decimal(0))
+                 for k in ("starting_balance", "cash", "fees", "funding", "insurance")}
+        total["fills"] = sum(a["fills"] for a in assets)
+        return {"strategy": assets[0]["strategy"], "assets": assets, "total": total}
+
+    def _fees(self, sleeve: str) -> Decimal:
+        with self.engine.connect() as c:
+            fees = c.execute(select(fills_t.c.fee).where(fills_t.c.sleeve == sleeve)).scalars().all()
+        return sum((to_decimal(f, "fee") for f in fees), Decimal(0))
+
+    def asset_mismatches(self, limit: int = 50) -> list[dict]:
+        """Reconcile by (Strategy, asset): journal rows whose instrument is not their row's (an orders, fills, funding
+        or insurance row written with another asset, or left '' because its Strategy row was gone). Empty when every
+        row is keyed right; reconcile names each one (0026 left the check here, never a foreign key)."""
+        out = []
+        with self.engine.connect() as c:
+            for t in (orders_t, fills_t, funding_t, insurance_t):
+                q = (select(t.c.id, t.c.sleeve, t.c.instrument, sleeves_t.c.instrument.label("expected"))
+                     .select_from(t.outerjoin(sleeves_t, sleeves_t.c.name == t.c.sleeve))
+                     .where(or_(sleeves_t.c.instrument.is_(None), t.c.instrument != sleeves_t.c.instrument))
+                     .order_by(t.c.id).limit(limit))
+                out += [{"table": t.name, "id": r.id, "sleeve": r.sleeve, "instrument": r.instrument,
+                         "expected": r.expected} for r in c.execute(q)]
+        return out[:limit]
+
+    def record_shadow_outcome(self, decision_id: int, *, kind: str, pnl, method: str,
+                              computed_at: datetime | None = None) -> str:
+        """A trimmed or refused idea's outcome (Advisor MA-SPEC): "new" when written, "same" when this decision holds
+        the same figure already (a rerun), and an error when it holds another (write-once: never overwritten)."""
+        pnl = to_decimal(pnl, "pnl")
+        row = dict(decision_id=decision_id, kind=kind, pnl=pnl, hypothetical=kind == "refusal", method=method,
+                   computed_at=computed_at or utcnow())
+        t = shadow_outcomes_t
+        with self.engine.begin() as c:
+            have = c.execute(select(t).where(t.c.decision_id == decision_id)).first()
+            if have is None:
+                c.execute(insert(t).values(**row))
+                return "new"
+        if have.kind == kind and have.method == method and stored(have.pnl) == stored(pnl):
+            return "same"
+        raise ValueError(f"decision {decision_id} already has a {have.kind} outcome of {stored(have.pnl)}; "
+                         "an outcome is never rewritten")
+
+    def shadow_outcomes(self, strategy: str | None = None, limit: int = 200) -> list[dict]:
+        """Trimmed and refused ideas with their outcomes, newest first: the decision (Strategy row, asset, bar, asked,
+        approved, the test, planned stop and target, side) and its outcome once computed (None until then). Every
+        Strategy by default; a Strategy's name takes in all its legs."""
+        g, t, o = gate_decisions_t, sleeves_t, shadow_outcomes_t
+        q = (select(t.c.name.label("sleeve"), func.coalesce(t.c.parent, t.c.name).label("strategy"), t.c.instrument,
+                    g.c.id.label("decision_id"), g.c.bar_ts, g.c.stage, g.c.outcome, g.c.test_hit, g.c.compliance_version,
+                    g.c.requested_qty, g.c.approved_qty, g.c.price, g.c.planned_stop, g.c.planned_target, g.c.side,
+                    g.c.would_be, o.c.kind, o.c.pnl, o.c.hypothetical, o.c.method, o.c.computed_at)
+             .select_from(g.join(t, t.c.id == g.c.sleeve_id).outerjoin(o, o.c.decision_id == g.c.id))
+             .where(g.c.outcome.in_(("trimmed", "rejected")))
+             .order_by(g.c.decided_at.desc(), g.c.id.desc()).limit(limit))
+        if strategy is not None:
+            q = q.where(func.coalesce(t.c.parent, t.c.name) == strategy)
+        with self.engine.connect() as c:
+            return _rows(c.execute(q))
 
     # --- compliance tests (bridge A, DA 0027; Advisor BRIDGE-3) -----------------------------------------------
 
