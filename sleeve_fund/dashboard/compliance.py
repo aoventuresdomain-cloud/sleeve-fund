@@ -54,6 +54,34 @@ def fund_halt(store: Store) -> str | None:
         return None
 
 
+def engine_use(store: Store, tests: dict[str, dict]) -> dict | None:
+    """C2: the engine's own use of each test (PE2's compliance_use, Drop B) in this page's shape, or None until the
+    engine has it. Its share is used over the limit; as a share of the book that is share x the limit's percentage
+    (the limit is that percentage of the book). The largest asset or group is the headline, the rest on hover."""
+    try:
+        from sleeve_fund.gate_ledger import compliance_use  # PE2's, once it lands
+    except ImportError:
+        return None
+    try:
+        got = compliance_use(store)
+    except Exception:  # noqa: BLE001 - unread is shown as unreadable, never as room
+        return {"source": "unreadable"}
+    if not got or got.get("stale"):
+        return {"source": "unmarked"}
+    out: dict = {"source": "gate"}
+    for key, u in got.items():
+        if key not in rules.BY_KEY or not isinstance(u, dict):
+            continue
+        pct = Decimal(str(tests.get(key, {}).get("limit", 0)))
+        parts = u.get("by_asset") or u.get("by_group") or {}
+        top = max(parts.items(), key=lambda kv: kv[1], default=(None, None))[0]
+        what = (top.capitalize() if "by_group" in u else top) if top else ""
+        rest = " · ".join(f"{(k.capitalize() if 'by_group' in u else k)} {float(v) * 100:.0f}% of its limit"
+                          for k, v in sorted(parts.items(), key=lambda kv: -kv[1]))
+        out[key] = {"used": Decimal(str(u.get("share", 0))) * pct, "what": what, "rest": rest}
+    return out
+
+
 def use_now(store: Store, groups: dict[str, str]) -> dict:
     """{key: {used, what, tone}} for each test against the entry gate's last mark, or {} with `source` unmarked /
     unreadable. Open risk by asset and by group is the gate's own per-holding risk summed; an unmapped asset is in no
@@ -101,7 +129,7 @@ def page(store: Store) -> dict:
     the history, each version with what it changed from the one before."""
     current = store.compliance()
     tests, groups = as_set(current)
-    use = use_now(store, groups)
+    use = engine_use(store, tests) or use_now(store, groups)
     rows = []
     for r in rules.RULES:
         t = tests.get(r.key, {"limit": r.default, "enabled": False})
@@ -110,6 +138,7 @@ def page(store: Store) -> dict:
                      "shown": rules.show(r.key, t["limit"]), "locked": r.locked, "low": rules.show(r.key, r.low),
                      "high": rules.show(r.key, r.high), "unit": r.unit, "action": ACTION_WORDS.get(r.action, r.action),
                      "used": rules.show(r.key, u["used"]) if u else None, "what": u["what"] if u else "",
+                     "rest": u.get("rest", "") if u else "",
                      "tone": _tone(u["used"], t["limit"]) if u and t["enabled"] else "",
                      # The bar's fill, % of the limit used (not capped: past 100 is past the limit), None with no use.
                      "fill": float(u["used"] / t["limit"] * 100) if u and t["limit"] else None})
