@@ -20,6 +20,7 @@ import pytest
 from sleeve_fund.dashboard import trading
 from sleeve_fund.paper.runtime import WIPED_OUT, SleeveRuntime, liquidation_head, pair_ral_figures
 from sleeve_fund.store import LIQUIDATION_RESET, PAIR_REBASE, PAIR_REBASED, RAL, Store, make_engine, metadata
+from tests.test_two_legs_entry_block import entry
 
 T = datetime(2026, 10, 14, 9, 0, tzinfo=UTC)
 SPOT = {"instrument": "BTC/USDT", "params": {}, "venue": "KRAKEN", "side": 1}
@@ -413,3 +414,38 @@ def test_the_strategys_page_takes_both_causes_and_sends_the_legs_reset(store, cl
                     auth=AUTH, headers=SAME, follow_redirects=False)
     assert r.status_code == 303 and "command_error" not in r.headers["location"], r.headers["location"]
     assert [c["incident"] for c in store.pending_commands("carry~2")] == [iid]
+
+
+# --- HoQA R3, R4: the pair's entry (F283-L1, tests/test_two_legs_entry_block) after a reset -------------------------
+
+def test_both_legs_liquidated_after_one_reset_the_still_liquidated_lead_blocks_the_pair(store):
+    """HoQA R3: the perp leg is reset; the first leg, also liquidated, is not yet: the pair's entry sends nothing."""
+    p, first = _liquidate(store)
+    at = T + timedelta(minutes=1)
+    p.clock[0] = at
+    p.rt["carry"].tick(equity=p.cash("carry"), cash=p.cash("carry"), qty=0.0, price=PX,
+                       other_equity=p.cash("carry~2"), ruined=WIPED_OUT)
+    _incident(store, "carry", at)
+    _ral(store, first)
+    p.tick(T + timedelta(minutes=2))
+    p.tick(T + timedelta(minutes=3))
+    assert p.rt["carry~2"].can_open() and not p.rt["carry"].can_open()
+    notes, sent = entry(p.rt["carry"], p.rt["carry~2"])
+    assert not sent and "the first leg can't open" in notes[-1][1], notes
+
+
+def test_a_summed_halt_then_a_reset_then_a_restart_before_a_resume_opens_nothing(store):
+    """HoQA R4: the drawdown halt on the first leg outlives the reset and a restart; only a Resume lifts it."""
+    p, iid = _liquidate(store, loss=3_000.0, unwind=500.0)
+    _ral(store, iid)
+    p.tick(T + timedelta(minutes=2))
+    p.tick(T + timedelta(minutes=3))
+    p.restart()
+    p.tick(T + timedelta(minutes=4))
+    assert p.rt["carry"].status == "halted"
+    notes, sent = entry(p.rt["carry"], p.rt["carry~2"])
+    assert not sent and "the first leg can't open" in notes[-1][1], notes
+    store.command("carry", "resume", "the drawdown is understood")
+    p.tick(T + timedelta(minutes=5))
+    notes, sent = entry(p.rt["carry"], p.rt["carry~2"])
+    assert sent, notes
