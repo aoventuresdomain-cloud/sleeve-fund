@@ -5,7 +5,12 @@ from __future__ import annotations
 
 from html import unescape
 
-from test_dashboard import AUTH, _new, _strategy_accounts, client  # noqa: F401 - the fixtures
+from test_dashboard import (  # noqa: F401 - the fixtures
+    AUTH,
+    _new,
+    _strategy_accounts,
+    client,
+)
 
 
 def _resume_dialog(page: str) -> str:
