@@ -197,7 +197,7 @@ def test_strategy_page_tabs_in_order_with_six_figures(client):
     nav = page[page.index("data-tabs>"):page.index("</nav>", page.index("data-tabs>"))]
     tabs = re.findall(r'data-tab="([a-z]+)"', nav)
     # Trades and Orders leave the top row for the panel under the chart; Signals and Position stay (UI v2).
-    assert tabs == ["overview", "signals", "positions", "activity", "path", "settings"]
+    assert tabs == ["overview", "signals", "positions", "activity", "attribution", "path", "settings"]
     assert ">Path to live<" in nav
     figures = page[page.index('aria-label="Strategy figures"'):page.index("</section>", page.index('aria-label="Strategy figures"'))]
     assert [k.strip() for k in re.findall(r'<div class="k">([^<{]+)', figures)] == [
@@ -239,3 +239,19 @@ def test_settings_save_opens_a_confirm_with_the_changes(client):
     assert "data-diff-open" in form and 'id="dlg-save"' in form and "data-diff-rows" in form
     assert "Research recommendation" in form and "Risk profile change." in form
     assert 'data-limits="Conservative: halts at' in form
+
+
+def test_a_strategy_with_no_capital_of_its_own_shows_its_pnl_in_money_not_a_return(client):
+    # HoE 14 Oct (QD's starting_balance crash): the fund holds the capital, so nothing on the page is a share of the
+    # Strategy's own starting balance; Since start reads its money P&L and no return percentage is shown.
+    c, store = client
+    store.create_sleeve(name="fund-x", strategy="rsi_bands", instrument="BTC/USD", bar_spec="15-MINUTE-LAST-INTERNAL",
+                        starting_balance=0, params={"stop_loss": 0.02})
+    store.record_fill("fund-x", side="BUY", qty=0.01, price=60_000, fee=4.8, order_id="E-1", trade_id="T-1")
+    store.record_equity("fund-x", equity=95.2, cash=-600, qty=0.01, price=70_000, benchmark=0)
+    r = c.get("/sleeves/fund-x", auth=AUTH)
+    assert r.status_code == 200 and "inf" not in r.text.lower().replace("info", "") and "nan%" not in r.text.lower()
+    figures = r.text[r.text.index('aria-label="Strategy figures"'):r.text.index("</section>", r.text.index('aria-label="Strategy figures"'))]
+    since = figures.split('<div class="k">Since start</div>')[1].split("</div>")[0]
+    assert "95.20" in since and "%" not in since
+    assert "The fund holds the capital" in figures and "Started with 0.00" not in figures

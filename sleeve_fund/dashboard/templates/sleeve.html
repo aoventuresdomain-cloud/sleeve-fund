@@ -63,9 +63,11 @@
 
 {# Six figures, a label and a number each; the detail is each tile's hover title (UI v2). #}
 <section class="kpis" aria-label="Strategy figures">
-  <div class="kpi lead" title="Started with {{ s.starting_balance|money }} {{ quote }}"><div class="k">Equity</div><div class="v">{{ x.equity|money }}</div></div>
+  <div class="kpi lead" title="{% if s.starting_balance > 0 %}Started with {{ s.starting_balance|money }} {{ quote }}{% else %}The fund holds the capital{% endif %}"><div class="k">Equity</div><div class="v">{{ x.equity|money }}</div></div>
   {% if not backtest_id %}<div class="kpi" title="Since 00:00 UTC · {{ x.day_ret|pct1s }}"><div class="k">Today</div><div class="v">{{ money_signed(x.day_pnl) }}</div></div>{% endif %}
-  <div class="kpi" title="{{ x.pnl|smoney }} since start · buy-and-hold, {% if x.cap > 1 %}unlevered{% else %}{{ x.cap|pct0 }} invested{% endif %}: {{ x.bench_ret|pct1s }}"><div class="k">Since start</div><div class="v">{{ signed(x.ret) }}</div></div>
+  {# A Strategy with no capital of its own (the fund holds the cash) has no return on it: its money P&L instead. #}
+  {% if s.starting_balance > 0 %}<div class="kpi" title="{{ x.pnl|smoney }} since start · buy-and-hold, {% if x.cap > 1 %}unlevered{% else %}{{ x.cap|pct0 }} invested{% endif %}: {{ x.bench_ret|pct1s }}"><div class="k">Since start</div><div class="v">{{ signed(x.ret) }}</div></div>
+  {% else %}<div class="kpi" title="Its P&amp;L since start, in money: the fund holds the capital"><div class="k">Since start</div><div class="v">{{ money_signed(x.pnl) }}</div></div>{% endif %}
   <div class="kpi" title="{% if x.entry_px %}On the open position, entered at {{ x.entry_px|px }}{% else %}No open position{% endif %}"><div class="k">Unrealised</div><div class="v">{{ money_signed(x.unrealised) }}</div></div>
   <div class="kpi" title="{{ t.trades }} closed trade{{ 's' if t.trades != 1 }}{% if t.trades %} · {{ t.win_rate|pct0 }} won{% endif %}"><div class="k">Realised</div><div class="v">{{ money_signed(realised) }}</div></div>
   <div class="kpi" title="Fees {{ x.fees|money }} over {{ x.fills }} fills{% if perp %} · funding {{ 'received' if perp.funding_total >= 0 else 'paid' }} {{ perp.funding_total|abs|money }}{% endif %}{{ cost_share(x) }}"><div class="k">Fees and funding</div><div class="v">{{ fees_funding|money }}</div></div>
@@ -195,7 +197,7 @@
     <div class="pos-card"><h3>P&amp;L <span class="faint">{{ quote }}</span></h3><dl>
       <div><dt>Unrealised</dt><dd>{{ money_signed(x.unrealised) }}{% if position %} <span class="faint">{{ position.unrealised_ret|pct1s }}</span>{% endif %}</dd></div>
       <div><dt>Realised {{ help('realised') }}</dt><dd>{{ money_signed(realised) }}</dd></div>
-      <div class="total"><dt>Total</dt><dd>{{ money_signed(x.pnl) }} <span class="faint">{{ x.ret|pct1s }}</span></dd></div>
+      <div class="total"><dt>Total</dt><dd>{{ money_signed(x.pnl) }}{% if s.starting_balance > 0 %} <span class="faint">{{ x.ret|pct1s }}</span>{% endif %}</dd></div>
     </dl></div>
   </div>
   {% if perp %}<div class="pos-grid two">
