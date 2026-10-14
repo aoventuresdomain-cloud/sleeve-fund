@@ -815,12 +815,19 @@ def _traded_venue(c, sleeve: str) -> str | None:
                      .limit(1)).scalar()
 
 
+def holding(qty) -> bool:
+    """Whether a journal's net position is a position at all (F-WED1-3, DA): the one rule record_order's venue and
+    the start's venue check share. Dust is a position here: its exit goes where it is."""
+    return abs(qty) > 1e-12
+
+
 def _position_venue(c, sleeve: str) -> str | None:
-    """F-WED1-3: the venue the journal says the strategy's open position is on (_traded_venue) while its fills net to
-    a position; None when flat. Read on the caller's connection."""
-    net = c.execute(select(func.sum(case((fills_t.c.side == "BUY", fills_t.c.qty), else_=-fills_t.c.qty)))
-                    .where(fills_t.c.sleeve == sleeve)).scalar()
-    return _traded_venue(c, sleeve) if net else None
+    """F-WED1-3: the venue the journal says the strategy's open position is on (_traded_venue) while it holds one;
+    None when flat. The fills are summed here as Decimals, each read back exact (DA-9): a sum inside the database
+    is in floats on SQLite (DA). Read on the caller's connection."""
+    net = sum((to_decimal(q) if s == "BUY" else -to_decimal(q))
+              for s, q in c.execute(select(fills_t.c.side, fills_t.c.qty).where(fills_t.c.sleeve == sleeve)))
+    return _traded_venue(c, sleeve) if holding(net) else None
 
 
 def _check_rebook(order_id: str, row) -> None:
@@ -1287,8 +1294,8 @@ class Store:
         if traded is None:
             return router.NORMAL, None
         book = self.journal_book(sleeve.name, sleeve.starting_balance)
-        holding = abs(book["qty"]) > 1e-12 and not is_dust(book)
-        return router.start_mode(venue_for(sleeve.venue), traded, holding), traded
+        held = holding(book["qty"]) and not is_dust(book)  # a dust holder off its pin is refused, as a flat one
+        return router.start_mode(venue_for(sleeve.venue), traded, held), traded
 
     def record_timing(self, sleeve: str, order_id: str, *, fill: int | None = None, **stamps: int | None) -> None:
         """An order's timing stamps (UNIX ns, kept to the microsecond), filled in as they come (the send, the

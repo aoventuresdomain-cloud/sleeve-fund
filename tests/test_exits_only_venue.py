@@ -261,3 +261,44 @@ def test_every_order_is_journaled_before_it_is_sent_so_a_refused_row_sends_nothi
     assert sent == []
     submit, sent = _submitter(lambda **_: None)  # control: the same order goes once its row is written
     assert submit(intent) and len(sent) == 1
+
+
+# --- one holding rule, exact on both engines (DA) -------------------------------------------------------------------
+
+def test_a_book_flat_by_fills_a_float_sum_misses_is_flat_and_an_entry_goes_on_the_pin(store):
+    """0.1 + 0.2 bought and 0.3 sold sum to about 5.6e-17 in SQLite's floats: summed as the decimals each fill reads
+    back as, the book is flat, so nothing about a position refuses the entry and it is written on the pin."""
+    store.create_sleeve(name="s", strategy="buy_and_hold", instrument="BTC/USDT", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=10_000.0, venue="BINANCE")
+    for i, (side, qty) in enumerate((("BUY", 0.1), ("BUY", 0.2), ("SELL", 0.3))):
+        intent = "entry" if side == "BUY" else "exit"
+        store.record_order("s", order_id=f"s-{i}", side=side, qty=qty, intent=intent, reason="r")
+        store.record_fill("s", side=side, qty=qty, price=100.0, fee=0.0, order_id=f"s-{i}", trade_id=f"t{i}")
+    with store.engine.begin() as c:  # its orders went to another venue than its pin
+        c.execute(text("UPDATE orders SET venue = 'KRAKEN' WHERE sleeve = 's'"))
+    assert store.position_venue("s") is None
+    store.record_order("s", order_id="s-n", side="BUY", qty=1.0, intent="entry", reason="r")
+    assert _venue(store, "s-n") == "BINANCE"
+
+
+def test_exits_only_close_then_refused_then_reset_then_a_normal_start_on_the_pin(store, monkeypatch):
+    """DA: the whole sequence, with 0020's insert-only pin: the reset copies the pin to the run before the orders move,
+    so no pin trigger trips, and the fresh run starts normally on its pin."""
+    _held_elsewhere(store)
+    sup, started, stopped = _supervised(store, monkeypatch)
+    sup.step()
+    assert store.sleeve("s").status_reason == VENUE_EXITS
+    _closed(store)
+    sup.step()
+    assert store.sleeve("s").status == "stopped" and store.venue_start(store.sleeve("s"))[0] == router.REFUSE
+    store.request_reset("s", "Reset strategy: back on its own venue")
+    sup.step()  # carried out: the run so far is put away under its own name
+    (run,) = [n for n in store.archived() if n.startswith("s--")]
+    assert store.venue_start(store.sleeve("s")) == (router.NORMAL, None)
+    assert router.venue_for(store.sleeve(run).venue) == router.venue_for(store.sleeve("s").venue) == "BINANCE"
+    assert store.traded_venue(run) == "KRAKEN" and store.fills("s") == []
+    store.set_desired_state("s", "running")  # the PM's Start
+    sup.step()
+    assert started == ["s", "s"] and _events(store, "start_refused") == []  # started, not refused (the run has those)
+    store.record_order("s", order_id="s-n", side="BUY", qty=1.0, intent="entry", reason="r")
+    assert _venue(store, "s-n") == "BINANCE"
