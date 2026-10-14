@@ -740,7 +740,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         peak, dd = s.starting_balance, []  # from the starting balance too, as the book's (M12-F1)
         for v in eq:
             peak = max(peak, v)
-            dd.append(round(1 - v / peak, 5) if peak else 0.0)
+            dd.append(round(1 - v / peak, 5) if peak > 0 else 0.0)
         fills = [{"t": f["ts"].isoformat(), "side": f["side"], "qty": f["qty"], "price": f["price"]}
                  for f in st().fills(name, limit=2000)]
         return JSONResponse({
