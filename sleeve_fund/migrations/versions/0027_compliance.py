@@ -29,14 +29,14 @@ LIMIT = sa.Numeric(10, 4)
 V1_AT = datetime(2026, 10, 14, 21, 0, tzinfo=timezone.utc)
 V1_NOTE = "the PM's defaults (DEFAULTS-2, 14 Oct 2026); Advisor BRIDGE-3"
 V1 = (  # test, label, scope, measure, limit, action
-    ('asset_stop_loss', 'Loss per asset if every stop is hit', 'asset', 'open_risk', '0.04', 'trim'),
-    ('type_stop_loss', 'Loss per asset group if every stop is hit', 'asset_type', 'open_risk', '0.06', 'trim'),
-    ('fund_stop_loss', 'Loss for the whole fund if every stop is hit', 'fund', 'open_risk', '0.10', 'trim'),
-    ('fund_gross', 'Total position size (gross)', 'fund', 'gross', '1.5', 'trim'),
-    ('asset_net', 'Net position per asset', 'asset', 'net', '0.5', 'trim'),
-    ('fund_margin', 'Margin in use', 'fund', 'margin', '0.5', 'trim'),
-    ('fund_day_loss', 'Daily loss that pauses new entries until 00:00 UTC', 'fund', 'day_loss', '0.03', 'pause_day'),
-    ('fund_drawdown', 'Drawdown that closes everything and halts', 'fund', 'drawdown', '0.15', 'halt'),
+    ('asset_stop_loss', 'Per asset: loss if every stop is hit', 'asset', 'open_risk', '0.04', 'trim'),
+    ('type_stop_loss', 'Per asset group: loss if every stop is hit', 'asset_type', 'open_risk', '0.06', 'trim'),
+    ('fund_stop_loss', 'Whole fund: loss if every stop is hit', 'fund', 'open_risk', '0.10', 'trim'),
+    ('fund_gross', "Gross: every position's size added up", 'fund', 'gross', '1.5', 'trim'),
+    ('asset_net', 'Net per asset: long less short on one asset', 'asset', 'net', '0.5', 'trim'),
+    ('fund_margin', 'Margin posted', 'fund', 'margin', '0.5', 'trim'),
+    ('fund_day_loss', "Today's loss pauses new trades until the next day begins", 'fund', 'day_loss', '0.03', 'pause_day'),
+    ('fund_drawdown', 'Drawdown from the peak closes everything and halts', 'fund', 'drawdown', '0.15', 'halt'),
 )
 GROUPS = {'BTC': 'large', 'ETH': 'large', 'SOL': 'mid', 'XRP': 'mid'}
 OTHER = 'small'

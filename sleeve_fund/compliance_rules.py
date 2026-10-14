@@ -21,14 +21,14 @@ SHAPE = {
 }
 KEYS = tuple(SHAPE)
 LABELS = {
-    "asset_stop_loss": "Loss per asset if every stop is hit",
-    "type_stop_loss": "Loss per asset group if every stop is hit",
-    "fund_stop_loss": "Loss for the whole fund if every stop is hit",
-    "fund_gross": "Total position size (gross)",
-    "asset_net": "Net position per asset",
-    "fund_margin": "Margin in use",
-    "fund_day_loss": "Daily loss that pauses new entries until 00:00 UTC",
-    "fund_drawdown": "Drawdown that closes everything and halts",
+    "asset_stop_loss": "Per asset: loss if every stop is hit",
+    "type_stop_loss": "Per asset group: loss if every stop is hit",
+    "fund_stop_loss": "Whole fund: loss if every stop is hit",
+    "fund_gross": "Gross: every position's size added up",
+    "asset_net": "Net per asset: long less short on one asset",
+    "fund_margin": "Margin posted",
+    "fund_day_loss": "Today's loss pauses new trades until the next day begins",
+    "fund_drawdown": "Drawdown from the peak closes everything and halts",
 }
 # Inclusive, as shares of fund equity (gross and net: times the book). Advisor BRIDGE-A-DATA and BRIDGE-A-FE.
 BOUNDS = {
