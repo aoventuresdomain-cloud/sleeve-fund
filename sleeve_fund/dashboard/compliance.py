@@ -112,7 +112,7 @@ def history(store: Store, limit: int = 30) -> list[dict]:
             old_t, old_g = as_set(store.compliance(v["version"] - 1))
             lines = rules.changes(old_t, new_t, old_g, new_g)
         else:
-            lines = ["The tests as they started"]
+            lines = ["The compliance tests as they started"]
         out.append({**v, "changes": lines})
     return out
 

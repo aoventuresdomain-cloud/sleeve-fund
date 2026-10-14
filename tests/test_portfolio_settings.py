@@ -54,7 +54,7 @@ def test_the_page_shows_the_five_tests_their_limits_and_the_fixed_lines(ps):
     t = _text(r.text)
     for words in ("T1 Per asset", "T2 Per asset group", "T3 Whole fund", "T4 Size limits", "T5 Loss brakes",
                   "Edits apply to new trades only.", "can be changed but not switched off",
-                  "If the tests can't be read, no new trade goes out.",
+                  "If the compliance tests can't be read, no new trade goes out.",  # TEC-FE-WORD (HoE)
                   "An asset with no group can't take a new trade while the per-group test is on."):
         assert words in t
     assert "1.5x" in t and "15%" in t and "50%" in t
@@ -148,7 +148,7 @@ def test_switching_the_group_test_off_names_the_unmapped_assets_it_stops_refusin
             "and size limits.") in t
     page = _text(c.get("/portfolio-settings", auth=AUTH).text)
     assert "Version 1 · in force since" in page and "set by migration 0027" in page and "in force" in page
-    assert "14 Oct 22:00 UK" in page and "UTC" not in page.split("Edit tests and groups")[1].split("const ")[0]  # v1 at 21:00 UTC, in UK time (BST)
+    assert "14 Oct 22:00 UK" in page and "UTC" not in page.split("Edit compliance tests and groups")[1].split("const ")[0]  # v1 at 21:00 UTC, in UK time (BST)
     assert "until the next day begins" in page
     assert "Refuse or trim" in page and "Pause new trades" in page and "Flatten and halt" in page
 
