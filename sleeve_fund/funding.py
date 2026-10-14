@@ -95,11 +95,14 @@ def refresh(venue: str, pair: str, root: str | Path | None = None, since: pd.Tim
 
 
 def backfill(venue: str, pair: str, after: pd.Timestamp, root: str | Path | None = None, loader=None,
-             max_pages: int = 10) -> int:
+             max_pages: int = 10, dry_run: bool = False, refused: list | None = None,
+             report: dict | None = None) -> int:
     """Ask the venue's history again for the settlements from `after` up to the newest kept, and keep any it now has
     that the store lacks (a missing settlement, before it is called never published; Advisor, 7 Oct 2026, QA
     P1-O17a-11). refresh() only tops up past the newest kept, so a hole is never refetched otherwise. How many were
-    added."""
+    added. Only adds: a kept rate is never changed or removed. With dry_run, how many would be, writing nothing.
+    `refused` collects unbelievable rates as refresh() does; `report`, if given, gets 'complete' (False when
+    max_pages ran out before the newest kept was reached)."""
     from sleeve_fund.venues import venue as venue_profile
 
     loader = loader or venue_profile(venue).funding_loader
@@ -110,19 +113,28 @@ def backfill(venue: str, pair: str, after: pd.Timestamp, root: str | Path | None
     if not kept:
         return 0
     have, last = {t for t, _ in kept}, kept[-1][0]
-    start, found = int(after.timestamp() * 1000), []
+    start, found, complete = int(after.timestamp() * 1000), [], False
     for _ in range(max_pages):  # outside the locks, as refresh() (F212-1)
         page = loader(pair, start)
-        found += [[t, r] for t, r in _usable(page, venue, pair) if t < last and t not in have]
+        found += [[t, r] for t, r in _usable(page, venue, pair, refused) if t < last and t not in have]
         if len(page) < PAGE or not page or page[-1][0] >= last:
+            complete = True
             break
         start = page[-1][0] + 1
+    if report is not None:
+        report["complete"] = complete
+    if dry_run:
+        return len({t for t, _ in found})
     added = []
     if found:
         with _lock, _writing(path.parent):  # one writer per instrument, across processes too (CANON-F3)
             kept = _kept(path)  # as it is now
             have = {t for t, _ in kept}
-            added = [tr for tr in found if tr[0] not in have]
+            added = []
+            for t, r in found:  # each settlement once, the first a page gave (CR F270-1), as the dry run counts
+                if t not in have:
+                    have.add(t)
+                    added.append([t, r])
             if added:
                 _keep(path, sorted(kept + added, key=lambda tr: tr[0]))
                 _cache.pop((str(path.parent.parent.parent), venue.upper(), pair.upper()), None)

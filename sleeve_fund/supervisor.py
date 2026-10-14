@@ -71,7 +71,7 @@ def fund_equity(store: Store) -> Decimal:
     runs = store.reset_runs()
     total = Decimal(0)
     for s in store.sleeves():
-        if is_backtest(s.name):
+        if is_backtest(s.name) or outside_fund_book(store, s):  # F229-6: a sub-8dp test Strategy isn't the fund's
             continue
         cash = to_decimal(store.strategy_cash_pnl(s.name), "cash")
         if s.name in runs:
@@ -96,7 +96,7 @@ def fund_equity(store: Store) -> Decimal:
 def fund_holdings(store: Store) -> tuple[Holding, ...]:
     """Every strategy's positions as the book's Holdings, for book_marks' figures. The paper gate's positions (P2-1b
     W2) build them; until then a fund that holds nothing has none, and one that holds anything raises."""
-    if any(_holding(store, s) for s in store.sleeves()):
+    if any(_holding(store, s) for s in store.sleeves() if not outside_fund_book(store, s)):
         raise NotImplementedError("the book's holdings come with the paper gate's positions (P2-1b W2)")
     return ()
 
@@ -222,14 +222,28 @@ def is_test_currency_account(account: str, venue: str | None) -> bool:
     return _test_account_reason(account, venue) is not None
 
 
+def _quote_places(s) -> tuple[str, int]:
+    """The Strategy's quote currency and the places the engine holds it to (one it doesn't list it holds to 8)."""
+    from nautilus_trader.model import Currency
+
+    quote = s.instrument.split("/")[-1].split("-")[0].upper()
+    return quote, Currency.from_str(quote).precision
+
+
+def outside_fund_book(store: Store, s) -> bool:
+    """F229-6 (HoE 13 Oct 18:12 UK): a Strategy whose quote currency is held under 8 places, on the test account its
+    venue names (CCY-8DP), is outside the fund's book. Neither its equity (fund_equity) nor its position (both
+    fund_holdings) counts, and its entries don't reserve against the book gate (LongFlatStrategy._paper_gated); its own
+    per-Strategy checks still apply. The one predicate all of those read."""
+    return (_quote_places(s)[1] < FILL_PLACES
+            and is_test_currency_account(store.account_of(s.name), getattr(s, "venue", None)))
+
+
 def check_quote_places(s: Sleeve, account: str) -> str | None:
     """Raises ValueError when the Strategy's quote currency is held to fewer than 8 places on an account its venue
     doesn't name as a test account; returns the warning to log when it does; None when the currency holds 8. The
     words name no venue (they reach the PM)."""
-    from nautilus_trader.model import Currency
-
-    quote = s.instrument.split("/")[-1].split("-")[0].upper()
-    places = Currency.from_str(quote).precision  # as the engine holds it (one it doesn't list it holds to 8)
+    quote, places = _quote_places(s)
     if places >= FILL_PLACES:
         return None
     why = _test_account_reason(account, getattr(s, "venue", None))

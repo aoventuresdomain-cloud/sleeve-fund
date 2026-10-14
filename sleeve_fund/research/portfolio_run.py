@@ -78,7 +78,8 @@ class LegSpec:
 class PortfolioResult:
     legs: dict[str, BacktestResult]  # each Strategy's own record, as run_backtest gives it, over the whole window
     book: pd.Series  # the fund's equity at every mark (each hour's close), the whole window
-    decisions: list[dict]  # every gate decision, in order: strategy, ts, outcome, approved, requested, limit, reason
+    decisions: list[dict]  # every gate decision, in order: strategy, ts, bar_ts, outcome, approved, requested, limit,
+    # reason, side, price (the expected fill the gate priced it at); bar_ts keys it against the paper journal (parity)
     halt: dict | None  # {"ts", "drawdown", "reason"} when the drawdown halt fired
     halt_flatten_cost: float  # the fees and half spread the halt's flatten paid (R2)
     # {"ts", "reason", "until"} for each daily pause. By design (Advisor 03:25 UK) a pause lifts at 00:00 UTC, when a
@@ -318,9 +319,12 @@ def _result(results, spread, marks, actions, gate, hours, window, profile, unall
               for t, w, why, until in actions
               if w == "pause" and until is not None and until > pd.Timestamp(t, tz="UTC")]
     worst, risk = _intrabar(book, marks, hours, profile, halt_info, pauses)
-    decisions = [{"strategy": r.strategy, "ts": r.at, "outcome": r.decision.outcome,
-                  "approved": r.decision.approved_qty, "requested": r.decision.requested_qty,
-                  "limit": r.decision.limit_hit, "reason": r.decision.reason} for r in gate.ledger.records]
+    # bar_ts: the deciding bar's close, as paper's journal keys a decision: both gates tag it (tagged_intent).
+    decisions = [{"strategy": r.strategy, "ts": r.at, "bar_ts": r.intent.bar_ts, "kind": r.intent.kind,
+                  "outcome": r.decision.outcome, "approved": r.decision.approved_qty,
+                  "requested": r.decision.requested_qty, "limit": r.decision.limit_hit, "reason": r.decision.reason,
+                  "side": r.intent.side, "price": r.intent.price,
+                  "bar_decided": r.intent.intent_id not in gate.unbarred} for r in gate.ledger.records]
     gaps = [{"ts": at, "strategy": msg.split(":", 1)[0], "why": msg.split(":", 1)[1].strip(),
              "what": "entry" if kind == "portfolio_check_failed" else "open_risk"}
             for kind, msg, at in gate.ledger.alerts

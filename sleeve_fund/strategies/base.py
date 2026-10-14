@@ -3144,7 +3144,9 @@ class LongFlatStrategy(Strategy):
                 self._note(f"{what}_refused_by_portfolio", decision.decision.reason)
             return
         batch, name = self._portfolio
-        batch.post(self.clock, self.clock.timestamp_ns(), Pending(name, intent, send, lambda i, d: count("refused")))
+        bar = {"bar": self._deciding[0] if self._deciding else None}  # as paper's gate gets it: parity keys on it
+        batch.post(self.clock, self.clock.timestamp_ns(),
+                   Pending(name, {**intent, **bar}, send, lambda i, d: count("refused")))
 
     def _resting_entry_terms(self):
         """ORPHAN-GUARD og1 for a resting entry on paper: good-till-date to its decision bar's next close, clamped past
@@ -3168,9 +3170,12 @@ class LongFlatStrategy(Strategy):
             return None
         if self._paper_gate is None:
             from sleeve_fund.paper.portfolio_gate import paper_gate
+            from sleeve_fund.supervisor import outside_fund_book
 
-            self._paper_gate = paper_gate(rt.store)
-        return self._paper_gate
+            # F229-6: a sub-8dp test Strategy is outside the fund's book, so its entries reserve nothing against it
+            # (False: made once, not gated); its own per-Strategy checks still run.
+            self._paper_gate = False if outside_fund_book(rt.store, rt.store.sleeve(rt.name)) else paper_gate(rt.store)
+        return self._paper_gate or None
 
     def _cancel_gated_at_close(self, close_ns: int) -> None:
         """Paper with the portfolio gate: at each bar close, every gated entry or addition still resting that was sent

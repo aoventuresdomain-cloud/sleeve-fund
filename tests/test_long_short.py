@@ -353,7 +353,7 @@ def test_the_dashboard_shows_a_short(client):  # noqa: F811
     from test_dashboard import AUTH
 
     c, store = client
-    store.create_sleeve(name="pp-ls", strategy="ping_pong", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
+    store.create_sleeve(name="pp-ls", strategy="ping_pong", instrument="BTC/USDT", bar_spec="1-MINUTE-LAST-INTERNAL",
                         starting_balance=10_000, params={"rise": 0.01, "dip": 0.005, **PERP, "stop_loss": 0.02})
     store.record_fill("pp-ls", side="BUY", qty=0.05, price=60_000.0, fee=1.5, order_id="o1", trade_id="t1")
     store.record_fill("pp-ls", side="SELL", qty=0.05, price=60_600.0, fee=1.5, order_id="o2", trade_id="t2")
