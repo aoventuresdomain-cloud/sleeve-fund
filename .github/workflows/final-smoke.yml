@@ -1,0 +1,84 @@
+name: final-smoke
+# Final-head smoke (venue-swap plan §B; pe1-plans/b-smoke-runbook.md), on the paper server after the final head is
+# deployed and before testing starts. Run it by hand from main (HoE), with HoQA watching. Same secrets and variable as
+# canon, parity and status. Every check prints PASS or FAIL, and the job fails on any FAIL.
+#   check = read-only: B1 the deployed commit, B6 no credential in the supervisor, hub and dashboard containers and only demo ones in the mirror's,
+#           B2 the hub fresh, B5 the gate against the tile. Selects, a hub subscription and an in-memory dry check
+#           only: nothing is written (scripts/final_smoke.py).
+#   check = round-trip: B3, the one step that acts. It starts the allowlisted smoke Strategy on paper, flattens it
+#           after its entry and stops it again, whatever happens (scripts/round_trip.py); then B4 reads its journal.
+on:
+  workflow_dispatch:
+    inputs:
+      check:
+        description: read-only checks, or the B3 paper round trip then B4
+        type: choice
+        options: [read-only, round-trip]
+        default: read-only
+      strategy:
+        description: the smoke Strategy for the round trip (the allowlist)
+        type: choice
+        options: [ping-pong-ls-binance]
+        default: ping-pong-ls-binance
+      timeout_min:
+        description: minutes the round trip waits for its entry and exit before stopping
+        required: true
+        default: "30"
+jobs:
+  smoke:
+    runs-on: ubuntu-24.04
+    permissions: { contents: read }
+    if: ${{ vars.DEPLOY_ENABLED == 'true' && github.ref == 'refs/heads/main' }}
+    timeout-minutes: 60
+    env:
+      USER_AT: ${{ vars.DEPLOY_USER || 'root' }}
+    steps:
+      - name: Check the inputs
+        env:
+          TIMEOUT: ${{ inputs.timeout_min }}
+        run: |
+          [[ "$TIMEOUT" =~ ^[0-9]{1,2}$ ]] || { echo "timeout_min must be 1 to 99"; exit 1; }
+      - name: Configure SSH
+        env:
+          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/id_deploy && chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts
+      - name: Read-only checks (B1, B6, B2, B5)
+        if: ${{ inputs.check == 'read-only' }}
+        # The server's own copy of the script, so the checks run the deployed code. Every check runs; the step fails
+        # at the end if any failed.
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          ssh -i ~/.ssh/id_deploy -o ServerAliveInterval=30 -o ServerAliveCountMax=10 "$USER_AT@$HOST" '
+            cd /opt/sleeve-fund && echo "deployed: $(sudo cat .deployed_sha 2>/dev/null || echo none)"
+            rc=0
+            for svc in supervisor hub-binance dashboard; do
+              echo "== B6 in $svc"; sudo docker compose exec -T $svc python -u - safety < scripts/final_smoke.py || rc=1
+            done
+            echo "== B6 in mirror (its demo and testnet account names only)"
+            sudo docker compose exec -T mirror python -u - safety --mirror < scripts/final_smoke.py || rc=1
+            echo "== B2"; sudo docker compose exec -T supervisor python -u - hub < scripts/final_smoke.py || rc=1
+            echo "== B5"; sudo docker compose exec -T supervisor python -u - gate < scripts/final_smoke.py || rc=1
+            exit $rc'
+      - name: Paper round trip (B3), then its journal (B4)
+        if: ${{ inputs.check == 'round-trip' }}
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          STRATEGY: ${{ inputs.strategy }}
+          TIMEOUT: ${{ inputs.timeout_min }}
+        run: |
+          [[ "$STRATEGY" == "ping-pong-ls-binance" ]] || { echo "not on the allowlist"; exit 1; }
+          ssh -i ~/.ssh/id_deploy -o ServerAliveInterval=30 -o ServerAliveCountMax=10 "$USER_AT@$HOST" "
+            cd /opt/sleeve-fund && echo \"deployed: \$(sudo cat .deployed_sha 2>/dev/null || echo none)\"
+            since=\$(date -u +%Y-%m-%dT%H:%M:%S+00:00)
+            rc=0
+            sudo docker compose exec -T supervisor python -u - --strategy $STRATEGY --timeout-min $TIMEOUT \
+              < scripts/round_trip.py || rc=1
+            echo '== B4'
+            sudo docker compose exec -T supervisor python -u - journal --strategy $STRATEGY --since \$since \
+              < scripts/final_smoke.py || rc=1
+            exit \$rc"

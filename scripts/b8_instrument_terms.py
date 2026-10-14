@@ -1,7 +1,15 @@
 """B8 instrument terms (venue-swap plan §B, Advisor 14 Oct 2026 03:05 UK): for every instrument a configured
 Strategy trades on a perpetual venue with published terms, the engine's terms beside the venue's, with a verdict
-per row. The engine side is the instrument paper builds (VenueProfile.instrument), its fallback included when the
-venue's contract can't be read; with no instrument compared at all the check fails (B8: NOTHING CHECKED). Read-only: public endpoints, no key, writes nothing.
+per row, on two engine sides:
+- "engine": the instrument backtest and research build (VenueProfile.instrument), its fallback included when the
+  venue's contract can't be read.
+- "(paper)": the definition the venue's hub serves in its hello, which is what every hub-fed paper process trades
+  with (paper/hub_client.py). The hub reads it once, when it starts relaying the instrument, and never again, so a
+  run of this check during testing also shows a venue term change paper has not seen (F267-2). A paper process
+  connected before a hub restart keeps the copy it was given; the rows show the hub's. Only configured Strategies'
+  instruments get these rows, and a hub that can't be reached or doesn't serve one is a MUST, never a pass.
+With no instrument compared at all the check fails (B8: NOTHING CHECKED). Read-only: public endpoints and a hub
+subscription, no key, writes nothing.
 
 Runs where the venue's public API is reachable: on the paper server, inside the venue's hub container
 (.github/workflows/instrument-terms.yml). The instruments come from configs/sleeves/*.toml at run time, so a later
@@ -23,6 +31,8 @@ from __future__ import annotations
 
 import glob
 import json
+import os
+import socket
 import sys
 import tomllib
 import urllib.request
@@ -80,11 +90,34 @@ def _dec(x) -> Decimal | None:
 
 
 def engine_instrument(pair: str):
-    """The instrument paper builds for the pair (VenueProfile.instrument, as paper's node does): the venue's contract
-    limits when it answers, otherwise the cautious fallback (size precision capped at 3, no minimum quantity,
-    minimum notional 5). Comparing this, not the contract parse alone, covers the fallback and perpetual()."""
+    """The instrument backtest and research build for the pair (VenueProfile.instrument): the venue's contract limits
+    when it answers, otherwise the cautious fallback (size precision capped at 3, no minimum quantity, minimum
+    notional 5). Comparing this, not the contract parse alone, covers the fallback and perpetual()."""
     base, quote = pair.split("/")
     return venue("binance").instrument(base, quote)
+
+
+def hub_instruments(name: str, pairs: list[str], connect=socket.create_connection) -> dict[str, object]:
+    """{pair: instrument} as the venue's hub serves them in its hello: what a hub-fed paper process is given. Inside
+    the hub's own container by default; HUB_<VENUE> (host:port) points elsewhere. A pair the hub doesn't serve is
+    left out; a hub that can't be reached raises."""
+    from sleeve_fund.hub import protocol
+    from sleeve_fund.paper.hub_client import instrument_from
+
+    profile = venue(name)
+    ids = {f"{profile.symbol_of(p)}.{profile.name}": p for p in pairs}
+    host, _, port = (os.environ.get(f"HUB_{profile.name}") or "localhost:7700").rpartition(":")
+    with connect((host, int(port)), timeout=TIMEOUT) as s:
+        s.sendall(protocol.encode(protocol.subscription(sorted(ids))))
+        hello = protocol.decode(s.makefile("rb").readline())
+    if hello.get("t") != "hello":
+        raise RuntimeError(f"the hub answered {hello}")
+    return {ids[d["id"]]: instrument_from(d) for d in hello.get("instruments", []) if d.get("id") in ids}
+
+
+def paper_rows(pair: str, info: dict, inst) -> list[tuple[str, object, object, str]]:
+    """The hub's definition against the venue: the four terms that decide what paper accepts, by the same rules."""
+    return [(f"{term} (paper)", v, e, verdict) for term, v, e, verdict in rows(pair, info, {}, inst)[:4]]
 
 
 def rows(pair: str, info: dict, funding: dict, inst) -> list[tuple[str, object, object, str]]:
@@ -115,9 +148,11 @@ def rows(pair: str, info: dict, funding: dict, inst) -> list[tuple[str, object, 
 
 
 def main(argv: list[str], get: Callable[[str], object] = get_json, pattern: str = "configs/sleeves/*.toml",
-         build: Callable[[str], object] = engine_instrument) -> int:
-    pairs = configured(pattern) + [("BINANCE", a.upper()) for a in argv]
+         build: Callable[[str], object] = engine_instrument, hub: Callable[..., dict] | None = None) -> int:
+    traded = configured(pattern)
+    pairs = traded + [("BINANCE", a.upper()) for a in argv]
     fetched: dict[str, tuple[dict, dict]] = {}
+    served: dict[str, dict | str] = {}  # venue -> {pair: hub definition}, or why the hub couldn't be read
     must = compared = 0
     print(f"{'instrument':14} {'term':22} {'venue':>14} {'engine':>14}  verdict")
     for name, pair in dict.fromkeys(pairs):
@@ -128,7 +163,21 @@ def main(argv: list[str], get: Callable[[str], object] = get_json, pattern: str 
         if name not in fetched:
             info_url, funding_url = READERS[name]
             fetched[name] = (get(info_url), {x["symbol"]: x for x in get(funding_url)})
-        for term, v, e, verdict in rows(pair, *fetched[name], build(pair)):
+        out = rows(pair, *fetched[name], build(pair))
+        if (name, pair) in traded:  # an extra pair from the command line isn't traded, so the hub isn't asked for it
+            if name not in served:
+                try:
+                    served[name] = (hub or hub_instruments)(name, [p for v, p in traded if v == name])
+                except Exception as exc:  # noqa: BLE001 - reported on each row it leaves unchecked
+                    served[name] = f"hub unreachable: {exc!r}"
+            got = served[name]
+            if isinstance(got, str) or pair not in got:
+                why = got if isinstance(got, str) else "the hub doesn't serve it"
+                out.append(("hub definition (paper)", "-", "none", "MUST"))
+                print(f"{pair}: no paper terms to compare ({why})")
+            else:
+                out += paper_rows(pair, fetched[name][0], got[pair])
+        for term, v, e, verdict in out:
             must += verdict == "MUST"
             compared += 1
             print(f"{pair:14} {term:22} {v!s:>14} {e!s:>14}  {verdict}")
