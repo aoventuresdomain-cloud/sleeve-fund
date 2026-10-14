@@ -582,9 +582,12 @@ def create_app(store: Store | None = None) -> FastAPI:
         positions = trading.book_positions(st(), [x])
         working = [trading.order_view(o) for o in st().orders(name, trading.STATUS_TABS["open"][1], limit=200)]
         fees_funding = x.get("costs", x["fees"] - (perp_x["funding_total"] if perp_x else 0.0))  # funding is + received
+        # F-T-2: the fill-handler hold is its own flag, journaled (paper.runtime FILL_HOLD / FILL_HOLD_CLEARED).
+        hold = None if bt_id else st().last_event(name, ("fill_hold", "fill_hold_cleared"))
+        fill_hold = hold if hold is not None and hold["kind"] == "fill_hold" else None
         attr = None if bt_id else attribution.strategy(st(), name, trips, utcnow(), q.get("attr") if q.get("attr")
                                                        in attribution.PERIODS else "all")
-        return page(request, "sleeve.html", x=x, fills=fills[:200], trips=trips, feed=feed, orders=recent, attr=attr,
+        return page(request, "sleeve.html", x=x, fills=fills[:200], trips=trips, feed=feed, orders=recent, attr=attr, fill_hold=fill_hold,
                     order_total=order_total, liquidated=liquidated, ral=ral, clearing=clearing,
                     reset_dropped=reset_dropped,
                     positions=positions, working=working, fees_funding=fees_funding,
