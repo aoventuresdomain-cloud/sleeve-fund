@@ -52,9 +52,10 @@ from sleeve_fund.research import run as study_run
 from sleeve_fund.research.ledger import IdeaLedger, opened_words
 from sleeve_fund.research.holdout import HoldoutLocks
 from sleeve_fund.research.trials import TrialsRegister
-from sleeve_fund.risk import PROFILES
+from sleeve_fund.risk import PROFILES, leverage_cap
 from sleeve_fund.store import BACKTEST_PREFIX, LIQUIDATION_RESET, RAL, Store, is_backtest, utcnow
-from sleeve_fund.paper.runtime import EXITS_ONLY, RESUMABLE, clearing_action, entry_blocked, liquidation_event
+from sleeve_fund.paper.runtime import (EXITS_ONLY, RESUMABLE, clearing_action, entry_blocked, liquidation_event,
+                                      pair_ral_figures)
 from sleeve_fund.strategies import REGISTRY, check_perp_sizing, check_perp_stop
 from sleeve_fund.strategies.base import exit_warmup, maker_orders_enabled
 from sleeve_fund.wording import no_venues
@@ -95,10 +96,40 @@ def same_origin(request: Request) -> None:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "cross-site request blocked")
 
 
+_SLEEVE_POST = re.compile(r"^/sleeves/(?P<name>[^/]+)/(?P<action>[^/]+)$")
+# What isn't built to act on both legs of a two-leg Strategy yet (P2-8): refused on its first leg's row rather than
+# applied to one leg only. Its pause, resume, flatten, start and stop reach both legs (Store.command).
+_ONE_LEG_ONLY = {"reset": "a reset", "account": "a move to another account", "archive": "archiving",
+                 "lifecycle": "winding down or retiring", "settings": "a change of settings"}
+
+
+def two_leg_refusal(store: Store, name: str, action: str) -> str | None:
+    """Why a PM action on this strategy's row is refused because it is part of a two-leg Strategy, or None."""
+    try:
+        row = store.sleeve(name)
+    except KeyError:
+        return None  # the route says so
+    if row.parent is not None:
+        return f"this is the second leg of {row.parent}: act on {row.parent}, whose commands reach both legs"
+    if action in _ONE_LEG_ONLY and store._leg_of(name) is not None:
+        return f"{_ONE_LEG_ONLY[action]} isn't built for a two-leg Strategy yet, so nothing was changed"
+    return None
+
+
 def create_app(store: Store | None = None) -> FastAPI:
     _password()  # fail at start-up, not on first request
     app = FastAPI(title="Multi-Strategy Fund", docs_url=None, redoc_url=None, openapi_url=None)
     app.state.store = store or Store(portfolio_gate=True)  # the server's journal: CHOKE reads the portfolio too
+
+    @app.middleware("http")
+    async def two_leg_rows(request: Request, call_next):
+        """A two-leg Strategy is acted on through its first leg's row, never one leg alone (P2-8, Advisor M2)."""
+        m = _SLEEVE_POST.match(request.scope["path"]) if request.method == "POST" else None
+        # The lifecycle route judges its own: close-now, the PM's emergency exit, is never refused (Advisor, T fence)
+        if (m is not None and m["action"] != "lifecycle"
+                and (why := two_leg_refusal(app.state.store, m["name"], m["action"])) is not None):
+            return RedirectResponse(f"/sleeves/{m['name']}?{urlencode({'command_error': why})}", status_code=303)
+        return await call_next(request)
     app.state.jobs = Jobs()
     try:
         study_run.seed(LEDGER, TEARSHEETS)
@@ -377,13 +408,15 @@ def create_app(store: Store | None = None) -> FastAPI:
             return RedirectResponse("/risk?killed=0", status_code=303)
         for name in held:
             st().decide(actor, "flatten", f"Book kill switch: {why}", name)
-        for x in targets["all"]:
-            name = x["sleeve"].name
+        # A two-leg Strategy is told through its first leg's row, once: its flatten and start reach both legs, and
+        # the second leg's row has no process of its own to act on one (CR F283-2).
+        told = list(dict.fromkeys(st().legs(x["sleeve"].name)[0] for x in targets["all"]))
+        for name in told:
             st().command(name, "flatten", f"Book kill switch: {why}", actor=actor)
-            if x["sleeve"].desired_state != "running":
+            if st().sleeve(name).desired_state != "running":
                 st().set_desired_state(name, "running")
                 st().decide(actor, "start", f"Book kill switch: started to sell its position ({why})", name)
-        n = len(targets["all"]) + len(held)
+        n = len(told) + len(held)
         st().decide(actor, "flatten everything", f"{why} ({n} strateg{'y' if n == 1 else 'ies'})")
         return RedirectResponse(f"/risk?killed={n}", status_code=303)
 
@@ -800,8 +833,8 @@ def create_app(store: Store | None = None) -> FastAPI:
                 # A stopped strategy's process isn't there to act on a flatten, which would wait for its next
                 # start, maybe weeks later (review round 8, M8-2). Holding a position, it starts to sell it,
                 # as the kill switch does; flat, there is nothing to sell.
-                s = st().sleeve(name)
-                if abs(st().journal_book(name, s.starting_balance)["qty"]) <= 1e-12:
+                if all(abs(st().journal_book(n, st().sleeve(n).starting_balance)["qty"]) <= 1e-12
+                       for n in st().legs(name)):  # either leg of a two-leg Strategy (CR F283-2)
                     raise ValueError("it is stopped and holds no position, so there is nothing to flatten")
                 st().command(name, command, reason, actor=actor)
                 st().set_desired_state(name, "running")
@@ -827,14 +860,16 @@ def create_app(store: Store | None = None) -> FastAPI:
 
     @app.post("/sleeves/{name}/incident-note")
     def incident_note(name: str, incident: str = Form(""), author: str = Form(""),
-                      why_stop_did_not_protect: str = Form(""), actor: str = Depends(require_pm),
-                      _o: None = Depends(same_origin)):
-        """The note on a liquidation's incident that a reset after liquidation needs (P1-RAL, Advisor 18:17)."""
+                      why_stop_did_not_protect: str = Form(""), why_clamp_did_not_prevent: str = Form(""),
+                      actor: str = Depends(require_pm), _o: None = Depends(same_origin)):
+        """The note on a liquidation's incident that a reset after liquidation needs (P1-RAL, Advisor 18:17). A two-leg
+        Strategy's page takes the note on either leg's incident, with the pair's own cause too (F283-O3)."""
         try:
             ev = st().event_by_id(int(incident)) if incident.strip().isdigit() else None
-            if ev is None or ev["sleeve"] != name:
+            if ev is None or ev["sleeve"] not in st().legs(name):
                 raise ValueError("that incident is not this strategy's")
-            st().write_incident_note(ev["id"], author=author, why_stop_did_not_protect=why_stop_did_not_protect)
+            st().write_incident_note(ev["id"], author=author, why_stop_did_not_protect=why_stop_did_not_protect,
+                                     why_clamp_did_not_prevent=why_clamp_did_not_prevent)
         except ValueError as exc:
             return RedirectResponse(f"/sleeves/{name}?{urlencode({'command_error': str(exc)})}", status_code=303)
         return RedirectResponse(f"/sleeves/{name}?{urlencode({'done': 'Incident note saved.'})}", status_code=303)
@@ -931,9 +966,12 @@ def create_app(store: Store | None = None) -> FastAPI:
         return RedirectResponse(f"/setup?{urlencode({'reset': '1'})}", status_code=303)
 
     def _book_to_reset() -> list:
-        """The strategies a book reset covers: not archived, not a backtest, none already resetting."""
+        """The strategies a book reset covers: not archived, not a backtest, none already resetting, and no two-leg
+        Strategy, as a reset isn't built for one yet (CR F283-1: one leg's run put away alone)."""
         gone = set(st().archived())
-        return [s for s in st().sleeves() if s.name not in gone and not st().pending_reset(s.name)]
+        two_leg = {n for s in st().sleeves() if s.parent is not None for n in (s.name, s.parent)}
+        return [s for s in st().sleeves() if s.name not in gone and s.name not in two_leg
+                and not st().pending_reset(s.name)]
 
     def _retired(account: str) -> bool:
         return any(a["name"] == account and a["retired_at"] for a in st().accounts())
@@ -1044,6 +1082,9 @@ def create_app(store: Store | None = None) -> FastAPI:
                          actor: str = Depends(require_pm), _o: None = Depends(same_origin)):
         """P2-6: the PM's lifecycle move (wind_down, retire, close_now), and the one caller of Store.set_lifecycle.
         The buttons come with the phase 2 UI; the rules are sleeve_fund.lifecycle's."""
+        why = two_leg_refusal(st(), name, "lifecycle")
+        if why is not None and (action != "close_now" or st().sleeve(name).parent is not None):
+            return RedirectResponse(f"/sleeves/{name}?{urlencode({'command_error': why})}", status_code=303)
         try:
             if not reason.strip():
                 raise ValueError("a reason is required")
@@ -2068,6 +2109,21 @@ def _ral_view(store, name: str) -> dict | None:
     liquidation's incident (the newest since it) and its note; X and Y% read from the liquidation halt's own words
     ("... lost (liquidated): X, Y% of strategy equity at entry", with "includes adds" when the position was added
     to); and the equity left, the journal's cash. Whatever isn't there reads as None, and the dialog says so."""
+    legs = store.legs(name)
+    if len(legs) > 1:
+        # A two-leg Strategy (F283-O3): the first liquidated leg's reset, with the pair's figures (Advisor (d) 1); a
+        # second liquidated leg is offered once this one is reset.
+        for leg in legs:
+            if (view := _one_ral_view(store, leg)) is not None:
+                liq = view["liquidation"]
+                view.update(leg=leg, pair=pair_ral_figures(store, leg, liq),
+                            others=[n for n in legs if n != leg and liquidation_event(store, n) is not None])
+                return view
+        return None
+    return _one_ral_view(store, name)
+
+
+def _one_ral_view(store, name: str) -> dict | None:
     liq = liquidation_event(store, name)
     if liq is None:
         return None
@@ -2098,7 +2154,7 @@ def _demo_copy(store, s) -> dict | None:
                  if r["status"] == "filled")
     last = store.last_resync(s.name)
     return {"label": "the demo account", "put_on": put_on, "last": last,
-            "leverage": PROFILES[s.risk_profile].max_leverage}
+            "leverage": leverage_cap(PROFILES[s.risk_profile], s.params)}
 
 
 

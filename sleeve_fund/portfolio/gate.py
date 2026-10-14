@@ -31,7 +31,7 @@ from decimal import ROUND_HALF_EVEN, Decimal, localcontext
 from typing import Protocol
 
 from sleeve_fund.money import PRECISION, QUANTUM, money
-from sleeve_fund.portfolio.limits import Book, Decision, Holding, Intent, book_breach, decide, rejected
+from sleeve_fund.portfolio.limits import Book, Decision, Holding, Intent, book_breach, decide, decide_pair, rejected
 from sleeve_fund.risk import PortfolioProfile, trading_day
 
 EMPTY = Decimal("0.01")  # a book worth under a cent holds nothing: empty (F282-3, F-C3B-A)
@@ -285,6 +285,59 @@ def check_order(ledger: Ledger, strategy: str, intent: Intent, profile: Portfoli
         except Exception:  # noqa: BLE001 - as for the alert
             pass
         return Checked(rejected(qty, None, why), None, None)
+
+
+def check_pair(ledger: Ledger, strategy: str | tuple[str, str], first: Intent, second: Intent,
+               profile: PortfolioProfile, now: datetime) -> tuple[Checked, Checked]:
+    """A two-leg entry (P2-8) as one position: both legs decided together under the one lock (limits.decide_pair), the
+    same share of each or neither, and both reservations written before the lock is let go, so no other strategy's
+    check lands between them (Advisor M1). Each leg's decision is recorded, under its own row's name when `strategy`
+    names the two legs. Any failure fails closed for both legs, as check_order does for one."""
+    names = (strategy, strategy) if isinstance(strategy, str) else tuple(strategy)
+    strategy = names[0]
+    lock_failed = False
+    try:
+        with ExitStack() as held:
+            try:
+                held.enter_context(ledger.lock())
+            except Exception:
+                lock_failed = True
+                raise
+            block = _block(ledger, now)
+            if block is not None:
+                why = f"Entry rejected: {block[1]}"
+                decisions = (rejected(first.qty, block[0], why), rejected(second.qty, block[0], why))
+            else:
+                equity, held_now = ledger.positions()
+                book = Book(equity, (*held_now, *(r.holding for r in ledger.reservations())))
+                decisions = decide_pair(book, first, second, profile)
+            out = []
+            for name, intent, decision in zip(names, (first, second), decisions):
+                rid = None
+                if decision.approved_qty > 0:
+                    q = decision.approved_qty
+                    rid = ledger.reserve(name, Holding(intent.underlying, intent.side * q * intent.price,
+                                                       q * intent.margin_per_unit, q * intent.risk_per_unit), now, q)
+                out.append(Checked(decision, ledger.record(name, now, intent, decision, profile.version), rid))
+            return out[0], out[1]
+    except Exception as e:  # noqa: BLE001 - any failure here means neither leg is sent
+        why = f"Entry rejected: the portfolio check couldn't run ({type(e).__name__}: {e}), so neither leg is sent"
+        try:
+            ledger.alert("portfolio_check_failed", f"{strategy}: {why}", now)
+        except Exception:  # noqa: BLE001 - the refusal stands whether or not the alert lands
+            pass
+        out = []
+        for name, intent in zip(names, (first, second)):
+            qty = getattr(intent, "qty", Decimal(0))
+            qty = qty if isinstance(qty, Decimal) else Decimal(0)
+            try:
+                ledger.record(name, now, intent, Decision("error", Decimal(0), qty,
+                                                              "lock_error" if lock_failed else None, why),
+                              profile.version)
+            except Exception:  # noqa: BLE001 - as for the alert
+                pass
+            out.append(Checked(rejected(qty, None, why), None, None))
+        return out[0], out[1]
 
 
 def mark_book(ledger: Ledger, equity, now: datetime, profile: PortfolioProfile) -> str | None:

@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from sleeve_fund import backups, markets
+from sleeve_fund import backups, markets, risk
 from sleeve_fund.dashboard import trading
 from sleeve_fund.store import Store, utcnow
 from sleeve_fund.venues import venue as venue_profile
@@ -118,7 +118,7 @@ def most_it_can_lose(x: dict) -> float:
     t = markets.terms(s.params, s.venue) if qty else None
     if t is None:
         return equity
-    entry, lev = x.get("entry_px") or x["price"], x["profile"].max_leverage
+    entry, lev = x.get("entry_px") or x["price"], risk.leverage_cap(x["profile"], s.params)
     liq = markets.isolated_liquidation(x["cash"], qty, entry, lev, t.maintenance_margin)
     taker = float(markets.fees_for(s.params, venue_profile(s.venue).fees, s.venue).taker)
     cap = markets.gap_loss_cap(qty, entry, lev, x["cash"] + qty * entry, taker, liq)  # what the engine books (P1-D3)

@@ -23,7 +23,10 @@ import time
 from sleeve_fund.store import Store
 
 QUEUED = frozenset({"record_order", "record_timing", "update_order", "record_fill", "book_fill", "event", "record_equity",
-                    "heartbeat", "set_signal_state", "merge_order_signal"})
+                    "heartbeat", "set_signal_state", "merge_order_signal",
+                    # a two-leg Strategy's summed figures (P2-8): the high only rises and the day's start is set once a
+                    # day, so a write landing late never lowers or undoes one
+                    "raise_pair_peak", "set_pair_day"})
 OPENING = ("entry", "rebalance")  # as LongFlatStrategy's OPENING_INTENTS
 RETRY_SECONDS = (1.0, 5.0, 30.0)  # an exit's journal row: retried after each wait before the failure is kept
 

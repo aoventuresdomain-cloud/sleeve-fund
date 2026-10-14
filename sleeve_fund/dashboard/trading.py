@@ -3,7 +3,7 @@ the strategy gave when it acted (journaled in the orders table at decision time)
 
 from __future__ import annotations
 
-from sleeve_fund import markets
+from sleeve_fund import markets, risk
 from sleeve_fund.research.metrics import ZERO, _dec, trade_stats, trades
 from sleeve_fund.paper.runtime import liquidation_head
 from sleeve_fund.store import LIQUIDATION_RESET, OPEN_ORDER_STATUSES, Store, utcnow  # noqa: F401  (QA's tests import it here)
@@ -200,8 +200,9 @@ def open_lot(fills: list[dict], shorts: bool = False) -> dict | None:
 def liquidated_since_reset(store: Store, sleeve: str) -> bool:
     """Whether the strategy's position margin was lost with no reset after liquidation since: the engine's own rule
     (runtime.liquidation_head), so the dashboard and the gate can't disagree (CR 7). Read from the journal, not the
-    latest halt: a Stop/Start that halts it again on drawdown must not make a Resume restart it (QA P1-U22)."""
-    return liquidation_head(store, sleeve) is not None
+    latest halt: a Stop/Start that halts it again on drawdown must not make a Resume restart it (QA P1-U22). A two-leg
+    Strategy is liquidated while either leg is (F283-O3): each liquidated leg needs its own reset after liquidation."""
+    return any(liquidation_head(store, n) is not None for n in store.legs(sleeve))
 
 
 def stop_basis(params: dict, signal: dict | None, plan: dict | None = None, side: int = 1) -> str | None:
@@ -243,7 +244,7 @@ def position_margin(x: dict) -> tuple[float, float | None]:
     t = markets.terms(x["sleeve"].params, getattr(x["sleeve"], "venue", None))
     if t is None:
         return abs(qty) * entry, None
-    lev = x["profile"].max_leverage
+    lev = risk.leverage_cap(x["profile"], x["sleeve"].params)
     return (markets.isolated_margin(qty, entry, lev, cash + qty * entry),
             markets.isolated_liquidation(cash, qty, entry, lev, t.maintenance_margin))
 

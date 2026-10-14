@@ -758,6 +758,20 @@ def test_f282_2_the_rebase_values_dust_at_its_mark_not_its_entry(store):
     assert "dust counted as flat: a 0.00001 worth 0.7000;" in words
 
 
+def test_a_two_leg_strategy_created_after_the_first_mark_is_one_deposit_of_its_balance(store):
+    """P2-8: both legs' shares come in together, with the rows, as one flow of the Strategy's whole balance."""
+    _make(store, "a", 20_000)
+    _mark(store, T0)
+    store.create_two_legs(name="carry", strategy="ping_pong", bar_spec="1-MINUTE-LAST-INTERNAL", starting_balance=10_000,
+                          first={"instrument": "BTC/USDT", "params": {}, "venue": "BINANCE", "side": 1},
+                          second={"instrument": "BTC/USDT", "params": {"market": "perp"}, "venue": "BINANCE",
+                                  "side": -1}, desired_state="stopped")
+    assert _four(_state(store)) == (D(30_000),) * 4
+    assert len(_flows(store)) == 1 and "two-leg Strategy carry created with 10,000.00" in _flows(store)[0]
+    st = _mark(store, T0 + timedelta(minutes=1))
+    assert _four(st) == (D(30_000),) * 4 and not st.halted
+
+
 def test_f_haltref_5_the_dry_run_prints_every_strategy_its_run_and_the_dust_and_they_sum_to_the_figures(
         store, monkeypatch, capfd):
     """HoQA F-HALTREF-5: what the re-base reads, row by row, from the dry run itself: a reset's run with its fills
