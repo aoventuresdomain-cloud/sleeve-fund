@@ -35,7 +35,7 @@ V1 = (  # test, label, scope, measure, limit, action
     ('fund_gross', "Gross: every position's size added up", 'fund', 'gross', '1.5', 'trim'),
     ('asset_net', 'Net per asset: long less short on one asset', 'asset', 'net', '0.5', 'trim'),
     ('fund_margin', 'Margin posted', 'fund', 'margin', '0.5', 'trim'),
-    ('fund_day_loss', "Today's loss pauses new trades until 00:00 UTC", 'fund', 'day_loss', '0.03', 'pause_day'),
+    ('fund_day_loss', "Today's loss pauses new trades until the next day begins", 'fund', 'day_loss', '0.03', 'pause_day'),
     ('fund_drawdown', 'Drawdown from the peak closes everything and halts', 'fund', 'drawdown', '0.15', 'halt'),
 )
 GROUPS = {'BTC': 'large', 'ETH': 'large', 'SOL': 'mid', 'XRP': 'mid'}

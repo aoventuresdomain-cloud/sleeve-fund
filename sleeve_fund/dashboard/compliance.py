@@ -90,7 +90,9 @@ def page(store: Store) -> dict:
                      "shown": rules.show(r.key, t["limit"]), "locked": r.locked, "low": rules.show(r.key, r.low),
                      "high": rules.show(r.key, r.high), "unit": r.unit, "action": ACTION_WORDS.get(r.action, r.action),
                      "used": rules.show(r.key, u["used"]) if u else None, "what": u["what"] if u else "",
-                     "tone": _tone(u["used"], t["limit"]) if u and t["enabled"] else ""})
+                     "tone": _tone(u["used"], t["limit"]) if u and t["enabled"] else "",
+                     # The bar's fill, % of the limit used (not capped: past 100 is past the limit), None with no use.
+                     "fill": float(u["used"] / t["limit"] * 100) if u and t["limit"] else None})
     grouped = [{"test": k, "name": v, "rows": [x for x in rows if x["test"] == k]} for k, v in rules.TESTS.items()]
     names = sorted(set(assets(store)) | set(groups))
     return {"version": current.version, "tests": grouped, "source": use.get("source"),

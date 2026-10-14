@@ -37,7 +37,7 @@ RULES = (
          Decimal("0.5"), Decimal("0.05"), Decimal(1), unit="x"),
     Rule("fund_margin", "T4", "Margin posted", "fund", "margin", "trim",
          Decimal("0.5"), Decimal("0.10"), Decimal("0.80")),
-    Rule("fund_day_loss", "T5", "Today's loss pauses new trades until 00:00 UTC", "fund", "day_loss", "pause_day",
+    Rule("fund_day_loss", "T5", "Today's loss pauses new trades until the next day begins", "fund", "day_loss", "pause_day",
          Decimal("0.03"), Decimal("0.01"), Decimal("0.05"), locked=True),
     Rule("fund_drawdown", "T5", "Drawdown from the peak closes everything and halts", "fund", "drawdown", "halt",
          Decimal("0.15"), Decimal("0.05"), Decimal("0.25"), locked=True),

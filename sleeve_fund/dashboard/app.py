@@ -19,6 +19,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlencode, urlparse
+from zoneinfo import ZoneInfo
 
 import markdown
 from fastapi import Depends, FastAPI, Form, HTTPException, Request, status
@@ -96,6 +97,7 @@ def same_origin(request: Request) -> None:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "cross-site request blocked")
 
 
+UK = ZoneInfo("Europe/London")
 _SLEEVE_POST = re.compile(r"^/sleeves/(?P<name>[^/]+)/(?P<action>[^/]+)$")
 # What isn't built to act on both legs of a two-leg Strategy yet (P2-8): refused on its first leg's row rather than
 # applied to one leg only. Its pause, resume, flatten, start and stop reach both legs (Store.command).
@@ -180,6 +182,9 @@ def create_app(store: Store | None = None) -> FastAPI:
     # The year only when it isn't this one, as a backtest's or an old journal's dates need it.
     templates.env.filters["ts"] = lambda t: (t.strftime("%d %b %H:%M UTC" if t.year == utcnow().year
                                                         else "%d %b %Y %H:%M UTC") if t else "never")
+    # UK time, labelled UK (PM's rule; Portfolio Settings first, the rest of the site still reads UTC).
+    templates.env.filters["uk"] = lambda t: t.astimezone(UK).strftime(
+        "%d %b %H:%M UK" if t.year == utcnow().year else "%d %b %Y %H:%M UK") if t else "never"
     app.mount("/static", StaticFiles(directory=HERE / "static"), name="static")
 
     def st() -> Store:

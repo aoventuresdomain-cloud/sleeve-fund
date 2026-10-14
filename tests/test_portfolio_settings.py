@@ -148,4 +148,21 @@ def test_switching_the_group_test_off_names_the_unmapped_assets_it_stops_refusin
             "and size limits.") in t
     page = _text(c.get("/portfolio-settings", auth=AUTH).text)
     assert "Version 1 · in force since" in page and "set by migration 0027" in page and "in force" in page
+    assert "14 Oct 22:00 UK" in page and "UTC" not in page.split("Edit tests and groups")[1].split("const ")[0]  # v1 at 21:00 UTC, in UK time (BST)
+    assert "until the next day begins" in page
     assert "Refuse or trim" in page and "Pause new trades" in page and "Flatten and halt" in page
+
+
+def test_each_row_carries_the_share_of_its_limit_used_as_a_number():
+    from types import SimpleNamespace
+    from unittest import mock
+
+    from sleeve_fund.dashboard import compliance
+
+    v1 = SimpleNamespace(version=1, tests=[{"test": k, "limit": t["limit"], "enabled": True}
+                                           for k, t in rules.defaults().items()], asset_types={"BTC": "large"})
+    store = SimpleNamespace(compliance=lambda version=None: v1, instruments=list, compliance_versions=lambda n: [])
+    use = {"source": "gate", "fund_gross": {"used": D("0.75"), "what": ""}}
+    with mock.patch.object(compliance, "use_now", return_value=use):
+        rows = {r["key"]: r for g in compliance.page(store)["tests"] for r in g["rows"]}
+    assert rows["fund_gross"]["fill"] == 50.0 and rows["asset_net"]["fill"] is None
