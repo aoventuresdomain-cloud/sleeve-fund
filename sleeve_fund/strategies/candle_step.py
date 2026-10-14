@@ -15,13 +15,20 @@ A stop or target inside a cycle makes the rest of it a no-op; the next cycle sta
 however often its bar is seen. Started mid-cycle, it waits for step 0: it never sizes from a guess. Once the PM's
 run window (run_for_hours, no default) has passed, it closes what it holds and opens nothing.
 
-This module is pure: no engine, no clock, no journal, so every path reads the same answer."""
+The plan (step_at, Plan) is pure: no engine, no clock, no journal, so every path reads the same answer. CandleStep is
+the model the engine runs it through (LongFlatStrategy._on_bar_stepped): the same order path, gate and exits as every
+Strategy, so it tests that path."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+
+from nautilus_trader.model import Bar
+
+from sleeve_fund.data import bar_minutes
+from sleeve_fund.strategies.base import IdeaSpec, LongFlatConfig, LongFlatStrategy
 
 CYCLE = 6
 HALF = Decimal("0.5")
@@ -116,4 +123,92 @@ class Plan:
         return [] if held == 0 else [("close", -_side(held), abs(held))]
 
 
-__all__ = ["CYCLE", "STEPS", "Plan", "Step", "step_at"]
+SPEC = IdeaSpec(
+    summary="A test of the order path: a {size_share} share of fund equity bought, halved, reversed and closed on a "
+            "fixed 6-candle cycle.",
+    name="candle_step",
+    family="test",
+    idea="The PM's timed test: buy, sell half, sell the rest and short, cover half, close and reverse, wait, repeat, "
+         "with a tight stop and target, to see every order respect its stop, its target and the fund's limits.",
+    rules=(
+        "A cycle of 6 candles keyed by the candle's close time: buy Q, sell half, sell the rest and short Q, cover "
+        "half, close the short and buy Q, wait. Q is sized at the cycle's first candle from the fund's equity (the "
+        "size share) and kept for the cycle. A flip is two orders: the close, then the open once it fills. A stop or "
+        "target inside a cycle ends that cycle; the next one starts at its first candle."
+    ),
+    data_needs="1-minute OHLCV",
+    default_risk_profile="balanced",
+    default_params={"size_share": 0.6, "market": "perp", "allow_short": True},
+    known_weaknesses="A test of the plumbing, not an idea: it pays a round trip's costs on every step and is expected "
+                     "to lose. It runs alone, and only on the PM's go.",
+    listed=False,
+)
+
+STEP_WORDS = ("buy Q", "sell half", "sell the rest and short Q", "cover half", "close the short and buy Q", "wait")
+
+
+class CandleStepConfig(LongFlatConfig):
+    def __init__(self, *, size_share: float = 0.6, run_for_hours: float | None = None, **kwargs) -> None:
+        super().__init__(**kwargs)
+        if not 0 < size_share <= 1:
+            raise ValueError(f"size_share {size_share} outside (0, 1]: the share of fund equity Q is sized to, "
+                             "e.g. 0.6 for 60%")
+        if run_for_hours is not None and not run_for_hours > 0:
+            raise ValueError(f"run_for_hours {run_for_hours} must be positive, or unset for no end")
+        self.size_share, self.run_for_hours = size_share, run_for_hours
+
+
+class CandleStep(LongFlatStrategy):
+    STEPPED = True  # decided by step_orders (_on_bar_stepped), not want_side
+    REENTER_AFTER_EXIT_LEG = True  # a stop or target ends the cycle (exit_leg_closed), never locks a side
+
+    def __init__(self, config: CandleStepConfig) -> None:
+        super().__init__(config)
+        self.c = config
+        self._plan: Plan | None = None
+        self._started: datetime | None = None
+
+    def want_side(self, bar: Bar) -> int | None:
+        return None  # never decides by side: every order comes from the step
+
+    def want_long(self, bar: Bar) -> bool | None:
+        return None
+
+    def exit_leg_closed(self) -> None:
+        if self._plan is not None:
+            self._plan.closed_by_exit()
+
+    def step_orders(self, bar: Bar, held: Decimal) -> tuple[list[tuple[str, int, Decimal | None]], str, dict]:
+        """The orders this candle's step asks for, given the signed quantity held, with the reason and values to
+        journal. An open with qty None is the cycle's first: sized by the size share, and its size becomes Q
+        (entry_sent). Past the run window it only closes."""
+        close = datetime.fromtimestamp(int(bar.ts_event) / 1e9, tz=UTC)
+        cycle, step = step_at(close, bar_minutes(self._cfg.bar_type))
+        if self._started is None:
+            self._started = close
+        plan = self._plan
+        if plan is None or plan.cycle != cycle:
+            # A long carried into the cycle's first candle (the last cycle's wait) is this cycle's Q: no top-up.
+            plan = self._plan = Plan(cycle, held if step == 0 and held > 0 else None, self._started,
+                                     self.c.run_for_hours)
+        values = {"cycle": cycle, "step": step}
+        if plan.q is not None:
+            values["q"] = float(plan.q)
+        if plan.expired(close):
+            return plan.after_expiry(held), "The run window is over: closing what is held", values
+        reason = f"Candle step {step + 1} of {CYCLE} (cycle {cycle}): {STEP_WORDS[step]}"
+        if step == 0 and plan.q is None and not plan.exited:
+            if 0 in plan.done:
+                return [], reason, values
+            plan.done.add(0)
+            values["size_share"] = self.c.size_share
+            return ([("close", 1, -held)] if held < 0 else []) + [("open", 1, None)], reason, values
+        return plan.act(step, held), reason, values
+
+    def entry_sent(self, qty: Decimal, values: dict) -> None:
+        """The cycle's first open was sized: its quantity is Q for the rest of the cycle (Advisor CANDLE-STEP)."""
+        if self._plan is not None and self._plan.q is None and values.get("cycle") == self._plan.cycle:
+            self._plan.q = qty
+
+
+__all__ = ["CYCLE", "STEPS", "SPEC", "CandleStep", "CandleStepConfig", "Plan", "Step", "step_at"]

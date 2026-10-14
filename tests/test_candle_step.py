@@ -38,7 +38,9 @@ def test_one_cycle_buys_halves_flips_in_two_orders_halves_and_reverses(prices, i
 def test_a_flip_never_holds_more_than_one_side_at_once(prices, instrument):
     first, closes = _from_step_0(prices, 7)
     res = run_backtest("candle_step", _path(prices, closes), instrument, PARAMS, half_spread=0)
-    assert res.exposure.abs().max() <= 0.6 * 1.0001  # never Q long and Q short at once: the close fills first
+    # Never Q long and Q short at once (a double-size order reads ~1.2): the close fills first. Q is fixed at step 0, so
+    # the fees paid since then lift it a hair above 0.6 of the smaller equity.
+    assert res.exposure.abs().max() <= 0.6 * 1.01
 
 
 def test_a_stop_inside_the_cycle_makes_the_rest_of_it_a_no_op(prices, instrument):
@@ -57,3 +59,28 @@ def test_a_stop_inside_the_cycle_makes_the_rest_of_it_a_no_op(prices, instrument
 def test_size_share_outside_its_range_is_refused(bad, prices, instrument):
     with pytest.raises(ValueError, match="size_share"):
         run_backtest("candle_step", _path(prices, [100.0] * 8), instrument, {**PARAMS, "size_share": bad})
+
+
+def test_a_stop_after_a_reduce_sells_only_what_is_left(prices, instrument):
+    first, closes = _from_step_0(prices, 6)  # one cycle: steps 0-5
+    closes[first + 2:] = [99.7] * (len(closes) - first - 2)  # through the stop after the half sold, before the flip
+    res = run_backtest("candle_step", _path(prices, closes), instrument, PARAMS, half_spread=0)
+    fills = _fills(res)
+    q = fills[0][1]
+    # The resting stop shrank to Q/2 with the reduce (the venue keeps a reduce-only order within the position; paper's
+    # _sync_watched_stop does the same): it never sells more than is held, so it never opens a short.
+    assert fills[:3] == [("BUY", q, "entry"), ("SELL", q / 2, "exit"), ("SELL", q / 2, "stop_loss")]
+    assert len(fills) == 3  # steps 2-5 are no-ops once the stop has ended the cycle
+    stop = res.fills[[res.decisions[o]["intent"] == "stop_loss" for o in res.fills.index]]
+    assert D(str(stop["quantity"].iloc[0])) == q / 2  # the order itself, not only its reduce-only fill
+
+
+def test_past_the_run_window_it_closes_and_opens_nothing(prices, instrument):
+    first, closes = _from_step_0(prices, 12)
+    hours = (first + 3) * 24  # from the first bar it sees: the window ends on step 3, short Q
+    res = run_backtest("candle_step", _path(prices, closes), instrument, {**PARAMS, "run_for_hours": hours},
+                       half_spread=0)
+    fills = _fills(res)
+    q = fills[0][1]
+    assert fills == [("BUY", q, "entry"), ("SELL", q / 2, "exit"), ("SELL", q / 2, "exit"), ("SELL", q, "entry"),
+                     ("BUY", q, "exit")]
