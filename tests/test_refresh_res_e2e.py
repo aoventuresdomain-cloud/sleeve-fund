@@ -61,3 +61,31 @@ def test_a_put_away_strategys_accepted_order_is_closed_only_once_its_process_is_
             break
     assert code == reset_book.DONE, lines
     assert [(f["kind"], D(str(f["amount"]))) for f in store.fund_flows() if f["rebase"]] == [("deposit", D(100_000))]
+
+
+def test_a_put_away_holder_keeps_its_resting_stop_while_its_process_is_down(store):
+    """DA: an archived Strategy still holding runs for its exits, and its resting stop is an open order in the journal.
+    Down between a crash and its restart, its stop row is never closed: only a flat put-away is."""
+    _make(store, "a", 10_000)
+    store.record_fill("a", side="BUY", qty=0.1, price=60_000.0, fee=0.0, order_id="e1", trade_id="t1", ts=T0)
+    store.record_order("a", order_id="s1", side="SELL", qty=0.1, intent="stop_loss", reason="its stop",
+                       order_type="STOP_MARKET")
+    store.update_order("s1", status="accepted")
+    store.archive("a")
+    Supervisor(store, python="true").close_dead_orders()
+    assert [o["status"] for o in store.orders("a", limit=10) if o["order_id"] == "s1"] == ["accepted"]
+
+
+def test_a_failure_is_said_once_not_on_every_poll(store, monkeypatch):
+    _make(store, "a", 10_000)
+    _reserve(store, "a", 1, order_id="o1")
+    store.archive("a")
+    sup = Supervisor(store, python="true")
+
+    def broken(name, why):
+        raise RuntimeError("journal busy")
+
+    monkeypatch.setattr(store, "close_dead_orders", broken)
+    for _ in range(3):
+        sup.close_dead_orders()
+    assert [e["kind"] for e in store.events("a")].count("supervisor_error") == 1

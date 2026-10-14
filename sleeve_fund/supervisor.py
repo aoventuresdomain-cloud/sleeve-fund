@@ -572,6 +572,7 @@ class Supervisor:
         self._flatten_told: dict[str, datetime] = {}  # when each holder was last told to flatten for a portfolio halt
         self._halt_tells: dict[str, int] = {}  # how often, this halt (F229-5: at most SYSTEM_FLATTENS)
         self._flow_told: dict[int, str] = {}  # a fund flow's wait, said once while it lasts
+        self._dead_told: dict[str, str] = {}  # closing a stopped Strategy's orders failed: said once per failure
 
     def _refused(self, name: str) -> bool:
         """A model that can't run on its market (check_perp_sizing) is not started: it is stopped, and says why,
@@ -822,7 +823,7 @@ class Supervisor:
         refresh, waiting forever. Each one still in the book (not yet withdrawn) has those orders closed and the room
         released (Store.close_dead_orders), but only once its process is confirmed gone: none of ours alive, and its
         single-instance lock free, so no process started elsewhere holds it either. The lock is held while it closes,
-        so none can start meanwhile. Paper only; one failing never holds up the rest."""
+        so none can start meanwhile. Flat ones only, paper only; a failure is said once, and never holds up the rest."""
         from sleeve_fund.paper.single_lock import instance_lock
 
         withdrawn = self.store.withdrawn()
@@ -833,7 +834,10 @@ class Supervisor:
             if self.procs.get(runner, Proc()).alive or self.procs.get(name, Proc()).alive:
                 continue
             try:
-                if self.store.account_of(name) != "paper":
+                # Only a flat one (DA): an archived holder runs for its exits, and its resting stop is an open order
+                # in the journal; closed while its process is down between a crash and its restart, the restart
+                # might not place it again. The refresh only ever reaches a put-away that is flat.
+                if self.store.account_of(name) != "paper" or not self.store.lifecycle_flat(name)[1]:
                     continue
                 lock = instance_lock(runner)
                 if lock is None:  # a live process holds it: not confirmed gone
@@ -842,8 +846,13 @@ class Supervisor:
                     self.store.close_dead_orders(name, "put away, and its process has stopped")
                 finally:
                     lock.close()
-            except Exception as exc:  # noqa: BLE001 - the next poll tries again; the dashboard shows why
-                self.store.event(name, "error", "supervisor_error", f"closing a stopped Strategy's orders: {exc!r}")
+            except Exception as exc:  # noqa: BLE001 - the next poll tries again; the dashboard shows why, once
+                why = f"closing a stopped Strategy's orders: {exc!r}"
+                if self._dead_told.get(name) != why:
+                    self._dead_told[name] = why
+                    self.store.event(name, "error", "supervisor_error", why)
+            else:
+                self._dead_told.pop(name, None)
 
     def true_up_stopped(self) -> None:
         """True up every strategy without a running process (true_up_stopped); one failing never holds up the rest."""
