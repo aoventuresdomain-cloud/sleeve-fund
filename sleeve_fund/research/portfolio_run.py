@@ -25,7 +25,9 @@ import pandas as pd
 from nautilus_trader.common import DataActor, DataActorConfig
 
 from sleeve_fund.instruments import FeeSchedule
+from sleeve_fund.money import scale
 from sleeve_fund.open_risk import ATR_DAYS
+from sleeve_fund.portfolio import netting as nt
 from sleeve_fund.research import metrics, trials
 from sleeve_fund.research.portfolio import (
     BATCH_DELAY_NS,
@@ -97,6 +99,9 @@ class PortfolioResult:
     refusals: dict = field(default_factory=dict)
     profile: PortfolioProfile = PORTFOLIO
     portfolio_runs_tried: int | None = None  # set by record(): every portfolio run in the project, this one included
+    # With run_portfolio(netting=True): step B in shadow beside this run (P2-3, netting_shadow), else None. It never
+    # changes anything above: every figure there is step A's.
+    netting: dict | None = None
     # Hourly marks whose open risk couldn't be measured (Advisor 13 Oct 16:20 UK, MUST): their equity, drawdown halt
     # and daily pause were still marked; only open risk wasn't, and every entry was refused meanwhile.
     open_risk_unmarked_hours: int = 0
@@ -196,10 +201,11 @@ def _check(specs: list[LegSpec]) -> None:
 
 
 def run_portfolio(specs: list[LegSpec], profile: PortfolioProfile = PORTFOLIO, unallocated: float = 0.0,
-                  log_level: str = "ERROR") -> PortfolioResult:
+                  log_level: str = "ERROR", netting: bool = False) -> PortfolioResult:
     """Run every Strategy in `specs` together, in their order (the gate's fixed order), each on its own venue clone,
     under the portfolio limits in `profile`. unallocated: the fund's cash held by no Strategy, counted in the book
-    (Done-when 3)."""
+    (Done-when 3). netting: also report step B in shadow (P2-3, netting_shadow) on the result; off by default, and
+    it never changes the run."""
     _check(specs)
     order = tuple(s.name for s in specs)
     # A Strategy deciding on bars as short as its execution bars is fed its decision bars alone (run_backtest's
@@ -294,9 +300,11 @@ def run_portfolio(specs: list[LegSpec], profile: PortfolioProfile = PORTFOLIO, u
         for leg in legs:
             release_leg(leg)
         engine.dispose()
-    out = _result(results, spread, marks, actions, gate, hours, window, profile, unallocated)
-    out.open_risk_unmarked_hours = sum(1 for t in unmarked if t >= window)
-    return out
+    result = _result(results, spread, marks, actions, gate, hours, window, profile, unallocated)
+    result.open_risk_unmarked_hours = sum(1 for t in unmarked if t >= window)
+    if netting:
+        result.netting = netting_shadow(results, specs, hours, unallocated)
+    return result
 
 
 def _flatten_cost(results: dict[str, BacktestResult], legs_spread: dict[str, dict]) -> float:
@@ -387,3 +395,178 @@ def _intrabar(book: pd.Series, marks: dict, hours: dict, profile: PortfolioProfi
         if low <= start_of_day * (1 - profile.daily_loss):
             crossed["pause"].add(d)
     return worst_dd, {k: len(crossed[k] - marked[k] - (marked["halt"] if k == "pause" else set())) for k in crossed}
+
+
+def _fee(commissions) -> float:
+    return sum(float(str(m).split()[0]) for m in (commissions if isinstance(commissions, (list, tuple)) else [commissions]))
+
+
+def _exact(x: float) -> Decimal:
+    return scale(1, float(x))
+
+
+def netting_shadow(results: dict[str, BacktestResult], specs: list[LegSpec], hours: dict[str, pd.DataFrame],
+                   unallocated: float = 0.0) -> dict:
+    """Step B in shadow over a portfolio run's legs (P2-3 step 2; Advisor 13 Oct 19:10 UK, specs-p2-3-p2-8-p2-5.md §2):
+    what one account per venue would have traded had each bar's intents in an instrument gone out as one net order,
+    from what step A recorded, nothing re-simulated. Strategies on the same instrument net together whatever venue
+    clone they ran on (each leg's clone stands for its own account; the shadow asks what one account would do).
+
+    - Fills: each leg's own, at the price and fee it booked, stamped when they filled (intents decided on one bar fill
+      together, at its close + 1 ns), so they group by bar.
+    - Where intents cross, the net order is priced as step A prices a market order: the decision mark (the signal's
+      close) moved by the half spread that bar's market fills paid.
+    - Funding: each leg's own payments; the account pays the settlement's rate on the net position. Linear in the
+      position, so there is no funding saving line: the difference is rounding, left to the residual (Advisor 13 Oct
+      20:25 UK), but for the baseline for a missing rate, which has its own line (below).
+
+    Returns:
+    - saving: the book's lines by kind (crossed, fee), each + where the account saved;
+    - account, sub_ledger_total: the account's cash move and the sub-ledgers' summed; funding: the account's funding
+      and the sub-ledgers', which reconcile to within the residual once the next line is taken out;
+    - conservative_funding_baseline: on settlements charged the baseline for a missing rate (every side pays), the
+      sub-ledgers' charges less the account's on its net position, by formula (Advisor 13 Oct 20:55 UK); 0 when every
+      rate is present;
+    - crossed_notional: the volume matched inside the account instead of sent, at its mark;
+    - orders_sent / orders_alone: net orders with something to send, against step A's fills;
+    - residual: reconcile() of the sub-ledgers, the book's lines and the baseline line against the account, from the
+      fund's starting equity: here the funding's rounding only (the account is built from the same fills); on paper it bites against
+      the venue's own account;
+    - sub_ledger_vs_step_a: per Strategy, its sub-ledger P&L (cash plus the open position at the last close) less its
+      step A equity change, which should be nil but for float rounding;
+    - opposed_exposure: per Strategy pair, the share of their gross notional that cancels, at each day's close;
+    - notional_peak: the peak gross notional of the virtual positions summed (what step A's accounts margin) and of
+      the net positions (what one account would margin), across instruments, at each day's close. Information only:
+      the margin netting frees is never P&L (Advisor 13 Oct 20:25 UK)."""
+    fills: list[nt.Fill] = []
+    marks: dict[tuple[str, int], Decimal] = {}
+    halves: dict[tuple[str, int], float] = {}
+    for spec in specs:
+        r, inst = results[spec.name], str(spec.instrument.id)
+        if r.fills is None or r.fills.empty:
+            continue
+        for oid, f in r.fills.iterrows():
+            qty = float(f["filled_qty"])
+            if not qty:
+                continue
+            # The bar's close, to the microsecond: an exit fills at it and the flip's entry 1 ns after, one decision
+            ts, px = int(pd.Timestamp(f["ts_last"]).value) // 1_000 * 1_000, float(f["avg_px"])
+            side = 1 if str(f["side"]).endswith("BUY") else -1
+            fills.append(nt.Fill(spec.name, inst, ts, side * _exact(qty), _exact(px), _exact(_fee(f["commissions"]))))
+            close = ((r.decisions.get(oid) or {}).get("signal") or {}).get("close")
+            if close and (inst, ts) not in marks:
+                marks[(inst, ts)] = _exact(close)
+                halves[(inst, ts)] = abs(px / float(close) - 1)
+    funding = _funding_rows(results, specs, fills)
+    first = {}
+    for f in fills:
+        first.setdefault((f.instrument, f.ts), f)
+
+    def mark(inst: str, ts: int) -> Decimal:  # a cross with no decision close (stops only): the first fill's price
+        return marks.get((inst, ts), first[(inst, ts)].price)
+
+    def half(inst: str, ts: int) -> float:
+        return halves.get((inst, ts), next(float(s.half_spread or results[s.name].half_spread) for s in specs
+                                           if str(s.instrument.id) == inst))
+
+    taker = {str(s.instrument.id): s.fees.taker if s.fees is not None else _instrument_taker(s.instrument)
+             for s in specs}
+    if len(set(taker.values())) > 1:
+        raise ValueError("netting_shadow: the Strategies on one account must pay the same taker fee")
+    sh = nt.shadow(fills, funding, mark, half, next(iter(taker.values())) if taker else Decimal(0))
+    saving = sh.saving()
+    sub = sh.strategy_cash()
+    equity = sum((_exact(s.capital) for s in specs), _exact(unallocated))
+    # The residual is measured without the conservative funding baseline line (Advisor 13 Oct 20:55 UK)
+    residual = nt.reconcile(sum(sub.values(), Decimal(0)), sum(saving.values(), Decimal(0)) + sh.baseline_total(),
+                            sh.account, equity)
+    # Just after each day's close (1 us), so a flip at the close counts as the position it left
+    days = sorted({int(t.value) + 1_000 for h in hours.values() for t in h.index if t.value % DAY_NS == 0})
+    price = _closes_at(specs, hours)
+    return {
+        "saving": {k: float(v) for k, v in saving.items()},
+        "account": float(sh.account), "sub_ledger_total": float(sum(sub.values(), Decimal(0))),
+        "conservative_funding_baseline": float(sh.baseline_total()),
+        "funding": {"account": float(sh.account_funding),
+                    "sub_ledgers": float(sum((r.amount for r in funding), Decimal(0)))},
+        "crossed_notional": float(sum((o.crossed * mark(o.instrument, o.ts) for o in sh.orders), Decimal(0))),
+        "orders_sent": sum(1 for o in sh.orders if o.qty), "orders_alone": len(fills),
+        "residual": {k: (float(v) if isinstance(v, Decimal) else v) for k, v in residual.items()},
+        "sub_ledger_vs_step_a": _vs_step_a(results, specs, sub, fills, funding),
+        "opposed_exposure": {"/".join(k): v for k, v in nt.opposed_exposure(fills, price, days).items()},
+        "notional_peak": _notional_peak(fills, price, days),
+    }
+
+
+def _instrument_taker(instrument) -> Decimal:
+    return Decimal(str(instrument.taker_fee))
+
+
+def _funding_rows(results, specs, fills: list[nt.Fill]) -> list[nt.Funding]:
+    """Each leg's funding payments as netting.Funding rows. A run records the amount, not the rate, so the settlement's
+    rate x mark is read back from a leg holding a position then (-amount / position) and given to every row of that
+    settlement: the legs pay one rate on one mark."""
+    held: dict[tuple[str, str], list[nt.Fill]] = {}
+    for f in fills:
+        held.setdefault((f.strategy, f.instrument), []).append(f)
+
+    def position(name: str, inst: str, ts: int) -> Decimal:
+        return sum((f.qty for f in held.get((name, inst), ()) if f.ts < ts), Decimal(0))
+
+    raw = []
+    for spec in specs:
+        inst = str(spec.instrument.id)
+        for row in results[spec.name].funding:
+            ts = int(pd.Timestamp(row["ts"]).value)
+            both = row.get("kind") == "baseline"  # a missing rate: every side pays it (Advisor 6 Oct, D9)
+            raw.append((spec.name, inst, ts, _exact(row["amount"]), position(spec.name, inst, ts), both))
+    rate: dict[tuple[str, int], Decimal] = {}
+    for _, inst, ts, amount, pos, both in raw:
+        if pos and (inst, ts) not in rate:
+            rate[(inst, ts)] = abs(amount / pos) if both else -amount / pos
+    return [nt.Funding(name, inst, ts, rate.get((inst, ts), Decimal(0)), Decimal(1), amount, both)
+            for name, inst, ts, amount, _, both in raw]
+
+
+def _closes_at(specs, hours):
+    """The instrument's last hourly close at or before `ts`, as a Decimal (the marks the book used)."""
+    by = {str(s.instrument.id): hours[s.name]["close"] for s in specs}
+
+    def at(inst: str, ts: int) -> Decimal:
+        h = by[inst]
+        i = h.index.searchsorted(pd.Timestamp(ts, tz="UTC"), side="right") - 1
+        return _exact(h.iloc[max(i, 0)])
+
+    return at
+
+
+def _notional_peak(fills: list[nt.Fill], price, days: list[int]) -> dict:
+    """The peak, over each day's close, of the summed gross notional of the virtual positions and of the net ones."""
+    names, insts = sorted({f.strategy for f in fills}), sorted({f.instrument for f in fills})
+    peak_sum = peak_net = Decimal(0)
+    for t in days:
+        total = net = Decimal(0)
+        for inst in insts:
+            m = price(inst, t)
+            pos = [sum((f.qty for f in fills if f.strategy == n and f.instrument == inst and f.ts <= t), Decimal(0))
+                   for n in names]
+            total += sum((abs(p) for p in pos), Decimal(0)) * m
+            net += abs(sum(pos, Decimal(0))) * m
+        peak_sum, peak_net = max(peak_sum, total), max(peak_net, net)
+    return {"sum": float(peak_sum), "net": float(peak_net)}
+
+
+def _vs_step_a(results, specs, sub: dict, fills: list[nt.Fill], funding: list[nt.Funding]) -> dict[str, float]:
+    """Per Strategy: its sub-ledger P&L (cash plus the open position at its last decision close, plus any insurance
+    the venue's fund took) less the change in its step A equity over the run. Nil but for float rounding (MUST)."""
+    out = {}
+    for spec in specs:
+        r = results[spec.name]
+        if r.equity is None or r.equity.empty:
+            continue
+        pos = sum((f.qty for f in fills if f.strategy == spec.name), Decimal(0))
+        last = spec.prices["close"].iloc[-1]
+        insurance = sum((_exact(i["amount"]) for i in r.insurance), Decimal(0))
+        pnl = sub.get(spec.name, Decimal(0)) + pos * _exact(last) + insurance
+        out[spec.name] = float(pnl) - (float(r.equity.iloc[-1]) - float(r.starting_capital))
+    return out
