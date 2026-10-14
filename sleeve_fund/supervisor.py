@@ -115,9 +115,13 @@ def fund_book(store: Store, since: datetime | None = None) -> FundBook:
     plus every Strategy's cash P&L since then, put away or not (the cash is the fund's), plus its positions at the mark.
     The one book reader for the mark, sizing and the per-poll identity check."""
     since = since if since is not None else bridge_start(store)
+    flows = [f for f in store.fund_flows() if f["applied_at"] is not None]
+    # The capital starts at the re-base flow itself, by journal order, not its time: a flow applied at the same poll
+    # but ahead of it in id order went into the book the re-base replaced (PE1's reset cell a3)
+    base = max((f["id"] for f in flows if f["rebase"] and since is not None and f["applied_at"] <= since), default=None)
     capital = Decimal(0)
-    for f in store.fund_flows():
-        if f["applied_at"] is not None and (since is None or f["applied_at"] >= since):
+    for f in flows:
+        if since is None or (f["id"] >= base if base is not None else f["applied_at"] >= since):
             amount = to_decimal(f["amount"], "amount")
             capital += -amount if f["kind"] == "withdraw" else amount
     pnl = positions = Decimal(0)

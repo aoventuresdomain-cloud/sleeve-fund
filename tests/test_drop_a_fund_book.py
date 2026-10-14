@@ -197,3 +197,14 @@ def test_the_interim_open_risk_book_is_the_funds_once_it_holds_the_cash(store): 
     _make(store, "y", 0)
     book, risk, through = open_risk.account_book(store, "x", 0.0, lambda s: None)
     assert (book, risk, through) == (100_000.0, 0.0, [])
+
+
+def test_a_second_rebase_counts_capital_from_its_own_flow_not_one_applied_at_the_same_poll_before_it(store):  # noqa: F811
+    """PE1's reset a3: a withdrawal emptying the book and the next re-base land at the same poll; the new book is the
+    re-base's deposit alone, never the withdrawal ahead of it in journal order."""
+    _rebased(store)
+    _flow(store, "withdraw", 100_000, T0 + MIN)
+    _flow(store, "deposit", 50_000, T0 + MIN, rebase=True)
+    st = _mark(store, T0 + MIN)
+    assert [e[1] for e in _ended(store)] == [True, True, True]
+    assert supervisor.fund_book(store).capital == D(50_000) == st.equity
