@@ -60,6 +60,13 @@ def test_main_past_the_tested_commit_ships_mains_newest_green_commit_never_an_in
     assert (out, code) == (c[3], 0) and "shipping" in err
 
 
+def test_an_older_green_commit_ships_and_a_newer_red_or_running_one_never_does(repo):
+    c = repo["shas"]
+    # c5 red, c4 still running, c3 green: gh lists only the runs whose tests passed, so c3 ships.
+    out, err, code = pick(repo, c[0], deployed=c[0], green=[c[0], c[2]])
+    assert (out, code) == (c[2], 0) and "shipping" in err
+
+
 def test_no_green_commit_ships_nothing(repo):
     c = repo["shas"]
     out, err, code = pick(repo, c[1], deployed=c[0], green=[])

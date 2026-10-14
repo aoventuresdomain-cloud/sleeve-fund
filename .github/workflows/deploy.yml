@@ -75,14 +75,11 @@ jobs:
         if: steps.tip.outputs.current == 'true'
         env:
           HOST: ${{ secrets.DEPLOY_HOST }}
-          SHA: ${{ steps.tip.outputs.sha }}
         run: |
           # sudo is a no-op for root and needed for a non-root user such as Lightsail's ubuntu.
           ssh -i ~/.ssh/id_deploy "$USER_AT@$HOST" 'sudo mkdir -p /opt/sleeve-fund'
           rsync -az --delete --exclude .git --exclude .env --exclude kraken.env --exclude data --exclude .deployed_sha \
             --rsync-path="sudo rsync" -e "ssh -i ~/.ssh/id_deploy" ./ "$USER_AT@$HOST":/opt/sleeve-fund/
-          # The record the next run's pick reads: the server's code is this commit from here on.
-          echo "$SHA" | ssh -i ~/.ssh/id_deploy "$USER_AT@$HOST" 'sudo tee /opt/sleeve-fund/.deployed_sha >/dev/null'
       - name: Start stack
         if: steps.tip.outputs.current == 'true'
         env:
@@ -132,3 +129,27 @@ jobs:
             from sleeves s left join sleeve_archive a on a.sleeve = s.name where s.name not like '"'"'bt:%'"'"' order by s.id"' |
             while read -r line; do [ -n "$line" ] && echo "::notice title=Strategy::$line"; done
           [ "$LIVE" = "0" ] || { echo "FAIL: some running sleeves are not reporting"; exit 1; }
+      - name: Record the deployed commit
+        if: steps.tip.outputs.current == 'true'
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          SHA: ${{ steps.tip.outputs.sha }}
+        run: |
+          # Only after the health check passed: the record the next run's pick reads (no rollback past it). A failed
+          # deploy keeps the old record and alerts below.
+          echo "$SHA" | ssh -i ~/.ssh/id_deploy "$USER_AT@$HOST" 'sudo tee /opt/sleeve-fund/.deployed_sha >/dev/null'
+      - name: Alert on a failed deploy
+        if: failure() && steps.tip.outputs.current == 'true'
+        env:
+          ALERT_WEBHOOK_URL: ${{ secrets.ALERT_WEBHOOK_URL }}
+          SHA: ${{ steps.tip.outputs.sha }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # The same shape as sleeve_fund/alerts.post: JSON {text, content}, or plain text for an ntfy topic.
+          [ -n "$ALERT_WEBHOOK_URL" ] || { echo "::warning::no ALERT_WEBHOOK_URL; the failed run is the only alert"; exit 0; }
+          text="Deploy of $SHA failed; the server keeps its previous deployed record. $RUN"
+          case "$ALERT_WEBHOOK_URL" in
+            *ntfy*) curl -sS -m 20 -d "$text" "$ALERT_WEBHOOK_URL" ;;
+            *) curl -sS -m 20 -H 'Content-Type: application/json' \
+                 -d "$(jq -n --arg t "$text" '{text: $t, content: $t}')" "$ALERT_WEBHOOK_URL" ;;
+          esac
