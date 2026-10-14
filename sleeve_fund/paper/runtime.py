@@ -20,8 +20,8 @@ from types import SimpleNamespace
 from sleeve_fund import lifecycle, risk
 from sleeve_fund.exact import EngineJournal
 from sleeve_fund.router import venue_for
-from sleeve_fund.store import (BOOK_RESET, LIQUIDATION_RESET, OPEN_ORDER_STATUSES, PAIR_REBASE, PAIR_REBASED, RAL,
-                               RELOAD, WHY_STOP_FIELD, Store, replay_book, utcnow)
+from sleeve_fund.store import (BOOK_RESET, HALT_FLATTEN, HALT_WORDS, LIQUIDATION_RESET, OPEN_ORDER_STATUSES, PAIR_REBASE,
+                               PAIR_REBASED, RAL, RELOAD, WHY_STOP_FIELD, Store, flattened_words, replay_book, utcnow)
 
 # P2-6 journal kinds and order intents (orders.intent is String(16)).
 WIND_STOP, WIND_NOTICE, WIND_RETRY, WIND_FLATTEN = "wind_down_stop", "wind_down_notice", "wind_down_retry", "wind_down"
@@ -599,7 +599,8 @@ class SleeveRuntime:
         elif self.status == "paused" and self.paused_until is None:
             # The PM's pause, flatten or the book kill switch: no end time, so only a resume lifts it. Any
             # restart (a settings edit's reload, a stale heartbeat, a crash) keeps it (review round 10, B10-3).
-            self.store.event(self.name, "info", "restart", "restarted while paused by the PM; stays paused until "
+            by = "the portfolio halt" if self._status_reason().startswith(HALT_WORDS) else "the PM"
+            self.store.event(self.name, "info", "restart", f"restarted while paused by {by}; stays paused until "
                              "resumed", ts=self.now())
         elif self.status == "paused" and self.paused_until > self.now():
             self.store.event(self.name, "info", "restart", "restarted while paused", ts=self.now())
@@ -633,6 +634,9 @@ class SleeveRuntime:
         if last["kind"] == "risk_pause" and not (self.paused_until and self.paused_until > self.now()):
             return None
         label = {"pm_flatten": "Flattened by PM", "risk_halt": "Risk halt", "risk_pause": "Daily-loss pause"}
+        if last["kind"] == "pm_flatten" and last["message"].startswith(HALT_FLATTEN):  # the supervisor's (F-HALTREF-2)
+            return last["kind"], (f"{HALT_WORDS.capitalize()}, sent again after a restart: "
+                                  f"{last['message'][len(HALT_FLATTEN):]}")
         fills = self.store.fills(self.name, limit=100_000)
         before = [f for f in fills if f["ts"] <= last["ts"]]
         if (last["kind"] != "pm_flatten" and len(before) < len(fills)
@@ -1156,9 +1160,11 @@ class SleeveRuntime:
                 continue  # the supervisor's: it restarts this process under the new settings
             if cmd["command"] == "flatten":
                 flatten = True
-                self.flatten_why = self.flatten_why or ("pm_flatten", f"Flattened by PM: {cmd['reason']}")
+                # The order intent stays pm_flatten (the exit path's own, never gated); only the words say who asked.
+                words = flattened_words(cmd["reason"])
+                self.flatten_why = self.flatten_why or ("pm_flatten", words[0].upper() + words[1:])
                 if self.status != "halted":  # never downgrade a halt
-                    self._set("paused", f"flattened by PM: {cmd['reason']}")
+                    self._set("paused", words)
             elif cmd["command"] == "pause":
                 if self.status != "halted":
                     self._set("paused", f"paused by PM: {cmd['reason']}")

@@ -35,7 +35,8 @@ from sleeve_fund.risk import PORTFOLIO, trading_day
 from sleeve_fund.paper.safety import assert_portfolio_gate, credential_var
 from sleeve_fund.paper.single_lock import EXIT_DUPLICATE
 from sleeve_fund.paper.config import check_hub_bar_spec, load_sleeve, to_store_kwargs
-from sleeve_fund.store import DUST_NOTIONAL, OPEN_ORDER_STATUSES, TWO_LEG_FENCE, Sleeve, Store, is_dust, utcnow
+from sleeve_fund.store import (DUST_NOTIONAL, HALT_FLATTEN, OPEN_ORDER_STATUSES, TWO_LEG_FENCE, Sleeve, Store, is_dust,
+                               utcnow)
 from sleeve_fund.strategies import check_perp_sizing, check_perp_stop
 from sleeve_fund.paper.runtime import entry_blocked, liquidation_head, said_since_last_fill
 from sleeve_fund.strategies.base import EXITS_ONLY
@@ -696,7 +697,7 @@ class Supervisor:
         the portfolio is halted, not only the one that halted it, so a holder a failed command skipped, or one still
         holding after its flatten, is told again: never while a flatten waits for it, and at most once a minute (CR
         F229-3). One strategy's failure never stops the rest."""
-        reason = f"Portfolio halted: {why}"
+        reason = f"{HALT_FLATTEN}{why}"
         # A two-leg Strategy is told through its first leg's row, whose flatten reaches both legs, while either holds:
         # a flatten sent to the second leg's row alone has no process to act on it (CR F283-2).
         for s in self.store.sleeves(include_legs=False):
