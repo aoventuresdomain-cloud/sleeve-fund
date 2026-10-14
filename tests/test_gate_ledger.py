@@ -85,7 +85,7 @@ def _drop_schemas():
 
 def _strategies(store: Store) -> None:
     for name in STRATEGIES:
-        store.create_sleeve(name=name, strategy="buy_and_hold", instrument="BTC/USD", bar_spec="1-HOUR-LAST-INTERNAL",
+        store.create_sleeve(name=name, strategy="buy_and_hold", instrument="BTC/USDT", bar_spec="1-HOUR-LAST-INTERNAL",
                             starting_balance=1_000)
 
 
@@ -402,8 +402,8 @@ def test_the_state_row_round_trips_and_exists_before_the_first_mark():
     assert st.paused and st.paused_until is not None and st.halted is None
     with ledger.engine.connect() as c:
         assert c.execute(select(portfolio_state_t.c.status)).scalar() == "paused"
-    apply_flow(ledger, D(-400))
-    assert (ledger.state().equity, ledger.state().hwm) == (D(19_000), D(19_600))
+    apply_flow(ledger, D(-400))  # scaled (Advisor 09:45 UK): still 3% under the HWM, 20,000 x 19,000 / 19,400
+    assert ledger.state().equity == D(19_000) and abs(ledger.state().hwm - D("19587.628865979381443299")) < D("1e-9")
 
 
 def test_two_processes_take_seq_first_come_and_never_double_book_headroom(tmp_path):
@@ -502,4 +502,4 @@ def test_a_resume_rebases_below_the_hwm_and_round_trips_and_a_flow_moves_both():
     assert (st.halted, st.halt_reference, st.hwm) == (None, D(16_000), D(20_000))
     apply_flow(ledger, D(1_000))
     st = ledger.state()
-    assert (st.halt_reference, st.hwm, st.equity) == (D(17_000), D(21_000), D(17_000))
+    assert (st.halt_reference, st.hwm, st.equity) == (D(17_000), D(21_250), D(17_000))  # scaled by 17/16

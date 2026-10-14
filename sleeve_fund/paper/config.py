@@ -11,6 +11,7 @@ from pathlib import Path
 from sleeve_fund import markets
 from sleeve_fund.instruments import FeeSchedule
 from sleeve_fund.strategies import REGISTRY
+from sleeve_fund.router import venue_for
 from sleeve_fund.venues import DEFAULT_VENUE, venue as venue_profile
 
 # Any spot pair (SUI/USD, XRP/GBP, ...). Whether the venue lists it is checked when the sleeve starts.
@@ -160,7 +161,7 @@ def from_store(sleeve, fee_schedule: FeeSchedule | None = None) -> SleeveConfig:
         max_notional=max_notional,
         warmup_bars=sleeve.warmup_bars,
         risk_profile=sleeve.risk_profile,
-        venue=getattr(sleeve, "venue", None) or DEFAULT_VENUE,
+        venue=venue_for(getattr(sleeve, "venue", None)),
         fee_schedule=fee_schedule,
     )
 

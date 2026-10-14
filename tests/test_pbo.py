@@ -320,27 +320,81 @@ def test_r4_a_second_setting_ends_the_exemption_for_the_whole_family(tmp_path, m
     assert pbo(_frame(np.random.default_rng(1).normal(0, 0.01, size=(320, 2)))).verdict == TOO_FEW  # normal PBO
 
 
-def test_r4_an_edited_trial_row_loses_the_exemption(tmp_path, monkeypatch):
-    from sqlalchemy import update
+@pytest.fixture
+def r4_db(tmp_path, monkeypatch):
+    """A register on its own database, Postgres when TEST_DATABASE_URL is set (the write-once triggers differ by
+    engine), with the 18:05 ruling an hour ago as in _register."""
+    import os
 
-    from sleeve_fund.research.trials import legacy_idea_hash
+    from sqlalchemy import text
+
+    from sleeve_fund.research import trials
+    from sleeve_fund.research.trials import TrialsRegister
+    from sleeve_fund.store import Store, make_engine, metadata
+
+    monkeypatch.setattr(trials, "NO_SELECTION_RULING", pd.Timestamp.now(tz="UTC").to_pydatetime()
+                        - pd.Timedelta(hours=1))
+    eng = make_engine(os.environ.get("TEST_DATABASE_URL") or f"sqlite:///{tmp_path}/t.db")
+
+    def clean():
+        with eng.begin() as c:
+            c.execute(text("DROP TABLE IF EXISTS alembic_version"))
+        metadata.drop_all(eng)
+
+    clean()
+    store = Store(engine=eng)
+    yield store, TrialsRegister(store)
+    clean()
+
+
+def test_r4_a_counted_rows_settings_and_date_cannot_be_edited(r4_db):
+    """TRIALS-WORM: the edits the exemption guards against are refused by the database itself (a check violation on
+    Postgres, an ABORT on SQLite), so the register keeps both its settings and its order."""
+    from sqlalchemy import update
+    from sqlalchemy.exc import IntegrityError
+
     from sleeve_fund.store import trials_t
 
-    store, register = _register(tmp_path, monkeypatch)
-    idea = legacy_idea_hash(SPEC.name)
+    store, register = r4_db
     reg = register.preregister(strategy=SPEC.name, family="trend", settings={"fast": 50, "slow": 200}, setup=SETUP,
                                dataset="syn")
     run = _run_row(register, {"fast": 50, "slow": 200})
+    later = pd.Timestamp.now(tz="UTC") + pd.Timedelta(days=1)
+    for edit in (update(trials_t).where(trials_t.c.id == run).values(settings='{"fast": 40, "slow": 200}'),
+                 update(trials_t).where(trials_t.c.id == reg).values(created_at=later.to_pydatetime())):
+        with pytest.raises(IntegrityError, match="write-once"), store.engine.begin() as c:
+            c.execute(edit)
+
+
+def test_r4_an_edited_trial_row_loses_the_exemption(r4_db):
+    """A row whose stored settings differ from the setting its definition hash was made from (written so by
+    hand, or edited where the triggers were lifted) ends the exemption for the whole family. Built by insert, so the
+    write-once triggers stay on."""
+    from sleeve_fund.research.trials import legacy_definition_hash, legacy_idea_hash
+
+    store, register = r4_db
+    idea = legacy_idea_hash(SPEC.name)
+    register.preregister(strategy=SPEC.name, family="trend", settings={"fast": 50, "slow": 200}, setup=SETUP,
+                         dataset="syn")
+    _run_row(register, {"fast": 50, "slow": 200})
     assert register.no_selection(idea)
-    with store.engine.begin() as c:  # the run's settings rewritten after it ran
-        c.execute(update(trials_t).where(trials_t.c.id == run).values(settings='{"fast": 40, "slow": 200}'))
+    register.record(definition_hash=legacy_definition_hash(SPEC.name, {"fast": 50, "slow": 200}, SETUP),
+                    idea_hash=idea, name=SPEC.name, family="trend", settings={"fast": 40, "slow": 200},
+                    dataset="syn", stage="in_sample", source="study", sharpe=0.4,
+                    data_start=DAYS[0].to_pydatetime(), data_end=DAYS[-1].to_pydatetime())
     assert register.no_selection(idea) is None
-    with store.engine.begin() as c:
-        c.execute(update(trials_t).where(trials_t.c.id == run).values(settings='{"fast": 50, "slow": 200}'))
-    assert register.no_selection(idea)
-    later = pd.Timestamp.now(tz="UTC") + pd.Timedelta(days=1)  # the registration re-dated after the run
-    with store.engine.begin() as c:
-        c.execute(update(trials_t).where(trials_t.c.id == reg).values(created_at=later.to_pydatetime()))
+
+
+def test_r4_a_registration_dated_after_the_run_has_no_exemption(r4_db):
+    """The registration must come before the family's first run: one written after it (the order an edited
+    created_at would fake) is not a pre-registration of that run."""
+    from sleeve_fund.research.trials import legacy_idea_hash
+
+    store, register = r4_db
+    idea = legacy_idea_hash(SPEC.name)
+    _run_row(register, {"fast": 50, "slow": 200})
+    register.preregister(strategy=SPEC.name, family="trend", settings={"fast": 50, "slow": 200}, setup=SETUP,
+                         dataset="syn")
     assert register.no_selection(idea) is None
 
 

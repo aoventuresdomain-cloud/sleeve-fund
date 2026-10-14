@@ -33,6 +33,7 @@ from nautilus_trader.trading import Strategy
 from sleeve_fund import bars as bar_rule
 from sleeve_fund import lifecycle, markets, open_risk, risk
 from sleeve_fund.data import bar_minutes
+from sleeve_fund import router
 from sleeve_fund.instruments import BOOK_SHARE, lot_decimals, pair_of, taker_slippage, target_fill_px
 from sleeve_fund.margin import entry_liquidation
 from sleeve_fund.paper.runtime import ENTRY_CANCELLED, EXITS_ONLY, RACED_FILL, RESUMABLE, WIPED_OUT, block_codes, liquidation_reason
@@ -979,6 +980,13 @@ class LongFlatStrategy(Strategy):
                                          f"{self._cfg.instrument_id} is not listed on the venue")
             self.stop()
             return
+        if self.runtime is not None and not self._backtest and getattr(self.runtime, "pinned", True):
+            try:  # P2-4: a strategy whose market is on any venue but its own never starts (submit_order checks again)
+                router.check(self.runtime.name, str(self._cfg.instrument_id), self.runtime.venue)
+            except router.VenueMismatch as e:
+                why = f"{self.runtime.name} won't start: its market is on another venue, and it trades on its own only"
+                self.runtime.store.event(self.runtime.name, "error", "venue_mismatch", why, ts=self.runtime.now())
+                raise RuntimeError(f"{why} ({e.reason})") from e
         if self.recorder is not None:
             self.recorder.start(self.instrument)
         if self.runtime is not None and hasattr(self.runtime.store, "set_grid"):
@@ -3136,7 +3144,9 @@ class LongFlatStrategy(Strategy):
                 self._note(f"{what}_refused_by_portfolio", decision.decision.reason)
             return
         batch, name = self._portfolio
-        batch.post(self.clock, self.clock.timestamp_ns(), Pending(name, intent, send, lambda i, d: count("refused")))
+        bar = {"bar": self._deciding[0] if self._deciding else None}  # as paper's gate gets it: parity keys on it
+        batch.post(self.clock, self.clock.timestamp_ns(),
+                   Pending(name, {**intent, **bar}, send, lambda i, d: count("refused")))
 
     def _resting_entry_terms(self):
         """ORPHAN-GUARD og1 for a resting entry on paper: good-till-date to its decision bar's next close, clamped past
@@ -3160,9 +3170,12 @@ class LongFlatStrategy(Strategy):
             return None
         if self._paper_gate is None:
             from sleeve_fund.paper.portfolio_gate import paper_gate
+            from sleeve_fund.supervisor import outside_fund_book
 
-            self._paper_gate = paper_gate(rt.store)
-        return self._paper_gate
+            # F229-6: a sub-8dp test Strategy is outside the fund's book, so its entries reserve nothing against it
+            # (False: made once, not gated); its own per-Strategy checks still run.
+            self._paper_gate = False if outside_fund_book(rt.store, rt.store.sleeve(rt.name)) else paper_gate(rt.store)
+        return self._paper_gate or None
 
     def _cancel_gated_at_close(self, close_ns: int) -> None:
         """Paper with the portfolio gate: at each bar close, every gated entry or addition still resting that was sent
@@ -4217,13 +4230,15 @@ class LongFlatStrategy(Strategy):
 
         def arrived(when) -> bool:
             if when not in asked:
-                asked[when] = self._venue_rate(terms, pair, when) is not None
-            return asked[when]
+                asked[when] = self._venue_rate(terms, pair, when)
+            return asked[when] is not None
 
         if terms is not None:
             self._reverse_unsettled(terms)
         came = {when for when in sorted(self._funding_missing) if arrived(when)}
         self._funding_missing -= came
+        for when in sorted(came):
+            self._true_up(when, asked[when], now)
         try:
             state = funding.journal_state(rt.store, funding.stale_tag(venue, pair))
         except Exception:  # noqa: BLE001 - no database (locally), or a stub inbox: one episode, as before
@@ -4262,6 +4277,28 @@ class LongFlatStrategy(Strategy):
                 rt.store.event(None, "info", "funding_stale_cleared", f"{tag} The settled funding rate for {pair} has "
                                f"arrived from the venue for every settlement missing {funding.from_words(o)}"
                                + (f" ({len(came)} came in now)" if came else ""), ts=rt.now())
+
+    def _true_up(self, when, rate: float, now) -> None:
+        """Paper, CASH-4 (Advisor 8 Oct 04:10, ruling 2): the venue's rate for a settlement charged the baseline has
+        arrived. One journaled true-up of what it settles to less the baseline, on the position and price the
+        baseline was charged on, signed as the cash moves and moving cash now; the baseline is never edited. The
+        journal first and cash only for a movement it took, so a second process or a restart never books it twice."""
+        paid = self._funding_paid.pop(when, None)
+        if paid is None or self.runtime is None:
+            return
+        qty, px, _, _ = paid
+        settled = -float(qty) * float(px) * rate
+        ts = when.to_pydatetime() if hasattr(when, "to_pydatetime") else when
+        booked, up = self.runtime.store.record_true_up(self.runtime.name, ts, rate=rate, amount=round(settled, 8),
+                                                       arrived_at=now)
+        if booked != "new":
+            return
+        self._cash_adj += float(up)
+        self.funding_log.append((now, float(up), "true_up"))
+        self.runtime.store.event(self.runtime.name, "info", "funding_true_up",
+                                 f"Funding trued up: the venue's rate for the {ts:%d %b %Y %H:%M} UTC settlement "
+                                 f"arrived ({rate:.4%}), settling to {settled:+,.2f} against the baseline charged; "
+                                 f"{up:+,.2f} booked now", ts=now)
 
     def _is_settlement(self, terms, when) -> bool:
         """Whether `when` is still one of the venue's settlements as its records now read (markets.settlement_times)."""
@@ -4370,10 +4407,10 @@ class LongFlatStrategy(Strategy):
             ts = pd.Timestamp(row["ts"])
             rows.setdefault(ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC"), []).append(row)
         for ts, booked in rows.items():
-            # A settlement already reversed (its own reversal row, or rows netting to zero) is never watched again,
-            # so a restart can't refund it twice (CR, #163)
+            # A settlement already reversed (its own reversal row, or rows netting to zero) or trued up (CASH-4) is
+            # never watched again, so a restart can't refund or true it up twice (CR, #163)
             amounts = [r.get("amount") for r in booked]
-            if any(r.get("kind") == "reversal" for r in booked) or (
+            if any(r.get("kind") in ("reversal", "true_up") for r in booked) or (
                     None not in amounts and len(amounts) > 1 and abs(sum(amounts)) < 1e-9):
                 continue
             row = next((r for r in booked if r.get("kind") == "baseline"), None)
@@ -5502,8 +5539,23 @@ class LongFlatStrategy(Strategy):
 
     def submit_order(self, order, *args, **kwargs) -> None:
         """Nothing reaches the venue before trade_from, whatever sends it (a model's own resting entry too): a study's
-        out-of-sample window starts flat."""
+        out-of-sample window starts flat. Nothing reaches any venue but the strategy's own (router.check)."""
         if self._cfg.trade_from is not None and self.clock.timestamp_ns() < self._cfg.trade_from:
+            self.decisions.pop(str(order.client_order_id), None)
+            return
+        # P2-4: only to the strategy's own venue, whatever sends it. Paper's and live's is the strategy's pin; a
+        # backtest's, or an unpinned strategy's (SleeveRuntime.pinned), is the venue its market was set up on (a portfolio
+        # run's clone standing for its base venue).
+        own = not self._backtest and getattr(self.runtime, "pinned", True)
+        pinned = self.runtime.venue if own else self._cfg.instrument_id.venue.value
+        try:
+            router.check(self.runtime.name if self.runtime is not None else "backtest", str(order.instrument_id), pinned)
+        except router.VenueMismatch as e:
+            self.log.error(e.reason)
+            if self.runtime is not None:
+                self.runtime.on_order_status(str(order.client_order_id), "denied", e.reason)
+                self.runtime.store.event(self.runtime.name, "error", "order_refused_venue", e.reason,
+                                         ts=self.runtime.now())
             self.decisions.pop(str(order.client_order_id), None)
             return
         super().submit_order(order, *args, **kwargs)

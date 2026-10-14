@@ -13,13 +13,16 @@ from decimal import ROUND_CEILING, ROUND_HALF_UP, Decimal
 import json
 import math
 import os
+from contextlib import contextmanager
 from dataclasses import dataclass
+from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import (
     JSON,
     BigInteger,
     CheckConstraint,
+    DDL,
     Column,
     Date,
     DateTime,
@@ -53,6 +56,7 @@ from sqlalchemy.schema import DropConstraint
 from sleeve_fund import lifecycle
 from sleeve_fund.exact import EXACT
 from sleeve_fund.money import stored, to_decimal
+from sleeve_fund.router import venue_for
 
 DEFAULT_URL = "sqlite:///data/sleeve_fund.db"
 
@@ -154,7 +158,11 @@ funding_t = Table(
     # How the rate was set: "settled" (the venue's), "baseline" (missing, charged adversely) or "true_up" (a later
     # correction to the venue's rate), QA P1-O17.
     Column("kind", String(16), nullable=False, server_default="settled"),
+    # CASH-4: when a true-up moved cash, the real rate's arrival (ts stays the settlement's), so an as-of read before
+    # it shows the baseline only (Advisor 8 Oct 04:10, ruling 2). Only a true-up has one; every other row moved cash at ts.
+    Column("arrived_at", TS),
     CheckConstraint("kind IN ('settled', 'baseline', 'true_up', 'reversal')", name="funding_kind"),
+    CheckConstraint("(kind = 'true_up') = (arrived_at IS NOT NULL)", name="funding_true_up_arrived"),
     Index("funding_sleeve_ts", "sleeve", "ts"),
     # CASH-1: a settlement is charged once (settled or baseline, never both), and reversed or trued up at most once.
     # The key is the settlement time, so a second process or a restart that forgot it is refused by the database.
@@ -285,7 +293,9 @@ orders_t = Table(
     Column("reason", Text, nullable=False),  # plain English, e.g. "10-bar average crossed above 30-bar"
     Column("signal", JSON, nullable=False, default=dict),  # indicator values and price at the decision
     Column("message", Text, nullable=False, default=""),  # venue or risk-engine text on reject/cancel
+    Column("venue", String(16), nullable=False),  # where it was sent: the strategy's one venue (router, P2-4)
     Index("orders_sleeve_ts", "sleeve", "ts"),
+    CheckConstraint("venue = upper(venue)", name="orders_venue_upper"),
 )
 # When each paper or live order's decision bar closed and arrived, the decision, the send, the venue's acceptance
 # and its fills, to the microsecond (v2 P1-2): close-to-fill per strategy. Our clock throughout, except venue_ts,
@@ -350,6 +360,37 @@ sleeve_venues_t = Table(
     metadata,
     Column("sleeve", String(64), ForeignKey("sleeves.name"), primary_key=True),
     Column("venue", String(16), nullable=False),
+)
+# F-WED1-3 (Advisor, HoE 14 Oct): the pin is insert-only, held by the database itself. A venue is never changed; a pin is
+# deleted only with its saved backtest (prune_backtests); and a strategy that has an order or a fill can't be given one,
+# so nothing moves it off the venue its position and working orders are on. A new venue is a new strategy. Migration
+# 0020 writes the same triggers (spelled out there). They read orders, fills and backtests by name when they fire, so
+# it doesn't matter which create_all makes first.
+PIN_REFUSED = "a strategy''s venue is pinned: "  # quoted for SQL
+SLEEVE_VENUES_PG = (
+    "CREATE OR REPLACE FUNCTION sleeve_venue_pinned() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+    "IF TG_OP = 'UPDATE' THEN RAISE EXCEPTION USING ERRCODE = 'check_violation', "
+    f"MESSAGE = '{PIN_REFUSED}' || OLD.sleeve || ' cannot change venue'; END IF; "
+    "IF TG_OP = 'DELETE' THEN "
+    "IF substr(OLD.sleeve, 1, 3) <> 'bt:' OR NOT EXISTS (SELECT 1 FROM backtests WHERE sleeve = OLD.sleeve) THEN RAISE EXCEPTION USING "
+    f"ERRCODE = 'check_violation', MESSAGE = '{PIN_REFUSED}' || OLD.sleeve || "
+    "' is not a saved backtest, so its pin stays'; END IF; RETURN OLD; END IF; "
+    "IF EXISTS (SELECT 1 FROM orders WHERE sleeve = NEW.sleeve) OR EXISTS (SELECT 1 FROM fills WHERE sleeve = NEW.sleeve) "
+    "THEN RAISE EXCEPTION USING ERRCODE = 'check_violation', "
+    f"MESSAGE = '{PIN_REFUSED}' || NEW.sleeve || ' has traded, so it keeps its venue'; "
+    "END IF; RETURN NEW; END $$",
+    "CREATE TRIGGER sleeve_venue_pinned BEFORE INSERT OR UPDATE OR DELETE ON sleeve_venues FOR EACH ROW "
+    "EXECUTE FUNCTION sleeve_venue_pinned()",
+)
+SLEEVE_VENUES_SQLITE = (
+    "CREATE TRIGGER sleeve_venues_no_edit BEFORE UPDATE ON sleeve_venues BEGIN "
+    f"SELECT RAISE(ABORT, '{PIN_REFUSED}a venue cannot change'); END",
+    "CREATE TRIGGER sleeve_venues_no_delete BEFORE DELETE ON sleeve_venues "
+    "WHEN substr(OLD.sleeve, 1, 3) <> 'bt:' OR NOT EXISTS (SELECT 1 FROM backtests WHERE sleeve = OLD.sleeve) BEGIN "
+    f"SELECT RAISE(ABORT, '{PIN_REFUSED}only a saved backtest''s pin is deleted'); END",
+    "CREATE TRIGGER sleeve_venues_no_late_pin BEFORE INSERT ON sleeve_venues "
+    "WHEN EXISTS (SELECT 1 FROM orders WHERE sleeve = NEW.sleeve) OR EXISTS (SELECT 1 FROM fills WHERE sleeve = NEW.sleeve) "
+    f"BEGIN SELECT RAISE(ABORT, '{PIN_REFUSED}a strategy that has traded keeps its venue'); END",
 )
 account_keys_t = Table(
     "account_keys",
@@ -517,6 +558,39 @@ trials_t = Table(
     Index("trials_idea_hash", "idea_hash"),
     Index("trials_definition_dataset", "definition_hash", "dataset"),
 )
+# TRIALS-WORM (QD #238, HoE): the register is write-once. A row is never deleted, and an UPDATE may change only status
+# and error (a failed count re-counted); anything else, created_at, definition_hash, settings or the data range above
+# all, is refused by the database itself, so N, the earliest-row rule and the holdout check can't be edited after the
+# fact. Migration 0018 writes the same triggers (spelled out there: a migration is frozen at what it ran).
+TRIALS_FROZEN = ("id", "definition_hash", "idea_hash", "code_version", "definition_name", "family", "settings",
+                 "dataset", "stage", "source", "sharpe", "trades", "oos_trades", "backtest_id", "created_at",
+                 "data_start", "data_end", "kind")
+TRIALS_WORM_PG = (
+    "CREATE OR REPLACE FUNCTION trials_write_once() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+    "IF TG_OP = 'DELETE' THEN RAISE EXCEPTION USING ERRCODE = 'check_violation', "
+    "MESSAGE = 'trials are write-once: ' || OLD.id || ' cannot be deleted'; END IF; "
+    f"IF ({', '.join('NEW.' + c for c in TRIALS_FROZEN)}) IS DISTINCT FROM ({', '.join('OLD.' + c for c in TRIALS_FROZEN)}) "
+    "THEN RAISE EXCEPTION USING ERRCODE = 'check_violation', "
+    "MESSAGE = 'trials are write-once: only status and error of ' || OLD.id || ' may change'; END IF; "
+    "RETURN NEW; END $$",
+    "CREATE TRIGGER trials_write_once BEFORE UPDATE OR DELETE ON trials FOR EACH ROW EXECUTE FUNCTION trials_write_once()",
+)
+TRIALS_WORM_SQLITE = (
+    "CREATE TRIGGER trials_no_delete BEFORE DELETE ON trials BEGIN "
+    "SELECT RAISE(ABORT, 'trials are write-once: a row cannot be deleted'); END",
+    "CREATE TRIGGER trials_no_edit BEFORE UPDATE ON trials WHEN "
+    + " OR ".join(f"NEW.{c} IS NOT OLD.{c}" for c in TRIALS_FROZEN)
+    + " BEGIN SELECT RAISE(ABORT, 'trials are write-once: only status and error may change'); END",
+)
+for _sql in TRIALS_WORM_PG:
+    event.listen(trials_t, "after_create", DDL(_sql).execute_if(dialect="postgresql"))
+for _sql in TRIALS_WORM_SQLITE:
+    event.listen(trials_t, "after_create", DDL(_sql).execute_if(dialect="sqlite"))
+for _sql in SLEEVE_VENUES_PG:
+    event.listen(sleeve_venues_t, "after_create", DDL(_sql).execute_if(dialect="postgresql"))
+for _sql in SLEEVE_VENUES_SQLITE:
+    event.listen(sleeve_venues_t, "after_create", DDL(_sql).execute_if(dialect="sqlite"))
+
 # The held-back period each idea has opened (v2 P1-7, C4): one per idea and underlying, at any timeframe or
 # venue, for ever. Append-only, and no strategy column, so a reset never touches it.
 holdout_locks_t = Table(
@@ -828,6 +902,13 @@ def fill_cash(side: str, qty, price, fee) -> Decimal:
     return (-leg if side == "BUY" else leg) - per_fill(D(fee, "fee"))
 
 
+def _outside_book(store: "Store", s, account: str | None = None) -> bool:
+    """supervisor.outside_fund_book, the one predicate (imported late: the supervisor imports this module)."""
+    from sleeve_fund.supervisor import outside_fund_book
+
+    return outside_fund_book(store, s) if account is None else outside_fund_book(store, s, account)
+
+
 def is_backtest(name: str | None) -> bool:
     return bool(name) and name.startswith(BACKTEST_PREFIX)
 
@@ -1028,7 +1109,13 @@ class Store:
         if trial is not None:
             check_trial(trial)
         ts = utcnow()
-        with self.engine.begin() as c:
+        made = SimpleNamespace(name=name, instrument=instrument, venue=venue.upper() if venue else None)
+
+        def into() -> Decimal:  # its capital comes into the fund's book: a deposit, not a gain (HALT-REF-1)
+            in_book = not is_backtest(name) and not _outside_book(self, made)  # no account row yet: it starts on paper
+            return to_decimal(starting_balance) if in_book else Decimal(0)
+
+        with self._book_move(into, f"Strategy {name} created with {to_decimal(starting_balance):,.2f}", ts) as c:
             c.execute(insert(sleeves_t).values(
                 name=name, strategy=strategy, instrument=instrument, bar_spec=bar_spec, params=params or {},
                 starting_balance=starting_balance, risk_profile=risk_profile, warmup_bars=warmup_bars,
@@ -1040,6 +1127,33 @@ class Store:
             if trial is not None:
                 _put_trial_in(c, trial)
         return self.sleeve(name)
+
+    @contextmanager
+    def _book_move(self, amount, why, ts: datetime | None = None):
+        """A capital move into (amount() > 0) or out of (< 0) the fund's book (HALT-REF-1): the caller's writes, made on
+        the connection this yields, and the flow they make commit together under the portfolio gate's lock, so the
+        book moves by it and its HWM, the halt's reference and the day's start scale with it (portfolio.gate.apply_flow),
+        so the move is never read as a gain or a loss. The amount is read under the lock, before the writes, so two moves never both
+        count the same Strategy, and a supervisor mark that read the book while a move landed is skipped
+        (Supervisor.mark_portfolio). Journaled as a portfolio_flow event. With no state ever marked there is nothing to
+        move: the first mark reads the book as it is."""
+        from sleeve_fund.portfolio.gate import apply_flow
+
+        led = self._gate_ledger()
+        with led.lock():
+            c = led._local.conn
+            marked = c.execute(select(portfolio_state_t.c.book_equity).where(portfolio_state_t.c.id == 1)).scalar()
+            amount = amount() if marked is not None else Decimal(0)
+            yield c
+            if amount:
+                before = led.state().reference()
+                apply_flow(led, amount)
+                after = led.state().reference()
+                c.execute(insert(events_t).values(
+                    sleeve=None, ts=ts or utcnow(), level="info", kind="portfolio_flow",
+                    message=f"{why() if callable(why) else why}: the fund's book moves by {amount:+,.2f} and its "
+                            f"high-water mark, the halt's reference and the day's start scale with it (the reference "
+                            f"{before:,.2f} -> {after:,.2f}), so it isn't a gain or a loss"))
 
     def sleeve(self, name: str) -> Sleeve:
         with self.engine.connect() as c:
@@ -1061,6 +1175,8 @@ class Store:
         return [Sleeve.from_row(r, venues.get(r.name)) for r in rows]
 
     def _update_sleeve(self, name: str, **values) -> None:
+        if "starting_balance" in values:  # HALT-REF-1: capital into or out of the book only with its flow
+            raise ValueError("a Strategy's starting balance is set when it is created and never edited")
         with self.engine.begin() as c:
             c.execute(update(sleeves_t).where(sleeves_t.c.name == name).values(updated_at=utcnow(), **values))
 
@@ -1156,10 +1272,12 @@ class Store:
             raise ValueError(f"bad intent {intent!r}")
         now = ts or utcnow()
         with self.engine.begin() as c:
+            # The venue is the router's, never the caller's (P2-4): read with the order, in its transaction.
+            venue = c.execute(select(sleeve_venues_t.c.venue).where(sleeve_venues_t.c.sleeve == sleeve)).scalar()
             c.execute(insert(orders_t).values(sleeve=sleeve, order_id=order_id, ts=now, updated_at=now, side=side,
                                               order_type=order_type, qty=qty, status="submitted", filled_qty=0.0,
                                               fee=0.0, intent=intent, reason=reason, signal=signal or {},
-                                              message=""))
+                                              message="", venue=venue_for(venue)))
             if timing:
                 c.execute(insert(order_timings_t).values(order_id=order_id, sleeve=sleeve, **{
                     k: _from_ns(v) for k, v in timing.items() if v is not None}))
@@ -1425,7 +1543,24 @@ class Store:
         return row[0] if row else "paper"
 
     def assign_account(self, sleeve: str, account: str) -> None:
-        with self.engine.begin() as c:
+        """A move onto or off a test account its venue names moves the Strategy's equity out of or into the fund's
+        book (F229-6), with its flow (HALT-REF-1)."""
+        moved = []
+
+        def amount() -> Decimal:
+            if is_backtest(sleeve):
+                return Decimal(0)
+            s = self.sleeve(sleeve)
+            was = _outside_book(self, s)
+            if was == _outside_book(self, s, account):
+                return Decimal(0)
+            from sleeve_fund.supervisor import strategy_equity
+
+            moved.append("into" if was else "out of")
+            part = strategy_equity(self, s)
+            return part if was else -part
+
+        with self._book_move(amount, lambda: f"{sleeve} moved {moved[0]} the fund's book (account {account})") as c:
             self._ensure_paper_account(c)
             if c.execute(select(accounts_t.c.name).where(accounts_t.c.name == account)).first() is None:
                 raise ValueError(f"no account called {account}")
@@ -1745,17 +1880,25 @@ class Store:
         return replay_book(fills, starting_balance, self.funding_total(sleeve), self.insurance_total(sleeve))
 
     def record_funding(self, sleeve: str, *, qty: float, price: float, rate: float, amount: float,
-                       ts: datetime | None = None, kind: str = "settled") -> str:
+                       ts: datetime | None = None, kind: str = "settled", arrived_at: datetime | None = None) -> str:
         """Book a funding movement once (CASH-1): "new" when written; "same" when this settlement already holds it
         (a second process, a restart); "differs" when it holds another figure, or the other charge kind, which raises
-        an error event and moves nothing. Only "new" moved cash."""
+        an error event and moves nothing. Only "new" moved cash. A true-up moves cash at `arrived_at`, by default
+        when it is written; record_true_up works it out from the baseline (CASH-4)."""
         qty, price, amount = _exact(qty=qty, price=price, amount=amount)
         ts = ts or utcnow()
+        if kind == "true_up":
+            arrived_at = arrived_at or utcnow()
+        elif arrived_at is not None:
+            raise ValueError(f"only a true-up moves cash at an arrival time, not a {kind} row")
         key = (funding_t.c.sleeve == sleeve) & (funding_t.c.ts == ts)
         key &= funding_t.c.kind.in_(FUNDING_CHARGE_KINDS) if kind in FUNDING_CHARGE_KINDS else funding_t.c.kind == kind
-        booked = self._book_once(funding_t, key, dict(sleeve=sleeve, ts=ts, qty=qty, price=price, rate=rate,
-                                                      amount=amount, kind=kind),
-                                 lambda row: row.kind == kind and stored(row.amount) == stored(amount))
+        values = dict(sleeve=sleeve, ts=ts, qty=qty, price=price, rate=rate, amount=amount, kind=kind)
+        if arrived_at is not None:  # named only when set, so a journal from before 0016 still takes every other row
+            values["arrived_at"] = arrived_at
+        booked = self._book_once(funding_t, key, values,
+                                 lambda row: row.kind == kind and stored(row.amount) == stored(amount),
+                                 cols=(funding_t.c.kind, funding_t.c.amount))
         if booked == "differs":
             self.event(sleeve, "error", "funding_conflict",
                        f"Funding for the {ts:%d %b %H:%M} UTC settlement ({kind}, {amount:,.2f}) arrived again with "
@@ -1763,13 +1906,14 @@ class Store:
                        "before trusting this strategy's book", ts=ts)
         return booked
 
-    def _book_once(self, table, key, values: dict, same) -> str:
+    def _book_once(self, table, key, values: dict, same, cols=None) -> str:
         """Insert `values` unless a row matching `key` exists: "new", "same" (same(row) holds) or "differs". The
-        table's unique index makes a concurrent second writer fail; its retry reads the first writer's row."""
+        table's unique index makes a concurrent second writer fail; its retry reads the first writer's row. `cols`:
+        the columns same() reads, when not every column (one a later migration adds may not be there yet)."""
         for _ in range(2):
             try:
                 with self.engine.begin() as c:
-                    row = c.execute(select(table).where(key)).first()
+                    row = c.execute((select(*cols) if cols else select(table)).where(key)).first()
                     if row is not None:
                         return "same" if same(row) else "differs"
                     c.execute(insert(table).values(**values))
@@ -1777,6 +1921,58 @@ class Store:
             except IntegrityError:
                 continue
         raise RuntimeError(f"a {table.name} row of {values.get('sleeve')} could not be booked or read")
+
+    def record_true_up(self, sleeve: str, ts: datetime, *, rate: float, amount: float | Decimal,
+                       arrived_at: datetime) -> tuple[str, Decimal | None]:
+        """CASH-4 (Advisor 8 Oct 04:10, ruling 2): the venue's rate for settlement `ts`, charged at the baseline,
+        arrived at `arrived_at`; `amount` is what that rate settles to (signed as the cash moves). Books one true-up of
+        amount - baseline at the settlement's ts, moving cash at its arrival, and never edits the baseline. Returns
+        ("new", true-up) when written; ("same", true-up) when this settlement already holds that one (a second
+        process, a restart); ("differs", None) when it holds another, which raises an error event and moves nothing;
+        ("none", None) when there is nothing to true up: no baseline at ts (it was settled at the venue's rate) or
+        the baseline was reversed (no settlement after all). Only "new" moved cash."""
+        amount, = _exact(amount=amount)
+        at = (funding_t.c.sleeve == sleeve) & (funding_t.c.ts == ts)
+        for _ in range(2):
+            try:
+                with self.engine.begin() as c:
+                    rows = {r.kind: r for r in c.execute(select(funding_t).where(at))}
+                    base = rows.get("baseline")
+                    if base is None or "reversal" in rows:
+                        return "none", None
+                    up = amount - to_decimal(base.amount)
+                    if "true_up" in rows:
+                        if stored(rows["true_up"].amount) == stored(up):
+                            return "same", to_decimal(rows["true_up"].amount)
+                        break
+                    c.execute(insert(funding_t).values(sleeve=sleeve, ts=ts, qty=base.qty, price=base.price,
+                                                       rate=rate, amount=up, kind="true_up", arrived_at=arrived_at))
+                    return "new", up
+            except IntegrityError:
+                continue  # a second writer booked it first: read theirs
+        else:
+            raise RuntimeError(f"a funding true-up of {sleeve} could not be booked or read")
+        self.event(sleeve, "error", "funding_conflict",
+                   f"The true-up for the {ts:%d %b %H:%M} UTC settlement arrived again as {up:+,.2f}, not as booked. "
+                   "The booked true-up is kept and nothing moved; check the venue's record before trusting this "
+                   "strategy's book", ts=arrived_at)
+        return "differs", None
+
+    def open_baselines(self, sleeve: str) -> list[dict]:
+        """Settlements charged the baseline and neither trued up nor reversed yet, oldest first: what a strategy
+        with no process of its own is still owed a true-up on (Supervisor.true_up_stopped, CASH-4)."""
+        other = funding_t.alias("other")
+        done = (select(other.c.id).where(other.c.sleeve == funding_t.c.sleeve, other.c.ts == funding_t.c.ts,
+                                         other.c.kind.in_(("true_up", "reversal"))).exists())
+        q = (select(funding_t).where(funding_t.c.sleeve == sleeve, funding_t.c.kind == "baseline", ~done)
+             .order_by(funding_t.c.ts))
+        with self.engine.connect() as c:
+            return _rows(c.execute(q))
+
+    @staticmethod
+    def _cash_moved_at(t):
+        """When a row moved cash: a funding true-up at its arrival, everything else at its ts (CASH-4)."""
+        return func.coalesce(t.c.arrived_at, t.c.ts) if t is funding_t else t.c.ts
 
     def funding(self, sleeve: str, limit: int | None = 1000) -> list[dict]:
         """Newest first: the last `limit` rows, or all of them with limit=None, as a check that must see every
@@ -1786,12 +1982,16 @@ class Store:
             return _rows(c.execute(q))
 
     def funding_total(self, sleeve: str, before: datetime | None = None) -> Decimal:
-        """Funding booked to the strategy's cash, all of it or (before) only what settled before then."""
-        q = select(func.sum(funding_t.c.amount)).where(funding_t.c.sleeve == sleeve)
+        """Funding booked to the strategy's cash, all of it or (before) only what moved it before then: a true-up
+        from the arrival of the rate it corrects (CASH-4). Exact on either database, as strategy_cash_pnl: a true-up's
+        difference must not come back as a float's."""
+        w = funding_t.c.sleeve == sleeve
         if before is not None:
-            q = q.where(funding_t.c.ts < before)
+            w &= self._cash_moved_at(funding_t) < before
         with self.engine.connect() as c:
-            return to_decimal(c.execute(q).scalar() or 0)
+            if self.engine.dialect.name == "postgresql":
+                return to_decimal(c.execute(select(func.sum(funding_t.c.amount)).where(w)).scalar() or 0)
+            return sum((to_decimal(a) for a in c.execute(select(funding_t.c.amount).where(w)).scalars()), Decimal(0))
 
     def record_insurance(self, sleeve: str, *, price: float, amount: float, order_id: str | None = None,
                          trade_id: str | None = None, ts: datetime | None = None) -> str:
@@ -1833,14 +2033,15 @@ class Store:
         """The one cash reader (CASH-2): what the journal moved the strategy's cash by over (since, at], every row
         counted. That is each fill's cash leg less its fee, plus funding and the insurance fund's cover. since None
         is from the first row and at None is to the last; a row at `at` counts and a row at `since` does not, so
-        consecutive windows add up to the whole. Exact: summed by Postgres' NUMERIC, or row by row on SQLite, whose
-        own sum would be a float's."""
+        consecutive windows add up to the whole. A funding true-up counts from the arrival of the rate it corrects,
+        not its settlement's ts (CASH-4). Exact: summed by Postgres' NUMERIC, or row by row on SQLite, whose own sum
+        would be a float's."""
         def window(t):
-            w = t.c.sleeve == sleeve
+            w, moved = t.c.sleeve == sleeve, self._cash_moved_at(t)
             if since is not None:
-                w &= t.c.ts > since
+                w &= moved > since
             if at is not None:
-                w &= t.c.ts <= at
+                w &= moved <= at
             return w
 
         f = fills_t.c
@@ -2055,11 +2256,13 @@ class Store:
             c.execute(insert(sleeves_t).values(**{**row, "name": run, "desired_state": "stopped", "status": "stopped",
                                                   "status_reason": f"run put away by a reset on {now:%d %b %Y %H:%M}",
                                                   "updated_at": now}))
-            for t in moved:
-                c.execute(update(t).where(t.c.sleeve == name).values(sleeve=run))
+            # The pin is copied before the orders and fills move: the database refuses a pin to a strategy that has
+            # traded (F-WED1-3), and the put-away run hasn't yet.
             for t in (sleeve_accounts_t, sleeve_venues_t):
                 for r in c.execute(select(t).where(t.c.sleeve == name)).all():
                     c.execute(insert(t).values(**{**dict(r._mapping), "sleeve": run}))
+            for t in moved:
+                c.execute(update(t).where(t.c.sleeve == name).values(sleeve=run))
             c.execute(feed_seen_t.delete().where(feed_seen_t.c.sleeve == name))
             # The old run's conditions on the Signals tab until the fresh process writes its own (m13-E2).
             c.execute(signal_state_t.delete().where(signal_state_t.c.sleeve == name))

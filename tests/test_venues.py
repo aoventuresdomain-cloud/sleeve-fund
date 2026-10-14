@@ -57,6 +57,17 @@ def test_venue():
     venues.VENUES.pop("TESTX")
 
 
+def test_a_venue_name_longer_than_orders_store_is_refused():
+    """CR F-P24-a: orders.venue is 16 characters, so a longer name would fail order inserts on Postgres."""
+    from sleeve_fund.store import orders_t
+
+    assert orders_t.c.venue.type.length == venues.VENUE_NAME_MAX
+    with pytest.raises(ValueError, match="over 16 characters"):
+        venues.register(venues.VenueProfile(name="X" * 17, label="Too long", fees=FeeSchedule(
+            maker=Decimal("0.001"), taker=Decimal("0.002")), fee_basis="test", daily_history=lambda pair: None))
+    assert "X" * 17 not in venues.VENUES
+
+
 def test_a_second_venue_backtests_without_engine_changes(test_venue):
     from sleeve_fund.dashboard import preview
 
@@ -82,6 +93,7 @@ MAY_NAME_A_VENUE = {
     "safety.py": "lists venue credential prefixes so it can refuse every one of them",
     "accounts.py": "recognises the note older versions saved, so it can replace it on read",
     "wording.py": "turns a venue name into what it is (\"the demo account\") in what the PM reads, so it names each one",
+    "0020_orders_venue.py": "freezes the default venue of the day as a literal, so the orders backfill never moves (DA)",
 }
 
 

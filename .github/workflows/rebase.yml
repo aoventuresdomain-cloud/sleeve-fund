@@ -1,0 +1,53 @@
+name: rebase
+# HALT-REF-1 only: the paper portfolio's one-off re-base to the true book (python -m sleeve_fund.supervisor rebase).
+# Run it by hand from main: a dry run first (the default) prints the figures and any refusal and writes nothing; the
+# real run (dry_run false) pauses each Strategy that could trade once the halt clears (a journaled PM pause), re-bases,
+# and prints the next mark's halt and pause checks. It refuses once it has run, and on any figure the Advisor's
+# conditions rule out. The journal names this run's commit. It runs inside the supervisor container, with the deploy
+# workflow's secrets (DEPLOY_HOST, DEPLOY_SSH_KEY) and variable DEPLOY_USER, as start-check.yml does. The log is
+# public: the command names no host, user, key path or database address, and ssh runs quiet so its own messages don't
+# either. The job fails when the command exits 1 (refused, or a next mark that isn't clean).
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Only print what it would do (untick for the real run)"
+        type: boolean
+        default: true
+      actor:
+        description: "Who runs it, for the decision log (letters, digits, spaces, . _ -)"
+        type: string
+        required: true
+concurrency: { group: rebase, cancel-in-progress: false }  # one run at a time; never cut one off mid-write
+jobs:
+  rebase:
+    runs-on: ubuntu-24.04
+    permissions: { contents: read }
+    if: ${{ vars.DEPLOY_ENABLED == 'true' && github.ref == 'refs/heads/main' }}
+    env:
+      USER_AT: ${{ vars.DEPLOY_USER || 'root' }}
+    steps:
+      - name: Check the actor
+        env:
+          ACTOR: ${{ inputs.actor }}
+        # It goes into the remote command line, so only plain words get through.
+        run: |
+          [[ "$ACTOR" =~ ^[A-Za-z0-9\ ._-]{1,40}$ ]] || { echo "actor: letters, digits, spaces, . _ - only"; exit 1; }
+      - name: Configure SSH
+        env:
+          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/id_deploy && chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts 2>/dev/null
+      - name: Re-base
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          ACTOR: ${{ inputs.actor }}
+          COMMIT: ${{ github.sha }}
+          YES: ${{ inputs.dry_run == false && '--yes' || '' }}
+        # ssh and docker compose exec pass the command's exit code through: 1 on a refusal fails the job, and 255 is
+        # ssh itself failing (quiet, so it names no host or user).
+        run: |
+          ssh -o LogLevel=QUIET -i ~/.ssh/id_deploy "$USER_AT@$HOST" "cd /opt/sleeve-fund && sudo docker compose exec -T supervisor python -m sleeve_fund.supervisor rebase --actor '$ACTOR' --commit $COMMIT $YES"

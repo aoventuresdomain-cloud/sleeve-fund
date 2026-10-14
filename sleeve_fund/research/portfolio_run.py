@@ -74,13 +74,15 @@ class LegSpec:
     capital: float = 10_000.0
     half_spread: float | None = None
     fees: FeeSchedule | None = None
+    risk_profile: str | None = None  # paper's: its position cap and leverage, as run_backtest's (B7 replays paper)
 
 
 @dataclass
 class PortfolioResult:
     legs: dict[str, BacktestResult]  # each Strategy's own record, as run_backtest gives it, over the whole window
     book: pd.Series  # the fund's equity at every mark (each hour's close), the whole window
-    decisions: list[dict]  # every gate decision, in order: strategy, ts, outcome, approved, requested, limit, reason
+    decisions: list[dict]  # every gate decision, in order: strategy, ts, bar_ts, outcome, approved, requested, limit,
+    # reason, side, price (the expected fill the gate priced it at); bar_ts keys it against the paper journal (parity)
     halt: dict | None  # {"ts", "drawdown", "reason"} when the drawdown halt fired
     halt_flatten_cost: float  # the fees and half spread the halt's flatten paid (R2)
     # {"ts", "reason", "until"} for each daily pause. By design (Advisor 03:25 UK) a pause lifts at 00:00 UTC, when a
@@ -206,9 +208,12 @@ def run_portfolio(specs: list[LegSpec], profile: PortfolioProfile = PORTFOLIO, u
     it never changes the run."""
     _check(specs)
     order = tuple(s.name for s in specs)
+    # A Strategy deciding on bars as short as its execution bars is fed its decision bars alone (run_backtest's
+    # own rule); its exec_prices still mark it every hour.
     plans = [plan_run(s.strategy, s.prices, s.instrument, s.params, s.capital, bar_minutes=s.bar_minutes,
-                      exec_prices=s.exec_prices, exec_minutes=s.exec_minutes, half_spread=s.half_spread, fees=s.fees,
-                      warmup_prices=s.warmup_prices) for s in specs]
+                      exec_prices=None if s.exec_minutes == s.bar_minutes else s.exec_prices,
+                      exec_minutes=s.exec_minutes, half_spread=s.half_spread, fees=s.fees,
+                      warmup_prices=s.warmup_prices, risk_profile=s.risk_profile) for s in specs]
     hours = {s.name: _closes(s.exec_prices) for s in specs}
     grid = sorted(set().union(*(h.index for h in hours.values())))
     window = int(min(s.prices.index[0] for s in specs).value)
@@ -229,7 +234,12 @@ def run_portfolio(specs: list[LegSpec], profile: PortfolioProfile = PORTFOLIO, u
             h = hours[spec.name]
             at = h.index.searchsorted(pd.Timestamp(ts_ns, tz="UTC"), side="right") - 1
             if at < 0:
-                continue
+                # Before the window's first hourly close (a window opening inside an hour, as B7's replay of paper):
+                # its last execution bar's close, so the Strategy's own equity is in the book from its first decision.
+                h = spec.exec_prices
+                at = h.index.as_unit("ns").searchsorted(pd.Timestamp(ts_ns, tz="UTC"), side="right") - 1
+                if at < 0:
+                    continue
             close = float(h["close"].iloc[at])
             atr = leg.strategy._daily_atr.get((ts_ns - 1) // DAY_NS * DAY_NS)
             try:
@@ -326,9 +336,12 @@ def _result(results, spread, marks, actions, gate, hours, window, profile, unall
               for t, w, why, until in actions
               if w == "pause" and until is not None and until > pd.Timestamp(t, tz="UTC")]
     worst, risk = _intrabar(book, marks, hours, profile, halt_info, pauses)
-    decisions = [{"strategy": r.strategy, "ts": r.at, "outcome": r.decision.outcome,
-                  "approved": r.decision.approved_qty, "requested": r.decision.requested_qty,
-                  "limit": r.decision.limit_hit, "reason": r.decision.reason} for r in gate.ledger.records]
+    # bar_ts: the deciding bar's close, as paper's journal keys a decision: both gates tag it (tagged_intent).
+    decisions = [{"strategy": r.strategy, "ts": r.at, "bar_ts": r.intent.bar_ts, "kind": r.intent.kind,
+                  "outcome": r.decision.outcome, "approved": r.decision.approved_qty,
+                  "requested": r.decision.requested_qty, "limit": r.decision.limit_hit, "reason": r.decision.reason,
+                  "side": r.intent.side, "price": r.intent.price,
+                  "bar_decided": r.intent.intent_id not in gate.unbarred} for r in gate.ledger.records]
     gaps = [{"ts": at, "strategy": msg.split(":", 1)[0], "why": msg.split(":", 1)[1].strip(),
              "what": "entry" if kind == "portfolio_check_failed" else "open_risk"}
             for kind, msg, at in gate.ledger.alerts
