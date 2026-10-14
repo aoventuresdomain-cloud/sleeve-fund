@@ -17,11 +17,16 @@ from decimal import Decimal
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
-from sleeve_fund import risk
+from sleeve_fund import lifecycle, risk
 from sleeve_fund.exact import EngineJournal
 from sleeve_fund.store import (BOOK_RESET, LIQUIDATION_RESET, OPEN_ORDER_STATUSES, RAL, RELOAD, WHY_STOP_FIELD, Store,
                                replay_book, utcnow)
 
+# P2-6 journal kinds and order intents (orders.intent is String(16)).
+WIND_STOP, WIND_NOTICE, WIND_RETRY, WIND_FLATTEN = "wind_down_stop", "wind_down_notice", "wind_down_retry", "wind_down"
+WIND_STOP_RE = r"Wind-down stop at (?P<level>[0-9.e+-]+) for the (?P<side>long|short):"
+INTERIM = "interim safety stop"
+WIND_GRACE = timedelta(minutes=2)  # past a bar's length with no bar close: the feed is stale, so the tick flattens
 FLATTEN_RETRIES = 3  # times a flatten that did not close the position is sent again before the PM is asked
 RECONCILE_EVERY = timedelta(hours=24)
 # How often the typical spread is recorded from live quotes, and the fewest quotes worth a reading.
@@ -142,6 +147,9 @@ ENTRY_CANCELLED = "resting_entry_cancelled"  # resting opening orders cancelled 
 BLOCK_CHANGED = "entry_block_changed"
 REFUSED = "entry_blocked"  # the decision log's action for an order the gate refused (QA's exposure-gate master)
 RETIRED = _cause("retired", "cannot be started. Only Restore brings it back.")
+LIFE_RETIRED = _cause("retired", "the PM retired it, and it never trades again.")
+WINDING_DOWN = _cause("winding_down", "the PM is winding it down, so it opens nothing new; its exits and stops keep "
+                      "running until it is flat and retired.")
 STOPPED = _cause("stopped", "only Start clears it.")
 
 
@@ -190,8 +198,13 @@ def blocked_state(sleeve, now: datetime | None = None, *, liquidated: str | None
     halt = clearing_action(sleeve, now, since)
     if halt is not None and not (liquidated is not None and halt.code == "liquidated"):
         causes.append(halt)
-    if archived:
+    life = getattr(sleeve, "lifecycle", lifecycle.ACTIVE)
+    if life == lifecycle.RETIRED:
+        causes.append(LIFE_RETIRED)  # P2-6: never brought back, so not the archive's words
+    elif archived:
         causes.append(RETIRED)
+    if life == lifecycle.WINDING_DOWN:  # P2-6: Start and Resume don't clear it either
+        causes.append(WINDING_DOWN)
     if portfolio is not None:
         causes.append(portfolio)
     if not starting:  # Start and Resume act on a stopped or paused strategy: what they can't clear is above
@@ -376,6 +389,19 @@ class SleeveRuntime:
         rt.backtest = True
         return rt
 
+    @property
+    def halts(self) -> bool:
+        return self._halts
+
+    @halts.setter
+    def halts(self, on: bool) -> None:
+        """Turning the halts off is for a backtest's runtime only (HoE, F240-1): a paper or live Strategy without its
+        drawdown halt and daily-loss pause must never trade."""
+        if not on and not self.backtest:
+            raise ValueError(f"{self.name}: the drawdown halt and daily-loss pause can be turned off in a backtest "
+                             "only, never in paper or live")
+        self._halts = bool(on)
+
     def risk_events(self) -> list[dict]:
         """Halts and pauses, oldest first, for a backtest to show."""
         kinds = ("risk_halt", "risk_pause", "resume", "reconcile_mismatch", "liquidation", "liquidation_cut")
@@ -392,6 +418,9 @@ class SleeveRuntime:
         sleeve = self.store.sleeve(sleeve_name)
         self.profile = risk.profile(sleeve.risk_profile)
         self.cap = risk.position_cap(self.profile, sleeve.params)  # on a perp, the margin cap times the leverage cap
+        # The profile's drawdown halt and daily-loss pause act. Off only in a research backtest's ablation 1x pair
+        # (research.ablation.one_x_runtime, CR F235-5); never in paper or live (the halts setter and on_start, F240-1).
+        self._halts = True
         self.starting_balance = sleeve.starting_balance
         self.status = sleeve.status
         self.paused_until = sleeve.paused_until
@@ -424,6 +453,21 @@ class SleeveRuntime:
         # Why the engine holds new entries back for now, by what raised it (e.g. "funding", "data"): CHOKE's
         # entry_blocked reads them. Each holder sets and clears its own key.
         self.holds: dict[str, str] = {}
+        # P2-6: the PM's lifecycle as the journal holds it, read again every paper tick (a backtest has no PM, so it
+        # stays active). The wind-down stop and the 75% notice are read back from the journal, never recomputed.
+        self.lifecycle = sleeve.lifecycle
+        self.wind_started, self.wind_deadline = sleeve.wind_down_started, sleeve.wind_down_deadline
+        from sleeve_fund.data import spec_minutes
+
+        self.bar_length = timedelta(minutes=spec_minutes(sleeve.bar_spec))
+        self.wind_stop, self.wind_stop_interim = self._journaled_wind_stop()
+        self._wind_noticed = self._journaled_since(WIND_NOTICE)
+        self._wind_flattens = 0  # deadline flattens sent this process, for the retry alert
+        self._wind_checked: datetime | None = None  # the last bar close lifecycle_due ran at
+        # P26-2: when this process saw the PM's close now while the strategy held, until its flatten goes (on the
+        # first fresh tick) or it is flat; and whether the stale feed's wait for that tick has been alerted.
+        self._close_now_at: datetime | None = None
+        self._close_now_alerted = False
         self._block = open_block(store, sleeve_name)  # the block episode open in the journal, by its reason
         # Why a fill that raced a halt, a liquidation or the daily pause is owed a flatten (the strategy sets it on
         # such a fill; Advisor 23:05, SG7): the block's own flatten covers what filled after it, through the exit path.
@@ -474,6 +518,9 @@ class SleeveRuntime:
     # --- lifecycle ------------------------------------------------------------
 
     def on_start(self, taker_fee: float, now=None) -> None:
+        if not self._halts and not self.backtest:  # however it got here (F240-1): refuse before anything is sent
+            raise RuntimeError(f"{self.name} won't start: its drawdown halt and daily-loss pause are off, which only a "
+                               "backtest may run")
         self.taker_fee = taker_fee
         if now is not None:
             self.now = now
@@ -529,6 +576,158 @@ class SleeveRuntime:
         if self.status in ("running", "starting"):
             self._set("stopped", "process stopped")
 
+    # --- lifecycle (P2-6) --------------------------------------------------------
+
+    def _journaled_since(self, kind: str) -> dict | None:
+        """The latest `kind` event since this wind-down began, else None."""
+        if self.lifecycle != lifecycle.WINDING_DOWN or self.wind_started is None:
+            return None
+        last = self.store.last_event(self.name, (kind,))
+        return last if last is not None and last["ts"] >= self.wind_started else None
+
+    def _journaled_wind_stop(self) -> tuple[tuple[int, float] | None, bool]:
+        """This wind-down's stop as last journaled, ((side, level) or None, whether it is the interim safety stop):
+        placed once, never recomputed or trailed, so a restart reads it back (Advisor 6 Oct 14:55). The interim one
+        gives way once to an ATR stop that is tighter (Advisor 13 Oct 17:05)."""
+        last = self._journaled_since(WIND_STOP)
+        m = re.match(WIND_STOP_RE, last["message"]) if last else None
+        if not m:
+            return None, False
+        return (1 if m["side"] == "long" else -1, float(m["level"])), INTERIM in last["message"]
+
+    def refresh_lifecycle(self) -> None:
+        """Paper: the lifecycle as the PM last set it (Store.set_lifecycle), read every tick."""
+        if self.backtest:
+            return
+        sleeve = self.store.sleeve(self.name)
+        moved = (sleeve.lifecycle, sleeve.wind_down_started) != (self.lifecycle, self.wind_started)
+        # The PM's close now, from active or winding down (where only the deadline moves, to the moment it was
+        # pressed): its flatten goes on the first fresh tick, not at the next bar close (Advisor 13 Oct 20:30 UK).
+        closed_now = (sleeve.lifecycle == lifecycle.WINDING_DOWN and sleeve.wind_down_deadline is not None
+                      and sleeve.wind_down_deadline != self.wind_deadline and sleeve.wind_down_deadline <= self.now())
+        self.lifecycle, self.wind_started, self.wind_deadline = (sleeve.lifecycle, sleeve.wind_down_started,
+                                                                 sleeve.wind_down_deadline)
+        if moved:
+            self.wind_stop, self.wind_stop_interim, self._wind_noticed, self._wind_flattens = None, False, None, 0
+        if closed_now:
+            self._close_now_at, self._close_now_alerted = self.now(), False
+        elif self.lifecycle != lifecycle.WINDING_DOWN:
+            self._close_now_at = None
+
+    def place_wind_stop(self, side: int, price: float, atr: float, *, stop_atr: float | None,
+                        liquidation: float | None, note: str = "") -> float:
+        """The one reduce-only stop a strategy holding a position gets when its wind-down starts (lifecycle.
+        wind_down_stop), journaled with its figures; returns its level."""
+        stop = lifecycle.wind_down_stop(side, repr(price), repr(atr), stop_atr=stop_atr,
+                                        liquidation=None if liquidation is None else repr(liquidation))
+        level = float(stop.level)
+        self.wind_stop, self.wind_stop_interim = (side, level), False
+        self.store.event(self.name, "info", WIND_STOP,
+                         f"Wind-down stop at {level!r} for the {'long' if side > 0 else 'short'}: {stop.reason} "
+                         f"Price {price:,.6g}, ATR {atr:,.6g} x {stop.atrs:g} = {float(stop.distance):,.6g}"
+                         + (" (held at half the distance to liquidation)" if stop.clamped else "") + note + ".",
+                         ts=self.now())
+        self.store.decide("system", WIND_STOP, f"{stop.reason} Level {level:,.6g}.", self.name, ts=self.now())
+        return level
+
+    def place_interim_wind_stop(self, side: int, price: float, liquidation: float | None) -> float | None:
+        """With no ATR at all yet, the restart safety stop's rule at once (S3 to S5): half the remaining distance from
+        the price to liquidation, or to zero where nothing liquidates it (1x, spot). Journaled as interim: an ATR stop
+        replaces it once if tighter (Advisor 13 Oct 17:05). None when the price is already through liquidation."""
+        target = liquidation if liquidation is not None else 0.0
+        if side * (price - target) <= 0:
+            return None
+        level = price - 0.5 * (price - target)
+        self.wind_stop, self.wind_stop_interim = (side, level), True
+        to = f"the liquidation price {liquidation:,.6g}" if liquidation is not None else "zero"
+        self.store.event(self.name, "info", WIND_STOP,
+                         f"Wind-down stop at {level!r} for the {'long' if side > 0 else 'short'}: {INTERIM}, half way "
+                         f"from the {price:,.6g} price to {to}, while no ATR is ready; an ATR stop replaces it if "
+                         "tighter.", ts=self.now())
+        self.store.decide("system", WIND_STOP, f"Interim wind-down stop at {level:,.6g}, no ATR yet.", self.name,
+                          ts=self.now())
+        return level
+
+    def keep_wind_stop(self, why: str) -> None:
+        """The interim stop stays as the wind-down's fixed stop: the ATR one would be further away."""
+        side, level = self.wind_stop
+        self.wind_stop_interim = False
+        self.store.event(self.name, "info", WIND_STOP,
+                         f"Wind-down stop at {level!r} for the {'long' if side > 0 else 'short'}: the interim stop is "
+                         f"kept and now fixed; {why}.", ts=self.now())
+
+    def wind_stop_hit(self, price: float) -> bool:
+        """Paper: whether the wind-down stop is hit by this trade's price (judged on every trade, as the strategy's
+        own stop is; paper doesn't rest stops at the venue yet)."""
+        if self.wind_stop is None or price <= 0 or self.lifecycle != lifecycle.WINDING_DOWN:
+            return False
+        side, level = self.wind_stop
+        return price <= level if side > 0 else price >= level
+
+    def lifecycle_due(self, now: datetime, *, flat: bool, busy: bool,
+                      reason: str | None = None) -> tuple[str, str] | None:
+        """P2-6 at a bar close (lifecycle.due): the 75% notice, retire once flat, or the deadline's flatten as
+        (intent, reason) for the engine to send through its exit path, on stale data too and again each bar until
+        flat. None when there is nothing to send. reason: the flatten's words when it isn't the deadline's (close
+        now's)."""
+        if self.lifecycle != lifecycle.WINDING_DOWN:  # a research backtest's is always active: it has no PM
+            return None
+        self._wind_checked = now
+        act = lifecycle.due(self.lifecycle, self.wind_started, self.wind_deadline, now, flat=flat,
+                            noticed=self._wind_noticed is not None)
+        if act == lifecycle.NOTICE:
+            self.store.event(self.name, "warning", WIND_NOTICE,
+                             f"Winding down: 75% of its window has passed; it must be flat by "
+                             f"{lifecycle.stamp(self.wind_deadline)}, and is flattened then if it still holds.",
+                             ts=now)
+            self._wind_noticed = {"ts": now}
+        elif act == lifecycle.RETIRE:
+            closed = self.store.decisions(self.name, limit=1, action="close_now", since=self.wind_started)
+            how = ("close_now" if closed
+                   else "deadline" if self._wind_flattens or now >= self.wind_deadline else "flat")
+            if self.store.complete_retire(self.name, now, how):
+                self.lifecycle = lifecycle.RETIRED
+                self._set("stopped", "retired")
+        elif act == lifecycle.FLATTEN and not busy:
+            if self._wind_flattens == 1:
+                self.store.event(self.name, "error", WIND_RETRY,
+                                 f"Still holding after the wind-down deadline's flatten "
+                                 f"({lifecycle.stamp(self.wind_deadline)}); it is sent again at each bar close until "
+                                 "the strategy is flat.", ts=now)
+            self._wind_flattens += 1
+            reason = reason or f"Wind-down deadline {lifecycle.stamp(self.wind_deadline)} reached: flattened"
+            self.store.decide("system", "flatten", reason, self.name, ts=now)
+            return WIND_FLATTEN, reason
+        return None
+
+    def _close_now_tick(self, now: datetime, qty: float, busy: bool) -> bool:
+        """P26-2 (Advisor 13 Oct 20:30 UK): the PM's close now flattens at market on the first fresh tick after it,
+        from active and from winding down alike; the strategy's own stops stay until the flatten fills. On stale data
+        it waits for a fresh tick, and says so once if none has come a bar plus WIND_GRACE after the close now. True
+        when the flatten is to go now (flatten_why set)."""
+        if "stale_data" in self.holds:
+            if not self._close_now_alerted and now - self._close_now_at > self.bar_length + WIND_GRACE:
+                self._close_now_alerted = True
+                self.store.event(self.name, "error", "close_now_waiting",
+                                 f"Close now has not flattened yet: no fresh price since "
+                                 f"{lifecycle.stamp(self._close_now_at)} ({self.holds['stale_data']}). It is sent at "
+                                 "market on the first fresh price; the strategy's own stops stay meanwhile.", ts=now)
+            return False
+        why = self.lifecycle_due(now, flat=abs(qty) < max(self.close_floor, 1e-12), busy=busy,
+                                 reason="Close now by the PM: flattened at market on the first fresh price")
+        if why is not None or self.lifecycle != lifecycle.WINDING_DOWN:
+            self._close_now_at = None  # sent (a bar close resends it while it still holds), or retired once flat
+        if why is None:
+            return False
+        self.flatten_why = why
+        return True
+
+    def wind_down_overdue(self, now: datetime) -> bool:
+        """Paper: past the deadline with no bar close for over a bar (a stale feed), so the tick flattens instead."""
+        return (self.lifecycle == lifecycle.WINDING_DOWN and self.wind_deadline is not None
+                and now >= self.wind_deadline
+                and (self._wind_checked is None or now - self._wind_checked > self.bar_length + WIND_GRACE))
+
     # --- gates ----------------------------------------------------------------
 
     def entry_blocked(self) -> tuple[bool, str | None]:
@@ -539,7 +738,8 @@ class SleeveRuntime:
         sleeve = None if self.backtest else self.store.sleeve(self.name)
         state = SimpleNamespace(status=self.status, status_reason=sleeve.status_reason if sleeve else "",
                                 paused_until=self.paused_until,
-                                desired_state=sleeve.desired_state if sleeve else "running")
+                                desired_state=sleeve.desired_state if sleeve else "running",
+                                lifecycle=sleeve.lifecycle if sleeve else lifecycle.ACTIVE)
         blocked, why = blocked_state(state, self.now(),
                                      liquidated=(self.liquidated or WIPED_OUT) if self.wiped_out else None,
                                      archived=sleeve is not None and self.name in self.store.archived(),
@@ -702,6 +902,8 @@ class SleeveRuntime:
     def can_open(self) -> bool:
         if self.wiped_out:
             return False  # liquidated: nothing opens until the PM resets it after the liquidation
+        if not lifecycle.can_open(self.lifecycle):
+            return False  # P2-6: winding down or retired; exits never ask
         if self.status == "paused" and self.paused_until and self.paused_until <= self.now():
             self._set("running", "daily-loss pause expired")
             self.store.event(self.name, "info", "resume", "daily-loss pause expired; trading again", ts=self.now())
@@ -726,6 +928,7 @@ class SleeveRuntime:
         the liquidation's halt, which a resume doesn't clear."""
         now = self.now()
         self.store.heartbeat(self.name, now)
+        self.refresh_lifecycle()
         if self.progress is not None:
             self.progress(now)
         if price <= 0:
@@ -771,7 +974,7 @@ class SleeveRuntime:
                 flatten, self.flatten_why = True, ("risk_halt", f"Risk halt: {ruined}")
         elif self.status == "running":
             judged = min(equity, guard_equity) if guard_equity is not None else equity
-            breach = risk.check(self.profile, judged, self.peak, self._day_open)
+            breach = risk.check(self.profile, judged, self.peak, self._day_open, self.halts)
             if breach and breach.action == "halt":
                 self._set("halted", breach.reason)
                 self.store.event(self.name, "error", "risk_halt", breach.reason + "; flattened, PM must resume", ts=self.now())
@@ -789,7 +992,7 @@ class SleeveRuntime:
             # pause; a daily-loss breach flattens and is journaled but keeps the pause it was in, so a PM pause or an
             # exits-only start is never turned into one the 00:00 roll lifts. A daily pause already flattened.
             judged = min(equity, guard_equity) if guard_equity is not None else equity
-            breach = risk.check(self.profile, judged, self.peak, self._day_open)
+            breach = risk.check(self.profile, judged, self.peak, self._day_open, self.halts)
             if breach and breach.action == "halt":
                 self._set("halted", breach.reason)
                 self.store.event(self.name, "error", "risk_halt", breach.reason + "; flattened, PM must resume",
@@ -883,6 +1086,14 @@ class SleeveRuntime:
                 self.store.event(self.name, "error", "flatten_failed",
                                  f"still holding {qty:.12g} after {FLATTEN_RETRIES} attempts to close it; the PM must "
                                  f"flatten it ({self._owed_flatten[1]})", ts=self.now())
+        if not flatten and self._close_now_at is not None:
+            flatten = self._close_now_tick(now, qty, busy)
+        if not flatten and self._close_now_at is None and self.wind_down_overdue(now):
+            # P2-6: the deadline passed and no bar has closed for over a bar (a stale feed): the flatten that the bar
+            # close would have sent goes from the tick, and again a bar later while still holding (Advisor 14:55).
+            why = self.lifecycle_due(now, flat=abs(qty) < max(self.close_floor, 1e-12), busy=busy)
+            if why is not None:
+                flatten, self.flatten_why = True, why
         if not flatten and self.raced is not None:
             held = abs(qty) >= max(self.close_floor, 1e-12)
             flattening = self.status == "halted" or (self.status == "paused" and self.paused_until is not None)

@@ -13,6 +13,7 @@ from sleeve_fund.research.pbo import (
     NOT_JUDGED,
     PARTIAL,
     PBO_CHECK,
+    TOO_PARTIAL,
     TOO_FEW,
     _ranks,
     g1_row,
@@ -95,7 +96,21 @@ def test_r4_4_too_few_variants_or_days_are_not_judged_and_never_pass_g1():
         assert g1_row(r)[1] == NOT_JUDGED and g1_row(r)[2].startswith("PBO not judged: ")
     assert g1_row(short)[2].startswith("PBO not judged: window too short")
     assert g1_verdict([("Something else", "PASS", ""), g1_row(short)]) == (NOT_JUDGED, [PBO_CHECK])
-    assert g1_row(None) == (PBO_CHECK, "N/A", "not computed for this study")  # a result from before R4
+
+
+def test_f238_1_a_study_with_no_pbo_result_is_not_judged_so_g1_fails_closed():
+    assert g1_row(None) == (PBO_CHECK, NOT_JUDGED, "PBO not computed for this study")  # a result from before R4
+    assert g1_verdict([("Something else", "PASS", ""), g1_row(None)]) == (NOT_JUDGED, [PBO_CHECK])
+
+
+def test_f238_3_more_than_a_fifth_of_the_family_not_re_run_is_not_judged_a_fifth_still_is():
+    f = _frame(np.random.default_rng(8).normal(0, 0.01, size=(320, 12)))
+    three = tuple(f"trial t{i}: ValueError: bad" for i in range(3))  # 3 of 15 = 20%: judged, labelled partial
+    four = tuple(f"trial t{i}: ValueError: bad" for i in range(4))  # 4 of 16 = 25%: not judged
+    judged, not_judged = pbo(f, partial=three), pbo(f, partial=four)
+    assert judged.value == pbo(f).value and g1_row(judged)[2].startswith(PARTIAL)
+    assert (not_judged.value, not_judged.verdict) == (None, TOO_PARTIAL) and "4 of the 16" in not_judged.words
+    assert g1_row(not_judged)[1] == NOT_JUDGED
 
 
 def test_r4_5_thresholds_at_their_boundaries():
@@ -412,3 +427,25 @@ def test_r4_buy_and_hold_is_never_a_g1_candidate(tmp_path, instrument):
     passing = [(n, "PASS" if n not in (CANDIDATE_CHECK, PBO_CHECK) else v, e) for n, v, e in checks]
     assert g1_verdict(passing)[0] == NOT_JUDGED  # every other row passing still isn't a pass
     assert g1_verdict([("Enough trades", "FAIL", "3"), row]) == ("FAIL", ["Enough trades"])  # nor hides a fail
+
+
+def test_f238_2_pbo_reads_the_studys_own_idea_family_and_the_model_names_only_without_one():
+    from sleeve_fund.research.study import _overfit
+    from sleeve_fund.research.trials import legacy_idea_hash
+
+    class Register:
+        def __init__(self):
+            self.asked = []
+
+        def no_selection(self, idea):
+            self.asked.append(idea)
+            return ""
+
+        def _counted(self, idea):
+            self.asked.append(idea)
+            return []
+
+    for given, want in (("structural-abc", "structural-abc"), (None, legacy_idea_hash(SPEC.name))):
+        reg = Register()
+        _overfit({}, [], reg, SPEC, pd.DataFrame(), bt=None, idea_hash=given)
+        assert reg.asked == [want, want]

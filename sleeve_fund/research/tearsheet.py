@@ -110,7 +110,7 @@ def _row(label: str, s: dict, b: dict | None) -> str:
 def _idea(r: StudyResult) -> str:
     from sleeve_fund.research.trials import legacy_idea_hash
 
-    return legacy_idea_hash(r.spec.name)
+    return getattr(r, "idea_hash", None) or legacy_idea_hash(r.spec.name)
 
 
 def _counts(r: StudyResult, ledger: IdeaLedger, register) -> dict:
@@ -594,6 +594,10 @@ def render(r: StudyResult, ledger: IdeaLedger, register=None, liquidation_ack: s
                "Break-even fees in this table are interpolated between the cost ladder's rungs; the chosen "
                "settings' is re-run to verify it, as the cost ladder says.")
     out.append("")
+    if getattr(r, "ablation", None) is not None:
+        from sleeve_fund.research.ablation import section
+
+        out.extend(section(r.ablation))
     out.append("## Idea counter")
     out.append("")
     uncertain = f" {N_UNCERTAIN}" if counts.get("n_uncertain") else ""
