@@ -1,9 +1,9 @@
 {% extends "base.html" %}
 {% from "_reasons.html" import reason_picker %}
-{% block title %}Portfolio Settings · Multi-Strategy Fund{% endblock %}
+{% block title %}Portfolio compliance settings · Multi-Strategy Fund{% endblock %}
 {% block content %}
 <div class="page-head">
-  <h1>Portfolio Settings: compliance tests</h1>
+  <h1>Portfolio compliance settings</h1>
   {% if mode == 'view' %}<div class="actions"><a class="button" href="/portfolio-settings?edit=1">Edit tests and groups</a></div>{% endif %}
   <p class="lede">Every trade idea from every Strategy passes these tests before an order goes out, or it is refused and the test that refused it is recorded. Version {{ v.version }}.</p>
 </div>
@@ -46,12 +46,12 @@
 
 <section class="panel" aria-labelledby="groups-h">
   <h2 id="groups-h">Asset groups</h2>
-  <p class="muted">The per-group test adds up each group's loss if every stop is hit. An asset with no group counts as {{ v.strictest }}, the strictest group.</p>
+  <p class="muted">The per-group test adds up each group's loss if every stop is hit. {{ v.unmapped_words }}</p>
   <table class="tbl">
     <thead><tr><th scope="col">Asset</th><th scope="col">Group</th></tr></thead>
     <tbody>{% for a in v.groups %}<tr data-asset="{{ a.asset }}"><td>{{ a.asset }}</td>
-      <td>{% if editing %}{% set fg = (form.get('group.' ~ a.asset) if form else a.group) %}<select name="group.{{ a.asset }}" aria-label="{{ a.asset }} group"><option value="">No group (counts as {{ v.strictest }})</option>{% for g in v.group_names %}<option value="{{ g }}"{{ ' selected' if fg == g }}>{{ g|capitalize }}</option>{% endfor %}</select>
-      {% elif a.group %}{{ a.group|capitalize }}{% else %}<span class="warn">{{ v.strictest|capitalize }} (no group set)</span>{% endif %}</td></tr>
+      <td>{% if editing %}{% set fg = (form.get('group.' ~ a.asset) if form else a.group) %}<select name="group.{{ a.asset }}" aria-label="{{ a.asset }} group"><option value="">No group</option>{% for g in v.group_names %}<option value="{{ g }}"{{ ' selected' if fg == g }}>{{ g|capitalize }}</option>{% endfor %}</select>
+      {% elif a.group %}{{ a.group|capitalize }}{% else %}<span class="warn">No group{{ ": no new trades while the per-group test is on" if v.t2_on }}</span>{% endif %}</td></tr>
     {% else %}<tr><td colspan="2" class="empty">No assets yet.</td></tr>{% endfor %}</tbody>
   </table>
 </section>

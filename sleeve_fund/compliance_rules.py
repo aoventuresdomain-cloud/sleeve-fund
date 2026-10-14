@@ -26,18 +26,18 @@ class Rule:
 
 RULES = (
     Rule("asset_stop_loss", "T1", "Per asset: loss if every stop is hit", "asset", "open_risk", "trim",
-         Decimal("0.02"), Decimal("0.0025"), Decimal("0.05")),
+         Decimal("0.04"), Decimal("0.0025"), Decimal("0.05")),
     Rule("type_stop_loss", "T2", "Per asset group: loss if every stop is hit", "asset_type", "open_risk", "trim",
-         Decimal("0.03"), Decimal("0.005"), Decimal("0.10")),
+         Decimal("0.06"), Decimal("0.005"), Decimal("0.10")),
     Rule("fund_stop_loss", "T3", "Whole fund: loss if every stop is hit", "fund", "open_risk", "trim",
-         Decimal("0.05"), Decimal("0.01"), Decimal("0.10"), locked=True),
+         Decimal("0.10"), Decimal("0.01"), Decimal("0.10"), locked=True),
     Rule("fund_gross", "T4", "Gross: every position's size added up", "fund", "gross", "trim",
          Decimal("1.5"), Decimal("0.1"), Decimal(3), unit="x"),
     Rule("asset_net", "T4", "Net per asset: long less short on one asset", "asset", "net", "trim",
          Decimal("0.5"), Decimal("0.05"), Decimal(1), unit="x"),
     Rule("fund_margin", "T4", "Margin posted", "fund", "margin", "trim",
          Decimal("0.5"), Decimal("0.10"), Decimal("0.80")),
-    Rule("fund_day_loss", "T5", "Today's loss pauses new trades until 00:00 UTC", "fund", "day_loss", "pause",
+    Rule("fund_day_loss", "T5", "Today's loss pauses new trades until 00:00 UTC", "fund", "day_loss", "pause_day",
          Decimal("0.03"), Decimal("0.01"), Decimal("0.05"), locked=True),
     Rule("fund_drawdown", "T5", "Drawdown from the peak closes everything and halts", "fund", "drawdown", "halt",
          Decimal("0.15"), Decimal("0.05"), Decimal("0.25"), locked=True),
@@ -48,7 +48,8 @@ LOCKED = frozenset(r.key for r in RULES if r.locked)
 TESTS = {"T1": "Per asset", "T2": "Per asset group", "T3": "Whole fund", "T4": "Size limits", "T5": "Loss brakes"}
 
 GROUPS = ("large", "mid", "small")
-STRICTEST = "small"  # an asset with no group counts as this one (Advisor BRIDGE-3)
+# An asset with no group: the gate refuses its entries while the per-group test is on (Advisor BRIDGE-A-FE-2).
+UNMAPPED = "An asset with no group can't take a new trade while the per-group test is on. Give it a group here."
 
 
 def show(key: str, limit: Decimal | float) -> str:
@@ -132,8 +133,8 @@ def changes(old: dict[str, dict] | None, new: dict[str, dict], old_groups: dict[
 
 
 def defaults() -> dict[str, dict]:
-    """Version 1 as the DA seeds it: the built tests on, per asset and per group off until the PM switches them on."""
-    return {r.key: {"limit": r.default, "enabled": r.key not in ("asset_stop_loss", "type_stop_loss")} for r in RULES}
+    """Version 1 as the DA seeds it (PM defaults 14 Oct 22:50 UK): every test on."""
+    return {r.key: {"limit": r.default, "enabled": True} for r in RULES}
 
 
 # The gate's limit_hit before the versioned tests (portfolio.limits), as the test it now is; and its outcomes that

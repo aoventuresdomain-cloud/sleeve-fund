@@ -25,8 +25,8 @@ def assets(store: Store) -> list[str]:
 
 def use_now(store: Store, groups: dict[str, str]) -> dict:
     """{key: {used, what, tone}} for each test against the entry gate's last mark, or {} with `source` unmarked /
-    unreadable. Open risk by asset and by group is the gate's own per-holding risk summed; an unmapped asset counts in
-    the strictest group."""
+    unreadable. Open risk by asset and by group is the gate's own per-holding risk summed; an unmapped asset is in no
+    group (the gate takes no new entry on it while the per-group test is on)."""
     from sleeve_fund.paper.portfolio_gate import PaperGate
     from sleeve_fund.portfolio.limits import Book
 
@@ -45,8 +45,8 @@ def use_now(store: Store, groups: dict[str, str]) -> dict:
     by_group: dict[str, Decimal] = {}
     for h in book.holdings:
         by_asset[h.underlying] = by_asset.get(h.underlying, Decimal(0)) + h.risk
-        g = groups.get(h.underlying, rules.STRICTEST)
-        by_group[g] = by_group.get(g, Decimal(0)) + h.risk
+        if (g := groups.get(h.underlying)) is not None:
+            by_group[g] = by_group.get(g, Decimal(0)) + h.risk
     nets = {u: abs(book.net(u)) for u in by_asset}
 
     def top(d: dict[str, Decimal]) -> tuple[Decimal, str]:
@@ -90,10 +90,12 @@ def page(store: Store) -> dict:
                      "used": rules.show(r.key, u["used"]) if u else None, "what": u["what"] if u else "",
                      "tone": _tone(u["used"], t["limit"]) if u and t["enabled"] else ""})
     grouped = [{"test": k, "name": v, "rows": [x for x in rows if x["test"] == k]} for k, v in rules.TESTS.items()]
-    names = assets(store)
+    names = sorted(set(assets(store)) | set(groups))
     return {"version": current.version, "tests": grouped, "source": use.get("source"),
-            "groups": [{"asset": a, "group": groups.get(a)} for a in sorted(set(names) | set(groups))],
-            "group_names": rules.GROUPS, "strictest": rules.STRICTEST, "history": history(store),
+            # Unmapped first, flagged (Advisor BRIDGE-A-FE-2).
+            "groups": [{"asset": a, "group": groups.get(a)} for a in sorted(names, key=lambda a: (a in groups, a))],
+            "group_names": rules.GROUPS, "unmapped_words": rules.UNMAPPED,
+            "t2_on": tests.get("type_stop_loss", {}).get("enabled", False), "history": history(store),
             "current": {"tests": tests, "groups": groups}}
 
 

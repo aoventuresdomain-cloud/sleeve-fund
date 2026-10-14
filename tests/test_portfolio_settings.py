@@ -1,7 +1,7 @@
 """Portfolio Settings (Bridge Drop A; Advisor BRIDGE-3 and BRIDGE-A-FE, 14 Oct 2026): the five compliance tests with
 their use now, edited through a review step into a new version shown in history; the whole-fund test and the loss
 brakes can't be switched off or set outside their bounds, on the form and on the server; the asset-group map with
-unmapped assets counted as the strictest group; edits apply to new trades only."""
+unmapped assets first and flagged; edits apply to new trades only."""
 
 from __future__ import annotations
 
@@ -65,8 +65,8 @@ def ps(client):  # noqa: F811
 
 
 def _form(**over) -> dict:
-    f = {"expected_version": "1", "asset_stop_loss.limit": "2", "type_stop_loss.limit": "3",
-         "fund_stop_loss.limit": "5", "fund_gross.limit": "1.5", "asset_net.limit": "0.5", "fund_margin.limit": "50",
+    f = {"expected_version": "1", "asset_stop_loss.limit": "4", "type_stop_loss.limit": "6",
+         "fund_stop_loss.limit": "10", "asset_stop_loss.enabled": "on", "type_stop_loss.enabled": "on", "fund_gross.limit": "1.5", "asset_net.limit": "0.5", "fund_margin.limit": "50",
          "fund_day_loss.limit": "3", "fund_drawdown.limit": "15", "fund_gross.enabled": "on", "asset_net.enabled": "on",
          "fund_margin.enabled": "on", "group.BTC": "large"}
     f.update(over)
@@ -85,31 +85,31 @@ def test_the_page_shows_the_five_tests_their_limits_and_the_fixed_lines(ps):
     for words in ("T1 Per asset", "T2 Per asset group", "T3 Whole fund", "T4 Size limits", "T5 Loss brakes",
                   "Edits apply to new trades only.", "can be changed but not switched off",
                   "If the tests can't be read, no new trade goes out.",
-                  "An asset with no group counts as small, the strictest group."):
+                  "An asset with no group can't take a new trade while the per-group test is on."):
         assert words in t
     assert "1.5x" in t and "15%" in t and "50%" in t
     assert t.count("Always on") == 3  # T3 and both loss brakes
-    assert "Small (no group set)" in t  # BTC and SOL unmapped at version 1
+    assert t.count("No group: no new trades while the per-group test is on") == 2  # BTC and SOL unmapped at v1
     assert "sleeve" not in t.lower()
 
 
 def test_an_edit_is_reviewed_old_to_new_then_saved_as_a_new_version_in_history(ps):
     c, v = ps
-    r = c.post("/portfolio-settings/review", data=_form(**{"asset_stop_loss.limit": "1.5",
-                                                           "asset_stop_loss.enabled": "on"}), auth=AUTH, headers=SAME)
+    r = c.post("/portfolio-settings/review", data=_form(**{"asset_stop_loss.limit": "3",
+                                                           "type_stop_loss.enabled": None}), auth=AUTH, headers=SAME)
     assert r.status_code == 200
     t = _text(r.text)
-    assert "T1 Per asset: 2% → 1.5%" in t and "T1 Per asset: off → on" in t and "BTC group: none → large" in t
+    assert "T1 Per asset: 4% → 3%" in t and "T2 Per asset group: on → off" in t and "BTC group: none → large" in t
     assert len(v.versions) == 1  # the review writes nothing
     carried = dict(re.findall(r'<input type="hidden" name="([^"]+)" value="([^"]*)">', r.text))
     r = c.post("/portfolio-settings/apply", data={**carried, "reason_pick": "Tighter while testing"}, auth=AUTH,
                headers=SAME, follow_redirects=False)
     assert r.status_code == 303 and r.headers["location"] == "/portfolio-settings?saved=2"
     new = {t["test"]: t for t in v.versions[-1]["tests"]}
-    assert new["asset_stop_loss"]["limit"] == D("0.015") and new["asset_stop_loss"]["enabled"]
+    assert new["asset_stop_loss"]["limit"] == D("0.03") and not new["type_stop_loss"]["enabled"]
     assert v.versions[-1]["asset_types"] == {"BTC": "large"} and v.versions[-1]["note"] == "Tighter while testing"
     page = _text(c.get("/portfolio-settings?saved=2", auth=AUTH).text)
-    assert "Saved as version 2" in page and "Tighter while testing" in page and "T1 Per asset: 2% → 1.5%" in page
+    assert "Saved as version 2" in page and "Tighter while testing" in page and "T1 Per asset: 4% → 3%" in page
     assert "Large" in page
 
 
