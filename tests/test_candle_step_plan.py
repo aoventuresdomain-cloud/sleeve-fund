@@ -17,7 +17,8 @@ MIN = timedelta(minutes=1)
 
 
 def test_the_step_clock_is_the_bars_close_time_never_the_start():
-    assert [step_at(T0 + i * MIN, 1) for i in range(8)] == [(0, s) for s in range(6)] + [(1, 0), (1, 1)]
+    c = step_at(T0, 1)[0]
+    assert [step_at(T0 + i * MIN, 1) for i in range(8)] == [(c, s) for s in range(6)] + [(c + 1, 0), (c + 1, 1)]
     assert step_at(T0, 1)[0] + 1 == step_at(T0 + 6 * MIN, 1)[0]
     assert step_at(T0 + 3 * MIN, 1) == step_at(T0 + 3 * MIN + timedelta(seconds=59), 1)  # one bar, one step
     assert step_at(T0 + 15 * MIN, 5) == (step_at(T0 + 15 * MIN, 5)[0], 3)  # 5-minute bars count bars, not minutes
