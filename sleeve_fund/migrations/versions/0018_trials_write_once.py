@@ -9,8 +9,8 @@ Additive only: nothing is changed or removed; no row is read. Skipped when a Sto
 first (create_all).
 
 Revision ID: 0018
-Revises: 0014 (0015 ORPHAN-GUARD, 0016 CASH-4 and 0017 P2-6 are reserved and not merged: the PR that merges later
-re-chains, per the register)
+Revises: 0016 (CASH-4, merged; 0015 ORPHAN-GUARD is reserved and not merged: the PR that merges later re-chains,
+per the register)
 Create Date: 2026-10-13 17:40:00.000000
 """
 
@@ -19,7 +19,7 @@ import sqlalchemy as sa
 
 
 revision = '0018'
-down_revision = '0014'
+down_revision = '0016'
 branch_labels = None
 depends_on = None
 
