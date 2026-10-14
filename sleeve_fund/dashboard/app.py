@@ -214,10 +214,10 @@ def create_app(store: Store | None = None) -> FastAPI:
         return sleeves, frames, summaries
 
     def shown_book():
-        """The book as the PM's equity and P&L show it (CCY-8DP-UI, HoE 13 Oct): strategies on a named test account are
-        left out of those totals and listed apart, as their results are never Strategy evidence. Display only, and
-        never risk: open risk, margin and the Risk page read every strategy, as the limits do, so the screen never
-        shows less risk than the engine enforces. Returns book_data's three plus the test ones."""
+        """The book as the PM's equity and P&L show it (CCY-8DP-UI): a Strategy outside the fund's book (a test
+        account, supervisor.outside_fund_book) is left out of those totals, as the gate and fund_equity leave it out
+        (F229-6 A4), and listed apart; its results are never Strategy evidence. Its position still shows on the
+        Positions tab, marked as not counted. Returns book_data's three plus the test ones."""
         sleeves, frames, summaries = book_data()
         tests = [x for x in summaries if x["test_account"]]
         out = {x["sleeve"].name for x in tests}
@@ -239,7 +239,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         working = [trading.order_view(o) for o in st().orders(None, trading.STATUS_TABS["open"][1], limit=200)
                    if o["sleeve"] in names]
         book = bookm.book_view(st(), summaries, frames)
-        positions = trading.book_positions(st(), summaries + tests)  # risk counts every strategy, as the gate does
+        positions = trading.book_positions(st(), summaries + tests)  # shown; outside the book is marked not counted
         funding = trading.book_funding(st(), summaries)
         # Costs as money paid: fees plus funding paid (funding totals are + received, - paid).
         book["funding_paid"] = -funding["total"]
@@ -254,15 +254,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                     book=book, alerts=st().alerts(limit=30), shell=shell(),
                     positions=positions, working=working, holdings=bookm.holdings(positions["rows"], book["equity"]),
                     book_fills=trading.book_fills(st(), sleeves), funding=funding,
-                    fill_count=sum(x["fills"] for x in summaries), tests=tests,
-                    test_risk=_test_risk(positions, tests))
-
-    def _test_risk(positions: dict, tests: list[dict]) -> dict:
-        """Per test-account strategy, the open risk its position row counts in the tile (None: not measured), and
-        their total, for the tile's "incl. test accounts" line."""
-        names = {x["sleeve"].name for x in tests}
-        per = {r["sleeve"]: r["risk"]["amount"] for r in positions["rows"] if r["sleeve"] in names}
-        return {"per": per, "total": sum(v for v in per.values() if v is not None)}
+                    fill_count=sum(x["fills"] for x in summaries), tests=tests)
 
     def _recent_json(sleeves, days: int, daily) -> JSONResponse:
         """The last day or week at fine resolution, in the shape the charts read."""
@@ -298,7 +290,7 @@ def create_app(store: Store | None = None) -> FastAPI:
 
     @app.get("/risk", response_class=HTMLResponse)
     def risk_page(request: Request, _: str = Depends(require_pm)):
-        sleeves, frames, summaries = book_data()  # every strategy: risk is never filtered (CCY-8DP-UI)
+        sleeves, frames, summaries = book_data()
         book = bookm.book_view(st(), summaries, frames)
         kill = _kill_targets(summaries)
         risk = riskops.risk_view(st(), summaries, book)

@@ -40,7 +40,7 @@
   <div class="kpi" title="{{ book.margin_used|money }} isolated margin across open positions"><div class="k">Margin used</div><div class="v">{{ (book.margin_used / book.equity if book.equity > 0 else 0)|pct0 }}</div></div>
   {% else %}<div class="kpi pending" title="Waiting on the corrected isolated-margin figures"><div class="k">Margin used</div><div class="v faint">–</div></div>{% endif %}
   {% if positions.open_risk is defined %}
-  <div class="kpi wrap" title="{{ open_risk_hint(positions) }}{% if open_risk_room(positions, book.equity)|trim %} · {{ open_risk_room(positions, book.equity, plain=True) }}{% endif %}"><div class="k">Open risk</div><div class="v {{ open_risk_warn(positions) }}">{{ open_risk_text(positions) }}{% if positions.spot_left_out %} · spot {{ positions.spot_left_out|length }} not counted{% endif %}</div>{% if tests %}<div class="faint" title="Strategies on a test account: left out of equity and P&amp;L, but counted here as the limits count them">incl. test accounts: {{ test_risk.total|money }}</div>{% endif %}</div>
+  <div class="kpi wrap" title="{{ open_risk_hint(positions) }}{% if open_risk_room(positions, book.equity)|trim %} · {{ open_risk_room(positions, book.equity, plain=True) }}{% endif %}"><div class="k">Open risk</div><div class="v {{ open_risk_warn(positions) }}">{{ open_risk_text(positions) }}{% if positions.spot_left_out %} · spot {{ positions.spot_left_out|length }} not counted{% endif %}</div></div>
   {% else %}<div class="kpi pending" title="Waiting on the corrected open-risk figures"><div class="k">Open risk</div><div class="v faint">–</div></div>{% endif %}
   <div class="kpi" title="Worst {{ book.max_drawdown|pct1 }}{% if closest %} · closest to halt: {{ closest.sleeve.name }}, {{ closest.dd_used|pct0 }} of its limit used{% endif %}"><div class="k">Drawdown</div><div class="v {{ 'loss' if book.drawdown >= 0.05 }}">{{ book.drawdown|pct1 }}</div></div>
   <div class="kpi" title="Fees {{ book.fees|money }} · funding {{ 'paid' if book.funding_paid >= 0 else 'received' }} {{ book.funding_paid|abs|money }}{{ cost_share(book) }}"><div class="k">Fees and funding</div><div class="v">{{ book.fees_funding|money }}</div></div>
@@ -174,9 +174,9 @@
 
 {% if tests %}
 <details class="panel archived" id="test-accounts" open>
-  <summary><strong>Test accounts ({{ tests|length }})</strong> <span class="muted">strategies on a named test account: left out of the book's equity and P&amp;L above, and never Strategy evidence. Their open risk counts in the book's, as the limits count it, and the kill switch acts on them.</span></summary>
+  <summary><strong>Test accounts ({{ tests|length }})</strong> <span class="muted">strategies on a test account, outside the fund's book: left out of its equity, P&amp;L and open risk, as the limits leave them out, and never Strategy evidence. Their positions show under Positions, marked as not counted.</span></summary>
   <ul class="feed" style="margin-top:10px">{% for x in tests %}{% set s = x.sleeve %}
-    <li><span class="when">{{ x.equity|money }}</span><span class="what"><a href="/sleeves/{{ s.name }}">{{ s.name }}</a> {{ chip(s.status) }} {{ test_chip() }} <span class="muted">{{ s.instrument }} · {{ s.strategy|replace('_', ' ') }} · {{ signed(x.ret) }} since start{% if s.name in test_risk.per %} · open risk {% if test_risk.per[s.name] is not none %}{{ test_risk.per[s.name]|money }}{% else %}not measured{% endif %}{% endif %}</span></span></li>{% endfor %}
+    <li><span class="when">{{ x.equity|money }}</span><span class="what"><a href="/sleeves/{{ s.name }}">{{ s.name }}</a> {{ chip(s.status) }} {{ test_chip() }} <span class="muted">{{ s.instrument }} · {{ s.strategy|replace('_', ' ') }} · {{ signed(x.ret) }} since start</span></span></li>{% endfor %}
   </ul>
 </details>
 {% endif %}

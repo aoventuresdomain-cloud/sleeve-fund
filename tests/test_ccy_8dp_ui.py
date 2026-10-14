@@ -1,6 +1,6 @@
-"""CCY-8DP-UI (HoE 13 Oct): a Strategy on a named test account (supervisor.is_test_currency_account) is marked in the
-PM's views and left out of the book's figures, display only: it is never Strategy evidence, the kill switch still acts
-on it, and what the engine's limits read is unchanged."""
+"""CCY-8DP-UI (HoE 13 Oct; F229-6 A4, 14 Oct): a Strategy outside the fund's book (supervisor.outside_fund_book: under
+8 places on a named test account) is marked in the PM's views and left out of the book's figures, as the gate and
+fund_equity leave it out. It is never Strategy evidence, and what the engine's limits read is unchanged."""
 
 from fastapi.testclient import TestClient
 
@@ -44,9 +44,9 @@ def test_the_books_figures_leave_a_test_account_strategy_out(tmp_path, monkeypat
 
 
 
-def test_open_risk_is_never_filtered_and_says_what_the_test_accounts_add(tmp_path, monkeypatch):
-    """HoE: the screen never shows less risk than the engine enforces. The tile keeps the gate's figure, test accounts
-    included, with their part on a line under it; only equity and P&L leave them out."""
+def test_its_position_shows_marked_as_not_counted_and_the_home_equity_is_the_funds(tmp_path, monkeypatch):
+    """F229-6 A4: mark, don't hide. The position row stays on the Positions tab, not counted in the open risk (outside
+    the fund's book); the book's equity is the in-book Strategies' only."""
     from sleeve_fund.dashboard import trading
 
     c, _ = _client(tmp_path, monkeypatch)
@@ -55,9 +55,18 @@ def test_open_risk_is_never_filtered_and_says_what_the_test_accounts_add(tmp_pat
     monkeypatch.setattr(trading, "book_positions", lambda st, summaries: seen.append(
         sorted(x["sleeve"].name for x in summaries)) or real(st, summaries))
     home = c.get("/", auth=AUTH).text
-    assert seen == [["real", "tst"]]  # the tile's positions: every strategy
-    assert "incl. test accounts:" in home
-    assert "left out of the figures on this page" not in c.get("/risk", auth=AUTH).text  # it reads every strategy
+    assert seen == [["real", "tst"]]  # both listed
+    assert "outside the fund's book" in home and "incl. test accounts" not in home
+
+
+def test_the_test_account_mark_is_the_gates_predicate(tmp_path, monkeypatch):
+    from sleeve_fund import supervisor
+    from sleeve_fund.dashboard import book as bookm
+
+    _, store = _client(tmp_path, monkeypatch)
+    for s in store.sleeves():
+        assert bookm.is_test_account(store, s) == supervisor.outside_fund_book(store, s)
+    assert [s.name for s in store.sleeves() if bookm.is_test_account(store, s)] == ["tst"]
 
 
 def test_its_path_to_live_says_it_is_not_strategy_evidence(tmp_path, monkeypatch):

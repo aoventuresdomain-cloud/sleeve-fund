@@ -42,11 +42,12 @@ def _equity_at(store: Store, sleeve, ts: datetime) -> float:
 
 
 def is_test_account(store: Store, sleeve) -> bool:
-    """Whether the Strategy runs on a named test account (CCY-8DP): its results are never Strategy evidence, so the
-    PM's figures list it apart (CCY-8DP-UI). The supervisor's list decides, never a copy of it."""
-    from sleeve_fund.supervisor import is_test_currency_account
+    """Whether the Strategy is outside the fund's book: its quote currency held under 8 places, on the test account its
+    venue names (CCY-8DP, F229-6). Its results are never Strategy evidence and the gate leaves it out, so the PM's
+    figures list it apart (CCY-8DP-UI). The supervisor's one predicate decides, never a copy of it."""
+    from sleeve_fund.supervisor import outside_fund_book
 
-    return is_test_currency_account(store.account_of(sleeve.name), sleeve.venue)
+    return outside_fund_book(store, sleeve)
 
 
 def sleeve_extras(store: Store, x: dict, frame: pd.DataFrame) -> dict:
