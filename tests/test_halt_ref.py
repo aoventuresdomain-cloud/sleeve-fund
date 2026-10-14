@@ -682,3 +682,30 @@ def test_f282_2_the_rebase_values_dust_at_its_mark_not_its_entry(store):
     _incident(store)
     _, _, words = supervisor.rebase_halt_ref_1(store, "HoE", "abc1234")
     assert "dust counted as flat: a 0.00001 worth 0.7000;" in words
+
+
+def test_f_haltref_5_the_dry_run_prints_every_strategy_its_run_and_the_dust_and_they_sum_to_the_figures(
+        store, monkeypatch, capfd):
+    """HoQA F-HALTREF-5: what the re-base reads, row by row, from the dry run itself: a reset's run with its fills
+    and fees, a test-account Strategy outside the book, dust against the cap; the rows sum to the two figures."""
+    _make(store, "a", 10_000)
+    _mark(store, T0)
+    store.record_fill("a", side="BUY", qty=1.0, price=1_000.0, fee=1.5, order_id="r1", trade_id="r1", ts=T0)
+    store.record_fill("a", side="SELL", qty=1.0, price=900.0, fee=1.25, order_id="r2", trade_id="r2", ts=T0)
+    _settle(store, "a")
+    run = _reset(store, "a")
+    _make(store, "test", 10_000, instrument="BTC/USD", venue="KRAKEN")  # on "paper", its venue's test account
+    _make(store, "d", 10_000)
+    _dust(store, "d", T0 + timedelta(seconds=1))
+    _incident(store, monkeypatch)
+    assert supervisor.main(["rebase", "--actor", "HoE", "--commit", "abc1234"]) == 0
+    out = capfd.readouterr().out
+    assert "true book (fund equity): " in out and supervisor.fund_equity(store) == D("19897.25")
+    assert supervisor.capital_in(store) == D(20_000)
+    assert f"{run} | in: a reset's run (" in out and "its cash only | 10,000.00 | -102.75 | 2 | 2.75 |" in out
+    assert "| -102.75 | 0.00" in out.split(f"{run} |")[1].splitlines()[0]
+    assert "test | out: a test account (F229-6) | 10,000.00 | 0.00 | 0 | 0.00 |" in out
+    assert "total | | | | | | | | | 19,897.25 | 20,000.00" in out  # fund_equity's and capital_in's
+    assert f"  {run} fill " in out and "BUY 1 at 1,000.00, fee 1.5000" in out and "SELL 1 at 900.00, fee 1.2500" in out
+    assert "dust: 1 holding(s) worth 0.0600, 0.0003% of the book (cap 0.1%, 19.90); d 0.000001 worth 0.0600" in out
+    assert "not written (a dry run)" in out
