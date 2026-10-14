@@ -1604,7 +1604,7 @@ class Store:
         taken: list[Decimal] = []
 
         def part() -> Decimal:
-            return Decimal(0) if sleeve in self.withdrawn() else self._in_book_equity(sleeve)
+            return Decimal(0) if sleeve in self.withdrawn() else self.in_book_equity(sleeve)
 
         def amount() -> Decimal:
             taken.append(part())
@@ -1625,7 +1625,7 @@ class Store:
                              .values(withdrawn=stored(out))).rowcount:
                 c.execute(insert(sleeve_archive_t).values(sleeve=sleeve, archived_at=ts, withdrawn=stored(out)))
 
-    def _in_book_equity(self, sleeve: str) -> Decimal:
+    def in_book_equity(self, sleeve: str) -> Decimal:
         """`sleeve`'s equity as the fund's book counts it (supervisor.strategy_equity), or nothing when it sits outside
         the book (a saved backtest, a test account, F229-6)."""
         s = self.sleeve(sleeve)
@@ -1674,7 +1674,7 @@ class Store:
         def amount() -> Decimal:
             if sleeve not in self.withdrawn():
                 return Decimal(0)  # an archive from before F-C3B-A: it never left the book
-            back.append(self._in_book_equity(sleeve))
+            back.append(self.in_book_equity(sleeve))
             return back[0]
 
         with self._book_move(amount, lambda: f"{sleeve} brought back: its equity {back[0]:,.2f} comes into the fund's "
