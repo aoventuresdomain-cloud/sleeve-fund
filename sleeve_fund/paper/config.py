@@ -91,8 +91,9 @@ class SleeveConfig:
         if not PAIR_RE.match(self.instrument):
             raise ValueError(f"instrument must look like BASE/QUOTE (e.g. SUI/USD), got {self.instrument!r}")
         markets.check_venue(self.params, self.venue)  # a perpetual venue has no spot
-        if self.starting_balance <= 0:
-            raise ValueError("starting_balance must be positive")
+        # 0 once the fund holds the cash (CUT-A (a)): the simulated account is funded from the fund (virtual_funding).
+        if self.starting_balance < 0:
+            raise ValueError("starting_balance can't be below 0")
         if self.max_notional is not None and self.max_notional <= 0:
             raise ValueError("max_notional must be positive")
         if not 0 <= self.warmup_bars <= MAX_WARMUP_BARS:
