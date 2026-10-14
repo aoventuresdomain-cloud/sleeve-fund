@@ -1677,8 +1677,13 @@ def create_app(store: Store | None = None) -> FastAPI:
             return page(request, "portfolio_settings.html", v=v, mode="edit", saved="", errors=errors, form=form)
         cur = v["current"]
         lines = compliance_rules.changes(cur["tests"], tests, cur["groups"], groups)
+        warned = compliance_rules.warnings(tests)
+        no_group = [g["asset"] for g in v["groups"] if not groups.get(g["asset"])]
+        if cur["tests"].get("type_stop_loss", {}).get("enabled") and not tests["type_stop_loss"]["enabled"] and no_group:
+            warned.append(f"Assets with no group ({', '.join(no_group)}) will no longer be refused. They still count "
+                          "under per asset, whole fund and size limits.")
         return page(request, "portfolio_settings.html", v=v, mode="review", saved="", errors=[], form=form,
-                    changes=lines, warnings=compliance_rules.warnings(tests), expected=expected,
+                    changes=lines, warnings=warned, expected=expected,
                     carry=compliance.to_form(tests, groups))
 
     @app.post("/portfolio-settings/apply")

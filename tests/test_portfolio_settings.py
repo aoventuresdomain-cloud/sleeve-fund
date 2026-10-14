@@ -88,8 +88,8 @@ def test_the_page_shows_the_five_tests_their_limits_and_the_fixed_lines(ps):
                   "An asset with no group can't take a new trade while the per-group test is on."):
         assert words in t
     assert "1.5x" in t and "15%" in t and "50%" in t
-    assert t.count("Always on") == 3  # T3 and both loss brakes
-    assert t.count("No group: no new trades while the per-group test is on") == 2  # BTC and SOL unmapped at v1
+    assert t.count("Locked on") == 3  # T3 and both loss brakes
+    assert t.count("No group · ideas refused") == 2  # BTC and SOL unmapped at v1
     assert "sleeve" not in t.lower()
 
 
@@ -164,3 +164,15 @@ def test_the_rules_module_round_trips_the_pms_units():
     assert not errors and groups == {"BTC": "mid"}
     assert {k: (t["limit"], t["enabled"]) for k, t in back.items()} == {
         k: (t["limit"], t["enabled"] or rules.BY_KEY[k].locked) for k, t in tests.items()}
+
+
+def test_switching_the_group_test_off_names_the_unmapped_assets_it_stops_refusing(ps):
+    c, _ = ps
+    r = c.post("/portfolio-settings/review", data=_form(**{"type_stop_loss.enabled": None, "group.BTC": None}),
+               auth=AUTH, headers=SAME)
+    t = _text(r.text)
+    assert ("Assets with no group (BTC, SOL) will no longer be refused. They still count under per asset, whole fund "
+            "and size limits.") in t
+    page = _text(c.get("/portfolio-settings", auth=AUTH).text)
+    assert "Version 1 · in force since" in page and "set by migration 0025" in page and "in force" in page
+    assert "Refuse or trim" in page and "Pause new trades" in page and "Flatten and halt" in page
