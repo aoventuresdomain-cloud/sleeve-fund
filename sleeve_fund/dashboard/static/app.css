@@ -1064,6 +1064,18 @@ nav.tabs .sig-tab-lights .sig-lamp { width: 7px; height: 7px; box-shadow: none; 
 .ov-signals .sig-timing { margin: 8px 2px 0; font-size: 12px; }
 /* Under the chart: Position, Trades, Open orders and Order history in one panel. */
 .ov-lower { margin-bottom: 14px; }
+/* C8: the side panel beside the chart (Signals | Settings), the read-only settings, and the wide dialogs. */
+.ov-side { min-width: 0; max-height: 640px; overflow-y: auto; margin: 0; }
+.ov-side .ov-signals { max-height: none; overflow: visible; padding: 10px 12px; }
+.side-kv { margin: 0; padding: 10px 16px 4px; display: grid; gap: 8px; font-size: 13px; }
+.side-kv > div { display: grid; gap: 2px; }
+.side-kv dt { color: var(--muted); font-size: 12px; }
+.side-kv dd { margin: 0; }
+.side-acts { padding: 4px 16px 14px; margin: 0; }
+.pos-more { padding: 0 18px 12px; }
+.tp-dropped { padding: 0 18px 10px; margin: 0; font-size: 12.5px; color: var(--muted); }
+.path-btn .faint { margin-left: 4px; }
+dialog.wide { width: min(960px, calc(100vw - 32px)); max-height: calc(100vh - 48px); overflow-y: auto; }
 .ov-lower .panel { border: 0; background: none; margin: 0; box-shadow: none; }
 .sub-tabs { display: flex; gap: 4px; padding: 6px 12px 0; border-bottom: 1px solid var(--line); overflow-x: auto; }
 .sub-tabs button { background: none; border: 0; border-bottom: 2px solid transparent; border-radius: 0; color: var(--muted); padding: 8px 10px; font-size: 13px; font-weight: 500; box-shadow: none; white-space: nowrap; }

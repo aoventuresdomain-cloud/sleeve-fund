@@ -58,6 +58,11 @@
 {{ _board(sig, "") }}
 </div>
 </div>
+{{ signals_clock() }}
+{%- endmacro %}
+
+{# The countdown script, once per page, beside either board. #}
+{% macro signals_clock() -%}
 <script>
 // The countdown to the model's next close ticks each second between live updates.
 (() => {

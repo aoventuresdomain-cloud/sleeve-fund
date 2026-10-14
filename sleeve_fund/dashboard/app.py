@@ -629,7 +629,11 @@ def create_app(store: Store | None = None) -> FastAPI:
                     clone_qs=_clone_qs(s), backtest_id=bt_id, tested=_tested(bt_id),
                     demo=None if bt_id else _demo_copy(st(), s),
                     strategy_errors=st().strategy_errors(name, since_start=not bt_id),
-                    path=path, journey=None if bt_id else _journey(s, x, path, st().mirror_rows(name, limit=200)))
+                    path=path, journey=None if bt_id else _journey(s, x, path, st().mirror_rows(name, limit=200)),
+                    rules=_order_rules(s, x), tp_drop=None if bt_id else _tp_drop(recent, x),
+                    contribution=None if bt_id else _contribution(st(), x),
+                    bars=[] if bt_id else compliance.strategy_bars(
+                        st(), s.instrument.split("/")[0], _risk_to_stop(x, position), s.params.get("risk_per_trade")))
 
     def _two_legs(s, x: dict, frame) -> dict | None:
         """A two-leg Strategy's part of its page (P2-8 step 7): on its first leg, the Strategy folded (legs.fold_one)
@@ -2739,6 +2743,44 @@ def _position_history(events: list[dict], funding: list[dict], position: dict | 
              for f in funding if f["ts"] >= since]
     rows.sort(key=lambda r: r["ts"], reverse=True)
     return rows[:60]
+
+
+def _order_rules(s, x: dict) -> dict:
+    """The Strategy's own settings as the Settings panel reads them (C8): risk per trade as a share of the fund, the
+    leverage its orders may use and whether a stop is required. A Strategy without a stop trades at 1x only."""
+    rpt = s.params.get("risk_per_trade")
+    stop = bool(s.params.get("stop_loss") or s.params.get("stop_atr"))
+    lev = leverage_cap(x["profile"], s.params) if markets.is_perp(s.params) and stop else 1.0
+    return {"risk_pct": float(rpt) * 100 if rpt else None, "leverage": lev, "stop": stop}
+
+
+def _risk_to_stop(x: dict, position: dict | None) -> float | None:
+    """The open position's loss if its stop is hit, at the last mark (open_risk.position_risk, the gate's formula);
+    0 when flat, None with no stop to measure from."""
+    if not position or not x.get("qty"):
+        return 0.0
+    try:
+        return float(open_risk.position_risk(x["qty"], x["price"], position.get("stop_px")))
+    except ValueError:
+        return None
+
+
+def _tp_drop(orders: list[dict], x: dict) -> dict | None:
+    """The take-profit the engine dropped on the open position's entry (QD's signal keys: tp_dropped in the PM's
+    words, tp_target and tp_break_even as fractions), or None. Read from the newest entry order."""
+    if not x.get("qty"):
+        return None
+    entry = next((o for o in orders if o.get("intent") == "entry"), None)
+    sig = (entry or {}).get("signal") or {}
+    if not sig.get("tp_dropped"):
+        return None
+    return {"words": sig["tp_dropped"], "target": sig.get("tp_target"), "break_even": sig.get("tp_break_even")}
+
+
+def _contribution(store, x: dict) -> float | None:
+    """Its P&L since start over the fund's book at its first mark; None before the book's first mark."""
+    first = store.first_book_mark()
+    return float(x["pnl"]) / float(first["equity"]) if first and first["equity"] else None
 
 
 def _journey(s, x: dict, path: list[dict] | None, mirror: list[dict]) -> list[dict]:

@@ -25,10 +25,8 @@ def assets(store: Store) -> list[str]:
     return sorted({r["underlying"] for r in store.instruments()})
 
 
-def use_now(store: Store, groups: dict[str, str]) -> dict:
-    """{key: {used, what, tone}} for each test against the entry gate's last mark, or {} with `source` unmarked /
-    unreadable. Open risk by asset and by group is the gate's own per-holding risk summed; an unmapped asset is in no
-    group (the gate takes no new entry on it while the per-group test is on)."""
+def _gate_book(store: Store):
+    """(the entry gate's Book, its state) at its last mark, or a reason it can't be read: 'unmarked' or 'unreadable'."""
     from sleeve_fund.paper.portfolio_gate import PaperGate
     from sleeve_fund.portfolio.limits import Book
 
@@ -36,12 +34,22 @@ def use_now(store: Store, groups: dict[str, str]) -> dict:
         ledger = PaperGate(store).ledger
         state = ledger.state()
         if state.equity is None or state.equity <= 0:
-            return {"source": "unmarked"}
+            return "unmarked"
         _, held = ledger.positions()
-        book = Book(state.equity, (*held, *(r.holding for r in ledger.reservations())))
+        return Book(state.equity, (*held, *(r.holding for r in ledger.reservations()))), state
     except Exception as exc:  # noqa: BLE001 - a book the gate can't read leaves the use out, said so
         print(f"portfolio settings: can't read the entry gate's book: {exc!r}")
-        return {"source": "unreadable"}
+        return "unreadable"
+
+
+def use_now(store: Store, groups: dict[str, str]) -> dict:
+    """{key: {used, what, tone}} for each test against the entry gate's last mark, or {} with `source` unmarked /
+    unreadable. Open risk by asset and by group is the gate's own per-holding risk summed; an unmapped asset is in no
+    group (the gate takes no new entry on it while the per-group test is on)."""
+    got = _gate_book(store)
+    if isinstance(got, str):
+        return {"source": got}
+    book, state = got
     eq = book.equity
     by_asset: dict[str, Decimal] = {}
     by_group: dict[str, Decimal] = {}
@@ -154,3 +162,37 @@ def rows(tests: dict[str, dict]) -> list[dict]:
     """A set of tests as the DA's compliance_tests rows (Store.add_compliance_version)."""
     return [{"test": r.key, "label": r.label, "scope": r.scope, "measure": r.measure, "limit": tests[r.key]["limit"],
              "action": r.action, "enabled": tests[r.key]["enabled"]} for r in rules.RULES if r.key in tests]
+
+
+def strategy_bars(store: Store, underlying: str, risk_to_stop: float | None, risk_pct: float | None) -> list[dict]:
+    """The Strategy page's three bars under its positions (C8): its risk to stop against its risk per trade, in money;
+    the fund's net on this asset against T4; the fund's loss if every stop is hit on this asset against T1. The fund's
+    figures and limits are the gate's book and the version in force; nothing is worked out in the browser. A bar with
+    no figure yet says why."""
+    got = _gate_book(store)
+    book = None if isinstance(got, str) else got[0]
+    why = {"unmarked": "The fund's book has no mark yet", "unreadable": "The fund's book can't be read"}.get(
+        got if isinstance(got, str) else "", "")
+    tests = {t["test"]: t for t in store.compliance().tests}
+
+    def bar(key, label, used, limit, title):
+        if used is None or limit is None or limit <= 0:
+            return {"key": key, "label": label, "fill": None, "why": why or "Not known yet", "title": title}
+        return {"key": key, "label": label, "fill": float(used / limit), "used": f"{float(used):,.2f}",
+                "limit": f"{float(limit):,.2f}", "title": title, "why": ""}
+
+    eq = book.equity if book is not None else None
+    per_trade = Decimal(str(risk_pct)) * eq if eq is not None and risk_pct is not None else None
+    out = [bar("risk_per_trade", "Risk to stop", Decimal(str(risk_to_stop)) if risk_to_stop is not None else None,
+               per_trade, "This Strategy's loss if its stops are hit, against its risk per trade")]
+    net = abs(book.net(underlying)) if book is not None else None
+    t4 = tests.get("asset_net")
+    out.append(bar("asset_net", f"Net on {underlying}", net,
+                   t4["limit"] * eq if t4 and t4["enabled"] and eq is not None else None,
+                   f"The fund's long less short on {underlying}, every Strategy, against T4 net per asset"))
+    risk = sum((h.risk for h in book.holdings if h.underlying == underlying), Decimal(0)) if book is not None else None
+    t1 = tests.get("asset_stop_loss")
+    out.append(bar("asset_stop_loss", f"{underlying} loss if stops hit", risk,
+                   t1["limit"] * eq if t1 and t1["enabled"] and eq is not None else None,
+                   f"The fund's loss on {underlying} if every stop is hit, every Strategy, against T1 per asset"))
+    return out

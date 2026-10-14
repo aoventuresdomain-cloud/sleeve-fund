@@ -1296,20 +1296,37 @@ window.Console = (() => {
   // Without JavaScript every panel shows, one after another.
   // Tabs inside a panel ([data-subtabs]): buttons [data-sub] show one [data-sub-panel] at a time. The address
   // keeps the page's own tab, so these keep their choice through live updates instead.
+  // Each box keeps its own choice (a page can have two: the Strategy page's side panel and the one under its chart),
+  // keyed by its position on the page. A hash naming a tab (#settings, #refused, #positions) opens it in its box.
   function subtabs() {
-    let chosen = null;
-    const apply = () => document.querySelectorAll("[data-subtabs]").forEach((box) => {
-      const want = chosen || box.querySelector("[data-sub]")?.dataset.sub;
+    const chosen = new Map();
+    const alias = {positions: "pos", position: "pos", orders: "history", attribution: "trades"};
+    const apply = () => document.querySelectorAll("[data-subtabs]").forEach((box, i) => {
+      const want = chosen.get(i) || box.querySelector("[data-sub]")?.dataset.sub;
       box.querySelectorAll("[data-sub]").forEach((b) => b.setAttribute("aria-selected", String(b.dataset.sub === want)));
       box.querySelectorAll("[data-sub-panel]").forEach((p) => { p.hidden = p.dataset.subPanel !== want; });
     });
+    const fromHash = () => {
+      const h = decodeURIComponent(location.hash.slice(1));
+      const name = alias[h] || h;
+      if (!name) return;
+      document.querySelectorAll("[data-subtabs]").forEach((box, i) => {
+        if (box.querySelector(`[data-sub="${CSS.escape(name)}"]`)) chosen.set(i, name);
+      });
+    };
     once("subtabsBound", () => {
       document.addEventListener("click", (e) => {
         const b = e.target.closest("[data-subtabs] [data-sub]");
-        if (b) { chosen = b.dataset.sub; apply(); }
+        if (!b) return;
+        const box = b.closest("[data-subtabs]");
+        chosen.set([...document.querySelectorAll("[data-subtabs]")].indexOf(box), b.dataset.sub);
+        apply();
       });
-      document.addEventListener("live:swap", () => { if (chosen) apply(); });
+      document.addEventListener("live:swap", () => { if (chosen.size) apply(); });
+      window.addEventListener("hashchange", () => { fromHash(); apply(); });
     });
+    fromHash();
+    apply();
   }
 
   // A period switch over tables rendered once per period ([data-periods] holding [data-period] buttons and
