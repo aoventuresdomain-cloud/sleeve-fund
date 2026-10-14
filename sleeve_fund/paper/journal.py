@@ -14,6 +14,7 @@ from datetime import datetime
 from decimal import ROUND_CEILING, Decimal
 
 from sleeve_fund.money import to_decimal
+from sleeve_fund.router import venue_for
 from sleeve_fund.store import (FINISHED_ORDER_STATUSES, INTENTS, LEVELS, ORDER_STATUSES, STATUSES, Sleeve,
                                 _check_rebook, _conflict_words, _rebook_words, _same_fill, exact_sum,
                                 utcnow)
@@ -54,13 +55,13 @@ class MemoryJournal:
 
     def create_sleeve(self, *, name: str, strategy: str, instrument: str, bar_spec: str, starting_balance: float,
                       params: dict | None = None, risk_profile: str = "balanced", warmup_bars: int = 0,
-                      desired_state: str = "running") -> Sleeve:
+                      desired_state: str = "running", venue: str | None = None) -> Sleeve:
         ts = utcnow()
         self.sleeve_row = Sleeve(id=1, name=name, strategy=strategy, instrument=instrument, bar_spec=bar_spec,
                                  params=dict(params or {}), starting_balance=starting_balance,
                                  risk_profile=risk_profile, warmup_bars=warmup_bars, desired_state=desired_state,
                                  status="starting", status_reason="", paused_until=None, heartbeat_at=None,
-                                 created_at=ts, updated_at=ts)
+                                 created_at=ts, updated_at=ts, venue=venue.upper() if venue else None)
         return self.sleeve_row
 
     def sleeve(self, name: str) -> Sleeve:
@@ -142,7 +143,8 @@ class MemoryJournal:
         self.orders_[order_id] = {"id": next(self._ids), "sleeve": sleeve, "order_id": order_id, "ts": now,
                                   "updated_at": now, "side": side, "order_type": order_type, "qty": qty,
                                   "status": "submitted", "filled_qty": 0.0, "avg_px": None, "fee": 0.0,
-                                  "intent": intent, "reason": reason, "signal": signal or {}, "message": ""}
+                                  "intent": intent, "reason": reason, "signal": signal or {}, "message": "",
+                                  "venue": venue_for(self.sleeve(sleeve).venue)}
 
     def rebook_liquidation(self, order_id: str, reason: str, signal: dict, ts: datetime | None = None) -> None:
         row = self.orders_.get(order_id)

@@ -33,12 +33,13 @@ from nautilus_trader.model import (
     TraderId,
 )
 
-from sleeve_fund import markets, spreads
+from sleeve_fund import markets, router, spreads
 from sleeve_fund.instruments import ScheduleFeeModel, fill_model
 from sleeve_fund.paper.config import SleeveConfig, from_store, load_sleeve
 from sleeve_fund.paper.runtime import SleeveRuntime
 from sleeve_fund.paper.safety import assert_keyless, assert_portfolio_gate
 from sleeve_fund.strategies import REGISTRY, check_perp_sizing, check_perp_stop
+from sleeve_fund.venues import VENUES
 from sleeve_fund.venues import venue as venue_profile
 
 
@@ -176,6 +177,8 @@ def build_node(sleeve: SleeveConfig, log_level: str = "INFO", runtime: SleeveRun
     assert_keyless()
     tag = _tag(sleeve.name)
     profile = venue_profile(sleeve.venue)
+    # P2-4: the strategy's one venue and its paper account; paper only until G2, so route() refuses any other kind.
+    route = router.route(sleeve.name, router.venue_for(sleeve.venue), VENUES, tag=tag)
     hub = hub or hub_address(profile.name)
     if profile.data_client is None and hub is None:
         raise ValueError(f"{profile.label} has no live market data client yet, so it can't run paper sleeves")
@@ -226,7 +229,7 @@ def build_node(sleeve: SleeveConfig, log_level: str = "INFO", runtime: SleeveRun
             SandboxExecutionClientConfig(
                 venue=venue,
                 starting_balances=balances,
-                account_id=AccountId.from_str(f"{profile.name}-PAPER-{tag[:20]}"),
+                account_id=AccountId.from_str(route.account_id),
                 oms_type=OmsType.NETTING,
                 # A perpetual trades on margin so it can go short; our own guards set its leverage.
                 account_type=AccountType.MARGIN if perp else AccountType.CASH,
