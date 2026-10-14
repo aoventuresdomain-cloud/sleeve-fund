@@ -13,6 +13,7 @@ import pytest
 from test_halt_ref import T0, _make, _mark, _settle, _state, _trade, store  # noqa: F401
 
 from sleeve_fund import supervisor
+from sleeve_fund.gate_ledger import DbLedger
 
 MIN = timedelta(minutes=1)
 
@@ -243,3 +244,20 @@ def test_an_insurance_credit_for_a_liquidation_fill_is_no_break(store):  # noqa:
     _covered(store, "x", "liquidation", T0 + MIN, "l1")
     _mark(store, T0 + 2 * MIN)
     assert _alerts(store) == [] and supervisor.insurance_breaks(store) == []
+
+
+def test_the_resume_identity_command_dry_runs_then_lifts_the_hold_on_the_pms_word(store, monkeypatch, capfd):  # noqa: F811
+    """The runbook's path (PE1, HoE): python -m sleeve_fund.supervisor resume-identity, dry run first."""
+    _rebased(store)
+    _make(store, "x", 0)
+    _trade(store, "x", 100, T0 + MIN)
+    fix = _broken(store, monkeypatch)
+    _mark(store, T0 + 2 * MIN)
+    monkeypatch.setattr(supervisor, "Store", lambda **k: store)
+    args = ["resume-identity", "--actor", "operator", "--reason", "PM: checked the double count"]
+    assert supervisor.main(args) == 1 and "still doesn't add up by -0.02" in capfd.readouterr().out
+    fix()
+    assert supervisor.main([*args, "--dry-run"]) == 0 and "book check hold:" in capfd.readouterr().out
+    assert DbLedger(store, lambda: ()).identity_hold()
+    assert supervisor.main(args) == 0 and "resumed" in capfd.readouterr().out
+    assert not DbLedger(store, lambda: ()).identity_hold()
