@@ -115,6 +115,9 @@ class Verdict:
     rebuilt_sharpe: float = float("nan")
     seed: int | None = None
     families: dict = None  # family -> {"sharpe", "unweighted_sharpe", "drawdown", "unweighted_drawdown"}: reported only
+    # The method-A gaps, printed whether or not they pass (Advisor 14 Oct 09:15 UK): {"sharpe_gap", "entries_differ",
+    # "entries"}, the rebuilt regime Sharpe's distance from the real regime run's and the opening entries that differ.
+    fidelity: dict = None
 
 
 def judge(weighted: pd.Series, unweighted: pd.Series, primary: Sequence[float], secondary: Sequence[float],
@@ -303,6 +306,8 @@ def _verdict(unweighted, weighted, ones, states, families, folds, seed, draws, t
     real_w = oos(metrics.daily_returns(weighted.book), folds)
     real_u = oos(metrics.daily_returns(unweighted.book), folds)
     unfaithful = exact(unweighted, ones) if exact_check else []
+    a, b = _opening(unweighted), _opening(weighted)
+    fidelity = {"sharpe_gap": abs(rebuilt - daily_sharpe(real_w)), "entries_differ": len(a ^ b), "entries": len(a)}
     at_one = metrics.daily_closes(rebuilt_book(t, [1.0] * len(t.entries)))
     book_u = metrics.daily_closes(unweighted.book.astype(float))
     # The book is marked hourly from the window's start; a leg's first mark can come later, so the rebuild is checked
@@ -311,7 +316,6 @@ def _verdict(unweighted, weighted, ones, states, families, folds, seed, draws, t
         unfaithful.append("the rebuild at weight 1.0 isn't the unweighted book to the cent")
     if not abs(rebuilt - daily_sharpe(real_w)) <= FIDELITY_SHARPE:
         unfaithful.append(f"the rebuild is off the real regime run: Sharpe {rebuilt:.3f} vs {daily_sharpe(real_w):.3f}")
-    a, b = _opening(unweighted), _opening(weighted)
     if len(a ^ b) > FIDELITY_ENTRIES * max(len(a), 1):
         unfaithful.append(f"{len(a ^ b)} of {len(a)} entries differ between the weighted and unweighted runs")
     weighed = [families.get(s, "") in DIRECTION for s, _ in t.entries]  # unregistered families stay at 1.0
@@ -333,4 +337,4 @@ def _verdict(unweighted, weighted, ones, states, families, folds, seed, draws, t
             per_state[d["regime_state"]] = per_state.get(d["regime_state"], 0) + 1
     v = judge(real_w, real_u, primary, secondary, bool(twice), per_state, rebuilt, unfaithful, seed,
               primary_complete=max(len(offsets), 1))
-    return replace(v, families=per_family(unweighted, weighted, families, folds))
+    return replace(v, families=per_family(unweighted, weighted, families, folds), fidelity=fidelity)

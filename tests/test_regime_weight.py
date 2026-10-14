@@ -254,6 +254,7 @@ def test_entries_differing_by_more_than_two_percent_is_not_judged(runs, ones):
     v = rt.acceptance(plain, fewer, pd.Series(rows), fams, folds, (plain, fewer), ones=ones, holdout_start=None,
                       draws=5)
     assert v.result == rt.NOT_JUDGED and any("entries differ" in r for r in v.reasons)
+    assert v.fidelity["entries_differ"] == 1 and v.fidelity["entries"] == len(opening)  # the figures, not just a fail
 
 
 def test_the_acceptance_run_is_seeded_and_never_passes_without_the_double_fee_pair(runs, ones):
@@ -305,6 +306,7 @@ def test_per_family_figures_are_reported_and_never_decide(runs, ones):
     fams, folds = {"a": "trend", "b": "mean-reversion"}, [(plain.book.index[0], plain.book.index[-1])]
     v = rt.acceptance(plain, weighted, pd.Series(rows), fams, folds, None, ones=ones, holdout_start=None, draws=5)
     assert set(v.families) == {"trend", "mean-reversion"}
+    assert v.fidelity["entries_differ"] == 0 and 0 <= v.fidelity["sharpe_gap"] < float("inf")  # printed on any result
     for f in v.families.values():
         assert set(f) == {"sharpe", "unweighted_sharpe", "drawdown", "unweighted_drawdown"}
     assert not any(f in r for r in v.reasons for f in ("trend", "mean-reversion"))
