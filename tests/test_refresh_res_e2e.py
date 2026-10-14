@@ -89,3 +89,34 @@ def test_a_failure_is_said_once_not_on_every_poll(store, monkeypatch):
     for _ in range(3):
         sup.close_dead_orders()
     assert [e["kind"] for e in store.events("a")].count("supervisor_error") == 1
+
+
+@pytest.mark.parametrize("runner", ["alive", "locked"])
+def test_a_put_away_legs_orders_stay_while_its_strategys_process_lives(store, runner):
+    """CR F-RRP-1 (HoE condition): a leg ("carry~2") is traded by its Strategy's own process ("carry"), never one of its
+    own. While that process is alive, or holds the lock, nothing of the leg is closed, though no process is named for
+    the leg itself. Mapping the leg to its own name would close a live Strategy's orders."""
+    from sqlalchemy import insert
+
+    from sleeve_fund.store import sleeve_archive_t, utcnow
+
+    store.create_two_legs(name="carry", strategy="ping_pong", bar_spec="1-MINUTE-LAST-INTERNAL", starting_balance=10_000,
+                          first={"instrument": "BTC/USDT", "params": {}, "venue": "BINANCE", "side": 1},
+                          second={"instrument": "BTC/USDT", "params": {"market": "perp"}, "venue": "BINANCE",
+                                  "side": -1}, desired_state="stopped")
+    _reserve(store, "carry~2", 1, order_id="o1")
+    with store.engine.begin() as c:  # the leg's row put away, its Strategy's process still running
+        c.execute(insert(sleeve_archive_t).values(sleeve="carry~2", archived_at=utcnow()))
+    sup = Supervisor(store, python="true")
+    held = None
+    if runner == "alive":
+        sup.procs["carry"] = Proc(popen=_Alive())
+    else:
+        held = instance_lock("carry")
+    sup.close_dead_orders()
+    if held is not None:
+        held.close()
+    assert store.withdrawal_blocker("carry~2") == "an order of it is still open"
+    sup.procs["carry"] = Proc()
+    sup.close_dead_orders()  # the Strategy's process gone: the leg's order goes
+    assert store.withdrawal_blocker("carry~2") is None
