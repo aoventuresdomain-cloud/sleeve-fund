@@ -8,10 +8,11 @@ from decimal import Decimal as D
 import pytest
 from sqlalchemy import delete, select
 
-from sleeve_fund.paper.runtime import entry_blocked
+from sleeve_fund.paper.portfolio_gate import NEVER_GATED, PaperGate
+from sleeve_fund.paper.runtime import WIND_FLATTEN, WIND_STOP, entry_blocked
 from sleeve_fund.portfolio.gate import check_order
 from sleeve_fund.risk import PORTFOLIO
-from sleeve_fund.store import Store, events_t, portfolio_state_t
+from sleeve_fund.store import GATED_INTENTS, INTENTS, Store, events_t, portfolio_state_t
 from test_gate_ledger import CellLedger, _drop_schemas, _store, _strategies  # noqa: F401
 from test_portfolio_gate import _buy
 from test_p21b_wiring_qa import EQ, _flattens, _hold, portfolio_pass
@@ -194,3 +195,14 @@ def test_a_halt_tells_a_holder_it_cant_close_at_most_system_flattens_times_then_
     gave_up = [e for e in store.events("a", limit=100) if e["kind"] == "flatten_gave_up"]
     assert len(gave_up) == 1 and "the PM must close it" in gave_up[0]["message"]
     assert entry_blocked(store, "a", T0 + timedelta(minutes=12))[0]
+
+
+def test_every_order_kind_but_an_opening_one_is_never_gated_the_wind_downs_included():
+    """HoE pin (after P2-6): every order kind the journal records is either one the gate reserves for or one it never
+    checks, so a new closing kind can't be gated by default; the wind-down's stop and deadline flatten pass the gate
+    even without the reduce-only flag."""
+    assert NEVER_GATED == set(INTENTS) - set(GATED_INTENTS)
+    assert {WIND_STOP, WIND_FLATTEN} <= NEVER_GATED
+    gate = PaperGate(_store())  # never marked: an order it checked would be refused as stale
+    for what in (WIND_STOP, WIND_FLATTEN):
+        assert gate("a", {"what": what, "side": -1}, 0) is None
