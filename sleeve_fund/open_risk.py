@@ -171,12 +171,14 @@ def _put_away_equity(store, s, runs) -> float:
     return cash if s.name in runs else s.starting_balance + cash
 
 
-def _book_part(store, s, earlier, runs) -> float | None:
-    """A Strategy's part of its account's book, or None when it is outside the fund's book. Put away by an earlier
-    book: its put-away equity, at no risk. Otherwise its current equity (its starting balance before its first mark)."""
+def _book_part(store, s, earlier, runs, out) -> float | None:
+    """A Strategy's part of its account's book, or None when it is outside the fund's book or its equity left the
+    book when it was put away (`out`, Store.withdrawn(): F-C3B-A, as supervisor.fund_equity skips it). Put away by an
+    earlier book: its put-away equity, at no risk. Otherwise its current equity (its starting balance before its
+    first mark)."""
     from sleeve_fund.supervisor import outside_fund_book
 
-    if outside_fund_book(store, s):
+    if s.name in out or outside_fund_book(store, s):
         return None
     if s.name in earlier:
         return _put_away_equity(store, s, runs)
@@ -223,12 +225,12 @@ def book_open_risk(store, atr_pct, account: str | None = None) -> list[dict]:
 def account_equity(store, account: str) -> float:
     """The book the limit measures an account's open risk against: every strategy on the account inside the fund's
     book, as account_book adds it up (_book_part), so one account's book is supervisor.fund_equity."""
-    earlier, runs = store.previous_book(), store.reset_runs()
+    earlier, runs, out = store.previous_book(), store.reset_runs(), store.withdrawn()
     book = 0.0
     for s in store.sleeves():
         if store.account_of(s.name) != account:
             continue
-        part = _book_part(store, s, earlier, runs)
+        part = _book_part(store, s, earlier, runs, out)
         book += part or 0.0
     return book
 
@@ -240,12 +242,12 @@ def account_book(store, sleeve_name: str, own_equity: float, atr_pct) -> tuple[f
     from sleeve_fund import markets
 
     account = store.account_of(sleeve_name)
-    earlier, runs = store.previous_book(), store.reset_runs()
+    earlier, runs, out = store.previous_book(), store.reset_runs(), store.withdrawn()
     book, risk, through = own_equity, 0.0, []
     for s in store.sleeves():
         if s.name == sleeve_name or store.account_of(s.name) != account:
             continue
-        part = _book_part(store, s, earlier, runs)
+        part = _book_part(store, s, earlier, runs, out)
         if part is None:
             continue
         book += part
