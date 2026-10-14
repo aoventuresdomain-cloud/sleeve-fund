@@ -174,7 +174,7 @@ def test_a_create_after_an_unmarked_loss_keeps_the_books_real_drawdown(store):  
     _make(store, "new", 10_000)
     st = _mark(store, T0 + timedelta(minutes=1))
     kept = _kept(10_000, 9_000, 19_000)
-    assert _four(st) == (D(19_000), kept, kept, kept), _four(st)
+    assert _same(_four(st), (D(19_000), kept, kept, kept)), _four(st)  # SQLite: ~16 digits
     assert _dd(st) == D("0.1"), _dd(st)
 
 
@@ -190,8 +190,8 @@ def test_a_move_off_the_book_when_only_the_rest_moved_keeps_the_books_real_drawd
     store.assign_account("test", "paper")
     st = _mark(store, T0 + timedelta(minutes=1))
     kept = _kept(30_000, 29_000, 9_000)
-    assert _four(st) == (D(9_000), kept, kept, kept), _four(st)
-    assert not st.halted and st.paused_until is None
+    assert _same(_four(st), (D(9_000), kept, kept, kept)), _four(st)  # SQLite: ~16 digits
+    assert not st.halted and st.paused_until is not None  # a real 3.3% day loss is over the 3% daily pause
 
 
 def test_a_move_into_the_book_after_an_unmarked_loss_keeps_the_rests_drawdown(store):  # noqa: F811
@@ -205,7 +205,7 @@ def test_a_move_into_the_book_after_an_unmarked_loss_keeps_the_rests_drawdown(st
     store.assign_account("test", "desk")  # into the book
     st = _mark(store, T0 + timedelta(minutes=1))
     kept = _kept(10_000, 9_000, 29_000)
-    assert _four(st) == (D(29_000), kept, kept, kept), _four(st)
+    assert _same(_four(st), (D(29_000), kept, kept, kept)), _four(st)  # SQLite: ~16 digits
     assert _dd(st) == D("0.1"), _dd(st)
 
 
@@ -220,3 +220,104 @@ def test_a_book_never_marked_still_moves_at_once_with_no_flow(store):  # noqa: F
     assert store.account_of("test") == "paper"  # moved now, not at a poll
     assert [e for e in store.events(None, limit=100) if e["kind"] == "portfolio_flow"] == []
     assert _four(_mark(store, T0)) == (D(10_000),) * 4
+
+
+# --- DA 0024 rules (book_moves): rows end once, latest wins, put-away supersedes; a two-leg create lands whole -----------
+
+def test_a_put_away_supersedes_a_waiting_move_so_the_poll_never_lands_it(store):  # noqa: F811
+    """DA rule 4: archiving a Strategy whose move waits cancels the move in the archive's own transaction, journaled;
+    the next poll lands nothing for it and its account row stays the one it had."""
+    _make(store, "fund", 10_000)
+    _make(store, "test", 20_000, instrument="BTC/USD", venue="KRAKEN")
+    store.assign_account("test", "desk")
+    _mark(store, T0)
+    store.assign_account("test", "paper")  # waits
+    store.set_desired_state("test", "stopped")
+    store.archive("test")
+    assert store.book_moves_pending() == {}
+    said = [e["message"] for e in store.events("test", limit=20) if e["kind"] == "book_move_superseded"]
+    assert len(said) == 1 and "move to account paper" in said[0] and "it was put away (archived)" in said[0]
+    _mark(store, T0 + timedelta(minutes=1))
+    assert store.account_of("test") == "desk"
+    assert [e for e in store.events("test", limit=20) if e["kind"] == "book_move_landed"] == []
+
+
+def test_a_request_back_to_its_own_side_just_cancels_the_waiting_move_and_says_so(store):  # noqa: F811
+    """DA rule 2: no new row, the waiting one superseded and journaled."""
+    from sleeve_fund.store import book_moves_t
+    from sqlalchemy import select
+
+    _make(store, "fund", 10_000)
+    _make(store, "test", 20_000, instrument="BTC/USD", venue="KRAKEN")
+    store.assign_account("test", "desk")
+    _mark(store, T0)
+    store.assign_account("test", "paper")
+    store.assign_account("test", "desk")
+    with store.engine.connect() as c:
+        rows = c.execute(select(book_moves_t)).all()
+    assert len(rows) == 1 and rows[0].superseded_at is not None and rows[0].landed_at is None
+    said = [e["message"] for e in store.events("test", limit=20) if e["kind"] == "book_move_superseded"]
+    assert len(said) == 1 and "same side of the book was made at once" in said[0]
+
+
+def test_one_waiting_row_per_strategy_and_each_row_ends_once(store):  # noqa: F811
+    """DA rule 1 and ux_book_moves_waiting: a second waiting row for one Strategy is refused by the database; ending a
+    row a second time changes nothing; a poll whose clock reads behind the request ends it at the request's time."""
+    import pytest
+    from sqlalchemy import insert, select
+    from sqlalchemy.exc import IntegrityError
+
+    from sleeve_fund.store import _end_move, book_moves_t
+
+    _make(store, "fund", 10_000)
+    _mark(store, T0)
+    _make(store, "new", 5_000)
+    row = store.book_moves_pending()["new"]
+    with pytest.raises(IntegrityError):
+        with store.engine.begin() as c:
+            c.execute(insert(book_moves_t).values(sleeve="new", account="paper", kind="create",
+                                                  requested_at=row["requested_at"]))
+    with store.engine.begin() as c:
+        got = c.execute(select(book_moves_t).where(book_moves_t.c.id == row["id"])).first()
+        assert _end_move(c, got, landed_at=row["requested_at"] - timedelta(days=1))  # behind the request
+        assert not _end_move(c, got, superseded_at=row["requested_at"])  # ended already
+        got = c.execute(select(book_moves_t).where(book_moves_t.c.id == row["id"])).first()
+    assert got.landed_at is not None and got.superseded_at is None
+    assert got.landed_at.replace(tzinfo=None) == row["requested_at"].replace(tzinfo=None)
+
+
+def test_a_landing_whose_row_ended_first_lands_nothing_and_moves_no_capital(store, monkeypatch):  # noqa: F811
+    """DA rule 1: rowcount 0 on the landing's end means another writer ended it; the landing's transaction (flow,
+    account row) rolls back whole and the poll says so, so it is never landed twice."""
+    from sleeve_fund import store as store_mod
+
+    _make(store, "fund", 10_000)
+    _make(store, "test", 20_000, instrument="BTC/USD", venue="KRAKEN")
+    store.assign_account("test", "desk")
+    _mark(store, T0)
+    store.assign_account("test", "paper")
+    monkeypatch.setattr(store_mod, "_end_move", lambda c, row, **end: False)
+    st = _mark(store, T0 + timedelta(minutes=1))
+    assert st.equity == D(30_000) and _flows(store) == [] and store.account_of("test") == "desk"
+    waits = [e["message"] for e in store.events("test", limit=20) if e["kind"] == "book_move_waits"]
+    assert len(waits) == 1 and "had already ended, so it isn't landed twice" in waits[0]
+
+
+def test_a_two_leg_create_on_a_marked_book_waits_on_both_legs_and_lands_them_together(store):  # noqa: F811
+    """Both legs refuse entries while they wait, and both land in the first leg's one transaction with one flow; the
+    second leg's own turn in the poll lands nothing more (DA Q2: both legs together)."""
+    from sleeve_fund.paper.runtime import entry_blocked
+
+    _make(store, "fund", 20_000)
+    _mark(store, T0)
+    store.create_two_legs(name="carry", strategy="ping_pong", bar_spec="1-MINUTE-LAST-INTERNAL", starting_balance=10_000,
+                          first={"instrument": "BTC/USDT", "params": {}, "venue": "BINANCE", "side": 1},
+                          second={"instrument": "BTC/USDT", "params": {"market": "perp"}, "venue": "BINANCE",
+                                  "side": -1}, desired_state="stopped")
+    for leg in ("carry", "carry~2"):
+        assert "book_moving" in entry_blocked(store, leg, T0, starting=True)[1].codes
+    assert store.land_move("carry~2", T0 + timedelta(seconds=1)) is False and store.joining("carry~2")
+    st = _mark(store, T0 + timedelta(minutes=1))
+    assert st.equity == D(30_000) and len(_flows(store)) == 1 and store.book_moves_pending() == {}
+    landed = [e["sleeve"] for e in store.events(None, limit=50) if e["kind"] == "book_move_landed"]
+    assert sorted(landed) == ["carry", "carry~2"]

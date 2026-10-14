@@ -369,7 +369,7 @@ sleeve_accounts_t = Table(
 # F-ASSIGN-STALE (Advisor ADV-ASSIGN, 14 Oct 17:41 UK): a create or an account move asked for on a marked book waits
 # here for the supervisor's poll, which lands it after its own mark with its flow, so P&L made since the last mark is
 # judged at the book's scale first. At most one waiting row per Strategy (landed_at and superseded_at both NULL); a
-# later request supersedes it. A new table, so it arrives as CREATE TABLE.
+# later request supersedes it. Rows are never deleted: each ends once, landed or superseded (DA, migration 0024).
 book_moves_t = Table(
     "book_moves",
     metadata,
@@ -382,7 +382,9 @@ book_moves_t = Table(
     Column("superseded_at", TS),
     CheckConstraint("kind IN ('create', 'move')", name="book_moves_kind"),
     CheckConstraint("landed_at IS NULL OR superseded_at IS NULL", name="book_moves_one_end"),
-    Index("book_moves_waiting", "sleeve", unique=True,
+    CheckConstraint("(landed_at IS NULL OR landed_at >= requested_at) "
+                    "AND (superseded_at IS NULL OR superseded_at >= requested_at)", name="book_moves_order"),
+    Index("ux_book_moves_waiting", "sleeve", unique=True,
           postgresql_where=text("landed_at IS NULL AND superseded_at IS NULL"),
           sqlite_where=text("landed_at IS NULL AND superseded_at IS NULL")),
 )
@@ -907,6 +909,7 @@ WITHDRAWAL_DEFERRED, WITHDRAWAL_NONE = "withdrawal_deferred", "withdrawal_none"
 NEXT_MARK = "flat, waiting for the supervisor's next mark"  # why a flat Strategy put away is deferred (F286-CR1)
 # F-ASSIGN-STALE: a create or a move waiting for the poll (book_moves), and its landing
 BOOK_MOVE_WAITING, BOOK_MOVE_LANDED = "book_move_waiting", "book_move_landed"
+BOOK_MOVE_SUPERSEDED = "book_move_superseded"
 GATED_INTENTS = ("entry", "rebalance")  # the orders the portfolio gate reserves for (engine OPENING_INTENTS)
 INTENTS = ("entry", "exit", "stop_loss", "take_profit", "risk_halt", "risk_pause", "pm_flatten", "rebalance",
            "liquidation", "liquidation_cut", "wind_down", "wind_down_stop",  # the venue would take it; cut back before it does (String(16))
@@ -1129,6 +1132,17 @@ class Sleeve:
         return cls(**d, venue=venue)
 
 
+def _end_move(c, row, **end: datetime) -> bool:
+    """End a waiting book_moves row once (DA 0024 rule 1): landed_at or superseded_at, guarded on its still waiting, so
+    a row two writers race for ends once; False when it had ended already. Never before it was asked for (CHECK
+    book_moves_order): a poll whose clock reads behind the request's ends it at the request's time."""
+    (col, ts), = end.items()
+    req = _aware(row.requested_at)
+    return bool(c.execute(update(book_moves_t).where(
+        book_moves_t.c.id == row.id, book_moves_t.c.landed_at.is_(None), book_moves_t.c.superseded_at.is_(None))
+        .values(**{col: max(_aware(ts), req)})).rowcount)
+
+
 def _rows(result) -> list[dict]:
     out = []
     for r in result:
@@ -1316,13 +1330,22 @@ class Store:
         ts = utcnow()
         legs = ((name, first, shares[0], None), (name + LEG, second, shares[1], name))
 
-        def into() -> Decimal:  # each leg's share in the fund's book comes in as a deposit (HALT-REF-1)
-            return sum((to_decimal(share) for leg_name, leg, share, _ in legs if not is_backtest(leg_name) and not
-                        _outside_book(self, SimpleNamespace(name=leg_name, instrument=leg["instrument"],
-                                                            venue=(leg.get("venue") or "").upper() or None))),
-                       Decimal(0))
+        def in_book(leg_name: str, leg: dict) -> bool:
+            return not is_backtest(leg_name) and not _outside_book(self, SimpleNamespace(
+                name=leg_name, instrument=leg["instrument"], venue=(leg.get("venue") or "").upper() or None))
 
-        with self._book_move(into, f"two-leg Strategy {name} created with {to_decimal(starting_balance):,.2f}", ts) as c:
+        def into() -> Decimal:  # each leg's share in the fund's book comes in as a deposit (HALT-REF-1)
+            return sum((to_decimal(share) for leg_name, leg, share, _ in legs if in_book(leg_name, leg)), Decimal(0))
+
+        def joins(c) -> None:
+            # F-ASSIGN-STALE: on a marked book both legs join at the supervisor's next poll, together (Store.land_move)
+            self._ensure_paper_account(c)
+            for leg_name, leg, _, _ in legs:
+                if in_book(leg_name, leg):
+                    self._wait_move(c, leg_name, "paper", "create", ts)
+
+        with self._book_move(into, f"two-leg Strategy {name} created with {to_decimal(starting_balance):,.2f}", ts,
+                             defer=None if is_backtest(name) else joins) as c:
             for leg_name, leg, share, parent in legs:
                 _insert_sleeve(c, ts, name=leg_name, strategy=strategy, instrument=leg["instrument"],
                                bar_spec=bar_spec, params=two_legs.leg_params(leg), starting_balance=share,
@@ -1932,22 +1955,28 @@ class Store:
             if not waits[0]:
                 c.execute(sleeve_accounts_t.delete().where(sleeve_accounts_t.c.sleeve == sleeve))
                 c.execute(insert(sleeve_accounts_t).values(sleeve=sleeve, account=account, assigned_at=ts))
-                self._end_waiting(c, sleeve, ts)  # a move made at once replaces any that waited
+                # a move made at once (no flow: back to the side it is on) replaces any that waited (DA 0024 rule 2)
+                self._end_waiting(c, sleeve, ts, f"a move to account {account} on the same side of the book was "
+                                                 "made at once")
 
     # --- F-ASSIGN-STALE: moves waiting for the supervisor's poll -------------------------------------------------
 
-    def _end_waiting(self, c, sleeve: str, ts: datetime) -> list:
-        """Supersede `sleeve`'s waiting move, if any; the rows superseded."""
+    def _end_waiting(self, c, sleeve: str, ts: datetime, why: str | None = None) -> list:
+        """Supersede `sleeve`'s waiting move, if any, journaled when `why` says what replaced it; the rows superseded.
+        Each row ends once (DA 0024 rule 1): a row another writer ended first is left as it is."""
         rows = c.execute(select(book_moves_t).where(book_moves_t.c.sleeve == sleeve, book_moves_t.c.landed_at.is_(None),
                                                     book_moves_t.c.superseded_at.is_(None))).all()
-        if rows:
-            c.execute(update(book_moves_t).where(book_moves_t.c.id.in_([r.id for r in rows]))
-                      .values(superseded_at=ts))
-        return rows
+        ended = [r for r in rows if _end_move(c, r, superseded_at=ts)]
+        for r in ended if why else ():
+            c.execute(insert(events_t).values(
+                sleeve=sleeve, ts=ts, level="info", kind=BOOK_MOVE_SUPERSEDED,
+                message=f"{sleeve}'s move to account {r.account}, waiting for the supervisor's next mark, is "
+                        f"cancelled: {why}"))
+        return ended
 
     def _wait_move(self, c, sleeve: str, account: str, kind: str, ts: datetime) -> None:
         """Record `sleeve`'s move to `account` as waiting for the poll (latest wins), journaled."""
-        before = self._end_waiting(c, sleeve, ts)
+        before = self._end_waiting(c, sleeve, ts, f"a later request moves it to account {account}")
         c.execute(insert(book_moves_t).values(sleeve=sleeve, account=account, kind=kind, requested_at=ts))
         what = (f"{sleeve} joins the fund's book on account {account}" if kind == "create"
                 else f"{sleeve} moves to account {account}")
@@ -1974,54 +2003,75 @@ class Store:
 
     def land_move(self, sleeve: str, ts: datetime | None = None) -> bool:
         """The supervisor's poll, after its mark: land `sleeve`'s waiting move with its flow at the fresh scale, in one
-        transaction with the account row and the landing (Advisor ADV-ASSIGN). A create joins the book with its
-        equity; a move goes as assign_account would. False when nothing waits."""
+        transaction with the account row and the landing (Advisor ADV-ASSIGN; DA 0024 rule 3). A create joins the book
+        with its equity; a move goes as assign_account would. A two-leg Strategy's create lands both legs together, on
+        its first leg's call, with one flow of their sum; its second leg's own call leaves it to the first. False when
+        nothing (of its own) waits."""
         from sleeve_fund.supervisor import strategy_equity
 
         ts = ts or utcnow()
-        got, moved, gone = [], [], []
+        got, moved, gone, on = [], [], [], {}
+
+        def waiting(r, name: str):
+            return r.execute(select(book_moves_t).where(
+                book_moves_t.c.sleeve == name, book_moves_t.c.landed_at.is_(None),
+                book_moves_t.c.superseded_at.is_(None))).first()
 
         def amount() -> Decimal:
             with self.engine.connect() as r:
-                row = r.execute(select(book_moves_t).where(
-                    book_moves_t.c.sleeve == sleeve, book_moves_t.c.landed_at.is_(None),
-                    book_moves_t.c.superseded_at.is_(None))).first()
-            got.append(row)
-            if row is None:
+                row = waiting(r, sleeve)
+                first = self.sleeve(sleeve).parent if row is not None else None
+                if row is not None and row.kind == "create" and first is not None and waiting(r, first) is not None:
+                    return Decimal(0)  # the second leg of a two-leg create: its first leg lands both (got stays empty)
+                rows = [row] if row is not None else []
+                if row is not None and row.kind == "create":
+                    rows += [w for leg in self.legs(sleeve) if leg != sleeve and (w := waiting(r, leg)) is not None
+                             and w.kind == "create"]
+            got.extend(rows)
+            # Read here, before this move writes (F286-ENG: on Store.in_memory a read after the writes loses them).
+            on.update({w.sleeve: self.account_of(w.sleeve) for w in rows})
+            if not rows:
                 return Decimal(0)
             if sleeve in self.withdrawn() or sleeve in self.archived():
-                gone.append(True)  # put away while it waited: it never lands
+                gone.append(True)  # put away while it waited (a put-away supersedes it, DA rule 4): it never lands
                 return Decimal(0)
-            s = self.sleeve(sleeve)
-            into = not _outside_book(self, s, row.account)
-            was = True if row.kind == "create" else _outside_book(self, s)
-            if was == (not into):
-                return Decimal(0)
-            moved.append("joins" if row.kind == "create" else "moved into" if was else "moved out of")
-            part = strategy_equity(self, s)
-            return part if was else -part
+            total = Decimal(0)
+            for w in rows:
+                s = self.sleeve(w.sleeve)
+                into = not _outside_book(self, s, w.account)
+                was = True if w.kind == "create" else _outside_book(self, s)
+                if was == (not into):
+                    continue
+                moved.append("joins" if w.kind == "create" else "moved into" if was else "moved out of")
+                part = strategy_equity(self, s)
+                total += part if was else -part
+            return total
 
         def said() -> str:
-            return f"{sleeve} {moved[0]} the fund's book (account {got[0].account}) at the supervisor's mark"
+            names = " and ".join(w.sleeve for w in got)
+            verb = "join" if len(moved) > 1 else moved[0]  # a two-leg create's legs join together
+            return f"{names} {verb} the fund's book (account {got[0].account}) at the supervisor's mark"
 
         with self._book_move(amount, said, ts) as c:
-            row = got[0] if got else None
-            if row is None:
+            if not got:
                 return False
-            if gone:
-                c.execute(update(book_moves_t).where(book_moves_t.c.id == row.id).values(superseded_at=ts))
+            for row in got:
+                if not _end_move(c, row, **({"superseded_at": ts} if gone else {"landed_at": ts})):
+                    raise RuntimeError(f"{row.sleeve}'s move to account {row.account} had already ended, so it isn't "
+                                       "landed twice")
+                if gone:
+                    c.execute(insert(events_t).values(
+                        sleeve=row.sleeve, ts=ts, level="info", kind=BOOK_MOVE_SUPERSEDED,
+                        message=f"{row.sleeve} was put away while its move to account {row.account} waited, so it "
+                                "never lands"))
+                    continue
+                if not (row.kind == "create" and row.account == "paper" and on[row.sleeve] == "paper"):
+                    c.execute(sleeve_accounts_t.delete().where(sleeve_accounts_t.c.sleeve == row.sleeve))
+                    c.execute(insert(sleeve_accounts_t).values(sleeve=row.sleeve, account=row.account, assigned_at=ts))
                 c.execute(insert(events_t).values(
-                    sleeve=sleeve, ts=ts, level="info", kind=BOOK_MOVE_LANDED,
-                    message=f"{sleeve} was put away while its move to account {row.account} waited, so it never lands"))
-                return True
-            if not (row.kind == "create" and row.account == "paper" and self.account_of(sleeve) == "paper"):
-                c.execute(sleeve_accounts_t.delete().where(sleeve_accounts_t.c.sleeve == sleeve))
-                c.execute(insert(sleeve_accounts_t).values(sleeve=sleeve, account=row.account, assigned_at=ts))
-            c.execute(update(book_moves_t).where(book_moves_t.c.id == row.id).values(landed_at=ts))
-            c.execute(insert(events_t).values(
-                sleeve=sleeve, ts=ts, level="info", kind=BOOK_MOVE_LANDED,
-                message=(f"{sleeve} joined the fund's book" if row.kind == "create" else f"{sleeve} moved to account "
-                         f"{row.account}") + " at the supervisor's mark"))
+                    sleeve=row.sleeve, ts=ts, level="info", kind=BOOK_MOVE_LANDED,
+                    message=(f"{row.sleeve} joined the fund's book" if row.kind == "create"
+                             else f"{row.sleeve} moved to account {row.account}") + " at the supervisor's mark"))
         return True
 
     def archived(self) -> dict[str, datetime]:
@@ -2086,6 +2136,8 @@ class Store:
         # A clean slate's put-away (previous_book) starts a fresh book, so its emptying carries nothing (MUST-F286-H4)
         with self._book_move(amount, said, ts, leaving=sleeve, carry=sleeve not in self.previous_book()) as c:
             yield c
+            # A create or move still waiting never lands for a Strategy put away (DA 0024 rule 4, F-ASSIGN-STALE)
+            self._end_waiting(c, sleeve, ts, f"it was put away ({why})")
             # Put away again (archived, then retired; a second archive): already out, so it keeps its row, its
             # amount and when it went, with no second flow (DA, 14 Oct).
             if c.execute(select(sleeve_archive_t.c.sleeve).where(sleeve_archive_t.c.sleeve == sleeve,

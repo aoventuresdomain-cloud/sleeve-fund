@@ -970,11 +970,13 @@ def book_figures(store: Store) -> str:
     """The book's headline figures as the Portfolio counts them (every strategy not in an earlier book):
     starting capital, equity, fees, open positions and the first mark, for the deploy log. A Strategy outside the
     fund's book (F229-6, outside_fund_book) is left out, as fund_equity leaves it out, and named after the figures
-    (F-HALTREF-4)."""
+    (F-HALTREF-4); so is one whose create waits for the supervisor's next mark (F-ASSIGN-STALE)."""
     earlier = store.previous_book()
     every = [s for s in store.sleeves() if s.name not in earlier]
     outside = [s.name for s in every if outside_fund_book(store, s)]
     current = [s for s in every if s.name not in outside]
+    joining = [n for n in outside if store.joining(n)]  # created on a marked book, its deposit waits (F-ASSIGN-STALE)
+    tests = [n for n in outside if n not in joining]
     start = sum(s.starting_balance for s in current)
     equity = sum(float((store.last_equity(s.name) or {"equity": s.starting_balance})["equity"]) for s in current)
     fees = sum(float(f["fee"]) for s in current for f in store.fills(s.name, limit=1_000_000))
@@ -982,7 +984,8 @@ def book_figures(store: Store) -> str:
     firsts = [m["ts"] for s in current if (m := store.first_equity(s.name))]
     return (f"from {start:,.2f}, equity {equity:,.2f}, fees {fees:,.2f}, "
             f"positions {', '.join(held) or 'none'}, first mark {min(firsts).isoformat() if firsts else 'none'}"
-            + (f"; outside the book (a test account): {', '.join(outside)}" if outside else ""))
+            + (f"; outside the book (a test account): {', '.join(tests)}" if tests else "")
+            + (f"; joining the book at the supervisor's next mark: {', '.join(joining)}" if joining else ""))
 
 
 REBASE_KEY = "HALT-REF-1"

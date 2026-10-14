@@ -466,8 +466,12 @@ def test_c9_a_flow_is_capital_not_pnl_in_the_book_figures(store):
     _trade(store, "a", 300)
     _mark(store, T0)
     assert supervisor.book_figures(store).startswith("from 20,000.00, equity 20,300.00,")
-    _make(store, "b", 5_000)
+    _make(store, "b", 5_000)  # F-ASSIGN-STALE: on a marked book it joins at the supervisor's next poll, after its mark
+    assert supervisor.book_figures(store).startswith("from 20,000.00, equity 20,300.00,")
+    assert supervisor.book_figures(store).endswith("; joining the book at the supervisor's next mark: b")
+    _mark(store, T0 + timedelta(minutes=1))
     assert supervisor.book_figures(store).startswith("from 25,000.00, equity 25,300.00,")
+    assert "joining" not in supervisor.book_figures(store)
 
 
 # --- C12: a starting balance is never edited -----------------------------------------------------------------------------
@@ -773,17 +777,21 @@ def test_f282_2_the_rebase_values_dust_at_its_mark_not_its_entry(store):
 
 
 def test_a_two_leg_strategy_created_after_the_first_mark_is_one_deposit_of_its_balance(store):
-    """P2-8: both legs' shares come in together, with the rows, as one flow of the Strategy's whole balance."""
+    """P2-8: both legs' shares come in together as one flow of the Strategy's whole balance; on a marked book at the
+    supervisor's next poll, after its mark (F-ASSIGN-STALE), both legs landing in the one transaction."""
     _make(store, "a", 20_000)
     _mark(store, T0)
     store.create_two_legs(name="carry", strategy="ping_pong", bar_spec="1-MINUTE-LAST-INTERNAL", starting_balance=10_000,
                           first={"instrument": "BTC/USDT", "params": {}, "venue": "BINANCE", "side": 1},
                           second={"instrument": "BTC/USDT", "params": {"market": "perp"}, "venue": "BINANCE",
                                   "side": -1}, desired_state="stopped")
-    assert _four(_state(store)) == (D(30_000),) * 4
-    assert len(_flows(store)) == 1 and "two-leg Strategy carry created with 10,000.00" in _flows(store)[0]
+    assert _four(_state(store)) == (D(20_000),) * 4 and _flows(store) == []
+    assert store.joining("carry") and store.joining("carry~2")
     st = _mark(store, T0 + timedelta(minutes=1))
     assert _four(st) == (D(30_000),) * 4 and not st.halted
+    assert len(_flows(store)) == 1 and "carry and carry~2 join the fund's book (account paper) at the supervisor's " \
+        "mark: the fund's book moves by +10,000.00" in _flows(store)[0], _flows(store)
+    assert not store.joining("carry") and not store.joining("carry~2")
 
 
 def test_f_haltref_5_the_dry_run_prints_every_strategy_its_run_and_the_dust_and_they_sum_to_the_figures(
