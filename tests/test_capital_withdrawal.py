@@ -346,7 +346,7 @@ def test_e3c_a_pause_that_has_ended_doesnt_hold_the_withdrawal_and_goes_with_the
     assert row.status == "ok" and row.marked_at is None and row.book_equity is None and row.hwm is None
 
 
-@pytest.mark.parametrize("why", ["could trade", "holds a position", "below nothing", "an order"])
+@pytest.mark.parametrize("why", ["could trade", "holds 0.5", "below nothing", "an order"])
 def test_e4_a_withdrawal_to_empty_is_refused_while_anything_is_open_and_below_nothing_always(store, why):
     from sleeve_fund.portfolio.gate import apply_flow
 
@@ -355,7 +355,7 @@ def test_e4_a_withdrawal_to_empty_is_refused_while_anything_is_open_and_below_no
     led = DbLedger(store, lambda: ())
     if why == "could trade":
         store.set_desired_state("a", "running")
-    elif why == "holds a position":
+    elif why == "holds 0.5":
         store.record_fill("a", side="BUY", qty=0.5, price=1_000.0, fee=0.0, order_id="h", trade_id="h", ts=T0)
     amount = D("-10000.01") if why == "below nothing" else D(-10_000)
     with pytest.raises(ValueError, match=why if why != "an order" else "an order still holds room"):

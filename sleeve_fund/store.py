@@ -1149,6 +1149,7 @@ class Store:
         (Supervisor.mark_portfolio). Journaled as a portfolio_flow event. With no state ever marked there is nothing to
         move: the first mark reads the book as it is."""
         from sleeve_fund.portfolio.gate import apply_flow
+        from sleeve_fund.supervisor import nothing_open
 
         led = self._gate_ledger()
         with led.lock():
@@ -1158,7 +1159,7 @@ class Store:
             yield c
             if amount:
                 before = led.state().reference()
-                emptied = apply_flow(led, amount, self._nothing_open, ts)
+                emptied = apply_flow(led, amount, lambda: nothing_open(self, led), ts)
                 if emptied is not None:  # the old figures stay in the journal (Advisor 14 Oct 10:00 UK)
                     tail = (f"which empties it, so the next mark starts it afresh (it was: high-water mark "
                             f"{_money2(emptied.hwm)}, the halt's reference {_money2(emptied.reference())}, the day's "
@@ -1170,20 +1171,6 @@ class Store:
                     sleeve=None, ts=ts or utcnow(), level="info", kind="portfolio_flow",
                     message=f"{why() if callable(why) else why}: the fund's book moves by {amount:+,.2f} {tail}, so "
                             "it isn't a gain or a loss"))
-
-    def _nothing_open(self) -> str | None:
-        """apply_flow's check before a withdrawal empties the book: why it can't (a Strategy in the book could trade or
-        holds a position), or None."""
-        from sleeve_fund.supervisor import could_trade
-
-        for s in self.sleeves():
-            if is_backtest(s.name) or _outside_book(self, s):
-                continue
-            if could_trade(s):
-                return f"{s.name} could trade"
-            if self.journal_book(s.name, s.starting_balance)["qty"] != 0:
-                return f"{s.name} holds a position"
-        return None
 
     def sleeve(self, name: str) -> Sleeve:
         with self.engine.connect() as c:

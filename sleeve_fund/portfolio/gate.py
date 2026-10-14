@@ -321,9 +321,6 @@ def resume_after_halt(ledger: Ledger) -> PortfolioState:
         return st
 
 
-EMPTY = Decimal("0.01")  # a book within a cent of nothing after a flow is empty (Advisor 14 Oct 10:00 UK)
-
-
 def apply_flow(ledger: Ledger, amount, idle: Callable[[], str | None] | None = None,
                now: datetime | None = None) -> PortfolioState | None:
     """Capital added (> 0) or withdrawn (< 0), so a deposit isn't a gain and a withdrawal isn't a loss (Advisor 3).
