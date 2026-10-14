@@ -6,14 +6,16 @@ name: final-smoke
 #           B2 the hub fresh, B5 the gate against the tile. Selects, a hub subscription and an in-memory dry check
 #           only: nothing is written (scripts/final_smoke.py).
 #   check = round-trip: B3, the one step that acts. It starts the allowlisted smoke Strategy on paper, flattens it
-#           after its entry and stops it again, whatever happens (scripts/round_trip.py); then B4 reads its journal.
+#           after its entry and stops it again, whatever happens (scripts/round_trip.py); then B4 reads its journal and
+#           B7 replays its window (scripts/b7_replay_parity.py, read-only).
+#   check = replay: B7 alone, read-only, on a round trip already made (its "since" line), e.g. after a B7 fix.
 on:
   workflow_dispatch:
     inputs:
       check:
-        description: read-only checks, or the B3 paper round trip then B4
+        description: read-only checks, the B3 paper round trip then B4 and B7, or B7 alone on an earlier round trip
         type: choice
-        options: [read-only, round-trip]
+        options: [read-only, round-trip, replay]
         default: read-only
       strategy:
         description: the smoke Strategy for the round trip (the allowlist)
@@ -24,6 +26,10 @@ on:
         description: minutes the round trip waits for its entry and exit before stopping
         required: true
         default: "30"
+      since:
+        description: for replay, the round trip's "since" line (UTC, e.g. 2026-10-14T09:00:03+00:00)
+        required: false
+        default: ""
 jobs:
   smoke:
     runs-on: ubuntu-24.04
@@ -36,8 +42,14 @@ jobs:
       - name: Check the inputs
         env:
           TIMEOUT: ${{ inputs.timeout_min }}
+          CHECK: ${{ inputs.check }}
+          SINCE: ${{ inputs.since }}
         run: |
           [[ "$TIMEOUT" =~ ^[0-9]{1,2}$ ]] || { echo "timeout_min must be 1 to 99"; exit 1; }
+          if [[ "$CHECK" == "replay" ]]; then
+            [[ "$SINCE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\+00:00|Z)$ ]] \
+              || { echo "since must be a UTC time such as 2026-10-14T09:00:03+00:00"; exit 1; }
+          fi
       - name: Configure SSH
         env:
           KEY: ${{ secrets.DEPLOY_SSH_KEY }}
@@ -81,4 +93,19 @@ jobs:
             echo '== B4'
             sudo docker compose exec -T supervisor python -u - journal --strategy $STRATEGY --since \$since \
               < scripts/final_smoke.py || rc=1
+            echo '== B7'
+            sudo docker compose exec -T supervisor python -u - --strategy $STRATEGY --since \$since \
+              < scripts/b7_replay_parity.py || rc=1
             exit \$rc"
+      - name: Replay parity and dashboard = journal (B7) on an earlier round trip
+        if: ${{ inputs.check == 'replay' }}
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          STRATEGY: ${{ inputs.strategy }}
+          SINCE: ${{ inputs.since }}
+        run: |
+          [[ "$STRATEGY" == "ping-pong-ls-binance" ]] || { echo "not on the allowlist"; exit 1; }
+          ssh -i ~/.ssh/id_deploy -o ServerAliveInterval=30 -o ServerAliveCountMax=10 "$USER_AT@$HOST" "
+            cd /opt/sleeve-fund && echo \"deployed: \$(sudo cat .deployed_sha 2>/dev/null || echo none)\"
+            sudo docker compose exec -T supervisor python -u - --strategy $STRATEGY --since $SINCE \
+              < scripts/b7_replay_parity.py"
