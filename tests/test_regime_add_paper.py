@@ -32,7 +32,9 @@ def test_on_paper_an_add_is_add_in_the_gate_journal_only_and_its_order_row_stays
         assert s._position_qty() >= s._min_qty(), "set-up: no position held to add to"
         s._send_entry(OrderSide.BUY, D("0.001"), "QA add", {"close": 60_000.0})
 
-    plan = Plan(t0=STD_T0, minutes=6, windows=[(M(STD_T0, 2), M(STD_T0, 6), 1)],
+    # 1% risk at the 2% stop sizes the entry (~9,200 off the 20,000 fund, CUT-A) inside the 0.5x net limit, leaving
+    # the add its room (TEC-QD-CUTA: sized at the risk profile's 66% the entry alone fills the limit).
+    plan = Plan(t0=STD_T0, minutes=6, windows=[(M(STD_T0, 2), M(STD_T0, 6), 1)], params={"risk_per_trade": 0.01},
                 hooks=[(M(STD_T0, 4) + pd.Timedelta(seconds=30), add)])
     run(tmp_path, paper, plan, monkeypatch)
     with paper.engine.connect() as c:

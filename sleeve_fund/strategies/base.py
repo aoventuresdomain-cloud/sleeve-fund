@@ -5055,7 +5055,8 @@ class LongFlatStrategy(Strategy):
         """Paper inside the fund (the portfolio gate on, and in the fund's book): the fund holds the cash, so the
         Strategy's own equity (its P&L, from a starting balance of 0) never sizes, halts or pauses it (Advisor CUT-A
         (d)). A test Strategy outside the book (F229-6) is its own fund."""
-        return self._paper_gated() is not None
+        rt = self.runtime
+        return rt is not None and not rt.backtest and self._paper_gated() is not None
 
     def _paper_fund_equity(self) -> float | None:
         """Paper's fund equity: the supervisor's last portfolio mark, or None when it is stale by the book's own rule
