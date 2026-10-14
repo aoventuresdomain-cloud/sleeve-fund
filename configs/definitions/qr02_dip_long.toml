@@ -1,0 +1,39 @@
+# QR top 3, #2 trend filter with a dip entry, long leg. Decision candle: 4h.
+# Pre-registered secondaries (each a try against the 20-per-idea budget): RSI(14) < 30; Bollinger(20,2) pct_b < 0
+# (Z < -2); a close back above the 12 EMA after the dip.
+version = 1
+name = "qr02-dip-long"
+reason = """Inside an uptrend (close above the daily 200-day SMA), a sharp short pullback (RSI(2) below 10 on 4h) is
+usually forced or emotional selling, and the buyer who steps in is paid for providing liquidity. Out when RSI(2) is
+back above 70, the close is back above its 5-period SMA, or after 10 candles; 2.5 ATR(14) stop."""
+
+[blocks.trend]
+kind = "sma"
+period = 200
+timeframe = "1d"
+
+[blocks.rsi]
+kind = "rsi"
+period = 2
+
+[blocks.sma5]
+kind = "sma"
+period = 5
+
+[blocks.atr]
+kind = "atr"
+period = 14
+
+[long]
+entry = { all = [
+    { left = "close", op = ">", right = "trend" },
+    { left = "rsi", op = "<", right = 10 },
+] }
+exit = { any = [
+    { left = "rsi", op = ">", right = 70 },
+    { left = "close", op = ">", right = "sma5" },
+] }
+
+[exits]
+time_stop = { bars = 10 }
+stop = { level = { sub = ["close", { mul = [2.5, "atr"] }] } }
