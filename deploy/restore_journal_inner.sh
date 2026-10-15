@@ -4,7 +4,9 @@
 # counted first; only then is the journal renamed aside, kept whole as <journal>_before_restore_<UTC stamp> and never
 # dropped here, and the stage renamed into its place. Anything wrong before that leaves the journal exactly as it was.
 # The log is public: the step, the migration and row counts only; the tools' own words go to restore-last.err beside
-# the dumps, readable by its owner only. Exit 0 when the journal is the dump's, else 1.
+# the dumps, readable by its owner only. Exit 0 when the journal is the dump's; 2 when no database carries the
+# journal's name (both renames failed: the operator puts it back by hand, and the app must stay stopped); else 1, with
+# the journal as it was.
 set -euo pipefail
 umask 077
 DIR=${BACKUP_DIR:-/backups}
@@ -28,6 +30,12 @@ COUNT="select (select version_num from alembic_version) || ' ' ||
   (select count(*) from events where sleeve is null or sleeve not like 'bt:%') || ' ' ||
   (select count(*) from fund_flows) || ' ' || (select count(*) from book_moves) || ' ' || (select count(*) from decisions)"
 NAMES="migration orders fills events fund_flows book_moves decisions"
+# The stage is a second journal: twice the journal's size free on the host's disk (beside the backups, as the pre-deploy
+# dump checks it), or nothing is restored.
+size=$(psql -d postgres -At -c "select pg_database_size('$DB')" 2>>"$ERR") \
+  || { rc=$?; fail "couldn't read the journal's size (exit $rc), details beside the dumps"; }
+free=$(df -PB1 "$DIR" | awk 'NR == 2 { print $4 }')
+[[ "$size" =~ ^[0-9]+$ && "$free" =~ ^[0-9]+$ ]] && [ "$free" -ge $((2 * size)) ] || fail "not enough disk"
 dropdb --if-exists "$STAGE" >/dev/null 2>&1 || true
 createdb "$STAGE" 2>>"$ERR" || { rc=$?; fail "couldn't make the stage database (exit $rc), details beside the dumps"; }
 pg_restore --no-owner --no-privileges --exit-on-error -d "$STAGE" "$DIR/$DUMP" 2>>"$ERR" \
@@ -48,7 +56,7 @@ rc=0
 psql -d postgres -v ON_ERROR_STOP=1 -c "ALTER DATABASE \"$STAGE\" RENAME TO \"$DB\"" >/dev/null 2>>"$ERR" || rc=$?
 if [ "$rc" != 0 ]; then
   psql -d postgres -v ON_ERROR_STOP=1 -c "ALTER DATABASE \"$KEEP\" RENAME TO \"$DB\"" >/dev/null 2>>"$ERR" \
-    || fail "the restored copy couldn't take the journal's place (exit $rc) and the journal is still named $KEEP"
+    || { echo "restore journal: FAIL, the restored copy couldn't take the journal's place (exit $rc) and the journal is still named $KEEP"; exit 2; }
   fail "the restored copy couldn't take the journal's place (exit $rc), the journal is back as it was"
 fi
 swapped=1

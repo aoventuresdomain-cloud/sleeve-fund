@@ -18,7 +18,8 @@ on:
         description: "Type: restore <the dump's file name>"
         required: true
         type: string
-concurrency: { group: restore-journal, cancel-in-progress: false }
+# The deploy's group (and canon's, the funding backfill's): a push to main waits for the restore, never overlaps it.
+concurrency: { group: history-writer, cancel-in-progress: false }
 jobs:
   restore:
     runs-on: ubuntu-24.04
@@ -47,7 +48,7 @@ jobs:
       - name: Restore the journal
         env:
           HOST: ${{ secrets.DEPLOY_HOST }}
-        # The script's exit code passes through ssh: 0 PASS, 1 FAIL, 255 ssh itself (quiet). DUMP and CONFIRM were
+        # The script's exit code passes through ssh: 0 PASS, 1 FAIL, 2 journal out of place, 255 ssh itself (quiet). DUMP and CONFIRM were
         # checked above to be a file name and its echo, so they are safe on the remote command line.
         run: |
           ssh -o LogLevel=QUIET -i ~/.ssh/id_deploy "$USER_AT@$HOST" \
