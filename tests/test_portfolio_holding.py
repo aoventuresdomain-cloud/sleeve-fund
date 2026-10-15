@@ -13,7 +13,7 @@ from sleeve_fund.portfolio.holding import ALIASES, underlying
 
 
 def _long(qty="2", stop=None, lev=5.0, instrument="BTC/USDT"):
-    return Position("s1", underlying(instrument), D(qty), None if stop is None else D(stop), lev)
+    return Position("s1", underlying(instrument), D(qty), None if stop is None else D(stop), lev, D(0))
 
 
 @pytest.mark.parametrize("side, stop, atr", [
@@ -24,9 +24,9 @@ def _long(qty="2", stop=None, lev=5.0, instrument="BTC/USDT"):
     (1, "101", 0.02),  # the price has gone through its stop: stopless, never 0
 ])
 def test_g5_the_books_holding_risk_is_the_interim_checks_formula(side, stop, atr):
-    pos = Position("s1", "BTC", side * D("2"), None if stop is None else D(stop), 5.0)
+    pos = Position("s1", "BTC", side * D("2"), None if stop is None else D(stop), 5.0, D(0))
     h = holding_for(pos, D("100"), atr)
-    interim = position_risk(side * 2.0, 100.0, None if stop is None else float(stop), atr)
+    interim = position_risk(side * 2.0, 100.0, None if stop is None else float(stop), atr, taker=0)
     assert float(h.risk) == pytest.approx(interim, rel=1e-12) and isinstance(h.risk, D)  # exact vs float
     assert (h.notional, h.margin) == (D(side * 200), D("40"))
 

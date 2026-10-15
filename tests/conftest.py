@@ -104,6 +104,20 @@ def _vs1_interim_tables(monkeypatch, request):
     monkeypatch.setattr(venue("BINANCE"), "maintenance_tiers", _EveryPair(flat(0.005)))
 
 
+@pytest.fixture(autouse=True)
+def _venue_terms_fetched(monkeypatch, request):
+    """FEE-LIVE: paper refuses entries, and the start check fails, while an instrument's fetched fee rates or tiers
+    are over 72 h old or were never fetched; only the supervisor fetches them. Every other test's store has never
+    fetched, so it runs as if they were fresh, and its paper is charged the published VIP 0 (fees.resolve); a test
+    marked venue_terms_live sees the rule as it is."""
+    if request.node.get_closest_marker("venue_terms_live"):
+        return
+    from sleeve_fund import venue_terms
+
+    monkeypatch.setattr(venue_terms, "entry_refusal", lambda *a, **k: None)
+    monkeypatch.setattr(venue_terms, "live_terms", lambda *a, **k: [])
+
+
 # TEC-BTWAIT (HoE, Drop B): how long a dashboard backtest request waits for its job before showing the queued-job page.
 # Production waits 8 s (BACKTEST_WAIT_SECONDS); a loaded test box can take longer, and a cell expecting the finished
 # run then reads the queued page instead (Drop A round, 14 Oct). A test that means the queued page sets its own.

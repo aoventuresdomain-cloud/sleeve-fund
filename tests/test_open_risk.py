@@ -16,25 +16,25 @@ _REAL_HISTORY_ATR = open_risk.history_atr_pct  # read at import, before conftest
 
 
 def test_a_stopped_position_risks_from_the_mark_to_its_stop():
-    assert open_risk.position_risk(2.0, 110.0, stop=100.0) == pytest.approx(20.0)  # long: from the mark, not entry
-    assert open_risk.position_risk(-2.0, 100.0, stop=104.0) == pytest.approx(8.0)  # short: the price rising to it
+    assert open_risk.position_risk(2.0, 110.0, stop=100.0, taker=0) == pytest.approx(20.0)  # long: from the mark, not entry
+    assert open_risk.position_risk(-2.0, 100.0, stop=104.0, taker=0) == pytest.approx(8.0)  # short: the price rising to it
 
 
 def test_a_position_the_price_has_gone_through_the_stop_of_counts_as_stopless_never_0():
     """QA P1-S9: still open past its stop (a gap, its exit not filled yet), it risks what a stopless one does."""
-    assert open_risk.position_risk(2.0, 110.0, stop=112.0, atr_pct=0.01) == pytest.approx(22.0)
-    assert open_risk.position_risk(-2.0, 100.0, stop=95.0, atr_pct=0.05) == pytest.approx(30.0)
+    assert open_risk.position_risk(2.0, 110.0, stop=112.0, atr_pct=0.01, taker=0) == pytest.approx(22.0)
+    assert open_risk.position_risk(-2.0, 100.0, stop=95.0, atr_pct=0.05, taker=0) == pytest.approx(30.0)
     assert open_risk.gapped(2.0, 110.0, 112.0) and open_risk.gapped(-2.0, 100.0, 95.0)
     assert not open_risk.gapped(2.0, 110.0, 100.0) and not open_risk.gapped(0.0, 110.0, 112.0)
     with pytest.raises(ValueError, match="daily ATR isn't known"):
-        open_risk.position_risk(2.0, 110.0, stop=112.0)
+        open_risk.position_risk(2.0, 110.0, stop=112.0, taker=0)
 
 
 @pytest.mark.parametrize("atr_pct, move", [(0.01, 0.10), (0.05, 0.15)])
 def test_a_stopless_position_counts_at_the_larger_of_10_percent_and_3_daily_atrs(atr_pct, move):
-    assert open_risk.position_risk(-0.5, 4_000.0, atr_pct=atr_pct) == pytest.approx(2_000 * move)
+    assert open_risk.position_risk(-0.5, 4_000.0, atr_pct=atr_pct, taker=0) == pytest.approx(2_000 * move)
     with pytest.raises(ValueError, match="daily ATR isn't known"):
-        open_risk.position_risk(0.5, 4_000.0)
+        open_risk.position_risk(0.5, 4_000.0, taker=0)
 
 
 def _days(n, width=4.0, start="2025-01-02"):
@@ -84,7 +84,7 @@ def test_paper_reads_the_daily_atr_from_the_history_store_and_doesnt_cache_a_mis
     hs.append("BINANCE", "BTC/USDT", _minutes(20, width=6.0), cursor="x")
     atr = open_risk.history_atr_pct("BINANCE", "BTC/USDT", now, history=hs)
     assert atr == pytest.approx(0.06)
-    assert open_risk.position_risk(1.0, 100.0, atr_pct=atr) == pytest.approx(18.0)  # 3 ATRs, over the 10% floor
+    assert open_risk.position_risk(1.0, 100.0, atr_pct=atr, taker=0) == pytest.approx(18.0)  # 3 ATRs, over the 10% floor
 
 
 @pytest.mark.real_daily_atr
@@ -110,7 +110,8 @@ def test_another_strategy_past_its_stop_counts_as_stopless_and_is_named(monkeypa
     store.record_equity("other", equity=10_000, cash=4_000, qty=0.1, price=60_000, benchmark=10_000)
     monkeypatch.setattr(open_risk, "_journal_stop", lambda store, s, qty: 61_000.0)  # a long's stop above the mark
     book, risk, through = open_risk.account_book(store, "pp", 10_000, lambda s: 0.01)
-    assert book == 20_000 and risk == pytest.approx(600.0) and through == ["other"]
+    # Stopless: 10% of 6,000, and the 0.055% taker fee on its exit at 54,000 (FEE-LIVE 5): 600 + 2.97.
+    assert book == 20_000 and risk == pytest.approx(600 + 0.1 * 54_000 * 0.00055) and through == ["other"]
 
 
 def test_the_limit_is_5_percent_of_the_book_counting_the_entry():

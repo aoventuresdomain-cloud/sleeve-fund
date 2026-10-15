@@ -28,9 +28,16 @@ def test_after_a_restart_a_replayed_minute_opening_past_liquidation_liquidates_h
     assert len(_liq_events(run)) == 1
 
 
+def _mismatch(run):
+    """The liquidation_mismatch warnings the restore raised (Advisor RESUME-CELL6)."""
+    return [e for e in run.events if e["kind"] == "liquidation_mismatch"]
+
+
 def test_the_journaled_liquidation_price_is_the_one_used_after_a_restart(monkeypatch):
-    """The entry's order carries a liquidation price further off than the formula's: the restarted strategy uses
-    the journaled one, so the minute opening 40 % against the 3x short is a stop past it, not a liquidation."""
+    """The entry's order carries a liquidation price further off than the formula's: the restarted strategy reads the
+    journaled one, and works to the nearer of it and the one worked out again (Advisor RESUME-CELL6, HoE TEC 15 Oct),
+    so the minute opening 40 % against the 3x short liquidates it, and the mismatch is alerted naming the journaled
+    price."""
     record = Store.record_order
 
     def with_liq(self, sleeve, **kw):
@@ -41,12 +48,16 @@ def test_the_journaled_liquidation_price_is_the_one_used_after_a_restart(monkeyp
     monkeypatch.setattr(Store, "record_order", with_liq)
     p = qa.shape(qa.flat_prices(30), 7.0, 8.0, qa.adverse(-1, 0.40))
     run = qa.restart(p, 6, 12, side=-1, perp=True, profile="aggressive", stop=0.10, qty=0.25)
-    assert qa.first_exit(run.sequence())[0] == "stop_loss", run.sequence()
+    assert qa.first_exit(run.sequence())[0] == "liquidation", run.sequence()
+    alerts = _mismatch(run)
+    assert len(alerts) == 1 and alerts[0]["level"] == "warning", alerts
+    assert f"journaled {qa.BASE * 1.5:,.6g}" in alerts[0]["message"], alerts[0]["message"]
 
 
 def test_a_later_entry_that_never_filled_does_not_hide_the_held_entrys_journaled_price(monkeypatch):
     """An expired post-only entry, journaled after the held one and never filled: the restart still reads the
-    held entry's journaled price (CR #146), so the same minute is a stop past it, not a liquidation."""
+    held entry's journaled price (CR #146), which the mismatch alert names; the nearer price, the one worked out again,
+    then liquidates the same minute (Advisor RESUME-CELL6, HoE TEC 15 Oct)."""
     from datetime import timedelta
 
     record = Store.record_order
@@ -63,7 +74,10 @@ def test_a_later_entry_that_never_filled_does_not_hide_the_held_entrys_journaled
     monkeypatch.setattr(Store, "record_order", with_liq)
     p = qa.shape(qa.flat_prices(30), 7.0, 8.0, qa.adverse(-1, 0.40))
     run = qa.restart(p, 6, 12, side=-1, perp=True, profile="aggressive", stop=0.10, qty=0.25)
-    assert qa.first_exit(run.sequence())[0] == "stop_loss", run.sequence()
+    assert qa.first_exit(run.sequence())[0] == "liquidation", run.sequence()
+    alerts = _mismatch(run)
+    assert len(alerts) == 1 and alerts[0]["level"] == "warning", alerts
+    assert f"journaled {qa.BASE * 1.5:,.6g}" in alerts[0]["message"], alerts[0]["message"]
 
 
 def test_an_entry_journals_the_liquidation_price_from_its_own_fill():

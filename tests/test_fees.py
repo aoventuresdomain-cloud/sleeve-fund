@@ -38,45 +38,41 @@ def test_kraken_account_fees_reads_trade_volume():
     assert "AddOrder" not in seen["path"]  # query only
 
 
+KRAKEN_BOUNDS = venues.KRAKEN.fee_bounds
+
+
+def _kraken_fetch(store, maker, taker, at=None):
+    store.record_venue_fetch("KRAKEN", "fee", "BTC/USD", source="trade-volume", ok=True, account="kraken-main",
+                             payload={"maker": maker, "taker": taker}, bounds=KRAKEN_BOUNDS, at=at)
+
+
 def test_resolve_prefers_the_latest_fetched_account_schedule(store):
-    q = resolve("KRAKEN", store)
-    assert q.source == "published" and "no account on this venue is connected" in q.text
+    """FEE-LIVE (HoE TEC, head 3): the account's fetched rate is the newest good venue_terms_fetch row; until there
+    is one the published schedule is charged and says so."""
+    q = resolve("KRAKEN", store, instrument="BTC/USD", account="kraken-main")
+    assert q.source == "published" and "published" in q.text
     store.create_account("kraken-main", "live", venue="kraken")
-    store.record_fees("KRAKEN", "kraken-main", 0.003, 0.006)
-    q = resolve("KRAKEN", store)
+    _kraken_fetch(store, "0.003", "0.006")
+    q = resolve("KRAKEN", store, instrument="BTC/USD", account="kraken-main")
     assert q.source == "account" and (q.fees.maker, q.fees.taker) == (Decimal("0.003"), Decimal("0.006"))
-    assert "from account kraken-main" in q.text and "0.30% maker, 0.60% taker" in q.text
-    with pytest.raises(ValueError):
-        store.record_fees("KRAKEN", "kraken-main", 0.2, 0.3)  # a percent passed as a fraction
+    assert "0.30% maker, 0.60% taker" in q.text
+    _kraken_fetch(store, "0.2", "0.3")  # a percent passed as a fraction: kept as failed, never used
+    q = resolve("KRAKEN", store, instrument="BTC/USD", account="kraken-main")
+    assert q.fees.taker == Decimal("0.006")
 
 
 def test_supervisor_fetches_fees_for_connected_live_accounts_only(store, monkeypatch):
+    """FEE-LIVE (HoE TEC, head 3): the supervisor's fee pass is check_venue_terms, and the retired per-account write
+    to fee_schedules never runs, whatever key is set."""
     from sleeve_fund.supervisor import Supervisor
 
     store.create_account("kraken-main", "live", venue="kraken")
-    store.create_account("kraken-nokey", "live", venue="kraken")
-    calls = []
-
-    def fake_fetch(key, secret):
-        calls.append(key)
-        from sleeve_fund.instruments import FeeSchedule
-
-        return FeeSchedule(Decimal("0.0025"), Decimal("0.004"))
-
-    monkeypatch.setattr(venues.KRAKEN, "fetch_fees", fake_fetch)
+    calls, passes = [], []
+    monkeypatch.setattr(venues.KRAKEN, "fetch_fees", lambda key, secret: calls.append(key))
+    monkeypatch.setattr(Supervisor, "check_venue_terms", lambda self, environ=None, **kw: passes.append(environ))
     env = {"KRAKEN_API_KEY__KRAKEN_MAIN": "k1", "KRAKEN_API_SECRET__KRAKEN_MAIN": "s1"}
     Supervisor(store).check_fees(environ=env)
-    assert calls == ["k1"]
-    assert resolve("KRAKEN", store).fees.taker == Decimal("0.004")
-
-    def failing(key, secret):
-        raise ValueError(f"EAPI:Invalid key {key} {secret}")
-
-    monkeypatch.setattr(venues.KRAKEN, "fetch_fees", failing)
-    Supervisor(store).check_fees(environ=env)
-    assert resolve("KRAKEN", store).fees.taker == Decimal("0.004")  # the last good schedule stays
-    ev = [e for e in store.events(limit=10) if e["kind"] == "fee_fetch_failed"][0]
-    assert "k1" not in ev["message"] and "s1" not in ev["message"]
+    assert calls == [] and passes == [env]
 
 
 def test_paper_processes_never_inherit_any_venue_key():
@@ -92,8 +88,9 @@ def test_backtest_charges_the_fetched_account_fees(store):
     from sleeve_fund.data import synthetic_ohlcv
 
     store.create_account("kraken-main", "live", venue="kraken")
-    store.record_fees("KRAKEN", "kraken-main", 0.002, 0.004)
+    _kraken_fetch(store, "0.002", "0.004")  # FEE-LIVE (HoE TEC, head 3): the account's rate from venue_terms_fetch
     preview._history.clear()
-    res = preview.run("trend_filter", "BTC/USD", {"fast": 5, "slow": 20}, fee_quote=resolve("KRAKEN", store),
+    quote = resolve("KRAKEN", store, instrument="BTC/USD", account="kraken-main")
+    res = preview.run("trend_filter", "BTC/USD", {"fast": 5, "slow": 20}, fee_quote=quote,
                       fetch=lambda pair: synthetic_ohlcv(days=200, seed=4, vol=0.03))
     assert res["fee_schedule"]["taker"] == 0.004 and res["fee_schedule"]["source"] == "account"

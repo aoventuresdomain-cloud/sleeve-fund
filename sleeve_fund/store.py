@@ -94,6 +94,12 @@ def flattened_words(reason: str) -> str:
 RELOAD = "reload"
 LIFECYCLE_ACTIONS = ("wind_down", "retire", "close_now")  # the PM's lifecycle moves (Store.set_lifecycle)
 LIFECYCLE_EVENT = "lifecycle"  # one event per lifecycle move, with what moved and why
+# The supervisor's cancel of one resting order whose Strategy can no longer manage it (ORPHAN-GUARD, Advisor 8 Oct
+# 06:15 and 06:20 UK). Never the Strategy's: pending_commands leaves it out, and only apply_cancel applies it, when the
+# venue has answered.
+CANCEL = "cancel"
+# Every kind a commands row may hold, which the commands_kind CHECK enforces (migration 0030).
+COMMAND_KINDS = (*sorted(COMMANDS), RELOAD, CANCEL)
 STATUSES = {"starting", "running", "paused", "halted", "stopped", "error"}
 LEVELS = ("info", "warning", "error")
 
@@ -305,6 +311,20 @@ commands_t = Table(
     Column("incident", Integer, ForeignKey("events.id", ondelete="RESTRICT")),
     Index("commands_incident", "incident", unique=True, postgresql_where=text("incident IS NOT NULL"),
           sqlite_where=text("incident IS NOT NULL")),
+    # The one resting order a cancel names (migration 0030). Only a cancel has one, and a cancel always does: NULL never
+    # means "every order".
+    Column("order_id", String(64), ForeignKey("orders.order_id", ondelete="RESTRICT")),
+    CheckConstraint(f"command IN ({', '.join(repr(k) for k in COMMAND_KINDS)})", name="commands_kind"),
+    CheckConstraint(f"(command = '{CANCEL}') = (order_id IS NOT NULL)", name="commands_cancel_order"),
+    # When the venue first answered a cancel "not found" with no fill in the journal: no proof of a cancel (Advisor 8 Oct
+    # 06:20 UK, 13 Oct 17:00 UK), so nothing is released and the Strategy's entries stay blocked until the venue confirms
+    # the order's end state (apply_cancel "cancelled" with zero fills, or "filled").
+    Column("not_found_at", TS),
+    CheckConstraint(f"not_found_at IS NULL OR command = '{CANCEL}'", name="commands_not_found_cancel"),
+    # One open cancel per order: a retry, a second sweep or a restart finds the first, never sends a second.
+    Index("commands_cancel_open", "order_id", unique=True,
+          postgresql_where=text(f"command = '{CANCEL}' AND applied_at IS NULL"),
+          sqlite_where=text(f"command = '{CANCEL}' AND applied_at IS NULL")),
 )
 
 decisions_t = Table(
@@ -485,8 +505,8 @@ account_keys_t = Table(
     Column("present", Integer, nullable=False),  # 1 if the supervisor sees both key and secret
     Column("checked_at", TS, nullable=False),
 )
-# Fee schedules read from each connected live account by the supervisor (query-only key, server
-# only). Every fetch is kept, so a result can always say which schedule it used.
+# Retired (FEE-LIVE, head 3): fee schedules the supervisor once read from live accounts. Nothing writes or reads it now
+# (venue_terms_fetch holds every fee fetch); the table and its rows are kept, never dropped.
 fee_schedules_t = Table(
     "fee_schedules",
     metadata,
@@ -497,6 +517,103 @@ fee_schedules_t = Table(
     Column("taker", Float, nullable=False),
     Column("fetched_at", TS, nullable=False),
 )
+# FEE-LIVE (DA, 0029; data-architect/fee-live-storage.md): every fetch of a venue's fee rates (from the account) or margin
+# tiers (public) is one row, kept whether it worked or not. The engine reads the newest good row per (venue, kind,
+# instrument) as last-known-good and judges its age itself. A failed fetch, or one whose numbers fail the write path's
+# checks (fees outside the published bounds, tiers margin.tiers refuses), is kept with its reason and is never good.
+# Numbers in the payload are the venue's own decimal strings. Append-only, held by the database (triggers below).
+VENUE_FETCH_KINDS = ("fee", "tiers")
+# Advisor HEAD3: an account with no fee endpoint trades at the venue's published VIP0 schedule, written as a good fee
+# row with this source, so the start check and the dashboard label it "published, not account" and alert on it.
+PUBLISHED_FEES = "published-vip0"
+venue_terms_fetch_t = Table(
+    "venue_terms_fetch",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("venue", String(16), nullable=False),
+    Column("kind", String(8), nullable=False),
+    Column("instrument", String(32), nullable=False),  # the engine pair, BTC/USDT; the venue's symbol is in the payload
+    Column("account", String(41), ForeignKey("accounts.name"), nullable=True),  # a label, never a key; NULL for tiers
+    Column("source", String(64), nullable=False),  # the endpoint read
+    Column("fetched_at", TS, nullable=False),
+    Column("ok", Integer, nullable=False),
+    Column("reason", Text, nullable=False, default=""),
+    Column("payload", JSON, nullable=True),
+    CheckConstraint("venue = upper(venue)", name="venue_terms_fetch_venue_upper"),
+    CheckConstraint("kind IN ('fee', 'tiers')", name="venue_terms_fetch_kind"),
+    CheckConstraint("ok IN (0, 1)", name="venue_terms_fetch_ok"),
+    CheckConstraint("(ok = 1 AND reason = '') OR (ok = 0 AND reason <> '')", name="venue_terms_fetch_reason"),
+    CheckConstraint("ok = 0 OR payload IS NOT NULL", name="venue_terms_fetch_payload"),
+    CheckConstraint("kind <> 'tiers' OR account IS NULL", name="venue_terms_fetch_public_tiers"),
+    Index("ix_venue_terms_latest", "venue", "kind", "instrument", "ok", "fetched_at", "id"),
+)
+VENUE_FETCH_WORM = "venue_terms_fetch is append-only: a fetch is never edited or deleted, a new fetch is a new row"
+VENUE_FETCH_PG = (
+    "CREATE OR REPLACE FUNCTION venue_terms_fetch_append_only() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+    f"RAISE EXCEPTION USING ERRCODE = 'check_violation', MESSAGE = '{VENUE_FETCH_WORM}'; END $$",
+    "CREATE TRIGGER venue_terms_fetch_append_only BEFORE UPDATE OR DELETE ON venue_terms_fetch FOR EACH ROW "
+    "EXECUTE FUNCTION venue_terms_fetch_append_only()",
+)
+VENUE_FETCH_SQLITE = tuple(f"CREATE TRIGGER venue_terms_fetch_no_{o.lower()} BEFORE {o} ON venue_terms_fetch BEGIN "
+                           f"SELECT RAISE(ABORT, '{VENUE_FETCH_WORM}'); END" for o in ("UPDATE", "DELETE"))
+for _sql in VENUE_FETCH_PG:
+    event.listen(venue_terms_fetch_t, "after_create", DDL(_sql).execute_if(dialect="postgresql"))
+for _sql in VENUE_FETCH_SQLITE:
+    event.listen(venue_terms_fetch_t, "after_create", DDL(_sql).execute_if(dialect="sqlite"))
+
+
+def _fee_problem(payload, bounds) -> str:
+    """Why a fetched fee payload can't be last-known-good, or "" when it can (both rates decimal strings, each inside
+    its published [lowest, VIP0] bounds; out of bounds counts as missing, Advisor FEE-LIVE)."""
+    for side in ("maker", "taker"):
+        if side not in payload:
+            return f"no {side} rate in the venue's answer"
+        try:
+            rate = Decimal(payload[side])
+        except Exception:  # noqa: BLE001 - whatever the venue sent, it isn't a number
+            return f"{side} rate {payload[side]!r} isn't a number"
+        lo, hi = bounds[side]
+        if not (rate.is_finite() and Decimal(lo) <= rate <= Decimal(hi)):
+            return f"out of bounds: {side} {payload[side]} outside the published [{lo}, {hi}]"
+    return ""
+
+
+def margin_tiers_of(row: dict) -> tuple:
+    """A good tiers fetch as the engine's maintenance table (margin.Tier: ceiling, rate, deduction). The venue's last
+    ceiling is where it stops taking positions; the engine's table ends open (vs1-tiers.md), and margin.tiers checks
+    the rest: ceilings rising, continuous at every ceiling, rates in (0, 1)."""
+    from sleeve_fund.margin import Tier, tiers
+
+    rows = row["payload"]["tiers"]
+    return tiers(tuple(Tier(math.inf if n == len(rows) - 1 else float(Decimal(t["ceiling"])), float(Decimal(t["mmr"])),
+                            float(Decimal(t["deduction"] or "0"))) for n, t in enumerate(rows)))
+
+
+def venue_fees_of(row: dict):
+    """A good fee fetch as the engine's FeeSchedule, each rate parsed from the venue's string as a Decimal: never
+    through a float, so 0.00055 stays 0.00055 through the fee and compliance-test maths (Advisor FEE-STORE)."""
+    from sleeve_fund.instruments import FeeSchedule
+
+    return FeeSchedule(maker=Decimal(row["payload"]["maker"]), taker=Decimal(row["payload"]["taker"]))
+
+
+def _tiers_problem(payload) -> str:
+    """Why a fetched tiers payload can't be last-known-good, or "" when margin.tiers accepts it."""
+    try:
+        margin_tiers_of({"payload": payload})
+    except (KeyError, TypeError, IndexError, ArithmeticError, ValueError) as e:  # Decimal's errors are ArithmeticError
+        return f"tiers refused: {e}"
+    return "" if payload.get("tiers") else "tiers refused: an empty table"
+
+
+def _strings_only(payload) -> None:
+    """The venue's numbers are kept exactly as it wrote them: a float here has already been rounded by someone."""
+    if isinstance(payload, float):
+        raise ValueError("venue numbers are kept as the venue's decimal strings, not floats")
+    for v in payload.values() if isinstance(payload, dict) else payload if isinstance(payload, list) else ():
+        _strings_only(v)
+
+
 # Typical half bid-ask spread per instrument, measured from a paper sleeve's live quotes. Backtests
 # charge it on every order that takes liquidity, since their bars carry trade prices, not quotes.
 spreads_t = Table(
@@ -904,6 +1021,8 @@ gate_decisions_t = Table(
     Index("gate_decisions_sleeve_bar_intent_stage", "sleeve_id", "bar_ts", "intent_id", "stage", unique=True,
           sqlite_where=text("outcome <> 'error'"), postgresql_where=text("outcome <> 'error'")),
     Index("gate_decisions_sleeve_decided_at", "sleeve_id", "decided_at"),
+    # An order's decisions, read on every fill and status change of a gated order and by a cancel (migration 0030)
+    Index("gate_decisions_order_id", "order_id"),
 )
 # Headroom held by resting entries: one per approved or trimmed decision, released in the same transaction as the
 # fill, reject or cancel row. Never released blind while its order may still fill (Advisor 20:25 UK).
@@ -3154,15 +3273,6 @@ class Store:
                 c.execute(account_keys_t.delete().where(account_keys_t.c.account == name))
                 c.execute(insert(account_keys_t).values(account=name, present=int(bool(ok)), checked_at=now))
 
-    def record_fees(self, venue: str, account: str, maker: float, taker: float) -> None:
-        """Supervisor only: the fee schedule a live account's venue reports for it."""
-        for label, v in (("maker", maker), ("taker", taker)):
-            if not 0 <= v < 0.05:
-                raise ValueError(f"{label} fee {v} outside [0, 5%)")
-        with self.engine.begin() as c:
-            c.execute(insert(fee_schedules_t).values(venue=venue.upper(), account=account, maker=float(maker),
-                                                     taker=float(taker), fetched_at=utcnow()))
-
     def record_spread(self, venue: str, instrument: str, half_spread: float, samples: int,
                       ts: datetime | None = None) -> None:
         if not 0 <= half_spread < 0.05:
@@ -3205,14 +3315,75 @@ class Store:
         with self.engine.connect() as c:
             return _rows(c.execute(q))
 
-    def latest_fees(self, venue: str, account: str | None = None) -> dict | None:
-        """The most recent fetched schedule for a venue (or one account), or None."""
-        q = select(fee_schedules_t).where(fee_schedules_t.c.venue == venue.upper())
-        if account:
-            q = q.where(fee_schedules_t.c.account == account)
+    def record_venue_fetch(self, venue: str, kind: str, instrument: str, *, source: str, ok: bool, reason: str = "",
+                           payload: dict | None = None, account: str | None = None, at: datetime | None = None,
+                           bounds: dict | None = None) -> int:
+        """FEE-LIVE: keep one fetch of a venue's fee rates or margin tiers, good or not, and return its id. A fetch
+        said to be good is checked first: fees against `bounds` ({"maker": (lowest, VIP0), "taker": (...)}, the
+        venue's published range, required), tiers by margin.tiers. One that fails is kept as failed, with why."""
+        if kind not in VENUE_FETCH_KINDS:
+            raise ValueError(f"venue fetch kind must be one of {VENUE_FETCH_KINDS}")
+        if kind == "tiers" and account is not None:
+            raise ValueError("margin tiers are the venue's public table: no account")
+        if payload is not None:
+            _strings_only(payload)
+        if ok:
+            if kind == "fee" and not bounds:
+                raise ValueError("a fee fetch is checked against the venue's published bounds: pass bounds")
+            problem = _fee_problem(payload or {}, bounds) if kind == "fee" else _tiers_problem(payload or {})
+            if problem:
+                ok, reason = False, problem
+        elif not reason:
+            raise ValueError("a failed fetch keeps its reason")
+        with self.engine.begin() as c:
+            if ok and source == PUBLISHED_FEES and self._is_live(c, account):
+                ok, reason = False, ("the published stand-in is for paper and demo accounts only: a live account's "
+                                     "fees are fetched from the account")
+            return c.execute(insert(venue_terms_fetch_t).values(
+                venue=venue.upper(), kind=kind, instrument=instrument, account=account, source=source,
+                fetched_at=at or utcnow(), ok=int(bool(ok)), reason="" if ok else reason, payload=payload)
+            ).inserted_primary_key[0]
+
+    def record_published_fees(self, venue: str, instrument: str, *, account: str, bounds: dict,
+                              at: datetime | None = None) -> int:
+        """A fee fetch attempt that fell back to the venue's published VIP0 schedule (Advisor HEAD3): a fresh
+        stand-in row at this attempt's time, so it ages as any fetch does (Advisor FEE-STORE). Kept as failed for a
+        live account, which must fetch its own."""
+        from sleeve_fund.venues import venue as venue_profile
+
+        fees = venue_profile(venue).fees
+        return self.record_venue_fetch(venue, "fee", instrument, source=PUBLISHED_FEES, ok=True, account=account,
+                                       at=at, bounds=bounds, payload={"maker": str(fees.maker), "taker": str(fees.taker)})
+
+    @staticmethod
+    def _is_live(c, account: str | None) -> bool:
+        return account is not None and c.execute(
+            select(accounts_t.c.kind).where(accounts_t.c.name == account)).scalar() == "live"
+
+    def _latest_venue_fetch(self, venue: str, kind: str, instrument: str, good: bool,
+                            account: str | None = None) -> dict | None:
+        t = venue_terms_fetch_t
+        q = select(t).where(t.c.venue == venue.upper(), t.c.kind == kind, t.c.instrument == instrument)
         with self.engine.connect() as c:
-            rows = _rows(c.execute(q.order_by(fee_schedules_t.c.fetched_at.desc(), fee_schedules_t.c.id.desc()).limit(1)))
+            if account is not None:
+                q = q.where(t.c.account == account)
+                if good and self._is_live(c, account):  # never the stand-in, however it got there
+                    q = q.where(t.c.source != PUBLISHED_FEES)
+            if good:
+                q = q.where(t.c.ok == 1)
+            rows = _rows(c.execute(q.order_by(t.c.fetched_at.desc(), t.c.id.desc()).limit(1)))
         return rows[0] if rows else None
+
+    def latest_good_venue_fetch(self, venue: str, kind: str, instrument: str,
+                                account: str | None = None) -> dict | None:
+        """The last-known-good fetch (newest good row; equal times go to the later row), or None if none ever was;
+        with `account`, that account's own (a live account's never the published stand-in). Its age is the caller's
+        to judge (FEE-LIVE: alert after 24 h, refuse entries after 72 h). venue_fees_of gives its rates as Decimal."""
+        return self._latest_venue_fetch(venue, kind, instrument, good=True, account=account)
+
+    def latest_venue_fetch(self, venue: str, kind: str, instrument: str) -> dict | None:
+        """The newest fetch, good or failed: what an alert says went wrong last."""
+        return self._latest_venue_fetch(venue, kind, instrument, good=False)
 
     def set_signal_state(self, sleeve: str, payload: dict, ts: datetime | None = None) -> None:
         """Paper only: the model's conditions on the forming candle, replacing the last ones (Signals tab)."""
@@ -3867,6 +4038,15 @@ class Store:
             locked = c.execute(select(resets_t.c.restart).where(resets_t.c.id == request["id"]).with_for_update()).first()
             if locked is not None:  # a PM Stop since the request (Store.hold_on_reset) keeps the fresh run stopped
                 request["restart"] = locked.restart
+            # F241-4: an open cancel would move with the run, archived, and the fresh run would trade with nothing
+            # blocking its entries while the venue may still fill that order. Read in this transaction, so a cancel
+            # requested since the supervisor's check (F241-3) is caught too; nothing has been written yet.
+            pending = c.execute(select(commands_t.c.id).where(commands_t.c.sleeve == name,
+                                                              commands_t.c.command == CANCEL,
+                                                              commands_t.c.applied_at.is_(None))).first()
+            if pending is not None:
+                raise ValueError("a strategy with a cancel the venue hasn't answered can't be reset; it is reset once "
+                                 "the venue confirms the order cancelled or filled")
             row = dict(c.execute(select(sleeves_t).where(sleeves_t.c.name == name)).first()._mapping)
             row_id = row.pop("id")
             c.execute(insert(sleeves_t).values(**{**row, "name": run, "desired_state": "stopped", "status": "stopped",
@@ -4923,7 +5103,11 @@ class Store:
         return next((c for c in self.pending_commands(sleeve) if c["command"] == RELOAD), None)
 
     def pending_commands(self, sleeve: str) -> list[dict]:
-        q = (select(commands_t).where(commands_t.c.sleeve == sleeve, commands_t.c.applied_at.is_(None))
+        """The commands a Strategy's process (and the PM's screens) act on. A cancel is the supervisor's, read with
+        open_cancels: a process never applies one, and drop_pending never lapses one, since the order would be left
+        resting with nobody asking for it to go."""
+        q = (select(commands_t).where(commands_t.c.sleeve == sleeve, commands_t.c.applied_at.is_(None),
+                                      commands_t.c.command != CANCEL)
              .order_by(commands_t.c.id))
         with self.engine.connect() as c:
             return _rows(c.execute(q))
@@ -4949,8 +5133,123 @@ class Store:
         return rows[0] if rows else None
 
     def mark_applied(self, command_id: int) -> None:
+        """Not for a cancel: apply_cancel applies one, with its order and reservation, when the venue has answered."""
         with self.engine.begin() as c:
-            c.execute(update(commands_t).where(commands_t.c.id == command_id).values(applied_at=utcnow()))
+            c.execute(update(commands_t).where(commands_t.c.id == command_id, commands_t.c.command != CANCEL)
+                      .values(applied_at=utcnow()))
+
+    # --- ORPHAN-GUARD: the supervisor's cancel of a resting order (migration 0030) -----------------------------------
+
+    def request_cancel(self, sleeve: str, order_id: str, reason: str, actor: str = "supervisor") -> int:
+        """Ask for one resting order to be cancelled, journaled before anything is sent. Returns the cancel's id; a
+        cancel already open for this order is returned, never a second one (commands_cancel_open), so a retry, a second
+        sweep or a restart sends nothing new. Refused for an order of another Strategy or one no longer open."""
+        if not reason.strip():
+            raise ValueError("every command needs a reason")
+        with self.engine.begin() as c:
+            order = c.execute(select(orders_t.c.sleeve, orders_t.c.status)
+                              .where(orders_t.c.order_id == order_id)).first()
+            if order is None or order.sleeve != sleeve:
+                raise ValueError(f"no order {order_id!r} for {sleeve}")
+            if (open_id := self._open_cancel(c, order_id)) is not None:
+                return open_id
+            if order.status not in OPEN_ORDER_STATUSES:
+                raise ValueError(f"order {order_id} is {order.status}, not resting: nothing to cancel")
+        now = utcnow()
+        try:
+            with self.engine.begin() as c:  # the cancel and its decision-log line together, or neither (CR F241-2)
+                cid = c.execute(insert(commands_t).values(sleeve=sleeve, command=CANCEL, order_id=order_id,
+                                                          reason=reason.strip(), created_at=now)
+                                ).inserted_primary_key[0]
+                c.execute(insert(decisions_t).values(ts=now, actor=actor, action=CANCEL, sleeve=sleeve,
+                                                     reason=f"{reason.strip()} (order {order_id})"))
+        except IntegrityError:  # another caller opened it between our read and our insert
+            with self.engine.connect() as c:
+                if (open_id := self._open_cancel(c, order_id)) is None:
+                    raise
+                return open_id
+        return cid
+
+    @staticmethod
+    def _open_cancel(c, order_id: str) -> int | None:
+        return c.execute(select(commands_t.c.id).where(commands_t.c.order_id == order_id,
+                                                       commands_t.c.command == CANCEL,
+                                                       commands_t.c.applied_at.is_(None))).scalar()
+
+    def open_cancels(self, sleeve: str | None = None) -> list[dict]:
+        """Cancels sent or to send whose venue answer hasn't come: the supervisor's to work, oldest first."""
+        q = select(commands_t).where(commands_t.c.command == CANCEL, commands_t.c.applied_at.is_(None))
+        if sleeve is not None:
+            q = q.where(commands_t.c.sleeve == sleeve)
+        with self.engine.connect() as c:
+            return _rows(c.execute(q.order_by(commands_t.c.id)))
+
+    def apply_cancel(self, command_id: int, outcome: str, at: datetime | None = None) -> str:
+        """The venue's answer to a cancel, in one transaction: "cancelled" (confirmed), "not_found" or "filled".
+
+        "Not found" is not proof of a cancel (Advisor 8 Oct 06:20 UK), so the fill journal is read first:
+        - an order with a fill: nothing is written and "filled" is returned. The caller books the venue's fills (each
+          reduces the reservation as any fill does), closes the orphan (og5) and then answers "filled";
+        - an order with none: only the first such answer's time is kept (not_found_at) and "unconfirmed" is returned.
+          Nothing is released, however long our journal stays silent (Advisor 13 Oct 17:00 UK): the cancel stays
+          open, which blocks the Strategy's entries (open_cancels), until the venue's own order query and fill history
+          settle it as "cancelled" (a terminal state with zero fills) or "filled".
+        "filled", once the journal holds the order's fills: the command is applied and nothing more released (the
+        fills used what they used); refused with no fill in the journal.
+        "cancelled": the venue confirmed the order ended (cancelled, or terminal with zero fills after a "not found").
+        The order's open reservation (what no fill used) is released as 'cancel', the order marked canceled and the
+        command applied: "applied", or "partly_filled" for an order with fills, whose filled part the caller closes
+        (og5).
+        "already" when another got there first, and then nothing at all is written. `at`: when the answer came, on
+        the supervisor's clock, else now."""
+        if outcome not in ("cancelled", "not_found", "filled"):
+            raise ValueError(f"a cancel's outcome is 'cancelled', 'not_found' or 'filled', not {outcome!r}")
+        now = at or utcnow()
+        with self.engine.begin() as c:
+            cmd = c.execute(select(commands_t).where(commands_t.c.id == command_id,
+                                                     commands_t.c.command == CANCEL)).first()
+            if cmd is None:
+                raise ValueError(f"command {command_id} is not a cancel")
+            if cmd.applied_at is not None:
+                return "already"
+            filled = self._order_filled(c, cmd)
+            if outcome == "not_found":
+                if filled:
+                    return "filled"
+                c.execute(update(commands_t).where(commands_t.c.id == command_id, commands_t.c.not_found_at.is_(None))
+                          .values(not_found_at=now))
+                return "unconfirmed"
+            if outcome == "filled":
+                if not filled:
+                    raise ValueError(f"order {cmd.order_id} has no fill in the journal: book the venue's fills first")
+                took = c.execute(update(commands_t).where(commands_t.c.id == command_id,
+                                                          commands_t.c.applied_at.is_(None))
+                                 .values(applied_at=now)).rowcount
+                return "applied" if took else "already"
+            if not self._close_cancel(c, cmd, "canceled", f"cancelled by the supervisor: {cmd.reason}", now):
+                return "already"
+        return "partly_filled" if filled else "applied"
+
+    @staticmethod
+    def _order_filled(c, cmd) -> bool:
+        return c.execute(select(fills_t.c.id).where(fills_t.c.sleeve == cmd.sleeve,
+                                                    fills_t.c.order_id == cmd.order_id).limit(1)).first() is not None
+
+    @staticmethod
+    def _close_cancel(c, cmd, status: str, message: str, now: datetime) -> bool:
+        """Apply the cancel, release what of its order's reservation no fill used and end the order, inside the
+        caller's transaction. False when another got there first (nothing written)."""
+        took = c.execute(update(commands_t).where(commands_t.c.id == cmd.id, commands_t.c.applied_at.is_(None))
+                         .values(applied_at=now)).rowcount
+        if not took:
+            return False
+        decisions = select(gate_decisions_t.c.id).where(gate_decisions_t.c.order_id == cmd.order_id)
+        c.execute(update(gate_reservations_t).where(gate_reservations_t.c.decision_id.in_(decisions),
+                                                    gate_reservations_t.c.released_at.is_(None))
+                  .values(released_at=now, release_reason="cancel"))
+        c.execute(update(orders_t).where(orders_t.c.order_id == cmd.order_id, orders_t.c.status.in_(OPEN_ORDER_STATUSES))
+                  .values(status=status, updated_at=now, message=message))
+        return True
 
     def decide(self, actor: str, action: str, reason: str, sleeve: str | None = None,
                ts: datetime | None = None) -> None:

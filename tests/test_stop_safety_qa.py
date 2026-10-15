@@ -232,7 +232,7 @@ from test_dashboard import client  # noqa: E402, F401 - the dashboard fixture
 @pytest.mark.parametrize("qty", [0.1, -0.1])
 @pytest.mark.parametrize("atr_pct, share", [(0.02, 0.10), (0.05, 0.15), (0.10 / 3, 0.10), (0.0, 0.10)])
 def test_a_stopless_position_counts_notional_times_the_larger_of_10pct_and_3_atrs(qty, atr_pct, share):
-    from sleeve_fund.open_risk import position_risk; position_open_risk = lambda q, m, stop=None, daily_atr_pct=None: position_risk(q, m, stop, daily_atr_pct)
+    from sleeve_fund.open_risk import position_risk; position_open_risk = lambda q, m, stop=None, daily_atr_pct=None: position_risk(q, m, stop, daily_atr_pct, taker=0)
 
     # 0.1 at 60,000 = 6,000 of notional; an ATR of 0 leaves the 10% floor
     assert position_open_risk(qty, 60_000.0, stop=None, daily_atr_pct=atr_pct) == pytest.approx(6_000 * share)
@@ -245,14 +245,14 @@ def test_a_stopless_position_counts_notional_times_the_larger_of_10pct_and_3_atr
     (-0.1, 58_000.0, 63_000.0, 500.0),
 ])
 def test_a_stopped_position_counts_from_the_current_mark_to_its_stop(qty, mark, stop, risk):
-    from sleeve_fund.open_risk import position_risk; position_open_risk = lambda q, m, stop=None, daily_atr_pct=None: position_risk(q, m, stop, daily_atr_pct)
+    from sleeve_fund.open_risk import position_risk; position_open_risk = lambda q, m, stop=None, daily_atr_pct=None: position_risk(q, m, stop, daily_atr_pct, taker=0)
 
     assert position_open_risk(qty, mark, stop=stop, daily_atr_pct=0.02) == pytest.approx(risk)
 
 
 @pytest.mark.parametrize("atr_pct", [float("nan"), None])
 def test_an_unknown_or_nan_atr_refuses_to_measure_a_stopless_position(atr_pct):
-    from sleeve_fund.open_risk import position_risk; position_open_risk = lambda q, m, stop=None, daily_atr_pct=None: position_risk(q, m, stop, daily_atr_pct)
+    from sleeve_fund.open_risk import position_risk; position_open_risk = lambda q, m, stop=None, daily_atr_pct=None: position_risk(q, m, stop, daily_atr_pct, taker=0)
 
     with pytest.raises(ValueError):
         position_open_risk(0.1, 60_000.0, stop=None, daily_atr_pct=atr_pct)
@@ -267,7 +267,7 @@ def test_the_open_risk_limit_is_5pct_of_book_inclusive():
     why = open_risk_breach(1_000.01, 20_000.0)
     assert why and "open risk" in why.lower()
     # Worked from a position: a stopless 0.1 at 60,000 with a 2% ATR counts 600; on a 12,000 book that is 5.0%.
-    from sleeve_fund.open_risk import position_risk; position_open_risk = lambda q, m, stop=None, daily_atr_pct=None: position_risk(q, m, stop, daily_atr_pct)
+    from sleeve_fund.open_risk import position_risk; position_open_risk = lambda q, m, stop=None, daily_atr_pct=None: position_risk(q, m, stop, daily_atr_pct, taker=0)
 
     assert open_risk_breach(position_open_risk(0.1, 60_000.0, None, 0.02), 12_000.0) is None
     assert open_risk_breach(position_open_risk(0.1, 60_000.0, None, 0.02), 11_999.0) is not None
@@ -275,7 +275,7 @@ def test_the_open_risk_limit_is_5pct_of_book_inclusive():
 
 @pytest.mark.parametrize("qty, mark, stop", [(0.1, 56_000.0, 57_000.0), (-0.1, 64_000.0, 63_000.0)])
 def test_a_position_gapped_through_its_stop_counts_at_the_stopless_measure(qty, mark, stop):
-    from sleeve_fund.open_risk import position_risk; position_open_risk = lambda q, m, stop=None, daily_atr_pct=None: position_risk(q, m, stop, daily_atr_pct)
+    from sleeve_fund.open_risk import position_risk; position_open_risk = lambda q, m, stop=None, daily_atr_pct=None: position_risk(q, m, stop, daily_atr_pct, taker=0)
 
     got = position_open_risk(qty, mark, stop=stop, daily_atr_pct=0.02)
     assert got == pytest.approx(abs(qty) * mark * 0.10)  # 560 / 640: max(10%, 3 x 2%) of the notional at the mark

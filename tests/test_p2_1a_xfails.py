@@ -416,15 +416,15 @@ def test_g2_open_risk_formula_on_main_is_the_stopless_rule():
     """Guard (green on main 1709cd9): the ONE formula is notional x max(10%, 3 daily ATR) [G2]."""
     from sleeve_fund.open_risk import position_risk
 
-    assert position_risk(2.0, 100.0, None, 0.02) == pytest.approx(2 * 100 * 0.10)  # 3 x 2% = 6% < 10%
-    assert position_risk(-2.0, 100.0, None, 0.05) == pytest.approx(2 * 100 * 0.15)  # 3 x 5% = 15%
-    assert position_risk(2.0, 100.0, 95.0, 0.05) == pytest.approx(10.0)  # with a stop: to the stop
+    assert position_risk(2.0, 100.0, None, 0.02, taker=0) == pytest.approx(2 * 100 * 0.10)  # 3 x 2% = 6% < 10%
+    assert position_risk(-2.0, 100.0, None, 0.05, taker=0) == pytest.approx(2 * 100 * 0.15)  # 3 x 5% = 15%
+    assert position_risk(2.0, 100.0, 95.0, 0.05, taker=0) == pytest.approx(10.0)  # with a stop: to the stop
 
 
 @pytest.mark.parametrize("qty, atr_pct, risk", [(D(2), 0.02, D(20)), (D(-2), 0.05, D(30)), (D("0.5"), 0.0333, D(5))])
 def test_g2_holding_for_counts_a_stopless_position_at_the_stopless_move(qty, atr_pct, risk):
     (holding_for,) = _need("holding_for", module="sleeve_fund.portfolio")
-    h = holding_for(SimpleNamespace(qty=qty, stop=None, strategy="s", underlying="BTC"), D(100), atr_pct)
+    h = holding_for(SimpleNamespace(qty=qty, stop=None, strategy="s", underlying="BTC", taker=D(0)), D(100), atr_pct)
     assert isinstance(h.risk, D)
     assert abs(h.risk - risk) <= D("0.01"), (h.risk, risk)
 
@@ -471,5 +471,5 @@ def test_intent_risk_matches_position_risk(side):
     s = size_entry(i)
     intent = intent_for(s, i, "BTC")
     stop_px = 100 * (1 - side * 0.03)
-    expected = position_risk(side * float(s.qty), 100.0, stop_px, 0.02)
+    expected = position_risk(side * float(s.qty), 100.0, stop_px, 0.02, taker=0)
     assert abs(float(intent.risk_per_unit * s.qty) - expected) <= 0.01, (intent.risk_per_unit, s.qty, expected)

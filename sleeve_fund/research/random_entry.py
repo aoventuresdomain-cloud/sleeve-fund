@@ -27,6 +27,9 @@ DRAWS = 1000
 BAR = 95.0  # percentile of the random draws the strategy's net return must reach
 WEAK_EXPOSURE = 0.6  # in the market more than this share of the test bars: the benchmark is weak
 DISAGREE = 30.0  # percentile points between the return and Sharpe readings worth flagging
+# How a strength-sized variant's draws take their sizes (Advisor G5-DW5 Q1), named in its words.
+PERMUTED = "sizes drawn from the variant's own, permuted within each window"
+REPLACED = "sizes drawn from the variant's own with replacement (a window's trade count differed)"
 
 
 @dataclass(frozen=True)
@@ -41,6 +44,10 @@ class Trade:
     # ABSORB-GAP (Advisor 15 Oct ~02:55 UK, option A): the gap past bankruptcy the venue absorbed on this trade's
     # liquidation, over its entry notional (the base of its return): charged to the strategy's trade, never a draw's.
     charge: float = 0.0
+    # G5 research side (Advisor G5-DW5): a strength-sized variant's size factor f on this trade, its return on equity f
+    # times the trade's; 1 for a flat version (and then the benchmark is exactly as before). Only trades taken carry
+    # one, so it is above 0.
+    size: float = 1.0
 
 
 @dataclass
@@ -54,6 +61,7 @@ class RandomEntryResult:
     draws: int
     weak: bool
     disagree: bool
+    sizing: str = ""  # a strength-sized variant's: how its draws took their sizes (PERMUTED or REPLACED)
 
     @property
     def verdict(self) -> str:
@@ -75,6 +83,8 @@ class RandomEntryResult:
                     "a weak test")
         if self.disagree:
             out += f"; on Sharpe it beats {self.sharpe_percentile:.0f}%, far from the return reading"
+        if self.sizing:
+            out += f"; {self.sizing}"
         return out
 
 
@@ -158,6 +168,14 @@ def _compound(r: np.ndarray) -> float:
     return float(np.prod(1 + r) - 1)
 
 
+def _draw_sizes(rng: np.random.Generator, sizes: np.ndarray, n: int) -> tuple[np.ndarray, str]:
+    """A draw's n trade sizes from a window's own: a permutation, so the window's total exposure is the variant's;
+    with replacement only when the counts differ (Advisor G5-DW5 Q1 guard)."""
+    if len(sizes) == n:
+        return rng.permutation(sizes), PERMUTED
+    return rng.choice(sizes, size=n, replace=True), REPLACED
+
+
 def _random_entries(rng: np.random.Generator, start: int, end: int, holds: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Entry bars for `holds` placed in random order, without overlap, between bar `start` and bar `end`
     (an exit may land on `end`). Returns (order, entries): entries[k] is the entry of holds[order[k]]."""
@@ -187,6 +205,8 @@ def _by_window(trades: list[Trade], windows: list[tuple[int, int]]):
         holds = np.array([t.exit - t.entry for t in inside])
         if (holds < 1).any():
             raise ValueError("a trade must hold for at least one bar")
+        if any(not t.size > 0 for t in inside):
+            raise ValueError("a trade's size factor is above 0: an entry skipped below the floor is no trade")
         held += int(holds.sum())
         per_window.append((start, end, np.array([t.entry for t in inside]), holds, np.array([t.side for t in inside]),
                            inside))
@@ -233,15 +253,25 @@ def random_entry(closes, trades: list[Trade], windows: list[tuple[int, int]], co
     if n == 0:
         return RandomEntryResult(math.nan, math.nan, 0.0, 0.0, 0, 0.0, draws, False, False)
     levs = [_levs(w[5], leverage) for w in per_window]
-    actual = np.concatenate([_trade_returns(c, e, h, s, cost_per_side, lv) - np.array([t.charge for t in inside])
-                             for (_, _, e, h, s, inside), lv in zip(per_window, levs)])
+    # G5: a strength-sized variant's trades at their own sizes, and each draw at a draw of those sizes; a flat
+    # version (every size 1) takes no draw of sizes, so its benchmark is exactly as before.
+    sizes = [np.array([t.size for t in w[5]], dtype=float) for w in per_window]
+    sized = any((f != 1.0).any() for f in sizes)
+    actual = np.concatenate([(_trade_returns(c, e, h, s, cost_per_side, lv) - np.array([t.charge for t in inside]))
+                             * (f if sized else 1)
+                             for (_, _, e, h, s, inside), lv, f in zip(per_window, levs, sizes)])
     rets, sharpes = np.empty(draws), np.empty(draws)
+    how = set()
     for d in range(draws):
         parts = []
-        for (start, end, _, holds, sides, _), lv in zip(per_window, levs):
+        for (start, end, _, holds, sides, _), lv, f in zip(per_window, levs, sizes):
             order, entries = _random_entries(rng, start, end, holds)
-            parts.append(_trade_returns(c, entries, holds[order], sides[order], cost_per_side,
-                                        None if lv is None else lv[order]))
+            r = _trade_returns(c, entries, holds[order], sides[order], cost_per_side, None if lv is None else lv[order])
+            if sized:
+                drawn, method = _draw_sizes(rng, f, len(holds))
+                how.add(method)
+                r = r * drawn
+            parts.append(r)
         r = np.concatenate(parts)
         rets[d], sharpes[d] = _compound(r), _sharpe(r)
     strategy_return, strategy_sharpe = _compound(actual), _sharpe(actual)
@@ -252,4 +282,5 @@ def random_entry(closes, trades: list[Trade], windows: list[tuple[int, int]], co
         return_percentile=ret_pct, sharpe_percentile=sharpe_pct, strategy_return=strategy_return,
         median_random_return=float(np.median(rets)), trades=n, exposure=exposure, draws=draws,
         weak=exposure > WEAK_EXPOSURE, disagree=abs(ret_pct - sharpe_pct) > DISAGREE,
+        sizing=(REPLACED if REPLACED in how else PERMUTED) if sized else "",
     )

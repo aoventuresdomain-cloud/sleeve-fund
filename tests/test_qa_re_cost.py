@@ -31,7 +31,7 @@ from sleeve_fund.research.study import run_study
 from sleeve_fund.research.tearsheet import render
 from sleeve_fund.strategies.trend_filter import SPEC
 
-PERP_TAKER = 0.0005  # the simulated low-fee perp market's (markets.LOW_FEE_PERP)
+PERP_TAKER = 0.00055  # the simulated low-fee perp market's (markets.LOW_FEE_PERP)
 PERP_FUNDING = 0.0001  # per settlement, 3 a day
 SPREAD = 0.0003
 
@@ -182,7 +182,7 @@ def test_dw3_the_fee_note_shows_the_fee_paid_and_the_break_even_fee(tmp_path, in
     Source: quant-review/re-cost-xfails/test_re_cost_xfails.py."""
     r = _study(tmp_path, instrument, "perp")
     note = r.fee_note
-    assert f"{PERP_TAKER:.2%} taker" in note, note
+    assert "0.055% taker" in note, note
     assert f"{float(instrument.taker_fee):.2%} taker" not in note, ("the spot fee is not what was paid", note)
     assert "break-even" in note.lower(), note
     assert str(r.breakeven) in note, ("the break-even fee itself, not just the word", r.breakeven, note)

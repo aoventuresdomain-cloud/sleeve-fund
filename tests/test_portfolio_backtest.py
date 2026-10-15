@@ -348,7 +348,7 @@ def test_a_trimmed_entry_of_a_weight_model_is_topped_up_on_the_next_bar():
 # --- M3: P2-2's gate over the MemoryLedger, with reservations held for each order's life ----------------------------
 
 _ORDER = dict(side=1, qty=D(2), close=D(100), price=D("100.05"), stop_frac=0.02, step=D("0.001"),
-              min_qty=D("0.001"), instrument="XBT", leverage=None, atr_pct=None)
+              min_qty=D("0.001"), instrument="XBT", leverage=None, atr_pct=None, taker=D(0))
 T0 = int(datetime(2026, 10, 8, 12, tzinfo=timezone.utc).timestamp() * 1e9)
 
 

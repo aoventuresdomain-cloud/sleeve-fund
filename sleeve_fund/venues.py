@@ -21,8 +21,13 @@ from typing import Callable
 import pandas as pd
 from nautilus_trader.model import Venue
 
-from sleeve_fund.instruments import FeeSchedule, perpetual, spot_pair
+from sleeve_fund.instruments import FeeSchedule, pct, perpetual, spot_pair
 from sleeve_fund.margin import Tier
+
+# FEE-LIVE: the paper venue's published perp VIP 0 (the PM's pasted schedule, 15 Oct 2026; research/venue-data): the one
+# place a perp fee rate is written. What the paper venue charges until its account's own rate is fetched (venue_terms),
+# what research charges at least, the simulated perp's rates and the shadow outcomes' fee.
+PAPER_PERP_FEES = FeeSchedule(maker=Decimal("0.0002"), taker=Decimal("0.00055"))
 
 
 @dataclass
@@ -103,7 +108,14 @@ class VenueProfile:
     maintenance_tiers: dict[str, tuple] = field(default_factory=dict)
     maintenance_basis: str | None = None
     maintenance_read_on: date | None = None  # when the tables were read: the start check notes them past 30 days
+    # FEE-LIVE: where the venue's public margin tiers are read ({symbol} filled in) and its account fee-rate path
+    risk_limit_url: str = ""
+    fee_rate_path: str = ""
     maintenance_limits: dict[str, float] = field(default_factory=dict)  # pair -> the venue's last published ceiling
+    # FEE-LIVE: the published range a fetched fee rate must fall in ({"maker": (lowest, VIP 0), "taker": ...}) and
+    # where it was read; a profile without one has no fetched rates (venue_terms refuses to read them)
+    fee_bounds: dict[str, tuple] | None = None
+    fee_bounds_basis: str = ""
 
     @property
     def venue(self) -> Venue:
@@ -149,7 +161,7 @@ class VenueProfile:
         return f"{self.name}_API_KEY__{suffix}", f"{self.name}_API_SECRET__{suffix}"
 
     def fee_text(self) -> str:
-        return f"{self.label}: {float(self.fees.maker):.2%} maker, {float(self.fees.taker):.2%} taker ({self.fee_basis})"
+        return f"{self.label}: {pct(self.fees.maker)} maker, {pct(self.fees.taker)} taker ({self.fee_basis})"
 
 
 VENUES: dict[str, VenueProfile] = {}
@@ -334,6 +346,10 @@ KRAKEN = register(VenueProfile(
     # 3 Oct 2026. Tier 2 (0.30% maker, 0.60% taker) starts at $2,501.
     fees=FeeSchedule(maker=Decimal("0.0040"), taker=Decimal("0.0080")),
     fee_basis="Tier 1, 3 Oct 2026",
+    # FEE-LIVE (HoE): no venue falls back silently. No fee endpoint is read here, so the published Tier 1 is written
+    # as a labelled row at each hourly attempt (venue_terms.fetch_due), checked against zero up to Tier 1.
+    fee_bounds={"maker": (Decimal("0"), Decimal("0.0040")), "taker": (Decimal("0"), Decimal("0.0080"))},
+    fee_bounds_basis="spot maker and taker, zero up to the published Tier 1, 3 Oct 2026",
     daily_history=_kraken_daily,
     sub_8dp_test_accounts={"paper": "the hub-fed USD test Strategies and the full-stack check"},
     ohlc_history=_kraken_ohlc,
@@ -629,9 +645,15 @@ BINANCE_GTD_MIN_LEAD = timedelta(seconds=600)
 BINANCE = register(VenueProfile(
     name="BINANCE",
     label="Binance USD-M perpetuals",
-    # The published base tier (VIP 0) for USD-M futures, without the BNB discount: what a new account pays.
-    fees=FeeSchedule(maker=Decimal("0.0002"), taker=Decimal("0.0005")),
-    fee_basis="VIP 0, published schedule, 5 Oct 2026",
+    # FEE-LIVE: the paper venue's published perp VIP 0 (the PM's pasted schedule, 15 Oct 2026; research/venue-data),
+    # what a new account pays, what research charges at least, and what a demo account with no fee endpoint is
+    # charged on paper. Running strategies are charged the account's own rate per instrument (venue_terms).
+    fees=PAPER_PERP_FEES,
+    fee_basis="VIP 0, published schedule, 15 Oct 2026",
+    # A fetched rate outside [the lowest published (Supreme VIP), VIP 0] is missing, never a wider range (Advisor (c)).
+    fee_bounds={"maker": (Decimal("0"), PAPER_PERP_FEES.maker), "taker": (Decimal("0.0003"), PAPER_PERP_FEES.taker)},
+    fee_bounds_basis="perp maker and taker, Supreme VIP to VIP 0, the PM's pasted schedule of 15 Oct 2026 "
+                     "(research/venue-data/paper-venue-fee-schedule-2026-10-15.md), DA hand-check",
     daily_history=binance_daily,
     ohlc_history=binance_ohlc,
     trade_history=binance_trades,
@@ -656,6 +678,10 @@ BINANCE = register(VenueProfile(
     maintenance_tiers={"BTC/USDT": BTCUSDT_TIERS},
     maintenance_basis=BTCUSDT_TIERS_BASIS,
     maintenance_read_on=date(2026, 10, 15),
+    # The PM's paper venue's public V5 risk-limit page (public market data, read-only, no key) and its signed
+    # read-only fee-rate call (FEE-LIVE).
+    risk_limit_url="https://api.bybit.com/v5/market/risk-limit?category=linear&symbol={symbol}",
+    fee_rate_path="/v5/account/fee-rate",
     maintenance_limits={"BTC/USDT": 1_200_000_000},  # past it the venue takes no position; nor do we
     core_pairs=("BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "SUI/USDT"),
     hub=True,

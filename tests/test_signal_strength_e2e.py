@@ -189,3 +189,32 @@ def test_mutant_paper_reading_strength_differently_from_the_backtest_turns_the_b
     with pytest.raises(AssertionError) as red:
         test_parity_the_backtest_decides_the_same_strengths_as_paper(tmp_path, monkeypatch)
     assert "(paper, bt)" in str(red.traceback[-1].statement), red.value  # red on the strength comparison itself
+
+
+def test_dw5_paper_and_the_backtest_journal_the_same_size_factor_on_each_entry(tmp_path, monkeypatch):
+    """G5 research side (DW5): each entry carries its size factor f in signal["size_factor"], the field research reads
+    (study._trip_sizes); paper and the backtest give the same f on the same bars, and it is the strength's own."""
+    import numpy as np
+
+    from sleeve_fund.research.runner import run_backtest
+    from sleeve_fund.venues import venue
+
+    _paper(tmp_path, monkeypatch, [18])
+    _, entries = _paper.last
+    paper = [(o["ts"], o["signal"].get("size_factor")) for o in entries]
+    h = _strength_model(monkeypatch)
+    idx = pd.date_range(h.STD_T0, periods=18, freq="1min", tz="UTC") + pd.Timedelta(minutes=1)
+    close = np.round(60_000 + 0.6 * np.arange(1, 19), 1)
+    prices = pd.DataFrame({"open": close - 0.6, "high": close, "low": close - 0.6, "close": close, "volume": 1e9},
+                          index=idx)
+    params = {**h.PERP, "stop_loss": h.STOP, "signal_strength": LINEAR,
+              "windows": [[h._ns(o), h._ns(c), s] for o, c, s in _windows(h, h.STD_T0)]}
+    r = run_backtest("egx", prices, venue("binance").instrument("BTC", "USDT"), params, starting_capital=20_000,
+                     risk_profile="balanced", bar_minutes=1, half_spread=0)
+    bt = sorted((o["ts"], (o.get("signal") or r.decisions.get(o["order_id"], {}).get("signal") or {}).get("size_factor"))
+                for o in r.journal.orders_.values() if o["intent"] == "entry")
+    assert paper == bt and paper and all(f is not None and 0 < f <= 1 for _, f in paper), (paper, bt)
+    for o in entries:  # f is the strength's own under linear: "signal strength 0.60 ..." -> 0.6
+        assert o["signal"]["size_factor"] == pytest.approx(float(o["signal"]["strength"].split()[2]))
+    assert all(r.decisions[k].get("signal", {}).get("size_factor") is not None for k in r.decisions
+               if r.decisions[k].get("intent") == "entry"), "research reads the decisions' signal"
