@@ -219,15 +219,3 @@ def test_m_closing_rejects_on_a_flat_row_never_open_an_episode(store):
         _order(store, "s3", "rejected", T0 + i * MIN)
     w.check(store, T0 + 3 * MIN)
     assert _kinds(store, OPEN) == []
-
-
-def test_n_a_benign_refusal_neither_counts_nor_breaks_a_streak():
-    """Advisor (A1 ruling): a reduce-only close refused with the position already flat never counts to F-RX-2; QD's
-    closing_orders marks it benign, and it is read as absent."""
-    from sleeve_fund.ops_health import exit_reject_streak
-
-    def row(status, benign=False):
-        return {"status": status, "benign": benign}
-
-    assert exit_reject_streak([row("rejected"), row("rejected", True), row("rejected", True)]) == 1
-    assert exit_reject_streak([row("rejected"), row("filled", True), row("rejected"), row("rejected")]) == 3

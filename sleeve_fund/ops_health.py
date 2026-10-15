@@ -283,8 +283,6 @@ def exit_reject_streak(rows: list[dict]) -> int:
     through ends it; one still in flight, cancelled or expired neither counts nor ends it."""
     n = 0
     for r in reversed(rows):
-        if r.get("benign"):  # a reduce-only close refused on a flat position (A1): as if absent (Advisor)
-            continue
         if r["status"] in EXIT_REJECTED:
             n += 1
         elif r["status"] in EXIT_WENT:
