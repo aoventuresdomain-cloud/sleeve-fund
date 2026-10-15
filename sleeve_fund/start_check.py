@@ -334,12 +334,15 @@ def check_books(store, cent: bool = False) -> Section:
     return sec
 
 
-def check_maintenance(store) -> Section:
+def check_maintenance(store, now=None) -> Section:
     """VS-1 (Advisor, 15 Oct): a perp Strategy's liquidation is priced at its venue's published maintenance tiers for
-    the instrument. One on a pair whose table isn't kept is a FAIL, named, never run at an assumed rate."""
+    the instrument. One on a pair whose table isn't kept is a FAIL, named, never run at an assumed rate. A table read
+    more than 30 days ago is noted, once per pair (VS-1-TABLE; the supervisor's alerts say it too)."""
+    from datetime import UTC, datetime
+
     from sleeve_fund import markets
 
-    sec = Section("Maintenance tables")
+    sec, live = Section("Maintenance tables"), []
     for s in store.sleeves():
         if s.lifecycle == "retired" or (s.params or {}).get("market") != "perp":
             continue
@@ -347,6 +350,10 @@ def check_maintenance(store) -> Section:
             markets.terms(s.params, s.venue, s.instrument)
         except markets.NoMaintenanceTable as exc:
             sec.add(FAIL, f"{s.name}: {exc}")
+            continue
+        live.append(s)
+    for line in markets.stale_maintenance(live, (now or datetime.now(UTC)).date()):
+        sec.add(NOTE, line)
     if not sec.failed:
         sec.add(PASS, "every perp Strategy's instrument has its venue's maintenance tiers")
     return sec

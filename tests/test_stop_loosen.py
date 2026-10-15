@@ -65,8 +65,11 @@ def _entry(res) -> float:
 
 def _liq(entry: float, side: int, lev: float) -> float:
     """The isolated liquidation price at this leverage (margin.isolated_liquidation): the margin is the notional over
-    the leverage, whatever the size, so the price is the entry's and the leverage's alone."""
-    return entry * (1 - side / lev) / (1 - side * MAINTENANCE)
+    the leverage, whatever the size, so the price is the entry's and the leverage's alone. The nearer of the two
+    formulas (VS-1-TABLE): a long's is on its entry value, a short's on its value at the price."""
+    if side > 0:
+        return entry * (1 - 1 / lev + MAINTENANCE)
+    return entry * (1 + 1 / lev) / (1 + MAINTENANCE)
 
 
 def _held(seen: list[dict], entry: float) -> list[float]:

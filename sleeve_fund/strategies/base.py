@@ -2427,6 +2427,12 @@ class LongFlatStrategy(Strategy):
             signal["ramp"] = ramp_gate.words
             signal[ramp.UNRAMPED] = round(float(min(v for k, v in limits.items() if k != ramp.LIMIT)), 2)
         notional = float(qty) * close
+        if notional >= self._cfg.perp.max_notional:  # VS-1-TABLE: past the venue's last tier, fail closed
+            self._note("entry_refused_top_tier",
+                       f"Entry refused: its {notional:,.0f} notional is at or past the venue's largest published "
+                       f"maintenance tier ({self._cfg.perp.max_notional:,.0f}), so its liquidation price is unknown")
+            return
+        self._noted.discard("entry_refused_top_tier")
         # CUT-A: the simulated account posts the margin, with the fund's virtual funding back in (_mark nets it out)
         liq, distance = entry_liquidation(cash + self._funded(), float(qty), close, side, self._cfg.assumed_taker_fee,
                                           self._cfg.perp.maintenance_margin, lev)
@@ -4094,7 +4100,8 @@ class LongFlatStrategy(Strategy):
         if liq is None or not qty or self._liq_px is None or not self._liq_funded or self._cfg.perp is None:
             return liq
         # Solved afresh at the funded cash, never shifted at the tier it was at (VS-1, Advisor (b)(2))
-        return markets.shifted_liquidation(liq, qty, self._liq_funded, self._cfg.perp.maintenance_margin)
+        entry = self._entry_px if self._entry_px else self._net_position()[1]  # as _liq_from_entry fixed it
+        return markets.shifted_liquidation(liq, qty, self._liq_funded, self._cfg.perp.maintenance_margin, entry=entry)
 
     def _capped_stop(self, frac: float | None) -> tuple[float | None, float | None]:
         """The stop a margin position may hold for `frac` (a share of the entry, as _stop_frac), and the liquidation

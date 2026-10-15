@@ -15,6 +15,13 @@ from sleeve_fund.margin import Tier
 TIERS = (Tier(50_000, 0.004, 0), Tier(250_000, 0.005, 50), Tier(1_000_000, 0.01, 1_300), Tier(math.inf, 0.025, 16_300))
 
 
+def _formula_a(cash, qty, entry, lev, tiers=TIERS):
+    """Formula A alone (the maintenance on the position's value at the price), on the isolated margin at lev. The
+    price used is the nearer of A and B (VS-1-TABLE: test_vs1_nearer_liquidation); these cells pin A's solve."""
+    return margin.liquidation_price(margin.isolated_margin(qty, entry, lev, cash + qty * entry) - qty * entry, qty,
+                                    tiers)
+
+
 def _venue(cash, qty, p, tiers=TIERS):
     """The venue's own test at price p: equity cash + qty x p against the tier of the notional |qty| x p."""
     t = margin.tier_at(tiers, abs(qty) * p)
@@ -29,7 +36,7 @@ def test_one_rate_is_the_formula_as_before():
 
 
 def test_a_long_in_the_first_tier_liquidates_where_the_venue_does():
-    p = margin.isolated_liquidation(40_000.0, 1.0, 60_000.0, 2.0, TIERS)  # 1 BTC long at 60,000, 2x, on 100,000
+    p = _formula_a(40_000.0, 1.0, 60_000.0, 2.0)  # 1 BTC long at 60,000, 2x, on 100,000
     assert p == pytest.approx(30_000 / 0.996, rel=1e-12)  # tier 1: (-30,000 + 0) / (0.004 - 1)
     assert margin.tier_at(TIERS, p) is TIERS[0]
     assert _venue(-30_000.0, 1.0, p) == pytest.approx(0, abs=1e-6)
@@ -56,7 +63,7 @@ def test_an_exact_tie_on_a_band_floor_takes_the_higher_tier():
 @pytest.mark.parametrize("lev", [1.0, 2.0, 3.0])
 def test_every_answer_is_the_venues_own_and_in_its_own_band(qty, lev):
     cash = -qty * 60_000.0 + 60_000.0 * abs(qty)  # a spot-style book that put up the whole notional
-    p = margin.isolated_liquidation(cash, qty, 60_000.0, lev, TIERS)
+    p = _formula_a(cash, qty, 60_000.0, lev)
     if p is None:
         assert qty > 0 and lev <= 1  # a fully paid long has no liquidation
         return
@@ -170,7 +177,8 @@ def test_a_stop_held_at_the_cap_is_pulled_in_when_the_position_reaches_a_higher_
         cash = -qty * 50  # all in at 2x: half the notional is the margin
         s._mark = lambda: (qty * 50, cash, qty, 100.0)
         liq = s._liq_now(cash, qty)
-        assert abs(_venue(cash, qty, liq)) < 1e-6  # the venue's own test is met at that price, in that tier
+        # the nearer of the two formulas, each solved in the tier its own notional lands in (VS-1-TABLE)
+        assert liq == pytest.approx(margin.nearer_liquidation(cash, qty, 100.0, TIERS), rel=1e-12)
         return liq
 
     small = held(100.0)  # notional at liquidation about 5,000: the 0.4% tier

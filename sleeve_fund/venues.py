@@ -14,7 +14,7 @@ import re
 import sys
 import urllib.request
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import date, timedelta
 from decimal import Decimal
 from typing import Callable
 
@@ -102,6 +102,8 @@ class VenueProfile:
     # liquidated at an assumed rate (markets.maintenance_for). Kept from the venue by DA-11 before G2.
     maintenance_tiers: dict[str, tuple] = field(default_factory=dict)
     maintenance_basis: str | None = None
+    maintenance_read_on: date | None = None  # when the tables were read: the start check notes them past 30 days
+    maintenance_limits: dict[str, float] = field(default_factory=dict)  # pair -> the venue's last published ceiling
 
     @property
     def venue(self) -> Venue:
@@ -653,6 +655,8 @@ BINANCE = register(VenueProfile(
     # VS-1: only BTC/USDT's table is kept so far; a perp on any other pair is refused until its table is checked in.
     maintenance_tiers={"BTC/USDT": BTCUSDT_TIERS},
     maintenance_basis=BTCUSDT_TIERS_BASIS,
+    maintenance_read_on=date(2026, 10, 15),
+    maintenance_limits={"BTC/USDT": 1_200_000_000},  # past it the venue takes no position; nor do we
     core_pairs=("BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "SUI/USDT"),
     hub=True,
 ))

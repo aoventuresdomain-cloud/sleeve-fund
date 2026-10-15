@@ -118,6 +118,7 @@ class Forwarder:
         self.digest = ops_health.DailyDigest(store, env, send=send)
         self.exit_rejects = ops_health.ExitRejectWatch()  # F-RX-2
         self._ops_failing: set[str] = set()
+        self._tables_said: set[str] = set()  # VS-1-TABLE: old maintenance tables already warned about
 
     def _resume(self) -> int:
         last = self.store.last_event(None, ("alerts_sent",)) if self.url else None
@@ -197,6 +198,16 @@ class Forwarder:
                              f"{self.clock_server}")
         self._clock_said = state
 
+    def check_tables(self, now) -> None:
+        """VS-1-TABLE (Advisor: an alert): a live perp Strategy's maintenance table read more than 30 days ago is a
+        warning, said once per table (the start check notes it too). Replaced by the daily fetch (FEE-LIVE) later."""
+        from sleeve_fund import markets
+
+        for line in markets.stale_maintenance(self.store.sleeves(), now.date()):
+            if line.split(":")[0] not in self._tables_said:
+                self._tables_said.add(line.split(":")[0])
+                self.store.event(None, "warning", "maintenance_table_old", line)
+
     def _ops_check(self, what: str, check) -> None:
         """One A15 check; a failure is one error until it works again (then one info line), and never stops the
         alerts or the uptime ping that follow it."""
@@ -220,6 +231,7 @@ class Forwarder:
         self._ops_check("no-stop", lambda: self.no_stop.check(self.store, now))
         self._ops_check("rejected-exit", lambda: self.exit_rejects.check(self.store, now))
         self._ops_check("daily digest", lambda: self.digest.step(now))
+        self._ops_check("maintenance table age", lambda: self.check_tables(now))
         if self.ping_url:
             try:
                 self.pinger(self.ping_url)
