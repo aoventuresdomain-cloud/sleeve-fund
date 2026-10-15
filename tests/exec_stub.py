@@ -64,6 +64,7 @@ class VenueStub:
         self._http: ThreadingHTTPServer | None = None
         self._ws_loop: asyncio.AbstractEventLoop | None = None
         self._ws_port: int | None = None
+        self._ws_stop: asyncio.Event | None = None
 
     # what a cell reads ---------------------------------------------------------------------------------------------
     def bodies(self, endpoint: str) -> list[dict]:
@@ -92,7 +93,7 @@ class VenueStub:
                 oid = str(next(self._ids))
                 self.orders[b["orderLinkId"]] = dict(b, orderId=oid, orderStatus="Untriggered")
                 return _ok({"orderId": oid, "orderLinkId": b["orderLinkId"]})
-            if path.startswith("/v5/order/amend") or path.startswith("/v5/order/cancel"):
+            if path.startswith(("/v5/order/amend", "/v5/order/cancel")):
                 b = json.loads(body)
                 o = self.orders.get(b.get("orderLinkId", ""))
                 if o is None:
@@ -103,7 +104,7 @@ class VenueStub:
                 else:
                     o["orderStatus"] = "Cancelled"
                 return _ok({"orderId": o["orderId"], "orderLinkId": o["orderLinkId"]})
-            if path.startswith("/v5/order/realtime") or path.startswith("/v5/order/history"):
+            if path.startswith(("/v5/order/realtime", "/v5/order/history")):
                 return _ok({"category": "linear", "list": [self.lookup_row(o) for o in self.orders.values()],
                             "nextPageCursor": ""})
         return _ok({"category": "linear", "list": [], "nextPageCursor": ""})
@@ -169,20 +170,16 @@ class VenueStub:
                                               "conn_id": "stub"}))
 
         async def main():
-            self._ws_loop = asyncio.get_running_loop()
+            self._ws_loop, self._ws_stop = asyncio.get_running_loop(), asyncio.Event()
             async with serve(handler, "127.0.0.1", 0) as server:
                 self._ws_port = server.sockets[0].getsockname()[1]
                 ready.set()
-                await asyncio.Future()
+                await self._ws_stop.wait()
 
-        try:
-            asyncio.run(main())
-        except RuntimeError:
-            pass
+        asyncio.run(main())
 
     def stop(self) -> None:
         if self._http is not None:
             self._http.shutdown()
         if self._ws_loop is not None:
-            for task in asyncio.all_tasks(self._ws_loop):
-                self._ws_loop.call_soon_threadsafe(task.cancel)
+            self._ws_loop.call_soon_threadsafe(self._ws_stop.set)

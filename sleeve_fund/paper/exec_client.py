@@ -207,3 +207,50 @@ def assert_off(environ) -> None:
         raise PaperSafetyError(f"{MODE_ENV}={s.mode}: the exchange order client can't run a paper node yet (its "
                                "market data on the exchange is on the drill list); unset it to run on the simulated "
                                "client")
+
+
+# Resting stops through the client (drill prep, QD; findings /mnt/project-files/sleeve-fund/qd/exec-client-stop-
+# findings.md). The client's amend carries a new quantity but drops a new trigger price without a word, and it
+# creates a stop with no trigger price type, so the venue's default applies. A level therefore only ever moves by
+# cancel-and-replace, and after every place or replace the venue's order lookup is compared with the Strategy's stop.
+STOP_TRIGGER_BY = "LastPrice"  # the stop triggers on the last trade price, as the backtest and the watched stop do
+RESTING = frozenset({"Untriggered", "New"})  # a conditional order waiting for its trigger
+
+
+def _dec(x):
+    from decimal import Decimal, InvalidOperation
+
+    try:
+        return Decimal(str(x))
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def stop_change(old: tuple, new: tuple) -> str:
+    """How a resting stop moves from (level, qty) `old` to `new`: "none", "amend" (the quantity alone) or "replace"
+    (any level change: cancel and place again, because the client's amend would drop it)."""
+    (old_level, old_qty), (new_level, new_qty) = old, new
+    if _dec(old_level) != _dec(new_level):
+        return "replace"
+    return "none" if _dec(old_qty) == _dec(new_qty) else "amend"
+
+
+def stop_drift(row: dict | None, *, side: str, qty, level) -> list[str]:
+    """Every way the venue's order lookup row for a resting stop differs from the Strategy's stop (side BUY or SELL,
+    its quantity and level), in words for the CRITICAL alert; [] when they match. None: no stop at the venue."""
+    if row is None:
+        return ["no resting stop at the venue"]
+    out = []
+    if row.get("orderStatus") not in RESTING:
+        out.append(f"not resting ({row.get('orderStatus')})")
+    if str(row.get("side", "")).upper() != side.upper():
+        out.append(f"side {row.get('side')} instead of {side.title()}")
+    if _dec(row.get("triggerPrice")) != _dec(level):
+        out.append(f"level {row.get('triggerPrice')} instead of {level}")
+    if row.get("triggerBy") != STOP_TRIGGER_BY:
+        out.append(f"trigger type {row.get('triggerBy')} instead of {STOP_TRIGGER_BY}")
+    if row.get("reduceOnly") is not True:
+        out.append("not reduce-only")
+    if _dec(row.get("qty")) != _dec(qty):
+        out.append(f"quantity {row.get('qty')} instead of {qty}")
+    return out

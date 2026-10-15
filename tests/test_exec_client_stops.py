@@ -10,8 +10,8 @@ import threading
 from datetime import timedelta
 
 import pytest
-
 from exec_stub import VenueStub
+
 from sleeve_fund.paper.exec_client import stop_change, stop_drift
 
 LEVEL, QTY = "60000.0", "0.010"
@@ -60,11 +60,18 @@ def test_e_a_level_change_is_always_a_replace(old, new, how):
 def venue_run():
     """One node run: a reduce-only LAST_PRICE stop is placed, its quantity and level are amended, then it is cancelled,
     all through the framework's exchange client in DEMO mode, against the stand-in venue."""
-    import nautilus_trader.adapters.bybit as bybit
+    from nautilus_trader.adapters import bybit
     from nautilus_trader.common import Environment, LoggerConfig, LogLevel
     from nautilus_trader.live import LiveNode
-    from nautilus_trader.model import (InstrumentId, OrderSide, Price, Quantity, TimeInForce, TraderId,
-                                       TriggerType)
+    from nautilus_trader.model import (
+        InstrumentId,
+        OrderSide,
+        Price,
+        Quantity,
+        TimeInForce,
+        TraderId,
+        TriggerType,
+    )
     from nautilus_trader.trading import Strategy
 
     venue = VenueStub().start()
@@ -143,4 +150,4 @@ def test_h_a_cancel_goes_out_once_by_our_order_id(venue_run):
     [cancel] = venue.bodies("order/cancel")
     [create] = venue.bodies("order/create")
     assert cancel["orderLinkId"] == create["orderLinkId"]
-    assert list(venue.orders.values())[0]["orderStatus"] == "Cancelled"
+    assert next(iter(venue.orders.values()))["orderStatus"] == "Cancelled"
