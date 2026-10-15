@@ -113,6 +113,7 @@ CATALOGUE = {
     "efficiency_ratio": "Efficiency ratio", "donchian": "Donchian channel", "rsi_divergence": "RSI divergence",
     "stochastic": "Stochastic", "keltner": "Keltner channel", "rolling_max": "Rolling high", "rolling_min": "Rolling low",
     "prior_period": "Previous day or week",
+    "session_levels": "Asia or London session high/low",
 }
 _ID = re.compile(r"^[a-z_][a-z0-9_]*$")
 _TIMEFRAME = re.compile(r"^(\d+)(m|h|d)$")
@@ -303,6 +304,12 @@ def _check_blocks(spec: dict, bar_minutes: int | None) -> dict:
         except ValueError as exc:
             raise ValueError(f"block {bid} ({kind}): {exc}") from None
         tf = _timeframe(b["timeframe"], bar_minutes, f"block {bid}") if "timeframe" in b else None
+        fits, minutes = getattr(BUILDER_BLOCKS[kind], "check_candle", None), tf or bar_minutes
+        if fits and minutes:  # a block whose settings must suit the candle it is fed (R1-WIN: a session's window)
+            try:
+                fits(settings, minutes)
+            except ValueError as exc:
+                raise ValueError(f"block {bid} ({kind}): {exc}") from None
         out[bid] = {"kind": kind, "settings": settings, "timeframe": tf, "input": b.get("input")}
     for bid, b in out.items():
         src = b["input"]
