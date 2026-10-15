@@ -110,7 +110,8 @@ def test_another_strategy_past_its_stop_counts_as_stopless_and_is_named(monkeypa
     store.record_equity("other", equity=10_000, cash=4_000, qty=0.1, price=60_000, benchmark=10_000)
     monkeypatch.setattr(open_risk, "_journal_stop", lambda store, s, qty: 61_000.0)  # a long's stop above the mark
     book, risk, through = open_risk.account_book(store, "pp", 10_000, lambda s: 0.01)
-    assert book == 20_000 and risk == pytest.approx(600.0) and through == ["other"]
+    # Stopless: 10% of 6,000, and the 0.055% taker fee on its exit at 54,000 (FEE-LIVE 5): 600 + 2.97.
+    assert book == 20_000 and risk == pytest.approx(600 + 0.1 * 54_000 * 0.00055) and through == ["other"]
 
 
 def test_the_limit_is_5_percent_of_the_book_counting_the_entry():

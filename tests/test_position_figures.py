@@ -81,7 +81,9 @@ def test_open_risk_is_the_sum_of_risk_to_stop_and_a_position_without_a_stop_is_n
     # as the gate counts it, and named as estimated, not left out as unbounded.
     assert short["risk"]["kind"] == "estimated" and short["risk"]["amount"] > 0
     for view in (port, risk, trades):
-        assert view["open_risk"] == pytest.approx(30.0 + short["risk"]["amount"])
+        # The gate's figure: the long's 30 to its stop and the 0.055% taker fee on the stop's notional, 1 x 2,940
+        # (FEE-LIVE 5), with the short's estimate.
+        assert view["open_risk"] == pytest.approx(30.0 + 1 * 2_940 * 0.00055 + short["risk"]["amount"])
         assert view["estimated"] == ["pp-short"] and view["left_out"] == []
         assert view["margin"] == pytest.approx(long_["margin"] + short["margin"])
 
