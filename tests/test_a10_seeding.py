@@ -445,3 +445,25 @@ def test_a_boundary_indicator_whose_own_warm_up_is_shorter_than_the_agreeing_see
     s._seed_pairs, s._seed_hold = {}, None
     s._check_seeds([("EMA(20) on daily closes", _Ema(20))], candles, 0, 1440, fed=400)
     assert s._seed_hold is None
+
+
+@pytest.mark.parametrize("unit, near, apart", [
+    (lambda: Ema(20), 5e-5, 5e-4),  # 1 bp: a gap of 0.5 bp agrees, 5 bp doesn't (a tenfold tolerance would pass it)
+    (lambda: ExponentialMovingAverage(20), 5e-5, 5e-4),
+    (lambda: Atr(14), 3e-3, 7e-3),  # 0.5%: 0.3% agrees, 0.7% doesn't (a doubled tolerance would pass it)
+])
+def test_the_ema_and_atr_tolerances_are_pinned(unit, near, apart):
+    """CR F-A10-1: two seedings a known share apart (every candle scaled by 1 + g scales the average by the same share)
+    agree inside the tolerance and are apart outside it, with room between the tolerance and a mutated one."""
+    candles = _walk(300)
+
+    def seeded(scale):
+        u = unit()
+        for o, h, lo, c, v, ts in candles:
+            seeding.feed(u, (o * scale, h * scale, lo * scale, c * scale, v, ts))
+        return u
+
+    base = seeded(1.0)
+    assert seeding.worst(seeded(1 + near), base) is None
+    gap = seeding.worst(seeded(1 + apart), base)
+    assert gap is not None and gap.gap == pytest.approx(apart, rel=0.05), gap
