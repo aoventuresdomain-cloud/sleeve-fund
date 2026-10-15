@@ -138,3 +138,20 @@ def test_the_check_writes_nothing(tmp_path, capfd, store):
     _run(tmp_path, capfd, store)
     with store.engine.connect() as c:
         assert c.execute(text("SELECT count(*) FROM venue_terms_fetch")).scalar() == before
+
+
+def test_an_accounts_fetched_rates_never_reach_the_public_log(tmp_path, capfd, store):
+    """The job log is public (HoE, 12:31 UK): an account's fetched rates print as a relation to the engine's only."""
+    _tiers(store, NOW - timedelta(hours=1))
+    _fees(store, NOW - timedelta(hours=1), taker="0.000437", maker="0.000123")
+    code, rows, out = _run(tmp_path, capfd, store)
+    assert rows["taker fee (fetched)"] == "FOLLOW-UP" and rows["maker fee (fetched)"] == "FOLLOW-UP", out
+    assert "437" not in out and "123" not in out, out
+    assert "engine charges more" in out
+
+
+def test_the_published_stand_in_may_print_its_rates(tmp_path, capfd, store):
+    _tiers(store, NOW - timedelta(hours=1))
+    _fees(store, NOW - timedelta(hours=1), source=PUBLISHED_FEES)
+    _, rows, out = _run(tmp_path, capfd, store)
+    assert [line for line in out.splitlines() if "taker fee (fetched)" in line and "0.0005" in line], out
