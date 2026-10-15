@@ -66,6 +66,13 @@ def show(key: str, limit: Decimal | float) -> str:
     return f"{(v * 100).quantize(Decimal('0.01')).normalize():f}%"
 
 
+def edit(key: str, limit: Decimal | float) -> str:
+    """A limit as the edit box carries it: every stored digit, in the page's unit without its sign (0.125x -> 0.125,
+    4% -> 4). Never show()'s rounded value: an untouched save must not change the limit (B-18 edge)."""
+    v = Decimal(str(limit))
+    return f"{(v * 100 if BY_KEY[key].unit == '%' else v).normalize():f}"
+
+
 SHORT = {"fund_gross": "Gross", "asset_net": "Net per asset", "fund_margin": "Margin",
          "fund_day_loss": "Daily loss pause", "fund_drawdown": "Drawdown halt"}
 

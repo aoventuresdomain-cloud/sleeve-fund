@@ -148,7 +148,8 @@ def page(store: Store) -> dict:
         t = tests.get(r.key, {"limit": r.default, "enabled": False})
         u = use.get(r.key)
         rows.append({"key": r.key, "test": r.test, "label": r.label, "limit": t["limit"], "enabled": t["enabled"],
-                     "shown": rules.show(r.key, t["limit"]), "locked": r.locked, "low": rules.show(r.key, r.low),
+                     "shown": rules.show(r.key, t["limit"]),
+                     "edit": rules.edit(r.key, t["limit"]), "locked": r.locked, "low": rules.show(r.key, r.low),
                      "high": rules.show(r.key, r.high), "unit": r.unit, "action": ACTION_WORDS.get(r.action, r.action),
                      "used": rules.show(r.key, u["used"]) if u else None, "what": u["what"] if u else "",
                      "rest": u.get("rest", "") if u else "",

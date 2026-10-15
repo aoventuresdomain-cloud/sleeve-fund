@@ -31,6 +31,9 @@ def test_percent_limits_are_unchanged():
 def test_display_only_the_rule_bounds_and_the_forms_value_round_trip():
     gross = rules.BY_KEY["fund_gross"]
     assert (gross.default, gross.low, gross.high) == (Decimal("1.5"), Decimal("0.1"), Decimal(3))  # stored untouched
-    # The form's input is the shown value without its unit (portfolio_settings.html: r.shown[:-1]): it reads back equal.
+    # The form's input is every stored digit (rules.edit, B-18 edge), never the rounded display value.
+    assert rules.edit("fund_gross", Decimal("0.125")) == "0.125" and rules.show("fund_gross", Decimal("0.125")) == "0.13x"
+    assert rules.edit("asset_net", 0.5) == "0.5" and rules.edit("asset_stop_loss", Decimal("0.04125")) == "4.125"
+    assert rules.edit("fund_margin", Decimal(1)) == "100"
     assert Decimal(rules.show("fund_gross", gross.default)[:-1]) == gross.default
     assert Decimal(rules.show("asset_net", Decimal("0.5"))[:-1]) == Decimal("0.5")
