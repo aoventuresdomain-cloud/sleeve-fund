@@ -1222,6 +1222,12 @@ def is_dust(book: dict) -> bool:
     return 1e-12 < abs(book["qty"]) and abs(book["qty"]) * (book["entry_px"] or 0) < DUST_NOTIONAL
 
 
+def qty_words(qty: Decimal) -> str:
+    """A quantity as words read it, the same on every engine: Postgres hands a NUMERIC back at the column's scale
+    (1.000000000E-9), SQLite as 1E-9; plain digits either way, never an exponent (TEC-DUST-FMT)."""
+    return format(qty.normalize(), "f")
+
+
 def replay_book(fills, starting_balance, funding=0, insurance=0) -> dict:
     """Cash, signed position and average entry from fills in time order, plus funding received and any
     shortfall the venue's insurance fund took.
@@ -2503,7 +2509,7 @@ class Store:
 
         def said() -> str:
             qty = dust_qty[0]
-            dust = f", with dust of {qty.normalize()} no order can close, which leaves with it" if qty else ""
+            dust = f", with dust of {qty_words(qty)} no order can close, which leaves with it" if qty else ""
             return f"{sleeve} put away ({why}): its equity {seen[0][1]:,.2f} leaves the fund's book{dust}"
 
         # A clean slate's put-away (previous_book) starts a fresh book, so its emptying carries nothing (MUST-F286-H4)
