@@ -138,7 +138,7 @@ SPEC = IdeaSpec(
     ),
     data_needs="1-minute OHLCV",
     default_risk_profile="balanced",
-    default_params={"size_share": 0.6, "market": "perp", "allow_short": True},
+    default_params={"size_share": 0.6, "market": "perp", "allow_short": True, "keep_sub_cost_target": True},
     known_weaknesses="A test of the plumbing, not an idea: it pays a round trip's costs on every step and is expected "
                      "to lose. It runs alone, and only on the PM's go.",
     listed=False,
@@ -157,6 +157,9 @@ STEP_WORDS = ("buy Q", "sell half", "sell the rest and short Q", "cover half", "
 
 class CandleStepConfig(LongFlatConfig):
     def __init__(self, *, size_share: float = 0.6, run_for_hours: float | None = None, **kwargs) -> None:
+        # PM 22:38 UK "run as i specified": its 0.1% target is placed though below the round trip's costs (QD's C8
+        # flag, on for this test Strategy only; the PM's settings may still turn it off).
+        kwargs.setdefault("keep_sub_cost_target", True)
         super().__init__(**kwargs)
         if not 0 < size_share <= 1:
             raise ValueError(f"size_share {size_share} outside (0, 1]: the share of fund equity Q is sized to, "

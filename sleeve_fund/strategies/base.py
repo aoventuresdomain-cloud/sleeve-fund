@@ -404,8 +404,9 @@ class LongFlatConfig(StrategyConfig):
                 raise ValueError("maker-first orders aren't available on a perpetual yet: every order goes at market")
             if rebalance_band is not None:
                 raise ValueError("rebalancing to a target weight isn't available on a perpetual yet")
-        # A target in R is after costs by construction (r_target); a fixed one must clear them itself.
-        if take_profit is not None:
+        # A target in R is after costs by construction (r_target); a fixed one must clear them itself, unless the
+        # Strategy's settings keep one below costs (C8 keep_sub_cost_target: the candle-step test, PM 22:38 UK).
+        if take_profit is not None and not keep_sub_cost_target:
             leg = assumed_taker_fee + assumed_half_spread
             cost = leg + (1 + take_profit) * leg  # the fee and half spread in, then out on the larger value
             if take_profit <= cost:
