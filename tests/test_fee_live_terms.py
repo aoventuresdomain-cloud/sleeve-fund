@@ -200,6 +200,8 @@ def test_a_pulled_table_that_differs_from_the_engines_refuses_entries_until_it_i
     changed = _recorded("risk-limit-BTCUSDT-2026-10-15.json")
     changed["result"]["list"] = changed["result"]["list"][:-1]  # the venue withdrew its top tier
     venue_terms.fetch_tiers(store, PAPER, PAIR, get=lambda url: changed, now=T)
+    venue_terms.fetch_fees(store, PAPER, PAIR, client=Recorded(_recorded("fee-rate-BTCUSDT.json")),
+                           account="paper-main", live=False, now=T)
     t = venue_terms.term(store, PAPER, "tiers", PAIR, T + timedelta(hours=1))
     assert t.state == "refused" and "differs from the table" in t.words and "re-paste" in t.words
     assert "differs" in venue_terms.entry_refusal(store, PAPER, PAIR, T + timedelta(hours=1))
