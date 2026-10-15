@@ -95,15 +95,18 @@ def test_a_real_journal_is_dumped_and_restores_whole_and_only_three_are_kept(tmp
 
 # --- with stand-in Postgres tools ------------------------------------------------------------------------------------
 
-def _tools(bin_dir: Path, log: Path, restore_ok: bool = True, copy: str = "0028 5 4 9 1 2 3") -> None:
+def _tools(bin_dir: Path, log: Path, restore_ok: bool = True, copy: str = "0028 5 4 9 1 2 3",
+           dump_ok: bool = True, read_ok: bool = True) -> None:
     bin_dir.mkdir(exist_ok=True)
     stubs = {
-        "pg_dump": 'while [ $# -gt 0 ]; do [ "$1" = -f ] && { echo dump > "$2"; }; shift; done',
+        "pg_dump": ('while [ $# -gt 0 ]; do [ "$1" = -f ] && { echo dump > "$2"; }; shift; done' if dump_ok
+                    else "echo 'pg_dump: error: secret-host' >&2; exit 1"),
         "createdb": "exit 0",
         "dropdb": "exit 0",
         "pg_restore": "exit 0" if restore_ok else "echo 'pg_restore: error: secret-host row' >&2; exit 1",
         # the live journal answers the same before and after; the scratch copy answers $copy
-        "psql": f'case "$*" in *predeploy_check*) echo "{copy}";; *) echo "0028 5 4 9 1 2 3";; esac',
+        "psql": (f'case "$*" in *predeploy_check*) echo "{copy}";; *) echo "0028 5 4 9 1 2 3";; esac' if read_ok
+                 else "echo 'psql: error: secret-host' >&2; exit 2"),
     }
     for name, body in stubs.items():
         (bin_dir / name).write_text(f'#!/usr/bin/env bash\necho "{name} $PGHOST:$PGUSER $*" >> {log}\n{body}\n')
@@ -178,6 +181,17 @@ echo "/dev/x 99999999999 1 {free} 1% /"
         assert [p.name for p in (tmp_path / "b").iterdir()] == ["sleeve_fund-20261015-0012.dump"]
 
 
+@pytest.mark.parametrize("kw, words", [({"dump_ok": False}, "the dump didn't complete"),
+                                       ({"read_ok": False}, "couldn't read the journal")])
+@needs_bash
+def test_a_tool_that_fails_says_so_and_leaves_nothing(tmp_path, kw, words):
+    """QT3 N2: a failed pg_dump (or psql) once exited through set -e with no line in the deploy log."""
+    done, _ = _run(tmp_path, **kw)
+    assert done.returncode == 1 and done.stdout.strip() == f"pre-deploy dump: FAIL, {words}"
+    assert "secret-host" not in done.stdout + done.stderr
+    assert not list((tmp_path / "b").iterdir())
+
+
 @needs_bash
 def test_a_whole_copy_passes_and_is_never_named_like_a_nightly_dump(tmp_path):
     done, calls = _run(tmp_path)
@@ -186,6 +200,7 @@ def test_a_whole_copy_passes_and_is_never_named_like_a_nightly_dump(tmp_path):
                                    "fund_flows 1, book_moves 2, decisions 3")
     (dump,) = (tmp_path / "b").glob("predeploy-*")
     assert re.fullmatch(r"predeploy-\d{8}-\d{6}\.pgdump", dump.name)
+    assert dump.stat().st_mode & 0o077 == 0  # QT3 N1: docker exec runs with umask 0000; the copy is the owner's only
     assert any(c.startswith("pg_restore") and "--exit-on-error" in c for c in calls)
     # the backup container's environment holds only the password: the journal's host and role are backup.sh's
     tools = [c for c in calls if c.split(" ")[0] in ("pg_dump", "createdb", "dropdb", "pg_restore", "psql")]
