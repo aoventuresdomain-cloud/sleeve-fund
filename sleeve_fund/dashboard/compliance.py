@@ -5,6 +5,7 @@ through the Store only. Use now is the entry gate's own book (as withdrawal.limi
 
 from __future__ import annotations
 
+from datetime import UTC
 from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo
 
@@ -55,30 +56,42 @@ def fund_halt(store: Store) -> str | None:
 
 
 def engine_use(store: Store, tests: dict[str, dict]) -> dict | None:
-    """C2: the engine's own use of each test (PE2's compliance_use, Drop B) in this page's shape, or None until the
-    engine has it. Its share is used over the limit; as a share of the book that is share x the limit's percentage
-    (the limit is that percentage of the book). The largest asset or group is the headline, the rest on hover."""
+    """C2: the engine's own use of each test (PE2's supervisor.compliance_use, Drop B) in this page's shape, or None
+    until the engine has it. The engine gives money: used of the limit it allows. The page shows the limit as its share
+    of the book, so use is shown as used/limit x that share, and the bar fills used/limit exactly as the gate counts
+    it. A test that is off has no limit, so its use is shown as a share of the book. Per asset (T1, net) and per group
+    (T2), the largest is the headline and the rest are on hover; net is signed, so its size is shown."""
     try:
-        from sleeve_fund.supervisor import compliance_use  # PE2's, once it lands
+        from sleeve_fund.supervisor import compliance_use
     except ImportError:
         return None
     try:
         got = compliance_use(store)
-    except Exception:  # noqa: BLE001 - unread is shown as unreadable, never as room
+    except Exception as exc:  # noqa: BLE001 - unread is shown as unreadable, never as room
+        print(f"portfolio settings: can't read the engine's use of the compliance tests: {exc!r}")
         return {"source": "unreadable"}
-    if not got or got.get("stale"):
+    eq = got.get("equity")
+    if eq is None or eq <= 0:
         return {"source": "unmarked"}
     out: dict = {"source": "gate"}
-    for key, u in got.items():
-        if key not in rules.BY_KEY or not isinstance(u, dict):
+    for key, t in (got.get("tests") or {}).items():
+        if key not in rules.BY_KEY:
             continue
-        pct = Decimal(str(tests.get(key, {}).get("limit", 0)))
-        parts = u.get("by_asset") or u.get("by_group") or {}
-        top = max(parts.items(), key=lambda kv: kv[1], default=(None, None))[0]
-        what = (top.capitalize() if "by_group" in u else top) if top else ""
-        rest = " · ".join(f"{(k.capitalize() if 'by_group' in u else k)} {float(v) * 100:.0f}% of its limit"
-                          for k, v in sorted(parts.items(), key=lambda kv: -kv[1]))
-        out[key] = {"used": Decimal(str(u.get("share", 0))) * pct, "what": what, "rest": rest}
+        limit, pct = t.get("limit"), Decimal(str(tests.get(key, {}).get("limit", 0)))
+
+        def shown(money: Decimal, limit=limit, pct=pct) -> Decimal:
+            return money / limit * pct if limit else money / eq
+
+        used = t.get("used")
+        if isinstance(used, dict):
+            parts = {(k.capitalize() if key == "type_stop_loss" else k): abs(Decimal(v)) for k, v in used.items()}
+            order = sorted(parts.items(), key=lambda kv: (-kv[1], kv[0]))
+            what, amount = order[0] if order else ("", Decimal(0))
+            rest = " · ".join(f"{k} {float(v / limit * 100):.0f}% of its limit" if limit
+                              else f"{k} {rules.show(key, shown(v))}" for k, v in order)
+        else:
+            what, amount, rest = "", abs(Decimal(used or 0)), ""
+        out[key] = {"used": shown(amount), "what": what, "rest": rest}
     return out
 
 
@@ -287,6 +300,8 @@ def fund_banner(store: Store) -> dict | None:
     state = s["state"]
     if state == "brake":
         until = s.get("until")
+        if until is not None and until.tzinfo is None:  # the engine's times are UTC, stored naive or aware
+            until = until.replace(tzinfo=UTC)
         text = "New trades paused until the next day begins" + (f" ({until.astimezone(UK):%H:%M} UK)" if until else "")
         return {"state": state, "tone": "warn", "text": text, "reason": reason}
     if state == "halt":

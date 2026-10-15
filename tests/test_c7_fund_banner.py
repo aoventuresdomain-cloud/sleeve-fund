@@ -44,6 +44,22 @@ def test_the_daily_brake_says_until_when_in_uk_time(client, monkeypatch, path): 
     assert "(00:00 UK)" in _banner(c.get(path, auth=AUTH).text)  # winter: UK is UTC
 
 
+
+def test_a_brake_end_the_engine_gives_without_a_zone_is_read_as_utc(client, monkeypatch):  # noqa: F811
+    import time
+
+    c, store = client
+    _sleeve(store)
+    monkeypatch.setenv("TZ", "America/New_York")  # the server's own zone must never move the UK time
+    time.tzset()
+    try:
+        _seed(monkeypatch, {"state": "brake", "since": None, "until": datetime(2026, 10, 16),  # noqa: DTZ001 - naive on purpose
+                             "reason": None})
+        assert "(01:00 UK)" in _banner(c.get("/portfolio-settings", auth=AUTH).text)
+    finally:
+        monkeypatch.undo()
+        time.tzset()
+
 def test_the_drawdown_halt_gives_its_reason_and_a_restart(client, monkeypatch):  # noqa: F811
     c, store = client
     _sleeve(store)
