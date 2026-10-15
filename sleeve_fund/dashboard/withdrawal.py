@@ -44,7 +44,9 @@ def leaving(store: Store) -> dict[str, str | None]:
 def state_words(store: Store, name: str) -> str:
     """What became of a put-away Strategy's equity, as the PM reads it after "Archived, " or "Retired, "; "" for one
     archived before F-C3B-A (still counted until supervisor withdraw-archived) or a reset's earlier run."""
-    if name in store.withdrawn():
+    if (out := store.withdrawn().get(name)) is not None:
+        if out == 0:  # F-WN-2: fund-held cash, nothing of its own in the book to take out (PE2's F-WN-1)
+            return "it left with nothing to move: its P&L stays in the fund's cash, which isn't a loss"
         return "its equity left the fund's book, which isn't a loss"
     if name in store.withdrawal_pending():
         if (why := store.withdrawal_blocker(name)) is not None:
