@@ -129,7 +129,13 @@ def check_account_sharing(environ: dict[str, str], engine: Engine) -> Section:
     """A7: with one account per Strategy on (ACCOUNT_PER_STRATEGY=on), every live or test-network account is one
     Strategy's; each shared one FAILs, named with its Strategies. Off, it says so and passes."""
     from sleeve_fund.accounts import per_strategy
-    from sleeve_fund.store import accounts_t, is_backtest, sleeve_accounts_t, sleeve_archive_t, sleeves_t
+    from sleeve_fund.store import (
+        accounts_t,
+        is_backtest,
+        sleeve_accounts_t,
+        sleeve_archive_t,
+        sleeves_t,
+    )
 
     sec = Section("One account per Strategy")
     if not per_strategy(environ):
