@@ -155,8 +155,8 @@ class StopMover:
         out = []
         for oid in venue_resting:
             if not ours(oid):
-                out.append(("alert", "critical", f"Order {oid} on the account is not the fund's: left alone, entries "
-                                                 "held until the account reconciles"))
+                out.append(("alert", "critical", (f"Order {oid} on the account is not the fund's: left alone, entries "
+                                                  "held until the account reconciles")))
             elif oid != journal_current:
                 out.append(("cancel", oid))
         return out
