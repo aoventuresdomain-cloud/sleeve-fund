@@ -29,6 +29,7 @@ from sleeve_fund.store import Store, is_backtest, utcnow
 
 UK = ZoneInfo("Europe/London")
 RESET_ACTION = "book_reset_pm"  # the decisions row each step writes, keyed by the slate's id
+CLOSE_OUT = "old-book-close-out"  # the key of a close-out's cash rows (Store.close_out_run): once per run, any slate
 WAIT, REFUSED, DONE = 2, 1, 0  # the command's exit codes: run again later; refused, nothing more written; deposited
 
 
@@ -61,13 +62,60 @@ def _old_pockets(store: Store) -> dict[str, Decimal]:
     return left
 
 
-def _stuck(store: Store) -> list[str]:
+def _close_outs(store: Store) -> list[tuple[str, str, Decimal]]:
+    """RESET-NEG (Advisor, 15 Oct 03:10 UK): each reset run of the old book below zero, as (run, the Strategy it was
+    reset from, its loss), to be closed out from the old book's pooled cash before the empty-book check. The pooled
+    cash is that Strategy's: a run's capital is its Strategy's (split_run), so the loss goes back where the capital came
+    from, and the book's total doesn't move. Only while that Strategy is still in the book and carries every loss of
+    its runs at or above 0 (a withdrawal is never negative); else the loss stays a pocket no withdrawal takes out, and
+    the reset is refused by name (_stuck). A run at 0 has nothing to close: a rerun closes out nothing."""
+    pockets, came_from, out = _old_pockets(store), store.reset_from(), store.withdrawn()
+    by_name = {s.name: s for s in store.sleeves()}
+    losses: dict[str, list[tuple[str, Decimal]]] = {}
+    for run, eq in pockets.items():
+        into = came_from.get(run)
+        if eq < 0 and into in by_name and into not in out and not is_backtest(into) and \
+                not supervisor.outside_fund_book(store, by_name[into]):
+            losses.setdefault(into, []).append((run, -eq))
+    runs = store.reset_runs()
+    return [(run, into, loss) for into, each in losses.items()
+            if supervisor.strategy_equity(store, by_name[into], runs) >= sum(loss for _, loss in each)
+            for run, loss in each]
+
+
+def _stuck(store: Store, closing: list | None = None) -> list[str]:
     """What the slate can't flatten or take out, so the book could never be empty (CAP5-RESET: refused, named): an
-    archived Strategy still holding a position, and an old pocket holding a loss (a withdrawal is never negative). A
-    Strategy still on the book is not one: the slate flattens it first."""
+    archived Strategy still holding a position, and an old pocket holding a loss (a withdrawal is never negative) that
+    no close-out covers. A Strategy still on the book is not one: the slate flattens it first."""
     out = store.withdrawn()
+    closed = {run for run, _, _ in (_close_outs(store) if closing is None else closing)}
     held = _holding(store, [n for n in store.archived() if n not in out and not is_backtest(n)])
-    return held + [f"{n} {eq:,.2f}, a loss no withdrawal takes out" for n, eq in _old_pockets(store).items() if eq < 0]
+    return held + [f"{n} {eq:,.2f}, a loss no withdrawal takes out" for n, eq in _old_pockets(store).items()
+                   if eq < 0 and n not in closed]
+
+
+def _minus(amount: Decimal) -> str:
+    return f"\u2212{amount:,.2f}"
+
+
+def _close_out_words(into: str, loss: Decimal, now: datetime) -> str:
+    """The journal's words for one close-out (HoE 03:10 UK): by the Strategy's name only, never the run's, whose id
+    names its venue."""
+    return (f"Old book close-out: {into} ended at {_minus(loss)} from paper losses before the "
+            f"{now.astimezone(UK):%-d %b} restart; covered from the old book's cash. No effect on the old book total.")
+
+
+def _count_words(n: int) -> str:
+    return ("no", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine")[n] if n < 10 else str(n)
+
+
+def _closed_words(book: Decimal, closing: list, deposit: Decimal) -> str:
+    """The PM's line for the reset once old losses were closed out (HoE 03:10 UK)."""
+    n, total = len(closing), sum((loss for _, _, loss in closing), Decimal(0))
+    fresh = f"{deposit:,.2f}".removesuffix(".00")
+    which = "retired Strategy that had" if n == 1 else "retired Strategies that had"
+    return (f"Old book closed at {book:,.2f}, including {total:,.2f} of losses on {_count_words(n)} {which} run below "
+            f"zero; the new fund starts at {fresh}.")
 
 
 def empty_book_pockets(store: Store) -> list[str]:
@@ -117,10 +165,14 @@ def plan(store: Store, slate: str, deposit: Decimal) -> list[str]:
             f"{n} {supervisor.strategy_equity(store, by_name[n], runs):,.2f}" for n in waiting))
     if holders := _holding(store, names):
         lines.append(f"would flatten first: {'; '.join(holders)}")
+    if closing := _close_outs(store):
+        lines.append("would close out first, from the old book's cash (no effect on its total): "
+                     + ", ".join(f"{into} {_minus(loss)}" for _, into, loss in closing)
+                     + f"; {sum(loss for _, _, loss in closing):,.2f} in all")
     if old := {n: eq for n, eq in _old_pockets(store).items() if eq > 0}:
         lines.append("would take out of the old book at the next mark: "
                      + ", ".join(f"{n} {eq:,.2f}" for n, eq in old.items()))
-    if stuck := _stuck(store):
+    if stuck := _stuck(store, closing):
         lines.append(f"would refuse, nothing written: the book can't be emptied while {'; '.join(stuck)}")
     lines.append(f"then deposit {deposit:,.2f} into the fund's cash, once the book is empty, as its fresh start")
     return lines
@@ -137,9 +189,18 @@ def run(store: Store, actor: str, commit: str, slate: str, deposit: Decimal,
     now = now or utcnow()
     if _done(store, slate):
         return DONE, [f"reset {slate}: deposited already, nothing to do"]
-    if stuck := _stuck(store):  # before anything is written: a reset that can't empty the book doesn't start
+    closing = _close_outs(store)
+    if stuck := _stuck(store, closing):  # before anything is written: a reset that can't empty the book doesn't start
         return REFUSED, [f"refused, nothing written: the book can't be emptied while {'; '.join(stuck)}"]
     said = []
+    if closing:  # RESET-NEG: first, so each Strategy's put-away below takes out what is left of its cash
+        book = supervisor.fund_equity(store)
+        for run, into, loss in closing:
+            store.close_out_run(run, into, loss, CLOSE_OUT, now, actor, RESET_ACTION,
+                                f"{slate}:close-out {_close_out_words(into, loss, now)}")
+        store.decide(actor, RESET_ACTION, f"{slate}:closed {_closed_words(book, closing, deposit)}", ts=now)
+        said.append("closed out from the old book's cash: "
+                    + ", ".join(f"{into} {_minus(loss)}" for _, into, loss in closing))
     reason = f"{slate}: PM reset of the paper book, every Strategy put away and {deposit:,.2f} deposited afresh"
     if put_away := supervisor.clear_entries(store, [{"id": slate, "reason": reason}]):
         said.append(f"put away: {', '.join(put_away)}")
@@ -176,7 +237,10 @@ def run(store: Store, actor: str, commit: str, slate: str, deposit: Decimal,
         return REFUSED, said + [f"refused, no deposit written: the book isn't empty; still in it: {'; '.join(left)}"]
     flow = store.fund_flow("deposit", deposit, actor="pm", reason=reason, rebase=True, now=now)
     store.decide(actor, RESET_ACTION, f"{slate}:deposit {deposit:,.2f} as fund flow {flow} at commit {commit}")
-    return DONE, said + [f"deposit {deposit:,.2f} written as fund flow {flow}: the supervisor's next mark applies it"]
+    closed = [d["reason"].removeprefix(f"{slate}:closed ") for d in store.decisions(action=RESET_ACTION, limit=10_000)
+              if d["reason"].startswith(f"{slate}:closed ")]
+    return DONE, said + [f"deposit {deposit:,.2f} written as fund flow {flow}: the supervisor's next mark applies it",
+                         *closed[:1]]
 
 
 def main(args) -> int:

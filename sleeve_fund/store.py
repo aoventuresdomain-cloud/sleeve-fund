@@ -3397,6 +3397,32 @@ class Store:
             return {r.run: _aware(r.done_at) for r in c.execute(
                 select(resets_t).where(resets_t.c.done_at.is_not(None), resets_t.c.run != ""))}
 
+    def reset_from(self) -> dict[str, str]:
+        """Each run a reset put away, and the Strategy it was reset from: {run name: Strategy name}."""
+        with self.engine.connect() as c:
+            return {r.run: r.sleeve for r in c.execute(
+                select(resets_t.c.run, resets_t.c.sleeve).where(resets_t.c.done_at.is_not(None), resets_t.c.run != ""))}
+
+    def close_out_run(self, run: str, into: str, amount: Decimal, key: str, ts: datetime, actor: str, action: str,
+                      said: str) -> bool:
+        """RESET-NEG (Advisor, 15 Oct): a reset run of the old book below zero closed out against the Strategy it was
+        reset from, whose capital it ran on (split_run): `amount` (the run's loss, > 0) credited to the run, bringing it
+        to exactly 0, and debited from `into`, with the decision `said`, in one transaction. A transfer inside the book,
+        so its total doesn't move. The rows are cash rows both of the book's readers count (journal_book and
+        strategy_cash_pnl), so its identity doesn't move either, keyed by `key` and the run: once only (insurance_once),
+        a second call writes nothing and returns False."""
+        if amount <= 0:
+            raise ValueError(f"a close-out credits a run below zero, not {amount}")
+        i = insurance_t.c
+        with self.engine.begin() as c:
+            if c.execute(select(i.id).where(i.sleeve == run, i.order_id == key, i.trade_id == run)).first():
+                return False
+            c.execute(insert(insurance_t), [
+                {"sleeve": run, "ts": ts, "price": 0, "amount": amount, "order_id": key, "trade_id": run},
+                {"sleeve": into, "ts": ts, "price": 0, "amount": -amount, "order_id": key, "trade_id": run}])
+            c.execute(insert(decisions_t).values(ts=ts, actor=actor, action=action, sleeve=into, reason=said.strip()))
+        return True
+
     def refuse_reset(self, request: dict, why: str) -> None:
         """Close a reset the supervisor won't carry out: done, with no run put away, and journaled with why."""
         with self.engine.begin() as c:
