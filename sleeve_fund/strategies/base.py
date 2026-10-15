@@ -597,6 +597,9 @@ class LongFlatStrategy(Strategy):
         self.funding_marks: list[tuple] = []
         # (time, amount) for every credit that only brought a flat book's equity back to zero (_cover_shortfall)
         self.insurance_log: list[tuple] = []
+        # ABSORB-GAP (INSURE-RULE point 5): (time, amount) for every liquidation the market took past its bankruptcy
+        # price, the gap the venue absorbed beyond the margin booked (_liquidation_diagnostic); recorded, never booked
+        self.absorbed_log: list[tuple] = []
         # GAP-LIQ-CAP: each liquidation order's booking, {order id: (bankruptcy price, its liquidation fees)}, which a
         # backtest's fills report takes in place of the venue's (research.runner); and the one being closed now
         self.liquidation_books: dict[str, tuple[float, float]] = {}
@@ -4860,6 +4863,7 @@ class LongFlatStrategy(Strategy):
         market, past = c["market"] / c["qty"], c["past"]
         rt = self.runtime
         if past >= 0.005:
+            self.absorbed_log.append((rt.now(), past))
             rt.store.event(rt.name, "warning", "insurance_fund",
                            f"The market closed the position at {market:,.6g}, past the bankruptcy price "
                            f"{c['bankrupt']:,.6g}: the {past:,.2f} beyond it is covered by the venue's insurance fund. "

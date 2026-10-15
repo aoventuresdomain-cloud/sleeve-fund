@@ -70,6 +70,9 @@ class BacktestResult:
     funding_schedule: str = ""
     # Shortfalls past the bankruptcy price the venue's insurance fund took, as {"ts", "amount"}.
     insurance: list = field(default_factory=list)
+    # ABSORB-GAP: the gap past the bankruptcy price the venue absorbed on each liquidation, as {"ts", "amount"};
+    # recorded, never booked (GAP-LIQ-CAP books the liquidation at bankruptcy), so research can charge it.
+    absorbed: list = field(default_factory=list)
     # How far the fills can be trusted, when they relied on what traded first inside a bar (P1-D13): e.g.
     # "bars-only: stop fills pessimistic". Empty when no resting level ever lay inside a bar.
     labels: list = field(default_factory=list)
@@ -500,6 +503,7 @@ def leg_result(engine: BacktestEngine, leg: Leg) -> BacktestResult:
         **dict(zip(("funding_at_baseline", "funding_held", "funding_baseline_longest"),
                    funding.baseline_summary(strategy.funding_marks, _funding_interval(strategy)))),
         insurance=[{"ts": ts, "amount": a} for ts, a in strategy.insurance_log],
+        absorbed=[{"ts": ts, "amount": a} for ts, a in strategy.absorbed_log],
         handler_errors=list(strategy.handler_errors),
         unsettled_fills=sum(1 for o in (fills.index if fills is not None else ())
                             if strategy.decisions.get(o, {}).get("unsettled")),
