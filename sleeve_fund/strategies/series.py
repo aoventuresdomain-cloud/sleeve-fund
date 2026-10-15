@@ -25,12 +25,14 @@ import pandas as pd
 
 from sleeve_fund.data import bar_type_for, to_bars
 from sleeve_fund.instruments import BOOK_SHARE
+from sleeve_fund.store import model_params
 from sleeve_fund.strategies import REGISTRY
 
 
 def build(strategy_name: str, instrument, params: dict, bar_minutes: int):
     """The strategy as run_backtest builds it, without an engine: same config, same warm-up count."""
     strategy_cls, config_cls = REGISTRY[strategy_name]
+    params = model_params(params)  # a stored row's: never the Strategy's own keys (MA-PARAMS-1)
     config = config_cls(instrument_id=instrument.id, bar_type=bar_type_for(instrument, bar_minutes),
                         assumed_taker_fee=float(instrument.taker_fee), volume_scale=BOOK_SHARE, **params)
     strategy = strategy_cls(config)
@@ -42,7 +44,8 @@ def warmup(strategy_name: str, params: dict, bar_minutes: int) -> int:
     """Candles of `bar_minutes` the model needs before its indicators read as settled, as a backtest counts them."""
     strategy_cls = REGISTRY[strategy_name][0]
     spec = getattr(importlib.import_module(strategy_cls.__module__), "SPEC", None)
-    return strategy_cls.warmup_needed({**(spec.default_params if spec is not None else {}), **params}, bar_minutes)
+    return strategy_cls.warmup_needed({**(spec.default_params if spec is not None else {}), **model_params(params)},
+                                      bar_minutes)
 
 
 def indicator_series(strategy_name: str, candles: pd.DataFrame, instrument, params: dict | None = None,

@@ -39,6 +39,7 @@ from sleeve_fund.instruments import ScheduleFeeModel, fill_model
 from sleeve_fund.paper.config import SleeveConfig, from_store, load_sleeve
 from sleeve_fund.paper.runtime import EXITS_ONLY, SleeveRuntime
 from sleeve_fund.paper.safety import assert_keyless, assert_portfolio_gate
+from sleeve_fund.store import model_params
 from sleeve_fund.strategies import REGISTRY, check_perp_sizing, check_perp_stop
 from sleeve_fund.venues import VENUES
 from sleeve_fund.venues import venue as venue_profile
@@ -465,7 +466,7 @@ def _strategy(sleeve: SleeveConfig, profile, classes, instrument_id: str, bar_ty
                                                     runtime.store if runtime is not None else None).half_spread,
                 warmup_bars=sleeve.warmup_bars,
                 strategy_id=strategy_id(strategy_cls.__name__, sleeve.name),
-                **sleeve.params,
+                **model_params(sleeve.params),
             )
         ).attach_runtime(runtime).attach_recorder(recorder)
         # A hub-fed node's history is the hub's own, in the store it writes: never the venue's candles, which
