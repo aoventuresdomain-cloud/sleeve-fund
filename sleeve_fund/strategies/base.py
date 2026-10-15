@@ -34,6 +34,7 @@ from sleeve_fund import bars as bar_rule
 from sleeve_fund import lifecycle, markets, open_risk, risk
 from sleeve_fund.data import bar_minutes
 from sleeve_fund import router
+from sleeve_fund import ramp, strength
 from sleeve_fund.instruments import BOOK_SHARE, lot_decimals, pair_of, taker_slippage, target_fill_px
 from sleeve_fund.margin import entry_liquidation
 from sleeve_fund.paper.runtime import FILL_HANDLER_PAUSE  # noqa: F401  (T-FIX8's name, kept for its callers)
@@ -300,6 +301,10 @@ def _step_values(values: dict, qty: Decimal | None) -> dict:
     return values if qty is None else {**values, "step_qty": float(qty)}
 
 
+# G5: a Model's own sizing limits, its configured size; the rest are caps on it (sleeve_fund.strength).
+OWN_SIZE_LIMITS = ("risk per trade", "risk profile cap", "the Strategy's size share", "the step's size", "target weight")
+
+
 def _side_word(side: int) -> str:
     return "long" if side > 0 else "short" if side < 0 else "flat"
 
@@ -340,6 +345,7 @@ class LongFlatConfig(StrategyConfig):
         keep_sub_cost_target: bool = False,
         trade_from: int | None = None,
         leg: dict | None = None,
+        signal_strength: dict | None = None,
         **kwargs: Any,
     ) -> None:
         leg_spec = leg  # `leg` is reused below for a fee and a half spread
@@ -427,6 +433,12 @@ class LongFlatConfig(StrategyConfig):
         # A leg of a two-leg Strategy (P2-8; two_legs.leg_params): it trades only through its Pair, and with no Pair it
         # opens nothing (Advisor M4), whoever built it.
         self.leg = dict(leg_spec) if leg_spec is not None else None
+        # G5, off when None: scale the configured size by the entry signal's strength (sleeve_fund.strength).
+        self.signal_strength = strength.check(signal_strength)
+        if self.signal_strength is not None and rebalance_band is not None:
+            raise ValueError(strength.NO_REBALANCE)
+        if self.signal_strength is not None and self.leg is not None:
+            raise ValueError(strength.NO_LEG)
         self.instrument_id = instrument_id
         self.bar_type = bar_type
         # Backtest only: no trade on a bar that closes before this time (ns), so a study's out-of-sample window starts
@@ -726,6 +738,10 @@ class LongFlatStrategy(Strategy):
         # SleeveRuntime in paper/live (journal, PM controls, risk guard); None in backtest.
         # Attach with attach_runtime() before the strategy is added to a node or engine.
         self.runtime = None
+        # A9: the minimum-size ramp's switch, read once when the Strategy starts (never mid-run), and its gate, read
+        # once a UTC day: (day, Gate).
+        self._ramp_on = ramp.enabled()
+        self._ramp_day = None
         # Paper/live on bars built from live trades: loads warm-up bars from the venue history store
         # (the venue can't serve those bars). Attach with attach_history(); None requests them from
         # the venue's candles instead.
@@ -2385,9 +2401,18 @@ class LongFlatStrategy(Strategy):
             limits["the Strategy's size share"] = Decimal(str(base * share))
         if (step := values.get("step_qty")) is not None:  # a STEPPED model's later open: Q, never more
             limits["the step's size"] = Decimal(str(step)) * bar.close.as_decimal()
+        if (strength_words := LongFlatStrategy._strength_limit(self, limits, values, base)) is False:
+            return
+        ramp_gate = LongFlatStrategy._ramp_limit(  # A9, off by default: only ever shrinks an entry or add
+            self, limits, side, lambda: self._signed_qty() if held_qty else Decimal(0), bar.close.as_decimal())
         size_by = min(limits, key=limits.get)
         budget = limits[size_by]
         qty = (budget / bar.close.as_decimal()).quantize(self._lot(), rounding=ROUND_DOWN)
+        if ramp_gate is not None and size_by == ramp.LIMIT and qty <= 0:
+            self._note("entry_held_ramp", f"Entry skipped: the position is already at its minimum size, and it "
+                       f"{ramp_gate.words}", level="info")
+            return
+        self._noted.discard("entry_held_ramp")
         if qty <= 0 or qty < self._min_qty():
             self._note("buy_skipped", f"Entry skipped: the {size_by} limit ({float(budget):,.2f}) comes to {qty}, "
                        f"below the smallest order the venue takes ({self._min_qty()})")
@@ -2395,6 +2420,11 @@ class LongFlatStrategy(Strategy):
         self._noted.discard("buy_skipped")
         signal = {**values, "close": close, "side": _side_word(side), "sized_by": size_by,
                   "budget": round(float(budget), 2), **self._fund_at_entry(base)}
+        if strength_words:
+            signal["strength"] = strength_words
+        if ramp_gate is not None and size_by == ramp.LIMIT:  # with the size it would have had, for its track
+            signal["ramp"] = ramp_gate.words
+            signal[ramp.UNRAMPED] = round(float(min(v for k, v in limits.items() if k != ramp.LIMIT)), 2)
         notional = float(qty) * close
         # CUT-A: the simulated account posts the margin, with the fund's virtual funding back in (_mark nets it out)
         liq, distance = entry_liquidation(cash + self._funded(), float(qty), close, side, self._cfg.assumed_taker_fee,
@@ -3379,10 +3409,18 @@ class LongFlatStrategy(Strategy):
             limits["risk per trade"] = Decimal(str(base * self._cfg.risk_per_trade / self._loss_at_stop()))
         if (cap := self._volume_cap(bar)) is not None:
             limits["share of the bar's volume"] = cap
+        if (strength_words := LongFlatStrategy._strength_limit(self, limits, values or {}, base)) is False:
+            return
+        ramp_gate = LongFlatStrategy._ramp_limit(self, limits, 1, self._signed_qty, bar.close.as_decimal())  # A9
         size_by = min(limits, key=limits.get)
         budget = limits[size_by]
         step = self._lot()
         qty = (budget / bar.close.as_decimal()).quantize(step, rounding=ROUND_DOWN)
+        if ramp_gate is not None and size_by == ramp.LIMIT and qty <= 0:
+            self._note("entry_held_ramp", f"Buy skipped: the position is already at its minimum size, and it "
+                       f"{ramp_gate.words}", level="info")
+            return
+        self._noted.discard("entry_held_ramp")
         min_qty = self._min_qty()
         if qty <= 0 or qty < min_qty:
             self._note("buy_skipped", f"Buy skipped: the {size_by} limit ({float(budget):,.2f}) buys {qty}, below "
@@ -3391,6 +3429,11 @@ class LongFlatStrategy(Strategy):
         self._noted.discard("buy_skipped")
         signal = {**(values or {}), "close": bar.close.as_double(), "sized_by": size_by,
                   "budget": round(float(budget), 2), **self._fund_at_entry(base)}
+        if strength_words:
+            signal["strength"] = strength_words
+        if ramp_gate is not None and size_by == ramp.LIMIT:  # with the size it would have had, for its track
+            signal["ramp"] = ramp_gate.words
+            signal[ramp.UNRAMPED] = round(float(min(v for k, v in limits.items() if k != ramp.LIMIT)), 2)
         if self._stop_frac:
             # What this position loses if the stop is hit, costs included: one R, for the trade's R multiple.
             loss = self._loss_at_stop()
@@ -5478,6 +5521,73 @@ class LongFlatStrategy(Strategy):
         if self.runtime.now() - st.mark_ts > gate.MARK_STALE:
             return None
         return float(st.equity)
+
+    def _strength_limit(self, limits: dict, values: dict, base: float) -> str | None | bool:
+        """G5: with the Model's signal_strength set, the signal strength limit: f(strength) x its configured size, the
+        smallest of its own sizing limits (risk per trade, the risk profile's cap, a size share or step), so the
+        configured size is the ceiling and every other limit still applies after it. Returns the journal's words, None
+        when off (limits untouched, values never read), or False when the entry is skipped: below its floor or before
+        the Model's indicators have settled (A10), journaled, or a missing, NaN or out-of-range strength (journaled as
+        an alert, never full size)."""
+        cfg = self._cfg.signal_strength
+        if cfg is None:
+            return None
+        if values.get("step_qty") is not None:  # a stepped Model's later open: Q, already scaled at its first (F-G5-6)
+            return "the step's size, its first open's signal strength already applied"
+        st = strength.factor(cfg, values)
+        if st.f is not None and LongFlatStrategy._unsettled(self):  # A10: an unsettled block gives no strength
+            st = strength.Strength(None, "entry skipped: the Model's indicators haven't settled (warm-up), so its "
+                                         "signal strength can't be read yet")
+        # Written once per change (QD F-G5-5), not every bar: once per level (an alert after an info skip is still
+        # written) until a strength passes again.
+        seen = {"info": "entry_skipped_strength:info", "error": "entry_skipped_strength:error"}
+        if st.f is None:
+            level = "error" if st.alert else "info"
+            if seen[level] not in self._noted:
+                self._noted.add(seen[level])
+                self._noted.discard("entry_skipped_strength")
+                self._note("entry_skipped_strength", st.words[0].upper() + st.words[1:], level=level)
+            return False
+        self._noted.difference_update(seen.values())
+        own = [v for k, v in limits.items() if k in OWN_SIZE_LIMITS or k.endswith("risk profile cap")]
+        configured = min(own) if own else min(limits.values())
+        limits[strength.LIMIT] = configured * Decimal(repr(st.f))
+        return strength.words(st, float(configured) / base if base else 0.0)
+
+    def _ramp_limit(self, limits: dict, side: int, held, price: Decimal) -> ramp.Gate | None:
+        """A9: while switched on (read at start) and paper inside the fund, a Strategy short of its gate adds the
+        minimum-size ramp to `limits`: one minimum order from flat, no add. held reads the signed position, only once
+        the ramp applies. Returns the gate when the ramp applies, None when it doesn't (switched off, outside the fund,
+        a backtest, or the gate passed). Only an entry or add reads it; exits never do."""
+        if not self._ramp_on or not self._in_fund():
+            return None
+        g = LongFlatStrategy._ramp_gate(self)
+        if g.passed:
+            return None
+        least = ramp.minimum_qty(self._min_qty(), self._lot(), LongFlatStrategy._min_notional(self), price)
+        limits[ramp.LIMIT] = ramp.cap(least, held(), side, price)
+        return g
+
+    def _ramp_gate(self) -> ramp.Gate:
+        """The gate, re-evaluated once a UTC day (Advisor A9 Q6); a change either way is journaled in words."""
+        day = self.runtime.now().astimezone(timezone.utc).date()
+        if self._ramp_day is not None and self._ramp_day[0] == day:
+            return self._ramp_day[1]
+        g = ramp.read_gate(self.runtime.store, self.runtime.name, self.runtime.now())
+        before = self._ramp_day[1] if self._ramp_day is not None else None
+        self._ramp_day = (day, g)
+        if before is not None and before.passed != g.passed:
+            self._noted.discard("ramp_gate")
+            self._note("ramp_gate", ("Minimum-size ramp passed: new entries size normally; it " if g.passed else
+                                     "Back on the minimum-size ramp for new entries (open positions are kept); it ")
+                       + g.words, level="info")
+        return g
+
+    def _min_notional(self) -> Decimal:
+        """The venue's smallest order value in the quote currency (the instrument's min_notional), 0 when it names
+        none."""
+        m = getattr(getattr(self, "instrument", None), "min_notional", None)
+        return m.as_decimal() if m is not None else Decimal(0)
 
     def _sizing_base(self, equity: float) -> float | None:
         """BRIDGE-3: the equity an entry's size is a share of: the fund's when the fund holds the cash (fund_equity),
