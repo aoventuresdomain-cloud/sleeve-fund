@@ -216,6 +216,10 @@ def dashboard(store, name: str, since: datetime) -> int:
                                store.insurance(name, limit=None) if perp else None)
              if t["opened"] is not None and t["opened"] >= since]
     moved = store.strategy_cash_pnl(name, since=since - timedelta(microseconds=1))
+    # An old book close-out (RESET-NEG) is cash the journal moved, but a transfer, never a trip's (CR F-RN-5)
+    if closed := store.close_out_cash(name, since=since - timedelta(microseconds=1)):
+        moved -= closed
+        print(f"an old book close-out of {closed:.2f} left out (a transfer, not a trip's)")
     page = sum((Decimal(repr(t["pnl"])) for t in trips), Decimal(0))
     print(f"B3 trip(s): {len(trips)}, P&L on the page {page:.2f}, cash the journal moved since {moved:.2f}")
     if not trips:
