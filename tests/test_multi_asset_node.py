@@ -76,3 +76,42 @@ def test_one_assets_stale_data_holds_only_that_legs_entries(built, tmp_path):
     assert "stale_data" in block_codes(runtimes[1].entry_blocked()[1])
     assert all("stale_data" not in block_codes(r.entry_blocked()[1]) for r in (runtimes[0], runtimes[2]))
     node.dispose()
+
+
+def _stored_legs():
+    """MA-PARAMS-1 (CR): the rows a real create_legs writes, whose params carry the Strategy's asset list and the
+    date it was chosen beside the model's own settings (the cells above build from params={}, which hid it)."""
+    from test_multi_asset_legs import _fund
+
+    from sleeve_fund.store import Store
+
+    store = _fund(Store.in_memory())
+    return store.create_legs(name="trend-x", strategy="trend_filter", bar_spec="15-MINUTE-LAST-INTERNAL",
+                             assets=["BTC/USD", "ETH/USD", "SOL/USD"], params={}, starting_balance=0,
+                             universe_date="2026-10-15", venue="kraken")
+
+
+def test_a_multi_asset_strategy_starts_from_its_stored_rows(built):
+    """MA-PARAMS-1: the asset list and universe_date are the Strategy's, never its model's: each row's config leaves
+    them out, so its model takes its settings and the node starts every leg."""
+    from sleeve_fund.paper.config import from_store
+
+    rows = _stored_legs()
+    assert rows[0].params["assets"] == ["BTC/USD", "ETH/USD", "SOL/USD"]  # still kept on the row
+    legs = [from_store(r) for r in rows]
+    assert all("assets" not in c.params and "universe_date" not in c.params for c in legs)
+    node = node_mod.build_legs_node(legs, log_level="ERROR", asset_fetch=dict, hub=HUB)
+    assert [type(s).__name__ for s in built["strategies"]] == ["TrendFilter"] * 3
+    node.dispose()
+
+
+def test_a_multi_asset_rows_model_builds_and_counts_its_warm_up_from_its_stored_params():
+    """MA-PARAMS-1: the chart's indicator lines and warm-up (strategies.series) read the row's params as stored."""
+    from sleeve_fund.instruments import spot_pair
+    from sleeve_fund.strategies import series
+    from sleeve_fund.venues import venue as venue_profile
+
+    row, profile = _stored_legs()[1], venue_profile("kraken")
+    inst = spot_pair("ETH", "USD", fees=profile.fees, venue=profile.venue, price_precision=8)
+    assert series.warmup(row.strategy, row.params, 15) > 0
+    assert series.build(row.strategy, inst, row.params, 15) is not None
