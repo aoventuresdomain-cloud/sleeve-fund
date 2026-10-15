@@ -2503,7 +2503,7 @@ class Store:
 
         def said() -> str:
             qty = dust_qty[0]
-            dust = f", with dust of {qty} no order can close, which leaves with it" if qty else ""
+            dust = f", with dust of {qty.normalize()} no order can close, which leaves with it" if qty else ""
             return f"{sleeve} put away ({why}): its equity {seen[0][1]:,.2f} leaves the fund's book{dust}"
 
         # A clean slate's put-away (previous_book) starts a fresh book, so its emptying carries nothing (MUST-F286-H4)
