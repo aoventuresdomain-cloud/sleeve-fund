@@ -203,6 +203,16 @@ def test_a_tool_that_fails_says_so_and_leaves_nothing(tmp_path, kw, words):
 
 
 @needs_bash
+def test_the_error_file_starts_afresh_each_run(tmp_path):
+    """CR: an older run's words never sit above today's."""
+    (tmp_path / "b").mkdir()
+    (tmp_path / "b" / "predeploy-last.err").write_text("yesterday's words\n")
+    done, _ = _run(tmp_path, dump_ok=False)
+    assert done.returncode == 1
+    assert "yesterday" not in (tmp_path / "b" / "predeploy-last.err").read_text()
+
+
+@needs_bash
 def test_a_whole_copy_passes_and_is_never_named_like_a_nightly_dump(tmp_path):
     done, calls = _run(tmp_path)
     assert done.returncode == 0, done.stdout + done.stderr
