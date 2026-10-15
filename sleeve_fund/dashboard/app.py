@@ -37,7 +37,7 @@ from sleeve_fund.dashboard.metrics import STALE, sleeve_summary
 from sleeve_fund.data import spec_minutes
 from sleeve_fund.fees import resolve as resolve_fees
 from sleeve_fund.history import REQUEST_YEARS
-from sleeve_fund.instruments import price_decimals
+from sleeve_fund.instruments import pct, price_decimals
 from sleeve_fund.exact import FloatView
 from sleeve_fund.spreads import resolve as resolve_spread
 from sleeve_fund.spreads import series as spread_series
@@ -1727,7 +1727,7 @@ def create_app(store: Store | None = None) -> FastAPI:
 
         # Named by market, not venue: venue names appear only where the PM sets up keys (QA U8 ruling).
         fee_quotes = [{"venue_label": "Perpetual venue" if v.perpetual else "Spot venue", "source": q.source, "taker": float(q.fees.taker),
-                       "rates": f"{float(q.fees.maker):.2%} maker / {float(q.fees.taker):.2%} taker",
+                       "rates": f"{pct(q.fees.maker)} maker / {pct(q.fees.taker)} taker",
                        "basis": q.basis if q.source == "published" else
                        f"account {q.account}, {q.fetched_at:%d %b %Y %H:%M} UTC",
                        "assumed_spread": f"{2 * v.assumed_half_spread:.2%}"}
@@ -2497,8 +2497,8 @@ MARKET_KEYS = ("market", "allow_short", "demo_mirror")  # form fields of their o
 
 def market_choices() -> list[tuple[str, str]]:
     return [(markets.SPOT, "Spot: long only, the venue's fees"),
-            (markets.PERP, f"{markets.LOW_FEE_PERP.label}: {markets.LOW_FEE_PERP.fees.maker:.2%} maker, "
-                           f"{markets.LOW_FEE_PERP.fees.taker:.2%} taker, funding"),
+            (markets.PERP, f"{markets.LOW_FEE_PERP.label}: {pct(markets.LOW_FEE_PERP.fees.maker)} maker, "
+                           f"{pct(markets.LOW_FEE_PERP.fees.taker)} taker, funding"),
             (markets.PERP_VENUE_FEES, f"{markets.VENUE_FEE_PERP.label}: funding")]
 
 

@@ -57,7 +57,7 @@ class Position:
 
     def holding(self):
         p = _Position(self.strategy_id, underlying(self.instrument), self.side * D(self.qty),
-                      None if self.stop_price is None else D(self.stop_price), self.leverage)
+                      None if self.stop_price is None else D(self.stop_price), self.leverage, D(0))
         return holding_for(p, D(self.mark), self.atr_frac)
 
 
@@ -95,7 +95,7 @@ class Intent:
         measure (HoE 20:12 UK; QA's cells all use none)."""
         px = D(self.price)
         stop = None if self.stop_frac is None else px * (1 - self.side * D(self.stop_frac))
-        risk = position_risk(Decimal(self.side), px, stop, self.atr_frac)
+        risk = position_risk(Decimal(self.side), px, stop, self.atr_frac, taker=0)
         margin = px / D(self.leverage) if self.leverage else px
         return _Intent(underlying(self.instrument), self.side, D(self.qty), px, margin, risk, D(self.lot),
                        D(self.min_qty))

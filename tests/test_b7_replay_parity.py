@@ -51,6 +51,7 @@ def _gate(store, intent_id: str, bar: datetime, qty=D("0.110"), with_bar=True, o
     price = fill_price(D(str(CLOSE)), 1, 0.0002)
     intent = {"side": 1, "qty": qty, "close": D(str(CLOSE)), "price": price, "stop_frac": None, "what": "entry",
               "step": D("0.001"), "min_qty": D("0.001"), "instrument": "BTC", "leverage": 2.0, "atr_pct": 0.03,
+              "taker": D(0),
               "intent_id": intent_id, **({"bar": _ns(bar)} if with_bar else {})}
     gated = PaperGate(store)(NAME, intent, _ns(bar) + 1)
     signal = {"close": CLOSE, **({"bar": _ns(bar)} if with_bar else {})}
