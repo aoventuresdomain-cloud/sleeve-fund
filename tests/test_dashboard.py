@@ -2194,11 +2194,10 @@ def test_reset_strategy_spells_out_what_it_closes_and_queues_it_for_the_supervis
                         venue="binance")
     store.record_fill("bn-ls", side="BUY", qty=0.076, price=86_000.0, fee=3.27, order_id="o1", trade_id="t1")
     page = c.get("/sleeves/bn-ls", auth=AUTH).text
-    # TEC-FE-C8 (PM spec C8): Reset is off the Strategy page; the dialog and its route stay until the fund refresh.
-    assert 'data-open="dlg-reset"' not in page and 'action="/sleeves/bn-ls/reset"' in page
-    assert "Closes the long of 0.076" in page and "and the copy on the demo account" in page and "Bybit" not in page
-    assert "Puts this run away under Previous book" in page and "Starts bn-ls again at 10,000.00" in page
-    assert "isolated margin at 2×" in page and "Demo copy" in page and "out of line" in page
+    # TEC-FE-C8 (PM spec C8): Reset is off the Strategy page. TEC-FE-REFRESH (HoE, 15 Oct): its orphaned dialog went
+    # with the refresh (Drop 3a), so nothing on the page reaches the route; the route stays for today (REFRESH-REMOVE-2).
+    assert 'data-open="dlg-reset"' not in page and 'action="/sleeves/bn-ls/reset"' not in page and "Bybit" not in page
+    assert "Demo copy" in page and "out of line" in page
     r = c.post("/sleeves/bn-ls/reset", data={"reason_pick": "Test finished; starting a clean run", "reason_note": ""},
                auth=AUTH, headers=SAME, follow_redirects=False)
     assert r.status_code == 303 and store.pending_reset("bn-ls")["restart"] == 1
@@ -2207,14 +2206,12 @@ def test_reset_strategy_spells_out_what_it_closes_and_queues_it_for_the_supervis
     r = c.post("/sleeves/bn-ls/reset", data={"reason": "again"}, auth=AUTH, headers=SAME, follow_redirects=False)
     assert "already+under+way" in r.headers["location"]
     _new(c)
+    # TEC-FE-REFRESH (HoE, 15 Oct): Setup's Reset all and its route are gone (Drop 3a); nothing more is reset.
     setup = c.get("/setup", auth=AUTH).text
-    assert 'data-open="dlg-reset-all"' in setup and 'action="/book/reset"' in setup and "Applies to: " in setup
-    r = c.post("/book/reset", data={"reason_pick": "Other", "reason_note": "short"}, auth=AUTH, headers=SAME,
-               follow_redirects=False)
-    assert "reset_error=" in r.headers["location"] and not store.pending_reset("btc-test")
+    assert 'data-open="dlg-reset-all"' not in setup and 'action="/book/reset"' not in setup
     r = c.post("/book/reset", data={"reason_pick": "Test finished; starting a clean run"}, auth=AUTH, headers=SAME,
                follow_redirects=False)
-    assert r.status_code == 303 and r.headers["location"] == "/setup?reset=1" and {x["sleeve"] for x in store.pending_resets()} == {"bn-ls", "btc-test"}
+    assert r.status_code in (404, 405) and {x["sleeve"] for x in store.pending_resets()} == {"bn-ls"}
     assert "Demo copy <span" not in c.get("/sleeves/btc-test", auth=AUTH).text  # not copied to Bybit Demo
 
 
@@ -2579,31 +2576,22 @@ def test_start_resume_and_reset_are_all_refused_while_liquidated_whatever_the_st
     assert "command_error" not in r.headers["location"] and store.sleeve("btc-test").desired_state == "running"
 
 
-def test_a_book_reset_names_a_liquidated_strategy_and_resets_only_once_the_pm_confirms_it(client):
-    """Code review on #164 (HoE), then the Advisor's U27 (6 Oct 20:41): Setup's Reset book must not put a liquidation
-    away unanswered. While a strategy is liquidated it resets nothing and names it; the PM's confirmation of that
-    list resets the whole book, writing one liquidation_reset for the liquidated strategy."""
+def test_no_book_reset_route_puts_a_liquidation_away(client):
+    """Was the Advisor's U27 on Setup's Reset book and its confirmation of the named list. TEC-FE-REFRESH (HoE, 15
+    Oct): that refresh is gone (Drop 3a), so neither route is left: a post to either resets nothing and writes no
+    liquidation_reset."""
     from sleeve_fund.store import LIQUIDATION_RESET
 
     c, store = client
     _new(c)
     _new(c, name="btc-other")
     store.event("btc-test", "error", "liquidation", "Liquidated: the price 50,000 gapped through 51,000")
-    r = c.post("/book/reset", data={"reason_pick": "Test finished; starting a clean run"}, auth=AUTH, headers=SAME,
-               follow_redirects=False)
-    assert "confirm_liquidated=btc-test" in r.headers["location"]
+    for path, data in (("/book/reset", {"reason_pick": "Test finished; starting a clean run"}),
+                       ("/book/reset/confirm", {"reason": "Test finished; starting a clean run", "liquidated": "btc-test"})):
+        r = c.post(path, data=data, auth=AUTH, headers=SAME, follow_redirects=False)
+        assert r.status_code in (404, 405), path
     assert store.pending_resets() == []
-    setup = c.get(r.headers["location"], auth=AUTH).text
-    assert "These strategies lost their position margin (liquidated): btc-test" in setup
-    assert 'action="/book/reset/confirm"' in setup and 'name="liquidated" value="btc-test"' in setup
-    r = c.post("/book/reset/confirm", data={"reason": "Test finished; starting a clean run", "liquidated": "btc-other"},
-               auth=AUTH, headers=SAME, follow_redirects=False)
-    assert "reset_error" in r.headers["location"] and store.pending_resets() == []  # not the list it named
-    r = c.post("/book/reset/confirm", data={"reason": "Test finished; starting a clean run", "liquidated": "btc-test"},
-               auth=AUTH, headers=SAME, follow_redirects=False)
-    assert "reset=1" in r.headers["location"]
-    assert {x["sleeve"] for x in store.pending_resets()} == {"btc-test", "btc-other"}
-    assert [e["kind"] for e in store.events("btc-test", limit=10)].count(LIQUIDATION_RESET) == 1
+    assert LIQUIDATION_RESET not in [e["kind"] for e in store.events("btc-test", limit=10)]
 
 
 def test_a_funding_alert_tag_names_the_pair_and_no_venue(client):

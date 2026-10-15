@@ -61,3 +61,44 @@ def test_g2_a_strategy_scales_only_once_its_own_track_is_at_least_its_minimum_tr
     ok, why = may_scale(weak)
     assert not ok and "stays at minimum size" in why and "of the" in why
     assert may_scale(_series([0.001] * 10))[0] is False  # too short to measure: never scales
+
+
+def test_r5_a_hand_computed_reference_case_matches_to_1e_6():
+    """HoE Done-when (15 Oct): 40 days of 2%, -1%, 0.5%, 0% repeating, worked by hand from the sample moments (Sharpe
+    0.342053, adjusted skew 0.336052, excess kurtosis -1.057575, z 1.644854): MinTRL 22.103668 days, so 40 is enough."""
+    got = min_trl(_series([0.02, -0.01, 0.005, 0.0] * 10))
+    assert got.days_needed == pytest.approx(22.103668, abs=1e-6)
+    assert got.sharpe == pytest.approx(0.342053, abs=1e-6) and got.days_have == 40 and got.met
+
+
+def test_r5_symmetric_fat_tails_alone_lengthen_the_track_at_the_same_sharpe_and_no_skew():
+    """HoE Done-when: fat tails lengthen the track against normal-shaped returns of the same Sharpe; here with no skew
+    on either, so the kurtosis term alone does it."""
+    def scaled(z):
+        z = np.asarray(z, dtype=float)
+        return _series(0.001 + 0.01 * (z - z.mean()) / z.std(ddof=1))
+
+    thin = scaled(np.tile([1.0, -1.0], 200))
+    fat = scaled(np.tile([4.0] + [0.0] * 18 + [-4.0] + [0.0] * 18, 10)[:400])
+    assert abs(thin.skew()) < 1e-9 and abs(fat.skew()) < 1e-9 and fat.kurt() > thin.kurt() + 5
+    assert min_trl(fat).sharpe == pytest.approx(min_trl(thin).sharpe)
+    # the kurtosis term alone: z^2 x (kurtosis fat - kurtosis thin) / 4, about 12 days here, not float noise
+    z = NormalDist().inv_cdf(0.95)
+    gap = min_trl(fat).days_needed - min_trl(thin).days_needed
+    assert gap == pytest.approx(z**2 * (fat.kurt() - thin.kurt()) / 4, rel=1e-9) and gap > 10
+
+
+def test_r5_too_few_returns_read_as_not_computed_on_the_g1_row():
+    """HoE Done-when ("n/a"): under 30 days there is no figure, and the G1 row says so instead of a number."""
+    row = mintrl.g1_row(_series(np.random.default_rng(6).normal(0.002, 0.01, MIN_DAYS - 1)))
+    assert row[1] == "INFO" and row[2].startswith("not computed") and "days" in row[2] and not any(
+        w.strip(",").isdigit() and int(w.strip(",")) > MIN_DAYS for w in row[2].split())
+
+
+def test_r5_the_g1_row_names_its_formula_estimator_and_z_with_the_daily_sharpe():
+    """Advisor (15 Oct): the row names what it computes, so the figure can be checked: the MinTRL formula (Bailey and
+    Lopez de Prado), the bias-adjusted sample skew and kurtosis it uses, z at 95%, and the Sharpe in the same daily
+    units as the zero it is tested against."""
+    words = mintrl.g1_row(_series([0.02, -0.01, 0.005, 0.0] * 10))[2]
+    assert "Bailey and Lopez de Prado" in words and "bias-adjusted sample skew and kurtosis" in words
+    assert "z 1.645" in words and "daily Sharpe 0.342" in words

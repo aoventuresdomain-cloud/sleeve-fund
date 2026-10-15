@@ -73,6 +73,7 @@
   <a href="/" {{ 'aria-current=page' if active == 'overview' }}>Overview</a>
   <a href="/trades" {{ 'aria-current=page' if active == 'trades' }}>Positions and trades</a>
   <a href="/orders" {{ 'aria-current=page' if active == 'orders' }}>Orders</a>
+  <a href="/fills" {{ 'aria-current=page' if active == 'fills' }}>Fills vs model</a>
 </nav>{% endmacro %}
 {% macro pts(x) %}<span class="{{ 'gain' if x > 0.00005 else ('loss' if x < -0.00005 else 'muted') }}">{{ '+' if x > 0.00005 else ('−' if x < -0.00005 else '') }}{{ '%.1f'|format((x * 100)|abs) }} pts</span>{% endmacro %}
 {# A two-leg Strategy (P2-8 step 7): the red flag while one of its pair's alerts is waiting to be acknowledged (M4),

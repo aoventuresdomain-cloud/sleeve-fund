@@ -50,7 +50,9 @@ def min_trl(returns: pd.Series, confidence: float = CONFIDENCE, benchmark: float
     return TrackRecord(need, n, sr, f"{math.ceil(need):,} days (about {need / 30.44:.1f} months) of daily returns for "
                        f"{confidence:.0%} confidence the Sharpe is above zero, fat tails counted (skew {skew:+.2f}, "
                        f"kurtosis {kurt:.1f}); {met}. At G2 the strategy stays at minimum size until its paper or "
-                       "live track is this long")
+                       f"live track is this long. Worked as Bailey and Lopez de Prado's minimum track record length "
+                       f"from the daily Sharpe {sr:.3f} against {benchmark:g}, the bias-adjusted sample skew and "
+                       f"kurtosis, and z {z:.3f}")
 
 
 def g1_row(returns: pd.Series) -> tuple[str, str, str]:
