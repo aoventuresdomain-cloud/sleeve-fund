@@ -924,11 +924,37 @@ window.Console = (() => {
     });
   }
 
+  // A test model (A-19) carries the PM's settings for it on its option (data-prefill): choosing it fills them in, the
+  // market, shorts, candle length, risk profile, stop and target, and its own fields; the demo copy stays unticked.
+  function applyPrefill(form, opt) {
+    if (!opt || !opt.dataset.prefill) return;
+    const set = JSON.parse(opt.dataset.prefill);
+    for (const [name, value] of Object.entries(set)) {
+      const el = form.elements[name];
+      if (!el) continue;
+      if (el instanceof RadioNodeList || (el.length && !el.tagName)) {
+        [...el].forEach((r) => { r.checked = r.value === value; });
+      } else if (el.type === "checkbox") {
+        el.checked = value === "1";
+      } else {
+        el.value = value;
+      }
+    }
+    if (form.elements.demo_mirror) form.elements.demo_mirror.checked = false;
+    const kinds = {stop: "stop_loss_pct", tp: "take_profit_pct"};
+    for (const [k, field] of Object.entries(kinds)) {
+      const pick = form.querySelector(`[data-kind=${k}]`);
+      if (pick && field in set) { pick.value = "pct"; pick.dispatchEvent(new Event("change", {bubbles: true})); }
+    }
+    ["market", "risk_profile"].forEach((n) => form.elements[n]?.dispatchEvent(new Event("change", {bubbles: true})));
+  }
+
   // New-sleeve form: show the chosen strategy's settings, keep a plain-English summary.
   function sleeveForm() {
     const form = document.getElementById("sleeve-form");
     if (!form) return;
     const $ = (n) => form.elements[n];
+    $("strategy").addEventListener("change", () => applyPrefill(form, $("strategy").selectedOptions[0]));
     const pct = (x) => `${(x * 100).toFixed(0)}%`;
     const sync = () => {
       const strat = $("strategy").value;
