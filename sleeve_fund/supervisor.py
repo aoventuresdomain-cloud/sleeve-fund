@@ -28,15 +28,15 @@ from sleeve_fund import accounts, lifecycle, liquidation, router
 from sleeve_fund.alerts import Forwarder
 from sleeve_fund.exact import float_view
 from sleeve_fund.money import to_decimal
-from sleeve_fund.gate_ledger import DbLedger
-from sleeve_fund.portfolio.gate import EMPTY, PortfolioState, mark_book, sweep, unrestorable
+from sleeve_fund.gate_ledger import IDENTITY_HOLD_ACTION, IDENTITY_RESUME_ACTION, DbLedger
+from sleeve_fund.portfolio.gate import EMPTY, PortfolioState, apply_flow, mark_book, sweep, unrestorable
 from sleeve_fund.portfolio.limits import Book, Holding
 from sleeve_fund.risk import PORTFOLIO, trading_day
 from sleeve_fund.paper.safety import assert_portfolio_gate, credential_var
 from sleeve_fund.paper.single_lock import EXIT_DUPLICATE
 from sleeve_fund.paper.config import check_hub_bar_spec, load_sleeve, to_store_kwargs
-from sleeve_fund.store import (DUST_NOTIONAL, HALT_FLATTEN, OPEN_ORDER_STATUSES, TWO_LEG_FENCE, Sleeve, Store, is_dust,
-                               utcnow)
+from sleeve_fund.store import (DUST_NOTIONAL, HALT_FLATTEN, OPEN_ORDER_STATUSES, TWO_LEG_FENCE, Sleeve, Store,
+                               check_own_capital, is_backtest, is_dust, utcnow)
 from sleeve_fund.strategies import check_perp_sizing, check_perp_stop
 from sleeve_fund.paper.runtime import entry_blocked, liquidation_head, said_since_last_fill
 from sleeve_fund.strategies.base import EXITS_ONLY
@@ -62,6 +62,232 @@ SYSTEM_FLATTENS = 3
 STOPPED_HOLDING = "it was stopped while it still holds a position"
 
 
+CENT = Decimal("0.01")  # the identity's tolerance: rounding, never a real gap (RECON-B)
+
+
+@dataclass(frozen=True)
+class FundBook:
+    """The fund-held book (Bridge Drop A): the fund's own cash put in (fund_flows since the re-base), what every
+    Strategy's journal moved its cash by since then (from 0: no Strategy holds capital) and its positions at their last
+    marks. total is the fund's equity."""
+    since: datetime | None
+    capital: Decimal
+    pnl: Decimal
+    positions: Decimal
+
+    @property
+    def total(self) -> Decimal:
+        return self.capital + self.pnl + self.positions
+
+
+def bridge_start(store: Store) -> datetime | None:
+    """When the fund-held book began: the latest re-base deposit applied (CAP5-RESET), or None while every Strategy
+    still carries its own capital (a journal from before the bridge, or before the PM's reset)."""
+    reader = getattr(store, "fund_flows", None)
+    if reader is None:
+        return None
+    at = [f["applied_at"] for f in reader() if f["rebase"] and f["applied_at"] is not None]
+    return max(at) if at else None
+
+
+def _in_book(store: Store, s) -> bool:
+    from sleeve_fund.store import is_backtest
+
+    return not is_backtest(s.name) and not outside_fund_book(store, s)
+
+
+def _position_value(store: Store, s) -> Decimal:
+    """A Strategy's journal position at its last mark; dust never marked at its entry price (F229-7). Raises when a
+    position has no mark, so the fund isn't marked."""
+    book = store.journal_book(s.name, s.starting_balance)
+    qty = to_decimal(book["qty"], "qty")
+    if qty == 0:
+        return Decimal(0)
+    last = store.last_equity(s.name)
+    if last is not None and last["price"]:
+        return qty * to_decimal(last["price"], "mark")
+    if is_dust(book) and book["entry_px"]:
+        return qty * to_decimal(book["entry_px"], "entry price")
+    raise RuntimeError(f"{s.name} holds {qty} with no mark, so the fund can't be marked")
+
+
+def fund_book(store: Store, since: datetime | None = None) -> FundBook:
+    """The fund-held book (Bridge Drop A; DA spec 7): cash put in (applied flows from `since`, the re-base by default),
+    plus every Strategy's cash P&L since then, put away or not (the cash is the fund's), plus its positions at the mark.
+    The one book reader for the mark, sizing and the per-poll identity check."""
+    since = since if since is not None else bridge_start(store)
+    flows = [f for f in store.fund_flows() if f["applied_at"] is not None]
+    # The capital starts at the re-base flow itself, by journal order, not its time: a flow applied at the same poll
+    # but ahead of it in id order went into the book the re-base replaced (PE1's reset cell a3)
+    base = max((f["id"] for f in flows if f["rebase"] and since is not None and f["applied_at"] <= since), default=None)
+    capital = Decimal(0)
+    for f in flows:
+        if since is None or (f["id"] >= base if base is not None else f["applied_at"] >= since):
+            amount = to_decimal(f["amount"], "amount")
+            capital += -amount if f["kind"] == "withdraw" else amount
+    pnl = positions = Decimal(0)
+    for s in store.sleeves():
+        if _in_book(store, s):
+            pnl += to_decimal(store.strategy_cash_pnl(s.name, since=since), "cash")
+            positions += _position_value(store, s)
+    return FundBook(since, capital, pnl, positions)
+
+
+def sizing_equity(store: Store, now: datetime | None = None) -> Decimal | None:
+    """The fund equity a Strategy sizes off (Advisor Q5, CUT-A; QD's strategy.fund_equity): the book at its last
+    mark less every open position's unrealised gain, so a gain not yet taken never sizes anything, while a loss
+    counts in full. None when the book's mark is older than the gate's MARK_STALE (or never made): sizing then
+    refuses the entry as "fund equity stale", as the gate would."""
+    from sleeve_fund.portfolio.gate import MARK_STALE
+
+    now = now or utcnow()
+    st = DbLedger(store, lambda: ()).state()
+    if st.equity is None or st.mark_ts is None or now - st.mark_ts > MARK_STALE:
+        return None
+    gains = Decimal(0)
+    for s in store.sleeves():
+        if not _in_book(store, s):
+            continue
+        book = store.journal_book(s.name, s.starting_balance)
+        qty = to_decimal(book["qty"], "qty")
+        last = store.last_equity(s.name) if qty != 0 else None
+        if qty != 0 and last is not None and last["price"] and book["entry_px"]:
+            gains += max(qty * (to_decimal(last["price"], "mark") - to_decimal(book["entry_px"], "entry")), Decimal(0))
+    return st.equity - gains
+
+
+def book_part(store: Store, s) -> Decimal:
+    """What moves into or out of the book when Strategy `s` joins or leaves it: its equity while it carries its own
+    capital; nothing once the fund holds the cash (Bridge Drop A), when a create, a move or a put-away only changes
+    where it books."""
+    return Decimal(0) if bridge_start(store) is not None else strategy_equity(store, s)
+
+
+def identity_gap(store: Store) -> Decimal:
+    """RECON-B (Advisor MUST): the fund's cash P&L read two ways, the journal's replay of every fill, funding and
+    insurance row (journal_book) against the exact cash reader (strategy_cash_pnl), over every Strategy in the book.
+    They are the same rows, so anything past a cent is a broken book: the poll then marks nothing and alerts, and
+    entries stop once the mark is 60 s old."""
+    gap = Decimal(0)
+    for s in store.sleeves():
+        if _in_book(store, s):
+            replayed = to_decimal(store.journal_book(s.name, 0)["cash"], "cash")
+            gap += replayed - to_decimal(store.strategy_cash_pnl(s.name), "cash")
+    return gap
+
+
+def identity_tolerance(store: Store) -> Decimal:
+    """A gap within a cent is rounding, not a break. RECON-SCOPE allows max(0.01, 1e-6 x the book), but the journal is
+    exact (DA-9) and HoQA's cells hold a 0.02 gap on a 100,000 book to be a break, so the cent stands (the stricter)."""
+    return CENT
+
+
+def positions_breaks(store: Store) -> list[str]:
+    """RECON-SCOPE (Advisor, the positions leg): per Strategy in the book, the position its journal's fills come to up to
+    its last mark against the live position that mark carries (the runtime's equity row). Apart by more than dust at
+    the mark (DUST_NOTIONAL: below any venue's smallest order, so within a lot) is a break even when the cash agrees: a
+    fill journaled twice, or one the journal lost. Returns each break in words, [] when every position ties."""
+    from sqlalchemy import case, func, select
+
+    from sleeve_fund.store import fills_t
+
+    out = []
+    for s in store.sleeves():
+        if not _in_book(store, s):
+            continue
+        last = store.last_equity(s.name)
+        if last is None:
+            continue
+        signed = case((fills_t.c.side == "BUY", fills_t.c.qty), else_=-fills_t.c.qty)
+        q = select(func.coalesce(func.sum(signed), 0)).where(fills_t.c.sleeve == s.name, fills_t.c.ts <= last["ts"])
+        with store.engine.connect() as c:
+            replayed = to_decimal(c.execute(q).scalar(), "qty")
+        live = to_decimal(last["qty"] or 0, "qty")
+        price = to_decimal(last["price"] or 0, "mark")
+        apart = abs(replayed - live)
+        if apart > Decimal("1e-12") and (price <= 0 or apart * price >= Decimal(str(DUST_NOTIONAL))):
+            out.append(f"{s.name}: the journal's fills come to {replayed.normalize():f} but the live position is "
+                       f"{live.normalize():f}")
+    return out
+
+
+def insurance_breaks(store: Store, since: datetime | None = None) -> list[str]:
+    """MUST-FUNDCASH-LOSS, TEC-INSURE-ZERO (HoE): once the fund holds the cash, a liquidation is booked at the bankruptcy
+    price (GAP-LIQ-CAP), so no fund-held Strategy is ever credited by the insurance fund; a credit is a loss booked back
+    as income, which the cash leg can't see (both its readers count insurance). Any credit from `since` (the bridge,
+    or the PM's last Resume) on, per Strategy in the book, whatever fill it names. Returns each in words, [] for none."""
+    from sqlalchemy import select
+
+    from sleeve_fund.store import insurance_t
+
+    names = [s.name for s in store.sleeves() if _in_book(store, s)]
+    if not names or since is None:
+        return []
+    i = insurance_t.c
+    q = select(i.sleeve, i.amount).where(i.sleeve.in_(names), i.ts >= since).order_by(i.id)
+    with store.engine.connect() as c:
+        rows = list(c.execute(q))
+    return [f"{r.sleeve}: an insurance credit of {to_decimal(r.amount, 'amount'):,.2f} booked inside the fund, which "
+            "books every liquidation at the bankruptcy price" for r in rows]
+
+
+def _last_resume(store: Store) -> datetime | None:
+    rows = store.decisions(action=IDENTITY_RESUME_ACTION)
+    return max((r["ts"] for r in rows), default=None) if rows else None
+
+
+def empty_book_pockets(store: Store) -> list[str]:
+    """What keeps the book from being empty, in the PM's words; empty is nothing left (CAP5-RESET: a re-base deposit
+    lands only onto an empty book). Every Strategy whose equity still counts, one waiting to leave, anything that
+    could trade or holds, any room held, and in a fund-held book its own cash and P&L."""
+    led = DbLedger(store, lambda: ())
+    out = []
+    if (why := nothing_open(store, led)) is not None:
+        out.append(why)
+    out += [f"{n} waits to leave the book" for n in store.withdrawal_pending()]
+    if bridge_start(store) is not None:
+        book = fund_book(store)
+        if abs(book.total) >= CENT:
+            out.append(f"the fund's cash and P&L, {book.total:,.2f}")
+        return out
+    runs, gone = store.reset_runs(), store.withdrawn()
+    for s in store.sleeves():
+        if _in_book(store, s) and s.name not in gone:
+            eq = strategy_equity(store, s, runs)
+            if abs(eq) >= CENT:
+                out.append(f"{s.name} {eq:,.2f}")
+    return out
+
+
+def resume_identity_hold(store: Store, actor: str, reason: str, now: datetime | None = None) -> str:
+    """The PM's Resume of a book-check hold (RECON-B): refused while the book still doesn't add up, else journaled, and
+    new entries may go out again. Returns the words journaled."""
+    led = DbLedger(store, lambda: ())
+    if not led.identity_hold():
+        raise ValueError("the fund's book check isn't holding entries: nothing to resume")
+    if not actor.strip() or not reason.strip():
+        raise ValueError("a Resume names who and why")
+    gap = identity_gap(store)
+    if abs(gap) > identity_tolerance(store):
+        raise ValueError(f"the book still doesn't add up by {gap:,.2f}: fix it before resuming")
+    if apart := positions_breaks(store):
+        raise ValueError(f"the positions still don't tie ({'; '.join(apart)}): fix them before resuming")
+    words = f"book check resumed: the book adds up again (gap {gap:,.2f}); {reason.strip()}"
+    store.decide(actor.strip(), IDENTITY_RESUME_ACTION, words, ts=now)
+    led.alert("book_identity_resumed", f"The PM resumed new entries after the book check: {words}", now or utcnow())
+    return words
+
+
+def free_cash(store: Store, led) -> Decimal:
+    """What the fund can pay out now (DA 7): the book less posted margin, less the loss at the stops, less every room
+    an order holds."""
+    book = fund_book(store).total
+    held = fund_holdings(store)
+    used = sum((h.margin + h.risk for h in held), Decimal(0))
+    used += sum((r.holding.margin + r.holding.risk for r in led.reservations()), Decimal(0))
+    return book - used
+
+
 def fund_equity(store: Store) -> Decimal:
     """The whole fund's marked equity (Advisor 3): every strategy's, running or not, plus the cash no strategy holds.
     A strategy's is its starting capital, what the journal moved its cash by (CASH-2's strategy_cash_pnl, the one cash
@@ -72,6 +298,8 @@ def fund_equity(store: Store) -> Decimal:
     with no mark is held at its entry price (F229-7)."""
     from sleeve_fund.store import is_backtest
 
+    if bridge_start(store) is not None:  # Bridge Drop A: the fund holds the cash
+        return fund_book(store).total
     runs, out = store.reset_runs(), store.withdrawn()
     total = Decimal(0)
     for s in store.sleeves():
@@ -343,6 +571,8 @@ class Supervisor:
         self._breach_told: set[str] = set()  # a withdrawn Strategy holding, alerted once per spell (F-C3B-A viii)
         self._flatten_told: dict[str, datetime] = {}  # when each holder was last told to flatten for a portfolio halt
         self._halt_tells: dict[str, int] = {}  # how often, this halt (F229-5: at most SYSTEM_FLATTENS)
+        self._flow_told: dict[int, str] = {}  # a fund flow's wait, said once while it lasts
+        self._dead_told: dict[str, str] = {}  # closing a stopped Strategy's orders failed: said once per failure
 
     def _refused(self, name: str) -> bool:
         """A model that can't run on its market (check_perp_sizing) is not started: it is stopped, and says why,
@@ -363,6 +593,7 @@ class Supervisor:
             return True
         try:
             check_venue_pin(self.store, s)  # first: an off-pin holder's exits-only run reads this reason (CR F277-2)
+            check_own_capital(self.store, s.name, s.starting_balance)  # F-ZS-1
             check_perp_sizing(s.strategy, s.params)
             check_perp_stop(s.strategy, s.params, s.risk_profile)
             check_funding_schedule(s)
@@ -585,6 +816,44 @@ class Supervisor:
                 self._start(sleeve.name, proc)
             elif action == "none" and proc.alive and proc.crashes and now - proc.started_at > STARTUP_GRACE:
                 proc.crashes = 0  # healthy again
+        self.close_dead_orders()
+
+    def close_dead_orders(self) -> None:
+        """F-REFRESH-RES (HoE, DA): a Strategy put away whose process is gone can't fill an order its journal still
+        shows open (the simulated venue went with the process), and that order's room would keep it, and the PM's
+        refresh, waiting forever. Each one still in the book (not yet withdrawn) has those orders closed and the room
+        released (Store.close_dead_orders), but only once its process is confirmed gone: none of ours alive, and its
+        single-instance lock free, so no process started elsewhere holds it either. The lock is held while it closes,
+        so none can start meanwhile. Flat ones only, paper only; a failure is said once, and never holds up the rest."""
+        from sleeve_fund.paper.single_lock import instance_lock
+
+        withdrawn = self.store.withdrawn()
+        for name in self.store.archived():
+            if name in withdrawn or is_backtest(name):
+                continue
+            runner = name.split("~", 1)[0]  # a leg is traded by its Strategy's own process
+            if self.procs.get(runner, Proc()).alive or self.procs.get(name, Proc()).alive:
+                continue
+            try:
+                # Only a flat one (DA): an archived holder runs for its exits, and its resting stop is an open order
+                # in the journal; closed while its process is down between a crash and its restart, the restart
+                # might not place it again. The refresh only ever reaches a put-away that is flat.
+                if self.store.account_of(name) != "paper" or not self.store.lifecycle_flat(name)[1]:
+                    continue
+                lock = instance_lock(runner)
+                if lock is None:  # a live process holds it: not confirmed gone
+                    continue
+                try:
+                    self.store.close_dead_orders(name, "put away, and its process has stopped")
+                finally:
+                    lock.close()
+            except Exception as exc:  # noqa: BLE001 - the next poll tries again; the dashboard shows why, once
+                why = f"closing a stopped Strategy's orders: {exc!r}"
+                if self._dead_told.get(name) != why:
+                    self._dead_told[name] = why
+                    self.store.event(name, "error", "supervisor_error", why)
+            else:
+                self._dead_told.pop(name, None)
 
     def true_up_stopped(self) -> None:
         """True up every strategy without a running process (true_up_stopped); one failing never holds up the rest."""
@@ -606,6 +875,7 @@ class Supervisor:
         led.ensure_state()
         before, behind = led.state(), False
         try:
+            self._check_identity(now)
             equity = fund_equity(self.ledger.store)
         except Exception as exc:  # noqa: BLE001 - no mark: the book goes stale and entries stop (fail closed)
             if not self._equity_failing:
@@ -655,6 +925,8 @@ class Supervisor:
                 self._halt_tells.clear()
             self._withdraw_flat(now)  # after the mark: the flatten's P&L is judged at the book's scale before it
             self._land_moves(now)  # after the mark, whatever it decided: a create or move judged at the fresh scale
+        if not self._equity_failing:  # after what was put away left the book; an empty book's first deposit included
+            self._apply_flows(now)
         self._alert_withdrawn_holders(now)
         self._count_waiting_moves(now)
         st = led.state()
@@ -667,6 +939,80 @@ class Supervisor:
         # a dead owner's orders is ORPHAN-GUARD og2 on the DA's 0015. Past the TTL, an unacked order's reservation is
         # kept and alerted on as not cancelled, never released blind.
         sweep(led, now, self._order_live, None, is_acked=self._order_acked)
+
+    def _check_identity(self, now: datetime) -> None:
+        """RECON-B (Advisor MUST, IDENT-STICKY): once the fund holds the cash, every poll checks cash + P&L + positions
+        against the book read the other way (identity_gap). Past a cent, read twice so a fill landing between the reads
+        isn't a break, it holds every new entry at once (identity_hold, journaled; the gate reads it), with one alert.
+        The hold is latched: a clean poll doesn't lift it, only the PM's Resume (resume_identity_hold). The mark, exits,
+        stops and close-now carry on."""
+        store = self.ledger.store
+        if bridge_start(store) is None or self.ledger.identity_hold():
+            return
+        tol = identity_tolerance(store)
+        since = max((t for t in (bridge_start(store), _last_resume(store)) if t is not None), default=None)
+        gap, apart = identity_gap(store), positions_breaks(store) + insurance_breaks(store, since)
+        if abs(gap) <= tol and not apart:
+            return
+        # once more: a fill between the first reads moves both sides by the time of this one
+        gap, apart = identity_gap(store), positions_breaks(store) + insurance_breaks(store, since)
+        if abs(gap) <= tol and not apart:
+            return
+        why = "; ".join(([f"cash + Strategy P&L + positions differs from the journal by {gap:,.2f}"]
+                         if abs(gap) > tol else []) + apart)
+        store.decide("supervisor", IDENTITY_HOLD_ACTION, why, ts=now)
+        self.ledger.alert("book_identity_broken", f"The fund's book doesn't add up: {why}. New entries are held until "
+                          "the PM resumes; exits and stops still go out", now)
+
+    def _apply_flows(self, now: datetime) -> None:
+        """The fund's deposits and withdrawals (DA fund_flows), in journal order, after this poll's mark: an inflow
+        never overtakes a pending outflow, so the first that must wait stops the rest (CAP5-RESET). A re-base deposit
+        lands only onto an empty book (empty_book_pockets), starting it afresh at exactly the deposit with nothing
+        carried; onto a book that isn't empty it is refused, naming what is left. A plain flow needs a fund-held book
+        (the re-base first). A withdrawal waits while it is more than the free cash (free_cash)."""
+        store, led = self.ledger.store, self.ledger
+        if getattr(store, "pending_flows", None) is None:
+            return
+        for f in store.pending_flows():
+            fid, amount = f["id"], to_decimal(f["amount"], "amount")
+            try:
+                if f["rebase"]:
+                    left = empty_book_pockets(store)
+                    if left:
+                        store.refuse_flow(fid, now, "the book isn't empty, so it can't start afresh: " + "; ".join(left))
+                        continue
+                    with led.lock():
+                        st = led.state()
+                        led.set_state(replace(st, equity=amount, hwm=amount, halt_reference=None, mark_ts=now,
+                                              day=trading_day(now), day_start_equity=amount, halted=None,
+                                              paused_until=None, paused=None, carried_hwm_drawdown=None,
+                                              carried_reference_drawdown=None, carried_day_return=None,
+                                              carried_day=None))
+                        store.settle_flow(fid, now, conn=led._local.conn)
+                    store.event(None, "warning", "portfolio_rebased", f"The fund's book starts afresh at "
+                                f"{amount:,.2f} (fund flow {fid}): nothing carried from before")
+                elif bridge_start(store) is None:
+                    store.refuse_flow(fid, now, "the fund holds no cash of its own until the PM's reset deposits it")
+                    continue
+                elif f["kind"] == "withdraw":
+                    with led.lock():
+                        free = free_cash(store, led)
+                        if amount > free:
+                            raise RuntimeError(f"it is more than the {free:,.2f} free now (the book less margin, "
+                                               "the loss at the stops and the room orders hold)")
+                        apply_flow(led, -amount, lambda: nothing_open(store, led), now)
+                        store.settle_flow(fid, now, conn=led._local.conn)
+                else:
+                    with led.lock():
+                        apply_flow(led, amount, None, now)
+                        store.settle_flow(fid, now, conn=led._local.conn)
+                self._flow_told.pop(fid, None)
+            except Exception as exc:  # noqa: BLE001 - it waits, and every flow behind it, until the next poll
+                if self._flow_told.get(fid) != str(exc):
+                    store.event(None, "warning", "fund_flow_waits", f"The fund's {f['kind']} of {amount:,.2f} (flow "
+                                f"{fid}) waits, and every flow after it: {exc}")
+                    self._flow_told[fid] = str(exc)
+                return
 
     def _withdraw_flat(self, now: datetime) -> None:
         """F-C3B-A (Advisor 14 Oct 10:45 UK): each Strategy put away and waiting (Store.withdrawal_pending: not flat
@@ -890,7 +1236,11 @@ def clear(store: Store, path: str) -> list[str]:
     flatten can trade, and the entry stays open to finish once it is flat: the supervisor retries it about
     every minute, and a retry touches only the strategies it was waiting on, never one added since."""
     with open(path, "rb") as fh:
-        entries = tomllib.load(fh).get("clear", [])
+        return clear_entries(store, tomllib.load(fh).get("clear", []))
+
+
+def clear_entries(store: Store, entries: list[dict]) -> list[str]:
+    """clear's work on its [[clear]] entries, read from a file or given by the PM's reset workflow (CAP5-RESET)."""
     done = {d["reason"].split(":", 1)[0] for d in store.decisions(action="clear", limit=10_000)}
     cleared = []
     for entry in entries:
@@ -1242,6 +1592,22 @@ def _rebase_command(store: Store, args) -> int:
     return 0 if not st.halted and not st.paused_until else 1
 
 
+def _resume_identity_command(store: Store, args) -> int:
+    """resume-identity: 0 once the hold is lifted (dry run: when there is one to lift), 1 when refused, naming why."""
+    held = DbLedger(store, lambda: ()).identity_hold()
+    print("book check hold:", held or "none")
+    if args.dry_run:
+        apart = positions_breaks(store)
+        print(f"cash gap {identity_gap(store):,.2f}; positions: {'; '.join(apart) or 'all tie'}")
+        return 0 if held else 1
+    try:
+        print(resume_identity_hold(store, args.actor, args.reason))
+    except ValueError as exc:
+        print(exc)
+        return 1
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="python -m sleeve_fund.supervisor")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1258,9 +1624,23 @@ def main(argv: list[str] | None = None) -> int:
     rb.add_argument("--commit", required=True, help="the deployed commit, for the journal")
     rb.add_argument("--yes", action="store_true", help="pause what could trade, then write it; else a dry run")
     rb.add_argument("--wait", type=float, default=120.0, help="seconds to wait for the pauses to apply")
+    rs = sub.add_parser("reset-book", help="CAP5-RESET only: the PM's clean slate of the paper book, then a fresh deposit")
+    rs.add_argument("--actor", required=True, help="who ran it on the PM's word, for the decision log")
+    rs.add_argument("--commit", required=True, help="the deployed commit, for the journal")
+    rs.add_argument("--id", required=True, help="the reset's id, e.g. 2026-10-21-reset; a second run of it carries on")
+    rs.add_argument("--deposit", default="100000", help="the fund's fresh capital, deposited once the book is empty")
+    rs.add_argument("--dry-run", action="store_true", help="print the book, the steps and what would hold them")
+    ri = sub.add_parser("resume-identity", help="RECON-B only: lift the book check's hold, on the PM's written word")
+    ri.add_argument("--actor", required=True, help="who runs it on the PM's word, for the decision log")
+    ri.add_argument("--reason", required=True, help="the PM's reason, quoted")
+    ri.add_argument("--dry-run", action="store_true", help="print the hold and whether the book adds up; write nothing")
     rn = sub.add_parser("run", help="supervise sleeve processes until stopped")
     rn.add_argument("--clear", help="clean slates file to retry while one waits on a flatten")
     args = ap.parse_args(argv)
+    if args.cmd == "reset-book":
+        from sleeve_fund import reset_book
+
+        return reset_book.main(args)
     store = Store(portfolio_gate=True)
     if args.cmd == "seed":
         print("added:", seed(store, args.paths) or "nothing new")
@@ -1272,6 +1652,8 @@ def main(argv: list[str] | None = None) -> int:
         print("book figures:", book_figures(store))
     elif args.cmd == "rebase":
         return _rebase_command(store, args)
+    elif args.cmd == "resume-identity":
+        return _resume_identity_command(store, args)
     elif args.cmd == "withdraw-archived":
         try:
             done = withdraw_archived(store, args.actor, args.commit)

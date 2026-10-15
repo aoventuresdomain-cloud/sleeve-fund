@@ -83,7 +83,7 @@ class PaperGate:
     position now (fund_holdings); a book never marked is refused before it is read (stale)."""
 
     store: Store
-    profile: PortfolioProfile = PORTFOLIO
+    profile: PortfolioProfile | None = PORTFOLIO  # None: the compliance tests in force, read at each check
     ledger: DbLedger = field(init=False)
 
     def __post_init__(self):
@@ -129,7 +129,8 @@ class PaperGate:
 
 
 def paper_gate(store: Store) -> PaperGate:
-    return PaperGate(store)
+    """Paper's gate: every idea checked against the PM's compliance tests in force at that moment (Bridge Drop A)."""
+    return PaperGate(store, profile=None)
 
 
 def resting_entries(store: Store, strategy: str, before: datetime) -> list[str]:

@@ -1,0 +1,25 @@
+# QR bench: capitulation-day rebound, long only. Decision candle: 1d.
+version = 1
+name = "qr10-capitulation-long"
+reason = """After an unusually large down day (close at least 2 ATR(14) below the open) on heavy volume (2 x normal),
+forced sellers are done and buyers who step in are paid over the next 1 to 3 days. Out after 3 days or on a close
+above the prior day's high; stop 1.5 ATR below the entry close."""
+
+[blocks.atr]
+kind = "atr"
+period = 14
+
+[blocks.rvol]
+kind = "relative_volume"
+period = 20
+
+[long]
+entry = { all = [
+    { left = { sub = ["open", "close"] }, op = ">=", right = { mul = [2.0, "atr"] } },
+    { left = "rvol", op = ">=", right = 2.0 },
+] }
+exit = { left = "close", op = ">", right = { prev = "high" } }
+
+[exits]
+time_stop = { bars = 3 }
+stop = { level = { sub = ["close", { mul = [1.5, "atr"] }] } }

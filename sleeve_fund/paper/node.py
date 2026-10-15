@@ -315,19 +315,40 @@ def build_two_leg_node(lead: SleeveConfig, follow: SleeveConfig, log_level: str 
         pair.journal(lead_runtime.store, lead.name)  # after add_strategy: it reads the clock the node gives the legs
     return node, pair
 
+VIRTUAL_HEADROOM = 10  # the simulated account's funding, in fund equities: no order is ever short of balance there
+
+
+def virtual_funding(runtime: SleeveRuntime) -> float:
+    """CUT-A (Advisor Q3-MARGIN, QD): once the fund holds the cash a Strategy has no capital of its own, so its
+    simulated account is funded virtually from the fund's equity, with headroom (VIRTUAL_HEADROOM) so the fund growing
+    never makes the venue refuse an order the gate let through; T4c (margin) is what binds. A view only: never
+    journaled, never in the book, and netted out of the engine's cash at reconcile (runtime.funded). 0 before the
+    PM's re-base, when each Strategy still carries its own capital."""
+    from sleeve_fund import supervisor
+
+    store = runtime.store
+    if supervisor.bridge_start(store) is None:
+        runtime.funded = 0.0
+    else:
+        runtime.funded = float(max(supervisor.fund_book(store).total, 0) * VIRTUAL_HEADROOM)
+    return runtime.funded
+
+
 def _balances(sleeve: SleeveConfig, runtime: SleeveRuntime | None, base_code: str, quote_code: str) -> list[Money]:
     """The paper account's opening balances: the sleeve's, or rebuilt from the journal so a restart carries its
     position over."""
     balances = [Money(sleeve.starting_balance, Currency.from_str(quote_code))]
     if runtime is not None:  # rebuild the paper book from the journal so a restart carries positions over
         book = runtime.book
+        funded = virtual_funding(runtime)
         if markets.is_perp(sleeve.params):
             # A margin account holds the quote currency only. The position is put back by a restore order
             # at start (LongFlatStrategy._send_restore); the account opens with the cash it had when the
             # position was opened, so after that restore its cash equals the journal's.
-            balances = [Money(book["cash"] + book["qty"] * (book["entry_px"] or 0.0), Currency.from_str(quote_code))]
+            balances = [Money(funded + book["cash"] + book["qty"] * (book["entry_px"] or 0.0),
+                              Currency.from_str(quote_code))]
         else:
-            balances = [Money(book["cash"], Currency.from_str(quote_code))]
+            balances = [Money(funded + book["cash"], Currency.from_str(quote_code))]
             if book["qty"] > 0:
                 balances.append(Money(book["qty"], Currency.from_str(base_code)))
     return balances
@@ -451,6 +472,14 @@ def main(argv: list[str] | None = None) -> int:
         row = store.sleeve(args.db_sleeve)
         if row.parent is not None:  # the supervisor never starts one: its first leg's process trades it
             raise SystemExit(f"{row.name} is the second leg of {row.parent}: it runs in {row.parent}'s process")
+        from sleeve_fund.store import check_own_capital
+
+        try:  # F-ZS-1: the supervisor refuses it too (_refused); this catches a process started by hand
+            check_own_capital(store, row.name, row.starting_balance)
+        except ValueError as exc:
+            if not store.holds_any(row.name):  # a holder still runs for its exits (venue_start, the safety stop)
+                store.event(row.name, "error", "start_refused", f"Not started: {exc}")
+                return 1
         row = venue_start(store, row)
         if row is None:
             return 1

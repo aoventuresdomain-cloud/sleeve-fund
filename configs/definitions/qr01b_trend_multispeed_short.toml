@@ -1,0 +1,48 @@
+# QR #1 default form, short leg (half risk). Decision candle: 4h.
+version = 1
+name = "qr01b-trend-multispeed-short"
+reason = """Mirror of the long leg: short when all three EMA pairs (8/32, 16/64, 32/128) point down, cover when two of
+the three turn up; 3 ATR(14) stop."""
+
+[blocks.f1]
+kind = "ema"
+period = 8
+
+[blocks.s1]
+kind = "ema"
+period = 32
+
+[blocks.f2]
+kind = "ema"
+period = 16
+
+[blocks.s2]
+kind = "ema"
+period = 64
+
+[blocks.f3]
+kind = "ema"
+period = 32
+
+[blocks.s3]
+kind = "ema"
+period = 128
+
+[blocks.atr]
+kind = "atr"
+period = 14
+
+[short]
+entry = { all = [
+    { left = "f1", op = "<", right = "s1" },
+    { left = "f2", op = "<", right = "s2" },
+    { left = "f3", op = "<", right = "s3" },
+] }
+exit = { any = [
+    { all = [{ left = "f1", op = ">", right = "s1" }, { left = "f2", op = ">", right = "s2" }] },
+    { all = [{ left = "f1", op = ">", right = "s1" }, { left = "f3", op = ">", right = "s3" }] },
+    { all = [{ left = "f2", op = ">", right = "s2" }, { left = "f3", op = ">", right = "s3" }] },
+] }
+
+[exits]
+stop = { level = { add = ["close", { mul = [3.0, "atr"] }] } }

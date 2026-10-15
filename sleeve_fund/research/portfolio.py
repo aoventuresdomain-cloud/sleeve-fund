@@ -87,6 +87,9 @@ class CloseBatch:
     gate: GateFn
     pending: dict[int, list[Pending]] = field(default_factory=dict)
     passes: list[tuple[int, tuple[str, ...]]] = field(default_factory=list)  # (close, strategies seen) for the record
+    # BRIDGE-3-QA 2: rotate the order per bar (bar_order). Off until a second Strategy runs (Advisor: a FOLLOW-UP for
+    # single-Strategy Drop A); on, the run's fixed order no longer decides who is gated first.
+    rotate: bool = False
 
     def post(self, clock, ts: int, item: Pending) -> None:
         """Queue an intent for the close `ts`; the first one for that close arms the alert on `clock`."""
@@ -104,9 +107,10 @@ class CloseBatch:
                 f"portfolio-gate-{ts}", ts + BATCH_DELAY_NS, callback=lambda event, t=ts: self.run(t))
 
     def run(self, ts: int) -> list[tuple[Pending, Any]]:
-        """The gate pass for the close `ts`: each intent in strategy order, then in the order it was posted."""
+        """The gate pass for the close `ts`: each intent in strategy order (this bar's, bar_order, when rotating), then
+        in the order it was posted."""
         items = self.pending.pop(ts, [])
-        rank = {name: n for n, name in enumerate(self.order)}
+        rank = {name: n for n, name in enumerate(bar_order(self.order, ts) if self.rotate else self.order)}
         items = sorted(items, key=lambda p: rank[p.strategy])  # stable: a strategy's own intents keep their order
         self.passes.append((ts, tuple(dict.fromkeys(p.strategy for p in items))))
         out = []
@@ -250,6 +254,18 @@ class PortfolioGate:
             qty = qty if isinstance(qty, Decimal) else Decimal(0)
             return Gated(Checked(rejected(qty, None, why), None, None), self)
         return Gated(check_order(self.ledger, strategy, order, self.profile, now), self)
+
+
+def bar_order(names: Iterable[str], bar_ts: int) -> tuple[str, ...]:
+    """The order Strategies are gated in for the ideas of one decision mark (Advisor BRIDGE-3-QA 2): it rotates per bar
+    by hash(strategy, bar), so no Strategy is always first when two want the same room and arrival order never
+    decides. Deterministic: the same run gates the same way every time."""
+    import hashlib
+
+    def key(name: str) -> bytes:
+        return hashlib.sha256(f"{name}|{int(bar_ts)}".encode()).digest()
+
+    return tuple(sorted(strategy_order(names), key=key))
 
 
 def strategy_order(names: Iterable[str]) -> tuple[str, ...]:
