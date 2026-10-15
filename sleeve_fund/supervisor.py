@@ -847,6 +847,7 @@ class Supervisor:
                 self.store.refuse_reset(req, liquidation.REFUSAL)
                 self._undo_reset_start(req)
                 continue
+            self._settle_ended_sandbox(name)  # CR MUST 2: a stopped paper process's cancels can't be answered
             if self.store.open_cancels(name):
                 # F241-3: the reset would put the cancel away with the run (split_run) and lift the fresh run's entry
                 # block while its order may still be resting, or fill.
@@ -879,10 +880,14 @@ class Supervisor:
                 if not self.store.open_cancels(name):
                     raise
                 # F241-4: its process asked for a cancel after the check above and before it was stopped. split_run
-                # changed nothing: refused as above, and the process starts again if it was running.
-                self.store.refuse_reset(req, OPEN_CANCEL_REFUSAL)
-                self._undo_reset_start(req)
-                continue
+                # changed nothing. Now stopped, a paper process's cancels are settled (CR MUST 2) and the reset runs;
+                # otherwise refused as above, and the process starts again if it was running.
+                self._settle_ended_sandbox(name)
+                if self.store.open_cancels(name):
+                    self.store.refuse_reset(req, OPEN_CANCEL_REFUSAL)
+                    self._undo_reset_start(req)
+                    continue
+                run = self.store.split_run(req, dust_ok=dust)
             self.store.set_desired_state(name, "running" if req["restart"] else "stopped")
             self.store.decide("system", "reset", f"Started afresh at {s.starting_balance:,.0f}; the run before is "
                               f"kept as {run} under Previous book", name)
@@ -890,6 +895,32 @@ class Supervisor:
                              f"{run}; starting again at {s.starting_balance:,.0f}")
             if s.params.get("demo_mirror"):
                 self.store.queue_resync(name, f"Reset strategy: {req['reason']}")
+
+    def _settle_ended_sandbox(self, name: str) -> None:
+        """CR MUST 2 (HoE ruling, CR option 1, 15 Oct): on the simulated paper client the venue lived in the strategy's
+        process, so once that process is proved gone (none of ours alive, its single-instance lock taken, as
+        close_dead_orders proves it) nothing will ever answer its cancels: they are settled as sandbox_ended
+        (orphan_guard.sandbox_gone). With the exchange order client on (any mode exec_target doesn't read as off) a
+        real venue's cancel is the venue's to answer, so nothing settles here. It never starts the strategy."""
+        from sleeve_fund import exec_target
+        from sleeve_fund.paper.single_lock import instance_lock
+
+        if not self.store.portfolio_gate or exec_target.read(os.environ) is not None:
+            return
+        if not (self.store.open_cancels(name) or orphan_guard.gated_open(self.store, name)):
+            return
+        if self.store.account_of(name) != "paper":
+            return
+        runner = name.split("~", 1)[0]  # a leg is traded by its Strategy's own process
+        if self.procs.get(runner, Proc()).alive or self.procs.get(name, Proc()).alive:
+            return
+        lock = instance_lock(runner)
+        if lock is None:  # a live process holds it: not proved gone
+            return
+        try:
+            orphan_guard.sandbox_gone(self.store, name, utcnow())
+        finally:
+            lock.close()
 
     def _undo_reset_start(self, req: dict) -> None:
         """A reset refused after its first pass has already queued its flatten and, for a strategy the PM had

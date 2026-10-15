@@ -280,12 +280,18 @@ def _open_cancel(store, name="s1"):
     assert store.open_cancels(name)
 
 
-def test_f241_3_a_strategy_reset_is_refused_while_a_cancel_is_open_and_runs_once_the_venue_settles_it(tmp_path):
+def test_f241_3_a_strategy_reset_is_refused_while_a_cancel_is_open_and_runs_once_the_venue_settles_it(
+        tmp_path, monkeypatch):
     """CR F241-3 (HoE MUST): split_run would put the open cancel away with the run and lift the fresh run's entry block
-    while its order may still rest. So the reset is refused, saying why; asked again once settled, it runs."""
+    while its order may still rest. So the reset is refused, saying why; asked again once settled, it runs. Its process
+    isn't proved gone (another holds its lock), so nothing settles by itself (CR MUST 2, TEC 15 Oct)."""
     from sleeve_fund import supervisor as sup
     from sleeve_fund.paper import orphan_guard as og
+    from sleeve_fund.paper.single_lock import instance_lock
     from sleeve_fund.store import Store
+
+    monkeypatch.setenv("SLEEVE_LOCK_DIR", str(tmp_path / "locks"))
+    held = instance_lock("s1")
 
     store = Store(f"sqlite:///{tmp_path}/r.db", portfolio_gate=True)
     store.create_sleeve(name="s1", strategy="trend_filter", instrument="BTC/USDT", bar_spec="1-HOUR-LAST-INTERNAL",
@@ -300,6 +306,7 @@ def test_f241_3_a_strategy_reset_is_refused_while_a_cancel_is_open_and_runs_once
     og.venue_lookup(store, "o-rest", terminal="canceled", fills=[], at=CLOSE + timedelta(hours=3))
     store.request_reset("s1", "Again, now settled")
     sv.reset_pending()
+    held.close()
     assert store.pending_reset("s1") is None and len(store.reset_runs()) == 1
 
 
@@ -307,9 +314,14 @@ def test_f241_4_a_cancel_asked_between_the_check_and_split_run_refuses_the_reset
         tmp_path, monkeypatch):
     """DA F241-4: its process may ask for a cancel after reset_pending's check and before it is stopped. split_run
     then refuses and changes nothing; the supervisor refuses the reset as F241-3 does, and a running strategy runs
-    again, rather than the supervisor's loop raising."""
+    again, rather than the supervisor's loop raising. Its process isn't proved gone (another holds its lock), so
+    nothing settles by itself (CR MUST 2, TEC 15 Oct)."""
     from sleeve_fund import supervisor as sup
+    from sleeve_fund.paper.single_lock import instance_lock
     from sleeve_fund.store import Store
+
+    monkeypatch.setenv("SLEEVE_LOCK_DIR", str(tmp_path / "locks"))
+    held = instance_lock("s1")
 
     store = Store(f"sqlite:///{tmp_path}/r.db", portfolio_gate=True)
     store.create_sleeve(name="s1", strategy="trend_filter", instrument="BTC/USDT", bar_spec="1-HOUR-LAST-INTERNAL",
@@ -320,6 +332,7 @@ def test_f241_4_a_cancel_asked_between_the_check_and_split_run_refuses_the_reset
     sv = sup.Supervisor(store, python="true")
     monkeypatch.setattr(sv, "_stop", lambda name, proc, why: _open_cancel(store, name))  # the race, at the stop
     sv.reset_pending()
+    held.close()
     assert store.pending_reset("s1") is None and not store.reset_runs() and store.open_cancels("s1")
     assert store.last_event("s1", ("reset_refused",))["message"].endswith(sup.OPEN_CANCEL_REFUSAL)
     assert store.sleeve("s1").desired_state == "running"
@@ -343,3 +356,86 @@ def test_f241_3_a_book_reset_or_a_reset_after_liquidation_never_lifts_an_open_ca
     store.write_incident_note(iid, author="Head of Engineering", why_stop_did_not_protect="QA gap")
     store.command("s1", "reset_after_liquidation", "PM read the incident", actor="PM", incident=iid)
     assert store.open_cancels("s1") and entry_blocked(store, "s1", CLOSE + timedelta(hours=3))[0]
+
+
+# ---- CR MUST 2 (HoE ruling, CR option 1, 15 Oct): a Stop with a resting entry never wedges the PM's Reset ------------
+
+def _stopped_with_a_resting_entry(tmp_path, monkeypatch):
+    """The PM stopped `s1` while a post-only entry rested: _stop journalled owner_down, the next pass asked its cancel,
+    and on paper nothing answers it, since the simulated venue lived in the stopped process."""
+    from sleeve_fund.paper import orphan_guard as og
+    from sleeve_fund.store import Store
+
+    monkeypatch.setenv("SLEEVE_LOCK_DIR", str(tmp_path / "locks"))
+    for var in ("EXEC_MODE", "EXEC_HOST"):
+        monkeypatch.delenv(var, raising=False)
+    store = Store(f"sqlite:///{tmp_path}/r.db", portfolio_gate=True)
+    store.create_sleeve(name="s1", strategy="trend_filter", instrument="BTC/USDT", bar_spec="1-HOUR-LAST-INTERNAL",
+                        starting_balance=10_000, params={"market": "perp", "allow_short": True})
+    og.qa_resting_entry(store, "s1", "o-rest", CLOSE)
+    og.owner_down(store, "s1", CLOSE + timedelta(minutes=10), "stop")
+    og.supervisor_pass(store, CLOSE + timedelta(minutes=10, seconds=5))
+    assert store.open_cancels("s1"), "set-up: the cancel is asked and open"
+    store.set_desired_state("s1", "stopped")
+    store.request_reset("s1", "Test finished")
+    return store
+
+
+def test_cr_must2_a_reset_after_a_stop_with_a_resting_entry_goes_through_and_settles_the_cancel_sandbox_ended(
+        tmp_path, monkeypatch):
+    from sleeve_fund import supervisor as sup
+    from sleeve_fund.paper import orphan_guard as og
+
+    store = _stopped_with_a_resting_entry(tmp_path, monkeypatch)
+    sup.Supervisor(store, python="true").reset_pending()
+    assert store.pending_reset("s1") is None and len(store.reset_runs()) == 1
+    (run,) = store.reset_runs()
+    assert not store.open_cancels("s1") and not store.open_cancels(run)
+    assert "o-rest" in store.last_event(run, (og.SANDBOX_ENDED,))["message"]  # settled, and put away with the run
+    assert store.sleeve("s1").desired_state == "stopped"  # the PM's Stop holds: Reset never starts it
+
+
+def test_cr_must2_with_the_instance_lock_still_held_the_reset_is_still_refused(tmp_path, monkeypatch):
+    from sleeve_fund import supervisor as sup
+    from sleeve_fund.paper.single_lock import instance_lock
+
+    store = _stopped_with_a_resting_entry(tmp_path, monkeypatch)
+    held = instance_lock("s1")  # a process still holds it: nothing proves the old one is gone
+    try:
+        sup.Supervisor(store, python="true").reset_pending()
+    finally:
+        held.close()
+    assert not store.reset_runs() and store.open_cancels("s1")
+    assert store.last_event("s1", ("reset_refused",))["message"].endswith(sup.OPEN_CANCEL_REFUSAL)
+
+
+@pytest.mark.parametrize("mode", ["demo", "OFF"])
+def test_cr_must2_with_the_order_client_on_nothing_settles_by_itself(tmp_path, monkeypatch, mode):
+    """A real venue's cancel is the venue's to answer; an unknown mode fails closed the same way (N-KH1)."""
+    from sleeve_fund import supervisor as sup
+
+    store = _stopped_with_a_resting_entry(tmp_path, monkeypatch)
+    monkeypatch.setenv("EXEC_MODE", mode)
+    sup.Supervisor(store, python="true").reset_pending()
+    assert not store.reset_runs() and store.open_cancels("s1")
+    assert store.last_event("s1", ("reset_refused",))["message"].endswith(sup.OPEN_CANCEL_REFUSAL)
+
+
+def test_cr_must2_the_f241_4_race_on_a_stopped_paper_process_settles_and_the_reset_runs(tmp_path, monkeypatch):
+    """The F241-4 race with the process proved gone (its lock free, the order client off): the cancel asked at the
+    stop is settled sandbox_ended and the reset goes through, restarting a running strategy as asked."""
+    from sleeve_fund import supervisor as sup
+    from sleeve_fund.store import Store
+
+    monkeypatch.setenv("SLEEVE_LOCK_DIR", str(tmp_path / "locks"))
+    monkeypatch.delenv("EXEC_MODE", raising=False)
+    store = Store(f"sqlite:///{tmp_path}/r.db", portfolio_gate=True)
+    store.create_sleeve(name="s1", strategy="trend_filter", instrument="BTC/USDT", bar_spec="1-HOUR-LAST-INTERNAL",
+                        starting_balance=10_000, params={"market": "perp", "allow_short": True})
+    store.set_desired_state("s1", "running")
+    store.request_reset("s1", "Test finished")
+    sv = sup.Supervisor(store, python="true")
+    monkeypatch.setattr(sv, "_stop", lambda name, proc, why: _open_cancel(store, name))  # the race, at the stop
+    sv.reset_pending()
+    assert store.pending_reset("s1") is None and len(store.reset_runs()) == 1 and not store.open_cancels("s1")
+    assert store.sleeve("s1").desired_state == "running"

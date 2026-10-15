@@ -249,6 +249,23 @@ def sandbox_ended(store, name: str, order_id: str, down: dict, at: datetime) -> 
         store.update_order(order_id, status="canceled", message=why)
 
 
+def sandbox_gone(store, name: str, now: datetime) -> list[str]:
+    """CR MUST 2 (HoE ruling, CR option 1, 15 Oct): the caller has proved `name`'s process gone (no process of ours
+    alive and its single-instance lock taken) on the simulated paper client, whose venue lived in that process. Every
+    gated entry it left, open or with its cancel open, ended with it: settled as sandbox_ended, as a restart's
+    reconcile does, so a cancel nothing can ever answer doesn't wedge the PM's Reset. Returns the ids settled."""
+    left = sorted({r["order_id"] for r in gated_open(store, name)} | {c["order_id"] for c in store.open_cancels(name)})
+    if not left:
+        return []
+    down = store.last_event(name, (OWNER_DOWN, OWNER_UP))
+    if down is None or down["kind"] != OWNER_DOWN:
+        owner_down(store, name, now, "its process is gone (its lock is free)")
+        down = store.last_event(name, (OWNER_DOWN,))
+    for oid in left:
+        sandbox_ended(store, name, oid, down, now)
+    return left
+
+
 def supervisor_pass(store, now: datetime, send=None) -> list[str]:
     """One supervisor pass of ORPHAN-GUARD at `now`; returns the order ids asked to cancel in it.
 
