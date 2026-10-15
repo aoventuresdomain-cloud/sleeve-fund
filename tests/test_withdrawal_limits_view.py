@@ -302,3 +302,18 @@ def test_a_strategy_wiped_out_before_the_fund_held_the_cash_never_reads_as_no_lo
         page = _get(client, "/sleeves/b")
         assert "its P&L stays in the fund's cash" not in page, start
         assert "Archived, its equity left the fund's book" in page, start
+
+
+def test_a_strategy_put_away_the_instant_the_fund_began_holding_the_cash_left_with_nothing_to_move(held, client,
+                                                                                                    monkeypatch):
+    """F-WN2-3 (CR, HoE): the boundary. A put-away stamped exactly at bridge_start is under fund-held cash (the
+    rebase deposit is applied first), so a withdrawn 0 reads as leaving with nothing to move, not as a loss."""
+    client.post("/sleeves/b/archive", data={"action": "archive", "reason": "done with it"}, auth=AUTH, headers=HDR,
+                follow_redirects=False)
+    _mark(held, T0 + timedelta(seconds=5))
+    monkeypatch.setattr(type(held), "withdrawn", lambda self: {"b": D(0)})
+    at = held.archived()["b"]
+    monkeypatch.setattr(supervisor, "bridge_start", lambda _store: at)
+    page = _get(client, "/sleeves/b")
+    assert "Archived, it left with nothing to move: its P&L stays in the fund's cash, which isn't a loss." in page
+    assert "its equity left the fund's book" not in page
