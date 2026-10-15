@@ -2414,12 +2414,15 @@ class Store:
         status, the venue's or risk engine's words (message) and when it last moved (updated_at). Every one is
         listed, refused or not, so a reader counts refused closes in a row from the tail (F-RX-2)."""
         o = orders_t.c
-        q = (select(o.order_id, o.intent, o.status, o.message, o.ts, o.updated_at, o.instrument)
+        q = (select(o.order_id, o.intent, o.status, o.message, o.ts, o.updated_at, o.instrument, o.signal)
              .where(o.sleeve == sleeve, o.intent.in_(CLOSING_INTENTS)))
         if since is not None:
             q = q.where(o.ts >= since)
         with self.engine.connect() as c:
-            return _rows(c.execute(q.order_by(o.ts, o.id)))
+            rows = _rows(c.execute(q.order_by(o.ts, o.id)))
+        # A1 (Advisor): benign: refused with nothing left to close (paper.runtime.BENIGN_REJECT): never one in a row
+        return [{**{k: v for k, v in r.items() if k != "signal"},
+                 "benign": bool((r["signal"] or {}).get("benign_reject"))} for r in rows]
 
     def order_counts(self, sleeve: str | None = None) -> dict[str, int]:
         q = select(orders_t.c.status, func.count()).group_by(orders_t.c.status)
