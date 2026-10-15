@@ -87,12 +87,12 @@ def _night(tmp_path: Path, lose_a_fill: bool = False) -> tuple[Path, str]:
 
 
 @needs_pg
-def test_a_dry_run_on_a_real_dump_passes_every_step(tmp_path, capsys):
+def test_a_dry_run_on_a_real_dump_passes_every_step(tmp_path, capfd):
     from sleeve_fund import restore_drill
 
     backups, dst = _night(tmp_path)
     assert restore_drill.main(["--backups", str(backups), "--db", dst, "--restore-seconds", "1.5"]) == 0
-    lines = capsys.readouterr().out.splitlines()
+    lines = capfd.readouterr().out.splitlines()
     steps = [ln.split(":")[0] for ln in lines]
     assert steps == ["backup", "restore", "migrate", "counts", "tables", "links", "research", "start check and books",
                      "restore drill"]
@@ -101,36 +101,36 @@ def test_a_dry_run_on_a_real_dump_passes_every_step(tmp_path, capsys):
 
 
 @needs_pg
-def test_a_dump_short_of_the_backups_own_count_fails(tmp_path, capsys):
+def test_a_dump_short_of_the_backups_own_count_fails(tmp_path, capfd):
     from sleeve_fund import restore_drill
 
     backups, dst = _night(tmp_path, lose_a_fill=True)
     assert restore_drill.main(["--backups", str(backups), "--db", dst]) == 1
-    out = capsys.readouterr().out
+    out = capfd.readouterr().out
     assert "counts: FAIL" in out and "apart from the backup's count: events" in out
     assert out.splitlines()[-1].startswith("restore drill: FAIL")
 
 
 @needs_pg
-def test_no_log_line_carries_data(tmp_path, capsys):
+def test_no_log_line_carries_data(tmp_path, capfd):
     """The log is public: step names, counts, timings and PASS/FAIL only."""
     from sleeve_fund import restore_drill
 
     backups, dst = _night(tmp_path)
     restore_drill.main(["--backups", str(backups), "--db", dst])
-    out = capsys.readouterr().out
+    out = capfd.readouterr().out
     host_db = re.match(r"^[^/]+//(?:[^@]*@)?([^:/]+)", URL).group(1)
     for leaked in (*SECRETS, str(tmp_path), str(backups), "drill_dst", "postgresql", host_db + ":"):
         assert leaked not in out, leaked
     assert all(LINE.match(ln) for ln in out.splitlines()), out
 
 
-def test_a_step_that_raises_prints_its_error_type_only(capsys):
+def test_a_step_that_raises_prints_its_error_type_only(capfd):
     from sleeve_fund.restore_drill import Drill
 
     drill = Drill()
     drill.step("links", lambda: (_ for _ in ()).throw(RuntimeError(f"host db.internal row {SECRETS[0]}")))
-    out = capsys.readouterr().out
+    out = capfd.readouterr().out
     assert drill.failed and out.startswith("links: FAIL (") and "RuntimeError" in out
     assert SECRETS[0] not in out and "db.internal" not in out
 
@@ -160,7 +160,7 @@ def _run(tmp_path: Path, fail_on: str = "") -> tuple[subprocess.CompletedProcess
     log = tmp_path / "docker.log"
     _docker(tmp_path / "bin", log, fail_on)
     env = {**os.environ, "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}", "DRILL_ID": "drill-x"}
-    done = subprocess.run(["bash", str(SCRIPT)], env=env, capture_output=True, text=True, timeout=60)
+    done = subprocess.run(["bash", str(SCRIPT)], env=env, capture_output=True, text=True, timeout=60, check=False)
     return done, log.read_text().splitlines()
 
 
@@ -188,3 +188,22 @@ def test_the_script_removes_what_it_made_when_a_step_fails_and_prints_no_tool_ou
     assert calls[-3:] == ["rm -f drill-x-db", "network rm drill-x", "volume rm drill-x"]
     assert "secret-host" not in done.stdout + done.stderr and "/var/lib" not in done.stdout
     assert ": FAIL" in done.stdout or "checks: exit" in done.stdout
+
+
+def test_the_workflow_is_by_hand_on_main_quiet_and_copies_nothing_off_the_server():
+    import yaml
+
+    wf = yaml.safe_load((ROOT / ".github" / "workflows" / "restore-drill.yml").read_text())
+    assert wf[True].keys() == {"workflow_dispatch"}  # YAML 1.1 reads "on" as true: never on a schedule or a push
+    job = wf["jobs"]["drill"]
+    for gate in ("vars.DEPLOY_ENABLED == 'true'", "github.ref == 'refs/heads/main'"):
+        assert gate in job["if"]
+    assert job["permissions"] == {"contents": "read"}
+    steps = job["steps"]
+    assert [s["name"] for s in steps] == ["Configure SSH", "Restore drill"]
+    assert "LogLevel=QUIET" in steps[1]["run"] and "sudo bash deploy/restore_drill.sh" in steps[1]["run"]
+    for s in steps:
+        assert "${{" not in s["run"], s["name"]  # secrets and vars reach a shell line through env only
+        assert "uses" not in s  # no upload, no artifact: no dump or row leaves the server
+    for word in ("scp", "rsync", "upload-artifact", "pg_dump"):
+        assert word not in (ROOT / ".github" / "workflows" / "restore-drill.yml").read_text()
