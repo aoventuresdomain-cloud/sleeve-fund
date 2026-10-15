@@ -208,6 +208,47 @@ def entry_refusal(store, profile, instrument: str, now: datetime, live: bool = F
     return None
 
 
+class _NoClient:
+    """Stands in for an account with no fee client on this server: every attempt is kept as failed, saying why."""
+
+    def __init__(self, why: str):
+        self.why = why
+
+    def call(self, *a, **k):
+        raise RuntimeError(self.why)
+
+
+TIER_EVERY = timedelta(hours=20)  # a tier table younger than this isn't pulled again: daily, with room before 24 h
+
+
+def fetch_due(store, now: datetime, client_for, get=_get_json) -> None:
+    """The supervisor's hourly pass (Supervisor.check_fees): for every running perp Strategy's instrument on a FEE-LIVE
+    venue, the pasted tables seeded once, the account's fee rates fetched (client_for(account, live) gives its signed
+    client, or None when this server has none for it), and the public tiers pulled when the last good table is 20 h
+    old or more. Each attempt is one row, so the 24 h and 72 h rules read the last good one."""
+    from sleeve_fund.venues import venue as venue_profile
+
+    seen = set()
+    for s in store.sleeves():
+        if s.lifecycle == "retired" or (s.params or {}).get("market") != "perp":
+            continue
+        profile = venue_profile(s.venue)
+        if not profile.fee_bounds:
+            continue
+        account = store.account_of(s.name)
+        live = store.account_kind(account) == "live"
+        if (profile.name, s.instrument, account) in seen:
+            continue
+        seen.add((profile.name, s.instrument, account))
+        seed_pasted_tiers(store, profile)
+        client = client_for(account, live)
+        fetch_fees(store, profile, s.instrument, account=account, live=live, now=now,
+                   client=client or _NoClient("this server has no fee-rate client for the account"))
+        good = store.latest_good_venue_fetch(profile.name, "tiers", s.instrument)
+        if good is None or now - _utc(good["fetched_at"]) >= TIER_EVERY:
+            fetch_tiers(store, profile, s.instrument, get=get, now=now)
+
+
 def live_terms(store, now: datetime) -> list[Term]:
     """Every running perp Strategy's instrument on a FEE-LIVE venue, its fee rates then its tiers, once per instrument
     and account kind: what the start check, the alerts and the dashboard read (FE's reader: live_terms(store, now))."""
