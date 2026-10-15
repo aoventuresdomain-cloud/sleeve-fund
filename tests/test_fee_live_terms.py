@@ -20,7 +20,8 @@ from sleeve_fund import venue_terms
 from sleeve_fund.store import PUBLISHED_FEES, Store, make_engine, margin_tiers_of, metadata
 from sleeve_fund.venues import venue
 
-pytestmark = pytest.mark.no_maintenance_tables  # the venue's own BTC/USDT table, not the tests' flat stand-in
+# the venue's own BTC/USDT table, not the tests' flat stand-in; FEE-LIVE's rules as they are
+pytestmark = [pytest.mark.no_maintenance_tables, pytest.mark.venue_terms_live]
 DATA = Path(__file__).parent / "data" / "fee_live"
 T = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
 PAPER = venue("BINANCE")  # the engine's paper perp venue profile

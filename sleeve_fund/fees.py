@@ -4,6 +4,11 @@ The fees come from the exchange itself: the supervisor reads each connected live
 schedule from its venue (query-only key, on the server only) and records it. Every mode then
 uses the most recent schedule fetched for the sleeve's venue. Until an account on that venue is
 connected, the venue profile's published schedule is used, and every result says so.
+
+FEE-LIVE (15 Oct 2026): on a venue with published fee bounds (the paper perp venue) the rate is the instrument's own,
+from venue_terms: the account's fetched rate, or on paper the published VIP 0 labelled "published, not account". It
+never falls back to a schedule silently; without an instrument (research, the venue list) it is the published VIP 0,
+which research never charges below.
 """
 
 from __future__ import annotations
@@ -24,9 +29,12 @@ class FeeQuote:
     fetched_at: datetime | None
     venue_label: str
     basis: str = ""  # published rates: which tier, and where and when they were read
+    words: str = ""  # FEE-LIVE: the instrument's own line (venue_terms), said in place of the venue-wide one
 
     @property
     def text(self) -> str:
+        if self.words:
+            return self.words
         rates = f"{float(self.fees.maker):.2%} maker, {float(self.fees.taker):.2%} taker"
         if self.source == "account":
             # "Venue fees", never the venue's name: this text reaches activity and the backtest (QA U8 ruling).
@@ -52,10 +60,15 @@ def taker_of(store, sleeve) -> Decimal:
     return markets.fees_for(sleeve.params, resolve(sleeve.venue, store).fees, sleeve.venue).taker
 
 
-def resolve(venue: str | None = None, store=None) -> FeeQuote:
+def resolve(venue: str | None = None, store=None, instrument: str | None = None, now: datetime | None = None,
+            live: bool = False) -> FeeQuote:
     """The fee schedule to use for `venue` now: the latest one fetched from a connected account,
-    else the venue profile's published schedule."""
+    else the venue profile's published schedule. On a FEE-LIVE venue (published fee bounds) with an instrument, the
+    instrument's last-known-good rate (venue_terms.term); one never fetched is charged at the published VIP 0, its
+    entries refused (venue_terms.entry_refusal) while its exits run."""
     profile = venue_profile(venue)
+    if profile.fee_bounds:
+        return _live_quote(profile, store, instrument, now, live)
     row = None
     if store is not None:
         try:
@@ -66,3 +79,22 @@ def resolve(venue: str | None = None, store=None) -> FeeQuote:
         fees = FeeSchedule(Decimal(str(row["maker"])), Decimal(str(row["taker"])))
         return FeeQuote(fees, "account", row["account"], row["fetched_at"], profile.label)
     return FeeQuote(profile.fees, "published", None, None, profile.label, profile.fee_basis)
+
+
+def _live_quote(profile, store, instrument: str | None, now: datetime | None, live: bool) -> FeeQuote:
+    from datetime import timezone
+
+    from sleeve_fund import venue_terms
+
+    if store is None or instrument is None:
+        return FeeQuote(profile.fees, "published", None, None, profile.label, profile.fee_basis)
+    t = venue_terms.term(store, profile, "fee", instrument, now or datetime.now(timezone.utc), live)
+    rates = f"{float(profile.fees.maker):.3%} maker, {float(profile.fees.taker):.3%} taker"
+    if t.value is None:
+        return FeeQuote(profile.fees, "published", None, None, profile.label, profile.fee_basis,
+                        words=f"Venue fees: {rates}, the published VIP 0, until {t.words}")
+    maker, taker = t.value
+    published = t.source == venue_terms.PUBLISHED_FEES
+    return FeeQuote(FeeSchedule(maker, taker), "published" if published else "account", t.account, t.fetched_at,
+                    profile.label, profile.fee_basis if published else "",
+                    words=f"Venue fees: {float(maker):.3%} maker, {float(taker):.3%} taker; {t.words}")

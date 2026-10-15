@@ -208,6 +208,26 @@ def entry_refusal(store, profile, instrument: str, now: datetime, live: bool = F
     return None
 
 
+def live_terms(store, now: datetime) -> list[Term]:
+    """Every running perp Strategy's instrument on a FEE-LIVE venue, its fee rates then its tiers, once per instrument
+    and account kind: what the start check, the alerts and the dashboard read (FE's reader: live_terms(store, now))."""
+    from sleeve_fund.venues import venue as venue_profile
+
+    out, seen = [], set()
+    for s in store.sleeves():
+        if s.lifecycle == "retired" or (s.params or {}).get("market") != "perp":
+            continue
+        profile = venue_profile(s.venue)
+        if not profile.fee_bounds:
+            continue
+        live = store.account_kind(store.account_of(s.name)) == "live"
+        if (profile.name, s.instrument, live) in seen:
+            continue
+        seen.add((profile.name, s.instrument, live))
+        out += [term(store, profile, kind, s.instrument, now, live) for kind in ("fee", "tiers")]
+    return out
+
+
 @dataclass(frozen=True)
 class ResearchFees:
     fees: FeeSchedule
