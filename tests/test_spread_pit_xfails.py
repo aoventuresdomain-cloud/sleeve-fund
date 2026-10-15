@@ -365,6 +365,17 @@ def _node_start(rows, at: datetime) -> dict:
     return {"assumed_half_spread": spreads.resolve(VENUE, PAIR, _store([r for r in rows if r[1] <= at])).half_spread}
 
 
+def _tape(h, p):
+    """TEC-GAPDOWN 2: the venue's trades for a replayed stop's minute are the cell's own ticks, as the harness trades
+    them (rounded to the tick), so the replay takes GAP-DOWN (b), "trade", explicitly."""
+    return [(h.START + s * h.S, float(px)) for s, px in enumerate(np.round(p, 1))]
+
+
+def _through(h, p, level: float, side: int) -> float:
+    """The first of those trades at or through the level: what GAP-DOWN (b) books, less the half spread in force."""
+    return next(float(px) for px in np.round(p, 1) if side * (px - level) <= 0)
+
+
 def _replayed_stop(run, h, side: int, stop: float = 0.01):
     """(booked price, the stop level from the journaled entry) of the replayed stop."""
     entry = h.fill_px(run, "entry")
@@ -413,12 +424,16 @@ def test_spread_pit_restart_replay_of_a_minute_before_t2_equals_the_backtest_at_
     rows = [(LOW, T1), (HIGH, _ts(9))]
     _with_store(monkeypatch, rows)
     p = h.shape(h.flat_prices(40), 7.5, 7 + 50 / 60, h.adverse(side, 0.02))
-    run = h.restart(p, 6, 12, side=side, perp=perp, profile=profile, leave=30, extra=_node_start(rows, _ts(12)))
+    run = h.restart(p, 6, 12, side=side, perp=perp, profile=profile, leave=30, extra=_node_start(rows, _ts(12)),
+                    trades=_tape(h, p))
     ex, o, level = _replayed_stop(run, h, side)
     assert ex[0] == "stop_loss" and ex[2] <= h.minute(13), ("set-up: the stop replayed on return", ex)
     assert h.is_modelled(o["signal"]), ("set-up: booked by the outage replay's model", o["signal"])
+    assert o["signal"].get("fill_source") == "trade", o["signal"]
     assert _node_start(rows, _ts(12))["assumed_half_spread"] == HIGH, "set-up: the restarted node starts on HIGH"
-    replay_paid = side * (1 - ex[3] / level)
+    # TEC-GAPDOWN 2: the 2% dip jumps through the 1% stop, so the replay books the first trade through it, less the
+    # half spread in force (GAP-DOWN (b)); what it paid is measured from that trade, the backtest's from its level.
+    replay_paid = side * (1 - ex[3] / _through(h, p, level, side))
     st = _store(rows)
     mins = h.minutes_of(p)
     bars = mins.set_axis(mins.index + pd.Timedelta(minutes=1))
@@ -446,10 +461,13 @@ def test_control_the_replay_books_the_0_05pc_floor_when_the_measurement_is_below
     rows = [(0.0001, T1)]
     _with_store(monkeypatch, rows)
     p = h.shape(h.flat_prices(40), 7.5, 7 + 50 / 60, h.adverse(side, 0.02))
-    run = h.restart(p, 6, 12, side=side, perp=perp, profile=profile, leave=30, extra=_node_start(rows, _ts(12)))
+    run = h.restart(p, 6, 12, side=side, perp=perp, profile=profile, leave=30, extra=_node_start(rows, _ts(12)),
+                    trades=_tape(h, p))
     ex, o, level = _replayed_stop(run, h, side)
-    assert ex[0] == "stop_loss" and h.is_modelled(o["signal"]), ex
-    assert abs(side * (1 - ex[3] / level) - FLOOR) < 2e-6, (ex, level)
+    assert ex[0] == "stop_loss" and h.is_modelled(o["signal"]) and o["signal"].get("fill_source") == "trade", ex
+    # TEC-GAPDOWN 2: the first trade through the stop (the dip jumps past it), less the floor (GAP-DOWN (b))
+    through = _through(h, p, level, side)
+    assert abs(side * (1 - ex[3] / through) - FLOOR) < 2e-6, (ex, level, through)
 
 
 # ------------------------------------------------------------------------------------------- fills-vs-model

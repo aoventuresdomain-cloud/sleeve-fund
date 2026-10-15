@@ -312,7 +312,12 @@ def test_c5_hub_away_while_long_and_the_price_still_past_the_stop_the_stop_runs_
     bt = per_order(*backtest(_dip_prices(False), {"period": 5, "stop_loss": 0.01}))
     assert [r[1] for r in hub][:2] == ["entry", "stop_loss"]
     assert hub[1][2] == pd.Timestamp(START + 13 * M, unit="ns", tz="UTC")  # sent at 00:12:05
-    assert abs(hub[1][4] / bt[1][4] - 1) < 5e-4, (hub[1], bt[1])
+    # TEC-GAPDOWN 2: this node has no trade history for the venue (no loader), so GAP-DOWN (c): the worse of the
+    # level less the floor (the backtest's price) and the minute to 00:07's low, as the ticks traded it. One-sided
+    # parity: never better than the backtest. Prices before fees: per_order's all-in price plus the fee per unit.
+    hub_px, bt_px = (r[4] + r[5] / r[3] for r in (hub[1], bt[1]))
+    low = float(np.round(_dip_prices(False)[6 * 60:7 * 60], 1).min())
+    assert hub_px == pytest.approx(min(bt_px, low), abs=0.051) and hub_px <= bt_px + 1e-6, (hub_px, bt_px, low)
     assert dec.late == 4  # the bars closing 00:07-00:10 came late: exits only
 
 
