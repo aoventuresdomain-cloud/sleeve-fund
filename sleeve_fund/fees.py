@@ -44,6 +44,14 @@ class FeeQuote:
         return f"{rates} ({self.basis or 'published'})"
 
 
+def taker_of(store, sleeve) -> Decimal:
+    """The taker rate a stored strategy's exits are charged at: its market's schedule, from the venue's fee source
+    (resolve). What the loss at its stop counts (open_risk.position_risk, FEE-LIVE (5))."""
+    from sleeve_fund import markets
+
+    return markets.fees_for(sleeve.params, resolve(sleeve.venue, store).fees, sleeve.venue).taker
+
+
 def resolve(venue: str | None = None, store=None) -> FeeQuote:
     """The fee schedule to use for `venue` now: the latest one fetched from a connected account,
     else the venue profile's published schedule."""

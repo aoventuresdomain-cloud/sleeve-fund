@@ -143,13 +143,14 @@ def gate_intent(d: dict) -> Intent:
     qty, expected fill (`price`, from fill_price), instrument, venue step and minimum, and what one unit posts and
     risks. Those come from holding_for on one unit at the expected fill, so the gate counts the order exactly as it
     counts the position once held: margin = price / leverage on a perp (leverage None: spot, the full price); risk to
-    the stop (stop_frac from the expected fill) or, with none, the stopless measure from the daily ATR (atr_pct).
+    the stop (stop_frac from the expected fill) or, with none, the stopless measure from the daily ATR (atr_pct), plus
+    the taker fee on that exit at the venue's rate (`taker`, FEE-LIVE (5)).
     Raises when a figure can't be used (a float price, a stopless order with no ATR), and the gate fails closed."""
     side, price = d["side"], money(d["price"], "price")
     frac = d.get("stop_frac")
     stop = price - scale(price, side * frac) if frac else None
     name = underlying(d["instrument"])
-    unit = holding_for(Position("", name, Decimal(side), stop, d.get("leverage")), price, d.get("atr_pct"))
+    unit = holding_for(Position("", name, Decimal(side), stop, d.get("leverage"), d.get("taker")), price, d.get("atr_pct"))
     return Intent(name, side, money(d["qty"], "qty"), price, unit.margin, unit.risk, d["step"], d["min_qty"])
 
 
