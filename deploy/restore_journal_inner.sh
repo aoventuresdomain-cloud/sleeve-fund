@@ -44,8 +44,9 @@ busy=$(psql -d postgres -At -c "select count(*) from pg_stat_activity where datn
 KEEP="${DB}_before_restore_$(date -u +%Y%m%d%H%M%S)"
 psql -d postgres -v ON_ERROR_STOP=1 -c "ALTER DATABASE \"$DB\" RENAME TO \"$KEEP\"" >/dev/null 2>>"$ERR" \
   || { rc=$?; fail "couldn't set the journal aside (exit $rc), it is as it was"; }
-if ! psql -d postgres -v ON_ERROR_STOP=1 -c "ALTER DATABASE \"$STAGE\" RENAME TO \"$DB\"" >/dev/null 2>>"$ERR"; then
-  rc=$?
+rc=0
+psql -d postgres -v ON_ERROR_STOP=1 -c "ALTER DATABASE \"$STAGE\" RENAME TO \"$DB\"" >/dev/null 2>>"$ERR" || rc=$?
+if [ "$rc" != 0 ]; then
   psql -d postgres -v ON_ERROR_STOP=1 -c "ALTER DATABASE \"$KEEP\" RENAME TO \"$DB\"" >/dev/null 2>>"$ERR" \
     || fail "the restored copy couldn't take the journal's place (exit $rc) and the journal is still named $KEEP"
   fail "the restored copy couldn't take the journal's place (exit $rc), the journal is back as it was"
