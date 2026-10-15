@@ -3476,6 +3476,8 @@ class Store:
             raise ValueError("a reason is required")
         if s.parent is not None or self._leg_of(sleeve) is not None:  # CR F283-1: split_run makes one leg's run
             raise ValueError("a reset isn't built for a two-leg Strategy yet, so nothing was changed")
+        if self._asset_legs(sleeve):  # DA (Drop B MUST): split_run would put away the parent's run alone
+            raise ValueError("a reset isn't built for a multi-asset Strategy yet, so nothing was changed")
         if self.pending_reset(sleeve):
             raise ValueError("a reset is already under way")
         from sleeve_fund.paper.runtime import liquidation_head  # the engine's liquidation rule

@@ -139,3 +139,18 @@ def test_a_put_away_with_a_leg_held_waits_for_that_leg_then_puts_every_leg_away(
     assert {store.sleeve(n).lifecycle for n in store.legs("trend-x")} == {"retired"}
     assert {store.sleeve(n).desired_state for n in store.legs("trend-x")} == {"stopped"}
     assert set(store.legs("trend-x")) <= set(store.archived())
+
+
+def test_a_reset_of_a_multi_asset_strategy_is_refused_and_changes_nothing():
+    """DA (Drop B MUST): a reset puts one row's run away (split_run), so a multi-asset parent's reset would leave its
+    asset legs' history under the live Strategy and asset_book would mix two runs. Until a reset covers every leg as
+    one run it is refused, on the parent as on a leg, and nothing changes; a book reset skips it as it does a two-leg
+    Strategy (_book_to_reset)."""
+    store = _fund(Store.in_memory())
+    _make(store, name="tx")
+    before = [(s.name, s.status, s.desired_state, s.starting_balance) for s in store.sleeves()]
+    for name in ("tx", "tx~ETH", "tx~SOL"):
+        with pytest.raises(ValueError, match="nothing was changed"):
+            store.request_reset(name, "Settings changed")
+        assert not store.pending_reset(name)
+    assert [(s.name, s.status, s.desired_state, s.starting_balance) for s in store.sleeves()] == before
