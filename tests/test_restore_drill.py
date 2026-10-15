@@ -2,7 +2,9 @@
 database on the server and python -m sleeve_fund.restore_drill checks it. Red first:
 1. a dry run on a real dump of a seeded journal passes every step, and a dump that lost rows fails;
 2. no log line carries data (the log is public): no Strategy name, message, amount, host, database or path;
-3. the script removes what it made, on failure too (stand-in docker, as test_backup_script stands in Postgres)."""
+3. the script removes what it made, on failure too (stand-in docker, as test_backup_script stands in Postgres);
+4. (HoE, 15 Oct) the script refuses to start unless the backups' disk and docker's have twice the newest dump free;
+5. (HoQA F-DA7-COUNTS) the money and history tables the backup now counts are matched too, not only four."""
 
 from __future__ import annotations
 
@@ -46,12 +48,13 @@ def _db(name: str) -> str:
     return URL.rsplit("/", 1)[0] + "/" + name
 
 
-def _night(tmp_path: Path, lose_a_fill: bool = False) -> tuple[Path, str]:
+def _night(tmp_path: Path, short: str = "", counted: tuple[str, ...] | None = None) -> tuple[Path, str]:
     """A journal at head with a Strategy, an order and its fill, an event and a decision; dumped as backup.sh dumps it,
     its status.json as backup.sh writes it, the same night's research archive; restored into a fresh database."""
     from sqlalchemy import create_engine, text
 
     from sleeve_fund import schema
+    from sleeve_fund.restore_drill import COUNTED
     from sleeve_fund.store import Store
 
     src = _db("drill_src")
@@ -63,15 +66,14 @@ def _night(tmp_path: Path, lose_a_fill: bool = False) -> tuple[Path, str]:
     store.event(SECRETS[0], "info", "note", SECRETS[1])
     store.decide("pm", "note", f"{SECRETS[1]} {SECRETS[2]}", SECRETS[0])
     with engine.begin() as c:
-        counts = {t: c.execute(text(f"SELECT count(*) FROM {t}")).scalar() for t in ("sleeves", "orders", "fills",
-                                                                                       "events")}
+        counts = {t: c.execute(text(f"SELECT count(*) FROM {t}")).scalar() for t in (counted or COUNTED)}
     engine.dispose()
     backups = tmp_path / "backups"
     backups.mkdir()
     dump = backups / "sleeve_fund-20261015-0012.dump"
     subprocess.run([_tool("pg_dump"), "-d", _libpq(src), "-Fc", "-f", str(dump)], check=True, timeout=60)
-    if lose_a_fill:
-        counts["events"] += 1  # the backup counted a row the dump no longer has
+    if short:
+        counts[short] += 1  # the backup counted a row the dump no longer has
     (backups / "status.json").write_text(json.dumps({"ts": "2026-10-15T00:13:00Z", "ok": True, "file": dump.name,
                                                      "message": "dumped and restored", "restored": counts}))
     research = tmp_path / "research"
@@ -101,14 +103,38 @@ def test_a_dry_run_on_a_real_dump_passes_every_step(tmp_path, capfd):
 
 
 @needs_pg
-def test_a_dump_short_of_the_backups_own_count_fails(tmp_path, capfd):
+@pytest.mark.parametrize("short", ["events", "decisions"])  # decisions: a history table the backup counts since F-DA7
+def test_a_dump_short_of_the_backups_own_count_fails(tmp_path, capfd, short):
     from sleeve_fund import restore_drill
 
-    backups, dst = _night(tmp_path, lose_a_fill=True)
+    backups, dst = _night(tmp_path, short=short)
     assert restore_drill.main(["--backups", str(backups), "--db", dst]) == 1
     out = capfd.readouterr().out
-    assert "counts: FAIL" in out and "apart from the backup's count: events" in out
+    assert "counts: FAIL" in out and f"apart from the backup's count: {short}" in out
     assert out.splitlines()[-1].startswith("restore drill: FAIL")
+
+
+def test_the_backup_counts_every_table_the_drill_matches():
+    from sleeve_fund.restore_drill import COUNTED
+    from sleeve_fund.store import metadata
+
+    script = (ROOT / "deploy" / "backup.sh").read_text()
+    money = {"decisions", "equity", "funding", "insurance", "fund_flows", "book_marks", "book_moves", "sleeve_archive",
+             "gate_reservations", "trials"}
+    assert money | {"sleeves", "orders", "fills", "events"} <= set(COUNTED) <= set(metadata.tables)
+    for t in COUNTED:
+        assert f"'{t}', (select count(*) from {t})" in script, t
+
+
+@needs_pg
+def test_a_status_from_before_the_wider_count_is_matched_on_what_it_counted(tmp_path, capfd):
+    """A backup taken before backup.sh counted the money tables: its four are matched, the rest are a note."""
+    from sleeve_fund import restore_drill
+
+    backups, dst = _night(tmp_path, counted=("sleeves", "orders", "fills", "events"))
+    assert restore_drill.main(["--backups", str(backups), "--db", dst]) == 0
+    line = next(ln for ln in capfd.readouterr().out.splitlines() if ln.startswith("counts"))
+    assert line.startswith("counts: PASS") and "not in the backup's count: book_marks" in line
 
 
 @needs_pg
@@ -137,12 +163,25 @@ def test_a_step_that_raises_prints_its_error_type_only(capfd):
 
 # --- the script, with a stand-in docker ---------------------------------------------------------------------------
 
-def _docker(bin_dir: Path, log: Path, fail_on: str = "") -> None:
+def _docker(bin_dir: Path, log: Path, fail_on: str = "", free: int = 10**9) -> None:
     bin_dir.mkdir(exist_ok=True)
+    disk = bin_dir.parent / "disk"
+    (disk / "backups").mkdir(parents=True, exist_ok=True)
+    (disk / "docker").mkdir(exist_ok=True)
+    (disk / "backups" / "sleeve_fund-20261014-0012.dump").write_bytes(b"x" * 10)
+    (disk / "backups" / "sleeve_fund-20261015-0012.dump").write_bytes(b"x" * 1000)  # the newest: 1000 bytes
+    (bin_dir / "df").write_text(f"""#!/usr/bin/env bash
+echo "df $*" >> {log}
+echo "Filesystem 1-blocks Used Available Capacity Mounted on"
+echo "/dev/x 99999999999 1 {free} 1% /"
+""")
+    (bin_dir / "df").chmod(0o755)
     (bin_dir / "docker").write_text(f"""#!/usr/bin/env bash
 echo "$*" >> {log}
 case "$*" in
   *"{fail_on or '@never@'}"*) echo "boom: secret-host /var/lib/data row" >&2; exit 1;;
+  "volume inspect"*Mountpoint*) echo {disk / "backups"};;
+  "info "*DockerRootDir*) echo {disk / "docker"};;
   "compose ps -q"*) echo cid-$4;;
   inspect*Mounts*) echo backups-volume;;
   inspect*Image*) echo some-image;;
@@ -156,9 +195,9 @@ exit 0
     (bin_dir / "sleep").chmod(0o755)
 
 
-def _run(tmp_path: Path, fail_on: str = "") -> tuple[subprocess.CompletedProcess, list[str]]:
+def _run(tmp_path: Path, fail_on: str = "", free: int = 10**9) -> tuple[subprocess.CompletedProcess, list[str]]:
     log = tmp_path / "docker.log"
-    _docker(tmp_path / "bin", log, fail_on)
+    _docker(tmp_path / "bin", log, fail_on, free)
     env = {**os.environ, "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}", "DRILL_ID": "drill-x"}
     done = subprocess.run(["bash", str(SCRIPT)], env=env, capture_output=True, text=True, timeout=60, check=False)
     return done, log.read_text().splitlines()
@@ -188,6 +227,38 @@ def test_the_script_removes_what_it_made_when_a_step_fails_and_prints_no_tool_ou
     assert calls[-3:] == ["rm -f drill-x-db", "network rm drill-x", "volume rm drill-x"]
     assert "secret-host" not in done.stdout + done.stderr and "/var/lib" not in done.stdout
     assert ": FAIL" in done.stdout or "checks: exit" in done.stdout
+
+
+@pytestmark_script
+@pytest.mark.parametrize("short_on", ["backups", "docker"])
+def test_the_script_refuses_to_start_without_twice_the_newest_dump_free(tmp_path, short_on):
+    """HoE: free disk on the backups' volume and on docker's root (where the drill's volume lands) must each be at
+    least twice the newest dump; else nothing is made and the log says so, without a path or a size."""
+    log = tmp_path / "docker.log"
+    _docker(tmp_path / "bin", log)
+    disk = tmp_path / "disk"
+    # df answers 1999 (one byte short of twice the newest dump) for the short path only
+    (tmp_path / "bin" / "df").write_text(f"""#!/usr/bin/env bash
+echo "df $*" >> {log}
+case "$*" in *{disk / short_on}*) free=1999;; *) free=2000;; esac
+echo "Filesystem 1-blocks Used Available Capacity Mounted on"
+echo "/dev/x 99999999999 1 $free 1% /"
+""")
+    env = {**os.environ, "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}", "DRILL_ID": "drill-x"}
+    done = subprocess.run(["bash", str(SCRIPT)], env=env, capture_output=True, text=True, timeout=60, check=False)
+    calls = log.read_text().splitlines()
+    assert done.returncode == 1
+    assert "not enough disk: FAIL" in done.stdout and str(disk) not in done.stdout and "1999" not in done.stdout
+    assert not any(c.startswith(("network create", "volume create", "run ")) for c in calls)  # nothing made
+    assert any(c.startswith("df") and str(disk / "backups") in c for c in calls)
+    assert any(c.startswith("df") and str(disk / "docker") in c for c in calls)
+
+
+@pytestmark_script
+def test_the_script_starts_with_exactly_twice_the_newest_dump_free(tmp_path):
+    done, calls = _run(tmp_path, free=2000)
+    assert done.returncode == 0, done.stdout
+    assert "disk: PASS" in done.stdout
 
 
 def test_the_workflow_is_by_hand_on_main_quiet_and_copies_nothing_off_the_server():
