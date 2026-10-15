@@ -11,7 +11,7 @@ from sleeve_fund.store import PUBLISHED_FEES, Store, make_engine, metadata
 from test_b8_instrument_terms import BTC_FUNDING, _sleeve, _symbol, _venue, b8, contract, hub  # noqa: F401 - autouse stubs
 
 NOW = datetime(2026, 10, 15, 12, 0, tzinfo=UTC)
-BOUNDS = {"maker": ("0", "0.0002"), "taker": ("0.0002", "0.0005")}
+BOUNDS = {"maker": ("0", "0.0002"), "taker": ("0.0002", "0.00055")}
 pytestmark = pytest.mark.no_maintenance_tables  # the venue's own tables (VS-1), not the tests' flat stand-in
 
 
@@ -40,7 +40,7 @@ def store(tmp_path):
     return s
 
 
-def _fees(store, at, taker="0.0005", maker="0.0002", source="fee-rate", **kw):
+def _fees(store, at, taker="0.00055", maker="0.0002", source="fee-rate", **kw):
     store.record_venue_fetch("BINANCE", "fee", "BTC/USDT", source=source, ok=True, account="paper-main", at=at,
                              payload={"symbol": "BTCUSDT", "maker": maker, "taker": taker}, bounds=BOUNDS, **kw)
 

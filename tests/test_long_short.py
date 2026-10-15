@@ -63,7 +63,7 @@ def test_markets_fees_and_validation():
 
     venue = FeeSchedule(Decimal("0.004"), Decimal("0.008"))
     assert markets.fees_for({}, venue) == venue
-    assert markets.fees_for({"market": "perp"}, venue).taker == Decimal("0.0005")
+    assert markets.fees_for({"market": "perp"}, venue).taker == Decimal("0.00055")
     assert markets.fees_for({"market": "perp-venue-fees"}, venue) == venue  # the stress case
     with pytest.raises(ValueError):
         markets.market_of({"market": "options"})
@@ -139,10 +139,10 @@ def test_ping_pong_on_a_perp_shorts_its_short_leg(prices, instrument):
     assert [t["side"] for t in (long1, short, long2)] == [1, -1, 1]
     assert short["entry_px"] == pytest.approx(101.5) and short["exit_px"] == pytest.approx(100.9)
     assert short["pnl"] == pytest.approx(short["qty"] * 0.6 - short["fees"])
-    # The low-fee perp schedule: 0.05% taker, not Kraken spot's 0.80%.
+    # The low-fee perp schedule: 0.055% taker, not Kraken spot's 0.80%.
     first = fills.iloc[0]
     fee = float(str(first["commissions"][0]).split()[0])
-    assert fee == pytest.approx(float(first["filled_qty"]) * 100 * 0.0005, abs=0.01)
+    assert fee == pytest.approx(float(first["filled_qty"]) * 100 * 0.00055, abs=0.01)
     # Ends short from 102: equity is the cash flows plus funding, marked at the close.
     assert res.exposure.iloc[-1] < 0
 
@@ -750,7 +750,7 @@ def test_a_long_short_strategy_clones_backtests_and_starts_as_long_short(client,
     result = c.get("/backtest?" + urlencode({**bt, "run": "1"}), auth=AUTH).text
     assert "Couldn't run it" not in result, result[result.find("Couldn't"):][:300]
     assert "Low-fee perpetual (simulated), long and short" in result
-    assert "0.02% maker, 0.05% taker" in result
+    assert "0.02% maker, 0.055% taker" in result
     run = store.backtests(limit=1)[0]
     saved = store.sleeve(run["sleeve"])
     assert saved.params.get("market") == "perp" and saved.params.get("allow_short") is True

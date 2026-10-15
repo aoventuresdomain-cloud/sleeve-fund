@@ -138,7 +138,10 @@ SHARED = {**{k: v for k, v in BASE.items() if k != "short"},
 
 @pytest.mark.parametrize("defn, params, want", [
     (SHARED, {}, (122, "4c9caef668e53419")),
-    ({**BASE, "exits": {"time_stop": {"bars": 45}}}, {"market": "perp", "allow_short": True}, (107, "8365dd00a2b62c2d")),
+    # FEE-LIVE 6a (HoE TEC): the perp taker 0.05% -> 0.055% only. At 0.05% this digest is still 8365dd00a2b62c2d; at
+    # 0.055% the same 107 fills keep their times, intents, sides and triggers, sized smaller for the fee (and the
+    # quantity-weighted fill price moving under 3e-7).
+    ({**BASE, "exits": {"time_stop": {"bars": 45}}}, {"market": "perp", "allow_short": True}, (107, "0ac4ae49e13e9071")),
 ])
 def test_g1_a_definition_with_shared_exits_loads_and_trades_as_it_did_before(defn, params, want, instrument):
     """HoQA: the fills (time, intent, side, quantity, price, trigger) of shared-exit definitions, digested on main

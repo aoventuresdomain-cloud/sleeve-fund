@@ -34,7 +34,7 @@ def _perp(store, name="ping-pong-ls-binance", desired="stopped"):
 
 def _fill(store, name, side, oid, ts, qty=0.01, price=60_000.0, intent="entry"):
     store.record_order(name, order_id=oid, side=side, qty=qty, intent=intent, reason="smoke", ts=ts)
-    store.book_fill(name, side=side, qty=qty, price=price, fee=round(qty * price * 0.0005, 8), order_id=oid,
+    store.book_fill(name, side=side, qty=qty, price=price, fee=round(qty * price * 0.00055, 8), order_id=oid,
                     trade_id=f"t-{oid}", ts=ts)
 
 
@@ -122,7 +122,7 @@ def test_journal_passes_a_round_trip_and_prints_the_fee_by_hand(capfd):
     _fill(store, "ping-pong-ls-binance", "SELL", "o2", T0 + timedelta(minutes=2), price=60_100.0, intent="exit")
     assert fs.journal("ping-pong-ls-binance", T0, store=store) == 0
     out = capfd.readouterr().out
-    assert "qty x price x taker = 0.30000000" in out and "B4 journal: PASS" in out
+    assert "qty x price x taker = 0.33000000" in out and "B4 journal: PASS" in out
 
 
 def test_journal_fails_an_open_order_a_funding_conflict_and_a_held_position(capfd):
