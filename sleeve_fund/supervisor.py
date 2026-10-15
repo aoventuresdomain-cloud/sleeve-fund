@@ -192,11 +192,20 @@ def positions_breaks(store: Store) -> list[str]:
     from sleeve_fund.store import fills_t
 
     out = []
+    # HOLD-STALE-1 (15 Oct 03:59 UK): a Strategy put away (withdrawn, or an earlier book's: a reset run, a clean slate's)
+    # keeps the last mark its runtime wrote, which can be a moment behind its closing fill for good. Skipped only when
+    # that is all it is: by its stored state, never its name, its journal flat and its last mark from before it was put
+    # away. A put-away Strategy still holding, or marked since, is a real fault and still breaks.
+    archived, earlier = store.archived(), store.previous_book()
+    out_at = {n: archived.get(n, earlier.get(n)) for n in set(store.withdrawn()) | set(earlier)}
     for s in store.sleeves():
         if not _in_book(store, s):
             continue
         last = store.last_equity(s.name)
         if last is None:
+            continue
+        at = out_at.get(s.name)
+        if at is not None and last["ts"] <= at and abs(store.journal_book(s.name, 0)["qty"]) <= 1e-12:
             continue
         signed = case((fills_t.c.side == "BUY", fills_t.c.qty), else_=-fills_t.c.qty)
         q = select(func.coalesce(func.sum(signed), 0)).where(fills_t.c.sleeve == s.name, fills_t.c.ts <= last["ts"])

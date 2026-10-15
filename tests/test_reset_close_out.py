@@ -223,3 +223,84 @@ def test_a_close_out_that_fails_part_way_writes_nothing(store):
     else:
         raise AssertionError("set-up: the journal row was written with no action")
     assert _close_out_rows(store) == [] and store.strategy_cash_pnl(r1) == D("-29.70")
+
+
+def test_an_old_books_run_with_a_stale_mark_never_holds_the_fresh_book(store):
+    """15 Oct 03:59 UK (prod): the old book's reset runs kept their last equity row from 5 Oct, which still showed a
+    position (0.077) their fills had closed. Once the re-base made the book fund-held, the identity poll compared them
+    and latched the hold, which the PM's Resume can't lift while the break stands. A Strategy outside the fresh book
+    (withdrawn, or an earlier book's: previous_book) is never part of its positions check."""
+    _make(store, "rsi-bands", 10_000)
+    _mark(store, T0)
+    _trade(store, "rsi-bands", -29.70, T0)
+    cash = float(store.journal_book("rsi-bands", 10_000)["cash"])
+    store.record_equity("rsi-bands", equity=cash, cash=cash, qty=0.077, price=1_000.0, benchmark=cash,
+                        ts=T0 + timedelta(seconds=30))  # the runtime's last mark, a moment behind its closing fill
+    run = _reset(store, "rsi-bands")
+    _mark(store, T0 + timedelta(minutes=1))
+    steps = []
+    for i in range(6):
+        code, _ = _pass(store, i)
+        if code != reset_book.WAIT:
+            break
+        _mark(store, T0 + timedelta(minutes=2 + i, seconds=30))
+    _mark(store, T0 + timedelta(minutes=20))
+    assert code == reset_book.DONE and supervisor.bridge_start(store) is not None
+    assert run in store.previous_book()
+    assert supervisor.positions_breaks(store) == []
+    sup = supervisor.Supervisor(store)
+    sup._check_identity(T0 + timedelta(minutes=21))
+    assert _holds(store) == [] and not sup.ledger.identity_hold()
+
+
+def _stale_run(store, name="rsi-bands", balance=10_000):
+    """The prod shape: a Strategy whose runtime's last mark (qty 0.077) is a moment behind the fill that closed it, then
+    reset, so the run carries that stale mark into the earlier book with a flat journal."""
+    _make(store, name, balance)
+    _mark(store, T0)
+    _trade(store, name, -29.70, T0)
+    _stale_mark(store, name, T0 + timedelta(seconds=30))
+    return _reset(store, name)
+
+
+def _stale_mark(store, name, ts, qty=0.077):
+    cash = float(store.journal_book(name, store.sleeve(name).starting_balance)["cash"])
+    store.record_equity(name, equity=cash, cash=cash, qty=qty, price=1_000.0, benchmark=cash, ts=ts)
+
+
+def test_h2_a_put_away_run_whose_journal_isnt_flat_still_breaks(store):
+    """HOLD-STALE-1 H2 (the guard's mutant): put away is not enough; a run whose fills don't net to flat is a real fault."""
+    run = _stale_run(store)
+    store.record_fill(run, side="BUY", qty=0.5, price=1_000.0, fee=0.0, order_id="late", trade_id="late",
+                      ts=T0 + timedelta(seconds=10))
+    assert run in store.previous_book()
+    assert [b.split(":")[0] for b in supervisor.positions_breaks(store)] == [run]
+
+
+def test_h3_a_strategy_in_the_book_whose_position_doesnt_tie_still_breaks(store):
+    """H3: the guard never widens to a Strategy still in the book."""
+    _make(store, "live", 10_000)
+    _mark(store, T0)
+    _trade(store, "live", 10, T0)
+    _stale_mark(store, "live", T0 + timedelta(seconds=30))
+    assert [b.split(":")[0] for b in supervisor.positions_breaks(store)] == ["live"]
+
+
+def test_h4_a_put_away_run_marked_since_it_was_put_away_still_breaks(store):
+    """H4: a run still writing marks after it was put away is a real fault, stale-looking or not."""
+    from sleeve_fund.store import utcnow
+
+    run = _stale_run(store)
+    _stale_mark(store, run, utcnow() + timedelta(minutes=1))
+    assert [b.split(":")[0] for b in supervisor.positions_breaks(store)] == [run]
+
+
+def test_h5_the_guard_keys_on_the_stored_state_never_the_runs_name(store):
+    """H5: a Strategy in the book named like a reset run ("--YYYYMMDDhhmmss") is checked like any other."""
+    name = "rsi-bands--20261006101139"
+    _make(store, name, 10_000)
+    _mark(store, T0)
+    _trade(store, name, -29.70, T0)
+    _stale_mark(store, name, T0 + timedelta(seconds=30))
+    assert name not in store.previous_book()
+    assert [b.split(":")[0] for b in supervisor.positions_breaks(store)] == [name]
