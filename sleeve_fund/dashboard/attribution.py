@@ -88,10 +88,21 @@ def fund(store: Store, sleeves, now: datetime, period: str = "all") -> dict:
     so is everything but the rows' P&L, before the book's first mark. The total runs to the last mark, not to `now`,
     because the rows have no upper bound either (every trade closed since the start): a period that ends before the
     last mark must bound both the rows and the total (HoE 15 Oct)."""
-    rows = []
-    for s in sleeves:
+    rows: dict[str, dict] = {}
+    names = {s.name for s in sleeves}
+    # A two-leg Strategy is one row under its first leg's name: the second leg ("<name>~2", parent set) adds into it.
+    for s in sorted(sleeves, key=lambda s: bool(getattr(s, "parent", None))):
         a = strategy(store, s.name, trips_of(store, s), now, period)
-        rows.append({"name": s.name, "pnl": a["pnl"], "contribution": a["contribution"], "trades": a["trades"]})
+        parent = getattr(s, "parent", None)
+        if parent in names and parent in rows:
+            r = rows[parent]
+            r["pnl"] += a["pnl"]
+            r["trades"] += a["trades"]
+            if r["contribution"] is not None and a["contribution"] is not None:
+                r["contribution"] += a["contribution"]
+            continue
+        rows[s.name] = {"name": s.name, "pnl": a["pnl"], "contribution": a["contribution"], "trades": a["trades"]}
+    rows = list(rows.values())
     base = _base(store, since(period, now))
     book = _book_now(store)
     out = {"rows": rows, "fund_start": base, "label": PERIODS[period], "fund": None, "total": None}
