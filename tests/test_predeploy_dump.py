@@ -106,7 +106,7 @@ def _tools(bin_dir: Path, log: Path, restore_ok: bool = True, copy: str = "0028 
         "psql": f'case "$*" in *predeploy_check*) echo "{copy}";; *) echo "0028 5 4 9 1 2 3";; esac',
     }
     for name, body in stubs.items():
-        (bin_dir / name).write_text(f'#!/usr/bin/env bash\necho "{name} $*" >> {log}\n{body}\n')
+        (bin_dir / name).write_text(f'#!/usr/bin/env bash\necho "{name} $PGHOST:$PGUSER $*" >> {log}\n{body}\n')
         (bin_dir / name).chmod(0o755)
 
 
@@ -115,7 +115,8 @@ def _run(tmp_path: Path, **kw) -> tuple[subprocess.CompletedProcess, list[str]]:
     log.touch()
     _tools(tmp_path / "bin", log, **kw)
     (tmp_path / "b").mkdir(exist_ok=True)
-    env = {**os.environ, "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}", "BACKUP_DIR": str(tmp_path / "b")}
+    env = {k: v for k, v in os.environ.items() if k not in ("PGHOST", "PGUSER")}
+    env |= {"PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}", "BACKUP_DIR": str(tmp_path / "b")}
     done = subprocess.run(["bash", str(SCRIPT)], env=env, capture_output=True, text=True, timeout=30, check=False)
     return done, log.read_text().splitlines()
 
@@ -145,6 +146,9 @@ def test_a_whole_copy_passes_and_is_never_named_like_a_nightly_dump(tmp_path):
     (dump,) = (tmp_path / "b").iterdir()
     assert re.fullmatch(r"predeploy-\d{8}-\d{6}\.pgdump", dump.name)
     assert any(c.startswith("pg_restore") and "--exit-on-error" in c for c in calls)
+    # the backup container's environment holds only the password: the journal's host and role are backup.sh's
+    tools = [c for c in calls if c.split(" ")[0] in ("pg_dump", "createdb", "dropdb", "pg_restore", "psql")]
+    assert len(tools) >= 7 and all(c.split(" ")[1] == "db:sleeve" for c in tools), tools
 
 
 def test_the_deploy_dumps_before_the_new_code_starts():
