@@ -147,7 +147,7 @@ def test_the_fee_is_booked_once_to_cash_and_only_the_liquidation_price_moves(mon
     (fill,) = [f for f in now.fills if f["order_id"] == entry_now["order_id"]]
     liq_now = entry_now["signal"]["position_liquidation_px"]
     liq_was = entry_was["signal"]["position_liquidation_px"]
-    assert liq_now - liq_was == pytest.approx(float(fill["fee"]) / float(fill["qty"]), rel=1e-6)
+    assert liq_now - liq_was == pytest.approx(float(fill["fee"]) / float(fill["qty"]), abs=0.1)  # both on the tick
 
 
 def test_the_liquidation_price_rounds_to_the_tick_toward_the_entry():
@@ -159,13 +159,20 @@ def test_the_liquidation_price_rounds_to_the_tick_toward_the_entry():
     raw = margin.isolated_liquidation(500_000.0, 1.0, entry, lev, MM, fees=0.1 + 1e-6)
     assert raw == pytest.approx(30_300.100001, abs=1e-7)
     assert margin.isolated_liquidation(500_000.0, 1.0, entry, lev, MM, fees=0.1 + 1e-6, tick=tick) == 30_300.2
-    # Short, qty -1: formula A binds, liq = (90,000 - fees) / 1.005; fees put it just short of 89,552.3
-    fees = 90_000.0 - 1.005 * (89_552.3 - 1e-6)
+    # Short, qty -1: formula A binds, liq = (90,000 - fees) / 1.005; fees put it just short of 89,552.2
+    fees = 90_000.0 - 1.005 * (89_552.2 - 1e-6)
     raw = margin.isolated_liquidation(500_000.0, -1.0, entry, lev, MM, fees=fees)
-    assert raw == pytest.approx(89_552.299999, abs=1e-7)
-    assert margin.isolated_liquidation(500_000.0, -1.0, entry, lev, MM, fees=fees, tick=tick) == 89_552.2
+    assert raw == pytest.approx(89_552.199999, abs=1e-7)
+    assert margin.isolated_liquidation(500_000.0, -1.0, entry, lev, MM, fees=fees, tick=tick) == 89_552.1
     # On the tick already: left there, never moved a tick by float noise in the division
     assert margin.isolated_liquidation(500_000.0, 1.0, entry, lev, MM, fees=0.5, tick=tick) == 30_300.5
     # The decision's estimate rounds the same way
     liq, _ = margin.entry_liquidation(500_000.0, 1.0, entry, 1, 0.0, MM, lev, tick=tick)
     assert liq == margin.isolated_liquidation(500_000.0 - entry, 1.0, entry, lev, MM, tick=tick)
+
+
+def test_a_long_fully_paid_for_still_has_nothing_to_liquidate_it():
+    """The fee off the margin never gives a 1x long a liquidation price: it is fully paid for, and its safety stop
+    and checks keep treating it so (test_stop_safety_qa, conservative 1x long)."""
+    assert margin.isolated_liquidation(500_000.0 - 60_000.0, 1.0, 60_000.0, 1.0, MM, fees=33.0) is None
+    assert margin.isolated_liquidation(500_000.0 + 60_000.0, -1.0, 60_000.0, 1.0, MM, fees=33.0) is not None  # a short

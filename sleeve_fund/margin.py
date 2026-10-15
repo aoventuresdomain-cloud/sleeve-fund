@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
+from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_EVEN, Decimal
 from typing import NamedTuple
 
 
@@ -129,7 +130,7 @@ def shifted_liquidation(liq: float | None, qty: float, funded: float, maintenanc
 
 
 def isolated_liquidation(cash: float, qty: float, entry: float, leverage: float, maintenance: Maintenance,
-                         fees: float = 0.0) -> float | None:
+                         fees: float = 0.0, tick: float | None = None) -> float | None:
     """The liquidation price of a position of qty opened at entry on isolated margin at this leverage: the nearer
     of the two formulas (nearer_liquidation, VS-1-TABLE). cash is the strategy's spot-style cash (its balance less
     qty x entry). fees are the entry fees the position still holds (the journal's replay_book entry_fees, or
@@ -137,12 +138,32 @@ def isolated_liquidation(cash: float, qty: float, entry: float, leverage: float,
     entry fee rate x the entry (LIQ-FEE: HoE and Advisor (a), 15 Oct; the QA master's C-NA3-LIQ). The fee is booked
     once, to cash, as before: only the liquidation price moves. None when flat, or when no positive price liquidates
     it (a long at 1x or less is fully paid for). The one liquidation function: the fill, the decision's estimate, a
-    restart's recompute and safety stop, and the dashboard all work it here."""
+    restart's recompute and safety stop, and the dashboard all work it here. With the instrument's tick, the result is
+    rounded to it toward the entry, up for a long and down for a short, so float error only brings it nearer
+    (Advisor MUST, LIQ-FEE close; to_tick)."""
     if qty == 0 or entry <= 0:
         return None
     # The balance (cash + qty x entry) is after the fee already: a cap at it takes nothing more off
-    margin = min(isolated_margin(qty, entry, leverage) - max(fees, 0.0), max(cash + qty * entry, 0.0))
-    return nearer_liquidation(margin - qty * entry, qty, entry, maintenance)
+    margin = min(isolated_margin(qty, entry, leverage), max(cash + qty * entry, 0.0))
+    if qty > 0 and margin >= qty * entry:
+        return None  # a long fully paid for: nothing liquidates it, its fee aside (the margin is all it can lose)
+    margin = min(margin, isolated_margin(qty, entry, leverage) - max(fees, 0.0))
+    return to_tick(nearer_liquidation(margin - qty * entry, qty, entry, maintenance), qty, tick)
+
+
+def to_tick(liq: float | None, qty: float, tick: float | None) -> float | None:
+    """A liquidation price on the tick grid, toward the entry: up for a long, down for a short. A value within a
+    millionth of a tick of a tick is that tick, so float noise in the division never moves it a whole tick."""
+    if liq is None or not tick or tick <= 0:
+        return liq
+    step = Decimal(str(tick))
+    n = Decimal(repr(liq)) / step
+    near = n.to_integral_value(ROUND_HALF_EVEN)
+    if abs(n - near) < Decimal("1e-6"):
+        n = near
+    else:
+        n = n.to_integral_value(ROUND_CEILING if qty > 0 else ROUND_FLOOR)
+    return float(n * step)
 
 
 def entry_fees_after(held: float, pos: float, q: float, fee: float, lot: float = 0.0) -> float:
@@ -161,11 +182,11 @@ def entry_fees_after(held: float, pos: float, q: float, fee: float, lot: float =
 
 
 def entry_liquidation(cash: float, qty: float, close: float, side: int, fee: float, maintenance: Maintenance,
-                      leverage: float) -> tuple[float | None, float]:
+                      leverage: float, tick: float | None = None) -> tuple[float | None, float]:
     """The liquidation price of an entry of qty at close once it fills (the fee paid, its notional over the
     leverage as its isolated margin: isolated_margin), and how far that is from close as a share of
     it (inf when none)."""
     notional = qty * close  # cash afterwards is spot-style, as the journal keeps it: the fee paid, the notional taken out
     liq = isolated_liquidation(cash - side * notional * (1 + side * fee), side * qty, close, leverage, maintenance,
-                               fees=notional * fee)  # off the margin, as the fill's will be (LIQ-FEE)
+                               fees=notional * fee, tick=tick)  # off the margin, as the fill's will be (LIQ-FEE)
     return liq, (abs(liq / close - 1) if liq is not None else float("inf"))

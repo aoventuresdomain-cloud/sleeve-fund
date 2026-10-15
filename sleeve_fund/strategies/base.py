@@ -1688,7 +1688,8 @@ class LongFlatStrategy(Strategy):
         if self._margin:
             lev = LongFlatStrategy._max_leverage(self)
             liq = markets.isolated_liquidation(cash + self._funded(), qty, entry, lev,
-                                               self._cfg.perp.maintenance_margin, fees=self._entry_fees)
+                                               self._cfg.perp.maintenance_margin, fees=self._entry_fees,
+                                               tick=LongFlatStrategy._tick(self))
         target = liq if liq is not None else 0.0
         if side * (mark - target) <= 0:
             return  # already through liquidation: the liquidation guard closes it
@@ -2488,7 +2489,7 @@ class LongFlatStrategy(Strategy):
         self._noted.discard("entry_refused_venue_terms")
         # CUT-A: the simulated account posts the margin, with the fund's virtual funding back in (_mark nets it out)
         liq, distance = entry_liquidation(cash + self._funded(), float(qty), close, side, self._cfg.assumed_taker_fee,
-                                          self._cfg.perp.maintenance_margin, lev)
+                                          self._cfg.perp.maintenance_margin, lev, tick=LongFlatStrategy._tick(self))
         if liq is not None:
             signal["liquidation_px"] = round(liq, 8)
             signal["leverage"] = round(notional / base, 4)  # of what it was sized off: the fund's equity inside it
@@ -4121,6 +4122,11 @@ class LongFlatStrategy(Strategy):
         an 8-decimal buy then leaves 1e-7 behind after a full exit, and reconcile halts (review round 9, B9-1)."""
         return max(self.instrument.size_increment.as_decimal(), Decimal(10) ** -lot_decimals(self.instrument))
 
+    def _tick(self) -> float | None:
+        """The instrument's price tick, which a liquidation price rounds to toward the entry (margin.to_tick)."""
+        inc = getattr(self.instrument, "price_increment", None) if self.instrument is not None else None
+        return float(inc) if inc is not None else None
+
     def _held_qty(self, qty: float) -> float:
         """A fill's quantity as the account holds it. A venue can print and fill at 8 lot decimals in a
         currency the engine keeps at 6 (XRP, ADA): the account rounds each fill to 6, so the journal must
@@ -4248,7 +4254,8 @@ class LongFlatStrategy(Strategy):
         lev = LongFlatStrategy._max_leverage(self)
         entry = self._entry_px if self._entry_px else self._net_position()[1]
         return markets.isolated_liquidation(cash + LongFlatStrategy._funded(self), qty, entry, lev,
-                                            self._cfg.perp.maintenance_margin, fees=self._entry_fees)
+                                            self._cfg.perp.maintenance_margin, fees=self._entry_fees,
+                                            tick=LongFlatStrategy._tick(self))
 
     def _position_opened(self, fills: list[dict]) -> int:
         """When the position held now opened (ns): its first fill since the journal was last flat or went through
