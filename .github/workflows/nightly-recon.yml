@@ -1,0 +1,40 @@
+name: nightly-recon
+# NIGHTLY-RECON, once by hand, read-only (HoE, 15 Oct): the night's comparison (python -m sleeve_fund.nightly_recon) run
+# now against the server journal, its PASS/FAIL/NOTE lines printed here, before NIGHTLY_ALERT lets a scheduled night's
+# FAIL reach the PM (deploy.yml). It opens the journal read-only (start_check.read_only_engine: Postgres refuses any
+# write in that session), writes nothing to the journal and raises no alert or event; its record goes to a scratch
+# folder inside the container, never RECON_DIR. Read-only is the only mode: unticking it refuses the run. It runs inside
+# the supervisor container with the deploy workflow's secrets (DEPLOY_HOST, DEPLOY_SSH_KEY) and variable DEPLOY_USER, as
+# start-check.yml does. The log is public: the command names no host, user, key path or database address, and ssh runs
+# quiet so its own messages don't either. The job fails when the night does (exit 1).
+on:
+  workflow_dispatch:
+    inputs:
+      read_only:
+        description: "Read-only: print the night's lines, write nothing, alert no one (the only mode)"
+        type: boolean
+        default: true
+concurrency: { group: nightly-recon, cancel-in-progress: false }
+jobs:
+  recon:
+    runs-on: ubuntu-24.04
+    permissions: { contents: read }
+    if: ${{ vars.DEPLOY_ENABLED == 'true' && github.ref == 'refs/heads/main' && inputs.read_only }}
+    env:
+      USER_AT: ${{ vars.DEPLOY_USER || 'root' }}
+    steps:
+      - name: Configure SSH
+        env:
+          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/id_deploy && chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts 2>/dev/null
+      - name: Run the night read-only
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+        # ssh and docker compose exec pass the exit code through: 0 PASS, 1 FAIL, and 255 is ssh itself failing (quiet,
+        # so it names no host or user).
+        run: |
+          ssh -o LogLevel=QUIET -i ~/.ssh/id_deploy "$USER_AT@$HOST" 'cd /opt/sleeve-fund && sudo docker compose exec -T supervisor python -m sleeve_fund.nightly_recon --dir /tmp/recon-preview'

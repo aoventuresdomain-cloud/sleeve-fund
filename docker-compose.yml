@@ -45,6 +45,7 @@ services:
       BACKUP_DIR: /data/backups  # read only: a late or failed backup raises an alert
       CLOCK_SERVER: time.aws.com  # the server clock is checked against it; drift past 250 ms raises an alert
       RECON_DIR: /data/recon  # the nightly dashboard-against-journal records; a FAIL raises an alert
+      NIGHTLY_ALERT: ${NIGHTLY_ALERT:-off}  # on: a FAIL alerts the PM; off: journaled only (deploy.yml)
     volumes: [history:/data/history:ro, backups:/data/backups:ro, recon:/data/recon]
     env_file:
       - path: kraken.env
