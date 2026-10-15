@@ -9,7 +9,7 @@ from decimal import Decimal as D
 
 import pandas as pd
 from sqlalchemy import select
-from test_exposure_gate_xfails import M, STD_T0, Plan, _events, _offline, _orders, run, store  # noqa: F401
+from test_exposure_gate_xfails import M, NAME, STD_T0, Plan, _events, _offline, _orders, run, store  # noqa: F401
 
 from sleeve_fund.gate_ledger import DbLedger
 from sleeve_fund.paper.portfolio_gate import paper_gate
@@ -96,6 +96,7 @@ def test_a_gated_entry_still_resting_at_the_next_bar_close_is_cancelled_and_its_
     order = {o["order_id"]: o for o in _orders(paper)}[held["order"]]
     assert order["status"] == "canceled", order
     assert [r.release_reason for r in _decisions(paper) if r.id == held["rid"]] == ["cancel"]
+    assert not paper.open_cancels(NAME)  # og6: its journalled cancel settled by the venue's confirmation
 
 
 def test_a_gated_entry_is_cancelled_at_the_next_close_even_when_that_bar_is_not_decided_on(
@@ -155,3 +156,45 @@ def test_a_paper_stopless_entry_is_measured_with_the_history_stores_daily_atr(mo
     s.runtime = SimpleNamespace(name="s1", backtest=False, now=lambda: END,
                                 store=SimpleNamespace(sleeve=lambda name: sleeve))
     assert s._entry_atr_pct() == 0.031 and asked == [("KRAKEN", "BTC/USD")]
+
+
+def test_a_crashed_strategys_resting_entry_is_cancelled_by_the_supervisor_and_released_at_its_restart(
+        tmp_path, store, monkeypatch):  # noqa: F811
+    """ORPHAN-GUARD og2 + og3 through the paper engine (HoE 13 Oct, the pair; Advisor 13 Oct 17:30 UK): the process
+    dies with a gated entry resting in its in-process venue; the supervisor marks it down and asks the cancel, which
+    nothing answers while it is down (the strategy blocked, the reservation held); the restart, a live process,
+    settles it as the venue's confirmed end: the cancel applied, the order ended and the reservation released as
+    'cancel', journalled with the owner_down event and the journal's fill total."""
+    from sleeve_fund.paper import orphan_guard as og
+
+    paper, held = _gated(store), {}
+
+    def attach(rt, kw):
+        (o,) = [o for o in _orders(paper) if o["intent"] == "entry"]
+        g = paper_gate(paper)(rt.name, _qa_intent(), pd.Timestamp(rt.now()).value)
+        g.attach(o["order_id"])
+        held.update(order=o["order_id"], rid=g.checked.reservation)
+
+    # The process dies inside the bar after the decision's: its bar-close cancel never runs.
+    run(tmp_path, paper, Plan(t0=STD_T0, minutes=3, rest=[(M(STD_T0, 2), 1, 70_000.0, 0.01)],
+                              hooks=[(M(STD_T0, 2) + pd.Timedelta(seconds=30), attach)]), monkeypatch)
+    assert held, "set-up: the hook never ran"
+    oid = held["order"]
+    assert {o["order_id"]: o for o in _orders(paper)}[oid]["status"] not in ("canceled", "expired"), "set-up"
+
+    down = M(STD_T0, 3).to_pydatetime()
+    og.owner_down(paper, NAME, down, "crash, exit code 1")
+    assert og.supervisor_pass(paper, down + timedelta(seconds=5)) == [oid]  # og2: asked within the 60 s
+    for m in (4, 30, 120):  # nothing answers while it is down: held and blocked, however long
+        og.supervisor_pass(paper, M(STD_T0, m).to_pydatetime())
+    assert og.resting_block(paper, NAME, M(STD_T0, 120).to_pydatetime())
+    assert [r.release_reason for r in _decisions(paper) if r.id == held["rid"]] == [None]
+
+    run(tmp_path, paper, Plan(t0=STD_T0 + pd.Timedelta(minutes=121), minutes=2, tag="r"), monkeypatch)
+    assert og.down_since(paper, NAME) is None and not paper.open_cancels(NAME)
+    assert {o["order_id"]: o for o in _orders(paper)}[oid]["status"] == "canceled"
+    assert [r.release_reason for r in _decisions(paper) if r.id == held["rid"]] == ["cancel"]
+    (told,) = [e["message"] for e in _events(paper) if e["kind"] == "sandbox_ended"]
+    (gone,) = [e for e in _events(paper) if e["kind"] == "owner_down"]
+    assert f"sandbox ended with owner_down (event {gone['id']}); journal fills 0" in told
+    assert og.resting_block(paper, NAME, M(STD_T0, 124).to_pydatetime()) is None
