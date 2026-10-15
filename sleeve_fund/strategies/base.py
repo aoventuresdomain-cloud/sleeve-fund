@@ -2202,7 +2202,7 @@ class LongFlatStrategy(Strategy):
             return
         self._noted.discard("buy_skipped")
         signal = {**values, "close": close, "side": _side_word(side), "sized_by": size_by,
-                  "budget": round(float(budget), 2)}
+                  "budget": round(float(budget), 2), **self._fund_at_entry(base)}
         notional = float(qty) * close
         # CUT-A: the simulated account posts the margin, with the fund's virtual funding back in (_mark nets it out)
         liq, distance = entry_liquidation(cash + self._funded(), float(qty), close, side, self._cfg.assumed_taker_fee,
@@ -3103,7 +3103,7 @@ class LongFlatStrategy(Strategy):
             return
         self._noted.discard("buy_skipped")
         signal = {**(values or {}), "close": bar.close.as_double(), "sized_by": size_by,
-                  "budget": round(float(budget), 2)}
+                  "budget": round(float(budget), 2), **self._fund_at_entry(base)}
         if self._stop_frac:
             # What this position loses if the stop is hit, costs included: one R, for the trade's R multiple.
             loss = self._loss_at_stop()
@@ -4928,7 +4928,13 @@ class LongFlatStrategy(Strategy):
         fees = (float(replay_book(rest, 0.0)["entry_fees"]) + sum(float(f["fee"]) for f in liq)
                 + notional * self.runtime.taker_fee)
         at_entry = None
-        if window:  # Y's base (Advisor 20:37): the equity at the position's first fill, flat then so all cash
+        if window and LongFlatStrategy._in_fund(self):
+            # F-FC-4 (Advisor 15 Oct ~02:35 UK): inside the fund, Y's base is the fund equity the position's first
+            # entry was sized off, journaled with it; None (Y reads "all") when it wasn't, never the Strategy's own.
+            first = next((o for o in store.orders(name, limit=100_000) if o["order_id"] == window[0]["order_id"]), {})
+            at_entry = (first.get("signal") or {}).get("fund_equity")
+            at_entry = None if at_entry is None else float(at_entry)
+        elif window:  # Y's base (Advisor 20:37): the equity at the position's first fill, flat then so all cash
             opened = window[0]["ts"]
             at_entry = float(replay_book(fills[:flat], self.runtime.starting_balance,
                                          store.funding_total(name, before=opened),
@@ -4952,11 +4958,13 @@ class LongFlatStrategy(Strategy):
         to one decimal under 10% so a small loss never reads 0% (QA P1-D17, P1-D20)."""
         lev = LongFlatStrategy._max_leverage(self)
         lost = markets.isolated_margin(qty, entry, lev) + fees
-        if before is None:
+        fund = LongFlatStrategy._in_fund(self)
+        if before is None and not fund:
             before = (self.runtime._last_equity or self.runtime.peak) if self.runtime is not None else 0.0
         share = (f"{lost / before:.1%}" if lost / before < 0.1 else f"{lost / before:.0%}") if before and before > 0 \
             else "all"
-        return f"{WIPED_OUT}: {lost:,.2f}, {share} of strategy equity at entry"
+        # F-FC-4: inside the fund, Y is of the fund's equity at entry (the Strategy's own starts at 0 there)
+        return f"{WIPED_OUT}: {lost:,.2f}, {share} of {'the fund' if fund else 'strategy equity'} at entry"
 
     def _liquidation_incident(self) -> None:
         """The incident the engine opens on every liquidation, once the position is gone (Advisor 18:17; 20:37: with
@@ -5109,6 +5117,17 @@ class LongFlatStrategy(Strategy):
 
         start = getattr(supervisor, "bridge_start", None)
         return start is not None and start(rt.store) is not None
+
+    def _fund_at_entry(self, base: float) -> dict:
+        """F-FC-4: inside the fund, the fund equity an entry was sized off (_sizing_base: net deposits + realised +
+        min(0, unrealised), at its mark), journaled with it: a liquidation's Y is its X over this, the position's first
+        entry's, through adds and partial reductions (Advisor 15 Oct ~02:35 UK). Nothing outside the fund."""
+        return {"fund_equity": round(float(base), 2)} if self._in_fund() else {}
+
+    def _in_fund(self) -> bool:
+        """Paper inside the fund (_fund_held), where the fund holds the cash and the Strategy's own equity starts at 0.
+        A research run handed the fund's figure keeps its own wording (F-FC-4 is paper's halt)."""
+        return LongFlatStrategy._fund_held(self)
 
     def _fund_held(self) -> bool:
         """Paper inside the fund (the portfolio gate on, and in the fund's book): the fund holds the cash, so the
