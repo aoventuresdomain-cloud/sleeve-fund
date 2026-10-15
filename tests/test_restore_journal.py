@@ -87,7 +87,7 @@ def test_a_proved_dump_replaces_the_journal_and_the_old_journal_is_kept_beside_i
         assert _count(old, "SELECT count(*) FROM events") == 3  # and the journal it replaced is whole, beside it
         assert "restore_stage_t" not in _databases()
     finally:
-        _drop("rj_src", *[d for d in _databases() if d.startswith("rj_live_before_restore_")])
+        _drop("rj_src", "rj_live", *[d for d in _databases() if d.startswith("rj_live_before_restore_")])
 
 
 # --- with stand-in Postgres tools ------------------------------------------------------------------------------------
@@ -191,7 +191,7 @@ def _host(tmp_path: Path, go: str = "pm-go", confirm: str | None = None, inner_o
 echo "$*" >> {log}
 case "$*" in
   "compose ps --services --status running") printf 'db\\nbackup\\ncaddy\\nsupervisor\\ndashboard\\nhub-binance\\n';;
-  *"backup bash -s") cat;;
+  *"backup bash -s") bash -s;;
   *"run --rm --no-deps migrate"*) {"exit 0" if migrate_ok else "exit 1"};;
 esac
 """)
