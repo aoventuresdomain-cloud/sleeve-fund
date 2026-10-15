@@ -59,3 +59,29 @@ def test_a_two_leg_strategy_is_made_with_0_in_the_fund_both_legs_at_0():
 def test_outside_the_fund_a_two_leg_strategy_still_needs_a_balance():
     with pytest.raises(TwoLegError, match="above 0"):
         _pair(Store.in_memory(), 0)
+
+
+def test_outside_the_fund_a_strategy_with_0_is_refused_at_start_with_a_clear_event(tmp_path, monkeypatch):
+    """F-ZS-1 (HoE, Drop A option B): before the fund holds the cash a Strategy is its own fund, so one with 0 could only
+    halt. The supervisor doesn't start it and a --db-sleeve process started by hand stops before it trades, each
+    saying why; inside the fund the same 0 starts."""
+    from sleeve_fund.paper.node import main
+    from sleeve_fund.supervisor import Supervisor
+
+    url = f"sqlite:///{tmp_path}/zs1.db"
+    monkeypatch.setenv("DATABASE_URL", url)
+    monkeypatch.setenv("SLEEVE_LOCK_DIR", str(tmp_path / "locks"))
+    store = Store(url)
+    store.create_sleeve(name="zero", strategy="ping_pong", instrument="BTC/USDT", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=0, params=PERP)
+
+    assert main(["--db-sleeve", "zero"]) == 1
+    sup = Supervisor(store, python="true")
+    assert sup._refused("zero")
+    refused = [e["message"] for e in store.events("zero") if e["kind"] == "start_refused"]
+    assert len(refused) == 2 and all("starting balance above 0" in m for m in refused), refused
+    assert store.sleeve("zero").status == "stopped" and store.sleeve("zero").desired_state == "stopped"
+
+    _fund(store)
+    store.set_desired_state("zero", "running")
+    assert not sup._refused("zero")  # in the fund a 0 is how every Strategy is made

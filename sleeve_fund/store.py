@@ -1313,6 +1313,12 @@ def is_dust(book: dict) -> bool:
     return 1e-12 < abs(book["qty"]) and abs(book["qty"]) * (book["entry_px"] or 0) < DUST_NOTIONAL
 
 
+def qty_words(qty: Decimal) -> str:
+    """A quantity as words read it, the same on every engine: Postgres hands a NUMERIC back at the column's scale
+    (1.000000000E-9), SQLite as 1E-9; plain digits either way, never an exponent (TEC-DUST-FMT)."""
+    return format(qty.normalize(), "f")
+
+
 def replay_book(fills, starting_balance, funding=0, insurance=0) -> dict:
     """Cash, signed position and average entry from fills in time order, plus funding received and any
     shortfall the venue's insurance fund took.
@@ -1621,6 +1627,17 @@ def _no_own_capital(store, name: str, starting_balance) -> None:
     if not is_backtest(name) and to_decimal(starting_balance or 0) != 0 and _fund_held(store):
         raise ValueError(f"Strategy {name} can't be made with {to_decimal(starting_balance):,.2f}: the fund holds the "
                          "cash, so a Strategy has no capital of its own; make it with 0")
+
+
+def check_own_capital(store, name: str, starting_balance) -> None:
+    """F-ZS-1 (HoE, Drop A): until the fund holds the cash a Strategy is its own fund, so one with no balance of its own
+    could only halt on its first bar. It is refused at start (the supervisor, and a --db-sleeve process started by
+    hand) rather than at creation. A saved backtest is neither."""
+    if is_backtest(name) or to_decimal(starting_balance or 0) > 0 or _fund_held(store):
+        return
+    raise ValueError(f"{name} has {to_decimal(starting_balance or 0):,.2f} of its own and the fund doesn't hold the "
+                     "cash yet, so it would have nothing to trade with: until the fund holds the cash a Strategy "
+                     "needs a starting balance above 0")
 
 
 @dataclass(frozen=True)
@@ -2191,6 +2208,43 @@ class Store:
             led = self.__dict__["_settle_ledger"] = DbLedger(self, no_book)
         return led
 
+    def close_dead_orders(self, sleeve: str, why: str, ts: datetime | None = None) -> list[str]:
+        """F-REFRESH-RES (HoE, Drop A SHOULD): a paper Strategy's process is confirmed stopped, so the simulated venue
+        its orders rested at went with it and none of them can fill. Each order the journal still shows open is
+        closed as canceled with `why` (its reservation released as 'cancel' with it, as any cancel's is), then every
+        reservation of the Strategy still active (one holding no order, or one an order left behind) is released as
+        'cancel' too, in one transaction with one event. Call it only after the process has exited (the caller checks
+        the process is gone). Refused for a live account: a venue order outlives the process. Returns the orders
+        closed."""
+        ts = ts or utcnow()
+        r = gate_reservations_t
+        held: list[str] = []  # a second leg's retry hold dies with its process too; put back if nothing commits
+        try:
+            with self.engine.begin() as c:
+                account = c.execute(select(sleeve_accounts_t.c.account)
+                                    .where(sleeve_accounts_t.c.sleeve == sleeve)).scalar() or "paper"
+                if account != "paper":
+                    raise ValueError(f"{sleeve} trades on a live account: its orders outlive its process, so none is "
+                                     "closed")
+                open_ids = [o for (o,) in c.execute(select(orders_t.c.order_id).where(
+                    orders_t.c.sleeve == sleeve, orders_t.c.status.in_(OPEN_ORDER_STATUSES)).order_by(orders_t.c.id))]
+                held = [o for o in open_ids if o in self._retry_held]
+                self._retry_held.difference_update(held)  # so each cancel below releases its room
+                for oid in open_ids:
+                    self._update_order(c, oid, status="canceled", message=f"closed: {why}")
+                sid = c.execute(select(sleeves_t.c.id).where(sleeves_t.c.name == sleeve)).scalar()
+                left = c.execute(update(r).where(r.c.sleeve_id == sid, r.c.released_at.is_(None))
+                                 .values(released_at=ts, release_reason="cancel")).rowcount
+                if open_ids or left:
+                    c.execute(insert(events_t).values(
+                        sleeve=sleeve, ts=ts, level="info", kind="orders_closed_stopped",
+                        message=f"{why}: its process has stopped, so {len(open_ids)} order(s) still shown open can't "
+                                "fill and are closed, and the room they or the Strategy held in the book is released"))
+        except Exception:
+            self._retry_held.update(held)
+            raise
+        return open_ids
+
     def _settle_reservation(self, c, order_id: str, fill_qty, status: str | None) -> None:
         """An entry's fills and end settle the reservation it holds, in the order's own transaction (HoQA w2b, w2c):
         a fill reduces it (filled to nothing, it is released as 'fill'); a filled order releases what is left as
@@ -2657,7 +2711,7 @@ class Store:
 
         def said() -> str:
             qty = dust_qty[0]
-            dust = f", with dust of {qty} no order can close, which leaves with it" if qty else ""
+            dust = f", with dust of {qty_words(qty)} no order can close, which leaves with it" if qty else ""
             return f"{sleeve} put away ({why}): its equity {seen[0][1]:,.2f} leaves the fund's book{dust}"
 
         # A clean slate's put-away (previous_book) starts a fresh book, so its emptying carries nothing (MUST-F286-H4)

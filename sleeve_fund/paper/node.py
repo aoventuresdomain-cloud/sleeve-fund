@@ -547,6 +547,14 @@ def main(argv: list[str] | None = None) -> int:
         row = store.sleeve(args.db_sleeve)
         if row.parent is not None:  # the supervisor never starts one: its first leg's process trades it
             raise SystemExit(f"{row.name} is the second leg of {row.parent}: it runs in {row.parent}'s process")
+        from sleeve_fund.store import check_own_capital
+
+        try:  # F-ZS-1: the supervisor refuses it too (_refused); this catches a process started by hand
+            check_own_capital(store, row.name, row.starting_balance)
+        except ValueError as exc:
+            if not store.holds_any(row.name):  # a holder still runs for its exits (venue_start, the safety stop)
+                store.event(row.name, "error", "start_refused", f"Not started: {exc}")
+                return 1
         row = venue_start(store, row)
         if row is None:
             return 1

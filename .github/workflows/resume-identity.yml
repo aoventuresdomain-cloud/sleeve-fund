@@ -1,0 +1,61 @@
+name: resume-identity
+# RECON-B only (HoE RESUME-WF, 14 Oct; PE2's subcommand): lift the book check's identity hold, ONLY on the PM's written
+# word, with the PM's reason quoted (python -m sleeve_fund.supervisor resume-identity). Run it by hand from main. A dry
+# run first (the default) prints the hold and whether the book adds up, and writes nothing. The real run (dry_run false)
+# lifts the hold, journaled with the actor and the reason, and exits 0; while the gap is still open it is refused and
+# exits 1, naming the gap: then stop and tell the HoE, never run it twice without the PM. It runs inside the supervisor
+# container, with the deploy workflow's secrets (DEPLOY_HOST, DEPLOY_SSH_KEY) and variable DEPLOY_USER, as
+# reset-book.yml does. The log is public: the command names no host, user, key path or database address, and ssh runs
+# quiet so its own messages don't either.
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Only print the hold and the gap (untick for the real run, on the PM's written word)"
+        type: boolean
+        default: true
+      actor:
+        description: "Who runs it on the PM's word, for the decision log (letters, digits, spaces, . _ -)"
+        type: string
+        required: true
+      reason:
+        description: "The PM's reason, quoted (letters, digits, spaces and . , : ; ! ? ( ) _ - only; 3 to 200)"
+        type: string
+        required: true
+concurrency: { group: resume-identity, cancel-in-progress: false }  # one run at a time; never cut one off mid-write
+jobs:
+  resume:
+    runs-on: ubuntu-24.04
+    permissions: { contents: read }
+    if: ${{ vars.DEPLOY_ENABLED == 'true' && github.ref == 'refs/heads/main' }}
+    env:
+      USER_AT: ${{ vars.DEPLOY_USER || 'root' }}
+    steps:
+      - name: Check the inputs
+        env:
+          ACTOR: ${{ inputs.actor }}
+          REASON: ${{ inputs.reason }}
+        # They go into the remote command line inside single quotes, so no quote, $ or backslash gets through.
+        run: |
+          actor_ok='^[A-Za-z0-9 ._-]{1,40}$'
+          reason_ok='^[A-Za-z0-9 .,:;!?()_-]{3,200}$'
+          [[ "$ACTOR" =~ $actor_ok ]] || { echo "actor: letters, digits, spaces, . _ - only"; exit 1; }
+          [[ "$REASON" =~ $reason_ok ]] || { echo "reason: letters, digits, spaces and . , : ; ! ? ( ) _ - only, 3 to 200"; exit 1; }
+      - name: Configure SSH
+        env:
+          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/id_deploy && chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts 2>/dev/null
+      - name: Lift the identity hold
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          ACTOR: ${{ inputs.actor }}
+          REASON: ${{ inputs.reason }}
+          DRY: ${{ inputs.dry_run && '--dry-run' || '' }}
+        # ssh and docker compose exec pass the command's exit code through: 0 lifted (dry run: a hold to lift), 1 refused
+        # naming the gap, and 255 is ssh itself failing (quiet, so it names no host or user).
+        run: |
+          ssh -o LogLevel=QUIET -i ~/.ssh/id_deploy "$USER_AT@$HOST" "cd /opt/sleeve-fund && sudo docker compose exec -T supervisor python -m sleeve_fund.supervisor resume-identity --actor '$ACTOR' --reason '$REASON' $DRY"

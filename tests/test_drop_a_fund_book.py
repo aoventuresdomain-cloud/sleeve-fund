@@ -13,6 +13,7 @@ import pytest
 from test_halt_ref import T0, _make, _mark, _settle, _state, _trade, store  # noqa: F401
 
 from sleeve_fund import supervisor
+from sleeve_fund.gate_ledger import DbLedger
 
 MIN = timedelta(minutes=1)
 
@@ -208,3 +209,57 @@ def test_a_second_rebase_counts_capital_from_its_own_flow_not_one_applied_at_the
     st = _mark(store, T0 + MIN)
     assert [e[1] for e in _ended(store)] == [True, True, True]
     assert supervisor.fund_book(store).capital == D(50_000) == st.equity
+
+
+def _covered(store, name, intent, at, oid):
+    """A fill on an order of `intent` that left `name` 300 below zero, and the insurance credit naming it."""
+    store.record_order(name, order_id=oid, side="SELL", qty=1.0, intent=intent, reason="QA", signal={}, ts=at)
+    store.record_fill(name, side="BUY", qty=1.0, price=1_000.0, fee=0.0, order_id=f"{oid}-in", trade_id=f"{oid}-in",
+                      ts=at)
+    store.record_fill(name, side="SELL", qty=1.0, price=700.0, fee=0.0, order_id=oid, trade_id=f"{oid}-t", ts=at)
+    store.record_insurance(name, price=700.0, amount=300.0, order_id=oid, trade_id=f"{oid}-t", ts=at)
+
+
+def test_an_insurance_credit_naming_no_liquidation_fill_holds_entries_with_one_alert(store):  # noqa: F811
+    """MUST-FUNDCASH-LOSS (HoE): a 0-capital Strategy's stop-out loss credited back as insurance hides from the cash
+    leg (both readers count insurance); the insurance leg holds new entries, alerts once, and a Resume lifts it for
+    that credit."""
+    _rebased(store)
+    _make(store, "x", 0)
+    _covered(store, "x", "stop_loss", T0 + MIN, "s1")
+    _mark(store, T0 + 2 * MIN)
+    _mark(store, T0 + 3 * MIN)
+    assert len(_alerts(store)) == 1 and "x: an insurance credit of 300.00" in _alerts(store)[0]
+    assert _entry(store, T0 + 3 * MIN).outcome == "rejected"
+    with pytest.raises(ValueError, match="must name"):
+        store.record_insurance("x", price=1.0, amount=1.0, ts=T0 + 3 * MIN)
+    supervisor.resume_identity_hold(store, "pm", "QA: the credit is QD's bug, fixed", now=T0 + 4 * MIN)
+    _mark(store, T0 + 5 * MIN)
+    assert _entry(store, T0 + 5 * MIN).outcome == "approved" and len(_alerts(store)) == 1
+
+
+def test_an_insurance_credit_even_for_a_liquidation_fill_holds_inside_the_fund(store):  # noqa: F811
+    """TEC-INSURE-ZERO (HoE): inside the fund every liquidation is booked at the bankruptcy price, so no credit is due."""
+    _rebased(store)
+    _make(store, "x", 0)
+    _covered(store, "x", "liquidation", T0 + MIN, "l1")
+    _mark(store, T0 + 2 * MIN)
+    assert len(_alerts(store)) == 1 and "x: an insurance credit of 300.00" in _alerts(store)[0]
+    assert _entry(store, T0 + 2 * MIN).outcome == "rejected"
+
+
+def test_the_resume_identity_command_dry_runs_then_lifts_the_hold_on_the_pms_word(store, monkeypatch, capfd):  # noqa: F811
+    """The runbook's path (PE1, HoE): python -m sleeve_fund.supervisor resume-identity, dry run first."""
+    _rebased(store)
+    _make(store, "x", 0)
+    _trade(store, "x", 100, T0 + MIN)
+    fix = _broken(store, monkeypatch)
+    _mark(store, T0 + 2 * MIN)
+    monkeypatch.setattr(supervisor, "Store", lambda **k: store)
+    args = ["resume-identity", "--actor", "operator", "--reason", "PM: checked the double count"]
+    assert supervisor.main(args) == 1 and "still doesn't add up by -0.02" in capfd.readouterr().out
+    fix()
+    assert supervisor.main([*args, "--dry-run"]) == 0 and "book check hold:" in capfd.readouterr().out
+    assert DbLedger(store, lambda: ()).identity_hold()
+    assert supervisor.main(args) == 0 and "resumed" in capfd.readouterr().out
+    assert not DbLedger(store, lambda: ()).identity_hold()
