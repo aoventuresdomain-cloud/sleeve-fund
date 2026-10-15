@@ -39,7 +39,7 @@ createdb "$CHECK" 2>/dev/null || { rc=$?; echo "pre-deploy dump: FAIL, couldn't 
 pg_restore --no-owner --no-privileges --exit-on-error -d "$CHECK" "$f.part" 2>/dev/null \
   || { rc=$?; echo "pre-deploy dump: FAIL, it didn't restore (exit $rc)"; exit 1; }
 copy=$(psql -d "$CHECK" -At -c "$COUNT" 2>/dev/null) || { rc=$?; echo "pre-deploy dump: FAIL, couldn't read the copy (exit $rc)"; exit 1; }
-dropdb "$CHECK"
+dropdb "$CHECK" >/dev/null 2>&1 || true  # the exit trap drops it again if this one failed (CR nit)
 read -r -a b <<< "$before"; read -r -a a <<< "$after"; read -r -a c <<< "$copy"; read -r -a n <<< "$NAMES"
 [ "${c[0]}" = "${b[0]}" ] && [ "${c[0]}" = "${a[0]}" ] \
   || { echo "pre-deploy dump: FAIL, the copy is at another migration"; exit 1; }

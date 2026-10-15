@@ -96,16 +96,17 @@ def test_a_real_journal_is_dumped_and_restores_whole_and_only_three_are_kept(tmp
 # --- with stand-in Postgres tools ------------------------------------------------------------------------------------
 
 def _tools(bin_dir: Path, log: Path, restore_ok: bool = True, copy: str = "0028 5 4 9 1 2 3",
-           dump_ok: bool = True, read_ok: bool = True) -> None:
+           dump_ok: bool = True, read_ok: bool = True, make_ok: bool = True, copy_ok: bool = True) -> None:
     bin_dir.mkdir(exist_ok=True)
     stubs = {
         "pg_dump": ('while [ $# -gt 0 ]; do [ "$1" = -f ] && { echo dump > "$2"; }; shift; done' if dump_ok
                     else "echo 'pg_dump: error: secret-host' >&2; exit 1"),
-        "createdb": "exit 0",
+        "createdb": "exit 0" if make_ok else "echo 'createdb: error: secret-host' >&2; exit 3",
         "dropdb": "exit 0",
         "pg_restore": "exit 0" if restore_ok else "echo 'pg_restore: error: secret-host row' >&2; exit 1",
         # the live journal answers the same before and after; the scratch copy answers $copy
-        "psql": (f'case "$*" in *predeploy_check*) echo "{copy}";; *) echo "0028 5 4 9 1 2 3";; esac' if read_ok
+        "psql": (f'case "$*" in *predeploy_check*) {f"echo {copy!r}" if copy_ok else "exit 4"};; '
+                 '*) echo "0028 5 4 9 1 2 3";; esac' if read_ok
                  else "echo 'psql: error: secret-host' >&2; exit 2"),
     }
     for name, body in stubs.items():
@@ -184,7 +185,9 @@ echo "/dev/x 99999999999 1 {free} 1% /"
 
 
 @pytest.mark.parametrize("kw, words", [({"dump_ok": False}, "the dump didn't complete (exit 1)"),
-                                       ({"read_ok": False}, "couldn't read the journal (exit 2)")])  # HoE: the code
+                                       ({"read_ok": False}, "couldn't read the journal (exit 2)"),
+                                       ({"make_ok": False}, "couldn't make the scratch database (exit 3)"),
+                                       ({"copy_ok": False}, "couldn't read the copy (exit 4)")])  # HoE; CR pins
 @needs_bash
 def test_a_tool_that_fails_says_so_and_leaves_nothing(tmp_path, kw, words):
     """QT3 N2: a failed pg_dump (or psql) once exited through set -e with no line in the deploy log."""
