@@ -148,6 +148,8 @@ def test_the_database_refuses_an_edit_or_a_delete(store, engine):
     "venue='BINANCE', kind='fee', ok=1, reason='', payload='{}', account='nobody'",  # a known account
 ])
 def test_the_database_holds_the_shape_whatever_writes_it(store, engine, cols):
+    if "nobody" in cols and engine.dialect.name == "sqlite":
+        pytest.skip("the project's SQLite runs without PRAGMA foreign_keys; Postgres holds the account link")
     with pytest.raises(IntegrityError), engine.begin() as c:
         _raw_insert(c, cols)
     with engine.begin() as c:  # the control: the same statement with good values is taken, so each refusal is its own
@@ -210,3 +212,16 @@ def test_0029_downgrade_refuses_while_fetches_are_kept(engine):
         command.downgrade(schema._config(conn), "-1")
     with engine.begin() as c:
         c.execute(text("DROP TABLE venue_terms_fetch"))
+
+
+def test_the_published_vip0_stand_in_is_good_and_says_it_is_published_not_the_accounts(store):
+    """Advisor HEAD3: an account with no fee endpoint trades at the venue's published VIP0 schedule, labelled and
+    alerted. It is a good row whose source is PUBLISHED_FEES, so the start check and the dashboard can tell it apart
+    from a rate the account reported."""
+    from sleeve_fund.store import PUBLISHED_FEES
+
+    row_id = _fee(store, T, source=PUBLISHED_FEES)
+    good = store.latest_good_venue_fetch("BINANCE", "fee", "BTC/USDT")
+    assert PUBLISHED_FEES == "published-vip0" and good["id"] == row_id and good["source"] == PUBLISHED_FEES
+    account = _fee(store, T + timedelta(hours=1))
+    assert store.latest_good_venue_fetch("BINANCE", "fee", "BTC/USDT")["id"] == account
