@@ -415,3 +415,25 @@ def test_f_sc_1_once_the_fund_holds_the_book_its_figures_count_the_fund_s_cash(s
     _mark(store, T0 + timedelta(minutes=23))
     assert supervisor.book_figures(store).startswith("from 100,000.00, equity 100,012.50, ")
     assert supervisor.fund_book(store).total == D("100012.50")
+
+
+def test_f_sc1_1_a_held_position_with_no_mark_shows_no_mark_and_the_fund_s_equity_reader_still_refuses(store):
+    """CR F-SC1-1: under the bridge `supervisor book` read the fund's book, which raises while a held position has no
+    mark, so the deploy log's line crashed where it used to print. It shows the position as not marked, with its
+    quantity; the fund's own reader (fund_book, which the mark and sizing read) still refuses to mark it."""
+    import pytest
+
+    _fund_held(store)
+    _make(store, "held", 0)
+    _mark(store, T0 + timedelta(minutes=21))
+    store.record_fill("held", side="BUY", qty=0.5, price=1_000.0, fee=0.0, order_id="h1", trade_id="h1",
+                      ts=T0 + timedelta(minutes=22))
+    with store.engine.begin() as c:  # its marks gone: a position the supervisor hasn't marked
+        from sqlalchemy import delete
+
+        from sleeve_fund.store import equity_t
+        c.execute(delete(equity_t).where(equity_t.c.sleeve == "held"))
+    with pytest.raises(RuntimeError, match="no mark"):
+        supervisor.fund_book(store)
+    assert supervisor.book_figures(store) == ("from 100,000.00, equity not marked (held holds 0.5 with no mark), "
+                                              "fees 0.00, positions held, first mark none")
