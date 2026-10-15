@@ -36,9 +36,16 @@ while true; do
     dropdb --if-exists restore_check 2>/dev/null
     if createdb restore_check 2>"$DIR/last_error.txt" \
        && pg_restore --no-owner -d restore_check "$f" 2>"$DIR/last_error.txt"; then
+      # The rows the restore drill (restore_drill.py COUNTED) matches against: the trades and the money history.
       counts=$(psql -d restore_check -At -c "select json_build_object('sleeves', (select count(*) from sleeves), \
         'orders', (select count(*) from orders), 'fills', (select count(*) from fills), \
-        'events', (select count(*) from events))" 2>"$DIR/last_error.txt")
+        'events', (select count(*) from events), 'decisions', (select count(*) from decisions), \
+        'equity', (select count(*) from equity), 'funding', (select count(*) from funding), \
+        'insurance', (select count(*) from insurance), 'fund_flows', (select count(*) from fund_flows), \
+        'book_marks', (select count(*) from book_marks), 'book_moves', (select count(*) from book_moves), \
+        'sleeve_archive', (select count(*) from sleeve_archive), \
+        'gate_reservations', (select count(*) from gate_reservations), \
+        'trials', (select count(*) from trials))" 2>"$DIR/last_error.txt")
       if [ -n "$counts" ]; then
         status true "$(basename "$f")" "dumped and restored into a scratch database" "$counts"
         wait=86400

@@ -134,7 +134,8 @@ def test_a_status_from_before_the_wider_count_is_matched_on_what_it_counted(tmp_
     backups, dst = _night(tmp_path, counted=("sleeves", "orders", "fills", "events"))
     assert restore_drill.main(["--backups", str(backups), "--db", dst]) == 0
     line = next(ln for ln in capfd.readouterr().out.splitlines() if ln.startswith("counts"))
-    assert line.startswith("counts: PASS") and "not in the backup's count: book_marks" in line
+    assert line.startswith("counts: PASS") and "as the backup counted; not in the backup's count: decisions" in line
+    assert "book_marks" in line.split("not in the backup's count")[1]
 
 
 @needs_pg
@@ -250,15 +251,14 @@ echo "/dev/x 99999999999 1 $free 1% /"
     assert done.returncode == 1
     assert "not enough disk: FAIL" in done.stdout and str(disk) not in done.stdout and "1999" not in done.stdout
     assert not any(c.startswith(("network create", "volume create", "run ")) for c in calls)  # nothing made
-    assert any(c.startswith("df") and str(disk / "backups") in c for c in calls)
-    assert any(c.startswith("df") and str(disk / "docker") in c for c in calls)
+    assert any(c.startswith("df") and str(disk / short_on) in c for c in calls)
 
 
 @pytestmark_script
 def test_the_script_starts_with_exactly_twice_the_newest_dump_free(tmp_path):
     done, calls = _run(tmp_path, free=2000)
     assert done.returncode == 0, done.stdout
-    assert "disk: PASS" in done.stdout
+    assert "disk: PASS" in done.stdout and any(c.startswith("exec drill-x-db pg_restore") for c in calls)
 
 
 def test_the_workflow_is_by_hand_on_main_quiet_and_copies_nothing_off_the_server():

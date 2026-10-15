@@ -4,7 +4,7 @@ volume, never the journal's; this then checks what came back, step by step, each
 
 - backup: the newest dump is the one the backup's own restore check last passed (status.json), and how old it is;
 - migrate: the restored journal brought to the newest migration (schema.migrate), alembic_version at head;
-- counts: the rows the backup's check counted (sleeves, orders, fills, events) came back, exactly;
+- counts: the rows the backup's check counted (the trades and the money history, COUNTED) came back, exactly;
 - tables: every table's rows, the history the fund's figures are rebuilt from;
 - links: every row's parent is there (each foreign key in the schema, orphans counted);
 - research: the archive beside the dump reads back whole (the idea ledger and the tear sheets);
@@ -27,7 +27,9 @@ from pathlib import Path
 
 PASS, FAIL, NOTE = "PASS", "FAIL", "NOTE"
 DUMP = re.compile(r"^sleeve_fund-(\d{8})-(\d{4})\.dump$")  # deploy/backup.sh's name: the UTC date and time it ran
-COUNTED = ("sleeves", "orders", "fills", "events")  # what the backup's own restore check counts (backup.sh)
+# What the backup's own restore check counts (backup.sh's json_build_object): the trades and the money history
+COUNTED = ("sleeves", "orders", "fills", "events", "decisions", "equity", "funding", "insurance", "fund_flows",
+           "book_marks", "book_moves", "sleeve_archive", "gate_reservations", "trials")
 
 
 class Drill:
@@ -70,14 +72,21 @@ def check_backup(backups: Path, dump: Path, now: datetime) -> tuple[str, str]:
 def check_counts(engine, backups: Path) -> tuple[str, str]:
     from sqlalchemy import text
 
+    from sleeve_fund.store import metadata
+
     want = json.loads((backups / "status.json").read_text()).get("restored") or {}
+    # Every table the backup counted (a name it counted that the schema hasn't is a FAIL, never a query); a COUNTED
+    # table missing from it is a backup taken before backup.sh counted it: a note, not a fail.
+    names = [t for t in COUNTED if t in want] + sorted(t for t in want if t not in COUNTED)
     with engine.connect() as c:
-        got = {t: c.execute(text(f"SELECT count(*) FROM {t}")).scalar() for t in COUNTED}
-    words = ", ".join(f"{t} {got[t]}" for t in COUNTED)
-    apart = [t for t in COUNTED if want.get(t) != got[t]]
-    if apart:
-        return FAIL, words + f"; apart from the backup's count: {', '.join(apart)}"
-    return PASS, words + ", as the backup counted"
+        got = {t: c.execute(text(f"SELECT count(*) FROM {t}")).scalar() for t in names if t in metadata.tables}
+    words = ", ".join(f"{t} {got[t]}" for t in names if t in got)
+    apart = [t for t in names if want.get(t) != got.get(t)]
+    unseen = [t for t in COUNTED if t not in want]
+    note = f"; not in the backup's count: {', '.join(unseen)}" if unseen else ""
+    if apart or not want:
+        return FAIL, words + f"; apart from the backup's count: {', '.join(apart) or 'no count'}" + note
+    return PASS, words + ", as the backup counted" + note
 
 
 def check_tables(engine) -> tuple[str, str]:

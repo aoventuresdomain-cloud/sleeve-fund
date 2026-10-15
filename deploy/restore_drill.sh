@@ -31,6 +31,17 @@ image_of() {
 BACKUPS=$(mount_of backup /backups) && [ -n "$BACKUPS" ] || fail "find the backups"
 PG_IMAGE=$(image_of db) && [ -n "$PG_IMAGE" ] || fail "find the database image"
 APP_IMAGE=$(image_of supervisor) && [ -n "$APP_IMAGE" ] || fail "find the app image"
+# The restore lands in a volume under docker's root, beside the backups' disk: each must have twice the newest dump
+# free (HoE), or nothing is made. Sizes and paths stay out of the log.
+BK_DIR=$(docker volume inspect -f '{{.Mountpoint}}' "$BACKUPS" 2>/dev/null) && [ -n "$BK_DIR" ] || fail "find the backups"
+NEWEST=$(ls -1 "$BK_DIR"/sleeve_fund-*.dump 2>/dev/null | sort | tail -n 1)
+SIZE=$(stat -c %s "$NEWEST" 2>/dev/null) && [ -n "$SIZE" ] || fail "find the newest dump"
+DOCKER_ROOT=$(docker info -f '{{.DockerRootDir}}' 2>/dev/null) && [ -n "$DOCKER_ROOT" ] || fail "find docker's disk"
+for dir in "$BK_DIR" "$DOCKER_ROOT"; do
+  free=$(df -PB1 "$dir" 2>/dev/null | awk 'NR == 2 { print $4 }')
+  [[ "$free" =~ ^[0-9]+$ ]] && [ "$free" -ge $((2 * SIZE)) ] || fail "not enough disk"
+done
+echo "disk: PASS, at least twice the newest dump free"
 docker network create --internal "$NET" >/dev/null 2>&1 || fail "make the drill's network"
 docker volume create "$VOL" >/dev/null 2>&1 || fail "make the drill's volume"
 docker run -d --name "$PG" --network "$NET" -v "$VOL:/var/lib/postgresql/data" -v "$BACKUPS:/backups:ro" \
