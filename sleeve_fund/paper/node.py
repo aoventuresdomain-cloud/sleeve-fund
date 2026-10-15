@@ -401,6 +401,10 @@ def _strategy(sleeve: SleeveConfig, profile, classes, instrument_id: str, bar_ty
     )
     if profile.ohlc_history is not None and hub is None:
         strategy.attach_gap_loader(gap_loader(sleeve.instrument, profile.ohlc_history))
+    if profile.trade_history is not None:
+        # GAP-DOWN: a stop replayed after an outage reads its trigger minute's trades from the venue (public data)
+        trades, pair = profile.trade_history, sleeve.instrument
+        strategy.attach_trade_loader(lambda start_ns, end_ns: trades(pair, start_ns // 1_000_000, end_ns // 1_000_000))
     if runtime is not None:
         # The measured spread in force at each time, read where there are no quotes yet and by a replay after an
         # outage; refreshed hourly as new measurements land (SPREAD-PIT).
