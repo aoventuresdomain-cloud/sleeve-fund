@@ -164,9 +164,7 @@ def digest(store, now: datetime, backup_dir=None, since: datetime | None = None)
             lines.append(f"  {r['sleeve']}: {last['qty']:g} at {_money(last['price'])}, {stop}")
     else:
         lines.append("Open positions: none")
-    events = [e for e in store.events_after(0, limit=100_000) if _aware(e["ts"]) > day_ago]
-    n_warn = sum(e["level"] == "warning" for e in events)
-    n_err = sum(e["level"] in ("error", "critical") for e in events)
+    n_warn, n_err = alert_counts(store, day_ago, now)
     lines.append(f"Alerts since the last digest: {n_warn} warning{'s' if n_warn != 1 else ''}, "
                  f"{n_err} error{'s' if n_err != 1 else ''}")
     issue = backups.problem(backup_dir, now) if backup_dir else None
@@ -176,6 +174,22 @@ def digest(store, now: datetime, backup_dir=None, since: datetime | None = None)
     clk = store.last_event(None, ("clock_ok", "clock_drift", "clock_unchecked"))
     lines.append("Clock: " + (clk["message"] if clk else "not checked yet"))
     return no_venues("\n".join(lines))
+
+
+def alert_counts(store, since: datetime, until: datetime) -> tuple[int, int]:
+    """Warnings and errors journaled in (since, until], counted by the database with no cap (HoQA A15-M1: a capped
+    read of the oldest rows reports none once the journal holds more than the cap). Saved backtests' never count."""
+    from sqlalchemy import func, select
+
+    from sleeve_fund.store import _not_backtest, events_t
+
+    q = (select(events_t.c.level, func.count()).where(events_t.c.ts > since, events_t.c.ts <= until,
+                                                     _not_backtest(events_t.c.sleeve),
+                                                     events_t.c.level.in_(("warning", "error")))
+         .group_by(events_t.c.level))
+    with store.engine.connect() as c:
+        n = dict(c.execute(q).all())
+    return n.get("warning", 0), n.get("error", 0)
 
 
 def _aware(ts: datetime) -> datetime:

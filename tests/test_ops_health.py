@@ -255,7 +255,9 @@ def test_4b_it_goes_once_a_day_at_08_00_uk_even_on_a_quiet_day_and_a_failed_send
     d.step(T0 + timedelta(minutes=59))  # 07:59 UK
     assert sent == [] and _kinds(store, "digest_send_failed") == []
     d.step(T0 + timedelta(hours=1))  # 08:00 UK: due, and the send fails
-    assert sent == [] and len(_kinds(store, "digest_send_failed")) == 1
+    d.step(T0 + timedelta(hours=1, seconds=30))
+    d.step(T0 + timedelta(hours=1, seconds=59))
+    assert sent == [] and len(_kinds(store, "digest_send_failed")) == 1  # HoQA A15-F1: once per outage, not per step
     fail[0] = False
     d.step(T0 + timedelta(hours=1, minutes=1))
     d.step(T0 + timedelta(hours=5))
@@ -405,3 +407,21 @@ def test_2e_the_hub_relay_feeds_the_watch_from_its_ticks_and_journals_on_the_sto
     r._seen_ns[BTC] = now
     r._check_stale()
     assert [a[2] for a, _ in events] == ["hub_data_stale", "hub_data_back"]
+
+
+def test_4j_alerts_are_counted_however_many_the_journal_holds():
+    """HoQA A15-M1: a capped read of the oldest events reported 0 errors past 100,000 old warnings. Counted in SQL."""
+    from sqlalchemy import insert
+
+    from sleeve_fund.ops_health import alert_counts, digest
+    from sleeve_fund.store import events_t
+
+    store = Store.in_memory()
+    old = T0 - timedelta(days=3)
+    with store.engine.begin() as c:
+        c.execute(insert(events_t), [{"sleeve": None, "ts": old, "level": "warning", "kind": "w", "message": "old"}
+                                     for _ in range(100_001)])
+    store.event(None, "error", "x", "an hour ago", ts=T0)
+    store.event("bt:1", "error", "x", "a saved backtest's", ts=T0)
+    assert alert_counts(store, T0 - timedelta(days=1), T0 + timedelta(hours=1)) == (0, 1)
+    assert "0 warnings, 1 error" in digest(store, T0 + timedelta(hours=1))
