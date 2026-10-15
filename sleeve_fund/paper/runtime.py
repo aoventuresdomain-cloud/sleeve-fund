@@ -146,6 +146,7 @@ def clearing_action(sleeve, now: datetime | None = None, since: datetime | None 
 # A block episode in the journal (Advisor 22:29): one alert when nothing may open any more, naming why, and one cleared
 # event when it ends, with how many orders it refused. Each refused order is its own decision row.
 BLOCK_STARTED, BLOCK_CLEARED, BLOCK_PREFIX = "entry_blocked", "entry_block_cleared", "Nothing opens. "
+BENIGN_REJECT = "benign_reject"  # A1: a reduce-only close refused with the position already flat (on its row's signal)
 RACED_FILL = "raced_fill"  # an opening order that filled after the gate closed, with the ms after (P1-SG15)
 ENTRY_CANCELLED = "resting_entry_cancelled"  # resting opening orders cancelled at a block, with the ms after it (P1-SG15)
 # Inside an episode, which causes hold changed (one of several cleared, or another began): an info row, never an
@@ -1489,6 +1490,16 @@ class SleeveRuntime:
         self.store.update_order(order_id, status=status, message=message)
         if status in ("rejected", "denied"):
             self.store.event(self.name, "warning", f"order_{status}", f"order {order_id} {status}: {message}", ts=self.now())
+
+    def on_benign_reject(self, order_id: str, message: str = "") -> None:
+        """A1 (Advisor): a reduce-only close refused with nothing left to close. Rejected, marked benign on its row
+        (BENIGN_REJECT in its signal, which store.closing_orders reads), and an info event, never a warning."""
+        self.store.update_order(order_id, status="rejected", message=message)
+        if hasattr(self.store, "merge_order_signal"):
+            self.store.merge_order_signal(order_id, {BENIGN_REJECT: True})
+        self.store.event(self.name, "info", "order_rejected_benign",
+                         f"order {order_id} refused with the position already flat: {message or 'no reason given'}",
+                         ts=self.now())
 
     def on_order_modify_rejected(self, order_id: str, message: str = "") -> None:
         """F-RX-1: the venue refused to resize a working order (a resting stop). Journaled as an event only: the
