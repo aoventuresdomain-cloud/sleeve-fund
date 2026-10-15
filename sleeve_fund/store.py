@@ -569,6 +569,14 @@ def margin_tiers_of(row: dict) -> tuple:
                             float(Decimal(t["deduction"] or "0"))) for n, t in enumerate(rows)))
 
 
+def venue_fees_of(row: dict):
+    """A good fee fetch as the engine's FeeSchedule, each rate parsed from the venue's string as a Decimal: never
+    through a float, so 0.00055 stays 0.00055 through the fee and compliance-test maths (Advisor FEE-STORE)."""
+    from sleeve_fund.instruments import FeeSchedule
+
+    return FeeSchedule(maker=Decimal(row["payload"]["maker"]), taker=Decimal(row["payload"]["taker"]))
+
+
 def _tiers_problem(payload) -> str:
     """Why a fetched tiers payload can't be last-known-good, or "" when margin.tiers accepts it."""
     try:
@@ -3298,24 +3306,50 @@ class Store:
         elif not reason:
             raise ValueError("a failed fetch keeps its reason")
         with self.engine.begin() as c:
+            if ok and source == PUBLISHED_FEES and self._is_live(c, account):
+                ok, reason = False, ("the published stand-in is for paper and demo accounts only: a live account's "
+                                     "fees are fetched from the account")
             return c.execute(insert(venue_terms_fetch_t).values(
                 venue=venue.upper(), kind=kind, instrument=instrument, account=account, source=source,
                 fetched_at=at or utcnow(), ok=int(bool(ok)), reason="" if ok else reason, payload=payload)
             ).inserted_primary_key[0]
 
-    def _latest_venue_fetch(self, venue: str, kind: str, instrument: str, good: bool) -> dict | None:
+    def record_published_fees(self, venue: str, instrument: str, *, account: str, bounds: dict,
+                              at: datetime | None = None) -> int:
+        """A fee fetch attempt that fell back to the venue's published VIP0 schedule (Advisor HEAD3): a fresh
+        stand-in row at this attempt's time, so it ages as any fetch does (Advisor FEE-STORE). Kept as failed for a
+        live account, which must fetch its own."""
+        from sleeve_fund.venues import venue as venue_profile
+
+        fees = venue_profile(venue).fees
+        return self.record_venue_fetch(venue, "fee", instrument, source=PUBLISHED_FEES, ok=True, account=account,
+                                       at=at, bounds=bounds, payload={"maker": str(fees.maker), "taker": str(fees.taker)})
+
+    @staticmethod
+    def _is_live(c, account: str | None) -> bool:
+        return account is not None and c.execute(
+            select(accounts_t.c.kind).where(accounts_t.c.name == account)).scalar() == "live"
+
+    def _latest_venue_fetch(self, venue: str, kind: str, instrument: str, good: bool,
+                            account: str | None = None) -> dict | None:
         t = venue_terms_fetch_t
         q = select(t).where(t.c.venue == venue.upper(), t.c.kind == kind, t.c.instrument == instrument)
-        if good:
-            q = q.where(t.c.ok == 1)
         with self.engine.connect() as c:
+            if account is not None:
+                q = q.where(t.c.account == account)
+                if good and self._is_live(c, account):  # never the stand-in, however it got there
+                    q = q.where(t.c.source != PUBLISHED_FEES)
+            if good:
+                q = q.where(t.c.ok == 1)
             rows = _rows(c.execute(q.order_by(t.c.fetched_at.desc(), t.c.id.desc()).limit(1)))
         return rows[0] if rows else None
 
-    def latest_good_venue_fetch(self, venue: str, kind: str, instrument: str) -> dict | None:
-        """The last-known-good fetch (newest good row; equal times go to the later row), or None if none ever was.
-        Its age is the caller's to judge (FEE-LIVE: alert after 24 h, refuse entries after 72 h)."""
-        return self._latest_venue_fetch(venue, kind, instrument, good=True)
+    def latest_good_venue_fetch(self, venue: str, kind: str, instrument: str,
+                                account: str | None = None) -> dict | None:
+        """The last-known-good fetch (newest good row; equal times go to the later row), or None if none ever was;
+        with `account`, that account's own (a live account's never the published stand-in). Its age is the caller's
+        to judge (FEE-LIVE: alert after 24 h, refuse entries after 72 h). venue_fees_of gives its rates as Decimal."""
+        return self._latest_venue_fetch(venue, kind, instrument, good=True, account=account)
 
     def latest_venue_fetch(self, venue: str, kind: str, instrument: str) -> dict | None:
         """The newest fetch, good or failed: what an alert says went wrong last."""
