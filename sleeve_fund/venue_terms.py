@@ -186,7 +186,14 @@ def term(store, profile, kind: str, instrument: str, now: datetime, live: bool =
              else margin_tiers_of(row))
     src = SOURCE_WORDS.get(row["source"], row["source"])
     when = f"fetched {at.day} {at:%b %H:%M} UTC from {src}"
-    if age > REFUSE_AFTER:
+    priced = profile.maintenance_tiers.get(instrument) if kind == "tiers" else None
+    if kind == "tiers" and priced is not None and tuple(priced) != tuple(value):
+        # Liquidation is priced with the profile's table (Advisor question (b), PE1's default): a pulled table that
+        # differs is never used silently; entries wait until it is re-pasted and checked in.
+        state, words = REFUSED, (f"{what}: the table {when} differs from the table liquidation is priced with, so "
+                                 "entries are refused until it is re-pasted and checked (DA-11); exits and stops "
+                                 "still run")
+    elif age > REFUSE_AFTER:
         state, words = REFUSED, (f"{what}: last {when}, {hours} hours ago, over 72 hours, so entries are refused "
                                  "until they are fetched again; exits and stops still run")
     elif age > ALERT_AFTER:
