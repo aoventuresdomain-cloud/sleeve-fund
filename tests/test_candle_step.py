@@ -177,3 +177,32 @@ def test_must_2_a_flip_at_the_size_limit_closes_in_full_and_ends_short_exactly_a
 
     book = D(str(run.book.asof(pd.Timestamp(flip["ts"]))))
     assert flip["approved"] * flip["price"] == book / 2 and sides[3][1] == flip["approved"]
+
+
+def test_its_0_1pct_target_is_kept_below_costs_and_fires_when_touched(prices, instrument):
+    """PM 22:38 UK "run as i specified" (design, PM ruling): the test Strategy's 0.1% take-profit is placed though it
+    is below the round trip's costs (keep_sub_cost_target, QD's C8 flag, on in this Strategy only), and it fires when
+    touched: the bar after the buy reaches +0.2%, so the target sells the whole position before step 1's reduce."""
+    first, closes = _from_step_0(prices, 3)
+    closes[first + 1:] = [100.2] * (len(closes) - first - 1)
+    res = run_backtest("candle_step", _path(prices, closes), instrument, {**PARAMS, "take_profit": 0.001},
+                       half_spread=0)
+    fills = _fills(res)
+    q = fills[0][1]
+    assert fills[:2] == [("BUY", q, "entry"), ("SELL", q, "take_profit")], fills
+
+
+def test_only_the_test_strategy_keeps_a_target_below_costs_by_default():
+    """The flag is off by default for every Strategy (QD C8; its cells pin that another Strategy drops such a target
+    with its reason code), and only the test Strategy's defaults turn it on."""
+    from sleeve_fund.strategies import REGISTRY
+    import inspect
+
+    from sleeve_fund.strategies.base import LongFlatConfig
+
+    assert inspect.signature(LongFlatConfig.__init__).parameters["keep_sub_cost_target"].default is False
+    on = [name for name, (cls, _) in REGISTRY.items()
+          if getattr(getattr(cls, "SPEC", None), "default_params", {}).get("keep_sub_cost_target")]
+    from sleeve_fund.strategies.candle_step import SPEC
+
+    assert SPEC.default_params["keep_sub_cost_target"] is True and on in ([], ["candle_step"])
