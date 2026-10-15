@@ -167,8 +167,8 @@ def most_it_can_lose(x: dict) -> float:
     leverage cap, markets.isolated_margin) and what it has made or lost since entry, plus the fee on the
     liquidation; the rest of its equity is not at risk (m13-U6). Anything else can lose at most its equity."""
     equity, s, qty = max(x["equity"], 0.0), x["sleeve"], x.get("qty") or 0.0
-    t = markets.terms(s.params, s.venue, s.instrument) if qty else None
-    if t is None:
+    t, tiered = markets.held_terms(s.params, s.venue, s.instrument) if qty else (None, False)
+    if t is None or not tiered:  # unknown liquidation (no kept table): no more than its equity
         return equity
     entry, lev = x.get("entry_px") or x["price"], risk.leverage_cap(x["profile"], s.params)
     liq = markets.isolated_liquidation(x["cash"], qty, entry, lev, t.maintenance_margin)
