@@ -497,6 +497,95 @@ fee_schedules_t = Table(
     Column("taker", Float, nullable=False),
     Column("fetched_at", TS, nullable=False),
 )
+# FEE-LIVE (DA, 0029; data-architect/fee-live-storage.md): every fetch of a venue's fee rates (from the account) or margin
+# tiers (public) is one row, kept whether it worked or not. The engine reads the newest good row per (venue, kind,
+# instrument) as last-known-good and judges its age itself. A failed fetch, or one whose numbers fail the write path's
+# checks (fees outside the published bounds, tiers margin.tiers refuses), is kept with its reason and is never good.
+# Numbers in the payload are the venue's own decimal strings. Append-only, held by the database (triggers below).
+VENUE_FETCH_KINDS = ("fee", "tiers")
+# Advisor HEAD3: an account with no fee endpoint trades at the venue's published VIP0 schedule, written as a good fee
+# row with this source, so the start check and the dashboard label it "published, not account" and alert on it.
+PUBLISHED_FEES = "published-vip0"
+venue_terms_fetch_t = Table(
+    "venue_terms_fetch",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("venue", String(16), nullable=False),
+    Column("kind", String(8), nullable=False),
+    Column("instrument", String(32), nullable=False),  # the engine pair, BTC/USDT; the venue's symbol is in the payload
+    Column("account", String(41), ForeignKey("accounts.name"), nullable=True),  # a label, never a key; NULL for tiers
+    Column("source", String(64), nullable=False),  # the endpoint read
+    Column("fetched_at", TS, nullable=False),
+    Column("ok", Integer, nullable=False),
+    Column("reason", Text, nullable=False, default=""),
+    Column("payload", JSON, nullable=True),
+    CheckConstraint("venue = upper(venue)", name="venue_terms_fetch_venue_upper"),
+    CheckConstraint("kind IN ('fee', 'tiers')", name="venue_terms_fetch_kind"),
+    CheckConstraint("ok IN (0, 1)", name="venue_terms_fetch_ok"),
+    CheckConstraint("(ok = 1 AND reason = '') OR (ok = 0 AND reason <> '')", name="venue_terms_fetch_reason"),
+    CheckConstraint("ok = 0 OR payload IS NOT NULL", name="venue_terms_fetch_payload"),
+    CheckConstraint("kind <> 'tiers' OR account IS NULL", name="venue_terms_fetch_public_tiers"),
+    Index("ix_venue_terms_latest", "venue", "kind", "instrument", "ok", "fetched_at", "id"),
+)
+VENUE_FETCH_WORM = "venue_terms_fetch is append-only: a fetch is never edited or deleted, a new fetch is a new row"
+VENUE_FETCH_PG = (
+    "CREATE OR REPLACE FUNCTION venue_terms_fetch_append_only() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+    f"RAISE EXCEPTION USING ERRCODE = 'check_violation', MESSAGE = '{VENUE_FETCH_WORM}'; END $$",
+    "CREATE TRIGGER venue_terms_fetch_append_only BEFORE UPDATE OR DELETE ON venue_terms_fetch FOR EACH ROW "
+    "EXECUTE FUNCTION venue_terms_fetch_append_only()",
+)
+VENUE_FETCH_SQLITE = tuple(f"CREATE TRIGGER venue_terms_fetch_no_{o.lower()} BEFORE {o} ON venue_terms_fetch BEGIN "
+                           f"SELECT RAISE(ABORT, '{VENUE_FETCH_WORM}'); END" for o in ("UPDATE", "DELETE"))
+for _sql in VENUE_FETCH_PG:
+    event.listen(venue_terms_fetch_t, "after_create", DDL(_sql).execute_if(dialect="postgresql"))
+for _sql in VENUE_FETCH_SQLITE:
+    event.listen(venue_terms_fetch_t, "after_create", DDL(_sql).execute_if(dialect="sqlite"))
+
+
+def _fee_problem(payload, bounds) -> str:
+    """Why a fetched fee payload can't be last-known-good, or "" when it can (both rates decimal strings, each inside
+    its published [lowest, VIP0] bounds; out of bounds counts as missing, Advisor FEE-LIVE)."""
+    for side in ("maker", "taker"):
+        if side not in payload:
+            return f"no {side} rate in the venue's answer"
+        try:
+            rate = Decimal(payload[side])
+        except Exception:  # noqa: BLE001 - whatever the venue sent, it isn't a number
+            return f"{side} rate {payload[side]!r} isn't a number"
+        lo, hi = bounds[side]
+        if not (rate.is_finite() and Decimal(lo) <= rate <= Decimal(hi)):
+            return f"out of bounds: {side} {payload[side]} outside the published [{lo}, {hi}]"
+    return ""
+
+
+def margin_tiers_of(row: dict) -> tuple:
+    """A good tiers fetch as the engine's maintenance table (margin.Tier: ceiling, rate, deduction). The venue's last
+    ceiling is where it stops taking positions; the engine's table ends open (vs1-tiers.md), and margin.tiers checks
+    the rest: ceilings rising, continuous at every ceiling, rates in (0, 1)."""
+    from sleeve_fund.margin import Tier, tiers
+
+    rows = row["payload"]["tiers"]
+    return tiers(tuple(Tier(math.inf if n == len(rows) - 1 else float(Decimal(t["ceiling"])), float(Decimal(t["mmr"])),
+                            float(Decimal(t["deduction"] or "0"))) for n, t in enumerate(rows)))
+
+
+def _tiers_problem(payload) -> str:
+    """Why a fetched tiers payload can't be last-known-good, or "" when margin.tiers accepts it."""
+    try:
+        margin_tiers_of({"payload": payload})
+    except (KeyError, TypeError, IndexError, ArithmeticError, ValueError) as e:  # Decimal's errors are ArithmeticError
+        return f"tiers refused: {e}"
+    return "" if payload.get("tiers") else "tiers refused: an empty table"
+
+
+def _strings_only(payload) -> None:
+    """The venue's numbers are kept exactly as it wrote them: a float here has already been rounded by someone."""
+    if isinstance(payload, float):
+        raise ValueError("venue numbers are kept as the venue's decimal strings, not floats")
+    for v in payload.values() if isinstance(payload, dict) else payload if isinstance(payload, list) else ():
+        _strings_only(v)
+
+
 # Typical half bid-ask spread per instrument, measured from a paper sleeve's live quotes. Backtests
 # charge it on every order that takes liquidity, since their bars carry trade prices, not quotes.
 spreads_t = Table(
@@ -3204,6 +3293,50 @@ class Store:
              .order_by(spreads_t.c.measured_at, spreads_t.c.id))
         with self.engine.connect() as c:
             return _rows(c.execute(q))
+
+    def record_venue_fetch(self, venue: str, kind: str, instrument: str, *, source: str, ok: bool, reason: str = "",
+                           payload: dict | None = None, account: str | None = None, at: datetime | None = None,
+                           bounds: dict | None = None) -> int:
+        """FEE-LIVE: keep one fetch of a venue's fee rates or margin tiers, good or not, and return its id. A fetch
+        said to be good is checked first: fees against `bounds` ({"maker": (lowest, VIP0), "taker": (...)}, the
+        venue's published range, required), tiers by margin.tiers. One that fails is kept as failed, with why."""
+        if kind not in VENUE_FETCH_KINDS:
+            raise ValueError(f"venue fetch kind must be one of {VENUE_FETCH_KINDS}")
+        if kind == "tiers" and account is not None:
+            raise ValueError("margin tiers are the venue's public table: no account")
+        if payload is not None:
+            _strings_only(payload)
+        if ok:
+            if kind == "fee" and not bounds:
+                raise ValueError("a fee fetch is checked against the venue's published bounds: pass bounds")
+            problem = _fee_problem(payload or {}, bounds) if kind == "fee" else _tiers_problem(payload or {})
+            if problem:
+                ok, reason = False, problem
+        elif not reason:
+            raise ValueError("a failed fetch keeps its reason")
+        with self.engine.begin() as c:
+            return c.execute(insert(venue_terms_fetch_t).values(
+                venue=venue.upper(), kind=kind, instrument=instrument, account=account, source=source,
+                fetched_at=at or utcnow(), ok=int(bool(ok)), reason="" if ok else reason, payload=payload)
+            ).inserted_primary_key[0]
+
+    def _latest_venue_fetch(self, venue: str, kind: str, instrument: str, good: bool) -> dict | None:
+        t = venue_terms_fetch_t
+        q = select(t).where(t.c.venue == venue.upper(), t.c.kind == kind, t.c.instrument == instrument)
+        if good:
+            q = q.where(t.c.ok == 1)
+        with self.engine.connect() as c:
+            rows = _rows(c.execute(q.order_by(t.c.fetched_at.desc(), t.c.id.desc()).limit(1)))
+        return rows[0] if rows else None
+
+    def latest_good_venue_fetch(self, venue: str, kind: str, instrument: str) -> dict | None:
+        """The last-known-good fetch (newest good row; equal times go to the later row), or None if none ever was.
+        Its age is the caller's to judge (FEE-LIVE: alert after 24 h, refuse entries after 72 h)."""
+        return self._latest_venue_fetch(venue, kind, instrument, good=True)
+
+    def latest_venue_fetch(self, venue: str, kind: str, instrument: str) -> dict | None:
+        """The newest fetch, good or failed: what an alert says went wrong last."""
+        return self._latest_venue_fetch(venue, kind, instrument, good=False)
 
     def latest_fees(self, venue: str, account: str | None = None) -> dict | None:
         """The most recent fetched schedule for a venue (or one account), or None."""
