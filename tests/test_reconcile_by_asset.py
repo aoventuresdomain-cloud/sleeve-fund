@@ -192,3 +192,26 @@ def test_a_clean_night_passes_the_positions_section(store, tmp_path):  # noqa: F
     assert not [f for f in fails if "orders record" in f]
     assert "every position its fills come to is what its orders record" in path.read_text()
 
+
+
+def test_two_rows_on_one_key_are_reported_never_one_hidden_behind_the_other(store, monkeypatch):  # noqa: F811
+    """0028's asset index rules this out; if it ever happens, the night names both rows and the keyed reader refuses."""
+    import pytest
+
+    _multi(store, "k", ("BTC/USDT",))
+    _multi(store, "j", ("BTC/USDT",))
+    real = reconcile._rows
+    monkeypatch.setattr(reconcile, "_rows", lambda c: {r: ("k", "BTC/USDT") for r in real(c)})
+    found = [f for f in reconcile.nightly(store) if f.kind == "key"]
+    assert [f.what for f in found] == ["k, BTC/USDT: rows j and k share one key, so neither may stand for it"]
+    with pytest.raises(ValueError, match="share a"):
+        store.positions_by_asset()
+
+
+def test_more_mismatches_than_a_night_lists_says_so(store, monkeypatch):  # noqa: F811
+    _multi(store)
+    row = {"table": "fills", "id": 1, "sleeve": "m~ETH", "instrument": "SOL/USDT", "expected": "ETH/USDT"}
+    monkeypatch.setattr(reconcile, "MISMATCHES", 2)
+    monkeypatch.setattr(type(store), "asset_mismatches", lambda self, limit=50: [row] * limit)
+    found = reconcile.nightly(store)
+    assert len(found) == 3 and "more than 2 journal rows are written under another asset" in found[0].what
