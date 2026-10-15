@@ -127,14 +127,39 @@ def test_a_copy_that_doesnt_restore_fails_and_drops_the_scratch_database(tmp_pat
     assert done.returncode == 1 and "pre-deploy dump: FAIL, it didn't restore" in done.stdout
     assert "secret-host" not in done.stdout + done.stderr
     assert calls[-1].startswith("dropdb") and "predeploy_check" in calls[-1]
+    assert not list((tmp_path / "b").iterdir())  # CR F-PDD-1: an unproved copy never stays under a good name
 
 
-@pytest.mark.parametrize("copy, words", [("0028 5 3 9 1 2 3", "fills short"), ("0027 5 4 9 1 2 3", "another migration"),
-                                         ("0028 5 4 9 1 1 3", "book_moves short")])
+@pytest.mark.parametrize("copy, words", [("0028 5 3 9 1 2 3", "fills doesn't match the journal"),
+                                         ("0027 5 4 9 1 2 3", "another migration"),
+                                         ("0028 5 4 9 1 1 3", "book_moves doesn't match the journal"),
+                                         ("0028 5 4 10 1 2 3", "events doesn't match the journal")])  # CR F-PDD-2
 @needs_bash
-def test_a_copy_short_of_the_journal_fails(tmp_path, copy, words):
+def test_a_copy_unlike_the_journal_fails_and_leaves_no_copy(tmp_path, copy, words):
     done, _ = _run(tmp_path, copy=copy)
     assert done.returncode == 1 and done.stdout.startswith("pre-deploy dump: FAIL") and words in done.stdout, done.stdout
+    assert not list((tmp_path / "b").iterdir())
+
+
+@pytest.mark.parametrize("free, ok", [(1999, False), (2000, True)])
+@needs_bash
+def test_the_dump_needs_twice_the_last_dump_free_or_takes_nothing(tmp_path, free, ok):
+    """HoE: a free-space check before the dump: under twice the newest dump's size, nothing is dumped."""
+    (tmp_path / "b").mkdir()
+    (tmp_path / "b" / "sleeve_fund-20261015-0012.dump").write_bytes(b"x" * 1000)
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / "df").write_text(f"""#!/usr/bin/env bash
+echo "Filesystem 1-blocks Used Available Capacity Mounted on"
+echo "/dev/x 99999999999 1 {free} 1% /"
+""")
+    (tmp_path / "bin" / "df").chmod(0o755)
+    done, calls = _run(tmp_path)
+    if ok:
+        assert done.returncode == 0, done.stdout
+    else:
+        assert done.returncode == 1 and done.stdout.strip() == "pre-deploy dump: FAIL, not enough disk"
+        assert not any(c.startswith("pg_dump") for c in calls)
+        assert [p.name for p in (tmp_path / "b").iterdir()] == ["sleeve_fund-20261015-0012.dump"]
 
 
 @needs_bash
@@ -143,7 +168,7 @@ def test_a_whole_copy_passes_and_is_never_named_like_a_nightly_dump(tmp_path):
     assert done.returncode == 0, done.stdout + done.stderr
     assert done.stdout.strip() == ("pre-deploy dump: PASS, restored at migration 0028, orders 5, fills 4, events 9, "
                                    "fund_flows 1, book_moves 2, decisions 3")
-    (dump,) = (tmp_path / "b").iterdir()
+    (dump,) = (tmp_path / "b").glob("predeploy-*")
     assert re.fullmatch(r"predeploy-\d{8}-\d{6}\.pgdump", dump.name)
     assert any(c.startswith("pg_restore") and "--exit-on-error" in c for c in calls)
     # the backup container's environment holds only the password: the journal's host and role are backup.sh's
