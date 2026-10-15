@@ -52,21 +52,25 @@ def test_a_refusal_shows_the_tests_numbers_and_side_the_gate_journaled(client): 
     assert want in tab and "<th scope=\"col\">Strategy</th>" not in tab.split("</table>")[0]
 
 
-def test_a_t1_or_t2_refusal_the_gate_named_only_by_its_limit_still_names_the_test(client):  # noqa: F811
-    """F-XA12-TESTNAME: a decision with no test_hit or version (written before compliance versions) names its test
-    from the gate's limit_hit: asset_open_risk is T1, group_open_risk T2; never a bare "Refused"."""
+
+def test_a_refusal_with_no_test_or_version_shows_the_gates_reason_not_a_bare_refused(client):  # noqa: F811
+    """F-XA12-TESTNAME (DA 05:15 UK): a T1 or T2 refusal always carries its test and version (the store ties
+    test_hit to a version), so the row names both; one with neither, a reason the gate gave before any test was
+    reached or a limit named the old way, shows that reason in words and a dash for the version."""
     from sleeve_fund import compliance_rules as rules
 
-    assert rules.refused_by("asset_open_risk") == rules.name("asset_stop_loss")
-    assert rules.refused_by("group_open_risk") == rules.name("type_stop_loss")
     c, store = client
     _traded(c, store)
     with store.engine.begin() as conn:
         sid = conn.execute(sleeves_t.select().where(sleeves_t.c.name == "btc-test")).first().id
         conn.execute(insert(gate_decisions_t), [{
             "sleeve_id": sid, "bar_ts": utcnow(), "intent": "entry", "underlying": "BTC", "profile_version": 1,
-            "price": D(50000), "stage": "submit", "seq": 9, "intent_id": "i9", "outcome": "rejected",
-            "limit_hit": "group_open_risk", "requested_qty": D("0.2"), "approved_qty": D(0), "decided_at": utcnow()}])
-    tab = c.get("/sleeves/btc-test", auth=AUTH).text.split('id="tab-refused"')[1]
-    first = tab.split("<tbody>")[1].split("</tr>")[0]
-    assert f"<td>{rules.name('type_stop_loss')}</td>" in first and '<td class="num">–</td>' in first
+            "price": D(50000), "stage": "submit", "seq": 9 + i, "intent_id": f"i{9 + i}", "outcome": "rejected",
+            "limit_hit": hit, "requested_qty": D("0.2"), "approved_qty": D(0), "decided_at": utcnow()}
+            for i, hit in enumerate(("below_min", "open_risk"))])
+    rows = c.get("/sleeves/btc-test", auth=AUTH).text.split('id="tab-refused"')[1].split("<tbody>")[1]
+    rows = rows.split("</tbody>")[0].split("</tr>")
+    shown = [r for r in rows if "<td>–</td>" in r or '<td class="num">–</td>' in r]
+    assert any(f"<td>{rules.NOT_A_TEST['below_min']}</td>" in r and '<td class="num">–</td>' in r for r in shown)
+    assert any(f"<td>{rules.name('fund_stop_loss')}</td>" in r and '<td class="num">–</td>' in r for r in shown)
+    assert not any("<td>Refused</td>" in r for r in rows)

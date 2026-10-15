@@ -170,8 +170,8 @@ def default_tests() -> list[dict]:
 
 # The gate's limit_hit before the versioned tests (portfolio.limits), as the test it now is; and its outcomes that
 # aren't a test, in the PM's words.
-LIMIT_HIT = {"asset_open_risk": "asset_stop_loss", "group_open_risk": "type_stop_loss", "gross": "fund_gross",
-             "net_instrument": "asset_net", "margin": "fund_margin", "open_risk": "fund_stop_loss", "halt": "fund_drawdown", "pause": "fund_day_loss"}
+LIMIT_HIT = {"gross": "fund_gross", "net_instrument": "asset_net", "margin": "fund_margin",
+             "open_risk": "fund_stop_loss", "halt": "fund_drawdown", "pause": "fund_day_loss"}
 NOT_A_TEST = {"below_min": "Below the smallest order the market takes",
               "portfolio_state_stale": "The fund's book wasn't marked recently, so nothing new goes out",
               "lock_error": "The check couldn't run, so the idea was refused"}
