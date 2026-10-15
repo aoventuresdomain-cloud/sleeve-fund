@@ -495,3 +495,21 @@ def test_5d_a_first_deploy_after_08_00_sends_no_digest_then_and_the_first_goes_t
     t[0] = T0 + timedelta(days=1, hours=1)  # 08:00 UK the next day
     fwd.step()
     assert len(sent) == 1 and sent[0].startswith("Multi-Strategy Fund daily digest")
+
+
+def test_5e_a_forwarder_restart_at_08_30_on_a_day_the_digest_went_sends_no_second_one():
+    store, sent = Store.in_memory(), []
+    t = [T0 + timedelta(hours=1)]  # 08:00 UK
+
+    def fwd():
+        return Forwarder(store, environ={"ALERT_WEBHOOK_URL": HOOK}, send=lambda url, text: sent.append(text),
+                         now=lambda: t[0])
+
+    fwd().step()
+    assert len(sent) == 1
+    t[0] = T0 + timedelta(hours=1, minutes=30)  # 08:30 UK: the supervisor restarted
+    again = fwd()
+    again.step()
+    t[0] += timedelta(hours=3)
+    again.step()
+    assert len(sent) == 1 and len(_kinds(store, "digest_sent")) == 1
