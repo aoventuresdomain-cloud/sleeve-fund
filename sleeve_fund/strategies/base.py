@@ -2077,7 +2077,10 @@ class LongFlatStrategy(Strategy):
         if bars:
             self.on_historical_bars(bars)
             self._check_boundaries(bars)
-            msg = f"Loaded {len(bars)} of {want} warm-up bars from {getattr(self.history_loader, 'source', 'the history store')}"
+            msg = (f"Loaded {min(len(bars), want)} of {want} warm-up bars from "
+                   f"{getattr(self.history_loader, 'source', 'the history store')}")
+            if len(bars) > want:  # A10: the farther agreeing seed (Advisor 15 Oct 08:49 UK)
+                msg += f", and {len(bars) - want} more before them so its averages settle"
             if len(bars) < want:  # the venue's recent candles stop short of a long look-back (m13-E4)
                 level = "warning"
                 short = want - len(bars)
