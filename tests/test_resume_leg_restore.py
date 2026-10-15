@@ -130,13 +130,15 @@ def test_a_restore_read_keyed_on_the_parent_turns_these_cells_red(store, instrum
 
 
 # --- perp legs (Advisor RESUME-CELLS, cell 6) --------------------------------------------------------------------------
-# Two perp legs of one Strategy (one settings block, so one leverage cap: create_legs), each entered at its own price
-# and size, each with the liquidation price its own fill journaled (deliberately not the formula's, so a value worked
-# out afresh, or a sibling's, shows) and a stop looser than half the way to it.
+# Two perp legs of one Strategy (one settings block, so one leverage cap: create_legs; Advisor RESUME-CELL6 (a)), each
+# entered at its own price and size, with a stop looser than half the way to its liquidation price, and a journaled
+# liquidation price deliberately not the formula's: BTC's nearer the entry than the one worked out again, ETH's farther.
+# The restore uses the nearer of the two and alerts on the difference (Advisor RESUME-CELL6, MUST).
 PERP_OPEN = {
     "perp-x": dict(px=60_000.0, qty=0.5, side="BUY", stop_frac=0.30, tp_frac=0.40, liq=41_000.0),
-    "perp-x~ETH": dict(px=2_500.0, qty=4.0, side="SELL", stop_frac=0.25, tp_frac=0.30, liq=3_200.0),
+    "perp-x~ETH": dict(px=2_500.0, qty=4.0, side="SELL", stop_frac=0.25, tp_frac=0.30, liq=3_400.0),
 }
+FUNDED = 100_000.0  # the fund's view the simulated account is funded with (paper.node): isolated margin is posted
 
 
 def _perp_legs(store):
@@ -167,6 +169,7 @@ def _perp_restart(store, instrument, name):
                            assumed_taker_fee=COST, stop_loss=0.10, take_profit=0.20, market="perp", allow_short=True))
     strat.runtime = SleeveRuntime(store, name, now=lambda: T0 + timedelta(minutes=60))
     strat.runtime.on_start(COST, now=lambda: T0 + timedelta(minutes=60))
+    strat.runtime.funded = FUNDED
     book = strat.runtime.book
     strat._entry_px, strat._entry_qty = book["entry_px"], abs(book["qty"])
     strat._entry_side = 1 if book["qty"] > 0 else -1
@@ -176,15 +179,27 @@ def _perp_restart(store, instrument, name):
     return strat
 
 
-def _half_way_cap(e, share):
+def _half_way_cap(e, liq, share):
     side = 1 if e["side"] == "BUY" else -1
-    return side * (1 - (e["px"] - side * share * abs(e["px"] - e["liq"])) / e["px"])
+    return side * (1 - (e["px"] - side * share * abs(e["px"] - liq)) / e["px"])
 
 
-def test_every_perp_leg_comes_back_on_its_own_margin_liquidation_price_and_half_way_stop(store, instrument):
-    """Advisor RESUME-CELLS cell 6: each perp leg comes back with its own position and side, the leverage cap and
-    isolated margin of its Strategy, the liquidation price ITS OWN fill journaled, and its stop re-checked against half
-    the way to that price: held there (STOP-LOOSEN-1), never measured from a sibling's."""
+def _worked_out_again(strat, e):
+    """The leg's liquidation price from its journaled entry, size and cash, its Strategy's leverage cap and the
+    maintenance table now: independently of the strategy's restore."""
+    from sleeve_fund import margin
+
+    book = strat.runtime.book
+    return margin.isolated_liquidation(book["cash"] + FUNDED, book["qty"], e["px"], strat.runtime.profile.max_leverage,
+                                       strat._cfg.perp.maintenance_margin)
+
+
+def test_every_perp_leg_comes_back_on_its_own_margin_and_the_nearer_liquidation_price(store, instrument):
+    """Advisor RESUME-CELL6: each perp leg comes back with its own position and side, its Strategy's leverage cap and
+    isolated margin, and the NEARER of the liquidation price its own fill journaled and the one worked out again from
+    its journaled entry, size, leverage and the table now, alerting "liquidation mismatch on restore" with its name
+    when they differ by more than a tick; its stop is then held inside half the way to that price (STOP-LOOSEN-1),
+    never measured from a sibling's."""
     names = _perp_legs(store)
     for n, (name, e) in enumerate(PERP_OPEN.items()):
         _perp_enter(store, name, minutes=n, **e)
@@ -193,13 +208,32 @@ def test_every_perp_leg_comes_back_on_its_own_margin_liquidation_price_and_half_
         side = 1 if e["side"] == "BUY" else -1
         assert strat._margin and strat._entry_side == side and strat._entry_px == pytest.approx(e["px"]), name
         assert strat._max_leverage() == strat.runtime.profile.max_leverage, name  # isolated, at its Strategy's cap
-        assert strat._liq_px == pytest.approx(e["liq"]), name  # its own journaled price, not the formula's
+        again = _worked_out_again(strat, e)
+        assert abs(again - e["liq"]) > 1, name  # the journal differs from the formula
+        nearer = max(again, e["liq"]) if side > 0 else min(again, e["liq"])
+        assert strat._liq_px == pytest.approx(nearer), name  # the nearer drives every check
+        alerts = [x for x in store.events(name, limit=200) if x["kind"] == "liquidation_mismatch"]
+        assert len(alerts) == 1 and alerts[0]["level"] == "warning", name
+        assert "liquidation mismatch on restore" in alerts[0]["message"].lower() and name in alerts[0]["message"]
+        assert not [x for s in PERP_OPEN if s != name for x in store.events(s, limit=200)
+                    if x["kind"] == "liquidation_mismatch" and name in x["message"]]  # on its own row only
         assert strat._stop_frac == pytest.approx(e["stop_frac"]), name  # restored as journaled ...
-        held, against = strat._capped_stop(strat._stop_frac)  # ... then held inside half the way to its own price
-        assert against == pytest.approx(e["liq"]), name
-        cap = _half_way_cap(e, strat.runtime.profile.stop_to_liquidation)
-        assert held == pytest.approx(cap) and cap < e["stop_frac"], name
+        held, against = strat._capped_stop(strat._stop_frac)  # ... then held inside half the way to the nearer price
+        cap = _half_way_cap(e, nearer, strat.runtime.profile.stop_to_liquidation)
+        assert against == pytest.approx(nearer) and held == pytest.approx(cap) and cap < e["stop_frac"], name
     assert _perp_restart(store, instrument, names[2]).runtime.book["qty"] == 0  # the flat leg stays flat
+
+
+def test_a_journaled_price_within_a_tick_of_the_formulas_raises_no_alert(store, instrument):
+    _perp_legs(store)
+    e = dict(PERP_OPEN["perp-x"])
+    _perp_enter(store, "perp-x", minutes=0, **{**e, "liq": 1.0})  # replaced below by the formula's own price
+    strat = _perp_restart(store, instrument, "perp-x")
+    again = _worked_out_again(strat, e)
+    store.merge_order_signal("E-perp-x", {"position_liquidation_px": again})
+    strat = _perp_restart(store, instrument, "perp-x")
+    assert strat._liq_px == pytest.approx(again)
+    assert len([x for x in store.events("perp-x", limit=200) if x["kind"] == "liquidation_mismatch"]) == 1  # the 1.0
 
 
 def test_crossing_the_legs_liquidation_prices_turns_cell_6_red(store, instrument, monkeypatch):
