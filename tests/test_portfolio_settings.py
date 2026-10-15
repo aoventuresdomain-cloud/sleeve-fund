@@ -59,7 +59,7 @@ def test_the_page_shows_the_five_tests_their_limits_and_the_fixed_lines(ps):
                   "If the compliance tests can't be read, no new trade goes out.",  # TEC-FE-WORD (HoE)
                   "An asset with no group can't take a new trade while the per-group test is on."):
         assert words in t
-    assert "1.5x" in t and "15%" in t and "50%" in t
+    assert "1.50x" in t and "15%" in t and "50%" in t  # B-18 TEC: "x" values show 2 dp
     assert t.count("Locked on") == 3  # T3 and both loss brakes
     assert t.count("No group · ideas refused") == 2  # ADA and DOGE: not in the v1 map
     assert "sleeve" not in t.lower()
@@ -190,3 +190,44 @@ def test_asking_a_locked_test_off_is_refused_in_words_and_writes_nothing(ps):
                   headers=SAME, follow_redirects=False)
     assert same.status_code == 400 and "Nothing changes from version 1, so nothing was saved" in same.text
     assert _n(store) == 1
+
+
+def _edit_form(html: str) -> dict:
+    """What the browser sends from the edit page untouched: every named input's value, ticked boxes, picked groups."""
+    form = {}
+    for tag in re.findall(r"<input\b[^>]*>", html):
+        name = re.search(r'name="([^"]+)"', tag)
+        if not name:
+            continue
+        if 'type="checkbox"' in tag:
+            if " checked" in tag:
+                form[name.group(1)] = "on"
+            continue
+        value = re.search(r'value="([^"]*)"', tag)
+        form[name.group(1)] = unescape(value.group(1)) if value else ""
+    for name, body in re.findall(r'<select name="([^"]+)"[^>]*>(.*?)</select>', html, re.DOTALL):
+        picked = re.search(r'<option value="([^"]*)" selected', body)
+        if picked:
+            form[name] = picked.group(1)
+    return form
+
+
+def test_an_untouched_save_keeps_every_digit_of_an_x_limit(ps):
+    """B-18 edge (HoE 15 Oct 17:43 UK): the edit box showed the 2-dp display value, so a stored 0.125x came back as
+    0.13x when the PM saved without touching it. The box carries the stored value in full."""
+    c, store = ps
+    r = c.post("/portfolio-settings/apply", data={**_form(**{"fund_gross.limit": "0.125"}), "reason_pick": "Tighter while testing"}, auth=AUTH, headers=SAME,
+               follow_redirects=False)
+    assert r.status_code == 303
+    edit = c.get("/portfolio-settings?edit=1", auth=AUTH).text
+    form = _edit_form(edit)
+    assert form["fund_gross.limit"] == "0.125" and form["expected_version"] == "2"
+    assert "0.13x" in _text(c.get("/portfolio-settings", auth=AUTH).text)  # the page still shows 2 dp
+    review = _text(c.post("/portfolio-settings/review", data=form, auth=AUTH, headers=SAME).text)
+    assert "Nothing changes from version 2." in review  # the untouched form asks for no change
+    # Saved untouched apart from one unrelated edit: the limit is still 0.125, not 0.13.
+    r = c.post("/portfolio-settings/apply", data={**form, "group.ADA": "small", "reason_pick": "New asset or group"},
+               auth=AUTH, headers=SAME, follow_redirects=False)
+    assert r.status_code == 303
+    cur = {t["test"]: t for t in store.compliance().tests}
+    assert store.compliance().version == 3 and cur["fund_gross"]["limit"] == D("0.125")

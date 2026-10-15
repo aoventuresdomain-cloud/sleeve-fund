@@ -841,3 +841,147 @@ def test_resume_on_a_strategy_page_says_what_happens_and_sends_one_resume(tmp_pa
         assert [c["command"] for c in store.pending_commands("r1")] == ["resume"]
         assert errors == []
         page.context.close()
+
+
+@pytest.fixture
+def a19(tmp_path, monkeypatch):
+    """A-19: a stand-alone dashboard for the timed-test form cells, its own store, no venue calls."""
+    from sleeve_fund.dashboard import app as app_mod
+    from sleeve_fund.dashboard import charts
+    from sleeve_fund.store import Store
+
+    monkeypatch.setenv("DASHBOARD_PASSWORD", PASSWORD)
+    monkeypatch.setattr(app_mod, "TEARSHEETS", tmp_path)
+    monkeypatch.setattr(app_mod, "LEDGER", tmp_path / "idea_ledger.jsonl")
+    listed = {"kraken": ["BTC/USD", "ETH/USD"], "binance": ["BTC/USDT", "ETH/USDT"]}
+    monkeypatch.setattr(charts, "instruments", lambda get_json=None, venue=None: listed.get(venue, []))
+    store = Store(f"sqlite:///{tmp_path}/a19.db")
+    with _Served(store) as base:
+        yield base, store
+
+
+def _a19_form(page):
+    v = page.input_value
+    return {"strategy": v("#strategy"), "market": v("#market"), "shorts": page.is_checked("#allow_short"),
+            "mirror_shown": page.evaluate("() => !document.getElementById('demo_mirror').closest('[data-when-perp]').hidden"),
+            "mirror": page.is_checked("#demo_mirror"),
+            "bar": page.locator("input[name=bar_spec]:checked").get_attribute("value"), "profile": v("#risk_profile"),
+            "stop_kind": v("#stop_kind"), "stop": v("#stop_loss_pct"), "tp_kind": v("#tp_kind"), "tp": v("#take_profit_pct"),
+            "share": v("#p-candle_step-size_share"), "hours": v("#p-candle_step-run_for_hours")}
+
+
+PM_SETTINGS = {"strategy": "candle_step", "market": "perp", "shorts": True, "mirror_shown": True, "mirror": False,
+               "bar": "1-MINUTE-LAST-INTERNAL", "profile": "balanced", "stop_kind": "pct", "stop": "0.1",
+               "tp_kind": "pct", "tp": "0.1", "share": "60", "hours": ""}
+
+
+def test_a19_the_timed_test_sits_in_its_own_test_group_and_choosing_it_fills_in_the_pms_settings(a19, browser):
+    base, _ = a19
+    page, errors = _open(browser, f"{base}/sleeves/new?instrument=BTC/USD")
+    groups = page.eval_on_selector_all("#strategy optgroup", "gs => gs.map(g => [g.label, [...g.children].map(o => o.value)])")
+    groups = dict(groups)
+    assert groups["Test"] == ["candle_step"] and "candle_step" not in groups["Strategies"]
+    page.evaluate("() => { const f = document.getElementById('sleeve-form'); f.elements.market.value = 'perp';"
+                  " f.elements.market.dispatchEvent(new Event('change')); f.elements.demo_mirror.checked = true; }")
+    _step(page, "Model")
+    page.select_option("#strategy", "candle_step")
+    assert _a19_form(page) == PM_SETTINGS  # the demo copy ticked before is cleared
+    hidden = page.eval_on_selector_all(".params", "ps => Object.fromEntries(ps.map(p => [p.dataset.strategy, p.hidden]))")
+    assert hidden["candle_step"] is False and hidden["trend_filter"] is True
+    assert "created stopped" in page.inner_text("[data-strategy=candle_step]")
+    assert errors == []
+    page.context.close()
+
+
+@pytest.mark.parametrize(("field", "value", "words"), [
+    ("#p-candle_step-size_share", "0", "size share: a % of fund equity above 0 and at most 100"),
+    ("#p-candle_step-size_share", "120", "size share: a % of fund equity above 0 and at most 100"),
+    ("#p-candle_step-run_for_hours", "-1", "run for hours: more than 0, or leave it empty to run until stopped"),
+])
+def test_a19_bad_input_is_refused_in_words_and_the_form_comes_back_filled_in(a19, browser, field, value, words):
+    base, store = a19
+    page, errors = _open(browser, f"{base}/sleeves/new?strategy=candle_step&instrument=BTC/USD&name=timed-test")
+    _step(page, "Model")
+    page.fill(field, value)
+    _submit(page)
+    assert f"Not saved: {words}" in page.inner_text("main")
+    assert page.input_value(field) == value and page.input_value("#strategy") == "candle_step"
+    assert {k: v for k, v in _a19_form(page).items() if k not in ("share", "hours")} == {
+        k: v for k, v in PM_SETTINGS.items() if k not in ("share", "hours")}
+    assert not any(s.name == "timed-test" for s in store.sleeves())
+    assert errors == []
+    page.context.close()
+
+
+def _step(page, name):
+    page.click(f".wiz-nav button:has-text('{name}')")
+
+
+def _submit(page):
+    """Pick a reason and send the form as the PM's button does (the wizard's own steps aside)."""
+    with page.expect_navigation():
+        page.evaluate("""() => {
+            const f = document.getElementById("sleeve-form");
+            f.querySelector("input[name=reason_pick]").checked = true;
+            f.requestSubmit();
+        }""")
+    page.wait_for_load_state("networkidle")
+
+
+def test_a19_created_from_the_form_it_is_stopped_and_its_page_brings_the_settings_back(a19, browser):
+    base, store = a19
+    page, errors = _open(browser, f"{base}/sleeves/new?instrument=BTC/USD&name=timed-test")
+    _step(page, "Model")
+    page.select_option("#strategy", "candle_step")
+    _submit(page)
+    assert page.url.endswith("/sleeves/timed-test"), page.url
+    s = store.sleeve("timed-test")
+    assert s.desired_state == "stopped" and s.params["size_share"] == pytest.approx(0.6)
+    assert page.locator("button[data-open=dlg-start]").count() == 1  # the PM starts it from here
+    page.click("a.button:has-text('Clone with changes')")
+    page.wait_for_load_state("networkidle")
+    assert _a19_form(page) == PM_SETTINGS
+    assert errors == []
+    page.context.close()
+
+
+def test_a19_the_button_says_create_stopped_for_the_timed_test_and_goes_back_on_switching(a19, browser):
+    base, _ = a19
+    page, errors = _open(browser, f"{base}/sleeves/new?instrument=BTC/USD")
+
+    def labels():
+        return page.eval_on_selector_all("#sleeve-form button[data-label]", "bs => bs.map(b => b.textContent.trim())")
+
+    assert labels() and set(labels()) == {"Start strategy in paper mode"}
+    _step(page, "Model")
+    page.select_option("#strategy", "candle_step")
+    assert set(labels()) == {"Create (stopped)"}  # the side button and the wizard's copy alike
+    page.select_option("#strategy", "trend_filter")
+    assert set(labels()) == {"Start strategy in paper mode"}
+    assert errors == []
+    page.context.close()
+
+
+def test_a19_fund_held_the_pm_makes_the_timed_test_from_the_form_with_no_capital_to_type(a19, browser):
+    """HoE MUST: with the fund holding the cash the store refuses a Strategy with capital of its own, so the form asks
+    none, sends 0, and its summary names no halt of the Strategy's own."""
+    from datetime import UTC, datetime, timedelta
+
+    base, store = a19
+    at = datetime.now(UTC) - timedelta(minutes=5)
+    store.settle_flow(store.fund_flow("deposit", 100_000, actor="pm", reason="the PM's reset", rebase=True, now=at), at)
+    page, errors = _open(browser, f"{base}/sleeves/new?instrument=BTC/USD&name=timed-test")
+    assert page.locator("input[name=starting_balance][type=number]").count() == 0
+    _step(page, "Model")
+    page.select_option("#strategy", "candle_step")
+    _step(page, "Capital and risk")
+    assert "The fund holds the capital. This Strategy sizes from fund equity." in page.inner_text("main")
+    assert "halt at" not in page.inner_text("#risk_profile")
+    summary = page.inner_text("#summary")
+    assert "sized from the fund's equity" in summary and "drawdown" not in summary and "simulated money" not in summary
+    _submit(page)
+    assert page.url.endswith("/sleeves/timed-test"), page.url
+    s = store.sleeve("timed-test")
+    assert s.desired_state == "stopped" and s.starting_balance == 0
+    assert errors == []
+    page.context.close()
