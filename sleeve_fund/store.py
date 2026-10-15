@@ -1151,6 +1151,9 @@ FINISHED_ORDER_STATUSES = ("filled", "canceled", "rejected", "denied", "expired"
 OPEN_ORDER_STATUSES = ("submitted", "accepted", "partially_filled")
 # F-C3B-A: a Strategy archived while not yet flat waits for its withdrawal; one with nothing to withdraw says so
 WITHDRAWAL_DEFERRED, WITHDRAWAL_NONE = "withdrawal_deferred", "withdrawal_none"
+# RESET-NEG (Advisor, 15 Oct): the key of an old book close-out's cash rows (close_out_run). A transfer inside the book,
+# never trading: the book's cash readers count it, the rows trades are paired with (insurance) leave it out.
+CLOSE_OUT = "old-book-close-out"
 NEXT_MARK = "flat, waiting for the supervisor's next mark"  # why a flat Strategy put away is deferred (F286-CR1)
 # F-ASSIGN-STALE: a create or a move waiting for the poll (book_moves), and its landing
 BOOK_MOVE_WAITING, BOOK_MOVE_LANDED = "book_move_waiting", "book_move_landed"
@@ -3183,7 +3186,11 @@ class Store:
         return booked
 
     def insurance(self, sleeve: str, limit: int | None = 1000) -> list[dict]:
-        q = select(insurance_t).where(insurance_t.c.sleeve == sleeve).order_by(insurance_t.c.ts.desc()).limit(limit)
+        """The insurance fund's covers, newest first, as the trades are paired with them (the Trades tab, attribution):
+        an old book close-out (CLOSE_OUT) is a transfer, not a trade's, so it isn't one (HoQA RESET-NEG cell 9)."""
+        i = insurance_t.c
+        q = (select(insurance_t).where(i.sleeve == sleeve, (i.order_id.is_(None)) | (i.order_id != CLOSE_OUT))
+             .order_by(i.ts.desc()).limit(limit))
         with self.engine.connect() as c:
             return _rows(c.execute(q))
 

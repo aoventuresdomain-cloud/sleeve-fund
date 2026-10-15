@@ -25,11 +25,10 @@ from zoneinfo import ZoneInfo
 
 from sleeve_fund import supervisor
 from sleeve_fund.gate_ledger import DbLedger
-from sleeve_fund.store import Store, is_backtest, utcnow
+from sleeve_fund.store import CLOSE_OUT, Store, is_backtest, utcnow
 
 UK = ZoneInfo("Europe/London")
 RESET_ACTION = "book_reset_pm"  # the decisions row each step writes, keyed by the slate's id
-CLOSE_OUT = "old-book-close-out"  # the key of a close-out's cash rows (Store.close_out_run): once per run, any slate
 WAIT, REFUSED, DONE = 2, 1, 0  # the command's exit codes: run again later; refused, nothing more written; deposited
 
 
@@ -255,4 +254,4 @@ def main(args) -> int:
     return code
 
 
-__all__ = ["DONE", "REFUSED", "WAIT", "empty_book_pockets", "main", "pause_words", "plan", "run", "strategies"]
+__all__ = ["CLOSE_OUT", "DONE", "REFUSED", "WAIT", "empty_book_pockets", "main", "pause_words", "plan", "run", "strategies"]

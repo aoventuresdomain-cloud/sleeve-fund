@@ -139,3 +139,87 @@ def test_a_loss_the_strategy_it_came_from_cant_carry_is_still_refused_by_name_an
     assert (store.decisions(limit=10_000), store.archived()) == before
     assert lines == [f"refused, nothing written: the book can't be emptied while {run} -120.00, a loss no withdrawal "
                      "takes out"]
+
+
+def test_a_close_out_is_never_a_trades_pnl_in_attribution(store):
+    """HoQA cell 9: the close-out's cash rows are a transfer, not trading. A trip open across one (here a close-out
+    written mid-trip, the worst case) keeps the P&L of its fills alone; the rows the trades are paired with
+    (Store.insurance, the Trades tab's and attribution's) leave them out, while the book's two cash readers count them."""
+    from sleeve_fund.research.metrics import trades
+
+    _make(store, "rsi-bands", 10_000)
+    _mark(store, T0)
+    _trade(store, "rsi-bands", -29.70, T0)
+    run = _reset(store, "rsi-bands")
+    t1, t2, t3 = (T0 + timedelta(minutes=m) for m in (5, 6, 7))
+    store.record_fill("rsi-bands", side="BUY", qty=1.0, price=1_000.0, fee=0.0, order_id="b1", trade_id="b1", ts=t1)
+    assert store.close_out_run(run, "rsi-bands", D("29.70"), reset_book.CLOSE_OUT, t2, "operator",
+                               reset_book.RESET_ACTION, "close-out")
+    store.record_fill("rsi-bands", side="SELL", qty=1.0, price=1_010.0, fee=0.0, order_id="s1", trade_id="s1", ts=t3)
+    for name, cash in (("rsi-bands", D("-19.70")), (run, D(0))):
+        assert store.insurance(name, limit=None) == []
+        assert store.strategy_cash_pnl(name) == cash  # the book still counts the transfer
+    fills = sorted(store.fills("rsi-bands", limit=None), key=lambda f: f["ts"])
+    trips = trades(fills, True, None, store.insurance("rsi-bands", limit=None))
+    assert [round(t["pnl"], 2) for t in trips] == [10.0]
+    assert not store.close_out_run(run, "rsi-bands", D("29.70"), reset_book.CLOSE_OUT, t3, "operator",
+                                   reset_book.RESET_ACTION, "again")  # once only
+
+
+def _fund_held(store):
+    """The old book reset to DONE and its re-base deposit applied: the fund holds the book (bridge_start set)."""
+    _old_book(store)
+    code, _ = _until_done(store, [])
+    _mark(store, T0 + timedelta(minutes=20))
+    assert code == reset_book.DONE and supervisor.bridge_start(store) is not None
+
+
+def _holds(store):
+    return store.decisions(action=supervisor.IDENTITY_HOLD_ACTION, limit=100)
+
+
+def test_a_close_out_on_a_fund_held_book_is_never_an_insurance_break_or_a_held_book(store):
+    """DA / HoE RESET-NEG cell 10: the close-out's rows are insurance rows, and once the fund holds the book an
+    insurance credit inside it is a break that latches the identity hold, which only the PM lifts. A close-out isn't
+    one; a real credit (no order named, as before 0013) still is."""
+    _fund_held(store)
+    _make(store, "x", 0)
+    _trade(store, "x", -50, T0 + timedelta(minutes=21))
+    run = _reset(store, "x")
+    at = T0 + timedelta(minutes=22)
+    assert store.close_out_run(run, "x", D(50), reset_book.CLOSE_OUT, at, "operator", reset_book.RESET_ACTION, "c")
+    sup = supervisor.Supervisor(store)
+    assert supervisor.insurance_breaks(store, supervisor.bridge_start(store)) == []
+    sup._check_identity(at + timedelta(seconds=1))
+    assert _holds(store) == [] and not sup.ledger.identity_hold()
+    from sqlalchemy import insert
+
+    from sleeve_fund.store import insurance_t
+
+    with store.engine.begin() as c:  # a credit from before 0013: no fill named
+        c.execute(insert(insurance_t).values(sleeve="x", ts=at + timedelta(seconds=2), price=0, amount=D(5)))
+    assert len(supervisor.insurance_breaks(store, supervisor.bridge_start(store))) == 1
+
+
+def test_a_loss_whose_strategy_has_already_left_the_book_is_refused_not_closed_out(store):
+    """CR F-RN-2: the Strategy a run came from, already withdrawn, has no cash in the book to cover it."""
+    r1, _, _ = _old_book(store)
+    store.archive("rsi-bands")
+    _mark(store, T0 + timedelta(minutes=1, seconds=30))
+    assert "rsi-bands" in store.withdrawn()
+    assert [run for run, _, _ in reset_book._close_outs(store)] == [r for r in store.reset_runs() if "ping-pong" in r]
+    assert any(line.startswith("would refuse") and r1 in line for line in reset_book.plan(store, SLATE, D(100_000)))
+
+
+def test_a_close_out_that_fails_part_way_writes_nothing(store):
+    """CR F-RN-3: the credit, the debit and the journal row are one transaction: a failure after the cash rows (here
+    the journal row, with no action) leaves neither."""
+    r1, _, _ = _old_book(store)
+    try:
+        store.close_out_run(r1, "rsi-bands", D("29.70"), reset_book.CLOSE_OUT, T0 + timedelta(minutes=2), "operator",
+                            None, "c")
+    except Exception:  # noqa: BLE001 - the database's refusal, whichever engine's
+        pass
+    else:
+        raise AssertionError("set-up: the journal row was written with no action")
+    assert _close_out_rows(store) == [] and store.strategy_cash_pnl(r1) == D("-29.70")
