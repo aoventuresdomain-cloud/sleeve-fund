@@ -318,3 +318,21 @@ def test_every_strategys_recursive_indicators_are_covered_by_the_warm_up_seed_ch
     assert not ok and "Warm-up seed check: FAIL" in page
     assert ("  FAIL  d1: EMA(20) on daily closes (_Ema(20)) is a recursive average the warm-up seed check doesn't cover (A10); it "
             "doesn't go to paper until it is") in page, page
+
+
+def test_a_multi_asset_strategys_rows_are_built_and_checked_without_their_identity_keys(tmp_path):
+    """CR A10-M2: create_legs keeps the asset list and universe_date in every row's params, which the model's config
+    refuses; the check builds each row from its model settings alone (store.model_params), so a multi-asset Strategy
+    is checked, not failed as unbuilt."""
+    from datetime import UTC, datetime, timedelta
+
+    url, _ = _journal(tmp_path)
+    store = Store(url)
+    at = datetime.now(UTC) - timedelta(minutes=5)
+    store.settle_flow(store.fund_flow("deposit", 100_000, actor="pm", reason="test", rebase=True, now=at), at)
+    store.create_legs(name="trend-x", strategy="trend_filter", bar_spec="15-MINUTE-LAST-INTERNAL",
+                      assets=["BTC/USDT", "ETH/USDT"], params={}, starting_balance=0, universe_date="2026-10-15",
+                      venue="BINANCE")
+    store.engine.dispose()
+    _, page = start_check.run(url, environ={})
+    assert "Warm-up seed check: PASS" in page and "couldn't be built" not in page, page
