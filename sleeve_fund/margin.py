@@ -128,14 +128,36 @@ def shifted_liquidation(liq: float | None, qty: float, funded: float, maintenanc
     return nearer_liquidation(cash + funded, qty, entry, maintenance)
 
 
-def isolated_liquidation(cash: float, qty: float, entry: float, leverage: float, maintenance: Maintenance) -> float | None:
+def isolated_liquidation(cash: float, qty: float, entry: float, leverage: float, maintenance: Maintenance,
+                         fees: float = 0.0) -> float | None:
     """The liquidation price of a position of qty opened at entry on isolated margin at this leverage: the nearer
     of the two formulas (nearer_liquidation, VS-1-TABLE). cash is the strategy's spot-style cash (its balance less
-    qty x entry). None when flat, or when no positive price liquidates it (a long at 1x or less is fully paid for)."""
+    qty x entry). fees are the entry fees the position still holds (the journal's replay_book entry_fees, or
+    entry_fees_after fill by fill): they come off its isolated margin, so the price is nearer by fees / qty, the
+    entry fee rate x the entry (LIQ-FEE: HoE and Advisor (a), 15 Oct; the QA master's C-NA3-LIQ). The fee is booked
+    once, to cash, as before: only the liquidation price moves. None when flat, or when no positive price liquidates
+    it (a long at 1x or less is fully paid for). The one liquidation function: the fill, the decision's estimate, a
+    restart's recompute and safety stop, and the dashboard all work it here."""
     if qty == 0 or entry <= 0:
         return None
-    margin = isolated_margin(qty, entry, leverage, cash + qty * entry)
+    # The balance (cash + qty x entry) is after the fee already: a cap at it takes nothing more off
+    margin = min(isolated_margin(qty, entry, leverage) - max(fees, 0.0), max(cash + qty * entry, 0.0))
     return nearer_liquidation(margin - qty * entry, qty, entry, maintenance)
+
+
+def entry_fees_after(held: float, pos: float, q: float, fee: float, lot: float = 0.0) -> float:
+    """The entry fees still held on the margin after a fill of signed q (its fee) on a position of pos holding `held`,
+    fill by fill as the journal's replay_book works entry_fees: an opening fill adds its fee; a reduction keeps the
+    share still held (its own fee is realised, not margin); a fill through flat carries the share of its fee that
+    opened the other side. Less than half a lot is flat."""
+    after = pos + q
+    if abs(after) <= lot / 2 or not q:
+        return 0.0 if abs(after) <= lot / 2 else held
+    if abs(pos) <= lot / 2 or (pos > 0) != (after > 0):  # from flat, or through it: the share that opened this side
+        return fee * abs(after) / abs(q)
+    if abs(after) > abs(pos):  # an add
+        return held + fee
+    return held * abs(after) / abs(pos)  # a reduction keeps the share still held
 
 
 def entry_liquidation(cash: float, qty: float, close: float, side: int, fee: float, maintenance: Maintenance,
@@ -144,5 +166,6 @@ def entry_liquidation(cash: float, qty: float, close: float, side: int, fee: flo
     leverage as its isolated margin: isolated_margin), and how far that is from close as a share of
     it (inf when none)."""
     notional = qty * close  # cash afterwards is spot-style, as the journal keeps it: the fee paid, the notional taken out
-    liq = isolated_liquidation(cash - side * notional * (1 + side * fee), side * qty, close, leverage, maintenance)
+    liq = isolated_liquidation(cash - side * notional * (1 + side * fee), side * qty, close, leverage, maintenance,
+                               fees=notional * fee)  # off the margin, as the fill's will be (LIQ-FEE)
     return liq, (abs(liq / close - 1) if liq is not None else float("inf"))
