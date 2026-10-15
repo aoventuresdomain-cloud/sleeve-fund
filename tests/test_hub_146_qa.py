@@ -1281,7 +1281,10 @@ def test_na3_a_minute_opening_short_of_liquidation_takes_the_reachable_stop_firs
     (fill,) = [f for f in run.fills if f["order_id"] == filled_orders(run, "entry")[0]["order_id"]]
     qty, px, fee = float(fill["qty"]), float(fill["price"]), float(fill["fee"])
     lev, mm = {"balanced": 2.0, "aggressive": 3.0}[profile], markets.LOW_FEE_PERP.maintenance_margin
-    derived = (px - side * (qty * px / lev - fee) / qty) / (1 - side * mm)
+    a = (px - side * (qty * px / lev - fee) / qty) / (1 - side * mm)
+    # and on the entry value (VS-1-TABLE): p = entry - side x (margin - mm x notional at entry) / qty; the nearer kept
+    b = px - side * (qty * px / lev - fee - mm * qty * px) / qty
+    derived = max(a, b) if side > 0 else min(a, b)
     assert abs(liq / derived - 1) < 0.001, (liq, derived)
     extreme = np.round(p[7 * 60:8 * 60], 1)
     assert side * (float(extreme.min() if side > 0 else extreme.max()) - liq) <= 0  # at or past it: branch "capped"

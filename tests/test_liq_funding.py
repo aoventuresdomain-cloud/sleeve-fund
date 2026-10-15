@@ -43,8 +43,14 @@ def _rate(monkeypatch, rate):
     monkeypatch.setattr(LongFlatStrategy, "_funding_rate", _funding_rate_stub(LongFlatStrategy, rate))
 
 
-def moved(fixed: float, qty: float, funded: float) -> float:
-    return fixed + funded / (MM * abs(qty) - qty)
+def moved(fixed: float, qty: float, funded: float, entry: float) -> float:
+    """The liquidation price once `funded` more backs the position (VS-1-TABLE): fixed is the nearer of formula A
+    (maintenance on the value at the price) and B (on the entry value). The cash behind it is the larger of the two
+    that put each at fixed; both are re-solved at that cash plus funded and the nearer kept. mm 0.5%, one tier."""
+    m = MM * abs(qty)
+    cash = max(fixed * (m - qty), m * entry - qty * fixed) + funded
+    a, b = cash / (m - qty), (m * entry - cash) / qty
+    return max(a, b) if qty > 0 else min(a, b)
 
 
 def _prices(side: int, depth: float, n: int = 40):
@@ -73,7 +79,8 @@ def _paper(prices, side):
 
 
 def _book(where, prices, side):
-    """(orders oldest first with intent and signal, the entry's fixed liquidation price, qty signed, funding since)."""
+    """(orders oldest first with intent and signal, the entry's fixed liquidation price, qty signed, funding since,
+    the entry fill's price)."""
     from sleeve_fund import markets
 
     if where == "paper":
@@ -92,7 +99,7 @@ def _book(where, prices, side):
         cash = 10_000 - side * fill["qty"] * fill["price"] - fill["fee"]
         fixed = markets.isolated_liquidation(cash, side * fill["qty"], fill["price"], 3.0, MM)
         funded = sum(r["amount"] for r in res.funding if pd.Timestamp(r["ts"]) > pd.Timestamp(fill["ts"]))
-    return orders, fixed, side * fill["qty"], funded
+    return orders, fixed, side * fill["qty"], funded, float(fill["price"])
 
 
 # A payment brings the price closer: a gap to a level the fixed price is well clear of (past the 7% cut too) is through
@@ -106,9 +113,9 @@ def test_funding_paid_moves_the_liquidation_price_closer_and_the_position_is_liq
                                                                                             where, side, rate, depth):
     _rate(monkeypatch, rate)
     p = _prices(side, depth)
-    orders, fixed, qty, funded = _book(where, p, side)
+    orders, fixed, qty, funded, entry = _book(where, p, side)
     assert funded < 0, ("set-up: the 08:00 settlement was paid", funded)
-    now = moved(fixed, qty, funded)
+    now = moved(fixed, qty, funded, entry)
     gap = float(p[-1])
     assert (now - fixed) * side > 0, "a payment moves it towards the price"
     assert (gap - fixed) * side / gap > 0.07, "set-up: the fixed price is clear of the gap and of the 7% cut"
@@ -128,9 +135,9 @@ CREDITS = [pytest.param(1, -0.10, 0.3417, id="long"), pytest.param(-1, 0.12, 0.3
 def test_a_funding_credit_moves_the_liquidation_price_away(hourly, monkeypatch, where, side, rate, depth):
     _rate(monkeypatch, rate)
     p = _prices(side, depth)
-    orders, fixed, qty, funded = _book(where, p, side)
+    orders, fixed, qty, funded, entry = _book(where, p, side)
     assert funded > 0, ("set-up: the 08:00 settlement was a credit", funded)
-    now = moved(fixed, qty, funded)
+    now = moved(fixed, qty, funded, entry)
     gap = float(p[-1])
     assert (fixed - now) * side > 0, "a credit moves it away from the price"
     assert (gap - fixed) * side <= 0, "set-up: the gap is through the fixed price"
@@ -165,7 +172,7 @@ def test_a_restart_reads_the_funding_since_the_fill_back_from_the_journal(hourly
 
     monkeypatch.setattr(Store, "record_order", journaled)
     monkeypatch.setattr(Store, "create_sleeve", with_funding)
-    now = moved(fixed, qty, funded)
+    now = moved(fixed, qty, funded, px)
     gap = now * 0.995  # through the moved price, and clear of the fixed price's 7% cut
     p = qa.shape(flat_prices(20), 4, 20, gap / qa.BASE)
     assert (gap - fixed) / gap > 0.07
@@ -184,6 +191,10 @@ def _stub(qty: float, fixed: float, funded: float, since: int | None = 0):
     class S:
         _liq_now = LongFlatStrategy._liq_now
         _cfg = SimpleNamespace(perp=SimpleNamespace(maintenance_margin=MM))
+        _entry_px = None  # no entry known: the shift is solved on formula A alone (VS-1-TABLE)
+
+        def _net_position(self):
+            return 0.0, None
 
         def __init__(self):
             self._liq_px, self._liq_funded, self._liq_from = fixed, funded, since
@@ -242,7 +253,7 @@ def hourly_guarded(monkeypatch):
 def test_guarded_a_drain_past_the_daily_loss_pauses_it_before_any_liquidation(hourly_guarded, monkeypatch, where,
                                                                                side):
     _rate(monkeypatch, 0.10 * side)  # 15% of equity paid at 08:00
-    orders, _, _, funded = _book(where, _prices(side, 0.25 if side > 0 else 0.22), side)
+    orders, _, _, funded, _ = _book(where, _prices(side, 0.25 if side > 0 else 0.22), side)
     assert funded < -800
     intents = [o["intent"] for o in orders]
     assert intents == ["entry", "risk_pause"], [(o["intent"], o["reason"]) for o in orders]
@@ -255,8 +266,8 @@ def test_guarded_a_drain_inside_the_limits_then_a_gap_liquidates_at_the_moved_pr
                                                                                      where, side, depth):
     _rate(monkeypatch, 0.05 * side)  # 7.5% of equity paid at 08:00: inside the 8% daily loss
     p = _prices(side, depth)
-    orders, fixed, qty, funded = _book(where, p, side)
-    now, gap = moved(fixed, qty, funded), float(p[-1])
+    orders, fixed, qty, funded, entry = _book(where, p, side)
+    now, gap = moved(fixed, qty, funded, entry), float(p[-1])
     assert -800 < funded < 0
     assert (gap - now) * side <= 0 < (gap - fixed) * side, "set-up: the gap is through the moved price only"
     assert [o["intent"] for o in orders] == ["entry", "liquidation"], [(o["intent"], o["reason"]) for o in orders]
@@ -382,7 +393,7 @@ def _add_run(where, prices, side):
     q = sum(f["qty"] for f in opened)
     avg = sum(f["qty"] * f["price"] for f in opened) / q
     fixed = markets.isolated_liquidation(10_000.0 - side * q * avg, side * q, avg, 3.0, MM)  # balance clear of margin
-    return orders, fixed, side * q, funded, fills, cash
+    return orders, fixed, side * q, funded, fills, cash, avg
 
 
 ADDS = [pytest.param(1, 0.10, 0.30, id="long"), pytest.param(-1, -0.10, 0.30, id="short")]
@@ -395,10 +406,10 @@ def test_an_add_keeps_the_funding_taken_before_it_and_the_combined_position_is_l
                                                                                                depth):
     _rate(monkeypatch, rate)
     p = _prices(side, depth)
-    orders, fixed, qty, funded, fills, _ = _add_run(where, p, side)
+    orders, fixed, qty, funded, fills, _, avg = _add_run(where, p, side)
     assert funded < 0 and all(pd.Timestamp(f["ts"]) > SETTLED for f in fills if f["intent"] == "rebalance"), \
         ("set-up: the 08:00 settlement was paid before the add", funded)
-    now, gap = moved(fixed, qty, funded), float(p[-1])
+    now, gap = moved(fixed, qty, funded, avg), float(p[-1])
     assert (gap - now) * side <= 0 < (gap - fixed) * side, "set-up: the gap is through the moved price only"
     liq = [o for o in orders if o["intent"] == "liquidation"]
     assert liq, [o["intent"] for o in orders]
@@ -412,7 +423,7 @@ def test_across_an_add_a_liquidation_still_loses_exactly_the_margin_and_fees(add
     from sleeve_fund import markets
 
     _rate(monkeypatch, rate)
-    _, _, qty, funded, fills, cash = _add_run(where, _prices(side, depth), side)
+    _, _, qty, funded, fills, cash, _ = _add_run(where, _prices(side, depth), side)
     opened = [f for f in fills if f["intent"] in ("entry", "rebalance")]
     (liq,) = [f for f in fills if f["intent"] == "liquidation"]
     margin = sum(markets.isolated_margin(f["qty"], f["price"], 3.0) for f in opened)
@@ -519,9 +530,9 @@ def test_a_restart_after_an_add_reads_back_the_funding_since_the_first_fill(hour
 
     monkeypatch.setattr(Store, "record_order", journaled)
     monkeypatch.setattr(Store, "create_sleeve", with_first_fill_and_funding)
-    now = moved(fixed, qty, -1500.0)
+    now = moved(fixed, qty, -1500.0, px)
     gap = now * 0.995  # through the price moved by both settlements, above the one moved by 08:00 alone
-    assert gap > moved(fixed, qty, -750.0)
+    assert gap > moved(fixed, qty, -750.0, px)
     p = qa.shape(flat_prices(20), 4, 20, gap / qa.BASE)
     held = (half, px, int(pd.Timestamp("2025-10-03 07:55", tz="UTC").value))
     run = qa.paper(p, side=1, perp=True, profile="aggressive", stop=None, enter=0, leave=19, held=held)

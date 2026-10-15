@@ -879,7 +879,10 @@ def test_a_perp_entry_puts_up_the_position_cap_as_margin_and_its_liquidation_pri
         assert (liq < close) if side > 0 else (liq > close), sig
         # Isolated: the margin is the notional over the leverage cap, so liquidation is the textbook price at
         # that leverage, not at the notional over the whole equity (review round 13, U13-2).
-        assert liq / close == pytest.approx((1 - side / prof.max_leverage) / (1 - side * m), rel=2e-3), sig
+        # The nearer of the two formulas (VS-1-TABLE): a long's is on its entry value, 1 - 1/leverage + maintenance;
+        # a short's on its value at the price, (1 + 1/leverage) / (1 + maintenance).
+        textbook = 1 - 1 / prof.max_leverage + m if side > 0 else (1 + 1 / prof.max_leverage) / (1 + m)
+        assert liq / close == pytest.approx(textbook, rel=2e-3), sig
         assert abs(liq / close - 1) >= prof.min_liquidation_distance, sig
 
 
