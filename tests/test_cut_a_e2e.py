@@ -9,19 +9,12 @@ import pandas as pd
 import pytest
 from test_exposure_gate_xfails import _offline  # noqa: F401
 
-from sleeve_fund import supervisor as _sup
 from sleeve_fund.gate_ledger import DbLedger
 from sleeve_fund.portfolio.gate import PortfolioState
 from sleeve_fund.store import Store
 
-# Red first until PE2's fund-held book is on the head (supervisor.sizing_equity, the simulated account's virtual
-# funding and the replay's netting of it); strict, so the merged head must pass them and drop nothing.
-PE2_BUILT = pytest.mark.xfail(not hasattr(_sup, "sizing_equity"), strict=True,
-                              reason="needs PE2's fund-held book (sizing_equity, virtual funding)")
-
 
 # ---- End to end: a Strategy with a starting balance of 0 inside the fund ---------------------------------------------
-@PE2_BUILT
 @pytest.mark.parametrize("headroom", [10, 1])
 def test_a_zero_balance_strategy_sizes_off_the_fund_fills_pays_its_fee_marks_and_renders(tmp_path, monkeypatch,
                                                                                          headroom):
@@ -66,7 +59,6 @@ def test_a_zero_balance_strategy_sizes_off_the_fund_fills_pays_its_fee_marks_and
     assert page.status_code == 200 and "Traceback" not in page.text and "division" not in page.text.lower()
 
 
-@PE2_BUILT
 @pytest.mark.parametrize("headroom", [10, 1])
 def test_a_fund_held_losing_trade_books_no_insurance_and_the_fund_falls_by_exactly_the_loss(tmp_path, monkeypatch,
                                                                                             headroom):

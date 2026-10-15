@@ -439,7 +439,9 @@ def test_a_two_leg_node_runs_on_the_hub_and_a_trade_the_journal_left_legging_wit
     node.dispose()
 
 
-def test_a_spot_and_perp_pair_judges_its_guards_on_every_spot_trade_and_fill_without_failing(tmp_path, monkeypatch):
+@pytest.mark.parametrize("gate", [False, True])
+def test_a_spot_and_perp_pair_judges_its_guards_on_every_spot_trade_and_fill_without_failing(tmp_path, monkeypatch,
+                                                                                            gate):
     """HoQA P2-8 (QT2's probe): on the real node, the spot leg of a spot + perp pair runs the guards on each trade print
     and each fill of either leg (Advisor M5). A spot leg has no liquidation price, so the guard reads none rather than
     failing on its missing perp terms (which fired handler_failed on every print and fill, leaving the summed halt,
@@ -486,6 +488,13 @@ def test_a_spot_and_perp_pair_judges_its_guards_on_every_spot_trade_and_fill_wit
         judged.append(self.runtime.name)
         return real_book(self, *a, **k)
 
+    liq_read = []
+    real_liq = LongFlatStrategy._liq_now
+
+    def liq_now(self, *a, **k):
+        liq_read.append(self.runtime.name)
+        return real_liq(self, *a, **k)
+
     marked = []
     real_mark = Pair.on_mark
 
@@ -496,13 +505,16 @@ def test_a_spot_and_perp_pair_judges_its_guards_on_every_spot_trade_and_fill_wit
     monkeypatch.setitem(REGISTRY, "driven", (Driven, LongFlatConfig))
     monkeypatch.setattr(LongFlatStrategy, "_entry_atr_pct", lambda self: 0.05)
     monkeypatch.setattr(LongFlatStrategy, "_guard_book", guard_book)
+    monkeypatch.setattr(LongFlatStrategy, "_liq_now", liq_now)
     monkeypatch.setattr(Pair, "on_mark", on_mark)
     inst = venue("kraken").instrument("BTC", "USDT")
     insts = {str(inst.id): inst}
     hub = Fanout("KRAKEN", known=lambda: set(insts), log=lambda *a: None,
                  instruments=lambda ids: [type(insts[i]).to_dict(insts[i]) for i in ids if i in insts])
     port = hub.start("127.0.0.1", 0)
-    store = Store(f"sqlite:///{tmp_path}/t.db", portfolio_gate=True)
+    # TEC-2LEG-GATEOFF (HoE): outside the fund (gate off) the legs' own summed halt and pause judge each print; inside it
+    # (gate on) they don't act, so the trade doesn't ask them (F-GUARD-OWN-EQ).
+    store = Store(f"sqlite:///{tmp_path}/t.db", portfolio_gate=gate)
     store.create_two_legs(name="carry", strategy="driven", bar_spec="1-MINUTE-LAST-INTERNAL", starting_balance=10_000,
                           first={"instrument": "BTC/USDT", "params": {}, "venue": "KRAKEN", "side": 1},
                           second={"instrument": "BTC/USDT", "params": {"market": "perp"}, "venue": "KRAKEN",
@@ -540,8 +552,14 @@ def test_a_spot_and_perp_pair_judges_its_guards_on_every_spot_trade_and_fill_wit
             failed = [e["message"] for e in store.events(name, limit=200) if e["kind"] == "handler_failed"]
             assert failed == [], failed
         assert pair.state == "hedged"
-        # Held, the spot leg is judged on its own prints (well over the 30-second tick's once) and on the fills.
-        assert judged.count("carry") >= 10 and judged.count("carry~2") >= 2
+        # Held, the spot leg is judged on its own prints (well over the 30-second tick's once) and on the fills: the
+        # account and liquidation distance always; the legs' own summed halt and pause only outside the fund, as inside
+        # it they don't act (F-GUARD-OWN-EQ; the fund's brakes, T5, do).
+        assert liq_read.count("carry") >= 10 and liq_read.count("carry~2") >= 2
+        if gate:
+            assert judged == [], judged
+        else:
+            assert judged.count("carry") >= 10 and judged.count("carry~2") >= 2
         # Advisor M5 (CR F283-6): each leg's own entry fill ran both legs' guards there and then (Pair.on_mark).
         assert {"carry", "carry~2"} <= set(marked)
     finally:
