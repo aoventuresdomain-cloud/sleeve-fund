@@ -340,21 +340,26 @@ def _booked(s, sold):
     s._sell_all = lambda intent, reason, values=None: sold.append((intent, reason, dict(s._outage_book or {})))
 
 
-@pytest.mark.parametrize("minutes, hit, booked", [
-    # A replayed stop books less the taker's slippage too (Advisor 20:39/20:42, NA-1 replay slippage).
-    ([(100.5, 99.5), (100.2, 97.9), (101.0, 99.0)], "stop_loss", 98.0 * 0.9995),  # 2% stop at 98, minute 2
-    ([(103.0, 99.5), (105.1, 101.0)], "take_profit", 105.0 * 0.9995),  # less the taker's slippage (L12)
-    ([(105.5, 97.5)], "stop_loss", 98.0 * 0.9995),  # both in one minute: the stop, adverse first (NA-2)
-    ([(100.5, 99.5), (97.0, 96.0)], "stop_loss", 96.5 * 0.9995),  # the 2nd minute opens past the stop: its open
-    ([(101.0, 99.0)], None, None),
+@pytest.mark.parametrize("minutes, hit, booked, source", [
+    # A replayed stop books less the taker's slippage too (Advisor 20:39/20:42, NA-1 replay slippage). The venue
+    # serves no trades for the trigger minute here, so a stop touched inside it books the worse of its level less
+    # the floor and the minute's low (GAP-DOWN branch "extreme"): min(98 x 0.9995 = 97.951, 97.9).
+    ([(100.5, 99.5), (100.2, 97.9), (101.0, 99.0)], "stop_loss", 97.9, "extreme"),  # 2% stop at 98, minute 2
+    ([(103.0, 99.5), (105.1, 101.0)], "take_profit", 105.0 * 0.9995, "touch"),  # less the taker's slippage (L12)
+    # Both in one minute: the stop, adverse first (NA-2); branch "extreme": min(97.951, the low 97.5).
+    ([(105.5, 97.5)], "stop_loss", 97.5, "extreme"),
+    ([(100.5, 99.5), (97.0, 96.0)], "stop_loss", 96.5 * 0.9995, "open"),  # the 2nd minute opens past the stop
+    ([(101.0, 99.0)], None, None, None),
 ])
 def test_a_stop_or_target_crossed_while_the_strategy_was_down_is_booked_where_the_venue_would_have_filled_it(
-        minutes, hit, booked):
+        minutes, hit, booked, source):
     """On restart the stored minutes since the previous process last saw market data are replayed as the venue's
-    resting orders would have traded them (Advisor NA-1): a stop at its level, or the open on a gap; a target at
-    its level; the market's price now beside it."""
+    resting orders would have traded them (Advisor NA-1, GAP-DOWN): a stop at its level less the floor, the open on
+    a gap, or with no trades served for the minute its adverse extreme when worse; a target at its level; the
+    market's price now beside it."""
     s, bar, events, sold, opened = _late_strategy()
     _booked(s, sold)
+    s.attach_trade_loader(lambda start_ns, end_ns: [])  # explicit: the venue serves no trades for that minute
     s._entry_px, s._entry_side, s._stop_frac, s._tp_frac = 100.0, 1, 0.02, 0.05
     s._last_alive = s._last_seen = datetime.fromtimestamp(NS / 1e9, tz=timezone.utc)  # market data seen till then
     s.runtime.store.fills = lambda name, limit: [{"ts": datetime.fromtimestamp((NS - 600e9) / 1e9, tz=timezone.utc)}]
@@ -368,6 +373,7 @@ def test_a_stop_or_target_crossed_while_the_strategy_was_down_is_booked_where_th
         return
     (intent, reason, book), = sold
     assert intent == hit and book["book_px"] == pytest.approx(booked) and book["market_on_return"] == 101.0
+    assert book["fill_source"] == source and ("outage fill: pessimistic" in reason) is (source == "extreme")
     assert s._entry_px is None and s._outage_book is None
     assert [e[2] for e in events] == ["outage_exit"] and "while the strategy was down" in reason
 
