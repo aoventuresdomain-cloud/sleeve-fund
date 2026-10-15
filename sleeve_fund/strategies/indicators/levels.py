@@ -1,4 +1,4 @@
-"""Levels: the highest and lowest of a series over a window (tool gap G2) and the previous calendar period's high, low
+"""Levels: the highest or lowest of a series over a window (tool gap G2) and the previous calendar period's high, low
 and close (G4)."""
 
 from __future__ import annotations
@@ -12,42 +12,34 @@ DAY_MINUTES = 1_440
 PERIODS = {"day": 1, "week": 7}  # days in each calendar period
 
 
-class Rolling(Block):
-    """The highest (max) and lowest (min) of the last `period` values fed, the one just fed included. It takes one
-    input, so a definition can feed it another block's output ("Bollinger width at its 120-candle low" is
-    bb.width <= lo.min with lo = rolling(120) fed bb.width); unfed, it reads the close. `value` is max."""
+class _Rolling(Block):
+    """The highest or lowest of the last `period` values fed, the one just fed included, as the rule builder's
+    Donchian channel counts its window (the bar just closed in it). It takes one input, so a definition can feed it
+    another block's output: "Bollinger width at its 120-candle low" is bb.width <= lo with lo = rolling_min(120)
+    fed bb.width. Unfed, it reads the close. With fewer than `period` values it has no value."""
 
     SETTINGS = (Setting("period", int, 20, 1, PERIOD_MAX),)
-    OUTPUTS = ("max", "min")
+    _keep = staticmethod(lambda last, x: last <= x)  # drop a queued value this one beats: max keeps the larger
 
     def __init__(self, period: int = 20) -> None:
         self.period = whole("period", period, 1)
         self.reset()
 
     def reset(self) -> None:
-        # Monotonic queues of (value number, value): the front is the window's max (or min), O(1) a value on average.
-        self._highs: deque[tuple[int, float]] = deque()
-        self._lows: deque[tuple[int, float]] = deque()
+        # A monotonic queue of (value number, value): the front is the window's max (or min), O(1) a value on average.
+        self._queue: deque[tuple[int, float]] = deque()
         self.count = 0
         self._value = 0.0
-        self._vals = dict.fromkeys(self.OUTPUTS, 0.0)
 
     def update_raw(self, value: float) -> None:
         x = float(value)
-        while self._highs and self._highs[-1][1] <= x:
-            self._highs.pop()
-        self._highs.append((self.count, x))
-        while self._lows and self._lows[-1][1] >= x:
-            self._lows.pop()
-        self._lows.append((self.count, x))
+        while self._queue and self._keep(self._queue[-1][1], x):
+            self._queue.pop()
+        self._queue.append((self.count, x))
         self.count += 1
-        oldest = self.count - self.period
-        while self._highs[0][0] < oldest:
-            self._highs.popleft()
-        while self._lows[0][0] < oldest:
-            self._lows.popleft()
-        self._value = self._highs[0][1]
-        self._vals = {"max": self._value, "min": self._lows[0][1]}
+        while self._queue[0][0] < self.count - self.period:
+            self._queue.popleft()
+        self._value = self._queue[0][1]
 
     def update_ohlcv(self, open_, high, low, close, volume, ts_ns=None) -> None:
         self.update_raw(close)
@@ -57,11 +49,21 @@ class Rolling(Block):
         return self.count >= self.period
 
     def _outputs(self) -> dict:
-        return dict(self._vals)
+        return {"value": self._value}
 
     @warmup
     def warmup_bars(cls, s) -> int:
         return s["period"]
+
+
+class RollingMax(_Rolling):
+    """The highest of the last `period` values of its input (tool gap G2)."""
+
+
+class RollingMin(_Rolling):
+    """The lowest of the last `period` values of its input (tool gap G2)."""
+
+    _keep = staticmethod(lambda last, x: last >= x)
 
 
 class PriorPeriod(Block):

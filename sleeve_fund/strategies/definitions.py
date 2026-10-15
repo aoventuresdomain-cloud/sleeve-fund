@@ -13,7 +13,7 @@ never changes because a file did. Design: /mnt/project-files/sleeve-fund/v2/p1-5
 
 A condition is {left, op, right}. An operand is a number, a price field (open, high, low, close, volume), a block
 ("rsi", or "bb.upper" for one of several outputs; its value as set at the last close), {prev = x} (x on the decision
-candle before), {add|sub|mul|div = [a, b]}, {time = "hour"|"weekday"|"day"|"days_to_month_end", tz = "Europe/London"} (at the candle's
+candle before), {add|sub|mul|div = [a, b]}, {time = "hour"|"weekday"|"day_of_month"|"days_to_month_end", tz = "Europe/London"} (at the candle's
 close, Monday 0, the day of the month from 1, days_to_month_end 0 on its last day (G3); UTC unless tz names a zone,
 whose summer time it follows), or {max_since_entry = x} / {min_since_entry = x}
 (since the leg's entry candle, that candle included). Conditions combine with {all = [...]},
@@ -23,9 +23,8 @@ its candle or one of the next N) and {setup = rule, trigger = rule, expire_after
 passed, a trigger on the last of their closes included; the cancel holding on a later close, or on the same one as a
 trigger, disarms it; a fresh setup re-arms it from that close).
 
-Exits: [exits] holds the exits both sides trade on; [exits.long] and [exits.short] may each hold that side's own, which
-replace the shared one of the same kind for that side only (tool gap G1: an ATR stop sits below a long and above a
-short). The sides agree on whether they carry a stop, and on whether they carry any level exit, since a stopless leg
+Exits: [exits] holds the exits both sides trade on, or [exits.long] and [exits.short] each hold one side's own, never
+both forms at once (tool gap G1: an ATR stop sits below a long and above a short). The sides agree on whether they carry a stop, and on whether they carry any level exit, since a stopless leg
 is held to 1x. time_stop = {minutes = N} or {bars = N} is wall-clock, ending the leg on the first candle at or after the
 deadline, so missing candles never lengthen a hold; {bars = N, count = "bars"} counts the candles that came, as
 rsi_cross does. stop = {level} is set when the position opens; trail = {level, ratchet} follows its level and with
@@ -60,7 +59,9 @@ COMPARE = {">": lambda a, b: a > b, "<": lambda a, b: a < b, ">=": lambda a, b: 
 CROSSES = ("crosses_above", "crosses_below")
 ARITHMETIC = {"add": lambda a, b: a + b, "sub": lambda a, b: a - b, "mul": lambda a, b: a * b,
               "div": lambda a, b: a / b if b else None}
-TIMES = ("hour", "weekday", "day", "days_to_month_end")
+TIMES = ("hour", "weekday", "day_of_month", "days_to_month_end")
+# The values a time operand can take (G3): a rule comparing one with a number outside them is refused.
+TIME_RANGE = {"hour": (0, 23), "weekday": (0, 6), "day_of_month": (1, 31), "days_to_month_end": (0, 30)}
 SINCE_ENTRY = {"max_since_entry": max, "min_since_entry": min}
 TOP_KEYS = ("version", "name", "reason", "blocks", "long", "short", "exits", "costs")
 LEVEL_EXITS = ("stop", "trail", "exit_at_level")
@@ -110,7 +111,7 @@ CATALOGUE = {
     "sma": "SMA", "ema": "EMA", "wma": "WMA", "vwap": "VWAP", "rsi": "RSI", "bollinger": "Bollinger bands",
     "atr": "ATR", "atr_sma": "ATR (simple average)", "relative_volume": "Relative volume",
     "efficiency_ratio": "Efficiency ratio", "donchian": "Donchian channel", "rsi_divergence": "RSI divergence",
-    "stochastic": "Stochastic", "keltner": "Keltner channel", "rolling": "Rolling high and low",
+    "stochastic": "Stochastic", "keltner": "Keltner channel", "rolling_max": "Rolling high", "rolling_min": "Rolling low",
     "prior_period": "Previous day or week",
 }
 _ID = re.compile(r"^[a-z_][a-z0-9_]*$")
@@ -388,6 +389,8 @@ def _check_rule(rule, where: str, blocks: dict, bar_minutes, uses_prev: list, en
             uses_prev.append(where)
         _check_operand(rule["left"], where, blocks, uses_prev)
         _check_operand(rule["right"], where, blocks, uses_prev)
+        _check_time_range(rule["left"], rule["right"], where)
+        _check_time_range(rule["right"], rule["left"], where)
     elif keys in ({"all"}, {"any"}):
         items = rule["all"] if "all" in rule else rule["any"]
         if not isinstance(items, list) or not items:
@@ -471,6 +474,16 @@ def _check_operand(x, where: str, blocks: dict, uses_prev: list) -> None:
     raise ValueError(f"{where}: not a value: {x!r}")
 
 
+def _check_time_range(x, number, where: str) -> None:
+    """A day of the month compared with 0 or 32, say, is a typing slip that would hold always or never (G3)."""
+    if not (isinstance(x, dict) and x.get("time") in TIME_RANGE and isinstance(number, (int, float))
+            and not isinstance(number, bool)):
+        return
+    lo, hi = TIME_RANGE[x["time"]]
+    if not lo <= number <= hi:
+        raise ValueError(f"{where}: {x['time']} runs {lo} to {hi}, so comparing it with {number:g} is a slip")
+
+
 def _zone(tz, where: str):
     from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -509,7 +522,7 @@ def _never_stop_side(level, side: str, blocks: dict) -> bool:
 
 
 def side_exits(exits: dict | None, side: str) -> dict:
-    """The exits one side trades on: the shared ones, each replaced by the same kind in the side's own table (G1)."""
+    """The exits one side trades on: the shared ones, or its own table's (G1)."""
     exits = exits or {}
     own = exits.get(side) or {}
     return {**{k: v for k, v in exits.items() if k not in ("long", "short")}, **own}
@@ -522,6 +535,10 @@ def _check_exits(exits: dict, blocks: dict, bar_minutes, uses_prev: list, sides=
     if unknown:
         raise ValueError(f"exits has no {', '.join(sorted(unknown))}; it takes {', '.join(SIDE_EXITS)}, and long "
                          "and short for one side's own")
+    shared = set(exits) & set(SIDE_EXITS)
+    if shared and ("long" in exits or "short" in exits):
+        raise ValueError(f"exits is either shared by both sides or per side ([exits.long], [exits.short]), not both: "
+                         f"move {', '.join(sorted(shared))} into each side's table")
     for side in ("long", "short"):
         if side not in exits:
             continue
@@ -678,7 +695,7 @@ class Compiled:
                     days, rest = divmod(env.ts // MINUTE_NS, DAY_MINUTES)
                     return float(rest // 60) if what == "hour" else float((days + 3) % 7)  # 1 Jan 1970: a Thursday
                 local = datetime.fromtimestamp(env.ts // 1_000_000_000, tz=zone or timezone.utc)
-                if what == "day":
+                if what == "day_of_month":
                     return float(local.day)
                 if what == "days_to_month_end":
                     return float(calendar.monthrange(local.year, local.month)[1] - local.day)
