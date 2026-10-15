@@ -92,14 +92,15 @@ def test_a_proved_dump_replaces_the_journal_and_the_old_journal_is_kept_beside_i
 
 # --- with stand-in Postgres tools ------------------------------------------------------------------------------------
 
-def _tools(bin_dir: Path, log: Path, restore_ok: bool = True, busy: int = 0, rename_ok: bool = True) -> None:
+def _tools(bin_dir: Path, log: Path, restore_ok: bool = True, busy: int = 0, rename_ok: bool = True,
+           size: int = 1000) -> None:
     bin_dir.mkdir(exist_ok=True)
     stubs = {
         "createdb": "exit 0",
         "dropdb": "exit 0",
         "pg_restore": "exit 0" if restore_ok else "echo 'pg_restore: error: secret-host row' >&2; exit 1",
-        "psql": (f'case "$*" in *pg_stat_activity*) echo {busy};; *"ALTER DATABASE"*) {"exit 0" if rename_ok else "exit 5"};; '
-                 '*) echo "0028 5 4 9 1 2 3";; esac'),
+        "psql": (f'case "$*" in *pg_stat_activity*) echo {busy};; *pg_database_size*) echo {size};; '
+                 f'*"ALTER DATABASE"*) {"exit 0" if rename_ok else "exit 5"};; *) echo "0028 5 4 9 1 2 3";; esac'),
     }
     for name, body in stubs.items():
         (bin_dir / name).write_text(f'#!/usr/bin/env bash\necho "{name} $*" >> {log}\n{body}\n')
@@ -171,8 +172,8 @@ def test_a_failed_second_rename_puts_the_journal_back_and_names_the_exit(tmp_pat
     psql = tmp_path / "bin" / "psql"  # the set-aside works, the stage's rename into place doesn't
     psql.write_text(f'''#!/usr/bin/env bash
 echo "psql $*" >> {log}
-case "$*" in *pg_stat_activity*) echo 0;; *'"restore_stage" RENAME'*) exit 6;; *"ALTER DATABASE"*) exit 0;;
-  *) echo "0028 5 4 9 1 2 3";; esac
+case "$*" in *pg_stat_activity*) echo 0;; *pg_database_size*) echo 1000;; *'"restore_stage" RENAME'*) exit 6;;
+  *"ALTER DATABASE"*) exit 0;; *) echo "0028 5 4 9 1 2 3";; esac
 ''')
     log.write_text("")
     env = {k: v for k, v in os.environ.items() if k not in ("PGHOST", "PGUSER")}
@@ -181,6 +182,33 @@ case "$*" in *pg_stat_activity*) echo 0;; *'"restore_stage" RENAME'*) exit 6;; *
     assert done.returncode == 1 and "(exit 6), the journal is back as it was" in done.stdout, done.stdout
     back = _renames(log.read_text().splitlines())[-1]
     assert '_before_restore_' in back and back.endswith('RENAME TO "sleeve_fund"')
+
+
+@needs_bash
+def test_a_journal_left_out_of_its_place_exits_2_and_says_so(tmp_path):
+    """QT3 F-RJ-1: the stage's rename and the put-back both fail. No database carries the journal's name, which no
+    other failure leaves: exit 2, never 1, so the server side keeps the app stopped."""
+    log = tmp_path / "calls.log"
+    _run(tmp_path)
+    (tmp_path / "bin" / "psql").write_text(f'''#!/usr/bin/env bash
+echo "psql $*" >> {log}
+case "$*" in *pg_stat_activity*) echo 0;; *pg_database_size*) echo 1000;; *'RENAME TO "sleeve_fund_before'*) exit 0;;
+  *"ALTER DATABASE"*) exit 6;; *) echo "0028 5 4 9 1 2 3";; esac
+''')
+    env = {k: v for k, v in os.environ.items() if k not in ("PGHOST", "PGUSER")}
+    env |= {"PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}", "BACKUP_DIR": str(tmp_path / "b"), "DUMP": DUMP}
+    done = subprocess.run(["bash", str(INNER)], env=env, capture_output=True, text=True, timeout=30, check=False)
+    assert done.returncode == 2 and "the journal is still named sleeve_fund_before_restore_" in done.stdout, done.stdout
+    assert "as it was" not in done.stdout
+
+
+@needs_bash
+def test_too_little_disk_for_the_stage_restores_nothing(tmp_path):
+    """QT3 minor: the stage is a second journal; twice the journal's size free on the host's disk (beside the
+    backups, as the pre-deploy dump checks), or nothing is restored."""
+    done, calls = _run(tmp_path, size=10**18)
+    assert done.returncode == 1 and "restore journal: FAIL, not enough disk" in done.stdout, done.stdout
+    assert not [c for c in calls if c.startswith(("createdb", "pg_restore"))] and not _renames(calls)
 
 
 @needs_bash
@@ -199,13 +227,14 @@ def test_the_stage_is_never_a_database_it_could_harm(tmp_path, stage):
 # --- the server side, with a stand-in docker -------------------------------------------------------------------------
 
 def _host(tmp_path: Path, go: str = "pm-go", confirm: str | None = None, inner_ok: bool = True,
-          migrate_ok: bool = True) -> tuple[subprocess.CompletedProcess, list[str]]:
+          migrate_ok: bool = True, inner_exit: int = 1) -> tuple[subprocess.CompletedProcess, list[str]]:
     log = tmp_path / "docker.log"
     log.write_text("")
     (tmp_path / "bin").mkdir(exist_ok=True)
     (tmp_path / "deploy").mkdir(exist_ok=True)
     (tmp_path / "deploy" / "restore_journal_inner.sh").write_text(
-        "echo 'restore journal: PASS, stand-in'\n" if inner_ok else "echo 'restore journal: FAIL, stand-in'; exit 1\n")
+        "echo 'restore journal: PASS, stand-in'\n" if inner_ok
+        else f"echo 'restore journal: FAIL, stand-in'; exit {inner_exit}\n")
     (tmp_path / "bin" / "docker").write_text(f"""#!/usr/bin/env bash
 echo "$*" >> {log}
 case "$*" in
@@ -246,6 +275,22 @@ def test_a_failure_before_the_swap_starts_the_app_again_on_the_untouched_journal
     done, calls = _host(tmp_path, inner_ok=False)
     assert done.returncode == 1 and "the journal is as it was" in done.stdout
     assert calls[-1] == "compose start supervisor dashboard hub-binance" and not [c for c in calls if "migrate" in c]
+
+
+@needs_bash
+def test_a_journal_out_of_its_place_keeps_the_app_stopped_and_says_so(tmp_path):
+    """QT3 F-RJ-1: the inner script's exit 2 means no database carries the journal's name: the app stays stopped."""
+    done, calls = _host(tmp_path, inner_ok=False, inner_exit=2)
+    assert done.returncode == 2 and "the app stays stopped" in done.stdout, done.stdout
+    assert "as it was" not in done.stdout and not [c for c in calls if c.startswith("compose start")]
+    assert not [c for c in calls if "migrate" in c]
+
+
+def test_a_restore_never_overlaps_a_deploy_or_another_journal_writer():
+    """QT3 F-RJ-2: the workflow runs in the deploy's history-writer group, so a push to main waits for it."""
+    deploy = (ROOT / ".github" / "workflows" / "deploy.yml").read_text()
+    group = re.compile(r"^concurrency: \{ group: ([\w-]+), cancel-in-progress: false \}$", re.M)
+    assert group.search(deploy).group(1) == "history-writer" == group.search(WORKFLOW.read_text()).group(1)
 
 
 @needs_bash
