@@ -1830,8 +1830,10 @@ class Store:
             raise ValueError(f"an asset's name is 1-16 letters or digits: {bad}")
         if len(set(unders)) != len(unders):
             raise ValueError(f"an asset is listed twice: {assets}")
+        from sleeve_fund.venues import DEFAULT_VENUE, venue as venue_profile
+
+        venue_profile(venue)  # F-B3C-VENUE (DA): a registered venue, or ValueError (unknown venue)
         if bad := [a for a in assets if not re.fullmatch(r"[A-Z0-9]+/[A-Z0-9]+", a)]:  # F-B3C-VENUE
-            from sleeve_fund.venues import DEFAULT_VENUE
 
             raise ValueError(f"each asset is BASE/QUOTE on the Strategy's one venue ({(venue or DEFAULT_VENUE).upper()})"
                              f", with no venue of its own: {bad}")
