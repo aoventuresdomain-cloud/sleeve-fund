@@ -176,3 +176,13 @@ def test_a_long_fully_paid_for_still_has_nothing_to_liquidate_it():
     and checks keep treating it so (test_stop_safety_qa, conservative 1x long)."""
     assert margin.isolated_liquidation(500_000.0 - 60_000.0, 1.0, 60_000.0, 1.0, MM, fees=33.0) is None
     assert margin.isolated_liquidation(500_000.0 + 60_000.0, -1.0, 60_000.0, 1.0, MM, fees=33.0) is not None  # a short
+
+
+def test_a_1x_short_still_liquidates_and_takes_its_fee_off_the_margin():
+    """The exemption is a fully paid long's only (Advisor, 15:31 UK): a 1x short has a real liquidation price, about
+    2 x the entry, worked with its entry fee off the margin as every other position's is."""
+    entry, fees = 60_000.0, 33.0
+    got = margin.isolated_liquidation(500_000.0 + entry - fees, -1.0, entry, 1.0, MM, fees=fees)
+    assert got == pytest.approx(_by_hand(-1.0, entry, 1.0, fees), rel=1e-12)
+    assert got == pytest.approx((2 * entry - fees) / (1 + MM), rel=1e-12)  # formula A binds: about 119,370
+    assert got < margin.isolated_liquidation(500_000.0 + entry - fees, -1.0, entry, 1.0, MM)  # nearer with the fee
