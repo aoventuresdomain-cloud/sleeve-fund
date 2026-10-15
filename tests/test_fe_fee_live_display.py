@@ -1,40 +1,47 @@
 """FEE-LIVE display (HoE, head 3; Advisor's ruling FEE-UI, 15 Oct): Setup's Costs and data shows, per instrument in use,
 the fee and the margin tiers as two rows, each with its own source and fetch time (UK), amber past 24 hours, red past 72
-hours or never fetched (entries refused), the out-of-range line when the latest fetch was refused, the published VIP0
-schedule labelled when it stands in, and the research-fee line. Display only: every figure is the reader's decimal
-string (DA's venue_terms_fetch: Store.latest_good_venue_fetch and latest_venue_fetch); nothing is computed here."""
+hours or never fetched (entries refused), the out-of-range line when the latest fetch was refused, the published
+schedule labelled when it stands in, and the research-fee line. Display only: each row is the engine's own reading
+(venue_terms.live_terms) of DA's venue_terms_fetch rows; nothing is computed here. TEC-FE-FEE-UI (HoE): the cells drive
+real journal rows instead of stubbing the store's readers; every intent is unchanged."""
 
+import json
 import re
-from datetime import timedelta
-from zoneinfo import ZoneInfo
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
-from test_halt_ref import T0, _make, store  # noqa: F401
 
+from sleeve_fund import venue_terms
+from sleeve_fund.store import PUBLISHED_FEES, Store
+from sleeve_fund.venues import venue
+
+pytestmark = [pytest.mark.no_maintenance_tables, pytest.mark.venue_terms_live]
 AUTH = ("pm", "pw")
 H = timedelta(hours=1)
-UK = ZoneInfo("Europe/London")
-NOW = T0 + 100 * H
-
-
-BOUNDS = {"maker": ("0.0001", "0.0002"), "taker": ("0.0004", "0.00055")}  # the published [lowest, VIP0]
-FEE = {"symbol": "BTCUSDT", "maker": "0.0002", "taker": "0.00055"}
-TIERS = {"symbol": "BTCUSDT", "tiers": [
-    {"ceiling": "300000", "mmr": "0.0033", "imr": "0.0066", "max_leverage": "150", "deduction": "0"},
-    {"ceiling": "800000", "mmr": "0.005", "imr": "0.01", "max_leverage": "100", "deduction": "510"}]}
-
-
-def _fetch(db, kind, at, *, ok=True, source=None, payload=None, reason=""):
-    """One fetch through DA's write path (store.record_venue_fetch), as FEE-LIVE's fetcher writes it."""
-    return db.record_venue_fetch("BINANCE", kind, "BTC/USDT", source=source or ("fee-rate" if kind == "fee" else
-                                 "risk-limit"), ok=ok, reason=reason, at=at, bounds=BOUNDS if kind == "fee" else None,
-                                 payload=payload if payload is not None else (FEE if kind == "fee" else TIERS))
+NOW = datetime(2026, 10, 15, 12, tzinfo=UTC)
+PAPER = venue("BINANCE")
+PAIR = "BTC/USDT"
+RECORDED = Path(__file__).parent / "data" / "fee_live" / "risk-limit-BTCUSDT-2026-10-15.json"  # the engine's table
 
 
 @pytest.fixture
-def fetched(store):
-    _make(store, "a", 10_000)
+def db():
+    store = Store.in_memory()
+    store.create_sleeve(name="a", strategy="ping_pong", instrument=PAIR, bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=10_000, venue="BINANCE", params={"market": "perp"})
     return store
+
+
+def _fee(db, age, *, taker="0.00055"):
+    db.record_venue_fetch("BINANCE", "fee", PAIR, source=venue_terms.FEE_RATE, ok=True, account=db.account_of("a"),
+                          at=NOW - age, bounds=PAPER.fee_bounds,
+                          payload={"symbol": "BTCUSDT", "maker": "0.0002", "taker": taker})
+
+
+def _tiers(db, age):
+    db.record_venue_fetch("BINANCE", "tiers", PAIR, source=venue_terms.RISK_LIMIT, ok=True, at=NOW - age,
+                          payload=venue_terms.tier_payload(json.loads(RECORDED.read_text())["result"], "BTCUSDT"))
 
 
 def _view(db):
@@ -56,65 +63,55 @@ def _words(db, monkeypatch):
     return " ".join(re.sub(r"<[^>]+>", " ", sect.group(0)).split())
 
 
-def test_fresh_fee_and_tiers_are_two_rows_each_with_its_source_and_uk_time(fetched, monkeypatch):
-    db = fetched
-    _fetch(db, "fee", NOW - 2 * H)
-    _fetch(db, "tiers", NOW - 5 * H)
-    v = _view(db)
-    (line,) = v["instruments"]
+def test_fresh_fee_and_tiers_are_two_rows_each_with_its_source_and_uk_time(db, monkeypatch):
+    _fee(db, 2 * H)
+    _tiers(db, 5 * H)
+    (line,) = _view(db)["instruments"]
     assert line["fee"]["state"] == "fresh" and line["tiers"]["state"] == "fresh"
-    assert line["fee"]["maker"] == "0.0002" and line["fee"]["taker"] == "0.00055"  # the reader's strings, as stored
+    assert line["fee"]["maker"] == "0.0002" and line["fee"]["taker"] == "0.00055"  # as fetched
     words = _words(db, monkeypatch)
-    assert "Fees: 0.0002 maker, 0.00055 taker, from the account" in words
-    assert "Margin tiers: 2 tiers, from the public tier list" in words
-    uk = (NOW - 2 * H).astimezone(UK).strftime("%d %b %H:%M UK")
-    assert f"fetched {uk}" in words
+    assert "Fees: 0.0002 maker, 0.00055 taker" in words and "from the account" in words
+    assert f"Margin tiers: {len(PAPER.maintenance_tiers[PAIR])} tiers" in words and "public risk-limit table" in words
+    assert f"fetched {venue_terms.uk(NOW - 2 * H)}" in words and " UK" in words
     assert "Research tests use the standard published fee or higher, never a lower one." in words
     assert not re.search(r"binance|bybit", words, re.IGNORECASE)
 
 
 @pytest.mark.parametrize("kind", ["fee", "tiers"])
-def test_past_24_hours_a_row_is_amber_on_its_own(fetched, monkeypatch, kind):
-    db = fetched
+def test_past_24_hours_a_row_is_amber_on_its_own(db, monkeypatch, kind):
+    (_fee if kind == "fee" else _tiers)(db, 30 * H)
+    (_tiers if kind == "fee" else _fee)(db, 1 * H)
     other = "tiers" if kind == "fee" else "fee"
-    _fetch(db, kind, NOW - 30 * H)
-    _fetch(db, other, NOW - 1 * H)
     line = _view(db)["instruments"][0]
     assert line[kind]["state"] == "stale" and line[other]["state"] == "fresh"
-    assert "30 hours old; the last good value is still in use" in _words(db, monkeypatch)
+    assert "30 hours ago, over 24 hours; trading goes on" in _words(db, monkeypatch)
 
 
 @pytest.mark.parametrize("age", [73, None])
-def test_past_72_hours_or_never_fetched_entries_are_refused(fetched, monkeypatch, age):
-    db = fetched
+def test_past_72_hours_or_never_fetched_entries_are_refused(db, monkeypatch, age):
     if age:
-        _fetch(db, "fee", NOW - age * H)
-    _fetch(db, "tiers", NOW - 1 * H)
+        _fee(db, age * H)
+    _tiers(db, 1 * H)
     assert _view(db)["instruments"][0]["fee"]["state"] == "refused"
     words = _words(db, monkeypatch)
-    assert "new entries are refused until a fresh fee is fetched" in words
-    assert ("Never fetched" in words) is (age is None)
+    assert "entries are refused" in words and "exits and stops still run" in words
+    assert ("never fetched" in words) is (age is None)
 
 
-def test_a_fetch_outside_the_published_range_is_not_used_and_says_so(fetched, monkeypatch):
-    db = fetched
-    _fetch(db, "fee", NOW - 3 * H)
-    _fetch(db, "fee", NOW - 1 * H, payload={"symbol": "BTCUSDT", "maker": "0.0002", "taker": "0.0007"})  # > VIP0
-    _fetch(db, "tiers", NOW - H)
-    assert not db.latest_venue_fetch("BINANCE", "fee", "BTC/USDT")["ok"]  # DA's write path refused it
+def test_a_fetch_outside_the_published_range_is_not_used_and_says_so(db, monkeypatch):
+    _fee(db, 3 * H)
+    _tiers(db, H)
+    _fee(db, H, taker="0.0007")  # above VIP0: DA's store keeps it as failed, "out of bounds: ..."
     line = _view(db)["instruments"][0]["fee"]
     assert line["out_of_range"] and line["state"] == "fresh" and line["taker"] == "0.00055"
-    uk = (NOW - 3 * H).astimezone(UK).strftime("%d %b %H:%M UK")
-    assert (f"latest fetched fee was outside the published range and was not used; using the last good fee from {uk}"
-            in _words(db, monkeypatch))
+    assert (f"latest fetched fee was outside the published range and was not used; the last good fee, fetched "
+            f"{venue_terms.uk(NOW - 3 * H)}, is still the one in use" in _words(db, monkeypatch))
 
 
-def test_the_published_vip0_schedule_is_labelled_never_as_the_accounts_fee(fetched, monkeypatch):
-    from sleeve_fund.store import PUBLISHED_FEES
-
-    db = fetched
-    _fetch(db, "fee", NOW - H, source=PUBLISHED_FEES)
-    _fetch(db, "tiers", NOW - H)
+def test_the_published_schedule_is_labelled_never_as_the_accounts_fee(db, monkeypatch):
+    db.record_published_fees("BINANCE", PAIR, account=db.account_of("a"), bounds=PAPER.fee_bounds, at=NOW - H)
+    _tiers(db, H)
+    assert _view(db)["instruments"][0]["fee"]["state"] == "fresh"
     words = _words(db, monkeypatch)
-    assert "from the published schedule (VIP0), as the account has no fee endpoint" in words
-    assert "from the account" not in words
+    assert "published, not account" in words and "from the account" not in words
+    assert PUBLISHED_FEES not in words
