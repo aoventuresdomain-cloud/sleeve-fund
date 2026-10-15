@@ -33,7 +33,10 @@ for var in ALERT_WEBHOOK_URL HEALTHCHECK_PING_URL DEMO_MIRROR DERIBIT_TESTNET_AP
   if [ -n "${!var:-}" ]; then printf '%s=%s\n' "$var" "${!var}" >> .env.tmp; fi
   mv .env.tmp .env
 done
+# backup.sh is bind-mounted: compose up keeps the backup container on the old script, so it is recreated each
+# deploy (it dumps at once on start: one extra dump per deploy).
 docker compose up -d --build --remove-orphans
+docker compose up -d --force-recreate --no-deps backup
 docker image prune -f >/dev/null
 docker compose ps
 # The demo mirror's first lines say whether each demo key signed in (sleeve_fund/mirror.py); never a key.
