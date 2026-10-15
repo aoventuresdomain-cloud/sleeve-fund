@@ -43,6 +43,7 @@ from sqlalchemy import (
     create_engine,
     delete,
     event,
+    exists,
     false,
     func,
     case,
@@ -2210,6 +2211,17 @@ class Store:
                 raise RuntimeError("settling a reservation never reads the book")
             led = self.__dict__["_settle_ledger"] = DbLedger(self, no_book)
         return led
+
+    def put_away_left_open(self) -> list[str]:
+        """F-RRP-5 (CR; DA): the put-away Strategies still in the book (archived, not withdrawn) whose journal shows an
+        order open or whose room is still held: the only ones Supervisor.close_dead_orders has anything to close for.
+        One query, however many runs the resets have put away."""
+        a, o, r, s = sleeve_archive_t, orders_t, gate_reservations_t, sleeves_t
+        left_open = or_(exists().where(o.c.sleeve == a.c.sleeve, o.c.status.in_(OPEN_ORDER_STATUSES)),
+                        exists().where(r.c.sleeve_id == s.c.id, r.c.released_at.is_(None)))
+        with self.engine.connect() as c:
+            return list(c.execute(select(a.c.sleeve).join(s, s.c.name == a.c.sleeve)
+                                  .where(a.c.withdrawn.is_(None), left_open).order_by(a.c.sleeve)).scalars())
 
     def close_dead_orders(self, sleeve: str, why: str, ts: datetime | None = None) -> list[str]:
         """F-REFRESH-RES (HoE, Drop A SHOULD): a paper Strategy's process is confirmed stopped, so the simulated venue
