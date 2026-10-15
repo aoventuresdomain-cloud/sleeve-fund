@@ -190,3 +190,27 @@ def test_the_published_stand_in_may_print_its_rates(tmp_path, capfd, store):
     _fees(store, NOW - timedelta(hours=1), source=PUBLISHED_FEES)
     _, rows, out = _run(tmp_path, capfd, store)
     assert [line for line in out.splitlines() if "taker fee (fetched)" in line and "0.0005" in line], out
+
+
+def test_a_refused_fee_fetch_never_prints_the_accounts_rate(tmp_path, capfd, store):
+    """HoE 15:41 UK: a refused fee fetch's reason carries the account's rate ("out of bounds: taker 0.000731 outside
+    ..."); the public job log says only that it was refused and why, in fixed words."""
+    _tiers(store, NOW - timedelta(hours=1))
+    _fees(store, NOW - timedelta(hours=2))
+    _fees(store, NOW - timedelta(hours=1), taker="0.000731")  # out of bounds: kept as failed, with the rate in its reason
+    _fees(store, NOW - timedelta(minutes=30), taker="0.0005", maker="x.000917")  # not a number: the value in its reason
+    reasons = [r["reason"] for r in [store.latest_venue_fetch("BINANCE", "fee", "BTC/USDT")]]
+    assert "917" in reasons[0]  # the stored reason keeps it, for the private dashboard; the public log never does
+    _, rows, out = _run(tmp_path, capfd, store)
+    assert "731" not in out and "917" not in out, out
+    assert "latest fetch not used: fee fetch refused (the venue's answer couldn't be used)" in out, out
+    assert rows["taker fee (fetched)"] == "FOLLOW-UP", out
+
+
+def test_an_out_of_bounds_fee_fetch_says_so_in_fixed_words(tmp_path, capfd, store):
+    _tiers(store, NOW - timedelta(hours=1))
+    _fees(store, NOW - timedelta(hours=2))
+    _fees(store, NOW - timedelta(hours=1), taker="0.000731")
+    _, _, out = _run(tmp_path, capfd, store)
+    assert "latest fetch not used: out of bounds (fee fetch refused, outside the published range)" in out, out
+    assert "731" not in out, out

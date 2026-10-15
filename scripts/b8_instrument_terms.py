@@ -197,6 +197,10 @@ def fetched_rows(store, name: str, pair: str, now: datetime) -> tuple[list[tuple
     def refused_since(kind: str, good: dict | None) -> str:
         last = store.latest_venue_fetch(name, kind, pair)
         if last and not last["ok"] and (good is None or last["id"] != good["id"]):
+            if kind == "fee":  # its reason can carry the account's rate, and this log is public (HoE 15:41 UK)
+                oob = str(last["reason"]).startswith("out of bounds")
+                return ("latest fetch not used: " + ("out of bounds (fee fetch refused, outside the published range)"
+                                                     if oob else "fee fetch refused (the venue's answer couldn't be used)"))
             return f"latest fetch not used: {last['reason']}"
         return ""
 
