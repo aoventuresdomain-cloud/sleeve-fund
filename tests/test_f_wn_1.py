@@ -34,10 +34,13 @@ def test_a_a_flat_put_away_after_the_bridge_is_out_at_0_with_no_warning_and_its_
     _round_trip_marked_mid_way(store, "y", T0 + MIN)
     _mark(store, T0 + MIN)
     assert supervisor.positions_breaks(store) == []  # the mark's fills, up to its time, are the 1 it carries
-    store.archive("y")
-    _mark(store, T0 + 3 * MIN)  # the poll takes it out
+    before = supervisor.fund_equity(store)
+    store.archive("y")  # out at once: nothing of its own moves, so no mark to wait for (DA condition 1)
     assert store.withdrawn() == {"y": D(0)}
-    assert _kinds(store, WITHDRAWAL_NONE) == []
+    assert _kinds(store, WITHDRAWAL_NONE) == [] and _kinds(store, "portfolio_flow") == []
+    assert supervisor.fund_equity(store) == before
+    _mark(store, T0 + 3 * MIN)
+    assert store.withdrawn() == {"y": D(0)}
     assert not [e for e in store.events_after(0, limit=1_000) if e["sleeve"] == "y"]  # nothing at warning or above
     [line] = _kinds(store, "put_away_fund_held")
     assert line["level"] == "info" and "y" in line["message"] and "fund holds the cash" in line["message"]
@@ -79,4 +82,27 @@ def test_c_before_the_bridge_a_put_away_still_takes_its_equity_out_and_0_is_stil
     assert store.withdrawn() == {"a": D(10_000)}
     [none] = _kinds(store, WITHDRAWAL_NONE)
     assert none["sleeve"] == "z" and none["level"] == "warning"
+    assert _kinds(store, "put_away_fund_held") == []
+
+
+def test_d_unarchive_after_the_bridge_deletes_the_row_with_no_flow(store):  # noqa: F811
+    _rebased(store)
+    _make(store, "y", 0)
+    _mark(store, T0 + MIN)
+    store.archive("y")
+    before = supervisor.fund_equity(store)
+    store.unarchive("y")
+    assert "y" not in store.withdrawn() and "y" not in store.archived()
+    assert _kinds(store, "portfolio_flow") == [] and supervisor.fund_equity(store) == before
+
+
+def test_e_a_non_zero_book_part_under_the_bridge_is_a_broken_invariant_and_still_warns(store, monkeypatch):  # noqa: F811
+    _rebased(store)
+    _make(store, "y", 0)
+    _mark(store, T0 + MIN)
+    monkeypatch.setattr(supervisor, "book_part", lambda st, s: D("12.34"))
+    store.archive("y")
+    assert "y" not in store.withdrawn()
+    [w] = _kinds(store, WITHDRAWAL_NONE)
+    assert w["level"] == "warning" and "12.34" in w["message"]
     assert _kinds(store, "put_away_fund_held") == []

@@ -2501,10 +2501,13 @@ class Store:
             blocked = self.withdrawal_blocker(sleeve)
             if blocked is not None:
                 return "deferred", blocked
+            if _fund_held(self):  # F-WN-1 (DA): nothing of its own moves, so no book scale to wait for; out at 0 now
+                equity = self.in_book_equity(sleeve)
+                # Anything but exactly 0 here is a broken invariant (book_part is 0 once the fund holds the cash): it
+                # stays in the book and warns, never written off as nothing moved.
+                return ("held", Decimal(0)) if equity == 0 else ("none", equity)
             if marked and not polled:
                 return "deferred", NEXT_MARK
-            if _fund_held(self):  # F-WN-1: no capital of its own, so nothing moves; never a "none" warning
-                return "held", Decimal(0)
             equity = self.in_book_equity(sleeve)
             return ("out", equity) if equity > 0 else ("none", equity)
 
