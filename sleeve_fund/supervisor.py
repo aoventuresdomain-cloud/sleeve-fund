@@ -35,8 +35,8 @@ from sleeve_fund.risk import PORTFOLIO, trading_day
 from sleeve_fund.paper.safety import assert_portfolio_gate, credential_var
 from sleeve_fund.paper.single_lock import EXIT_DUPLICATE
 from sleeve_fund.paper.config import check_hub_bar_spec, load_sleeve, to_store_kwargs
-from sleeve_fund.store import (DUST_NOTIONAL, OPEN_ORDER_STATUSES, TWO_LEG_FENCE, Sleeve, Store, is_backtest, is_dust,
-                               utcnow)
+from sleeve_fund.store import (DUST_NOTIONAL, OPEN_ORDER_STATUSES, TWO_LEG_FENCE, Sleeve, Store, check_own_capital,
+                               is_backtest, is_dust, utcnow)
 from sleeve_fund.strategies import check_perp_sizing, check_perp_stop
 from sleeve_fund.paper.runtime import entry_blocked, liquidation_head, said_since_last_fill
 from sleeve_fund.strategies.base import EXITS_ONLY
@@ -593,6 +593,7 @@ class Supervisor:
             return True
         try:
             check_venue_pin(self.store, s)  # first: an off-pin holder's exits-only run reads this reason (CR F277-2)
+            check_own_capital(self.store, s.name, s.starting_balance)  # F-ZS-1
             check_perp_sizing(s.strategy, s.params)
             check_perp_stop(s.strategy, s.params, s.risk_profile)
             check_funding_schedule(s)

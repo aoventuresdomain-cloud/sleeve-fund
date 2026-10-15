@@ -1532,6 +1532,17 @@ def _no_own_capital(store, name: str, starting_balance) -> None:
                          "cash, so a Strategy has no capital of its own; make it with 0")
 
 
+def check_own_capital(store, name: str, starting_balance) -> None:
+    """F-ZS-1 (HoE, Drop A): until the fund holds the cash a Strategy is its own fund, so one with no balance of its own
+    could only halt on its first bar. It is refused at start (the supervisor, and a --db-sleeve process started by
+    hand) rather than at creation. A saved backtest is neither."""
+    if is_backtest(name) or to_decimal(starting_balance or 0) > 0 or _fund_held(store):
+        return
+    raise ValueError(f"{name} has {to_decimal(starting_balance or 0):,.2f} of its own and the fund doesn't hold the "
+                     "cash yet, so it would have nothing to trade with: until the fund holds the cash a Strategy "
+                     "needs a starting balance above 0")
+
+
 @dataclass(frozen=True)
 class Compliance:
     """One version of the PM's compliance tests: the tests (dicts: test, label, scope, measure, limit, action,
