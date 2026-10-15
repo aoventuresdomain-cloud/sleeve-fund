@@ -6,8 +6,9 @@ and the old one is cancelled only once the venue has accepted the new one. Two r
 whichever triggers first closes, and the other can only reduce what is left. The planner keeps no clock and sends
 nothing: each call returns the actions for its owner to send, and the owner feeds back the venue's answers.
 
-Actions: ("place", order_id, level, qty), ("cancel", order_id), ("amend", order_id, qty), ("lookup", order_id) and
-("alert", "critical" | "warning", words). Built OFF: nothing calls it until the client is switched on."""
+Actions: ("place", order_id, level, qty), ("retry", order_id, level, qty) (a place sent after the limiter's back-off),
+("cancel", order_id), ("amend", order_id, qty), ("lookup", order_id), ("close", qty, why) (a reduce-only market close
+of this Strategy's quantity) and ("alert", "critical" | "warning", words). Built OFF: nothing calls it until the client is switched on."""
 
 from __future__ import annotations
 
@@ -40,6 +41,7 @@ class StopMover:
         self.pending: str | None = None  # placed, not yet accepted
         self.cancelling: set[str] = set()  # cancel sent (or failed, or unanswered), not confirmed gone
         self.waiting: str | None = None  # the latest level asked for while two stops rest
+        self.retried: str | None = None  # the order id of a transient refusal's one retry
 
     def _s(self, x: Decimal) -> str:
         return "0" if x == 0 else format(x.quantize(Decimal(1).scaleb(self.step)), "f")
@@ -79,12 +81,24 @@ class StopMover:
         self.cancelling.add(old)
         return [("cancel", old)]
 
-    def on_rejected(self, oid: str, why: str) -> list[tuple]:
+    def on_rejected(self, oid: str, why: str, kind: str = "other") -> list[tuple]:
+        """The venue refused a place, by reject class (Advisor STOP-RETRY; exec_client.reject_class): "transient" is
+        placed again once after the limiter's back-off, then left to the next stop update, never looped; "crossed"
+        (the price is already past the new level) means the Strategy's stop is hit, so its quantity closes at market
+        now; anything else is not retried. Every refusal alerts, CRITICAL when no stop is left resting."""
         level = self.levels.pop(oid, None)
         if oid == self.pending:
             self.pending = None
+        retried, self.retried = oid == self.retried, None
+        if kind == "crossed":
+            return [("close", self.qty, "stop level already crossed"),
+                    ("alert", "warning", f"The new stop at {level} was already crossed ({why}): closing at market")]
+        if kind == "transient" and not retried and level is not None:
+            again = new_order_id()
+            self.pending, self.levels[again], self.retried = again, level, again
+            return [("retry", again, level, self.qty)]
         kept = f"; the stop at {self.levels[self.current]} stays" if self.current in self.levels else ""
-        return [("alert", "critical" if self.current is None else "warning",
+        return [("alert", "critical" if self.current not in self.levels else "warning",
                  f"The venue refused the new stop at {level}: {why}{kept}")] + self._release()
 
     def on_cancelled(self, oid: str) -> list[tuple]:
@@ -105,15 +119,15 @@ class StopMover:
             return [("cancel", oid)] if oid in self.cancelling else []
         return self.on_cancelled(oid)
 
-    def on_filled(self, oid: str, filled) -> list[tuple]:
-        """A stop (part-)filled: the position is smaller, so every other resting stop covers only what is left."""
+    def on_filled(self, oid: str | None, filled) -> list[tuple]:
+        """A stop (part-)filled, or (oid None) a market close of this position filled: the position is smaller, so every
+        other resting stop covers only what is left, and none is left resting once it is flat."""
         left = max(_d(self.qty) - _d(filled), Decimal(0))
         self.qty = self._s(left)
         others = sorted(o for o in self.levels if o != oid)
         if left == 0:
             self.levels.pop(oid, None)
-            self.current = None if self.current == oid else self.current
-            self.waiting = None
+            self.current, self.waiting = None, None
             out = []
             for o in others:
                 self.cancelling.add(o)

@@ -267,3 +267,18 @@ def guard_modify(*, on: bool, trigger_price) -> None:
     if on and trigger_price is not None:
         raise TriggerAmendRefused(f"a stop's level ({trigger_price}) moves by placing a new stop, then cancelling the "
                                   "old one: the exchange client's amend would drop the new level")
+
+
+# A refused place by class (Advisor STOP-RETRY). The venue's codes, from its error-code page (to be checked against it
+# before QA, as the stand-in venue's shapes are).
+REJECT_CODES_SOURCE = "https://bybit-exchange.github.io/docs/v5/error"
+TRANSIENT_CODES = frozenset({10006, 10016, 10018})  # rate limit, server error, IP rate limit
+CROSSED_CODES = frozenset({110092, 110093})  # the trigger would fire at once: the price is already past it
+
+
+def reject_class(code: int | None, message: str = "") -> str:
+    """"transient" (retry once after the back-off), "crossed" (the stop is already hit) or "other" (no retry). No code
+    at all (a timeout, a dropped connection) is transient."""
+    if code is None or code in TRANSIENT_CODES:
+        return "transient"
+    return "crossed" if code in CROSSED_CODES else "other"
