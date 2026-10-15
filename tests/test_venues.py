@@ -52,6 +52,7 @@ def test_venue():
     profile = venues.register(venues.VenueProfile(
         name="TESTX", label="Test venue", fees=FeeSchedule(maker=Decimal("0.001"), taker=Decimal("0.002")),
         fee_basis="test", daily_history=lambda pair: synthetic_ohlcv(days=200, seed=4, vol=0.03),
+        fee_bounds={"maker": (Decimal(0), Decimal("0.001")), "taker": (Decimal(0), Decimal("0.002"))},  # FEE-LIVE
     ))
     yield profile
     venues.VENUES.pop("TESTX")
