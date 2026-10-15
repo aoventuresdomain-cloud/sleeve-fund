@@ -265,6 +265,16 @@ def test_a_journal_volume_means_a_dump_even_with_the_database_stopped(tmp_path, 
 
 
 @needs_bash
+def test_docker_not_answering_is_never_read_as_a_first_deploy(tmp_path):
+    _host(tmp_path, volume=True, running=True)
+    (tmp_path / "bin" / "docker").write_text("#!/usr/bin/env bash\nexit 1\n")
+    env = {**os.environ, "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}"}
+    done = subprocess.run(["bash", str(HOST)], cwd=tmp_path, env=env, capture_output=True, text=True, timeout=30,
+                          check=False)
+    assert done.returncode != 0 and "SKIP" not in done.stdout
+
+
+@needs_bash
 def test_a_database_that_never_answers_stops_the_deploy(tmp_path):
     done, calls = _host(tmp_path, volume=True, running=True, ready=False)
     assert done.returncode == 1 and "pre-deploy dump: FAIL, the journal's database didn't answer" in done.stdout
