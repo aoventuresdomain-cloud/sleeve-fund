@@ -225,3 +225,53 @@ def test_the_published_vip0_stand_in_is_good_and_says_it_is_published_not_the_ac
     assert PUBLISHED_FEES == "published-vip0" and good["id"] == row_id and good["source"] == PUBLISHED_FEES
     account = _fee(store, T + timedelta(hours=1))
     assert store.latest_good_venue_fetch("BINANCE", "fee", "BTC/USDT")["id"] == account
+
+
+def test_the_published_stand_in_is_never_a_live_accounts_fees(store, engine):
+    """Advisor FEE-STORE (1): the published VIP0 stand-in is for paper and demo accounts. Written for a live account
+    it is kept as failed, with why; and the reader never takes one for a live account however it got there, so a live
+    account with only a published row has no last-known-good fees and refuses entries (FEE-LIVE)."""
+    from sleeve_fund.store import PUBLISHED_FEES, venue_terms_fetch_t
+    from sqlalchemy import insert
+
+    store.create_account("live-a", "live", venue="binance")
+    row_id = _fee(store, T, source=PUBLISHED_FEES, account="live-a")
+    kept = store.latest_venue_fetch("BINANCE", "fee", "BTC/USDT")
+    assert kept["id"] == row_id and kept["ok"] == 0 and "paper and demo accounts only" in kept["reason"]
+    assert store.latest_good_venue_fetch("BINANCE", "fee", "BTC/USDT", account="live-a") is None
+    with engine.begin() as c:  # one written past the store: the reader still never takes it for the live account
+        c.execute(insert(venue_terms_fetch_t).values(venue="BINANCE", kind="fee", instrument="BTC/USDT",
+                                                     account="live-a", source=PUBLISHED_FEES, fetched_at=T, ok=1,
+                                                     reason="", payload=FEE))
+    assert store.latest_good_venue_fetch("BINANCE", "fee", "BTC/USDT", account="live-a") is None
+    paper = _fee(store, T, source=PUBLISHED_FEES)  # a paper account's stand-in is good
+    assert store.latest_good_venue_fetch("BINANCE", "fee", "BTC/USDT", account="paper-main")["id"] == paper
+    live = _fee(store, T + timedelta(hours=1), account="live-a")  # the account's own rate is
+    assert store.latest_good_venue_fetch("BINANCE", "fee", "BTC/USDT", account="live-a")["id"] == live
+
+
+def test_the_stand_in_ages_like_any_fetch_a_fresh_row_each_daily_attempt(store):
+    """Advisor FEE-STORE (2): each daily attempt that falls back writes a fresh stand-in row at that attempt's time,
+    so the 24 h and 72 h rules judge it as any fetch. Three simulated days."""
+    from sleeve_fund.store import PUBLISHED_FEES
+
+    ids = [store.record_published_fees("BINANCE", "BTC/USDT", account="paper-main", at=T + timedelta(days=d),
+                                       bounds=BOUNDS) for d in range(3)]
+    assert len(set(ids)) == 3
+    good = store.latest_good_venue_fetch("BINANCE", "fee", "BTC/USDT", account="paper-main")
+    at = good["fetched_at"] if good["fetched_at"].tzinfo else good["fetched_at"].replace(tzinfo=timezone.utc)
+    assert good["id"] == ids[-1] and good["source"] == PUBLISHED_FEES and at == T + timedelta(days=2)
+    assert good["payload"] == {"maker": "0.0002", "taker": "0.0005"}  # the venue profile's published VIP0, as strings
+    assert (T + timedelta(days=2, hours=1)) - at == timedelta(hours=1)  # one hour old, not three days
+
+
+def test_fees_are_decimal_from_the_stored_string_never_through_a_float(store):
+    """Advisor FEE-STORE (3): the reader parses the stored strings to Decimal. 0.00055 through a float is not 0.00055,
+    so a float anywhere on the path shows here."""
+    from sleeve_fund.store import venue_fees_of
+
+    _fee(store, T)
+    fees = venue_fees_of(store.latest_good_venue_fetch("BINANCE", "fee", "BTC/USDT"))
+    assert type(fees.taker) is D and type(fees.maker) is D
+    assert fees.taker == D("0.00055") and fees.taker != D(0.00055)
+    assert D("123456.78") * fees.taker == D("67.9012290")
