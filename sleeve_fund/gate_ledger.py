@@ -66,8 +66,6 @@ class TaggedIntent(Intent):
     stage: str = "submit"
     regime_weight: Decimal | None = None
     regime_state: str | None = None
-    planned_stop: Decimal | None = None  # the idea's own exits (DA 0028): a refusal's shadow outcome replays them
-    planned_target: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -241,8 +239,7 @@ class DbLedger:
                    "compliance_version": compliance_version, "test_hit": test_hit,
                    "outcome": decision.outcome, "limit_hit": limit_hit,
                    "requested_qty": stored(decision.requested_qty), "approved_qty": stored(decision.approved_qty),
-                   "price": stored(intent.price), "decided_at": at, **self._figures(intent.underlying),
-                   **self._idea(intent)}
+                   "price": stored(intent.price), "decided_at": at, **self._figures(intent.underlying)}
             if pending is not None:
                 rid, who, holding, made, qty = pending
                 if who != strategy or decision.approved_qty <= 0:
@@ -256,16 +253,6 @@ class DbLedger:
                     "open_risk": stored(holding.risk), "created_at": made, "expires_at": made + RESERVATION_TTL}])
                 loc.pending = None
         return seq
-
-    @staticmethod
-    def _idea(intent: Intent) -> dict:
-        """The idea as asked (DA 0028; multi-asset spec §5): its side and its planned stop and target, so a trimmed or
-        refused one keeps what its shadow outcome needs. A price that isn't above 0 is no plan: left out."""
-        def px(v):
-            return stored(v) if v is not None and v > 0 else None
-
-        return {"side": intent.side, "planned_stop": px(getattr(intent, "planned_stop", None)),
-                "planned_target": px(getattr(intent, "planned_target", None))}
 
     def _tags(self, strategy: str, at: datetime, intent: Intent) -> dict:
         """The journal's columns the core Intent doesn't carry. Refuses an untagged intent: a row that can't be tied

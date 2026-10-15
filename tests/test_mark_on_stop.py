@@ -16,7 +16,7 @@ import pytest
 import tests.qa_ir_hub_path_parity_lib as hp
 from sleeve_fund import lifecycle
 from sleeve_fund.paper.runtime import SleeveRuntime
-from sleeve_fund.start_check import FAIL, PASS, check_books
+from sleeve_fund.start_check import FAIL, NOTE, PASS, check_books
 from sleeve_fund.store import Store
 from tests.qa_ir_hub_path_parity_lib import (
     _probe,  # noqa: F401 - autouse: registers the probe strategy
@@ -115,14 +115,12 @@ def test_iv_a_backtest_takes_no_mark_on_stop():
 
 def test_v_without_the_stops_mark_the_start_check_names_the_tie(monkeypatch):
     """A process killed, not stopped: the flatten tick's mark is the latest, in the fill's own second, and doesn't hold
-    it. Not compared, and not on its own "nothing compared" (HoQA, #289): a FAIL naming the Strategy and the tie
-    (F289-2, HoE OK 18:48 UK 14 Oct: no start check or re-base is signed off it; compare again after the next mark)."""
+    it. Not compared, never a FAIL, and not on its own "nothing compared" (HoQA, #289): a NOTE naming the tie."""
     monkeypatch.setattr(SleeveRuntime, "final_mark", lambda self, **k: None, raising=False)
     _, _, store = _stopped_after(monkeypatch, flatten)
     lines = check_books(store).lines
-    assert [r[0] for r in lines] == [FAIL], lines
-    assert lines[0][1].startswith("hubqa: its latest mark predates a fill in the same second") \
-        and lines[0][1].endswith("compare again after the next mark"), lines
+    assert [r[0] for r in lines] == [NOTE], lines
+    assert "a fill in its latest mark's own second" in lines[0][1] and "which the mark predates" in lines[0][1]
 
 
 def _tie(tmp_path, held: float):
@@ -143,10 +141,9 @@ def test_v_a_tie_the_mark_holds_is_compared_and_passes(tmp_path):
     assert [r[0] for r in lines] == [PASS], lines
 
 
-def test_v_a_tie_the_mark_doesnt_hold_is_a_fail_naming_the_strategy(tmp_path):
+def test_v_a_tie_the_mark_doesnt_hold_is_a_note_not_a_fail(tmp_path):
     lines = check_books(_tie(tmp_path, 0.0)).lines
-    want = "s1: its latest mark predates a fill in the same second (16:56:09 UTC): compare again after the next mark"
-    assert lines == [(FAIL, want)], lines
+    assert [r[0] for r in lines] == [NOTE], lines
 
 
 def test_v_a_mark_short_of_a_fill_before_it_names_the_position(tmp_path):

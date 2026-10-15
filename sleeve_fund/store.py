@@ -13,7 +13,6 @@ from decimal import ROUND_CEILING, ROUND_HALF_UP, Decimal
 import json
 import math
 import os
-import re
 from contextlib import contextmanager
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -35,7 +34,6 @@ from sqlalchemy import (
     MetaData,
     Numeric,
     Sequence,
-    SmallInteger,
     String,
     Table,
     Text,
@@ -85,16 +83,9 @@ LEVELS = ("info", "warning", "error")
 metadata = MetaData()
 TS = DateTime(timezone=True)
 LEG = "~2"  # a two-leg Strategy's second leg row: "<name>~2" (P2-8)
-# Drop B (DA, 0028): a multi-asset Strategy's leg rows are "<name>~<ASSET>" (e.g. trend-x~ETH), many under one parent;
-# "~2" still fits. The suffix is 1-16 upper-case letters or digits, and a parent holds no "~", so legs are one level
-# deep. substr, not LIKE: a parent's own "_" or "%" would be a wildcard. "parent IS NOT NULL" is needed: with a NULL
-# parent the second term is NULL, and a CHECK passes on NULL. Spelled per engine (Postgres regex, SQLite GLOB).
-_LEG_HEAD = ("(parent IS NULL AND name NOT LIKE '%~%') "
-             "OR (parent IS NOT NULL AND parent NOT LIKE '%~%' AND substr(name, 1, length(parent) + 1) = parent || '~' "
-             "AND ")
-_LEG_SUFFIX = "substr(name, length(parent) + 2)"
-LEG_NAME_PG = _LEG_HEAD + f"{_LEG_SUFFIX} ~ '^[A-Z0-9]{{1,16}}$')"
-LEG_NAME_SQLITE = _LEG_HEAD + (f"length({_LEG_SUFFIX}) BETWEEN 1 AND 16 AND {_LEG_SUFFIX} NOT GLOB '*[^A-Z0-9]*')")
+# "parent IS NOT NULL" is needed: with a NULL parent the second term is NULL, and a CHECK passes on NULL.
+LEG_NAME = ("(parent IS NULL AND name NOT LIKE '%~%') "
+            "OR (parent IS NOT NULL AND name = parent || '~2' AND parent NOT LIKE '%~%')")
 
 sleeves_t = Table(
     "sleeves",
@@ -116,11 +107,9 @@ sleeves_t = Table(
     Column("created_at", TS, nullable=False),
     Column("updated_at", TS, nullable=False),
     # P2-8 two legs (DA, 0022): a two-leg Strategy's second leg is its own row, "<name>~2", whose parent is the first.
-    # Drop B (0028): a multi-asset Strategy's legs, "<name>~<ASSET>", many under one parent. The CHECK holds the shape
-    # on both engines: "~" only as that suffix, one level.
+    # The CHECK holds the shape on both engines: "~" only as that suffix, one level, at most one leg.
     Column("parent", String(64), ForeignKey("sleeves.name", name="sleeves_parent_fk", ondelete="RESTRICT")),
-    CheckConstraint(LEG_NAME_PG, name="sleeves_leg_name").ddl_if(dialect="postgresql"),
-    CheckConstraint(LEG_NAME_SQLITE, name="sleeves_leg_name").ddl_if(dialect="sqlite"),
+    CheckConstraint(LEG_NAME, name="sleeves_leg_name"),
     # P2-6: the PM's lifecycle, kept apart from running/stopped/paused (DA). The row holds the current state only;
     # each move is journaled in events and decisions (Store.set_lifecycle, the one writer).
     Column("lifecycle", String(16), nullable=False, default="active", server_default="active"),
@@ -130,12 +119,6 @@ sleeves_t = Table(
     CheckConstraint("lifecycle <> 'winding_down' OR (wind_down_started IS NOT NULL AND wind_down_deadline IS NOT NULL "
                     "AND wind_down_deadline >= wind_down_started)", name="sleeves_winding_down"),
 )
-# Drop B (DA, 0028): one row per (Strategy, asset). The Strategy is the parent's name on a leg row and the row's own
-# name otherwise, so no multi-asset leg trades its parent's instrument or another leg's. A two-leg "~2" row is left out:
-# a carry trades one symbol on two markets (spot and perp), which the market in params tells apart, not the row.
-STRATEGY_ASSET_ROWS = "parent IS NULL OR name <> parent || '~2'"
-Index("sleeves_strategy_asset", func.coalesce(sleeves_t.c.parent, sleeves_t.c.name), sleeves_t.c.instrument,
-      unique=True, sqlite_where=text(STRATEGY_ASSET_ROWS), postgresql_where=text(STRATEGY_ASSET_ROWS))
 
 equity_t = Table(
     "equity",
@@ -873,13 +856,6 @@ gate_decisions_t = Table(
     Column("regime_state", Text),
     Column("stage", String(8), nullable=False),
     Column("decided_at", TS, nullable=False),
-    # Drop B (DA, 0028), written by the gate inside its lock; nullable, so rows before it stay as they are.
-    Column("planned_stop", EXACT),  # the idea's stop and target prices: a refusal's shadow outcome replays them
-    Column("planned_target", EXACT),
-    # the refused or trimmed test's measure had the idea gone through at the requested size, as a share of
-    # book_equity (T1-T3 loss if stops are hit, T4 gross or net); NULL for T5 and when no test bound it
-    Column("would_be", EXACT),
-    Column("side", SmallInteger),  # +1 long, -1 short; requested_qty stays unsigned
     CheckConstraint(_in("outcome", GATE_OUTCOMES), name="gate_decisions_outcome"),
     CheckConstraint(_in("limit_hit", GATE_LIMITS), name="gate_decisions_limit_hit"),
     CheckConstraint(_in("stage", GATE_STAGES), name="gate_decisions_stage"),
@@ -914,27 +890,6 @@ gate_reservations_t = Table(
           postgresql_where=text("released_at IS NULL")),
     Index("gate_reservations_active_sleeve", "sleeve_id", sqlite_where=text("released_at IS NULL"),
           postgresql_where=text("released_at IS NULL")),  # the sweep, and DA-6's reset guard
-)
-# Drop B (DA, 0028; Advisor MA-SPEC): what a trimmed or refused idea would have made, filled in after the trade it was
-# part of (a trim) or a replay of its own stop, target and model exit at the asked size (a refusal, hypothetical). The
-# idea itself (asked, approved, the test, the planned stop and target) is its gate_decisions row. One outcome per
-# decision; write-once. A refusal's outcome never feeds the leg's real later entries.
-SHADOW_KINDS = ("trim", "refusal")
-SHADOW_METHODS = ("trade_scaled", "replay")  # trim: the real trade's per-unit P&L x (asked - approved); refusal: replay
-shadow_outcomes_t = Table(
-    "shadow_outcomes",
-    metadata,
-    Column("decision_id", BIG_ID, ForeignKey("gate_decisions.id", ondelete="RESTRICT"), primary_key=True,
-           autoincrement=False),
-    Column("kind", String(8), nullable=False),
-    Column("pnl", EXACT, nullable=False),  # net of fees and slippage, in the fund's cash
-    Column("hypothetical", Boolean, nullable=False),
-    Column("method", String(16), nullable=False),
-    Column("computed_at", TS, nullable=False),
-    CheckConstraint(_in("kind", SHADOW_KINDS), name="shadow_outcomes_kind"),
-    CheckConstraint(_in("method", SHADOW_METHODS), name="shadow_outcomes_method"),
-    CheckConstraint("(kind = 'refusal' AND hypothetical AND method = 'replay') "
-                    "OR (kind = 'trim' AND NOT hypothetical AND method = 'trade_scaled')", name="shadow_outcomes_shape"),
 )
 # Bridge A (DA, 0027; Advisor BRIDGE-3): the PM's compliance tests, versioned whole. One version is every test and the
 # asset-group map together, so a decision that records its version re-checks exactly. Written only through
@@ -1025,52 +980,6 @@ for _sql in GATE_TEST_HIT_PG:
     event.listen(gate_decisions_t, "after_create", DDL(_sql).execute_if(dialect="postgresql"))
 for _sql in GATE_TEST_HIT_SQLITE:
     event.listen(gate_decisions_t, "after_create", DDL(_sql).execute_if(dialect="sqlite"))
-
-# Drop B (DA, 0028): the idea's columns on gate_decisions. Triggers, not CHECKs, so 0028 adds them without rebuilding
-# gate_decisions on SQLite (as 0027's test_hit). would_be only with the test it measures.
-GATE_IDEA_BAD = ("(NEW.side IS NOT NULL AND NEW.side NOT IN (-1, 1)) "
-                 "OR (NEW.would_be IS NOT NULL AND NEW.test_hit IS NULL) "
-                 "OR NEW.planned_stop <= 0 OR NEW.planned_target <= 0")
-GATE_IDEA_PG = (
-    "CREATE OR REPLACE FUNCTION gate_idea_shape() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
-    f"IF {GATE_IDEA_BAD} THEN RAISE EXCEPTION USING ERRCODE = 'check_violation', "
-    "MESSAGE = 'gate_decisions: side is +1 or -1, would_be needs test_hit, a planned stop or target is above 0'; "
-    "END IF; RETURN NEW; END $$",
-    "CREATE TRIGGER gate_decisions_idea BEFORE INSERT OR UPDATE ON gate_decisions FOR EACH ROW "
-    "EXECUTE FUNCTION gate_idea_shape()",
-)
-GATE_IDEA_SQLITE = tuple(
-    f"CREATE TRIGGER gate_decisions_idea_{op.lower()} BEFORE {op} ON gate_decisions WHEN {GATE_IDEA_BAD} "
-    "BEGIN SELECT RAISE(ABORT, 'gate_decisions: side is +1 or -1, would_be needs test_hit, a planned stop or target "
-    "is above 0'); END"
-    for op in ("INSERT", "UPDATE"))
-# A shadow outcome is write-once, and its kind is its decision's outcome: a trim of a trimmed idea, a refusal of a
-# rejected one.
-SHADOW_WRONG_KIND = ("NOT EXISTS (SELECT 1 FROM gate_decisions WHERE id = NEW.decision_id AND outcome = "
-                     "CASE NEW.kind WHEN 'trim' THEN 'trimmed' WHEN 'refusal' THEN 'rejected' END)")
-SHADOW_PG = (
-    "CREATE OR REPLACE FUNCTION shadow_outcome_write_once() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
-    "RAISE EXCEPTION USING ERRCODE = 'check_violation', MESSAGE = 'shadow_outcomes is write-once'; END $$",
-    "CREATE TRIGGER shadow_outcomes_write_once BEFORE UPDATE OR DELETE ON shadow_outcomes FOR EACH ROW "
-    "EXECUTE FUNCTION shadow_outcome_write_once()",
-    "CREATE OR REPLACE FUNCTION shadow_outcome_kind() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
-    f"IF {SHADOW_WRONG_KIND} THEN RAISE EXCEPTION USING ERRCODE = 'check_violation', "
-    "MESSAGE = 'a shadow outcome is a trim of a trimmed decision or a refusal of a rejected one'; "
-    "END IF; RETURN NEW; END $$",
-    "CREATE TRIGGER shadow_outcomes_kind BEFORE INSERT ON shadow_outcomes FOR EACH ROW "
-    "EXECUTE FUNCTION shadow_outcome_kind()",
-)
-SHADOW_SQLITE = (
-    *(f"CREATE TRIGGER shadow_outcomes_no_{op.lower()} BEFORE {op} ON shadow_outcomes BEGIN "
-      "SELECT RAISE(ABORT, 'shadow_outcomes is write-once'); END" for op in ("UPDATE", "DELETE")),
-    f"CREATE TRIGGER shadow_outcomes_kind BEFORE INSERT ON shadow_outcomes WHEN {SHADOW_WRONG_KIND} BEGIN "
-    "SELECT RAISE(ABORT, 'a shadow outcome is a trim of a trimmed decision or a refusal of a rejected one'); END",
-)
-for _t, _pg, _lite in ((gate_decisions_t, GATE_IDEA_PG, GATE_IDEA_SQLITE), (shadow_outcomes_t, SHADOW_PG, SHADOW_SQLITE)):
-    for _sql in _pg:
-        event.listen(_t, "after_create", DDL(_sql).execute_if(dialect="postgresql"))
-    for _sql in _lite:
-        event.listen(_t, "after_create", DDL(_sql).execute_if(dialect="sqlite"))
 
 COMPLIANCE_V1_AT = datetime(2026, 10, 14, 21, 0, tzinfo=timezone.utc)
 COMPLIANCE_V1_NOTE = "the PM's defaults (DEFAULTS-2, 14 Oct 2026); Advisor BRIDGE-3"
@@ -1676,34 +1585,6 @@ def _compliance_changes(old: Compliance | None, rows: list[dict], groups: dict[s
     return ", ".join(said) or "no change"
 
 
-# DA-6 reset coverage: what a reset (Store.split_run) does with each table that names a Strategy (a sleeve, sleeve_id
-# or parent column, or a foreign key to sleeves). Every such table is in exactly one list, and a cell
-# (test_reset_coverage) fails when a new one is in none, so no new table silently mixes a put-away run with the fresh
-# one. The journal moves to the run's name; the venue and account pins are copied to it (the fresh run keeps them);
-# feed and signal state are the process's and go; everything else stays with the Strategy, for the reason given.
-RESET_MOVES = (decisions_t, events_t, commands_t, mirror_t, equity_t, exit_plans_t, fills_t, funding_t, insurance_t,
-               orders_t, order_timings_t, mirror_requests_t)
-RESET_COPIES = (sleeve_accounts_t, sleeve_venues_t)
-RESET_CLEARS = (feed_seen_t, signal_state_t)
-RESET_STAYS = {
-    sleeves_t: "the Strategy's own row; the run gets a new row (and a new id) made from it",
-    sleeve_archive_t: "written for the run, never for the Strategy",
-    resets_t: "the reset request itself, keyed to the Strategy that asked",
-    backtests_t: "a saved backtest is never reset; it keeps its own name",
-    book_moves_t: "the fund's record of the Strategy's capital landing in the book, not one run's",
-    pair_state_t: "a two-leg Strategy's coordinator; a reset happens only when flat, and the state is a hint",
-    gate_decisions_t: "keyed by the Strategy's id, which the reset keeps: the gate's record across runs",
-    gate_reservations_t: ("keyed by the Strategy's id, kept as history; any still active is released as the run is "
-                          "put away (its process is stopped first, so its order can't fill), so none from before a "
-                          "reset counts against the tests after it"),
-    # No Strategy column: each hangs off a row the reset moves or keeps by id (a move is an UPDATE of its sleeve, so
-    # ids hold), and follows it
-    acks_t: "an ack names its event by id: the event moves with the run, and the ack still points at it",
-    shadow_outcomes_t: "one per gate decision, which stays with the Strategy (above); write-once, never moved",
-}
-STRATEGY_COLUMNS = frozenset({"sleeve", "sleeve_id", "parent", "strategy_id"})
-
-
 class Store:
     def __init__(self, url: str | None = None, engine: Engine | None = None, portfolio_gate: bool = False) -> None:
         """portfolio_gate: the portfolio gate is in force on this journal, and with no state row its entries are
@@ -1783,9 +1664,7 @@ class Store:
 
         first, second = two_legs.check_legs(first, second)
         _no_own_capital(self, name, starting_balance)
-        # F-PAIR-IN-FUND: once the fund holds the cash both legs are made with 0, as any Strategy is (CUT-A (a)).
-        shares = ((Decimal(0), Decimal(0)) if not is_backtest(name) and to_decimal(starting_balance or 0) == 0
-                  and _fund_held(self) else two_legs.split_capital(starting_balance, (first, second)))
+        shares = two_legs.split_capital(starting_balance, (first, second))
         if trial is not None:
             check_trial(trial)
         ts = utcnow()
@@ -1821,66 +1700,6 @@ class Store:
             if trial is not None:
                 _put_trial_in(c, trial)
         return self.sleeve(name), self.sleeve(name + LEG)
-
-    def create_legs(self, *, name: str, strategy: str, bar_spec: str, assets: list[str], params: dict | None,
-                    starting_balance: float, universe_date: str, risk_profile: str = "balanced", warmup_bars: int = 0,
-                    desired_state: str = "running", venue: str | None = None,
-                    trial: dict | None = None) -> list[Sleeve]:
-        """A multi-asset Strategy (multi-asset spec §1-2): the parent row `name` trades the first asset, and each other
-        asset is a leg row "<name>~<UNDERLYING>" under it, every row with the one settings block, made together in one
-        transaction (with its trials row when given), or none. The list and universe_date are kept on the parent's
-        params: fixed for the Strategy's life (a new list is a new Strategy). Inside the fund only, every leg with 0
-        (CUT-A (a)); legs are independent ideas, never a pair."""
-        if is_backtest(name):
-            raise ValueError("a multi-asset backtest is a portfolio run of its legs, not stored rows")
-        if "~" in name:
-            raise ValueError(f"a Strategy's name can't hold a \"~\": {name!r}")
-        if not _fund_held(self):
-            raise ValueError("a multi-asset Strategy runs inside the fund: make it once the fund holds the cash")
-        if to_decimal(starting_balance or 0) != 0:
-            _no_own_capital(self, name, starting_balance)
-        assets = [str(a).strip().upper() for a in assets]
-        if len(assets) < 2:
-            raise ValueError("a multi-asset Strategy lists at least two assets; one asset is a single-asset Strategy")
-        unders = [a.split("/")[0] for a in assets]
-        if bad := [u for u in unders if not re.fullmatch(r"[A-Z0-9]{1,16}", u)]:  # 0028's sleeves_leg_name
-            raise ValueError(f"an asset's name is 1-16 letters or digits: {bad}")
-        if len(set(unders)) != len(unders):
-            raise ValueError(f"an asset is listed twice: {assets}")
-        from sleeve_fund.venues import DEFAULT_VENUE, venue as venue_profile
-
-        venue_profile(venue)  # F-B3C-VENUE (DA): a registered venue, or ValueError (unknown venue)
-        if bad := [a for a in assets if not re.fullmatch(r"[A-Z0-9]+/[A-Z0-9]+", a)]:  # F-B3C-VENUE
-
-            raise ValueError(f"each asset is BASE/QUOTE on the Strategy's one venue ({(venue or DEFAULT_VENUE).upper()})"
-                             f", with no venue of its own: {bad}")
-        if len(quotes := {a.split("/")[1] for a in assets}) > 1:
-            raise ValueError(f"a multi-asset Strategy's assets share one quote currency, its venue's account's: "
-                             f"{', '.join(sorted(quotes))} in {assets}")
-        if not universe_date:
-            raise ValueError("a multi-asset Strategy names the date its list was chosen (universe_date)")
-        params = {**(params or {}), "assets": assets, "universe_date": str(universe_date)}
-        if trial is not None:
-            check_trial(trial)
-        ts = utcnow()
-        rows = [(name, assets[0], None)] + [(f"{name}~{u}", a, name) for u, a in zip(unders[1:], assets[1:])]
-
-        def joins(c) -> None:  # F-ASSIGN-STALE: every leg joins at the supervisor's next poll, together
-            self._ensure_paper_account(c)
-            for leg_name, _, _ in rows:
-                self._wait_move(c, leg_name, "paper", "create", ts)
-
-        with self._book_move(lambda: Decimal(0), f"multi-asset Strategy {name} created", ts, defer=joins) as c:
-            for leg_name, instrument, parent in rows:
-                _insert_sleeve(c, ts, name=leg_name, strategy=strategy, instrument=instrument, bar_spec=bar_spec,
-                               params=params, starting_balance=0, risk_profile=risk_profile, warmup_bars=warmup_bars,
-                               desired_state=desired_state, venue=venue, parent=parent)
-            c.execute(insert(decisions_t).values(
-                ts=ts, actor="system", action="multi_asset", sleeve=name,
-                reason=f"asset legs made: {', '.join(assets)}, fixed on {universe_date}"))
-            if trial is not None:
-                _put_trial_in(c, trial)
-        return [self.sleeve(n) for n, _, _ in rows]
 
     @contextmanager
     def _book_move(self, amount, why, ts: datetime | None = None, leaving: str | None = None, carry: bool = True,
@@ -1972,17 +1791,13 @@ class Store:
             raise ValueError(f"bad desired state {state!r}")
         if is_backtest(name):
             raise ValueError("a saved backtest can't be started")
-        if self.multi_asset(name) and self.sleeve(name).parent is not None:
-            raise ValueError(f"{name} is an asset leg of {self.sleeve(name).parent}: start or stop the Strategy")
-        names = [name] + ([leg] if (leg := self._leg_of(name)) is not None else self._asset_legs(name))
-        with self.engine.begin() as c:  # a two-leg or multi-asset Strategy starts and stops as one (P2-8)
-            c.execute(update(sleeves_t).where(sleeves_t.c.name.in_(names)).values(updated_at=utcnow(),
-                                                                                  desired_state=state))
+        self._update_sleeve(name, desired_state=state)
+        if (leg := self._leg_of(name)) is not None:  # a two-leg Strategy starts and stops as one (P2-8)
+            self._update_sleeve(leg, desired_state=state)
 
     def _leg_of(self, name: str, c=None) -> str | None:
-        """A two-leg Strategy's second leg row, when `name` is its first leg's (P2-8); else None. A multi-asset
-        Strategy's asset legs are not one: they are never a pair (_asset_legs)."""
-        q = select(sleeves_t.c.name).where(sleeves_t.c.parent == name, sleeves_t.c.name == name + LEG)
+        """A two-leg Strategy's second leg row, when `name` is its first leg's (P2-8); else None."""
+        q = select(sleeves_t.c.name).where(sleeves_t.c.parent == name)
         if c is not None:
             return c.execute(q).scalar()
         with self.engine.connect() as conn:
@@ -1990,31 +1805,14 @@ class Store:
 
     def legs(self, name: str) -> list[str]:
         """Every row of the Strategy `name` belongs to: [name] for one leg; a two-leg Strategy's first leg's row and
-        its second's (P2-8), or a multi-asset Strategy's parent and its asset legs in asset order, from any of them."""
+        its second's, from either (P2-8)."""
         row = self.sleeve(name)
         first = row.parent or name
-        if (leg := self._leg_of(first)) is not None:
-            return [first, leg]
-        return [first] + self._asset_legs(first)
-
-    def _asset_legs(self, parent: str, c=None) -> list[str]:
-        """A multi-asset Strategy's asset leg rows ("<parent>~<ASSET>"), in its asset list's order; [] for any other."""
-        q = (select(sleeves_t.c.name).where(sleeves_t.c.parent == parent, sleeves_t.c.name != parent + LEG)
-             .order_by(sleeves_t.c.id))
-        if c is not None:
-            return list(c.execute(q).scalars())
-        with self.engine.connect() as conn:
-            return list(conn.execute(q).scalars())
+        return [first] + [leg] if (leg := self._leg_of(first)) is not None else [first]
 
     def two_leg(self, name: str) -> bool:
-        """Whether `name` is either leg's row of a two-leg Strategy (P2-8): a hedged pair, never a multi-asset one."""
-        row = self.sleeve(name)
-        return name.endswith(LEG) and row.parent is not None or self._leg_of(name) is not None
-
-    def multi_asset(self, name: str) -> bool:
-        """Whether `name` is the parent or an asset leg of a multi-asset Strategy (multi-asset spec §1)."""
-        row = self.sleeve(name)
-        return (row.parent is not None and not name.endswith(LEG)) or bool(self._asset_legs(name))
+        """Whether `name` is either leg's row of a two-leg Strategy (P2-8)."""
+        return self.sleeve(name).parent is not None or self._leg_of(name) is not None
 
     def holds_any(self, name: str) -> bool:
         """Whether any leg of the Strategy `name` belongs to holds a position an order can close (not dust): a
@@ -2886,12 +2684,7 @@ class Store:
         if two_leg and (action != "close_now" or s.parent is not None):
             raise ValueError(f"{action.replace('_', ' ')} on its second leg {TWO_LEG_FENCE}" if action == "close_now"
                              else f"{action.replace('_', ' ')} {TWO_LEG_FENCE}")
-        multi = self.multi_asset(sleeve)
-        if multi and s.parent is not None:
-            raise ValueError(f"{sleeve} is an asset leg of {s.parent}: a lifecycle move is on the Strategy, every leg")
-        names = self.legs(sleeve) if multi else [sleeve]
         held, flat = self.lifecycle_flat(sleeve)
-        flat = all(self.lifecycle_flat(n)[1] for n in names) if multi else flat  # retired once every leg is flat
         started, deadline_at, basis = s.wind_down_started, s.wind_down_deadline, ""
         if action == "wind_down":
             to = lifecycle.move(s.lifecycle, lifecycle.WINDING_DOWN, actor, flat=flat)
@@ -2910,9 +2703,6 @@ class Store:
             if to == lifecycle.WINDING_DOWN:
                 started, deadline_at = started or now, now
         text = lifecycle.moved_words(s.lifecycle, to, action, deadline_at, held) + basis
-        if multi:
-            self._lifecycle_legs(names, s.lifecycle, to, started, deadline_at, now, action, reason, text)
-            return self.sleeve(sleeve)
         # A retire puts it away for good: its equity leaves the book with the lifecycle row (F-C3B-A).
         with (self._put_away(sleeve, now, "retired") if to == lifecycle.RETIRED else self.engine.begin()) as c:
             values = {"lifecycle": to, "wind_down_started": started, "wind_down_deadline": deadline_at,
@@ -2930,69 +2720,16 @@ class Store:
             c.execute(insert(events_t).values(sleeve=sleeve, ts=now, level="info", kind=LIFECYCLE_EVENT, message=text))
         return self.sleeve(sleeve)
 
-    def _lifecycle_legs(self, names: list[str], was: str, to: str, started, deadline_at, now: datetime, action: str,
-                        reason: str, text: str) -> None:
-        """A multi-asset Strategy's lifecycle move, on every leg (names: the parent first). A move short of retired is one
-        transaction over every leg. A retire puts each leg away (F-C3B-A: its own flow under the gate's lock, as any
-        put-away), the asset legs first and the parent last, each with its row; one that fails leaves the rest winding
-        down and flat, and complete_retire finishes them. Journaled once, on the parent."""
-        values = {"lifecycle": to, "wind_down_started": started, "wind_down_deadline": deadline_at, "updated_at": now}
-        parent = names[0]
-
-        def journal(c) -> None:
-            c.execute(insert(decisions_t).values(ts=now, actor="PM", action=action, sleeve=parent, reason=reason.strip()))
-            c.execute(insert(events_t).values(sleeve=parent, ts=now, level="info", kind=LIFECYCLE_EVENT, message=text))
-
-        if to != lifecycle.RETIRED:
-            with self.engine.begin() as c:
-                done = c.execute(update(sleeves_t).where(sleeves_t.c.name.in_(names), sleeves_t.c.lifecycle == was)
-                                 .values(**values)).rowcount
-                if done != len(names):
-                    raise lifecycle.LifecycleError("This strategy's lifecycle changed meanwhile; look again and retry.")
-                journal(c)
-            return
-        values["desired_state"] = "stopped"
-        for name in names[1:] + names[:1]:
-            with self._put_away(name, now, "retired") as c:
-                c.execute(update(sleeves_t).where(sleeves_t.c.name == name).values(**values))
-                if name == parent:
-                    journal(c)
-
     def complete_retire(self, sleeve: str, now: datetime | None = None, how: str = "flat") -> bool:
         """Retire a winding-down strategy once the journal shows it flat (dust counts as flat: lifecycle_flat): the end of the PM's own wind-down, never a
         new move (lifecycle.due's RETIRE). False, and nothing written, unless it is winding down and flat. how: flat,
         deadline or close_now, for the journal's words. Its equity leaves the fund's book with the row (F-C3B-A)."""
         if self.two_leg(sleeve):
             return False  # it stays winding down, flat, until the put-away design lands (TWO_LEG_FENCE)
-        if self.multi_asset(sleeve):
-            return self._complete_retire_legs(self.legs(sleeve), now or utcnow(), how)
         try:
             return self._complete_retire(sleeve, now, how)
         except _NotRetired:
             return False
-
-    def _complete_retire_legs(self, names: list[str], now: datetime, how: str) -> bool:
-        """A multi-asset Strategy's wind-down ends once every leg is flat: each leg not yet retired is put away (the
-        parent last), so one leg's process finishing first never retires the Strategy alone."""
-        rows = {n: self.sleeve(n) for n in names}
-        left = [n for n in names if rows[n].lifecycle != lifecycle.RETIRED]
-        if not left or any(rows[n].lifecycle != lifecycle.WINDING_DOWN for n in left):
-            return False
-        if not all(self.lifecycle_flat(n)[1] for n in names):
-            return False
-        text = lifecycle.retired_words(how)
-        for name in [n for n in left if n != names[0]] + [n for n in left if n == names[0]]:
-            with self._put_away(name, now, "retired") as c:
-                c.execute(update(sleeves_t).where(sleeves_t.c.name == name, sleeves_t.c.lifecycle ==
-                                                  lifecycle.WINDING_DOWN)
-                          .values(lifecycle=lifecycle.RETIRED, desired_state="stopped", updated_at=now))
-                if name == names[0]:
-                    c.execute(insert(decisions_t).values(ts=now, actor="PM", action="retire", sleeve=name,
-                                                         reason="Triggered by the system once every leg was flat, "
-                                                                f"ending the PM's wind-down. {text}"))
-                    c.execute(insert(events_t).values(sleeve=name, ts=now, level="info", kind=LIFECYCLE_EVENT,
-                                                      message=text))
-        return True
 
     def _complete_retire(self, sleeve: str, now: datetime | None, how: str) -> bool:
         now = now or utcnow()
@@ -3544,8 +3281,6 @@ class Store:
             raise ValueError("a reason is required")
         if s.parent is not None or self._leg_of(sleeve) is not None:  # CR F283-1: split_run makes one leg's run
             raise ValueError("a reset isn't built for a two-leg Strategy yet, so nothing was changed")
-        if self._asset_legs(sleeve):  # DA (Drop B MUST): split_run would put away the parent's run alone
-            raise ValueError("a reset isn't built for a multi-asset Strategy yet, so nothing was changed")
         if self.pending_reset(sleeve):
             raise ValueError("a reset is already under way")
         from sleeve_fund.paper.runtime import liquidation_head  # the engine's liquidation rule
@@ -3683,6 +3418,8 @@ class Store:
         if abs(book["qty"]) > 1e-12 and not (dust_ok and is_dust(book)):
             raise ValueError("a strategy still holding a position can't be reset; it is flattened first")
         run = f"{name[:46]}--{now:%Y%m%d%H%M%S}"
+        moved = (decisions_t, events_t, commands_t, mirror_t, equity_t, exit_plans_t, fills_t, funding_t,
+                 insurance_t, orders_t, order_timings_t, mirror_requests_t)
         with self.engine.begin() as c:
             # The reset row is locked before the hold is read, as Store.command locks it: a PM pause or flatten pressed
             # meanwhile is either in the hold read here or waits and stays a pending command of the fresh run.
@@ -3690,26 +3427,20 @@ class Store:
             if locked is not None:  # a PM Stop since the request (Store.hold_on_reset) keeps the fresh run stopped
                 request["restart"] = locked.restart
             row = dict(c.execute(select(sleeves_t).where(sleeves_t.c.name == name)).first()._mapping)
-            row_id = row.pop("id")
+            row.pop("id")
             c.execute(insert(sleeves_t).values(**{**row, "name": run, "desired_state": "stopped", "status": "stopped",
                                                   "status_reason": f"run put away by a reset on {now:%d %b %Y %H:%M}",
                                                   "updated_at": now}))
             # The pin is copied before the orders and fills move: the database refuses a pin to a strategy that has
             # traded (F-WED1-3), and the put-away run hasn't yet.
-            for t in RESET_COPIES:
+            for t in (sleeve_accounts_t, sleeve_venues_t):
                 for r in c.execute(select(t).where(t.c.sleeve == name)).all():
                     c.execute(insert(t).values(**{**dict(r._mapping), "sleeve": run}))
-            for t in RESET_MOVES:
+            for t in moved:
                 c.execute(update(t).where(t.c.sleeve == name).values(sleeve=run))
-            # Feed state, and the old run's conditions on the Signals tab, until the fresh process writes its own
-            # (m13-E2).
-            for t in RESET_CLEARS:
-                c.execute(t.delete().where(t.c.sleeve == name))
-            # A reservation still active is room the old run held for an order that can no longer fill (the process
-            # is stopped before the split): released, so no claim from before the reset counts after it (HoE, DA-6).
-            r = gate_reservations_t
-            c.execute(update(r).where(r.c.sleeve_id == row_id, r.c.released_at.is_(None))
-                      .values(released_at=now, release_reason="cancel"))
+            c.execute(feed_seen_t.delete().where(feed_seen_t.c.sleeve == name))
+            # The old run's conditions on the Signals tab until the fresh process writes its own (m13-E2).
+            c.execute(signal_state_t.delete().where(signal_state_t.c.sleeve == name))
             c.execute(insert(sleeve_archive_t).values(sleeve=run, archived_at=now))
             hold = c.execute(select(reset_holds_t).where(reset_holds_t.c.reset_id == request["id"])).first()
             # A strategy paused or halted before the reset starts afresh still paused or halted (U13-4): the paper
@@ -4222,109 +3953,6 @@ class Store:
         with self.engine.connect() as c:
             return _rows(c.execute(select(instruments_t).order_by(instruments_t.c.id)))
 
-    # --- (Strategy, asset): multi-asset Strategies (Drop B, DA 0028; PE1 multi-asset-spec) ---------------------
-
-    def strategy_assets(self, name: str) -> list[dict]:
-        """Every asset of the Strategy `name` (its own row's name, or any of its legs'), one row each: the parent row
-        first, then its legs in the order they were made (the definition's asset order). A one-asset Strategy is one
-        row. Each row: sleeve (the row trading it), instrument, underlying, venue and whether it is a leg."""
-        from sleeve_fund.portfolio.holding import underlying
-        from sleeve_fund.venues import DEFAULT_VENUE
-
-        t, v = sleeves_t, sleeve_venues_t
-        with self.engine.connect() as c:
-            row = c.execute(select(t.c.name, t.c.parent).where(t.c.name == name)).first()
-            if row is None:
-                raise KeyError(f"no strategy {name!r}")
-            strategy = row.parent or row.name
-            rows = c.execute(select(t.c.name, t.c.instrument, t.c.parent, v.c.venue)
-                             .select_from(t.outerjoin(v, v.c.sleeve == t.c.name))
-                             .where(or_(t.c.name == strategy, t.c.parent == strategy))
-                             .order_by(t.c.parent.is_not(None), t.c.id)).all()
-        return [{"strategy": strategy, "sleeve": r.name, "instrument": r.instrument,
-                 "underlying": underlying(r.instrument), "venue": (r.venue or DEFAULT_VENUE).upper(),
-                 "leg": r.parent is not None} for r in rows]
-
-    def asset_book(self, strategy: str) -> dict:
-        """The Strategy's book per asset and in total, rebuilt from the journal (fills are the truth): each asset's
-        row is journal_book of the row trading it, and the total is their exact sum, so per-asset P&L, fees and
-        funding add up to the Strategy's to the last digit (nightly rebuild, Drop B Done-when 6). Position and entry
-        are per asset only: a total of BTC and ETH units means nothing."""
-        assets = []
-        for a in self.strategy_assets(strategy):
-            book = self.journal_book(a["sleeve"], self.sleeve(a["sleeve"]).starting_balance)
-            fees = self._fees(a["sleeve"])
-            assets.append(a | {"starting_balance": to_decimal(self.sleeve(a["sleeve"]).starting_balance),
-                               "cash": book["cash"], "qty": book["qty"], "entry_px": book["entry_px"],
-                               "fills": book["fills"], "fees": fees, "funding": book["funding"],
-                               "insurance": book["insurance"]})
-        total = {k: sum((a[k] for a in assets), Decimal(0))
-                 for k in ("starting_balance", "cash", "fees", "funding", "insurance")}
-        total["fills"] = sum(a["fills"] for a in assets)
-        return {"strategy": assets[0]["strategy"], "assets": assets, "total": total}
-
-    def _fees(self, sleeve: str) -> Decimal:
-        with self.engine.connect() as c:
-            fees = c.execute(select(fills_t.c.fee).where(fills_t.c.sleeve == sleeve)).scalars().all()
-        return sum((to_decimal(f, "fee") for f in fees), Decimal(0))
-
-    def positions_by_asset(self) -> dict[tuple[str, str], Decimal]:
-        """{(Strategy, asset): net quantity} as the orders record what filled, every journal row but saved backtests'
-        (NIGHTLY-RECON's stored side, reconcile.stored_positions; reconcile.rebuild_positions is the fills' side)."""
-        from sleeve_fund import reconcile
-
-        return reconcile.stored_positions(self)
-
-    def asset_mismatches(self, limit: int = 50) -> list[dict]:
-        """Reconcile by (Strategy, asset): journal rows whose instrument is not their row's (an orders, fills, funding
-        or insurance row written with another asset, or left '' because its Strategy row was gone). Empty when every
-        row is keyed right; reconcile names each one (0026 left the check here, never a foreign key)."""
-        out = []
-        with self.engine.connect() as c:
-            for t in (orders_t, fills_t, funding_t, insurance_t):
-                q = (select(t.c.id, t.c.sleeve, t.c.instrument, sleeves_t.c.instrument.label("expected"))
-                     .select_from(t.outerjoin(sleeves_t, sleeves_t.c.name == t.c.sleeve))
-                     .where(or_(sleeves_t.c.instrument.is_(None), t.c.instrument != sleeves_t.c.instrument))
-                     .order_by(t.c.id).limit(limit))
-                out += [{"table": t.name, "id": r.id, "sleeve": r.sleeve, "instrument": r.instrument,
-                         "expected": r.expected} for r in c.execute(q)]
-        return out[:limit]
-
-    def record_shadow_outcome(self, decision_id: int, *, kind: str, pnl, method: str,
-                              computed_at: datetime | None = None) -> str:
-        """A trimmed or refused idea's outcome (Advisor MA-SPEC): "new" when written, "same" when this decision holds
-        the same figure already (a rerun), and an error when it holds another (write-once: never overwritten)."""
-        pnl = to_decimal(pnl, "pnl")
-        row = dict(decision_id=decision_id, kind=kind, pnl=pnl, hypothetical=kind == "refusal", method=method,
-                   computed_at=computed_at or utcnow())
-        t = shadow_outcomes_t
-        with self.engine.begin() as c:
-            have = c.execute(select(t).where(t.c.decision_id == decision_id)).first()
-            if have is None:
-                c.execute(insert(t).values(**row))
-                return "new"
-        if have.kind == kind and have.method == method and stored(have.pnl) == stored(pnl):
-            return "same"
-        raise ValueError(f"decision {decision_id} already has a {have.kind} outcome of {stored(have.pnl)}; "
-                         "an outcome is never rewritten")
-
-    def shadow_outcomes(self, strategy: str | None = None, limit: int = 200) -> list[dict]:
-        """Trimmed and refused ideas with their outcomes, newest first: the decision (Strategy row, asset, bar, asked,
-        approved, the test, planned stop and target, side) and its outcome once computed (None until then). Every
-        Strategy by default; a Strategy's name takes in all its legs."""
-        g, t, o = gate_decisions_t, sleeves_t, shadow_outcomes_t
-        q = (select(t.c.name.label("sleeve"), func.coalesce(t.c.parent, t.c.name).label("strategy"), t.c.instrument,
-                    g.c.id.label("decision_id"), g.c.bar_ts, g.c.stage, g.c.outcome, g.c.test_hit, g.c.compliance_version,
-                    g.c.requested_qty, g.c.approved_qty, g.c.price, g.c.planned_stop, g.c.planned_target, g.c.side,
-                    g.c.would_be, o.c.kind, o.c.pnl, o.c.hypothetical, o.c.method, o.c.computed_at)
-             .select_from(g.join(t, t.c.id == g.c.sleeve_id).outerjoin(o, o.c.decision_id == g.c.id))
-             .where(g.c.outcome.in_(("trimmed", "rejected")))
-             .order_by(g.c.decided_at.desc(), g.c.id.desc()).limit(limit))
-        if strategy is not None:
-            q = q.where(func.coalesce(t.c.parent, t.c.name) == strategy)
-        with self.engine.connect() as c:
-            return _rows(c.execute(q))
-
     # --- compliance tests (bridge A, DA 0027; Advisor BRIDGE-3) -----------------------------------------------
 
     def compliance(self, version: int | None = None, conn=None) -> Compliance:
@@ -4711,20 +4339,10 @@ class Store:
         s = self.sleeve(sleeve)
         if is_backtest(sleeve):
             raise ValueError("a saved backtest's settings are what it tested; run a new backtest instead")
-        names = [sleeve]
-        if self.multi_asset(sleeve):
-            # One settings block for every leg (multi-asset spec §2); the asset list is the Strategy's identity (QT3 b3c).
-            if s.parent is not None:
-                raise ValueError(f"{sleeve} is an asset leg of {s.parent}: change the Strategy's settings")
-            for key in ("assets", "universe_date"):
-                if params.get(key) != s.params.get(key):
-                    raise ValueError(f"a multi-asset Strategy's {key} is fixed when it is made: a new list is a new "
-                                     "Strategy")
-            names = self.legs(sleeve)
         if trial is not None:
             check_trial(trial)
         with self.engine.begin() as c:
-            c.execute(update(sleeves_t).where(sleeves_t.c.name.in_(names)).values(
+            c.execute(update(sleeves_t).where(sleeves_t.c.name == sleeve).values(
                 updated_at=utcnow(), risk_profile=risk_profile, params=params, warmup_bars=warmup_bars))
             if trial is not None:
                 _put_trial_in(c, trial)

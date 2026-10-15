@@ -73,16 +73,3 @@ def _open_risk_setup(monkeypatch, request):
         from sleeve_fund.strategies.base import LongFlatStrategy
 
         monkeypatch.setattr(LongFlatStrategy, "_safety_stop_on_restore", lambda self, book: None)
-
-
-# TEC-BTWAIT (HoE, Drop B): how long a dashboard backtest request waits for its job before showing the queued-job page.
-# Production waits 8 s (BACKTEST_WAIT_SECONDS); a loaded test box can take longer, and a cell expecting the finished
-# run then reads the queued page instead (Drop A round, 14 Oct). A test that means the queued page sets its own.
-TEST_BACKTEST_WAIT = 300.0
-
-
-@pytest.fixture(autouse=True)
-def _backtest_wait(monkeypatch):
-    from sleeve_fund.dashboard import app as app_mod
-
-    monkeypatch.setattr(app_mod, "BACKTEST_WAIT", TEST_BACKTEST_WAIT)

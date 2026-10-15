@@ -12,7 +12,6 @@ import pytest
 
 from sleeve_fund.paper.config import from_store
 from sleeve_fund.store import Store
-from sleeve_fund.two_legs import TwoLegError
 
 PERP = {"market": "perp", "allow_short": True, "stop_loss": 0.02}
 
@@ -20,13 +19,6 @@ PERP = {"market": "perp", "allow_short": True, "stop_loss": 0.02}
 def _fund(store):
     at = datetime.now(UTC) - timedelta(minutes=5)
     store.settle_flow(store.fund_flow("deposit", 100_000, actor="pm", reason="test", rebase=True, now=at), at)
-
-
-def _pair(store, balance):
-    return store.create_two_legs(
-        name="carry", strategy="ping_pong", bar_spec="1-MINUTE-LAST-INTERNAL", starting_balance=balance,
-        first={"instrument": "BTC/USDT", "params": PERP, "side": 1, "ratio": 1, "leverage": 1},
-        second={"instrument": "ETH/USDT", "params": PERP, "side": -1, "ratio": 1, "leverage": 1})
 
 
 def test_a_strategy_made_with_0_in_the_fund_builds_its_paper_config():
@@ -45,20 +37,6 @@ def test_a_balance_below_0_is_still_refused():
     with pytest.raises(ValueError, match="below 0"):
         from_store(type(row)(**{**row.__dict__, "starting_balance": -1})
                    if hasattr(row, "__dict__") else row._replace(starting_balance=-1))
-
-
-def test_a_two_leg_strategy_is_made_with_0_in_the_fund_both_legs_at_0():
-    store = Store.in_memory()
-    _fund(store)
-    first, second = _pair(store, 0)
-    assert (first.starting_balance, second.starting_balance) == (0, 0)
-    assert second.parent == "carry"
-    assert from_store(first).starting_balance == from_store(second).starting_balance == 0
-
-
-def test_outside_the_fund_a_two_leg_strategy_still_needs_a_balance():
-    with pytest.raises(TwoLegError, match="above 0"):
-        _pair(Store.in_memory(), 0)
 
 
 def test_outside_the_fund_a_strategy_with_0_is_refused_at_start_with_a_clear_event(tmp_path, monkeypatch):
@@ -85,38 +63,3 @@ def test_outside_the_fund_a_strategy_with_0_is_refused_at_start_with_a_clear_eve
     _fund(store)
     store.set_desired_state("zero", "running")
     assert not sup._refused("zero")  # in the fund a 0 is how every Strategy is made
-
-
-def test_outside_the_fund_a_0_holder_started_by_hand_still_runs_for_its_exits(tmp_path, monkeypatch):
-    """F-ZS-2 (CR, Drop B rider): the node's F-ZS-1 refusal spares a Strategy that holds a position, so a process
-    started by hand still reaches the venue to run its exits (the safety stop) instead of leaving the position
-    unwatched. Only a flat one is refused."""
-    import sleeve_fund.paper.node as node
-
-    url = f"sqlite:///{tmp_path}/zs2.db"
-    monkeypatch.setenv("DATABASE_URL", url)
-    monkeypatch.setenv("SLEEVE_LOCK_DIR", str(tmp_path / "locks"))
-    store = Store(url)
-    store.create_sleeve(name="zero", strategy="ping_pong", instrument="BTC/USDT", bar_spec="1-MINUTE-LAST-INTERNAL",
-                        starting_balance=0, params=PERP)
-    store.record_fill("zero", side="BUY", qty=0.01, price=60_000.0, fee=0.0, order_id="o1", trade_id="t1",
-                      ts=datetime.now(UTC))
-    assert store.holds_any("zero")
-    reached = []
-    monkeypatch.setattr(node, "venue_start", lambda s, row: reached.append(row.name))  # stops main after the check
-
-    assert node.main(["--db-sleeve", "zero"]) == 1
-    assert reached == ["zero"]
-    assert not [e for e in store.events("zero") if e["kind"] == "start_refused"]
-
-
-def test_a_saved_backtest_with_0_is_not_refused_outside_the_fund():
-    """F-ZS-3 (CR, Drop B rider): F-ZS-1's start check exempts a saved backtest, which has no paper account to fund;
-    the same 0 on a paper Strategy is refused."""
-    from sleeve_fund.store import BACKTEST_PREFIX, check_own_capital
-
-    store = Store.in_memory()
-    check_own_capital(store, BACKTEST_PREFIX + "zero", 0)
-    check_own_capital(store, BACKTEST_PREFIX + "zero", None)
-    with pytest.raises(ValueError, match="starting balance above 0"):
-        check_own_capital(store, "zero", 0)

@@ -202,15 +202,12 @@ def _check(specs: list[LegSpec]) -> None:
 
 
 def run_portfolio(specs: list[LegSpec], profile: PortfolioProfile = PORTFOLIO, unallocated: float = 0.0,
-                  log_level: str = "ERROR", netting: bool = False, regime: Weighting | None = None,
-                  fund_sized: bool = False) -> PortfolioResult:
+                  log_level: str = "ERROR", netting: bool = False, regime: Weighting | None = None) -> PortfolioResult:
     """Run every Strategy in `specs` together, in their order (the gate's fixed order), each on its own venue clone,
     under the portfolio limits in `profile`. unallocated: the fund's cash held by no Strategy, counted in the book
     (Done-when 3). netting: also report step B in shadow (P2-3, netting_shadow) on the result; off by default, and
     it never changes the run. regime: the P2-5 weight on each new entry, for the counted regime variant only; None
-    (always, in G1) runs unweighted. fund_sized: every Strategy sizes its entries off the fund's book as the gate last
-    read it (BRIDGE-3, as paper sizes off the supervisor's last mark), not its own account: a multi-asset Strategy's
-    run (research.multi_asset); off, every run sizes as before."""
+    (always, in G1) runs unweighted."""
     _check(specs)
     order = tuple(s.name for s in specs)
     # A Strategy deciding on bars as short as its execution bars is fed its decision bars alone (run_backtest's
@@ -291,10 +288,6 @@ def run_portfolio(specs: list[LegSpec], profile: PortfolioProfile = PORTFOLIO, u
             clone = clone_instrument(spec.instrument, clone_venue(spec.instrument.id.venue, n))
             join = lambda s, name=spec.name: s.join_portfolio(batch, name)  # noqa: E731
             legs.append(add_leg(engine, plan, clone, before_add=join, order_id_tag=f"{n:03d}"))
-        if fund_sized:
-            last["book"] = (float(sum(s.capital for s in specs)) + float(unallocated), [])  # before the first read
-            for leg in legs:
-                leg.strategy.fund_equity = lambda: last["book"][0]
         first, end = int(grid[0].value), int(grid[-1].value)
         marker = _Marker(_MarkerConfig(first_ns=first, last_ns=end))
         marker._mark = mark
