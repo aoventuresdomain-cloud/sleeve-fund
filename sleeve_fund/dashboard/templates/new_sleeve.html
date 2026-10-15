@@ -55,7 +55,9 @@
       <ul class="summary" id="summary"></ul>
       <div id="g1-note" class="banner warn" hidden>Not G1-passed: observation only.</div>
       <p style="margin:14px 0 0"><a class="button secondary" id="bt-these" href="/backtest" target="_blank" rel="noopener">Backtest these settings</a></p>
-      <p style="margin:16px 0 0"><button>Start strategy in paper mode</button></p>
+      {% set test_models = strategies|selectattr('group', 'equalto', 'Test')|map(attribute='name')|list %}
+      {# A test Strategy is created stopped (A-19): the button says so, and the PM starts it from its page. #}
+      <p style="margin:16px 0 0"><button data-label="Start strategy in paper mode" data-test-label="Create (stopped)">{{ 'Create (stopped)' if chosen in test_models else 'Start strategy in paper mode' }}</button></p>
     </div>
   </aside>
 </form>

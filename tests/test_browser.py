@@ -943,3 +943,20 @@ def test_a19_created_from_the_form_it_is_stopped_and_its_page_brings_the_setting
     assert _a19_form(page) == PM_SETTINGS
     assert errors == []
     page.context.close()
+
+
+def test_a19_the_button_says_create_stopped_for_the_timed_test_and_goes_back_on_switching(a19, browser):
+    base, _ = a19
+    page, errors = _open(browser, f"{base}/sleeves/new?instrument=BTC/USD")
+
+    def labels():
+        return page.eval_on_selector_all("#sleeve-form button[data-label]", "bs => bs.map(b => b.textContent.trim())")
+
+    assert labels() and set(labels()) == {"Start strategy in paper mode"}
+    _step(page, "Model")
+    page.select_option("#strategy", "candle_step")
+    assert set(labels()) == {"Create (stopped)"}  # the side button and the wizard's copy alike
+    page.select_option("#strategy", "trend_filter")
+    assert set(labels()) == {"Start strategy in paper mode"}
+    assert errors == []
+    page.context.close()

@@ -88,6 +88,11 @@ def test_a_run_window_is_kept_in_hours(c, store):  # noqa: F811
     ("p_candle_step__size_share", "-5", "size share: a % of fund equity above 0 and at most 100"),
     ("p_candle_step__run_for_hours", "0", "run for hours: more than 0, or leave it empty to run until stopped"),
     ("p_candle_step__run_for_hours", "-2", "run for hours: more than 0, or leave it empty to run until stopped"),
+    # F-A19-2: float() takes these, and none is a size or a number of hours
+    ("p_candle_step__size_share", "nan", "size share: a % of fund equity above 0 and at most 100"),
+    ("p_candle_step__run_for_hours", "inf", "run for hours: more than 0, or leave it empty to run until stopped"),
+    ("p_candle_step__run_for_hours", "Infinity", "run for hours: more than 0, or leave it empty to run until stopped"),
+    ("p_candle_step__run_for_hours", "nan", "run for hours: more than 0, or leave it empty to run until stopped"),
 ])
 def test_bad_input_is_refused_in_words_and_the_form_comes_back_filled_in(c, store, field, value, words):  # noqa: F811
     r = _post(c, **{field: value})
@@ -107,3 +112,26 @@ def test_clone_with_changes_brings_the_size_share_back_as_a_percent(c, store):  
     assert q["strategy"] == ["candle_step"] and q["p_candle_step__size_share"] == ["60"]
     again = c.get(f"/sleeves/new?{link}", auth=AUTH).text
     assert re.search(r'name="p_candle_step__size_share" value="60"', again)
+
+
+def test_clone_with_changes_does_not_fill_in_what_the_source_left_unset(c, store):  # noqa: F811
+    """F-A19-1: the PM's settings fill a fresh pick only; a clone of a timed test run with shorts off and no target
+    must come back with shorts off and no target, not with the defaults laid over it."""
+    form = {k: v for k, v in FORM.items() if k != "allow_short"}
+    r = c.post("/sleeves/new", data={**form, "take_profit_pct": ""}, auth=AUTH, headers=SAME, follow_redirects=False)
+    assert r.status_code == 303
+    p = store.sleeve("timed-test").params
+    assert not p.get("allow_short") and not p.get("take_profit")
+    html = c.get("/sleeves/timed-test", auth=AUTH).text
+    link = re.search(r'href="/sleeves/new\?([^"]+)"', html).group(1).replace("&amp;", "&")
+    again = c.get(f"/sleeves/new?{link}", auth=AUTH).text
+    assert re.search(r'id="allow_short" name="allow_short" value="1" >', again)
+    assert re.search(r'name="take_profit_pct" type="number"[^>]*value=""', again)
+    assert re.search(r'name="p_candle_step__size_share" value="60"', again)
+
+
+def test_the_button_says_a_test_model_is_created_stopped(c):
+    test = c.get("/sleeves/new?strategy=candle_step", auth=AUTH).text
+    other = c.get("/sleeves/new?strategy=trend_filter", auth=AUTH).text
+    assert re.search(r'data-test-label="Create \(stopped\)">Create \(stopped\)</button>', test)
+    assert re.search(r'data-test-label="Create \(stopped\)">Start strategy in paper mode</button>', other)

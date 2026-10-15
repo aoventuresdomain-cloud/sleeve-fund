@@ -471,7 +471,9 @@ def create_app(store: Store | None = None) -> FastAPI:
         except ValueError:
             hints = _hints()
         pre = dict(request.query_params)
-        if chosen in TEST_PREFILL and not error:  # a test model opens with the PM's settings for it
+        # A test model picked afresh opens with the PM's settings for it; a clone or a refused form keeps its own
+        # (F-A19-1: a clone with shorts off and no target must not come back with them filled in).
+        if chosen in TEST_PREFILL and not error and pre.get("from") != "clone":
             pre = {**TEST_PREFILL[chosen], **pre}
         return page(request, "new_sleeve.html", strategies=choices, instruments=hints,
                     bar_specs=sorted(ALLOWED_BAR_SPECS, key=spec_minutes), profiles=PROFILES, error=error, g1=g1, chosen=chosen,
@@ -2602,10 +2604,11 @@ def _form_params(form, strategy: str) -> dict:
     for key in PERCENT_PARAMS.get(strategy, ()):  # entered as a %, stored as a fraction
         if key in params:
             share = float(params[key])
-            if not 0 < share <= 100:
+            if not (math.isfinite(share) and 0 < share <= 100):
                 raise ValueError(f"{key.replace('_', ' ')}: a % of fund equity above 0 and at most 100")
             params[key] = round(share / 100, 6)
-    if "run_for_hours" in params and not float(params["run_for_hours"]) > 0:
+    hours = float(params["run_for_hours"]) if "run_for_hours" in params else None
+    if hours is not None and not (math.isfinite(hours) and hours > 0):  # F-A19-2: "inf" is no number of hours
         raise ValueError("run for hours: more than 0, or leave it empty to run until stopped")
     market = str(form.get("market", "") or markets.SPOT)
     if market not in markets.MARKETS:
