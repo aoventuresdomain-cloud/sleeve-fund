@@ -1688,7 +1688,8 @@ class LongFlatStrategy(Strategy):
         if self._margin:
             lev = LongFlatStrategy._max_leverage(self)
             liq = markets.isolated_liquidation(cash + self._funded(), qty, entry, lev,
-                                               self._cfg.perp.maintenance_margin, fees=self._entry_fees,
+                                               self._cfg.perp.maintenance_margin,
+                                            fees=getattr(self, "_entry_fees", 0.0),  # a stub book may hold none
                                                tick=LongFlatStrategy._tick(self))
         target = liq if liq is not None else 0.0
         if side * (mark - target) <= 0:
@@ -4257,7 +4258,8 @@ class LongFlatStrategy(Strategy):
         lev = LongFlatStrategy._max_leverage(self)
         entry = self._entry_px if self._entry_px else self._net_position()[1]
         return markets.isolated_liquidation(cash + LongFlatStrategy._funded(self), qty, entry, lev,
-                                            self._cfg.perp.maintenance_margin, fees=self._entry_fees,
+                                            self._cfg.perp.maintenance_margin,
+                                            fees=getattr(self, "_entry_fees", 0.0),  # a stub book may hold none
                                             tick=LongFlatStrategy._tick(self))
 
     def _position_opened(self, fills: list[dict]) -> int:
@@ -6356,7 +6358,8 @@ class LongFlatStrategy(Strategy):
         half = self._lot() / 2
         side = 0 if abs(post) < half else (1 if post > 0 else -1)
         pre = post - sign * filled
-        self._entry_fees = margin.entry_fees_after(self._entry_fees, float(pre), float(sign * filled), fee,
+        held_fees = getattr(self, "_entry_fees", 0.0)  # a stub book may hold none
+        self._entry_fees = margin.entry_fees_after(held_fees, float(pre), float(sign * filled), fee,
                                                    float(half * 2))
         if side == 0:
             self._entry_px, self._entry_qty, self._entry_side = None, 0.0, 0
