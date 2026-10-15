@@ -148,7 +148,8 @@ def check_warmups(store) -> Section:
             profile = venue_profile(s.venue)
             base, quote = s.instrument.split("/")
             inst = spot_pair(base, quote, fees=profile.fees, venue=profile.venue, price_precision=8)
-            units = build(s.strategy, inst, s.params, spec_minutes(s.bar_spec)).seeding_units()
+            model = build(s.strategy, inst, s.params, spec_minutes(s.bar_spec))
+            units = model.seeding_units() + [u for us in model.seeding_timeframes().values() for u in us]
         except Exception as exc:  # noqa: BLE001 - said, as a failure: an unbuilt Strategy isn't checked
             sec.add(FAIL, f"{s.name}: couldn't be built to check its indicators ({exc})")
             continue

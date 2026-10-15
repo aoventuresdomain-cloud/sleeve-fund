@@ -44,9 +44,21 @@ def _engine(x) -> bool:
     return type(x).__module__.startswith("nautilus_trader.indicators")
 
 
+NAMES: dict[type, str] = {Rsi: "RSI", Ema: "EMA", ExponentialMovingAverage: "EMA", Atr: "ATR"}
+
+
+def register(cls: type, label: str, kind: str, tolerance: float) -> None:
+    """A model's own recursive average, under the Advisor's tolerance for its kind (an EMA's 1 bp)."""
+    TOLERANCE[cls], NAMES[cls] = (kind, tolerance), label
+
+
+def _length(leaf) -> int | None:
+    return getattr(leaf, "period", getattr(leaf, "span", None))
+
+
 def name(leaf) -> str:
-    period = getattr(leaf, "period", None)
-    kind = {Rsi: "RSI", Ema: "EMA", ExponentialMovingAverage: "EMA", Atr: "ATR"}.get(type(leaf), type(leaf).__name__)
+    period = _length(leaf)
+    kind = NAMES.get(type(leaf), type(leaf).__name__)
     return f"{kind}({period})" if period is not None else kind
 
 
@@ -88,7 +100,7 @@ def need(obj) -> int:
     """Bars the unit's recursive leaves take to settle: N, the nearer seed."""
     if hasattr(obj, "warmup_bars") and not _engine(obj):
         return int(obj.warmup_bars)
-    return max((int(x.warmup_bars) if isinstance(x, BlockBase) else settle_bars(x.period) for x in leaves(obj)),
+    return max((int(x.warmup_bars) if isinstance(x, BlockBase) else settle_bars(_length(x)) for x in leaves(obj)),
                default=0)
 
 
@@ -114,16 +126,16 @@ def _reset(obj) -> None:
 
 def fresh(obj):
     """A copy of the unit with nothing fed."""
-    if _engine(obj):
-        return type(obj)(obj.period)
+    if _engine(obj) or (type(obj) in TOLERANCE and not hasattr(obj, "reset")):  # built afresh from its length
+        return type(obj)(_length(obj))
     out = copy.deepcopy(obj)
     _reset(out)
     return out
 
 
 def feed(obj, c: Candle) -> None:
-    if _engine(obj):
-        obj.update_raw(c[3])
+    if _engine(obj) or not hasattr(obj, "update_ohlcv"):
+        obj.update_raw(c[3])  # a close-only average
     else:
         obj.update_ohlcv(*c)
 
@@ -132,7 +144,9 @@ def read(leaf) -> float | None:
     """The leaf's value now, whether or not it has passed its own warm-up; None before its first one."""
     if isinstance(leaf, Rsi) or _engine(leaf):
         return leaf.value if leaf.initialized else None
-    return leaf._value if leaf.count else None
+    if not leaf.count:
+        return None
+    return leaf._value if hasattr(leaf, "_value") else leaf.value
 
 
 @dataclass(frozen=True)

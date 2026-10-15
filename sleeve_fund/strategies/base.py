@@ -1259,14 +1259,32 @@ class LongFlatStrategy(Strategy):
         return [(seeding.name(v) if type(v) in seeding.TOLERANCE else k, v) for k, v in vars(self).items()
                 if not k.startswith("_") and seeding._indicator(v) and all(v is not b for b in slower)]
 
-    def _check_seeds(self, units: list, candles: list, want: int, slower=None) -> int:
+    def seeding_timeframes(self) -> dict[int, list[tuple[str, object]]]:
+        """Indicators the model feeds itself from its decision candles on a longer boundary (dip_buy's daily EMA, fed each
+        day's last close), by candle minutes: checked on the store's candles of that size, as {minutes: [(label,
+        indicator)]}. None by default."""
+        return {}
+
+    def _check_seeds(self, units: list, candles: list, want: int, slower=None, fed: int | None = None) -> int:
         """A10: each unit seeded twice on the loaded candles (seeding.check), oldest first as (open, high, low, close,
         volume, close ns). Returns how many of them to feed: the warm-up `want`, or more where the check settled only
         further back. Seeds still apart, or a store too short to tell, hold new entries (_entry_held) until a pair
-        carried on over live candles (of `slower`, or the decision candles) agrees; said once."""
+        carried on over live candles agrees; said once. slower: the SlowerCandles the pairs are fed from, minutes for
+        decision candles closing on that boundary, or None for every decision candle. fed: the candles the model itself
+        was fed, when it can't be fed more (a unit on its own boundary): settled only further back than that, it holds."""
         from sleeve_fund.strategies.indicators import seeding
 
         results = [seeding.check(unit, candles, label) for label, unit in units]
+        if fed is not None:
+            for (_, unit), r in zip(units, results, strict=True):
+                if r.settled and r.feed_bars > fed:  # settled only further back than the model's own seed reaches
+                    have = min(len(candles), seeding.CAP)
+                    own = seeding._seeded(unit, candles[len(candles) - fed:])
+                    far = seeding._seeded(unit, candles[len(candles) - have:])
+                    gap = seeding.worst(own, far)
+                    if gap is not None:
+                        r.settled, r.gap, r.seeds = False, gap, (fed, have)
+                        r.pair = seeding.Pair(own, far, fed, min(seeding.need(unit), seeding.CAP // 2))
         held = [r for r in results if not r.settled]
         if held:
             for r in held:
@@ -1280,11 +1298,29 @@ class LongFlatStrategy(Strategy):
                 self.runtime.store.event(self.runtime.name, "error", "seed_unsettled", msg)
         return max([want] + [r.feed_bars for r in results])
 
+    def _check_boundaries(self, bars: list) -> None:
+        """A10 for seeding_timeframes: each such indicator checked on the store's candles of its size, the model having
+        been fed the closes of those candles among its warm-up `bars`."""
+        from sleeve_fund.strategies.indicators import seeding
+
+        for minutes, units in self.seeding_timeframes().items():
+            fed = sum(1 for b in bars if b.ts_event % (minutes * MINUTE_NS) == 0)
+            bar_type = BarType.from_str(f"{self._cfg.instrument_id}-{bar_spec(minutes)}")
+            try:
+                got = self.history_loader(self.instrument, bar_type, seeding.CAP)
+            except Exception:  # noqa: BLE001 - no candles: the check holds, as a store too short
+                got = []
+            candles = [(b.open.as_double(), b.high.as_double(), b.low.as_double(), b.close.as_double(),
+                        b.volume.as_double(), b.ts_event) for b in sorted(got, key=lambda b: b.ts_event)
+                       if b.ts_event <= bars[-1].ts_event]
+            self._check_seeds(units, candles, 0, minutes, fed)
+
     def _feed_seeds(self, slower, c: tuple) -> None:
         """A live candle, of `slower` or the decision candles, to the pairs it feeds; once every pair agrees,
         entries open again."""
         for label, (pair, of, after) in list(self._seed_pairs.items()):
-            if of is slower and c[5] > after and pair.update(c):
+            mine = (slower is None and c[5] % (of * MINUTE_NS) == 0) if isinstance(of, int) else of is slower
+            if mine and c[5] > after and pair.update(c):
                 del self._seed_pairs[label]
         if self._seed_pairs or self._seed_hold is None:
             return
@@ -1988,6 +2024,7 @@ class LongFlatStrategy(Strategy):
         level = "info" if bars else "warning"
         if bars:
             self.on_historical_bars(bars)
+            self._check_boundaries(bars)
             msg = f"Loaded {len(bars)} of {want} warm-up bars from {getattr(self.history_loader, 'source', 'the history store')}"
             if len(bars) < want:  # the venue's recent candles stop short of a long look-back (m13-E4)
                 level = "warning"
