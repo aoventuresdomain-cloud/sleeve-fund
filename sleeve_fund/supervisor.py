@@ -116,6 +116,16 @@ def fund_book(store: Store, since: datetime | None = None) -> FundBook:
     plus every Strategy's cash P&L since then, put away or not (the cash is the fund's), plus its positions at the mark.
     The one book reader for the mark, sizing and the per-poll identity check."""
     since = since if since is not None else bridge_start(store)
+    pnl = positions = Decimal(0)
+    for s in store.sleeves():
+        if _in_book(store, s):
+            pnl += to_decimal(store.strategy_cash_pnl(s.name, since=since), "cash")
+            positions += _position_value(store, s)
+    return FundBook(since, _fund_capital(store, since), pnl, positions)
+
+
+def _fund_capital(store: Store, since: datetime | None) -> Decimal:
+    """The cash put in: applied flows from `since` (fund_book)."""
     flows = [f for f in store.fund_flows() if f["applied_at"] is not None]
     # The capital starts at the re-base flow itself, by journal order, not its time: a flow applied at the same poll
     # but ahead of it in id order went into the book the re-base replaced (PE1's reset cell a3)
@@ -125,12 +135,7 @@ def fund_book(store: Store, since: datetime | None = None) -> FundBook:
         if since is None or (f["id"] >= base if base is not None else f["applied_at"] >= since):
             amount = to_decimal(f["amount"], "amount")
             capital += -amount if f["kind"] == "withdraw" else amount
-    pnl = positions = Decimal(0)
-    for s in store.sleeves():
-        if _in_book(store, s):
-            pnl += to_decimal(store.strategy_cash_pnl(s.name, since=since), "cash")
-            positions += _position_value(store, s)
-    return FundBook(since, capital, pnl, positions)
+    return capital
 
 
 def sizing_equity(store: Store, now: datetime | None = None) -> Decimal | None:
@@ -1434,15 +1439,26 @@ def book_figures(store: Store) -> str:
     if bridge_start(store) is not None:
         # F-SC-1: once the fund holds the book its capital is the fund's cash, not any Strategy's balance (each holds
         # 0), so its figures are the fund's: the cash put in since the re-base and the book as the identity reads it
-        book = fund_book(store)
-        start, equity = book.capital, book.total
+        try:
+            book = fund_book(store)
+            start, equity = book.capital, f"{book.total:,.2f}"
+        except RuntimeError:  # F-SC1-1: a held position with no mark; the fund's reader refuses, the log line says so
+            start, unmarked = _fund_capital(store, bridge_start(store)), []
+            for s in store.sleeves():
+                if _in_book(store, s):
+                    try:
+                        _position_value(store, s)
+                    except RuntimeError:
+                        qty = to_decimal(store.journal_book(s.name, s.starting_balance)["qty"], "qty")
+                        unmarked.append(f"{s.name} holds {qty.normalize():f} with no mark")
+            equity = f"not marked ({'; '.join(unmarked)})"
     else:
         start = sum(s.starting_balance for s in current)
-        equity = sum(float((store.last_equity(s.name) or {"equity": s.starting_balance})["equity"]) for s in current)
+        equity = f'{sum(float((store.last_equity(s.name) or {"equity": s.starting_balance})["equity"]) for s in current):,.2f}'
     fees = sum(float(f["fee"]) for s in current for f in store.fills(s.name, limit=1_000_000))
     held = [s.name for s in current if abs(store.journal_book(s.name, s.starting_balance)["qty"]) > 1e-12]
     firsts = [m["ts"] for s in current if (m := store.first_equity(s.name))]
-    return (f"from {start:,.2f}, equity {equity:,.2f}, fees {fees:,.2f}, "
+    return (f"from {start:,.2f}, equity {equity}, fees {fees:,.2f}, "
             f"positions {', '.join(held) or 'none'}, first mark {min(firsts).isoformat() if firsts else 'none'}"
             + (f"; outside the book (a test account): {', '.join(tests)}" if tests else "")
             + (f"; joining the book at the supervisor's next mark: {', '.join(joining)}" if joining else ""))
