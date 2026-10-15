@@ -400,3 +400,18 @@ def test_f_rr3_1_close_out_cash_counts_only_after_since_as_strategy_cash_pnl_doe
     for since in (at - timedelta(microseconds=1), at, at + timedelta(microseconds=1)):
         assert store.close_out_cash("rsi-bands", since=since) == \
             store.strategy_cash_pnl("rsi-bands", since=since)  # only close-outs moved its cash after T0
+
+
+def test_f_sc_1_once_the_fund_holds_the_book_its_figures_count_the_fund_s_cash(store):
+    """HoQA F-SC-1 (15 Oct, after the reset): `supervisor book` printed "from 0.00, equity 0.00" on a fund holding
+    100,000, as it summed the Strategies' own balances only. Once the fund holds the book, its figures are the fund's:
+    from the cash put in since the re-base, equity the fund's book (fund_book, the identity's own reader)."""
+    _fund_held(store)
+    assert supervisor.book_figures(store) == \
+        "from 100,000.00, equity 100,000.00, fees 0.00, positions none, first mark none"
+    _make(store, "fresh", 0)
+    _mark(store, T0 + timedelta(minutes=21))
+    _trade(store, "fresh", 12.5, T0 + timedelta(minutes=22))
+    _mark(store, T0 + timedelta(minutes=23))
+    assert supervisor.book_figures(store).startswith("from 100,000.00, equity 100,012.50, ")
+    assert supervisor.fund_book(store).total == D("100012.50")
