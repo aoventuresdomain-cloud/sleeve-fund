@@ -334,6 +334,24 @@ def check_books(store, cent: bool = False) -> Section:
     return sec
 
 
+def check_maintenance(store) -> Section:
+    """VS-1 (Advisor, 15 Oct): a perp Strategy's liquidation is priced at its venue's published maintenance tiers for
+    the instrument. One on a pair whose table isn't kept is a FAIL, named, never run at an assumed rate."""
+    from sleeve_fund import markets
+
+    sec = Section("Maintenance tables")
+    for s in store.sleeves():
+        if s.lifecycle == "retired" or (s.params or {}).get("market") != "perp":
+            continue
+        try:
+            markets.terms(s.params, s.venue, s.instrument)
+        except markets.NoMaintenanceTable as exc:
+            sec.add(FAIL, f"{s.name}: {exc}")
+    if not sec.failed:
+        sec.add(PASS, "every perp Strategy's instrument has its venue's maintenance tiers")
+    return sec
+
+
 def check_assets(store) -> Section:
     """A multi-asset Strategy asset by asset (multi-asset spec §7): every listed asset has its row, and every journal
     row is keyed to its own row's asset (DA 0028's reconcile, store.asset_mismatches). One failing asset fails, named."""
@@ -399,8 +417,8 @@ def run(url: str, environ: dict[str, str] | None = None) -> tuple[bool, str]:
     store = read_only_store(url)
     engine = store.engine
     sections = [check_store(engine), check_keys(env, engine), check_alerts(env), check_venues(engine),
-                check_books(store), check_assets(store), check_warmups(store), check_account_sharing(env, engine),
-                check_strength(store)]
+                check_maintenance(store), check_books(store), check_assets(store), check_warmups(store),
+                check_account_sharing(env, engine), check_strength(store)]
     ok = not any(s.failed for s in sections)
     out = [f"Start check: {'PASS' if ok else 'FAIL'}",
            f"{datetime.now(UTC):%Y-%m-%d %H:%M} UTC, {journal_kind(url)} journal, read-only",
