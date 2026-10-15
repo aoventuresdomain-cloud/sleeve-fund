@@ -157,3 +157,22 @@ def test_once_entries_are_held_only_the_reduce_and_the_close_run(monkeypatch, co
     assert [(o["side"], D(str(o["filled_qty"])), o["intent"]) for o in orders] == [
         ("BUY", q, "entry"), ("SELL", q / 2, "exit"), ("SELL", q / 2, "exit")]
     assert _path(a)[-1] == 0
+
+
+@pytest.mark.parametrize("reenter, margin, lock", [(False, True, -1), (False, True, 1), (False, False, True),
+                                                   (True, True, None), (True, False, None)])
+def test_lock_resumed_keeps_the_side_lock_unless_the_model_ends_its_leg_at_a_stop(reenter, margin, lock):
+    """QD co-sign of PE1 25a092b6 (HoE 02:31 UK): a stop journaled before a restart. A model without
+    REENTER_AFTER_EXIT_LEG resumes with the side it closed locked (a perp: that side; spot: True) and its leg untouched,
+    as before the fix; one with it ends its leg instead (exit_leg_closed) and carries no lock, as the live path
+    (_lock_exit_leg) does. Either way the resume's pending lock is spent."""
+    from types import SimpleNamespace
+
+    from sleeve_fund.strategies.base import LongFlatStrategy
+
+    ended = []
+    s = SimpleNamespace(REENTER_AFTER_EXIT_LEG=reenter, _margin=margin, _exit_lock=None,
+                        exit_leg_closed=lambda: ended.append(True))
+    r = {"side": -1 if lock == -1 else 1, "lock_ns": 123}
+    LongFlatStrategy._lock_resumed(s, r)
+    assert s._exit_lock == lock and ended == ([True] if reenter else []) and r["lock_ns"] is None
