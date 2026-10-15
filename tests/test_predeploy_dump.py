@@ -208,8 +208,70 @@ def test_a_whole_copy_passes_and_is_never_named_like_a_nightly_dump(tmp_path):
 
 
 def test_the_deploy_dumps_before_the_new_code_starts():
-    lines = [ln.strip() for ln in (ROOT / "deploy" / "remote_up.sh").read_text().splitlines()]
-    dump = next(i for i, ln in enumerate(lines) if "deploy/predeploy_dump.sh" in ln)
-    assert lines[dump] == "docker compose exec -T backup bash -s < deploy/predeploy_dump.sh"
-    assert dump < lines.index("docker compose up -d --build --remove-orphans")
+    lines = [ln.strip() for ln in (ROOT / "deploy" / "predeploy.sh").read_text().splitlines()]
+    assert "docker compose exec -T backup bash -s < deploy/predeploy_dump.sh" in lines
     assert "set -euo pipefail" in lines  # a failed dump stops the deploy
+    assert "set -euo pipefail" in (ROOT / "deploy" / "remote_up.sh").read_text()
+
+
+# --- the host side (HoQA F-PDD-1): skip only on a true first deploy -----------------------------------------------------
+
+HOST = ROOT / "deploy" / "predeploy.sh"
+
+
+def _host(tmp_path: Path, volume: bool, running: bool, ready: bool = True) -> tuple[subprocess.CompletedProcess, list]:
+    """deploy/predeploy.sh as remote_up.sh runs it, with a stand-in docker: the journal's volume there or not, its
+    containers running or stopped, the database answering or not."""
+    log = tmp_path / "docker.log"
+    log.touch()
+    (tmp_path / "bin").mkdir(exist_ok=True)
+    (tmp_path / "deploy").mkdir(exist_ok=True)
+    (tmp_path / "deploy" / "predeploy_dump.sh").write_text("echo 'pre-deploy dump: PASS, stand-in'\n")
+    (tmp_path / "bin" / "docker").write_text(f"""#!/usr/bin/env bash
+echo "$*" >> {log}
+case "$*" in
+  "volume ls"*) {"echo sleeve-fund_pgdata" if volume else "true"};;
+  "compose start"*) {"exit 0" if running or volume else "exit 1"};;
+  *pg_isready*) {"exit 0" if ready else "exit 2"};;
+  "compose exec -T backup bash -s") cat;;
+esac
+""")
+    (tmp_path / "bin" / "docker").chmod(0o755)
+    (tmp_path / "bin" / "sleep").write_text("#!/usr/bin/env bash\nexit 0\n")
+    (tmp_path / "bin" / "sleep").chmod(0o755)
+    env = {**os.environ, "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}"}
+    done = subprocess.run(["bash", str(HOST)], cwd=tmp_path, env=env, capture_output=True, text=True, timeout=30,
+                          check=False)
+    return done, log.read_text().splitlines()
+
+
+@needs_bash
+def test_a_first_deploy_with_no_journal_volume_skips_the_dump(tmp_path):
+    done, calls = _host(tmp_path, volume=False, running=False)
+    assert done.returncode == 0 and done.stdout.strip() == "pre-deploy dump: SKIP, no journal yet (first deploy)"
+    assert not any(c.startswith(("compose start", "compose exec")) for c in calls)
+
+
+@needs_bash
+@pytest.mark.parametrize("running", [True, False])
+def test_a_journal_volume_means_a_dump_even_with_the_database_stopped(tmp_path, running):
+    """HoQA F-PDD-1: a stopped db once skipped the dump and the deploy went on with no proved copy. Now the journal's
+    containers are started as they are (never recreated: the new config must not start before the dump), then dumped."""
+    done, calls = _host(tmp_path, volume=True, running=running)
+    assert done.returncode == 0 and "pre-deploy dump: PASS, stand-in" in done.stdout, done.stdout
+    start = calls.index("compose start db backup")
+    assert start < calls.index("compose exec -T backup bash -s")
+    assert not any(c.startswith(("compose up", "compose create", "compose restart")) for c in calls)
+
+
+@needs_bash
+def test_a_database_that_never_answers_stops_the_deploy(tmp_path):
+    done, calls = _host(tmp_path, volume=True, running=True, ready=False)
+    assert done.returncode == 1 and "pre-deploy dump: FAIL, the journal's database didn't answer" in done.stdout
+    assert "compose exec -T backup bash -s" not in calls
+
+
+def test_the_deploy_runs_the_host_side_before_the_new_code_starts():
+    lines = [ln.strip() for ln in (ROOT / "deploy" / "remote_up.sh").read_text().splitlines()]
+    assert lines.index("bash deploy/predeploy.sh") < lines.index("docker compose up -d --build --remove-orphans")
+    assert not any("compose ps -q db" in ln for ln in lines)  # never keyed on "db running" again
