@@ -83,13 +83,46 @@ def test_the_start_check_notes_a_table_older_than_30_days(tmp_path):
     assert not any("days ago" in w for _, w in fresh.lines), fresh.lines
     old = start_check.check_maintenance(store, now=datetime(2026, 11, 15, tzinfo=UTC))
     assert not old.failed
-    assert ("NOTE", "BTC/USDT on the paper venue: its maintenance table was read on 15 Oct 2026, 31 days ago; "
-                    "re-paste and re-check it (DA-11)") in [(s, w.replace(perp_label(), "the paper venue"))
-                                                            for s, w in old.lines], old.lines
+    assert ("NOTE", "BTC/USDT: its maintenance table was read on 15 Oct 2026, 31 days ago; re-paste and re-check it "
+                    "(DA-11)") in old.lines, old.lines
 
 
-def perp_label():
-    return venue("BINANCE").label
+def test_the_whole_start_check_runs_with_a_perp_strategy_in_the_book(tmp_path):
+    """The maintenance section reads today's date itself when the page is run (no clock passed in)."""
+    from sleeve_fund import start_check
+    from sleeve_fund.store import Store
+
+    url = f"sqlite:///{tmp_path}/j.db"
+    store = Store(url)
+    store.create_sleeve(name="p1", strategy="ping_pong", instrument="BTC/USDT", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=10_000, venue="BINANCE", params={"market": "perp"})
+    store.engine.dispose()
+    _, page = start_check.run(url, environ={})
+    assert "Maintenance tables: PASS" in page, page
+
+
+def test_an_old_table_is_also_an_alert_said_once(monkeypatch):
+    """HoE (Advisor: alert): the supervisor's alert loop journals a warning when a perp Strategy's table is past 30
+    days, so it goes out with the other alerts; said once, not every minute; nothing before 30 days."""
+    from datetime import UTC, datetime
+
+    from sleeve_fund.alerts import Forwarder
+    from sleeve_fund.store import Store
+
+    store = Store.in_memory()
+    store.create_sleeve(name="p1", strategy="ping_pong", instrument="BTC/USDT", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=10_000, venue="BINANCE", params={"market": "perp"})
+    at = {"now": datetime(2026, 11, 14, 9, tzinfo=UTC)}
+    sent = []
+    fwd = Forwarder(store, environ={"ALERT_WEBHOOK_URL": "https://hooks.example.com/x"},
+                    send=lambda url, text: sent.append(text), now=lambda: at["now"])
+    fwd.step()
+    assert not any("maintenance table" in t for t in sent)
+    at["now"] = datetime(2026, 11, 15, 9, tzinfo=UTC)
+    fwd.step()
+    fwd.step()
+    said = [t for t in sent if "maintenance table" in t]
+    assert len(said) == 1 and "BTC/USDT: its maintenance table was read on 15 Oct 2026, 31 days ago" in said[0], sent
 
 
 def test_an_entry_at_or_past_the_venues_top_tier_is_refused(prices, instrument, full_margin, monkeypatch):
