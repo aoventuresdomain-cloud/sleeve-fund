@@ -261,6 +261,14 @@ def test_the_script_starts_with_exactly_twice_the_newest_dump_free(tmp_path):
     assert "disk: PASS" in done.stdout and any(c.startswith("exec drill-x-db pg_restore") for c in calls)
 
 
+def test_every_deploy_recreates_the_backup_so_it_runs_the_new_script():
+    """HoE: backup.sh is bind-mounted, so compose up leaves the backup running the old script; every deploy recreates
+    it, after the stack is up (one extra dump per deploy)."""
+    lines = [ln.strip() for ln in (ROOT / "deploy" / "remote_up.sh").read_text().splitlines()]
+    up = lines.index("docker compose up -d --build --remove-orphans")
+    assert lines[up + 1] == "docker compose up -d --force-recreate --no-deps backup"
+
+
 def test_the_workflow_is_by_hand_on_main_quiet_and_copies_nothing_off_the_server():
     import yaml
 
