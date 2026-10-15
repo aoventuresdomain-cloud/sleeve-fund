@@ -823,12 +823,15 @@ class Supervisor:
         refresh, waiting forever. Each one still in the book (not yet withdrawn) has those orders closed and the room
         released (Store.close_dead_orders), but only once its process is confirmed gone: none of ours alive, and its
         single-instance lock free, so no process started elsewhere holds it either. The lock is held while it closes,
-        so none can start meanwhile. Flat ones only, paper only; a failure is said once, and never holds up the rest."""
+        so none can start meanwhile. Flat ones only, paper only; a failure is said once, and never holds up the rest.
+        Only the runs with an order open or room held are looked at (Store.put_away_left_open, F-RRP-5)."""
         from sleeve_fund.paper.single_lock import instance_lock
 
-        withdrawn = self.store.withdrawn()
-        for name in self.store.archived():
-            if name in withdrawn or is_backtest(name):
+        names = self.store.put_away_left_open()  # F-RRP-5: one read, however many runs are put away
+        for gone in set(self._dead_told) - set(names):  # nothing left open: a failure said before is over
+            self._dead_told.pop(gone)
+        for name in names:
+            if is_backtest(name):
                 continue
             runner = name.split("~", 1)[0]  # a leg is traded by its Strategy's own process
             if self.procs.get(runner, Proc()).alive or self.procs.get(name, Proc()).alive:
