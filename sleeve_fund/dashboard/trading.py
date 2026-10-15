@@ -242,12 +242,19 @@ def position_margin(x: dict) -> tuple[float, float | None]:
     entry = x.get("entry_px") or x["price"]
     if not qty:
         return 0.0, None
-    t = markets.terms(x["sleeve"].params, getattr(x["sleeve"], "venue", None), x["sleeve"].instrument)
+    t, tiered = markets.held_terms(x["sleeve"].params, getattr(x["sleeve"], "venue", None), x["sleeve"].instrument)
     if t is None:
         return abs(qty) * entry, None
     lev = risk.leverage_cap(x["profile"], x["sleeve"].params)
     return (markets.isolated_margin(qty, entry, lev, cash + qty * entry),
-            markets.isolated_liquidation(cash, qty, entry, lev, t.maintenance_margin))
+            markets.isolated_liquidation(cash, qty, entry, lev, t.maintenance_margin) if tiered else None)
+
+
+def liq_unknown(x: dict) -> bool:
+    """A perp held on a pair whose venue tiers aren't kept: its liquidation price is unknown, never "none" (CR MUST 1)."""
+    s = x["sleeve"]
+    return bool(x["qty"]) and markets.is_perp(s.params) and not markets.held_terms(
+        s.params, getattr(s, "venue", None), s.instrument)[1]
 
 
 def risk_to_stop(qty: float, price: float, stop_px: float | None) -> float | None:
@@ -477,6 +484,7 @@ def open_position(x: dict, fills: list[dict], orders: dict[str, dict],
         "margin": margin,
         "leverage": cost / margin if margin else None,
         "liq_px": liq,
+        "liq_unknown": liq_unknown(x),
         "to_liq": abs(liq / x["price"] - 1) if liq and x["price"] else None,
         "risk_to_stop": risk_to_stop(x["qty"], x["price"], stop_px),
         "stop_liq": stop_to_liquidation(x["price"], stop_px, liq),
@@ -498,13 +506,13 @@ def perp_view(x: dict, position: dict | None, funding: list[dict]) -> dict | Non
     exposure is its notional at the mark over the strategy's equity (QA U2, as the Advisor worded them). Effective
     leverage is the notional at the mark over the same margin: it moves with the price, so it is always labelled
     "effective" and never shown in the leverage's own format (UP-2, Advisor ADV1940)."""
-    t = markets.terms(x["sleeve"].params, getattr(x["sleeve"], "venue", None), x["sleeve"].instrument)
+    t, tiered = markets.held_terms(x["sleeve"].params, getattr(x["sleeve"], "venue", None), x["sleeve"].instrument)
     if t is None:
         return None
     qty, price, equity = x["qty"], x["price"], x["equity"]
     notional = abs(qty * price)
     margin, liq = position_margin(x)
-    tier = markets.tier_at(t.maintenance_margin, notional)  # the venue's tier at the mark (VS-1)
+    tier = markets.tier_at(t.maintenance_margin, notional) if tiered else None  # the venue's tier at the mark (VS-1)
     opened = position["opened"] if position else None
     held = [f for f in funding if opened is not None and f["ts"] >= opened]
     return {
@@ -512,9 +520,10 @@ def perp_view(x: dict, position: dict | None, funding: list[dict]) -> dict | Non
         "exposure": notional / equity if equity > 0 else None,
         "effective_leverage": notional / margin if position and margin else None,
         "margin": margin,
-        "maintenance": notional * tier.rate - tier.amount,
-        "maintenance_rate": tier.rate,
+        "maintenance": notional * tier.rate - tier.amount if tier else None,
+        "maintenance_rate": tier.rate if tier else None,
         "liq_px": liq,
+        "liq_unknown": not tiered,
         "to_liq": abs(liq / price - 1) if liq and price else None,
         "funding_rate": t.funding_rate,
         "funding_last": held[0] if held else None,

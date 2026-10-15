@@ -105,7 +105,7 @@ def test_a_perp_on_a_pair_with_no_table_is_refused_by_name_never_at_an_assumed_r
     from sleeve_fund.venues import venue
 
     monkeypatch.setattr(venue("BINANCE"), "maintenance_tiers", {})
-    with pytest.raises(markets.NoMaintenanceTable, match="BTC/USDT on .* has no maintenance table"):
+    with pytest.raises(markets.NoMaintenanceTable, match="^BTC/USDT has no maintenance table"):
         markets.terms({"market": "perp"}, "BINANCE", "BTC/USDT")
     with pytest.raises(markets.NoMaintenanceTable, match="BTCUSDT-PERP"):
         markets.terms({"market": "perp"}, "BINANCE", "BTCUSDT-PERP")
@@ -155,7 +155,7 @@ def test_the_start_check_names_a_perp_strategy_whose_pair_has_no_table(tmp_path,
     monkeypatch.setattr(venue("BINANCE"), "maintenance_tiers", {})
     ok, page = start_check.run(url, environ={})
     assert not ok and "Maintenance tables: FAIL" in page, page
-    assert "  FAIL  p1: BTC/USDT on " in page and "has no maintenance table kept" in page and "FAIL  s1" not in page, page
+    assert "  FAIL  p1: BTC/USDT has no maintenance table kept" in page and "FAIL  s1" not in page, page
 
 
 def test_a_stop_held_at_the_cap_is_pulled_in_when_the_position_reaches_a_higher_rate():
