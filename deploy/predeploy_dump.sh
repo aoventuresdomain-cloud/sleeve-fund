@@ -31,14 +31,14 @@ COUNT="select (select version_num from alembic_version) || ' ' ||
   (select count(*) from fund_flows) || ' ' || (select count(*) from book_moves) || ' ' || (select count(*) from decisions)"
 NAMES="migration orders fills events fund_flows book_moves decisions"
 # Each tool's own words can name a host or a row: they go nowhere, and a failure says which step (QT3 N2).
-before=$(psql -d "$DB" -At -c "$COUNT" 2>/dev/null) || { echo "pre-deploy dump: FAIL, couldn't read the journal"; exit 1; }
-pg_dump -d "$DB" -Fc -f "$f.part" 2>/dev/null || { echo "pre-deploy dump: FAIL, the dump didn't complete"; exit 1; }
-after=$(psql -d "$DB" -At -c "$COUNT" 2>/dev/null) || { echo "pre-deploy dump: FAIL, couldn't read the journal"; exit 1; }
+before=$(psql -d "$DB" -At -c "$COUNT" 2>/dev/null) || { rc=$?; echo "pre-deploy dump: FAIL, couldn't read the journal (exit $rc)"; exit 1; }
+pg_dump -d "$DB" -Fc -f "$f.part" 2>/dev/null || { rc=$?; echo "pre-deploy dump: FAIL, the dump didn't complete (exit $rc)"; exit 1; }
+after=$(psql -d "$DB" -At -c "$COUNT" 2>/dev/null) || { rc=$?; echo "pre-deploy dump: FAIL, couldn't read the journal (exit $rc)"; exit 1; }
 dropdb --if-exists "$CHECK" >/dev/null 2>&1 || true
-createdb "$CHECK" 2>/dev/null || { echo "pre-deploy dump: FAIL, couldn't make the scratch database"; exit 1; }
+createdb "$CHECK" 2>/dev/null || { rc=$?; echo "pre-deploy dump: FAIL, couldn't make the scratch database (exit $rc)"; exit 1; }
 pg_restore --no-owner --no-privileges --exit-on-error -d "$CHECK" "$f.part" 2>/dev/null \
-  || { echo "pre-deploy dump: FAIL, it didn't restore"; exit 1; }
-copy=$(psql -d "$CHECK" -At -c "$COUNT" 2>/dev/null) || { echo "pre-deploy dump: FAIL, couldn't read the copy"; exit 1; }
+  || { rc=$?; echo "pre-deploy dump: FAIL, it didn't restore (exit $rc)"; exit 1; }
+copy=$(psql -d "$CHECK" -At -c "$COUNT" 2>/dev/null) || { rc=$?; echo "pre-deploy dump: FAIL, couldn't read the copy (exit $rc)"; exit 1; }
 dropdb "$CHECK"
 read -r -a b <<< "$before"; read -r -a a <<< "$after"; read -r -a c <<< "$copy"; read -r -a n <<< "$NAMES"
 [ "${c[0]}" = "${b[0]}" ] && [ "${c[0]}" = "${a[0]}" ] \
