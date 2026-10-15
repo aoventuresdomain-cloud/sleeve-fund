@@ -18,6 +18,7 @@ from decimal import Decimal
 from sleeve_fund.paper.exec_client import stop_change
 
 MAX_RESTING = 2  # never more than two resting stops per position (STOP-EXEC)
+ID_PREFIX = "sf-"  # the fund's namespace on a shared account (Advisor STOP-CLAIM): only these are ever ours to cancel
 
 
 def _d(x) -> Decimal:
@@ -27,8 +28,13 @@ def _d(x) -> Decimal:
 
 
 def new_order_id() -> str:
-    """A venue order id that fits its 36 characters (EXEC-SPEC MUST 5): a UUID."""
-    return str(uuid.uuid4())
+    """A venue order id in the fund's namespace that fits its 36 characters (EXEC-SPEC MUST 5): the prefix and a UUID's
+    32 hex digits."""
+    return ID_PREFIX + uuid.uuid4().hex
+
+
+def ours(order_id: str) -> bool:
+    return order_id.startswith(ID_PREFIX)
 
 
 class StopMover:
@@ -144,6 +150,13 @@ class StopMover:
     # a restart ------------------------------------------------------------------------------------------------------
     @staticmethod
     def reconcile(venue_resting: list[str], journal_current: str | None) -> list[tuple]:
-        """Every resting stop at the venue for this position that the journal doesn't own as its current stop is
-        cancelled (STOP-EXEC)."""
-        return [("cancel", oid) for oid in venue_resting if oid != journal_current]
+        """Every resting stop at the venue IN THE FUND'S NAMESPACE that the journal doesn't own as its current stop is
+        cancelled (STOP-EXEC, narrowed by STOP-CLAIM); one outside it is never touched and raises a CRITICAL alert."""
+        out = []
+        for oid in venue_resting:
+            if not ours(oid):
+                out.append(("alert", "critical", f"Order {oid} on the account is not the fund's: left alone, entries "
+                                                 "held until the account reconciles"))
+            elif oid != journal_current:
+                out.append(("cancel", oid))
+        return out

@@ -105,17 +105,22 @@ def test_h_a_quantity_change_alone_is_an_amend_of_the_one_resting_stop(mover):
     assert m.resting() == {old}
 
 
-def test_i_a_restart_cancels_every_resting_stop_the_journal_does_not_own():
-    venue = ["s-a", "s-b", "s-c"]
-    acts = StopMover.reconcile(venue, journal_current="s-b")
-    assert sorted(acts) == [("cancel", "s-a"), ("cancel", "s-c")]
+def test_i_a_restart_cancels_every_resting_stop_of_ours_the_journal_does_not_own():
+    venue = ["sf-a", "sf-b", "sf-c"]
+    acts = StopMover.reconcile(venue, journal_current="sf-b")
+    assert sorted(acts) == [("cancel", "sf-a"), ("cancel", "sf-c")]
     assert StopMover.reconcile(venue, journal_current=None) == [("cancel", v) for v in venue]
+
+
+def test_i2_a_restart_never_touches_an_order_outside_the_fund_s_namespace_and_alerts_critical():
+    acts = StopMover.reconcile(["by-hand-1", "sf-b"], journal_current="sf-b")
+    assert [a[:2] for a in acts] == [("alert", "critical")] and "by-hand-1" in acts[0][2]
 
 
 def test_j_order_ids_fit_the_venue():
     m = StopMover(side="SELL", qty="0.010")
-    ids = {m.move(str(60000 + i))[0][1] for i in range(1)}
-    assert all(len(i) <= 36 for i in ids)
+    oid = m.move("60000")[0][1]
+    assert len(oid) <= 36 and oid.startswith("sf-")
 
 
 def test_k_a_trigger_price_amend_through_the_client_is_refused_never_sent_without_it():
