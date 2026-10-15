@@ -1870,6 +1870,24 @@ class LongFlatStrategy(Strategy):
             return str(exc)
         return None
 
+    def _venue_terms_refusal(self) -> str | None:
+        """FEE-LIVE (Advisor FEE-LIVE-DW): why paper refuses an entry for its instrument's fee rates or margin tiers
+        (over 72 h old, or never fetched; venue_terms.entry_refusal), or None. A backtest charges research's rates and
+        never asks; only the entry path reads it, so exits, stops, the liquidation cut and Stop always run."""
+        if self._backtest or self.runtime is None:
+            return None
+        from sleeve_fund import venue_terms
+        from sleeve_fund.venues import venue as venue_profile
+
+        store, name = self.runtime.store, self.runtime.name
+        row = store.sleeve(name)
+        profile = venue_profile(getattr(self.runtime, "venue", None) or row.venue)
+        if not profile.fee_bounds or not profile.perpetual:  # a simulated perp on a spot venue charges LOW_FEE_PERP
+            return None
+        account = store.account_of(name)
+        live = store.account_kind(account) == "live"
+        return venue_terms.entry_refusal(store, profile, row.instrument, self.runtime.now(), live, account)
+
     def _open_risk_refusal(self, side: int, qty: float, close: float, equity: float, ts_ns: int,
                            held_qty: float = 0.0, held_stop: float | None = None) -> str | None:
         """Why the interim open-risk limit refuses this entry (sleeve_fund.open_risk), or None: it gates entries and
@@ -1879,16 +1897,19 @@ class LongFlatStrategy(Strategy):
         alerts (QA P1-S9). A two-leg Strategy's first leg adds what its entry opens on the second leg, in full: no
         hedge credit (Advisor M6); a backtest judges it against both legs' equity summed."""
         stop = close * (1 - side * self._stop_frac) if self._stop_frac else None
+        # The loss at the stop counts the exit's taker fee (FEE-LIVE (5)); None fails closed where it is read.
+        taker = getattr(getattr(self, "_cfg", None), "assumed_taker_fee", None)
         pair = getattr(self, "pair", None)
         follow = pair.follower_entry(Decimal(repr(qty)), close) if pair is not None and pair.lead is self else None
         if self._backtest:
             day = (ts_ns - 1) // DAY_NS * DAY_NS
             atr = self._daily_atr.get(day)
             try:
-                risk = (open_risk.position_risk(side * qty, close, stop, atr)
-                        + open_risk.position_risk(held_qty, close, held_stop, atr))
+                risk = (open_risk.position_risk(side * qty, close, stop, atr, taker=taker)
+                        + open_risk.position_risk(held_qty, close, held_stop, atr, taker=taker))
                 if follow is not None:
-                    risk += open_risk.position_risk(*follow, pair.follow._daily_atr.get(day))
+                    risk += open_risk.position_risk(*follow, pair.follow._daily_atr.get(day),
+                                                    taker=pair.follow._cfg.assumed_taker_fee)
                     equity += pair.other_book(self, close)[0]
             except ValueError:
                 return None
@@ -1913,11 +1934,13 @@ class LongFlatStrategy(Strategy):
                 through.append(name)
             needs_atr = stop is None or (held_qty and (held_stop is None or name in through))
             mine_atr = atr(store.sleeve(name)) if needs_atr else None
-            mine = (open_risk.position_risk(side * qty, close, stop, mine_atr)
-                    + open_risk.position_risk(held_qty, close, None if name in through else held_stop, mine_atr))
+            mine = (open_risk.position_risk(side * qty, close, stop, mine_atr, taker=taker)
+                    + open_risk.position_risk(held_qty, close, None if name in through else held_stop, mine_atr,
+                                              taker=taker))
             if follow is not None:  # the second leg's row is in the book and its held risk in `others` already
                 leg = pair.follow.runtime.name
-                mine += open_risk.position_risk(*follow, atr(store.sleeve(leg)) if follow[2] is None else None)
+                mine += open_risk.position_risk(*follow, atr(store.sleeve(leg)) if follow[2] is None else None,
+                                                taker=pair.follow._cfg.assumed_taker_fee)
         except ValueError as exc:
             return f"its open risk can't be measured: {exc}"
         if through:
@@ -2552,6 +2575,11 @@ class LongFlatStrategy(Strategy):
                        f"maintenance tier ({self._cfg.perp.max_notional:,.0f}), so its liquidation price is unknown")
             return
         self._noted.discard("entry_refused_top_tier")
+        terms_refusal = self._venue_terms_refusal()
+        if terms_refusal:  # FEE-LIVE: fees or tiers over 72 h old, or never fetched; exits and stops never come here
+            self._note("entry_refused_venue_terms", terms_refusal)
+            return
+        self._noted.discard("entry_refused_venue_terms")
         # CUT-A: the simulated account posts the margin, with the fund's virtual funding back in (_mark nets it out)
         liq, distance = entry_liquidation(cash + self._funded(), float(qty), close, side, self._cfg.assumed_taker_fee,
                                           self._cfg.perp.maintenance_margin, lev)
@@ -3777,7 +3805,8 @@ class LongFlatStrategy(Strategy):
                   "instrument": self._base_code(), "opens": self._position_qty() < self._min_qty(),
                   "leverage": LongFlatStrategy._max_leverage(self)
                   if self._margin else None,
-                  "atr_pct": None if self._stop_frac else self._entry_atr_pct()}
+                  "atr_pct": None if self._stop_frac else self._entry_atr_pct(),
+                  "taker": Decimal(repr(float(self._cfg.assumed_taker_fee)))}  # the exit's fee at the stop (FEE-LIVE)
         return signal, intent
 
     def _resting_entry_terms(self):
@@ -3848,7 +3877,8 @@ class LongFlatStrategy(Strategy):
                 if self._entry_px and self._stop_frac is not None else None)
         lev = LongFlatStrategy._max_leverage(self) if self._margin else None
         pos = Position(name, underlying(self._base_code()), Decimal(repr(float(qty))),
-                       None if stop is None else Decimal(repr(float(stop))), lev)
+                       None if stop is None else Decimal(repr(float(stop))), lev,
+                       Decimal(repr(float(self._cfg.assumed_taker_fee))))
         return Decimal(repr(float(equity))), holding_for(pos, Decimal(repr(float(close))), atr_pct)
 
     def portfolio_halt(self, reason: str) -> None:
@@ -4245,6 +4275,9 @@ class LongFlatStrategy(Strategy):
         if liq is None:
             return frac, None
         side = self._entry_side or 1
+        pulled = self._pulled_liq(cash, qty)
+        if pulled is not None and (pulled - liq) * side > 0:
+            liq = pulled  # Advisor TIER-DIFF 2: a pulled tier table that differs puts it nearer; the nearer one holds
         ref = self._entry_px if (self._entry_px - liq) * side > 0 else self._last_close
         if not ref or (ref - liq) * side <= 0:
             return frac, None  # the price is through it: the liquidation guard closes the position
@@ -4253,6 +4286,29 @@ class LongFlatStrategy(Strategy):
         if frac <= cap or math.isclose(frac, cap, rel_tol=1e-12, abs_tol=1e-15):
             return frac, None
         return cap, liq
+
+    def _pulled_liq(self, cash: float, qty: float) -> float | None:
+        """Paper only (Advisor TIER-DIFF 2): the liquidation price under the venue's newest pulled tier table when it
+        differs in value from the one liquidation is priced with (venue_terms.differing_tiers), else None. The readers
+        keep the priced table; only the stop's half-way cap takes the nearer of the two."""
+        if self._backtest or self.runtime is None or self._cfg.perp is None or not qty:
+            return None
+        from sleeve_fund import venue_terms
+        from sleeve_fund.venues import venue as venue_profile
+
+        store = self.runtime.store
+        row = store.sleeve(self.runtime.name) if hasattr(store, "latest_good_venue_fetch") else None
+        if row is None:  # no journal to read pulled tables from
+            return None
+        profile = venue_profile(getattr(self.runtime, "venue", None) or row.venue)
+        if not profile.perpetual:
+            return None
+        table = venue_terms.differing_tiers(store, profile, row.instrument)
+        if table is None:
+            return None
+        entry = self._entry_px if self._entry_px else self._net_position()[1]
+        return markets.isolated_liquidation(cash + LongFlatStrategy._funded(self), qty, entry,
+                                            LongFlatStrategy._max_leverage(self), table)
 
     def _hold_stop_capped(self, asked: float) -> bool:
         """Set the stop for `asked`, held inside the half-liquidation cap (_capped_stop). Journals a clamp only when

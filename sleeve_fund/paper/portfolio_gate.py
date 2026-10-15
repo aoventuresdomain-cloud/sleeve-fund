@@ -19,6 +19,7 @@ from decimal import Decimal
 
 from sqlalchemy import select
 
+from sleeve_fund.fees import taker_of
 from sleeve_fund.gate_ledger import DbLedger
 from sleeve_fund.money import to_decimal
 from sleeve_fund.portfolio.gate import Checked, check_order, check_pair
@@ -70,7 +71,8 @@ def fund_holdings(store: Store, now: datetime | None = None, atr_pct=None) -> tu
         stop = None if stop is None else to_decimal(stop, "stop")
         through = stop is not None and (mark - stop) * qty <= 0  # gapped: the stop no longer bounds the loss
         lev = risk.leverage_cap(risk.profile(s.risk_profile), s.params) if markets.is_perp(s.params) else None
-        pos = Position(s.name, underlying(s.instrument), qty, None if stop is None or through else stop, lev)
+        pos = Position(s.name, underlying(s.instrument), qty, None if stop is None or through else stop, lev,
+                       taker_of(store, s))
         out.append(holding_for(pos, mark, None if pos.stop is not None else atr_pct(s)))
     return tuple(out)
 

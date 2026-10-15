@@ -37,7 +37,7 @@ from sleeve_fund.dashboard.metrics import STALE, sleeve_summary
 from sleeve_fund.data import spec_minutes
 from sleeve_fund.fees import resolve as resolve_fees
 from sleeve_fund.history import REQUEST_YEARS
-from sleeve_fund.instruments import price_decimals
+from sleeve_fund.instruments import pct, price_decimals
 from sleeve_fund.exact import FloatView
 from sleeve_fund.spreads import resolve as resolve_spread
 from sleeve_fund.spreads import series as spread_series
@@ -154,6 +154,7 @@ def create_app(store: Store | None = None) -> FastAPI:
     templates.env.filters["uk_time"] = legs.uk_time
     templates.env.filters["leg_label"] = legs.label  # a second leg's row "<name>~2" reads "<name>, leg 2" (P2-8)
     templates.env.filters["pct"] = lambda x: f"{x:+.2%}"
+    templates.env.filters["rate"] = pct  # a fee rate as people read it: 0.055%, never 0.06%
     templates.env.filters["pct0"] = lambda x: f"{x:.0%}"
     # Biggest contributor first, by size whatever its sign (UP-3): rows keep their sign colour and bar direction.
     templates.env.filters["by_size"] = lambda rows, field: sorted(rows, key=lambda x: -abs(x[field]))
@@ -657,7 +658,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                     contribution=None if bt_id else _contribution(st(), multi["kpi"] if multi else x),
                     fund_halt=None if bt_id else compliance.fund_halt(st()),
                     bars=[] if bt_id else compliance.strategy_bars(
-                        st(), s.instrument.split("/")[0], _risk_to_stop(x, position), s.params.get("risk_per_trade")))
+                        st(), s.instrument.split("/")[0], _risk_to_stop(x, position, st(), s), s.params.get("risk_per_trade")))
 
     def _two_legs(s, x: dict, frame) -> dict | None:
         """A two-leg Strategy's part of its page (P2-8 step 7): on its first leg, the Strategy folded (legs.fold_one)
@@ -1727,7 +1728,7 @@ def create_app(store: Store | None = None) -> FastAPI:
 
         # Named by market, not venue: venue names appear only where the PM sets up keys (QA U8 ruling).
         fee_quotes = [{"venue_label": "Perpetual venue" if v.perpetual else "Spot venue", "source": q.source, "taker": float(q.fees.taker),
-                       "rates": f"{float(q.fees.maker):.2%} maker / {float(q.fees.taker):.2%} taker",
+                       "rates": f"{pct(q.fees.maker)} maker / {pct(q.fees.taker)} taker",
                        "basis": q.basis if q.source == "published" else
                        f"account {q.account}, {q.fetched_at:%d %b %Y %H:%M} UTC",
                        "assumed_spread": f"{2 * v.assumed_half_spread:.2%}"}
@@ -2500,8 +2501,8 @@ MARKET_KEYS = ("market", "allow_short", "demo_mirror")  # form fields of their o
 
 def market_choices() -> list[tuple[str, str]]:
     return [(markets.SPOT, "Spot: long only, the venue's fees"),
-            (markets.PERP, f"{markets.LOW_FEE_PERP.label}: {markets.LOW_FEE_PERP.fees.maker:.2%} maker, "
-                           f"{markets.LOW_FEE_PERP.fees.taker:.2%} taker, funding"),
+            (markets.PERP, f"{markets.LOW_FEE_PERP.label}: {pct(markets.LOW_FEE_PERP.fees.maker)} maker, "
+                           f"{pct(markets.LOW_FEE_PERP.fees.taker)} taker, funding"),
             (markets.PERP_VENUE_FEES, f"{markets.VENUE_FEE_PERP.label}: funding")]
 
 
@@ -2740,13 +2741,14 @@ def _order_rules(s, x: dict) -> dict:
     return {"risk_pct": float(rpt) * 100 if rpt else None, "leverage": lev, "stop": stop}
 
 
-def _risk_to_stop(x: dict, position: dict | None) -> float | None:
-    """The open position's loss if its stop is hit, at the last mark (open_risk.position_risk, the gate's formula);
-    0 when flat, None with no stop to measure from."""
+def _risk_to_stop(x: dict, position: dict | None, store, sleeve) -> float | None:
+    """The open position's loss if its stop is hit, at the last mark, with the exit's taker fee (open_risk.position_risk,
+    the gate's formula); 0 when flat, None with no stop to measure from or no fee rate."""
     if not position or not x.get("qty"):
         return 0.0
     try:
-        return float(open_risk.position_risk(x["qty"], x["price"], position.get("stop_px")))
+        return float(open_risk.position_risk(x["qty"], x["price"], position.get("stop_px"),
+                                             taker=open_risk.taker_of(store, sleeve)))
     except ValueError:
         return None
 

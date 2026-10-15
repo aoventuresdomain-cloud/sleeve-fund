@@ -85,7 +85,7 @@ def test_a_gated_entry_still_resting_at_the_next_bar_close_is_cancelled_and_its_
         g = paper_gate(paper)(rt.name, {"side": 1, "qty": D("0.01"), "close": D(60_000), "price": D(60_000),
                                         "stop_frac": 0.02, "what": "entry", "step": D("0.001"),
                                         "min_qty": D("0.001"), "instrument": "BTC", "leverage": None,
-                                        "atr_pct": None}, pd.Timestamp(rt.now()).value)
+                                        "atr_pct": None, "taker": D(0)}, pd.Timestamp(rt.now()).value)
         g.attach(o["order_id"])
         held.update(order=o["order_id"], rid=g.checked.reservation)
 
@@ -129,7 +129,8 @@ def _ns_of(t) -> int:
 
 def _qa_intent() -> dict:
     return {"side": 1, "qty": D("0.01"), "close": D(60_000), "price": D(60_000), "stop_frac": 0.02, "what": "entry",
-            "step": D("0.001"), "min_qty": D("0.001"), "instrument": "BTC", "leverage": None, "atr_pct": None}
+            "step": D("0.001"), "min_qty": D("0.001"), "instrument": "BTC", "leverage": None, "atr_pct": None,
+            "taker": D(0)}
 
 
 def test_a_paper_stopless_entry_is_measured_with_the_history_stores_daily_atr(monkeypatch):

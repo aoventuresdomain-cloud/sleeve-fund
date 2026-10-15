@@ -384,6 +384,25 @@ def check_maintenance(store, now=None) -> Section:
     return sec
 
 
+def check_venue_terms(store, now=None) -> Section:
+    """FEE-LIVE (Advisor FEE-LIVE-DW): each perp Strategy's instrument's fee rates and margin tiers, as fetched from the
+    venue. Over 72 h old, or never fetched, is a FAIL (its entries are refused; exits and stops run); over 24 h, or the
+    published rate standing in for the account's, is a NOTE."""
+    from datetime import UTC, datetime
+
+    from sleeve_fund import venue_terms
+
+    sec = Section("Venue fees and tiers")
+    for t in venue_terms.live_terms(store, now or datetime.now(UTC)):
+        if t.state == venue_terms.REFUSED:
+            sec.add(FAIL, t.words)
+        elif t.state == venue_terms.STALE or t.source == venue_terms.PUBLISHED_FEES:
+            sec.add(NOTE, t.words)
+    if not sec.failed:
+        sec.add(PASS, "every followed Strategy's instrument has its fee rates (and on a perp its tiers) within 72 hours")
+    return sec
+
+
 def check_assets(store) -> Section:
     """A multi-asset Strategy asset by asset (multi-asset spec §7): every listed asset has its row, and every journal
     row is keyed to its own row's asset (DA 0028's reconcile, store.asset_mismatches). One failing asset fails, named."""
@@ -449,8 +468,8 @@ def run(url: str, environ: dict[str, str] | None = None) -> tuple[bool, str]:
     store = read_only_store(url)
     engine = store.engine
     sections = [check_store(engine), check_keys(env, engine), check_exec_target(env), check_alerts(env),
-                check_venues(engine), check_maintenance(store), check_books(store), check_assets(store),
-                check_warmups(store),
+                check_venues(engine), check_maintenance(store), check_venue_terms(store), check_books(store),
+                check_assets(store), check_warmups(store),
                 check_account_sharing(env, engine), check_strength(store)]
     ok = not any(s.failed for s in sections)
     out = [f"Start check: {'PASS' if ok else 'FAIL'}",

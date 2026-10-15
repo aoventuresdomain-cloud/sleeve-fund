@@ -18,7 +18,7 @@ from sleeve_fund.research.portfolio_run import run_portfolio
 from sleeve_fund.risk import PortfolioProfile
 
 ORDER = dict(side=1, qty=D(2), close=D(100), price=D("100.05"), stop_frac=0.02, step=D("0.001"),
-             min_qty=D("0.001"), instrument="XBT", leverage=None, atr_pct=None)
+             min_qty=D("0.001"), instrument="XBT", leverage=None, atr_pct=None, taker=D(0))
 
 
 def _at(d: date, hour: int = 0) -> datetime:

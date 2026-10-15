@@ -274,7 +274,7 @@ def test_at_midnight_the_old_day_is_marked_first_so_no_decision_sees_a_stale_dai
     gate = PortfolioGate(lambda ts: (D(equity[max(t for t in equity if t <= ts)]), ()), PortfolioProfile())
     gate.mark(midnight - hour + 1)  # 23:00: the old day starts at 100
     order = {"side": 1, "qty": D(1), "price": D(10), "stop_frac": 0.02, "step": D("0.001"), "min_qty": D("0.001"),
-             "instrument": "BTC", "leverage": None, "atr_pct": None}
+             "instrument": "BTC", "leverage": None, "atr_pct": None, "taker": D(0)}
     decided = gate("a", order, midnight + 1)  # the gate pass at 00:00 + 1 ns runs before the hourly mark here
     assert decided.decision.outcome == "approved"  # the old day's 3% loss doesn't block the new day
     st = gate.ledger.state()
@@ -432,7 +432,7 @@ def test_f237_1_while_open_risk_is_unmarked_the_gate_refuses_every_entry_and_sti
     from sleeve_fund.research.portfolio import PortfolioGate
 
     order = dict(side=1, qty=D(2), close=D(100), price=D("100.05"), stop_frac=0.02, step=D("0.001"),
-                 min_qty=D("0.001"), instrument="XBT", leverage=None, atr_pct=None)
+                 min_qty=D("0.001"), instrument="XBT", leverage=None, atr_pct=None, taker=D(0))
     t0 = int(pd.Timestamp("2026-10-08 12:00", tz="UTC").value)
 
     equity, missing = {"now": D(1000)}, {"why": None}

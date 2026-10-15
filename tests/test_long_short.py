@@ -63,7 +63,7 @@ def test_markets_fees_and_validation():
 
     venue = FeeSchedule(Decimal("0.004"), Decimal("0.008"))
     assert markets.fees_for({}, venue) == venue
-    assert markets.fees_for({"market": "perp"}, venue).taker == Decimal("0.0005")
+    assert markets.fees_for({"market": "perp"}, venue).taker == Decimal("0.00055")
     assert markets.fees_for({"market": "perp-venue-fees"}, venue) == venue  # the stress case
     with pytest.raises(ValueError):
         markets.market_of({"market": "options"})
@@ -139,10 +139,10 @@ def test_ping_pong_on_a_perp_shorts_its_short_leg(prices, instrument):
     assert [t["side"] for t in (long1, short, long2)] == [1, -1, 1]
     assert short["entry_px"] == pytest.approx(101.5) and short["exit_px"] == pytest.approx(100.9)
     assert short["pnl"] == pytest.approx(short["qty"] * 0.6 - short["fees"])
-    # The low-fee perp schedule: 0.05% taker, not Kraken spot's 0.80%.
+    # The low-fee perp schedule: 0.055% taker, not Kraken spot's 0.80%.
     first = fills.iloc[0]
     fee = float(str(first["commissions"][0]).split()[0])
-    assert fee == pytest.approx(float(first["filled_qty"]) * 100 * 0.0005, abs=0.01)
+    assert fee == pytest.approx(float(first["filled_qty"]) * 100 * 0.00055, abs=0.01)
     # Ends short from 102: equity is the cash flows plus funding, marked at the close.
     assert res.exposure.iloc[-1] < 0
 
@@ -381,15 +381,17 @@ def test_the_dashboard_shows_a_short(client):  # noqa: F811
     kpi = re.search(r'<div class="kpi" title="([^"]*)"><div class="k">Fees and funding', html)
     assert kpi and re.search(r"· \d+% of gross P&amp;L$", kpi.group(1)), kpi and kpi.group(1)
     # QA U3: Risk & health and Trades give the same margin and Risk to stop as Portfolio (1,515 put up; the
-    # stop at 61,812 is 1,672 above the 60,140 mark, so 83.60 at risk on 0.05).
+    # stop at 61,812 is 1,672 above the 60,140 mark, so 83.60 at risk on 0.05, and the 0.055% taker fee on the
+    # stop's notional, 0.05 x 61,812 x 0.00055 = 1.70, FEE-LIVE 5: 85.30).
     for path in ("/risk", "/trades"):
         other = c.get(path, auth=AUTH).text
-        assert ">Margin used</div><div class=\"v\">1,515.00" in other and ">83.60</td>" in other, path
+        assert ">Margin used</div><div class=\"v\">1,515.00" in other and ">85.30</td>" in other, path
     # P1-U14: an exit-plan edit moves the open short's stop from 2% to 1% (61,206): Risk & health's stop columns
-    # read the position's stop, as its Risk to stop does (0.05 x 1,066 = 53.30), not the model's 2%.
+    # read the position's stop, as its Risk to stop does (0.05 x 1,066 = 53.30, and 0.05 x 61,206 x 0.00055 = 1.68
+    # the stop's fee: 54.98), not the model's 2%.
     store.set_exit_plan("pp-ls", "o3", kind="edit", stop_frac=0.01, tp_frac=None)
     risk = c.get("/risk", auth=AUTH).text
-    assert "from its entry\">1.0%</span>" in risk and ">53.30</td>" in risk and ">2.0%<" not in risk
+    assert "from its entry\">1.0%</span>" in risk and ">54.98</td>" in risk and ">2.0%<" not in risk
     assert '<span class="rh-chip ok" title="The position\'s stop at 61,206' in risk
     # A losing short grows: at 92,000 against 2,000 of equity it is 230%, past the 66% it was sized to.
     store.record_equity("pp-ls", equity=2_000.0, cash=6_600.0, qty=-0.05, price=92_000.0, benchmark=10_000)
@@ -750,7 +752,7 @@ def test_a_long_short_strategy_clones_backtests_and_starts_as_long_short(client,
     result = c.get("/backtest?" + urlencode({**bt, "run": "1"}), auth=AUTH).text
     assert "Couldn't run it" not in result, result[result.find("Couldn't"):][:300]
     assert "Low-fee perpetual (simulated), long and short" in result
-    assert "0.02% maker, 0.05% taker" in result
+    assert "0.02% maker, 0.055% taker" in result
     run = store.backtests(limit=1)[0]
     saved = store.sleeve(run["sleeve"])
     assert saved.params.get("market") == "perp" and saved.params.get("allow_short") is True

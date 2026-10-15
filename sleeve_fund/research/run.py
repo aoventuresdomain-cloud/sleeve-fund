@@ -15,6 +15,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from sleeve_fund.instruments import pct
+
 ROOT = Path(__file__).resolve().parent.parent.parent
 # Where the server keeps research it writes: outside the code, which each deploy replaces.
 LEDGER = Path(os.environ.get("IDEA_LEDGER", ROOT / "research" / "idea_ledger.jsonl"))
@@ -127,6 +129,13 @@ def run_store_study(req: StudyRequest, store=None, progress=None, ledger_path: P
     if prices.empty:
         raise ValueError(f"the stored history for {req.pair} has no {_bars(req.minutes)} bars yet")
     fees = resolve_fees(profile.name, store)
+    if profile.fee_bounds:  # FEE-LIVE: never below the published VIP 0, with the account's own rate said beside it
+        from dataclasses import replace
+
+        from sleeve_fund import venue_terms
+
+        floor = venue_terms.research_fees(store, profile, req.pair)
+        fees = replace(fees, fees=floor.fees, words=floor.text)
     spread = spreads.series(profile.name, req.pair, store)  # each run charges the one in force at each time
     base, quote = req.pair.split("/")
     # Price decimals from the stored prices, as the backtest page does: the default 2 rounded every
@@ -159,7 +168,7 @@ def run_store_study(req: StudyRequest, store=None, progress=None, ledger_path: P
     # The fees the strategy's runs paid: a perpetual market's own when it trades one, not the venue's spot rates (RE-COST).
     paid = result.fee_basis
     fee_words = fees.text if paid is None or paid == fees.fees else \
-        f"{float(paid.maker):.2%} maker, {float(paid.taker):.2%} taker (the perpetual market's)"
+        f"{pct(paid.maker)} maker, {pct(paid.taker)} taker (the perpetual market's)"
     span = int((prices.index[0] - pd.Timedelta(minutes=req.minutes)).value), int(prices.index[-1].value)
     result.fee_note = f"{fee_words}; the maker rate on post-only orders only; spread: {spread.text(*span)}"
     if result.breakeven:

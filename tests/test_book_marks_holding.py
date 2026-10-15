@@ -43,7 +43,9 @@ def test_fbm1_a_holding_fund_writes_one_book_mark_per_minute_with_its_holdings(s
     assert len(held) == 1 and held[0].notional == D(6000)  # 0.1 at 60,000, marked at its entry
     for r in rows:  # the row's figures are the gate's book: 6,000 long on 20,000
         assert money(r.gross) == D(6000) and money(r.net_max) == D(6000) and r.net_underlying == "BTC"
-        assert money(r.open_risk) == held[0].risk == D(120)  # to the 2% stop
+        # To the 2% stop, and the taker fee on the stop's notional at the rate its fills pay (FEE-LIVE 5): this
+        # Strategy is spot at the default venue, 0.80%, so 120 + 0.1 x 58,800 x 0.008 = 167.04.
+        assert money(r.open_risk) == held[0].risk == D(120) + D("0.1") * 58_800 * D("0.008")
         assert money(r.equity) == EQ and r.status == "ok"
     assert not _alerts(store, "supervisor_error")
 

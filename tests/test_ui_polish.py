@@ -55,7 +55,7 @@ def test_up1_total_size_and_net_are_the_figures_the_entry_gate_reads(tmp_path, m
     size = gate_size(store, BOOK)
     gated = paper_gate(store)("s1", {"side": 1, "qty": D("0.001"), "close": D(60_000), "price": D(60_000),
                                      "stop_frac": 0.02, "what": "entry", "step": D("0.001"), "min_qty": D("0.001"),
-                                     "instrument": "BTC", "leverage": None, "atr_pct": None}, pd.Timestamp(now).value)
+                                     "instrument": "BTC", "leverage": None, "atr_pct": None, "taker": D(0)}, pd.Timestamp(now).value)
     gate = gated.decision.figures["gross"]
     assert size["source"] == "gate" and size["total"] == pytest.approx(gate["before"]) == pytest.approx(1.2)
     assert size["limit"] == pytest.approx(gate["cap"]) == 1.5

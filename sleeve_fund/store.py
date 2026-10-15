@@ -485,8 +485,8 @@ account_keys_t = Table(
     Column("present", Integer, nullable=False),  # 1 if the supervisor sees both key and secret
     Column("checked_at", TS, nullable=False),
 )
-# Fee schedules read from each connected live account by the supervisor (query-only key, server
-# only). Every fetch is kept, so a result can always say which schedule it used.
+# Retired (FEE-LIVE, head 3): fee schedules the supervisor once read from live accounts. Nothing writes or reads it now
+# (venue_terms_fetch holds every fee fetch); the table and its rows are kept, never dropped.
 fee_schedules_t = Table(
     "fee_schedules",
     metadata,
@@ -3251,15 +3251,6 @@ class Store:
                 c.execute(account_keys_t.delete().where(account_keys_t.c.account == name))
                 c.execute(insert(account_keys_t).values(account=name, present=int(bool(ok)), checked_at=now))
 
-    def record_fees(self, venue: str, account: str, maker: float, taker: float) -> None:
-        """Supervisor only: the fee schedule a live account's venue reports for it."""
-        for label, v in (("maker", maker), ("taker", taker)):
-            if not 0 <= v < 0.05:
-                raise ValueError(f"{label} fee {v} outside [0, 5%)")
-        with self.engine.begin() as c:
-            c.execute(insert(fee_schedules_t).values(venue=venue.upper(), account=account, maker=float(maker),
-                                                     taker=float(taker), fetched_at=utcnow()))
-
     def record_spread(self, venue: str, instrument: str, half_spread: float, samples: int,
                       ts: datetime | None = None) -> None:
         if not 0 <= half_spread < 0.05:
@@ -3371,15 +3362,6 @@ class Store:
     def latest_venue_fetch(self, venue: str, kind: str, instrument: str) -> dict | None:
         """The newest fetch, good or failed: what an alert says went wrong last."""
         return self._latest_venue_fetch(venue, kind, instrument, good=False)
-
-    def latest_fees(self, venue: str, account: str | None = None) -> dict | None:
-        """The most recent fetched schedule for a venue (or one account), or None."""
-        q = select(fee_schedules_t).where(fee_schedules_t.c.venue == venue.upper())
-        if account:
-            q = q.where(fee_schedules_t.c.account == account)
-        with self.engine.connect() as c:
-            rows = _rows(c.execute(q.order_by(fee_schedules_t.c.fetched_at.desc(), fee_schedules_t.c.id.desc()).limit(1)))
-        return rows[0] if rows else None
 
     def set_signal_state(self, sleeve: str, payload: dict, ts: datetime | None = None) -> None:
         """Paper only: the model's conditions on the forming candle, replacing the last ones (Signals tab)."""
