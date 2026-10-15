@@ -969,7 +969,8 @@ def create_app(store: Store | None = None) -> FastAPI:
                      reason_note: str = Form(""), actor: str = Depends(require_pm),
                      _o: None = Depends(same_origin)):
         """PM, 5 Oct 2026: reset a strategy during testing. The supervisor flattens it (and its demo copy),
-        puts the run so far away under Previous book, and restarts it at its starting capital."""
+        puts the run so far away under Previous book, and restarts it at its starting capital. No page reaches it
+        since the refresh's removal (Drop 3a); it goes in the next drop (REFRESH-REMOVE-2)."""
         try:
             if _liquidated(name):  # an ordinary reset would put the liquidation away unanswered (P1-U27)
                 raise ValueError(liquidation.REFUSAL)
@@ -979,59 +980,6 @@ def create_app(store: Store | None = None) -> FastAPI:
         except ValueError as exc:
             return RedirectResponse(f"/sleeves/{name}?{urlencode({'command_error': str(exc)})}", status_code=303)
         return RedirectResponse(f"/sleeves/{name}", status_code=303)
-
-    @app.post("/book/reset")
-    def book_reset(reason: str = Form(""), reason_pick: str | None = Form(None), reason_note: str = Form(""),
-                   actor: str = Depends(require_pm), _o: None = Depends(same_origin)):
-        """Reset every strategy on the current book (not archived, not a backtest, none already resetting)."""
-        try:
-            reason = _reason("reset", reason, reason_pick, reason_note)
-        except ValueError as exc:
-            reason = ""
-            error = str(exc)
-        else:
-            error = "a reason is required"
-        if not reason:
-            return RedirectResponse(f"/setup?{urlencode({'reset_error': error})}", status_code=303)
-        liquidated = [s.name for s in _book_to_reset() if _liquidated(s.name)]
-        if liquidated:
-            # Advisor 20:41 (U27): while a strategy is liquidated a book reset resets nothing until the PM confirms
-            # the named list; it then also ends each liquidation (confirm below), never its incident.
-            q = {"confirm_liquidated": ", ".join(liquidated), "confirm_reason": reason}
-            return RedirectResponse(f"/setup?{urlencode(q)}", status_code=303)
-        for s in _book_to_reset():
-            st().request_reset(s.name, reason, actor=actor, book=True)
-        return RedirectResponse(f"/setup?{urlencode({'reset': '1'})}", status_code=303)
-
-    @app.post("/book/reset/confirm")
-    def book_reset_confirm(reason: str = Form(""), liquidated: list[str] = Form([]),
-                           actor: str = Depends(require_pm), _o: None = Depends(same_origin)):
-        """The PM's confirmation of a book reset with the named list of liquidated strategies (U27): each gets one
-        liquidation_reset (the PM's, "book reset"), then every strategy on the book is reset. Its liquidation
-        incident stays open until its note is written and the PM acknowledges it."""
-        reason = (reason or "").strip()
-        named = sorted(s.name for s in _book_to_reset() if _liquidated(s.name))
-        if not reason:
-            return RedirectResponse(f"/setup?{urlencode({'reset_error': 'a reason is required'})}", status_code=303)
-        if sorted(set(liquidated)) != named:
-            error = (f"the liquidated strategies are now {', '.join(named) or 'none'}; confirm that list"
-                     if named else "nothing is liquidated now; use Reset book")
-            return RedirectResponse(f"/setup?{urlencode({'reset_error': error})}", status_code=303)
-        for name in named:
-            st().event(name, "info", LIQUIDATION_RESET, f"Reset after liquidation by the PM in a book reset (book "
-                       f"reset): {reason}")
-            st().decide(actor, "reset after liquidation", f"Book reset, liquidation confirmed: {reason}", name)
-        for s in _book_to_reset():
-            st().request_reset(s.name, reason, actor=actor, book=True)
-        return RedirectResponse(f"/setup?{urlencode({'reset': '1'})}", status_code=303)
-
-    def _book_to_reset() -> list:
-        """The strategies a book reset covers: not archived, not a backtest, none already resetting, and no two-leg
-        Strategy, as a reset isn't built for one yet (CR F283-1: one leg's run put away alone)."""
-        gone = set(st().archived())
-        two_leg = {n for s in st().sleeves() if s.parent is not None for n in (s.name, s.parent)}
-        return [s for s in st().sleeves() if s.name not in gone and s.name not in two_leg
-                and not st().pending_reset(s.name)]
 
     def _retired(account: str) -> bool:
         return any(a["name"] == account and a["retired_at"] for a in st().accounts())
@@ -1636,6 +1584,14 @@ def create_app(store: Store | None = None) -> FastAPI:
         return page(request, "orders.html", orders=rows, tab=tab, tabs=tabs, sleeve=sleeve, sleeves=names,
                     backtest=backtest)
 
+    @app.get("/fills", response_class=HTMLResponse)
+    def fills_page(request: Request, _: str = Depends(require_pm)):
+        """A8: each paper fill against the model's price, and per Strategy what paper execution costs next to what the
+        backtest assumes (fills_model)."""
+        from sleeve_fund.dashboard import fills_model
+
+        return page(request, "fills.html", r=fills_model.view(st(), utcnow()))
+
     @app.get("/accounts")
     def accounts_page(request: Request, _: str = Depends(require_pm)):
         return _moved(request, "/setup", "#accounts")
@@ -1786,7 +1742,6 @@ def create_app(store: Store | None = None) -> FastAPI:
                     error=error, pre=dict(request.query_params), shell=frame,
                     steps=setup_view.path(here), stage_n=here, next_words=setup_view.NEXT[here], mirror=mirror,
                     paper_count=sum(1 for x in sleeves if x.name not in st().archived()),
-                    resettable=[x.name for x in sleeves if x.name not in st().archived()],
                     alerts_out=setup_view.outside_alerts(st()), backup=setup_view.backup_state(frame["now"]))
 
     return app

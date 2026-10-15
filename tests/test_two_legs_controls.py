@@ -132,13 +132,15 @@ def test_f283_1_a_reset_is_refused_on_either_legs_row_in_the_store_itself(tmp_pa
     assert store.pending_reset("carry") is None and store.pending_reset("carry~2") is None
 
 
-def test_f283_1_a_book_reset_leaves_a_two_leg_strategy_out_and_resets_the_rest(client):
+def test_f283_1_no_book_reset_route_is_left_to_reset_one_leg_of_a_two_leg_strategy(client):
+    """TEC-FE-REFRESH (HoE, 15 Oct): Setup's Reset all, which left a two-leg Strategy out, is gone (Drop 3a); the store
+    refuses either leg's reset (above). A post to the old route resets nothing."""
     c, store = client
     store.create_sleeve(name="solo", strategy="trend_filter", instrument="BTC/USD", bar_spec="1-HOUR-LAST-INTERNAL",
                         starting_balance=1000)
     r = c.post("/book/reset", data={"reason": "testing"}, auth=AUTH, headers=SAME, follow_redirects=False)
-    assert r.status_code == 303 and "reset_error" not in r.headers["location"]
-    assert store.pending_reset("solo") is not None
+    assert r.status_code in (404, 405)
+    assert store.pending_reset("solo") is None
     assert store.pending_reset("carry") is None and store.pending_reset("carry~2") is None
 
 

@@ -1577,6 +1577,26 @@ def _reset_steps(client, store, monkeypatch, path):
     return sup, r
 
 
+def _book_reset_steps(store, monkeypatch):
+    """The book reset as the old Setup refresh asked it (TEC-FE-REFRESH, HoE 15 Oct): its route is gone (Drop 3a), so
+    the pin drives Store.request_reset(book=True) on every Strategy on the book, as /book/reset did, with no
+    expectation changed."""
+    from sleeve_fund.dashboard.trading import liquidated_since_reset
+    from sleeve_fund.store import is_backtest
+
+    sup = _supervisor(store, monkeypatch)
+    sup.step()
+    gone = set(store.archived())
+    book = [s.name for s in store.sleeves()
+            if s.name not in gone and not is_backtest(s.name) and not store.pending_reset(s.name)]
+    if not any(liquidated_since_reset(store, n) for n in book):  # as the route: nothing until the PM confirms (U27)
+        for name in book:
+            store.request_reset(name, "QA: reset it", actor="pm", book=True)
+    for _ in range(3):
+        sup.step()
+    return sup
+
+
 @pytest.mark.parametrize("reason_name", [pytest.param("drawdown_halt", id="per-strategy-reset-drawdown_halt"),
                                          pytest.param("daily_pause", id="per-strategy-reset-daily_pause"),
                                          pytest.param("portfolio_halt", id="per-strategy-reset-portfolio_halt",
@@ -1609,19 +1629,19 @@ def test_a_book_reset_clears_the_daily_pause_and_the_portfolio_halt_but_not_a_li
     A liquidated strategy's incident stays open (unacknowledged) through it until the PM acknowledges it (RAL)."""
     if reason_name == "portfolio_halt":
         verdict = _portfolio_halted(store)
-        _reset_steps(client, store, monkeypatch, "/book/reset")
+        _book_reset_steps(store, monkeypatch)
         assert not verdict().halt, "the book reset did not clear the portfolio drawdown halt"
         return
     if reason_name == "liquidation":
         _session_one(tmp_path, store, monkeypatch, "liquidation")
         inc = _events(store, ("incident",))
         assert inc, "not built: the liquidation incident (RAL), so there is nothing to keep open"
-        _reset_steps(client, store, monkeypatch, "/book/reset")
+        _book_reset_steps(store, monkeypatch)
         open_ = [a for a in store.alerts(limit=10_000) if a["kind"] == "incident" and a["sleeve"] == NAME]
         assert open_, "the book reset closed (or put away) the liquidation incident"
         return
     _session_one(tmp_path, store, monkeypatch, reason_name)
-    _reset_steps(client, store, monkeypatch, "/book/reset")
+    _book_reset_steps(store, monkeypatch)
     assert store.sleeve(NAME).status != "paused", (store.sleeve(NAME).status, store.sleeve(NAME).status_reason)
     t2 = _session_two(tmp_path, store, monkeypatch, reason_name)
     assert _opened(store, t2), "nothing opened after the book reset"

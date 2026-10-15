@@ -12,9 +12,9 @@ ASSUMED INTERFACES (adapt the names, never the assertions), with test_ral_xfails
 (whose helpers and fixtures this file imports: copy all three into tests/):
 - Per-strategy Reset: Store.request_reset(name, reason, actor) and POST /sleeves/{name}/reset, as on 3be572a. Refused
   while liquidated: ValueError at the call, and command_error from the dashboard, naming "reset after liquidation".
-- Whole-book clean slate: POST /book/reset (the setup page's "Reset all"). While any strategy is liquidated it resets
-  nothing and sends the PM to the named list (its redirect, or the page it leads to, names each liquidated strategy).
-  POST /book/reset/confirm, with the reason and one "liquidated" field per strategy on that list, carries it out.
+- Whole-book clean slate: was POST /book/reset (the setup page's "Reset all") and POST /book/reset/confirm on the
+  named list of liquidated strategies. Both are gone (Drop 3a, TEC-FE-REFRESH): the pins drive the store as the
+  confirmation did (_confirmed_book_reset).
 - The liquidation_reset a book reset writes is the kind test_ral_xfails.LIQUIDATION_RESET, naming the PM and "book
   reset". A reset puts the run so far away (Store.split_run), so it is looked for under the strategy's name and its
   runs' names ("<name>--<time>").
@@ -23,8 +23,6 @@ ASSUMED INTERFACES (adapt the names, never the assertions), with test_ral_xfails
   book reset closes it"): Store.incident_is_open(incident_id) -> bool. The PM acknowledges it as any alert,
   Store.ack(incident_id, "PM").
 """
-
-from urllib.parse import unquote
 
 import pytest
 
@@ -59,17 +57,18 @@ def _book(store, tmp_path):
 
 
 def _confirmed_book_reset(store, client, monkeypatch):
-    """The PM's whole-book clean slate: Reset all (which holds back and lists the liquidated strategy), then the
-    confirmation of that named list, carried out by the supervisor. Returns the redirect of the first post."""
+    """The PM's whole-book clean slate once the PM confirmed the named list of liquidated strategies, carried out by the
+    supervisor. TEC-FE-REFRESH (HoE, 15 Oct): the Setup refresh and its routes are gone (Drop 3a), so this drives the
+    store as POST /book/reset/confirm did: one liquidation_reset for each liquidated strategy (the PM's, "book reset"),
+    then Store.request_reset(book=True) for every strategy on the book. The incident pins on it are unchanged."""
     sup = _supervised(store, monkeypatch)
-    assert any(getattr(r, "path", None) == CONFIRM for r in client.app.routes), (
-        f"not built: POST {CONFIRM} (the PM confirms the named list of liquidated strategies)")
-    first = _form(client, "/book/reset", {"reason": WHY_RESET})
-    r = _form(client, CONFIRM, {"reason": WHY_RESET, "liquidated": [NAME]})
-    assert r.status_code == 303 and "error" not in r.headers["location"], r.headers["location"]
+    store.event(NAME, "info", LIQUIDATION_RESET, f"Reset after liquidation by the PM in a book reset (book reset): "
+                f"{WHY_RESET}")
+    store.decide("pm", "reset after liquidation", f"Book reset, liquidation confirmed: {WHY_RESET}", NAME)
+    for name in (NAME, OTHER):
+        store.request_reset(name, WHY_RESET, actor="pm", book=True)
     for _ in range(3):
         sup.step()
-    return first
 
 
 # --- (1) an ordinary per-strategy Reset is refused while liquidated [U27] -----------------------------------------
@@ -95,32 +94,17 @@ def test_an_ordinary_reset_is_refused_while_liquidated_naming_reset_after_liquid
 
 # --- (2) a whole-book clean slate clears it only after the PM confirms the named list [U27] -----------------------
 
-def test_a_book_reset_clears_a_liquidated_strategy_only_after_the_pm_confirms_the_named_list(store, tmp_path, client,
-                                                                                             monkeypatch):
-    """[U27] "A whole-book clean slate may clear it only after the PM confirms the named list of liquidated
-    strategies; it writes one liquidation_reset per strategy (author PM, note "book reset")": Reset all on its own
-    resets nothing while a strategy is liquidated and names it for the PM; once the PM confirms that list, the book
-    is reset, the liquidated strategy's halt is cleared and exactly one liquidation_reset is written for it (naming
-    the PM and "book reset"), none for the ordinary strategy. Fails "not built" while there is no confirmation route."""
+def test_no_book_reset_route_is_left_to_clear_a_liquidated_strategy(store, tmp_path, client):
+    """[U27] was pinned here on Setup's Reset all and its confirmation of the named list. TEC-FE-REFRESH (HoE, 15 Oct):
+    that refresh is gone (Drop 3a); the PM's clean slate is reset_book, which puts every Strategy away. So neither old
+    route exists, a post to either resets nothing, writes no liquidation_reset, and the strategy stays halted."""
     _book(store, tmp_path)
-    sup = _supervised(store, monkeypatch)
-    assert any(getattr(r, "path", None) == CONFIRM for r in client.app.routes), (
-        f"not built: POST {CONFIRM} (the PM confirms the named list of liquidated strategies)")
-    r = _form(client, "/book/reset", {"reason": WHY_RESET})
-    assert r.status_code == 303, r.status_code
-    shown = unquote(r.headers["location"]) + client.get(r.headers["location"], auth=AUTH).text
-    assert NAME in shown, r.headers["location"]  # the named list
-    assert store.pending_reset(NAME) is None and store.pending_reset(OTHER) is None  # nothing reset yet
+    paths = {getattr(r, "path", None) for r in client.app.routes}
+    assert "/book/reset" not in paths and CONFIRM not in paths
+    for path, data in (("/book/reset", {"reason": WHY_RESET}), (CONFIRM, {"reason": WHY_RESET, "liquidated": [NAME]})):
+        assert _form(client, path, data).status_code in (404, 405), path
+    assert store.pending_reset(NAME) is None and store.pending_reset(OTHER) is None
     assert not _resets(store, NAME) and store.sleeve(NAME).status == "halted"
-    r = _form(client, CONFIRM, {"reason": WHY_RESET, "liquidated": [NAME]})
-    assert r.status_code == 303 and "error" not in r.headers["location"], r.headers["location"]
-    for _ in range(3):
-        sup.step()
-    got = _resets(store, NAME)
-    assert len(got) == 1, [(e["sleeve"], e["message"]) for e in got]
-    assert "PM" in got[0]["message"] and "book reset" in got[0]["message"].lower(), got[0]["message"]
-    assert not _resets(store, OTHER)
-    assert store.sleeve(NAME).status != "halted", (store.sleeve(NAME).status, store.sleeve(NAME).status_reason)
 
 
 # --- (3) the book reset leaves the liquidation incident open until the note [U27] ---------------------------------
