@@ -657,7 +657,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                     contribution=None if bt_id else _contribution(st(), multi["kpi"] if multi else x),
                     fund_halt=None if bt_id else compliance.fund_halt(st()),
                     bars=[] if bt_id else compliance.strategy_bars(
-                        st(), s.instrument.split("/")[0], _risk_to_stop(x, position), s.params.get("risk_per_trade")))
+                        st(), s.instrument.split("/")[0], _risk_to_stop(x, position, st(), s), s.params.get("risk_per_trade")))
 
     def _two_legs(s, x: dict, frame) -> dict | None:
         """A two-leg Strategy's part of its page (P2-8 step 7): on its first leg, the Strategy folded (legs.fold_one)
@@ -2737,13 +2737,14 @@ def _order_rules(s, x: dict) -> dict:
     return {"risk_pct": float(rpt) * 100 if rpt else None, "leverage": lev, "stop": stop}
 
 
-def _risk_to_stop(x: dict, position: dict | None) -> float | None:
-    """The open position's loss if its stop is hit, at the last mark (open_risk.position_risk, the gate's formula);
-    0 when flat, None with no stop to measure from."""
+def _risk_to_stop(x: dict, position: dict | None, store, sleeve) -> float | None:
+    """The open position's loss if its stop is hit, at the last mark, with the exit's taker fee (open_risk.position_risk,
+    the gate's formula); 0 when flat, None with no stop to measure from or no fee rate."""
     if not position or not x.get("qty"):
         return 0.0
     try:
-        return float(open_risk.position_risk(x["qty"], x["price"], position.get("stop_px")))
+        return float(open_risk.position_risk(x["qty"], x["price"], position.get("stop_px"),
+                                             taker=open_risk.taker_of(store, sleeve)))
     except ValueError:
         return None
 

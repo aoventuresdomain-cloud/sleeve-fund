@@ -1762,16 +1762,18 @@ class LongFlatStrategy(Strategy):
         alerts (QA P1-S9). A two-leg Strategy's first leg adds what its entry opens on the second leg, in full: no
         hedge credit (Advisor M6); a backtest judges it against both legs' equity summed."""
         stop = close * (1 - side * self._stop_frac) if self._stop_frac else None
+        taker = self._cfg.assumed_taker_fee  # the loss at the stop counts the exit's taker fee (FEE-LIVE (5))
         pair = getattr(self, "pair", None)
         follow = pair.follower_entry(Decimal(repr(qty)), close) if pair is not None and pair.lead is self else None
         if self._backtest:
             day = (ts_ns - 1) // DAY_NS * DAY_NS
             atr = self._daily_atr.get(day)
             try:
-                risk = (open_risk.position_risk(side * qty, close, stop, atr)
-                        + open_risk.position_risk(held_qty, close, held_stop, atr))
+                risk = (open_risk.position_risk(side * qty, close, stop, atr, taker=taker)
+                        + open_risk.position_risk(held_qty, close, held_stop, atr, taker=taker))
                 if follow is not None:
-                    risk += open_risk.position_risk(*follow, pair.follow._daily_atr.get(day))
+                    risk += open_risk.position_risk(*follow, pair.follow._daily_atr.get(day),
+                                                    taker=pair.follow._cfg.assumed_taker_fee)
                     equity += pair.other_book(self, close)[0]
             except ValueError:
                 return None
@@ -1796,11 +1798,13 @@ class LongFlatStrategy(Strategy):
                 through.append(name)
             needs_atr = stop is None or (held_qty and (held_stop is None or name in through))
             mine_atr = atr(store.sleeve(name)) if needs_atr else None
-            mine = (open_risk.position_risk(side * qty, close, stop, mine_atr)
-                    + open_risk.position_risk(held_qty, close, None if name in through else held_stop, mine_atr))
+            mine = (open_risk.position_risk(side * qty, close, stop, mine_atr, taker=taker)
+                    + open_risk.position_risk(held_qty, close, None if name in through else held_stop, mine_atr,
+                                              taker=taker))
             if follow is not None:  # the second leg's row is in the book and its held risk in `others` already
                 leg = pair.follow.runtime.name
-                mine += open_risk.position_risk(*follow, atr(store.sleeve(leg)) if follow[2] is None else None)
+                mine += open_risk.position_risk(*follow, atr(store.sleeve(leg)) if follow[2] is None else None,
+                                                taker=pair.follow._cfg.assumed_taker_fee)
         except ValueError as exc:
             return f"its open risk can't be measured: {exc}"
         if through:
@@ -3651,7 +3655,8 @@ class LongFlatStrategy(Strategy):
                   "instrument": self._base_code(), "opens": self._position_qty() < self._min_qty(),
                   "leverage": LongFlatStrategy._max_leverage(self)
                   if self._margin else None,
-                  "atr_pct": None if self._stop_frac else self._entry_atr_pct()}
+                  "atr_pct": None if self._stop_frac else self._entry_atr_pct(),
+                  "taker": Decimal(repr(float(self._cfg.assumed_taker_fee)))}  # the exit's fee at the stop (FEE-LIVE)
         return signal, intent
 
     def _resting_entry_terms(self):
@@ -3722,7 +3727,8 @@ class LongFlatStrategy(Strategy):
                 if self._entry_px and self._stop_frac is not None else None)
         lev = LongFlatStrategy._max_leverage(self) if self._margin else None
         pos = Position(name, underlying(self._base_code()), Decimal(repr(float(qty))),
-                       None if stop is None else Decimal(repr(float(stop))), lev)
+                       None if stop is None else Decimal(repr(float(stop))), lev,
+                       Decimal(repr(float(self._cfg.assumed_taker_fee))))
         return Decimal(repr(float(equity))), holding_for(pos, Decimal(repr(float(close))), atr_pct)
 
     def portfolio_halt(self, reason: str) -> None:
