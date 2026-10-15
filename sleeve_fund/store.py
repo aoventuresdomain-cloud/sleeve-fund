@@ -4301,6 +4301,13 @@ class Store:
             fees = c.execute(select(fills_t.c.fee).where(fills_t.c.sleeve == sleeve)).scalars().all()
         return sum((to_decimal(f, "fee") for f in fees), Decimal(0))
 
+    def positions_by_asset(self) -> dict[tuple[str, str], Decimal]:
+        """{(Strategy, asset): net quantity} as the orders record what filled, every journal row but saved backtests'
+        (NIGHTLY-RECON's stored side, reconcile.stored_positions; reconcile.rebuild_positions is the fills' side)."""
+        from sleeve_fund import reconcile
+
+        return reconcile.stored_positions(self)
+
     def asset_mismatches(self, limit: int = 50) -> list[dict]:
         """Reconcile by (Strategy, asset): journal rows whose instrument is not their row's (an orders, fills, funding
         or insurance row written with another asset, or left '' because its Strategy row was gone). Empty when every
