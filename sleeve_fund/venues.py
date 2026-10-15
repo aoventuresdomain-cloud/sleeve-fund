@@ -95,6 +95,11 @@ class VenueProfile:
     # to it, so a daily candle closes there. 00:00 UTC on every venue so far (Independent Quant Advisor, 5 Oct); the
     # history store's resample assumes it, so a venue set otherwise can't warm slower candles from the store.
     daily_anchor_minutes: int = 0
+    # VS-1 (A12; Advisor 15 Oct): pair -> the venue's published maintenance tiers (margin.Tier: notional ceiling, rate,
+    # maintenance amount), and where and when they were read. A perp on a pair with no table is refused, never
+    # liquidated at an assumed rate (markets.maintenance_for). Kept from the venue by DA-11 before G2.
+    maintenance_tiers: dict[str, tuple] = field(default_factory=dict)
+    maintenance_basis: str | None = None
 
     @property
     def venue(self) -> Venue:

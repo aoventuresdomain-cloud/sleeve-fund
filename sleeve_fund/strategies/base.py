@@ -489,7 +489,7 @@ class LongFlatConfig(StrategyConfig):
         # a liquidation price and leverage limits (sleeve_fund.markets); allow_short lets it go short.
         self.market = market
         self.allow_short = bool(allow_short)
-        self.perp = markets.terms({"market": market}, str(instrument_id.venue))
+        self.perp = markets.terms({"market": market}, str(instrument_id.venue), str(instrument_id.symbol))
         # Read by the demo mirror (sleeve_fund.mirror), not by the strategy: paper is unchanged.
         self.demo_mirror = bool(demo_mirror)
         # C8 (Drop B): keep a take-profit even when a hit would not cover the round trip's costs (the entry's check
@@ -4093,9 +4093,8 @@ class LongFlatStrategy(Strategy):
         liq = self._liq(cash, qty)
         if liq is None or not qty or self._liq_px is None or not self._liq_funded or self._cfg.perp is None:
             return liq
-        denom = self._cfg.perp.maintenance_margin * abs(qty) - qty
-        moved = liq + self._liq_funded / denom if denom else liq
-        return moved if moved > 0 else None
+        # Solved afresh at the funded cash, never shifted at the tier it was at (VS-1, Advisor (b)(2))
+        return markets.shifted_liquidation(liq, qty, self._liq_funded, self._cfg.perp.maintenance_margin)
 
     def _capped_stop(self, frac: float | None) -> tuple[float | None, float | None]:
         """The stop a margin position may hold for `frac` (a share of the entry, as _stop_frac), and the liquidation
