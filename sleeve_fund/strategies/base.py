@@ -54,6 +54,10 @@ LOCKING_INTENTS = (*EXIT_LEGS, "liquidation", "liquidation_cut")
 # The resting stops a backtest keeps: the model's own, and the risk guard's (_rest_risk_stop).
 STOP_INTENTS = ("stop_loss", "risk_halt", "risk_pause", "liquidation_cut", "liquidation")
 MINUTE_NS = 60_000_000_000
+# GAP-DOWN (F-GD-DEADLINE): the longest a restart replay waits for a stop's trigger minute of trades, every page of it
+# together. It runs on the first trade after the restart, ahead of every stop and tick behind it, so past this the
+# minute's extreme books the stop instead.
+TRADES_DEADLINE = 5.0
 DAY_NS = 86_400_000_000_000
 SAFETY_STOP_SHARE = 0.5  # of the way from the mark to the liquidation price (_safety_stop_on_restore)
 # The status reason the supervisor gives a refused start that still holds a position: it runs for its exits only
@@ -2596,6 +2600,21 @@ class LongFlatStrategy(Strategy):
                 else:
                     px, source = worse(px, worst), "extreme"
                     pessimistic = "; outage fill: pessimistic (no trade data for that minute: its worst price)"
+                    liq_px = venue.get("liquidation")
+                    if liq_px is not None and side * (px - liq_px) <= 0:
+                        # Advisor 15 Oct ~02:45 UK (GAP-DOWN (c) vs NA-3, option B): the minute's extreme says how far
+                        # the price went, not how far the stop's fill did, and a stop inside half the distance
+                        # triggers first; so no liquidation is inferred: the stop books one tick short of the
+                        # liquidation price, said, and the alert names the loss. The rest of the way to the extreme
+                        # is not charged.
+                        tick = self.instrument.price_increment.as_double() if self.instrument is not None else 0.0
+                        px = liq_px + side * (tick or liq_px * 1e-6)
+                        loss = side * (entry - px) * abs(qty) if qty else None
+                        pessimistic = (f"; outage fill: pessimistic, capped at liquidation (no trade data for that "
+                                       f"minute: its worst price {worst:,.6g} is at or past the {liq_px:,.2f} "
+                                       "liquidation price, which the stop triggers before)"
+                                       + (f"; inferred loss about {loss:,.2f}" if loss is not None else ""))
+                        source = "extreme_capped"
         now = self._price()
         words = {"stop_loss": "stop", "take_profit": "target", "liquidation": "liquidation price",
                  "liquidation_cut": "cut before liquidation", "risk_halt": "drawdown halt's level",
@@ -2644,9 +2663,25 @@ class LongFlatStrategy(Strategy):
         stop level, or None when there are none, the venue serves none or the request fails (said)."""
         if self.trade_loader is None:
             return None
-        try:
-            trades = self.trade_loader(close_ns - MINUTE_NS, close_ns)
-        except Exception as exc:  # noqa: BLE001 - the minute's extreme books it instead, labelled
+        import threading
+
+        got: dict = {}
+
+        def load():
+            try:
+                got["trades"] = self.trade_loader(close_ns - MINUTE_NS, close_ns)
+            except Exception as exc:  # noqa: BLE001 - said below
+                got["error"] = exc
+
+        # The fetch runs beside the replay, which waits for it TRADES_DEADLINE at most, however slow the venue is
+        # (F-GD-DEADLINE); a fetch still going is left to finish on its own and read by nobody.
+        reader = threading.Thread(target=load, name="gap-down-trades", daemon=True)
+        reader.start()
+        reader.join(TRADES_DEADLINE)
+        outcome = {"error": f"no answer within {TRADES_DEADLINE:g} s"} if reader.is_alive() else dict(got)
+        trades = outcome.get("trades")
+        if trades is None:
+            exc = outcome.get("error", "no answer")
             if self.runtime is not None:
                 self.runtime.store.event(self.runtime.name, "warning", "outage_trades_unavailable",
                                          f"Couldn't read the trades of the minute to {_hhmm(close_ns)}: {exc}; the "

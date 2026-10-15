@@ -27,6 +27,7 @@ and is flat otherwise, so every order is placed by design and only the stop, the
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
@@ -491,7 +492,7 @@ def gapdown_extreme(p, close_minute: int, level: float, side: int) -> float:
     """TEC-GAPDOWN (Advisor GAP-DOWN (c), HoE 02:34 UK): a stop touched inside the minute closing at close_minute,
     with no trade data for it, is booked at the worse of its level less TP_SLIP and that minute's adverse extreme (its
     low for a long, high for a short), derived here from the cell's own prices: seconds [(k-1)*60, k*60)."""
-    sec = p[(close_minute - 1) * 60:close_minute * 60]
+    sec = np.round(p[(close_minute - 1) * 60:close_minute * 60], 1)  # as the ticks trade it (F-GD-TICK)
     return min(tp_model(level, side), float(sec.min())) if side > 0 else max(tp_model(level, side), float(sec.max()))
 
 
@@ -1257,11 +1258,46 @@ def test_l8_na3_a_missed_minute_opening_beyond_liquidation_liquidates(path, labe
 @pytest.mark.parametrize("label, perp, profile, side", LIQ_SETUPS, ids=LIQ_IDS)
 @pytest.mark.parametrize("path", LIQ_PATHS)
 def test_na3_a_minute_opening_short_of_liquidation_takes_the_reachable_stop_first(path, label, perp, profile, side):
-    """Already true on ebe39c5 (the stop is checked, liquidation isn't): pinned. The minute opens flat and wicks
-    beyond liquidation; the 10 % stop is reached first."""
+    """The minute opens flat and wicks beyond liquidation; the 10 % stop is reached first. TEC-GAPDOWN, Advisor ~02:45
+    UK (GAP-DOWN (c) vs NA-3, option B): with no trade data for the minute (explicit), the stop books at the worse of
+    its level less the floor and the minute's extreme, capped one tick short of the liquidation price: the extreme
+    is past it, so the cap books it. No liquidation, no drawdown halt; the one alert says so and names the loss."""
     p = shape(flat_prices(30), 7.25, 7.5, adverse(side, LIQ_DEPTH[profile]))
-    run = _outage(path, p, side=side, perp=perp, profile=profile, stop=0.10, qty=0.25)
-    assert first_exit(run.sequence())[0] == "stop_loss", run.sequence()
+    run = _outage(path, p, side=side, perp=perp, profile=profile, stop=0.10, qty=0.25, trades=NO_TRADES)
+    ex = first_exit(run.sequence())
+    assert ex[0] == "stop_loss", run.sequence()
+    (alert,) = run.kinds("outage_exit")
+    assert alert["level"] == "warning" and "outage fill: pessimistic, capped at liquidation" in alert["message"]
+    # The liquidation price now (_liq_now: the entry's, less the fees taken from the isolated margin), as the alert
+    # states it; cross-checked against the entry's own where the journal carries it.
+    liq = float(re.search(r"past the ([\d,]+\.\d\d) liquidation price", alert["message"]).group(1).replace(",", ""))
+    (entry,) = filled_orders(run, "entry")
+    if entry["signal"].get("liquidation_px"):
+        assert abs(liq / float(entry["signal"]["liquidation_px"]) - 1) < 0.001
+    extreme = np.round(p[7 * 60:8 * 60], 1)
+    assert side * (float(extreme.min() if side > 0 else extreme.max()) - liq) <= 0  # at or past it: branch "capped"
+    assert ex[3] == pytest.approx(liq + side * 0.1, abs=0.006), (ex, liq)  # one tick short of it, never at or past
+    (o,) = filled_orders(run, "stop_loss")
+    assert o["signal"].get("fill_source") == "extreme_capped", o["signal"]
+    assert "inferred loss about " in alert["message"]
+    # No liquidation: no liquidation fill, halt or incident. The loss booked is past the profile's drawdown limit,
+    # so the drawdown halt acts on it as on any loss.
+    assert not [x for x in run.sequence() if x[0] == "liquidation"]
+    assert not [e for e in run.events if "liquidat" in e["kind"] or (e["kind"] == "risk_halt"
+                                                                     and "liquidat" in e["message"].lower())]
+    assert all(e["message"].startswith("drawdown ") for e in run.kinds("risk_halt"))
+
+
+@pytest.mark.parametrize("label, perp, profile, side", LIQ_SETUPS, ids=LIQ_IDS)
+@pytest.mark.parametrize("path", LIQ_PATHS)
+def test_na3_a_minute_opening_past_liquidation_with_no_trade_data_is_still_a_liquidation(path, label, perp, profile,
+                                                                                        side):
+    """Advisor ~02:45 UK: the cap is for a touch inside the minute only; a minute that OPENS at or past the
+    liquidation price is a liquidation (NA-3 order, GAP-LIQ-CAP at bankruptcy), trade data or none."""
+    p = shape(flat_prices(30), 7.0, 8.0, adverse(side, LIQ_DEPTH[profile]))
+    run = _outage(path, p, side=side, perp=perp, profile=profile, stop=0.10, qty=0.25, trades=NO_TRADES)
+    assert first_exit(run.sequence())[0] == "liquidation", run.sequence()
+    assert not filled_orders(run, "stop_loss")
 
 
 # PE2 (stop-safety, master 02845fb6): passes (mark removed)

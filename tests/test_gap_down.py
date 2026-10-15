@@ -162,3 +162,41 @@ def test_gap_down_binance_trades_reads_the_minute_in_order_and_pages_on_by_id():
     assert "startTime=0" in asked[0] and "endTime=60999" in asked[0] and "fromId=1000" in asked[1]
     with pytest.raises(ValueError, match="Binance: bad"):
         binance_trades("BTC/USDT", 0, 1, get_json=lambda url: {"code": -1, "msg": "bad"})
+
+
+def test_gap_down_a_slow_venue_never_holds_the_replay_past_the_deadline(monkeypatch):
+    """F-GD-DEADLINE (HoE 02:59 UK, MUST): the replay runs on the first trade after a restart, ahead of every stop and
+    tick behind it, so it waits for the trigger minute's trades TRADES_DEADLINE at most, every page together; past
+    that the minute's extreme books the stop, said, and a late answer is never read."""
+    import threading
+    import time
+
+    from sleeve_fund.strategies import base
+
+    monkeypatch.setattr(base, "TRADES_DEADLINE", 0.3, raising=False)
+    release = threading.Event()
+    s, bar, events, sold, opened = _late_strategy()
+    _booked(s, sold)
+    s._entry_px, s._entry_side, s._stop_frac, s._tp_frac = 100.0, 1, 0.02, 0.05
+    s._last_alive = s._last_seen = datetime.fromtimestamp(NS / 1e9, tz=timezone.utc)
+    s.runtime.store.fills = lambda name, limit: [{"ts": datetime.fromtimestamp((NS - 600e9) / 1e9, tz=timezone.utc)}]
+    s._mark = lambda: (1e4, 1e4, 0.0, 101.0)
+    s.history_loader = lambda instrument, bar_type, n: _minutes((100.5, 99.5), (100.2, 97.0))
+
+    def slow(start_ns, end_ns):  # a venue that answers long after the deadline, with a trade far better than the low
+        release.wait(3)
+        return [(_at(2, 10), 97.9)]
+
+    s.instrument = None
+    s.attach_trade_loader(slow)
+    began = time.monotonic()
+    try:
+        assert s._check_outage_exits() is True
+        took = time.monotonic() - began
+    finally:
+        release.set()
+    (intent, reason, book), = sold
+    assert took < 0.3 + 0.5, took
+    assert intent == "stop_loss" and book["fill_source"] == "extreme" and book["book_px"] == pytest.approx(97.0)
+    assert "outage fill: pessimistic" in reason
+    assert any(e[2] == "outage_trades_unavailable" and "no answer within 0.3 s" in e[3] for e in events), events
