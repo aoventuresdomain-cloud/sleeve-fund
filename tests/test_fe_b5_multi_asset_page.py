@@ -143,3 +143,22 @@ def test_the_book_kill_switch_flattens_every_open_leg_of_a_multi_asset_strategy(
     told = {n for n in [s.name for s in db.sleeves()] if any(c["command"] == "flatten"
                                                             for c in db.pending_commands(n))}
     assert {a["sleeve"] for a in db.strategy_assets("m")} <= told
+
+
+def test_a_flatten_while_a_reset_is_pending_holds_every_leg(held):
+    """F-B5-1 (CR): a flatten pressed while a reset is under way is kept as each leg's pause on its fresh run, one hold
+    per leg (Store._hold_on_reset per leg). A multi-asset reset is refused today (request_reset), so the pending rows are
+    written directly: the pin is on the fan-out's hold, should a reset of every leg be built."""
+    from sqlalchemy import insert, select
+
+    from sleeve_fund.store import reset_holds_t, resets_t, utcnow
+
+    db, _client = held
+    legs = [a["sleeve"] for a in db.strategy_assets("m")]
+    with db.engine.begin() as c:
+        ids = {n: c.execute(insert(resets_t).values(sleeve=n, reason="drill", actor="pm", created_at=utcnow(),
+                                                    restart=1, run="")).inserted_primary_key[0] for n in legs}
+    db.command("m", "flatten", "done for today")
+    with db.engine.connect() as c:
+        holds = {r.reset_id: r.status for r in c.execute(select(reset_holds_t))}
+    assert holds == {ids[n]: "paused" for n in legs}
