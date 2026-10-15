@@ -12,7 +12,7 @@ import pytest
 from nautilus_trader.indicators import ExponentialMovingAverage
 from nautilus_trader.model import BarType
 
-from sleeve_fund.strategies.indicators import BLOCKS, Atr, Ema, Keltner, Rsi, RsiDivergence, Sma
+from sleeve_fund.strategies.indicators import BLOCKS, Atr, Ema, Keltner, Rsi, RsiDivergence, Sma, make_block
 from sleeve_fund.strategies.indicators import seeding
 
 MIN = 60_000_000_000
@@ -116,7 +116,7 @@ def test_an_atr_seeded_differently_moves_the_stop_by_no_more_than_its_tolerance(
 
 def test_every_block_is_classified_and_composites_are_checked_on_their_recursive_parts():
     for kind, cls in BLOCKS.items():
-        block = cls()
+        block = make_block(kind)
         assert seeding.uncovered(block) == [], kind
         assert (cls in seeding.TOLERANCE) or isinstance(block, seeding.WINDOW) or seeding.leaves(block), kind
     assert [seeding.name(x) for x in seeding.leaves(Keltner(20, 10))] == ["EMA(20)", "ATR(10)"]
@@ -182,7 +182,7 @@ def test_a_strategy_the_extension_settles_is_fed_the_nearer_agreeing_seed():
     s, events, bars, _ = _rsi_bands(candles)
     s._warm_from_history()
     assert s._seed_hold is None and s._decision_bars == 280
-    assert s.rsi.value == pytest.approx(seeding._seeded(Rsi(14), candles[-280:]).value, abs=1e-9)
+    assert s.rsi.value == pytest.approx(seeding._seeded(Rsi(14), candles[-280:]).value, abs=1e-6)  # bars at the pair's price precision
     assert not [e for e in events if e[2] == "seed_unsettled"]
 
 
@@ -191,7 +191,7 @@ def test_a_strategy_still_apart_holds_entries_says_so_once_and_opens_once_the_se
     s, events, bars, _ = _rsi_bands(candles)
     s._warm_from_history()
     (name, level, kind, msg), = [e for e in events if e[2] == "seed_unsettled"]
-    assert level == "error" and msg.startswith("No new entries: RSI(14) seeded 140 and 280 bars back reads RSI(14) ")
+    assert level == "error" and msg.startswith("No new entries: RSI(14) seeded 140 and 280 bars back reads ")
     assert "points apart (tolerance 0.1)" in msg and "Stops, targets and exits still run" in msg
     assert s._entry_held(bars[-1], "long entry") and s._entry_held(bars[-1], "addition")
     assert [e[2] for e in events].count("entry_held") == 1  # said once, not every bar
@@ -201,7 +201,8 @@ def test_a_strategy_still_apart_holds_entries_says_so_once_and_opens_once_the_se
     assert s._entry_held(bars[-1], "long entry")
     for c in live[50:]:
         s._accept(_bar_at(s, c))
-    assert s._seed_hold is None and not s._entry_held(bars[-1], "long entry")
+    assert s._seed_hold is None and "entry_held" not in s._noted  # a later hold is said again
+    assert not s._entry_held(bars[-1], "long entry")
     assert [e[2] for e in events][-1] == "seed_settled"
 
 
@@ -244,10 +245,13 @@ def test_every_hand_coded_model_names_its_recursive_indicators_and_only_dip_buys
     for name in REGISTRY:
         if name == "rules":
             continue
-        s = build(name, instrument, {}, 1)
+        try:
+            s = build(name, instrument, {}, 1)
+        except ValueError:  # a model on daily candles only
+            s = build(name, instrument, {}, 1440)
         units = s.seeding_units()
         found[name] = (sorted(seeding.name(x) for _, u in units for x in seeding.leaves(u)),
-                       sorted(u for _, o in units for u in seeding.uncovered(o)))
+                       sorted(f"{k}: {u}" for k, o in units for u in seeding.uncovered(o)))
     assert found["rsi_bands"] == (["RSI(14)"], [])
     assert found["rsi_pullback"][0] == sorted(["RSI(14)", f"EMA({build('rsi_pullback', instrument, {}, 1).c.ema_period})"])
     assert found["dip_buy"][1] == ["day_ema: _Ema"]

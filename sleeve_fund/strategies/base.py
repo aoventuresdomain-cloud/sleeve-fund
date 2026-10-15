@@ -621,6 +621,11 @@ class LongFlatStrategy(Strategy):
         self._exit_lock = False  # after a stop/target exit, wait for the signal to reset before re-entering
         self._slower: list[SlowerCandles] = []  # slower candles the model reads (slower(), v2 P1-4)
         self._short_history: str | None = None  # why the slower candles' warm-up isn't met yet: no new entries
+        # A10: why the warm-up's two seeds of an indicator disagree (no new entries), the pairs carried on over live
+        # bars until they agree, and the last loaded bar's close (ns), after which a bar is live
+        self._seed_hold: str | None = None
+        self._seed_pairs: dict = {}
+        self._seed_after: int | None = None
         # After a restart: the journal's last entry and the exit after it that locked re-entry, which the warm-up
         # bars since are decided on again to rebuild the model's leg (_plan_resume, _replay); None once done.
         self._resume: dict | None = None
@@ -1236,7 +1241,55 @@ class LongFlatStrategy(Strategy):
                 s.handle_bar(bar, missing)
             self._journal_missed()
         self.update_indicators(bar)
+        if self._seed_pairs and bar.ts_event > self._seed_after:
+            self._feed_seeds(bar)
         return True
+
+    def seeding_units(self) -> list[tuple[str, object]]:
+        """The model's indicators fed on its decision candles, each with the name the warm-up's seed-twice check (A10)
+        reports it by: a lone recursive indicator by its own name (RSI(14)), anything else by the attribute holding
+        it. Indicators fed on slower candles are left to those candles' own warm-up."""
+        from sleeve_fund.strategies.indicators import seeding
+
+        slower = [b for s in self._slower for b in s.blocks]
+        return [(seeding.name(v) if type(v) in seeding.TOLERANCE else k, v) for k, v in vars(self).items()
+                if not k.startswith("_") and seeding._indicator(v) and all(v is not b for b in slower)]
+
+    def _check_seeds(self, bars: list, want: int) -> list:
+        """A10: each recursive indicator seeded twice on the loaded bars (seeding.check). Returns the bars the model is
+        fed: its own warm-up, or more where the check settled only further back. Seeds still apart, or a store too
+        short to tell, hold new entries (_entry_held) until a pair carried on over live bars agrees; said once."""
+        from sleeve_fund.strategies.indicators import seeding
+
+        self._seed_pairs, self._seed_hold = {}, None
+        candles = [(b.open.as_double(), b.high.as_double(), b.low.as_double(), b.close.as_double(),
+                    b.volume.as_double(), b.ts_event) for b in bars]
+        results = [seeding.check(unit, candles, label) for label, unit in self.seeding_units()]
+        held = [r for r in results if not r.settled]
+        if held:
+            self._seed_pairs = {r.label: r.pair for r in held}
+            self._seed_after = bars[-1].ts_event
+            self._seed_hold = "; ".join(r.why() for r in held)
+            msg = (f"No new entries: {self._seed_hold}. Stops, targets and exits still run; entries open once the two "
+                   "seeds agree on a live bar.")
+            self.log.error(msg)
+            if self.runtime is not None:
+                self.runtime.store.event(self.runtime.name, "error", "seed_unsettled", msg)
+        return bars[-max([want] + [r.feed_bars for r in results]):]
+
+    def _feed_seeds(self, bar: Bar) -> None:
+        c = (bar.open.as_double(), bar.high.as_double(), bar.low.as_double(), bar.close.as_double(),
+             bar.volume.as_double(), bar.ts_event)
+        for label, pair in list(self._seed_pairs.items()):
+            if pair.update(c):
+                del self._seed_pairs[label]
+        if self._seed_pairs:
+            return
+        self._seed_hold = None
+        self._noted.discard("entry_held")
+        if self.runtime is not None:
+            self.runtime.store.event(self.runtime.name, "info", "seed_settled",
+                                     "Entries open again: the two seeds of each of its indicators now agree")
 
     def _journal_missed(self) -> None:
         """Each slower candle with no decision candles at all is recorded missing as it is found, never made up
@@ -1903,13 +1956,18 @@ class LongFlatStrategy(Strategy):
     def _warm_from_history(self) -> None:
         """Feed the indicators the latest stored bars, so a model on bars built from live trades
         is ready on its first live bar instead of waiting out its longest look-back."""
+        from sleeve_fund.strategies.indicators import seeding
+
         want = self._cfg.warmup_bars
-        try:
-            bars = self.history_loader(self.instrument, self._cfg.bar_type, want)
+        checked = any(seeding.leaves(unit) for _, unit in self.seeding_units())
+        try:  # the seed check (A10) compares seeds up to seeding.CAP bars back
+            bars = self.history_loader(self.instrument, self._cfg.bar_type, max(want, seeding.CAP) if checked else want)
         except Exception as exc:  # noqa: BLE001 - a missing or stale store must not stop the sleeve
             bars, why = [], str(exc)
         else:
             why = "the history store has none"
+        if checked:
+            bars = self._check_seeds(list(bars), want)
         level = "info" if bars else "warning"
         if bars:
             self.on_historical_bars(bars)
@@ -2340,7 +2398,12 @@ class LongFlatStrategy(Strategy):
     def _entry_held(self, bar: Bar, what: str) -> bool:
         """True when no entry or addition may be decided on this bar: its slower candles' warm-up isn't met yet
         (v2 P1-4), the latest closed slower candle is degraded (over 10% of its minutes missing: Advisor 6 Oct
-        16:40, 4.1), or the decision is late (_late_entry). Exits and reductions are never held."""
+        16:40, 4.1), the warm-up's two seeds of an indicator disagree (A10, _check_seeds), or the decision is late
+        (_late_entry). Exits and reductions are never held."""
+        if self._seed_hold is not None:
+            self._note("entry_held", f"Skipped a {what} on the {_hhmm(bar.ts_event)} candle: {self._seed_hold}. Said "
+                       "once until entries open again")
+            return True
         if self._short_history is not None:
             if any(s.count < s.need for s in self._slower):
                 self._note("entry_held", f"Skipped a {what} on the {_hhmm(bar.ts_event)} candle: "
