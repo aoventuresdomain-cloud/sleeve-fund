@@ -144,9 +144,11 @@ def test_a_copy_unlike_the_journal_fails_and_leaves_no_copy(tmp_path, copy, word
     assert not list((tmp_path / "b").iterdir())
 
 
-@pytest.mark.parametrize("check", ["postgres", "sleeve_fund", "restore_check", "predeploy"])
+@pytest.mark.parametrize("check, journal", [("postgres", "sleeve_fund"), ("sleeve_fund", "sleeve_fund"),
+                                            ("restore_check", "sleeve_fund"), ("predeploy", "sleeve_fund"),
+                                            ("predeploy_x", "predeploy_x")])  # CR nit: never the journal itself
 @needs_bash
-def test_the_scratch_database_is_never_one_it_could_harm(tmp_path, check):
+def test_the_scratch_database_is_never_one_it_could_harm(tmp_path, check, journal):
     """It drops its scratch database on every exit: that name can only be its own (predeploy_*), never the journal's,
     the server's maintenance database or the nightly check's."""
     log = tmp_path / "calls.log"
@@ -154,7 +156,7 @@ def test_the_scratch_database_is_never_one_it_could_harm(tmp_path, check):
     _tools(tmp_path / "bin", log)
     (tmp_path / "b").mkdir()
     env = {**os.environ, "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}", "BACKUP_DIR": str(tmp_path / "b"),
-           "PREDEPLOY_CHECK_DB": check, "BACKUP_DB": "sleeve_fund"}
+           "PREDEPLOY_CHECK_DB": check, "BACKUP_DB": journal}
     done = subprocess.run(["bash", str(SCRIPT)], env=env, capture_output=True, text=True, timeout=30, check=False)
     assert done.returncode == 1 and done.stdout.strip() == "pre-deploy dump: FAIL, not a scratch database name"
     assert log.read_text() == ""  # no tool ran, nothing dropped
