@@ -260,3 +260,16 @@ def test_the_book_the_put_away_line_and_the_capital_agree_to_the_cent(held, clie
     words = " ".join(re.sub(r"<[^>]+>", " ", page).split())
     assert "Book value 10,000.00 Put away, not trading 10,250.37" in words  # = fund_equity; = what left
     assert "with the book, 20,250.37 in all" in page  # = the capital
+
+
+def test_a_strategy_put_away_with_nothing_withdrawn_says_its_pnl_stays_in_the_funds_cash(held, client, monkeypatch):
+    """F-WN-2 (pairs PE2's F-WN-1): under fund-held cash a Strategy put away flat is withdrawn 0, as nothing of its own
+    is in the book; it never reads as its equity leaving the book, but as leaving with nothing to move."""
+    r = client.post("/sleeves/b/archive", data={"action": "archive", "reason": "done with it"}, auth=AUTH,
+                    headers=HDR, follow_redirects=False)
+    assert r.status_code == 303
+    _mark(held, T0 + timedelta(seconds=5))
+    monkeypatch.setattr(type(held), "withdrawn", lambda self: {"b": D(0)})  # as F-WN-1 journals it
+    page = _get(client, "/sleeves/b")
+    assert ("Archived, it left with nothing to move: its P&L stays in the fund's cash, which isn't a loss." in page)
+    assert "its equity left the fund's book" not in page
