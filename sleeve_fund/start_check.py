@@ -116,22 +116,25 @@ def check_keys(environ: dict[str, str], engine: Engine) -> Section:
     return sec
 
 
-def check_exec_target(environ: dict[str, str]) -> Section:
+def check_exec_target(environ: dict[str, str], extra=()) -> Section:
     """Head 3: where the exchange order client would send orders (sleeve_fund.exec_target, the reader its guard shares):
-    off is a note; on, the key type and the host, each mismatch failing, named. Key values are never shown."""
+    off is a note; on, the key type and the host, each mismatch failing, named. Key values are never shown. `extra`:
+    the client's own guard lines, as (status, text), added after these (PE3's EXEC-CLIENT hook)."""
     from sleeve_fund import exec_target
 
     sec = Section("Order client")
     t = exec_target.read(environ)
     if t is None:
         sec.add(NOTE, exec_target.OFF)
-        return sec
-    found = exec_target.problems(t)
-    for p in found:
-        sec.add(FAIL, p)
-    if not found:
-        sec.add(PASS, exec_target.describe(t))
-        sec.add(NOTE, exec_target.SCOPE_UNCHECKED)
+    else:
+        found = exec_target.problems(t)
+        for p in found:
+            sec.add(FAIL, p)
+        if not found:
+            sec.add(PASS, exec_target.describe(t))
+            sec.add(NOTE, exec_target.SCOPE_UNCHECKED)
+    for status, text in extra:
+        sec.add(status, text)
     return sec
 
 

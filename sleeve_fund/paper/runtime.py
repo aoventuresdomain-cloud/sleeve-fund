@@ -67,14 +67,15 @@ LIQUIDATED_WORDS = (fold(WIPED_OUT), "wiped out", "position margin lost")  # a l
 # one, and says what alone clears it; no venue names.
 CODES = ("liquidated", "drawdown_halt", "halted", "portfolio_halt", "daily_pause", "portfolio_pause", "retired",
          "winding_down", "stopped", "paused", "exits_only", "stale_data", "degraded_candle", "funding_missing",
-         "portfolio_stale", "book_moving", "exit_rejects", "account_shared")
+         "portfolio_stale", "book_moving", "exit_rejects", "account_shared", "exec_target")
 LABELS = {"liquidated": "Liquidated", "drawdown_halt": "Drawdown halt", "halted": "Halted",
           "portfolio_halt": "Portfolio halted", "daily_pause": "Daily loss pause", "portfolio_pause": "Portfolio paused",
           "retired": "Retired", "winding_down": "Winding down", "stopped": "Stopped",
           "paused": "Paused", "exits_only": "Exits only", "stale_data": "Stale data",
           "degraded_candle": "Degraded candle", "funding_missing": "No funding rate",
           "portfolio_stale": "Portfolio unchecked", "book_moving": "Entry refused",
-          "exit_rejects": "Exits rejected", "account_shared": "Account shared"}
+          "exit_rejects": "Exits rejected", "account_shared": "Account shared",
+          "exec_target": "Order client"}
 # The portfolio gate's entry blocks (portfolio.gate.entry_block's kinds) as CHOKE codes, with the words their own
 # reason starts with, which the label already says.
 PORTFOLIO_CODES = {"halt": ("portfolio_halt", "Portfolio halted: "),
@@ -193,7 +194,7 @@ def blocked_state(sleeve, now: datetime | None = None, *, liquidated: str | None
                   holds: dict[str, str] | None = None, starting: bool = False,
                   since: datetime | None = None, portfolio: Why | None = None,
                   moving: str | None = None, exit_rejects: Why | None = None,
-                  account: Why | None = None) -> tuple[bool, Why | None]:
+                  account: Why | None = None, exec_target: Why | None = None) -> tuple[bool, Why | None]:
     """CHOKE (HoE 6 Oct 20:52, Advisor): the one "nothing opens" gate, as (blocked, why). Blocked: liquidated until a
     reset after liquidation (`liquidated`, from the journal: liquidation_head), a halt, the daily-loss pause, retired,
     then (not when `starting`: the supervisor's Stop and the dashboard's Start and Resume, which act on these
@@ -202,7 +203,8 @@ def blocked_state(sleeve, now: datetime | None = None, *, liquidated: str | None
     strategy clears. `moving`: the account a create or move of this Strategy waits to land on at the supervisor's
     next mark (F-ASSIGN-STALE, Advisor ADV-ASSIGN), which no Start or Resume clears either. `exit_rejects`: closing
     orders rejected repeatedly on its instrument anywhere in the fund (exit_reject_block, F-RX-2), cleared only by a
-    close that goes through. The why lists every cause
+    close that goes through. `account` and `exec_target`: A7's shared account and the order client's key or host
+    mismatch (exec_target_block), each refusing entries only. The why lists every cause
     that applies (Advisor 00:20). The engine checks every order
     that would make the position bigger, at submit and at fill; the supervisor and the dashboard's Start and Resume
     read the same answer. Stops, reduce-only orders, the PM's close and a liquidation are never gated."""
@@ -227,6 +229,8 @@ def blocked_state(sleeve, now: datetime | None = None, *, liquidated: str | None
         causes.append(exit_rejects)
     if account is not None:
         causes.append(account)
+    if exec_target is not None:
+        causes.append(exec_target)
     if not starting:  # Start and Resume act on a stopped or paused strategy: what they can't clear is above
         if "stopped" in (sleeve.status, getattr(sleeve, "desired_state", "running")):
             causes.append(STOPPED)
@@ -377,7 +381,7 @@ def entry_blocked(store, name: str, now: datetime | None = None, *, starting: bo
                          holds=held or None, starting=starting, since=_halted_since(store, name, sleeve),
                          portfolio=portfolio_block(store, now), moving=moving_to(store, name),
                          exit_rejects=exit_reject_block(store, sleeve.instrument, now),
-                         account=account_block(store, name))
+                         account=account_block(store, name), exec_target=exec_target_block())
 
 
 def account_block(store, name: str) -> Why | None:
@@ -399,6 +403,23 @@ def account_block(store, name: str) -> Why | None:
         return None
     return _cause("account_shared", f"account {account} is shared with {', '.join(others)}; one account per Strategy "
                   "is on. Exits and stops still run; move one Strategy to its own account to trade again.")
+
+
+def exec_target_block(environ=None) -> Why | None:
+    """Head 3 (Advisor KEYHOST MUST): while the order client's key or host is wrong (exec_target.problems, the start
+    check's "Order client" FAIL), nothing opens or adds; exits, stops, the liquidation cut and Stop still run. Off
+    (EXEC_MODE unset) or sound: None. Unreadable, it fails closed."""
+    import os
+
+    from sleeve_fund import exec_target
+
+    try:
+        found = exec_target.problems(exec_target.read(os.environ if environ is None else environ))
+    except Exception:  # noqa: BLE001 - fail closed, never an error out of CHOKE
+        found = ["its key and host couldn't be read"]
+    if not found:
+        return None
+    return _cause("exec_target", "; ".join(found) + ". Exits and stops still run; fix the key or host to trade again.")
 
 
 def _live_account(store, account: str) -> bool:
@@ -923,7 +944,8 @@ class SleeveRuntime:
                                      moving=None if self.backtest else moving_to(self.store, self.name),
                                      exit_rejects=None if self.backtest or sleeve is None
                                      else exit_reject_block(self.store, sleeve.instrument, self.now()),
-                                     account=None if self.backtest else account_block(self.store, self.name))
+                                     account=None if self.backtest else account_block(self.store, self.name),
+                                     exec_target=None if self.backtest else exec_target_block())
         self._episode(why if blocked else None)
         return blocked, why
 

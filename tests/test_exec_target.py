@@ -144,3 +144,64 @@ def test_the_section_is_on_the_page_and_a_mismatch_fails_the_whole_check(tmp_pat
     assert "Start check: FAIL" in page_bad
     # off, the section is a note: it never fails the check
     assert not start_check.check_exec_target(alerts).failed and ok_off == ("Start check: PASS" in page_off)
+
+
+# ---- Advisor KEYHOST MUST (line 5): a FAIL refuses starts and entries only, never exits or stops -----------------------
+def test_a_key_host_fail_with_an_open_position_refuses_entries_and_the_stop_still_fires(tmp_path, monkeypatch):
+    """As the A7 rule: a start-check FAIL here is a CHOKE cause (entries and starts refused, named), and a Strategy
+    holding on a restart still has its stop, exits and a flatten: nothing halts or stops it."""
+    from sleeve_fund.paper import runtime
+    from sleeve_fund.store import Store
+
+    store = Store(f"sqlite:///{tmp_path}/j.db")
+    store.create_sleeve(name="s1", strategy="ping_pong", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=10_000, desired_state="running")
+    store.record_fill("s1", side="BUY", qty=0.1, price=60_000.0, fee=0.0, order_id="in", trade_id="in")
+    for k, v in {**DEMO, "EXEC_HOST": "api.bybit.com"}.items():
+        monkeypatch.setenv(k, v)
+    why = runtime.exec_target_block()
+    assert why is not None and why.code == "exec_target" and "a production host (api.bybit.com) in demo mode" in why
+    blocked, said = runtime.entry_blocked(store, "s1", starting=True)  # the dashboard's Start reads this too
+    assert blocked and "exec_target" in said.codes
+    rt = runtime.SleeveRuntime(store, "s1")
+    rt.on_start(0.008)
+    blocked, said = rt.entry_blocked()
+    assert blocked and "exec_target" in said.codes
+    assert rt.wiped_out is False and store.sleeve("s1").status != "halted"  # nothing halts or stops it
+    # a CHOKE cause, so entries only: CHOKE never gates a stop, a reduce-only order, the PM's close or a liquidation
+    assert why.code in runtime.CODES and "Exits and stops still run" in why
+    for k in DEMO:
+        monkeypatch.delenv(k)
+    monkeypatch.delenv("EXEC_HOST", raising=False)
+    assert runtime.exec_target_block() is None and not runtime.entry_blocked(store, "s1", starting=True)[0]
+
+
+def test_demo_keys_with_no_host_variable_at_all_fail_by_name_never_a_default_host():
+    """HoQA line 2: keys present, EXEC_HOST missing entirely: FAIL by name, no fallback host."""
+    env = {k: v for k, v in DEMO.items() if k != "EXEC_HOST"}
+    t = et.read(env)
+    assert t.host == "" and "no host set (EXEC_HOST)" in et.problems(t)
+    with pytest.raises(et.ExecTargetRefused, match="no host set"):
+        et.assert_ok(env)
+
+
+def test_the_order_clients_own_guard_lines_join_the_section_and_a_fail_among_them_fails_it():
+    """PE3's hook: EXEC-CLIENT's guard lines (drill go, the G2 lock) go in this one section, after the key and host."""
+    from sleeve_fund.start_check import FAIL, NOTE, PASS, check_exec_target
+
+    sec = check_exec_target(DEMO, extra=[(PASS, "guard line")])
+    assert sec.lines[-1] == (PASS, "guard line") and sec.lines[0][1] == "demo key, host api-demo.bybit.com"
+    assert not sec.failed
+    off = check_exec_target({}, extra=[(FAIL, "guard refused")])
+    assert off.lines == [(NOTE, et.OFF), (FAIL, "guard refused")] and off.failed
+
+
+def test_an_unreadable_target_fails_closed_in_choke(monkeypatch):
+    from sleeve_fund.paper import runtime
+
+    def boom(_):
+        raise RuntimeError("x")
+
+    monkeypatch.setattr(et, "read", boom)
+    why = runtime.exec_target_block({"EXEC_MODE": "demo"})
+    assert why is not None and why.code == "exec_target" and "couldn't be read" in why
