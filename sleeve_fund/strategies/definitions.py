@@ -558,8 +558,8 @@ def _check_exits(exits: dict, blocks: dict, bar_minutes, uses_prev: list, sides=
             has = {s: bool(kinds & set(side_exits(exits, s))) for s in sides}
             if has["long"] != has["short"]:
                 yes, no = ("long", "short") if has["long"] else ("short", "long")
-                raise ValueError(f"exits: the {yes} has {what} and the {no} has none; a leg without one is held to "
-                                 "1x, so both sides carry one or neither does")
+                raise ValueError(f"exits: the {yes} has {what} and the {no} has none: split into two definitions, "
+                                 f"a {yes}-only one with {what} and a {no}-only one without, held at 1x")
 
 
 def _check_exit_table(exits: dict, blocks: dict, uses_prev: list, side: str, name) -> None:

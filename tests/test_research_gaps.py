@@ -82,7 +82,8 @@ def test_g1_both_legs_trade_with_per_side_stops_where_a_shared_long_stop_holds_e
     ({"long": {"stop": LONG_STOP}, "short": {"stop": SHORT_STOP}, "middle": {}}, "exits has no middle"),
     ({"long": {"stop": LONG_STOP, "target": LONG_STOP}, "short": {"stop": SHORT_STOP}}, "exits.long has no target"),
     ({"long": "tight"}, "exits.long is a table"),
-    ({"long": {"stop": LONG_STOP}}, "long has a stop and the short has none"),
+    ({"long": {"stop": LONG_STOP}}, "the long has a stop and the short has none: split into two definitions, a "
+                                    "long-only one with a stop and a short-only one without, held at 1x"),
     ({"long": {"exit_at_level": {"level": "avg"}}, "short": {"stop": SHORT_STOP}}, "long has none"),
     ({"short": {"time_stop": {"minutes": 0}}}, "exits.short.time_stop"),
     ({"time_stop": {"minutes": 60}, "long": {"stop": LONG_STOP}, "short": {"stop": SHORT_STOP}}, "not both"),
