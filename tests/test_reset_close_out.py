@@ -382,3 +382,21 @@ def test_f_hs_2_a_last_mark_at_the_put_away_instant_is_stale_one_after_it_breaks
     assert supervisor.positions_breaks(store) == []
     _stale_mark(store, run, at + timedelta(microseconds=1))
     assert [b.split(":")[0] for b in supervisor.positions_breaks(store)] == [run]
+
+
+def test_f_rr3_1_close_out_cash_counts_only_after_since_as_strategy_cash_pnl_does(store):
+    """CR F-RR3-1: Store.close_out_cash's window is strategy_cash_pnl's (a row at `since` doesn't count, one after it
+    does), so b7 takes back out exactly the close-outs the cash it compares counted."""
+    r1, r2, _ = _old_book(store)
+    at = T0 + timedelta(minutes=2)
+    assert store.close_out_run(r1, "rsi-bands", D("29.70"), reset_book.CLOSE_OUT, at, "operator",
+                               reset_book.RESET_ACTION, "c1")
+    assert store.close_out_run(r2, "rsi-bands", D("82.51"), reset_book.CLOSE_OUT, at + timedelta(microseconds=1),
+                               "operator", reset_book.RESET_ACTION, "c2")
+    assert store.close_out_cash("rsi-bands") == D("-112.21")
+    assert store.close_out_cash("rsi-bands", since=at - timedelta(microseconds=1)) == D("-112.21")
+    assert store.close_out_cash("rsi-bands", since=at) == D("-82.51")  # the row at `since` is not counted
+    assert store.close_out_cash("rsi-bands", since=at + timedelta(microseconds=1)) == 0
+    for since in (at - timedelta(microseconds=1), at, at + timedelta(microseconds=1)):
+        assert store.close_out_cash("rsi-bands", since=since) == \
+            store.strategy_cash_pnl("rsi-bands", since=since)  # only close-outs moved its cash after T0
