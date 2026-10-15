@@ -16,13 +16,18 @@ from sqlalchemy.exc import IntegrityError
 
 from sleeve_fund import store as store_mod
 from sleeve_fund.store import (RESET_CLEARS, RESET_COPIES, RESET_MOVES, RESET_STAYS, STRATEGY_COLUMNS, Store,
-                               equity_t, feed_seen_t, make_engine, metadata, sleeves_t)
+                               acks_t, equity_t, events_t, feed_seen_t, make_engine, metadata, sleeves_t)
 
 T = datetime(2026, 10, 15, 5, 0, tzinfo=timezone.utc)
 
 
-def _names_a_strategy(t) -> bool:
-    return bool(STRATEGY_COLUMNS & set(t.c.keys())) or any(fk.column.table is sleeves_t for fk in t.foreign_keys)
+def _names_a_strategy(t, _seen=frozenset()) -> bool:
+    """A Strategy column, or a foreign key to sleeves or to any table that names a Strategy (an alert's ack hangs off
+    its event, a shadow outcome off its gate decision): a reset has to plan for those rows too."""
+    if STRATEGY_COLUMNS & set(t.c.keys()):
+        return True
+    parents = {fk.column.table for fk in t.foreign_keys} - {t} - set(_seen)
+    return any(p is sleeves_t or _names_a_strategy(p, _seen | {t}) for p in parents)
 
 
 def test_every_table_naming_a_strategy_is_in_exactly_one_reset_list():
@@ -50,9 +55,12 @@ def test_the_lists_cover_a_table_added_later():
     assert _names_a_strategy(by_column)
     by_fk = Table("new_marks", metadata, Column("id", Integer, primary_key=True),
                   Column("owner", String(64), ForeignKey("sleeves.name")))
+    by_chain = Table("new_notes", metadata, Column("id", Integer, primary_key=True),
+                     Column("mark_id", Integer, ForeignKey("new_marks.id")))
     try:
-        assert _names_a_strategy(by_fk)
+        assert _names_a_strategy(by_fk) and _names_a_strategy(by_chain)  # one step removed counts too
     finally:
+        metadata.remove(by_chain)
         metadata.remove(by_fk)
 
 
@@ -82,6 +90,10 @@ def test_a_reset_moves_copies_clears_and_keeps_exactly_what_its_lists_say(store)
         store.record_fill("s", side=side, qty=1.0, price=100.0 + n, fee=0.1, order_id=f"o{n}", trade_id=f"t{n}")
     with store.engine.begin() as c:
         c.execute(feed_seen_t.insert().values(sleeve="s", seen_at=T))
+    store.event("s", "warning", "probe", "an alert the PM acked before the reset", ts=T)
+    with store.engine.begin() as c:  # its ack follows the event into the run
+        acked = c.execute(select(func.min(events_t.c.id)).where(events_t.c.sleeve == "s")).scalar()
+        c.execute(acks_t.insert().values(event_id=acked, ts=T, actor="pm", note=""))
     store.request_reset("s", "Settings changed")
     with store.engine.connect() as c:
         before = {t.name: _count(c, t, "s") for t in RESET_MOVES + RESET_COPIES}
@@ -94,6 +106,8 @@ def test_a_reset_moves_copies_clears_and_keeps_exactly_what_its_lists_say(store)
             assert _count(c, t, "s") == _count(c, t, run) == before[t.name], t.name
         for t in RESET_CLEARS:
             assert _count(c, t, "s") == 0, t.name
+        assert c.execute(select(events_t.c.sleeve).join(acks_t, acks_t.c.event_id == events_t.c.id)
+                         ).scalars().all() == [run]
         if c.dialect.name == "sqlite":
             assert c.execute(text("PRAGMA foreign_key_check")).all() == []
     assert store.journal_book("s", 10_000.0)["fills"] == 0
