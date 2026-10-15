@@ -10,6 +10,9 @@ DIR=${BACKUP_DIR:-/backups}
 DB=${BACKUP_DB:-sleeve_fund}
 CHECK=${PREDEPLOY_CHECK_DB:-predeploy_check}
 export PGHOST=${PGHOST:-db} PGUSER=${PGUSER:-sleeve}  # as backup.sh: the container holds only the password
+# The scratch database is dropped on every exit, so its name can only be its own: never the journal or another database.
+[[ "$CHECK" =~ ^predeploy_[a-z0-9_]+$ ]] && [ "$CHECK" != "$DB" ] \
+  || { echo "pre-deploy dump: FAIL, not a scratch database name"; exit 1; }
 f="$DIR/predeploy-$(date -u +%Y%m%d-%H%M%S).pgdump"
 # Until the copy is proved it keeps its .part name, removed on any exit: an unproved copy never stays under a good one.
 trap 'rm -f "$f.part"; dropdb --if-exists "$CHECK" >/dev/null 2>&1 || true' EXIT
