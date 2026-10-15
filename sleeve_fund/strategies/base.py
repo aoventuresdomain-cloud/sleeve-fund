@@ -1538,7 +1538,7 @@ class LongFlatStrategy(Strategy):
                           if held is not None and o["ts"] >= held["ts"] and o.get("side") == opened
                           and o.get("intent") in OPENING_INTENTS and o["order_id"] in filled
                           and (o.get("signal") or {}).get("position_liquidation_px") is not None), None)
-            self._liq_px = fixed["signal"]["position_liquidation_px"] if fixed is not None else None
+            self._liq_px = self._restored_liq(fixed["signal"]["position_liquidation_px"]) if fixed is not None else None
             if fixed is not None:  # and the funding its margin has taken or been credited since it opened (LIQ-FUND-1)
                 self._liq_from = self._position_opened(fills)
                 self._liq_funded = sum(float(r["amount"]) for r in store.funding(name, limit=None)
@@ -1613,6 +1613,27 @@ class LongFlatStrategy(Strategy):
             self._safety_stop = False
             self.runtime.store.event(self.runtime.name, "info", "stop_restored", "The model's own stop is set again "
                                      "for the open position, so new entries can open again.", ts=self.runtime.now())
+
+    def _restored_liq(self, journaled: float) -> float:
+        """The liquidation price a restart works to (Advisor RESUME-CELL6): the nearer the entry of the one journaled at
+        the fill and the one worked out again from the journaled entry, size and cash, the leverage cap and the
+        maintenance table now, so a journaled price farther off never loosens the half-distance stop; a difference of
+        more than a tick is alerted, naming the Strategy's row ("liquidation mismatch on restore")."""
+        journaled = float(journaled)
+        book = self.runtime.book
+        again = self._liq_from_entry(book["cash"], book["qty"]) if book["qty"] else None
+        if again is None:
+            return journaled
+        side = self._entry_side or 1
+        nearer = max(journaled, again) if side > 0 else min(journaled, again)
+        tick = float(self.instrument.price_increment) if self.instrument is not None else 0.0
+        if abs(journaled - again) > tick and not self._backtest:
+            self.runtime.store.event(
+                self.runtime.name, "warning", "liquidation_mismatch",
+                f"Liquidation mismatch on restore for {self.runtime.name}: journaled {journaled:,.6g}, worked out again "
+                f"{again:,.6g} from its entry, size, leverage and the maintenance table now; the nearer, {nearer:,.6g}, "
+                "is the one its stop and liquidation checks use.", ts=self.runtime.now())
+        return nearer
 
     def _safety_stop_on_restore(self, book: dict) -> None:
         """After a restart holding a position (Independent Quant Advisor and HoE, 6 Oct; QA P1-S1, S5, S7):
