@@ -173,10 +173,18 @@ def hub_address(venue: str, environ=None) -> tuple[str, int] | None:
     return host, int(port)
 
 
+def assert_exec_off() -> None:
+    """EXEC-CLIENT ships OFF: every paper node is on the simulated client (exec_client.assert_off)."""
+    from sleeve_fund.paper.exec_client import assert_off
+
+    assert_off(os.environ)
+
+
 def build_node(sleeve: SleeveConfig, log_level: str = "INFO", runtime: SleeveRuntime | None = None,
                asset_fetch=None, recorder=None, history=None, hub: tuple[str, int] | None = None) -> LiveNode:
     """hub: (host, port) of the venue's market data hub; by default HUB_<VENUE> (hub_address)."""
     assert_keyless()
+    assert_exec_off()
     tag = _tag(sleeve.name)
     profile = venue_profile(sleeve.venue)
     # P2-4: the strategy's one venue and its paper account; paper only until G2, so route() refuses any other kind.
@@ -255,6 +263,7 @@ def build_two_leg_node(lead: SleeveConfig, follow: SleeveConfig, log_level: str 
     from sleeve_fund.strategies.pair import LegFollower, Pair
 
     assert_keyless()
+    assert_exec_off()
     profile = venue_profile(lead.venue)
     if venue_profile(follow.venue).name != profile.name:
         raise ValueError(f"a two-leg Strategy's legs trade on one venue, not {lead.venue} and {follow.venue}")
@@ -329,6 +338,7 @@ def build_legs_node(legs: list[SleeveConfig], log_level: str = "INFO",
     from sleeve_fund.research.portfolio import clone_venue
 
     assert_keyless()
+    assert_exec_off()
     if len(legs) < 2:
         raise ValueError("a multi-asset Strategy has at least two legs")
     runtimes = list(runtimes or [None] * len(legs))

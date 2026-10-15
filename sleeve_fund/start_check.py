@@ -138,6 +138,29 @@ def check_exec_target(environ: dict[str, str], extra=()) -> Section:
     return sec
 
 
+def exec_gates(environ: dict[str, str], engine: Engine) -> list[tuple[str, str]]:
+    """EXEC-CLIENT's own gates (paper.exec_client.gates: the PM's drill-go record, the G2 lock), for the "Order client"
+    section's extra lines. The key's permissions are read from the venue only once the client goes on (drill prep)."""
+    from sleeve_fund.paper import exec_client
+
+    s = exec_client.exec_settings(environ)
+    return exec_client.gates(s, drill_go=s.on and exec_client.recorded(engine, exec_client.DRILL_GO),
+                             key_permissions=None)
+
+
+def check_exec(environ: dict[str, str], engine: Engine) -> Section:
+    """EXEC-CLIENT (Advisor HEAD3 (1)): every line of the client's guard on its own (exec_target's host and key lines,
+    then the gates), for QA and the client. The start check itself shows these once, in check_exec_target's section."""
+    from sleeve_fund.paper import exec_client
+
+    sec = Section("Exchange order client")
+    s = exec_client.exec_settings(environ)
+    for status, what in exec_client.guard(s, drill_go=s.on and exec_client.recorded(engine, exec_client.DRILL_GO),
+                                          key_permissions=None):
+        sec.add(status, what)
+    return sec
+
+
 def check_alerts(environ: dict[str, str]) -> Section:
     """A15 (G2): where alerts go and the uptime ping an outside monitor watches, so a dead server says so. Hosts only:
     a webhook's path or a ping's id is its token, and the page is public."""
@@ -467,10 +490,10 @@ def run(url: str, environ: dict[str, str] | None = None) -> tuple[bool, str]:
     env = dict(os.environ if environ is None else environ)
     store = read_only_store(url)
     engine = store.engine
-    sections = [check_store(engine), check_keys(env, engine), check_exec_target(env), check_alerts(env),
-                check_venues(engine), check_maintenance(store), check_venue_terms(store), check_books(store),
-                check_assets(store), check_warmups(store),
-                check_account_sharing(env, engine), check_strength(store)]
+    sections = [check_store(engine), check_keys(env, engine), check_exec_target(env, exec_gates(env, engine)),
+                check_alerts(env), check_venues(engine), check_maintenance(store), check_venue_terms(store),
+                check_books(store), check_assets(store), check_warmups(store), check_account_sharing(env, engine),
+                check_strength(store)]
     ok = not any(s.failed for s in sections)
     out = [f"Start check: {'PASS' if ok else 'FAIL'}",
            f"{datetime.now(UTC):%Y-%m-%d %H:%M} UTC, {journal_kind(url)} journal, read-only",
