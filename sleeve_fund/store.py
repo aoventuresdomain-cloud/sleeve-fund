@@ -1257,6 +1257,7 @@ FINISHED_ORDER_STATUSES = ("filled", "canceled", "rejected", "denied", "expired"
 OPEN_ORDER_STATUSES = ("submitted", "accepted", "partially_filled")
 # F-C3B-A: a Strategy archived while not yet flat waits for its withdrawal; one with nothing to withdraw says so
 WITHDRAWAL_DEFERRED, WITHDRAWAL_NONE = "withdrawal_deferred", "withdrawal_none"
+PUT_AWAY_FUND_HELD = "put_away_fund_held"  # F-WN-1: put away once the fund holds the cash; withdrawn = 0
 # RESET-NEG (Advisor, 15 Oct): the key of an old book close-out's cash rows (close_out_run). A transfer inside the book,
 # never trading: the book's cash readers count it, the rows trades are paired with (insurance) leave it out.
 CLOSE_OUT = "old-book-close-out"
@@ -2711,7 +2712,10 @@ class Store:
         Only the supervisor's poll (polled), after its own mark, takes equity out of a marked book (F286-CR1, HoE on the
         Advisor's option (b)): put away anywhere else, flat or not, it is WITHDRAWAL_DEFERRED, so the P&L made since the
         last mark is judged at the book's scale before its equity leaves, never landing on the Strategies that remain.
-        A book never marked has no scale to keep: it is taken out at once, with no flow."""
+        A book never marked has no scale to keep: it is taken out at once, with no flow.
+
+        Once the fund holds the cash (Bridge Drop A) a Strategy has no capital of its own: settled flat, it leaves the
+        book with withdrawn = 0 and an info line (PUT_AWAY_FUND_HELD), never WITHDRAWAL_NONE (F-WN-1, HoE + DA)."""
         if self.two_leg(sleeve):  # the backstop behind every put-away: never one leg alone (TWO_LEG_FENCE)
             raise ValueError(f"putting a Strategy away {TWO_LEG_FENCE}")
         seen: list[tuple[str, Decimal | str]] = []
@@ -2725,6 +2729,11 @@ class Store:
             blocked = self.withdrawal_blocker(sleeve)
             if blocked is not None:
                 return "deferred", blocked
+            if _fund_held(self):  # F-WN-1 (DA): nothing of its own moves, so no book scale to wait for; out at 0 now
+                equity = self.in_book_equity(sleeve)
+                # Anything but exactly 0 here is a broken invariant (book_part is 0 once the fund holds the cash): it
+                # stays in the book and warns, never written off as nothing moved.
+                return ("held", Decimal(0)) if equity == 0 else ("none", equity)
             if marked and not polled:
                 return "deferred", NEXT_MARK
             equity = self.in_book_equity(sleeve)
@@ -2754,7 +2763,7 @@ class Store:
                                                                  sleeve_archive_t.c.withdrawn.is_not(None))).first():
                 return
             kind, value = seen[0] if seen else decide(False)  # nothing marked yet: no flow, but decided all the same
-            out = stored(value) if kind == "out" else None
+            out = stored(value) if kind in ("out", "held") else None
             # An archive from before 0023 (withdraw-archived), or one waiting to go flat, keeps when it went:
             # previous_book reads archived_at against the clean slate's start (DA, 14 Oct). A fresh one is written now.
             if not c.execute(update(sleeve_archive_t).where(sleeve_archive_t.c.sleeve == sleeve)
@@ -2770,6 +2779,11 @@ class Store:
                     sleeve=sleeve, ts=ts, level="info", kind=WITHDRAWAL_DEFERRED,
                     message=f"{sleeve} put away ({why}) while not yet flat ({value}): it stays in the fund's book in "
                             "full, exiting but never entering, and its settled equity leaves the book when it is flat"))
+            elif kind == "held":
+                c.execute(insert(events_t).values(
+                    sleeve=sleeve, ts=ts, level="info", kind=PUT_AWAY_FUND_HELD,
+                    message=f"{sleeve} put away ({why}), settled flat: the fund holds the cash, so nothing moves and "
+                            "what it made stays in the fund's book"))
             elif kind == "none":
                 c.execute(insert(events_t).values(
                     sleeve=sleeve, ts=ts, level="warning", kind=WITHDRAWAL_NONE,
