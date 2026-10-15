@@ -6,6 +6,8 @@ Once the fund holds the cash (Bridge Drop A), the night also runs the supervisor
 "identity check every poll and in NIGHTLY-RECON"), the same functions on the same journal: the fund's cash P&L read
 two ways (identity_gap, past identity_tolerance fails), every position against its journal's fills (positions_breaks)
 and any insurance credit inside the fund (insurance_breaks). A hold the poll already latched is listed as known.
+Then every journal row's position by (Strategy, asset), rebuilt from its fills against what its orders record, exactly,
+and every row written under another asset (sleeve_fund.reconcile).
 
 Each night after RECON_HOUR UTC the supervisor's alert thread (alerts.Forwarder.check_recon) runs it once and
 writes a dated record, RECON_DIR/recon-YYYY-MM-DD.txt, whose first line is PASS or FAIL. A FAIL, or a comparison
@@ -66,11 +68,27 @@ def identity(store) -> Section:
     return sec
 
 
+def positions(store) -> Section:
+    """Every row's position by (Strategy, asset), fills against orders, exactly (reconcile.nightly)."""
+    from sleeve_fund import reconcile
+
+    sec = Section("Positions by Strategy and asset")
+    found = reconcile.nightly(store)
+    for f in found:
+        sec.add(FAIL, f.what)
+    if not found:
+        rows = reconcile.rebuild_positions(store)
+        sec.add(PASS, f"{len(rows)} journal rows: every position its fills come to is what its orders record")
+    for row, n in sorted(reconcile.unanchored(store).items()):
+        sec.add(NOTE, f"{row}: {n} fills with no order row, counted as they are on both sides")
+    return sec
+
+
 def compare(url: str) -> list[Section]:
-    """check_books, then the book check, against the journal at url, opened read-only."""
+    """check_books, the book check and the positions by asset, against the journal at url, opened read-only."""
     store = read_only_store(url)
     try:
-        return [check_books(store, cent=True), identity(store)]
+        return [check_books(store, cent=True), identity(store), positions(store)]
     finally:
         store.engine.dispose()
 

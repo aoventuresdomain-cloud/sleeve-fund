@@ -181,7 +181,8 @@ def _seeded(tmp_path, gap: float = 0.0, seed: int = 7):
 def test_a_seeded_book_matches_the_journal_to_the_cent(tmp_path):
     ok, _, fails = nightly_recon.run(tmp_path / "recon", _seeded(tmp_path), NIGHT)
     assert ok and not fails
-    assert _record(tmp_path / "recon").count("  PASS  ") == 3
+    dashboard = _record(tmp_path / "recon").split("Dashboard against the journal:\n")[1].split("\n\n")[0]
+    assert dashboard.count("  PASS  ") == 3
 
 
 def test_a_one_cent_gap_on_a_seeded_book_fails_and_alerts_though_the_start_check_allows_it(tmp_path):
