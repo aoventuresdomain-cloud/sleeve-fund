@@ -481,3 +481,17 @@ def test_5c_a_failing_ops_check_is_one_error_and_never_stops_the_alerts_or_the_u
     fwd.step()
     [back] = _kinds(store, "ops_check_back")
     assert back["level"] == "info"
+
+
+def test_5d_a_first_deploy_after_08_00_sends_no_digest_then_and_the_first_goes_the_next_morning():
+    store, sent = Store.in_memory(), []
+    t = [T0 + timedelta(hours=6, minutes=10)]  # 13:10 UK: the deploy
+    fwd = Forwarder(store, environ={"ALERT_WEBHOOK_URL": HOOK}, send=lambda url, text: sent.append(text),
+                    now=lambda: t[0])
+    fwd.step()
+    t[0] += timedelta(hours=3)
+    fwd.step()
+    assert sent == []
+    t[0] = T0 + timedelta(days=1, hours=1)  # 08:00 UK the next day
+    fwd.step()
+    assert len(sent) == 1 and sent[0].startswith("Multi-Strategy Fund daily digest")

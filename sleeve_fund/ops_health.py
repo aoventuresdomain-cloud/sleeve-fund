@@ -25,6 +25,7 @@ UK = ZoneInfo("Europe/London")
 STALE_AFTER = timedelta(minutes=5)  # matches the per-Strategy hold (strategies.base.STALE_PRICE_WARN_MINUTES)
 NO_STOP_AFTER = timedelta(seconds=60)  # Advisor A15-OPS, 15 Oct
 DIGEST_AT = time(8, 0)  # UK
+FIRST_GRACE = timedelta(minutes=2)  # the forwarder steps about once a minute (supervisor.ALERT_EVERY)
 _DAY = re.compile(r"daily digest for (\d{4}-\d{2}-\d{2})")
 
 
@@ -214,6 +215,7 @@ class DailyDigest:
         self._sent: str | None = None
         self._sent_at: datetime | None = None
         self._failing = False
+        self._first = True
 
     def _sent_day(self) -> str | None:
         if self._sent is None:
@@ -227,6 +229,13 @@ class DailyDigest:
             return
         local = now.astimezone(UK)
         day = f"{local:%Y-%m-%d}"
+        first, self._first = self._first, False
+        due = local.replace(hour=self.at.hour, minute=self.at.minute, second=0, microsecond=0)
+        if first and self._sent_day() == "" and local >= due + FIRST_GRACE:
+            # None has ever gone and this is a first start well after 08:00 (a deploy): the first digest is the next
+            # 08:00's, not one at deploy time. A supervisor already running steps within a minute of 08:00.
+            self._sent = day
+            return
         if local.time() < self.at or self._sent_day() == day:
             return
         from pathlib import Path

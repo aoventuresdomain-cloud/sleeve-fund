@@ -27,7 +27,7 @@ from datetime import timedelta
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from sleeve_fund import backups, clock, nightly_recon
+from sleeve_fund import backups, clock, nightly_recon, ops_health
 from sleeve_fund.store import Store, utcnow
 from sleeve_fund.wording import leg_name, no_venues
 
@@ -113,6 +113,10 @@ class Forwarder:
         self.clock_server, self.clock_offset = clock.server(env), clock_offset
         self._clock_checked = None
         self._clock_said = None  # "ok", "drift" or "unreachable": what was last journaled
+        # A15 (Drop 3a): the open positions with no live stop and the 08:00 UK digest, checked each step
+        self.no_stop = ops_health.NoStopWatch()
+        self.digest = ops_health.DailyDigest(store, env, send=send)
+        self._ops_failing: set[str] = set()
 
     def _resume(self) -> int:
         last = self.store.last_event(None, ("alerts_sent",)) if self.url else None
@@ -192,10 +196,28 @@ class Forwarder:
                              f"{self.clock_server}")
         self._clock_said = state
 
+    def _ops_check(self, what: str, check) -> None:
+        """One A15 check; a failure is one error until it works again (then one info line), and never stops the
+        alerts or the uptime ping that follow it."""
+        try:
+            check()
+        except Exception as exc:  # noqa: BLE001 - said once; tried again next step
+            if what not in self._ops_failing:
+                self._ops_failing.add(what)
+                self.store.event(None, "error", "ops_check_failed",
+                                 f"the {what} check failed: {type(exc).__name__}; retrying every minute")
+            return
+        if what in self._ops_failing:
+            self._ops_failing.discard(what)
+            self.store.event(None, "info", "ops_check_back", f"the {what} check works again")
+
     def step(self) -> None:
         self.check_backup()
         self.check_clock()
         self.check_recon()
+        now = self.now()
+        self._ops_check("no-stop", lambda: self.no_stop.check(self.store, now))
+        self._ops_check("daily digest", lambda: self.digest.step(now))
         if self.ping_url:
             try:
                 self.pinger(self.ping_url)
