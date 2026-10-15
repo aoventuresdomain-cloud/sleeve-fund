@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 
-from sleeve_fund.instruments import FeeSchedule
+from sleeve_fund.instruments import FeeSchedule, pct
 from sleeve_fund.venues import venue as venue_profile
 
 
@@ -35,7 +35,7 @@ class FeeQuote:
     def text(self) -> str:
         if self.words:
             return self.words
-        rates = f"{float(self.fees.maker):.2%} maker, {float(self.fees.taker):.2%} taker"
+        rates = f"{pct(self.fees.maker)} maker, {pct(self.fees.taker)} taker"
         if self.source == "account":
             # "Venue fees", never the venue's name: this text reaches activity and the backtest (QA U8 ruling).
             return (f"Venue fees: {rates}, from account {self.account}, "
@@ -46,7 +46,7 @@ class FeeQuote:
     @property
     def short(self) -> str:
         """One line for a result's header: "0.40/0.80% fees (Tier 1, 3 Oct 2026)"."""
-        rates = f"{float(self.fees.maker) * 100:.2f}/{float(self.fees.taker) * 100:.2f}% fees"
+        rates = f"{pct(self.fees.maker)[:-1]}/{pct(self.fees.taker)} fees"
         if self.source == "account":
             return f"{rates} (account {self.account}, {self.fetched_at.day} {self.fetched_at:%b %Y})"
         return f"{rates} ({self.basis or 'published'})"

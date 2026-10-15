@@ -329,7 +329,7 @@ def test_guarantee_2_a_stopped_entry_counts_as_open_risk_counts_the_position(sid
 
     i = _in(side=side, perp=True, leverage=3.0, stop_frac=0.03, half_spread=0.0004, stop_slippage=None)
     s = size_entry(i)
-    held = position_risk(side * float(s.qty), 100.0, 100 * (1 - side * 0.03), 0.02)
+    held = position_risk(side * float(s.qty), 100.0, 100 * (1 - side * 0.03), 0.02, taker=0)
     assert float(risk_per_unit(s, i) * s.qty) == pytest.approx(held, abs=1e-9)
     assert risk_per_unit(s, i) * s.qty < s.risk_amount
     assert margin_per_unit(i) == D(100) / 3 and margin_per_unit(_in()) == D(100)

@@ -20,7 +20,7 @@ import pandas as pd
 from nautilus_trader.model import CurrencyPair
 
 from sleeve_fund import funding
-from sleeve_fund.instruments import FeeSchedule, pair_of
+from sleeve_fund.instruments import FeeSchedule, pair_of, pct
 from sleeve_fund import markets
 from sleeve_fund.markets import PERP
 from sleeve_fund.research import regime_split
@@ -939,7 +939,7 @@ def run_study(
         breakeven=breakeven,
         oos_exec_minutes=oos_minutes,
         fill_labels=labels,
-        fee_note=(f"{float(run_fees.maker):.2%} maker on post-only orders, {float(run_fees.taker):.2%} taker "
+        fee_note=(f"{pct(run_fees.maker)} maker on post-only orders, {pct(run_fees.taker)} taker "
                   f"on every other order, plus {spread_words} on orders that take liquidity; break-even: {breakeven}"),
         fee_basis=run_fees,
         oos_uncharged_returns=pd.concat(

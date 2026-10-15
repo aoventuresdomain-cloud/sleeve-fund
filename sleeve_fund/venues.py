@@ -21,7 +21,7 @@ from typing import Callable
 import pandas as pd
 from nautilus_trader.model import Venue
 
-from sleeve_fund.instruments import FeeSchedule, perpetual, spot_pair
+from sleeve_fund.instruments import FeeSchedule, pct, perpetual, spot_pair
 from sleeve_fund.margin import Tier
 
 # FEE-LIVE: the paper venue's published perp VIP 0 (the PM's pasted schedule, 15 Oct 2026; research/venue-data): the one
@@ -158,7 +158,7 @@ class VenueProfile:
         return f"{self.name}_API_KEY__{suffix}", f"{self.name}_API_SECRET__{suffix}"
 
     def fee_text(self) -> str:
-        return f"{self.label}: {float(self.fees.maker):.2%} maker, {float(self.fees.taker):.2%} taker ({self.fee_basis})"
+        return f"{self.label}: {pct(self.fees.maker)} maker, {pct(self.fees.taker)} taker ({self.fee_basis})"
 
 
 VENUES: dict[str, VenueProfile] = {}

@@ -35,7 +35,7 @@ from nautilus_trader.model import (
 )
 
 from sleeve_fund import markets, router, spreads
-from sleeve_fund.instruments import ScheduleFeeModel, fill_model
+from sleeve_fund.instruments import ScheduleFeeModel, fill_model, pct
 from sleeve_fund.paper.config import SleeveConfig, from_store, load_sleeve
 from sleeve_fund.paper.runtime import EXITS_ONLY, SleeveRuntime
 from sleeve_fund.paper.safety import assert_keyless, assert_portfolio_gate
@@ -586,7 +586,7 @@ def main(argv: list[str] | None = None) -> int:
             configs[-1][1].venue = configs[-1][0].venue  # its pin's, or the one its open position is on (venue_start)
             perp = markets.terms(configs[-1][0].params, configs[-1][0].venue)
             store.event(r.name, "info", "fees", f"Charging {quote.text}" if perp is None or perp.fees is None else
-                        f"Charging {perp.label}: {perp.fees.maker:.2%} maker, {perp.fees.taker:.2%} taker, on the "
+                        f"Charging {perp.label}: {pct(perp.fees.maker)} maker, {pct(perp.fees.taker)} taker, on the "
                         "venue's live prices; funding every 8 hours from our own ledger")
         (sleeve, runtime), leg = configs[0], (configs[1] if second is not None else None)
         many = configs if assets else None

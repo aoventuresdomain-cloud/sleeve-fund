@@ -157,7 +157,7 @@ def test_a_paper_entry_not_decided_on_a_bar_is_listed_on_its_own_never_a_false_p
 
 
 _ORDER = dict(side=1, qty=D(2), close=D(100), price=D("100.05"), stop_frac=0.02, step=D("0.001"),
-              min_qty=D("0.001"), instrument="XBT", leverage=None, atr_pct=None)
+              min_qty=D("0.001"), instrument="XBT", leverage=None, atr_pct=None, taker=D(0))
 BAR_NS = int(_day(2).timestamp() * 1e9)
 
 

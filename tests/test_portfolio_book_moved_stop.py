@@ -45,7 +45,7 @@ def _book_hours(monkeypatch, exits: dict) -> list[dict]:
 
 
 def _risk(h: dict, stop: float) -> D:
-    pos = Position("r", underlying(h["base"]), D(repr(float(h["qty"]))), D(repr(float(stop))))
+    pos = Position("r", underlying(h["base"]), D(repr(float(h["qty"]))), D(repr(float(stop))), taker=D(0))
     return holding_for(pos, D(repr(float(h["close"]))), h["atr"]).risk
 
 
