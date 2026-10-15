@@ -45,7 +45,7 @@
     {% if fee_terms.instruments %}<table class="compact kv">
       {% for i in fee_terms.instruments %}{% set f = i.fee %}
       <tr><th scope="row">{{ i.instrument }} {{ i.market|lower }}</th><td>
-        {% if f.maker is not none %}<div>Fees: {{ f.maker }} maker, {{ f.taker }} taker</div>{% endif %}
+        {% if f.maker is not none %}<div>Fees: {{ f.maker|rate }} maker, {{ f.taker|rate }} taker</div>{% endif %}
         {{ state(f) }}
         {% if f.out_of_range %}<div class="warn">The latest fetched fee was outside the published range and was not used; the last good fee, fetched {{ f.fetched_at|uk }}, is still the one in use.</div>{% endif %}
         {% set t = i.tiers %}{% if t %}{% if t.tiers is not none %}<div>Margin tiers: {{ t.tiers }} tier{{ 's' if t.tiers != 1 }}</div>{% endif %}

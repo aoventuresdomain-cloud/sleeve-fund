@@ -11,9 +11,12 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from test_halt_ref import (
+    store,  # noqa: F401 - the journal, on Postgres too (TEST_DATABASE_URL)
+)
 
 from sleeve_fund import venue_terms
-from sleeve_fund.store import PUBLISHED_FEES, Store
+from sleeve_fund.store import PUBLISHED_FEES
 from sleeve_fund.venues import venue
 
 pytestmark = [pytest.mark.no_maintenance_tables, pytest.mark.venue_terms_live]
@@ -26,8 +29,7 @@ RECORDED = Path(__file__).parent / "data" / "fee_live" / "risk-limit-BTCUSDT-202
 
 
 @pytest.fixture
-def db():
-    store = Store.in_memory()
+def db(store):  # noqa: F811
     store.create_sleeve(name="a", strategy="ping_pong", instrument=PAIR, bar_spec="1-MINUTE-LAST-INTERNAL",
                         starting_balance=10_000, venue="BINANCE", params={"market": "perp"})
     return store
@@ -70,7 +72,9 @@ def test_fresh_fee_and_tiers_are_two_rows_each_with_its_source_and_uk_time(db, m
     assert line["fee"]["state"] == "fresh" and line["tiers"]["state"] == "fresh"
     assert line["fee"]["maker"] == "0.0002" and line["fee"]["taker"] == "0.00055"  # as fetched
     words = _words(db, monkeypatch)
-    assert "Fees: 0.0002 maker, 0.00055 taker" in words and "from the account" in words
+    # CR head 3 MUST: rates as percentages, as research words them (instruments.pct), never the raw fraction
+    assert "Fees: 0.02% maker, 0.055% taker" in words and "from the account" in words
+    assert "0.00055" not in words and "0.0002 " not in words
     assert f"Margin tiers: {len(PAPER.maintenance_tiers[PAIR])} tiers" in words and "public risk-limit table" in words
     assert f"fetched {venue_terms.uk(NOW - 2 * H)}" in words and " UK" in words
     assert "Research tests use the standard published fee or higher, never a lower one." in words

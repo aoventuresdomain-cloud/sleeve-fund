@@ -794,7 +794,7 @@ def test_the_fee_panel_shows_each_row_as_the_engine_reads_it_and_fits(tmp_path, 
         panel = page.locator("#fee-terms")
         assert panel.is_visible()
         text = panel.inner_text()
-        assert "Fees: 0.0002 maker, 0.00055 taker" in text and "from the account" in text
+        assert "Fees: 0.02% maker, 0.055% taker" in text and "from the account" in text
         amber = panel.locator(".warn").all_inner_texts()  # the tier row, and spot's schedule not recorded yet: both trade on
         assert len(amber) == 2 and "margin tiers" in amber[0] and "over 24 hours" in amber[0], amber
         assert "not recorded yet" in amber[1], amber
