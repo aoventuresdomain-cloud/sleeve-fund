@@ -424,7 +424,7 @@ def test_g2_open_risk_formula_on_main_is_the_stopless_rule():
 @pytest.mark.parametrize("qty, atr_pct, risk", [(D(2), 0.02, D(20)), (D(-2), 0.05, D(30)), (D("0.5"), 0.0333, D(5))])
 def test_g2_holding_for_counts_a_stopless_position_at_the_stopless_move(qty, atr_pct, risk):
     (holding_for,) = _need("holding_for", module="sleeve_fund.portfolio")
-    h = holding_for(SimpleNamespace(qty=qty, stop=None, strategy="s", underlying="BTC"), D(100), atr_pct)
+    h = holding_for(SimpleNamespace(qty=qty, stop=None, strategy="s", underlying="BTC", taker=D(0)), D(100), atr_pct)
     assert isinstance(h.risk, D)
     assert abs(h.risk - risk) <= D("0.01"), (h.risk, risk)
 

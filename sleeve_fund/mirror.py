@@ -715,3 +715,11 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+def fee_client(environ) -> "BybitDemo | None":
+    """FEE-LIVE: the paper venue's demo account, signed and read-only, for its fee-rate call (venue_terms.fetch_fees),
+    or None when this server holds no demo key and secret. Only ever the demo host (BybitDemo refuses any other)."""
+    key = environ.get(BYBIT_KEY_ENV, "").strip()
+    secret = environ.get(BYBIT_SECRET_ENV, "").strip()
+    return BybitDemo(Settings(key, secret)) if key and secret else None

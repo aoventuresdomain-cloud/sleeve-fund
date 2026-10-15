@@ -1259,8 +1259,7 @@ class Supervisor:
                 return None
             from sleeve_fund import mirror
 
-            key, secret = env.get(mirror.BYBIT_KEY_ENV, "").strip(), env.get(mirror.BYBIT_SECRET_ENV, "").strip()
-            return mirror.BybitDemo(mirror.Settings(key, secret)) if key and secret else None
+            return mirror.fee_client(env)
 
         try:
             venue_terms.fetch_due(self.store, now or utcnow(), client_for,
