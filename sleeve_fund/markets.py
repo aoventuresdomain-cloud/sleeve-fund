@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from sleeve_fund.instruments import FeeSchedule
+from sleeve_fund.venues import PAPER_PERP_FEES
 from sleeve_fund.margin import (  # noqa: F401 (re-exported)
     isolated_liquidation,
     isolated_margin,
@@ -54,10 +55,10 @@ class PerpTerms:
     max_notional: float = float("inf")
 
 
-# Published rates of the large perp venues' entry tiers (0.02% maker, 0.05% taker), a tight BTC book
-# (0.01% half spread), funding at the usual baseline of 0.01% every 8 hours (about 11% a year, paid by
-# longs) and a 0.5% maintenance margin, as the long/short verdict (4 Oct 2026) assumed.
-LOW_FEE_PERP = PerpTerms("Low-fee perpetual (simulated)", FeeSchedule(Decimal("0.0002"), Decimal("0.0005")),
+# The paper venue's published perp VIP 0 (venues.PAPER_PERP_FEES: 0.02% maker, 0.055% taker; FEE-LIVE), a tight BTC
+# book (0.01% half spread), funding at the usual baseline of 0.01% every 8 hours (about 11% a year, paid by longs) and
+# a 0.5% maintenance margin, as the long/short verdict (4 Oct 2026) assumed.
+LOW_FEE_PERP = PerpTerms("Low-fee perpetual (simulated)", PAPER_PERP_FEES,
                          0.0001, 0.0001, (0, 8, 16), 0.005)
 VENUE_FEE_PERP = PerpTerms("Perpetual at the venue's spot fees (stress)", None, None, 0.0001, (0, 8, 16), 0.005)
 

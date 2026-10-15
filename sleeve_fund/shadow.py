@@ -18,9 +18,10 @@ from sqlalchemy import select
 
 from sleeve_fund.money import money
 from sleeve_fund.research.metrics import trades
+from sleeve_fund.venues import PAPER_PERP_FEES
 from sleeve_fund.store import _aware, gate_decisions_t, shadow_outcomes_t, sleeves_t
 
-DEFAULT_FEE = Decimal("0.0005")  # a taker fee each way, as the backtests charge the paper venue
+DEFAULT_FEE = PAPER_PERP_FEES.taker  # a taker fee each way, the paper venue's published VIP 0 (FEE-LIVE)
 
 
 def _waiting(store) -> list:

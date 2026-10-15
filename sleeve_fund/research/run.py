@@ -127,6 +127,13 @@ def run_store_study(req: StudyRequest, store=None, progress=None, ledger_path: P
     if prices.empty:
         raise ValueError(f"the stored history for {req.pair} has no {_bars(req.minutes)} bars yet")
     fees = resolve_fees(profile.name, store)
+    if profile.fee_bounds:  # FEE-LIVE: never below the published VIP 0, with the account's own rate said beside it
+        from dataclasses import replace
+
+        from sleeve_fund import venue_terms
+
+        floor = venue_terms.research_fees(store, profile, req.pair)
+        fees = replace(fees, fees=floor.fees, words=floor.text)
     spread = spreads.series(profile.name, req.pair, store)  # each run charges the one in force at each time
     base, quote = req.pair.split("/")
     # Price decimals from the stored prices, as the backtest page does: the default 2 rounded every
