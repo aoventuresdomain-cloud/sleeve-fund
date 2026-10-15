@@ -1223,6 +1223,12 @@ def is_dust(book: dict) -> bool:
     return 1e-12 < abs(book["qty"]) and abs(book["qty"]) * (book["entry_px"] or 0) < DUST_NOTIONAL
 
 
+def qty_words(qty: Decimal) -> str:
+    """A quantity as words read it, the same on every engine: Postgres hands a NUMERIC back at the column's scale
+    (1.000000000E-9), SQLite as 1E-9; plain digits either way, never an exponent (TEC-DUST-FMT)."""
+    return format(qty.normalize(), "f")
+
+
 def replay_book(fills, starting_balance, funding=0, insurance=0) -> dict:
     """Cash, signed position and average entry from fills in time order, plus funding received and any
     shortfall the venue's insurance fund took.
@@ -1531,6 +1537,17 @@ def _no_own_capital(store, name: str, starting_balance) -> None:
     if not is_backtest(name) and to_decimal(starting_balance or 0) != 0 and _fund_held(store):
         raise ValueError(f"Strategy {name} can't be made with {to_decimal(starting_balance):,.2f}: the fund holds the "
                          "cash, so a Strategy has no capital of its own; make it with 0")
+
+
+def check_own_capital(store, name: str, starting_balance) -> None:
+    """F-ZS-1 (HoE, Drop A): until the fund holds the cash a Strategy is its own fund, so one with no balance of its own
+    could only halt on its first bar. It is refused at start (the supervisor, and a --db-sleeve process started by
+    hand) rather than at creation. A saved backtest is neither."""
+    if is_backtest(name) or to_decimal(starting_balance or 0) > 0 or _fund_held(store):
+        return
+    raise ValueError(f"{name} has {to_decimal(starting_balance or 0):,.2f} of its own and the fund doesn't hold the "
+                     "cash yet, so it would have nothing to trade with: until the fund holds the cash a Strategy "
+                     "needs a starting balance above 0")
 
 
 @dataclass(frozen=True)
@@ -2504,7 +2521,7 @@ class Store:
 
         def said() -> str:
             qty = dust_qty[0]
-            dust = f", with dust of {qty} no order can close, which leaves with it" if qty else ""
+            dust = f", with dust of {qty_words(qty)} no order can close, which leaves with it" if qty else ""
             return f"{sleeve} put away ({why}): its equity {seen[0][1]:,.2f} leaves the fund's book{dust}"
 
         # A clean slate's put-away (previous_book) starts a fresh book, so its emptying carries nothing (MUST-F286-H4)
