@@ -92,17 +92,28 @@ def test_since_drops_older_closes(store):
     assert [r["order_id"] for r in store.closing_orders("s", since=T + timedelta(minutes=5))] == ["x2"]
 
 
-def test_unfilled_unknown_is_a_status_that_fits_and_is_neither_open_nor_finished(store):
-    assert "unfilled_unknown" in ORDER_STATUSES and len("unfilled_unknown") <= 16
-    # not open: nothing is working at the venue as far as the journal knows; not finished: the venue's own answer
-    # (rejected, cancelled, filled) still lands on it when it comes
-    assert "unfilled_unknown" not in OPEN_ORDER_STATUSES and "unfilled_unknown" not in FINISHED_ORDER_STATUSES
+def test_unfilled_unknown_is_a_terminal_status_that_fits_and_is_never_open(store):
+    """DA sign-off: written only once the order-state check confirmed nothing filled, so it is finished, never open.
+    On Postgres this writes the 16 characters into orders.status, a String(16)."""
+    assert "unfilled_unknown" in ORDER_STATUSES and len("unfilled_unknown") == 16
+    assert "unfilled_unknown" in FINISHED_ORDER_STATUSES and "unfilled_unknown" not in OPEN_ORDER_STATUSES
     _order(store, "x1", "stop_loss", 1)
     store.update_order("x1", status="unfilled_unknown", message="not found at the venue; nothing filled")
     assert [(r["status"], r["message"]) for r in store.closing_orders("s")] == [
         ("unfilled_unknown", "not found at the venue; nothing filled")]
-    store.update_order("x1", status="rejected", message="late reject")
-    assert store.closing_orders("s")[0]["status"] == "rejected"
+    store.update_order("x1", status="accepted")  # a late "accepted" never reopens it
+    assert store.closing_orders("s")[0]["status"] == "unfilled_unknown"
+
+
+def test_a_late_fill_on_an_unfilled_unknown_close_still_lands_and_breaks_the_streak(store):
+    _order(store, "x1", "stop_loss", 1)
+    store.update_order("x1", status="rejected", message="no")
+    _order(store, "x2", "stop_loss", 2)
+    store.update_order("x2", status="unfilled_unknown", message="not found")
+    store.update_order("x2", fill_qty=0.1, fill_px=60_000.0)
+    row = store.orders("s", limit=1)[0]
+    assert row["order_id"] == "x2" and float(row["filled_qty"]) == pytest.approx(0.1)
+    assert [r["status"] for r in store.closing_orders("s")] == ["rejected", "filled"]
 
 
 def test_a_refused_close_writes_its_warning_event(store):

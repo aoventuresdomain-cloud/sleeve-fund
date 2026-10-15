@@ -1251,11 +1251,11 @@ TWO_LEG_FENCE = "isn't built for a two-leg Strategy yet, so nothing was changed"
 # Backtest names can't collide with a strategy's: those are lower-case letters, digits and dashes.
 BACKTEST_PREFIX = "bt:"
 # "triggered": paper's watched stop (not an order at the venue) when it fired, its market stop-loss sent for it.
-# "unfilled_unknown" (F-RX-1): the order-state check could not find the order at the venue and confirmed nothing filled.
-# Neither open nor finished: the venue's own answer (rejected, cancelled, filled) still lands on it when it comes.
+# "unfilled_unknown" (F-RX-1, DA): the order-state check could not find the order at the venue and confirmed nothing
+# filled. Finished, never open; a late fill still lands on it, and its gate room is released as a reject's.
 ORDER_STATUSES = ("submitted", "accepted", "partially_filled", "filled", "canceled", "rejected", "denied", "expired",
                   "triggered", "unfilled_unknown")
-FINISHED_ORDER_STATUSES = ("filled", "canceled", "rejected", "denied", "expired", "triggered")
+FINISHED_ORDER_STATUSES = ("filled", "canceled", "rejected", "denied", "expired", "triggered", "unfilled_unknown")
 OPEN_ORDER_STATUSES = ("submitted", "accepted", "partially_filled")
 # F-C3B-A: a Strategy archived while not yet flat waits for its withdrawal; one with nothing to withdraw says so
 WITHDRAWAL_DEFERRED, WITHDRAWAL_NONE = "withdrawal_deferred", "withdrawal_none"
@@ -2294,8 +2294,8 @@ class Store:
         with led.using(c):
             if fill_qty:
                 led.reduce(rid, fill_qty)
-            reason = {"filled": "fill", "rejected": "reject", "denied": "reject", "canceled": "cancel",
-                      "expired": "cancel"}.get(status)
+            reason = {"filled": "fill", "rejected": "reject", "denied": "reject", "unfilled_unknown": "reject",
+                      "canceled": "cancel", "expired": "cancel"}.get(status)
             if reason in ("reject", "cancel") and order_id in self._retry_held:
                 reason = None  # a two-leg Strategy's second leg: what is left stays reserved for its retry (hand_on)
             if reason is not None:
