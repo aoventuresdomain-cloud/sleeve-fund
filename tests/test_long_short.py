@@ -1397,3 +1397,32 @@ def test_a_liquidation_fill_not_yet_journaled_still_counts_in_x():
     assert not journaled
     # No mark before the short opened: Y's base is the cash the journal had then, the 10,000 it started with.
     assert text.startswith("Position margin lost (liquidated): 9,023.24, 90% of strategy equity at entry"), text
+
+
+@pytest.mark.no_open_risk_limit  # guards off: liquidation mechanics only
+def test_f_fc_3_the_wiped_out_halts_shortfall_is_the_account_below_zero_at_that_price(tmp_path, full_margin,
+                                                                                      monkeypatch):
+    """F-FC-3 (CR, display): a position taken past its bankruptcy price halts while still open with the shortfall
+    the venue's insurance fund will cover, an estimate at that price: the simulated account (equity with the fund's
+    virtual funding back in, CUT-A; none outside the fund) below zero, never more or less, written to the cent."""
+    from sleeve_fund.research.replay import replay
+    from sleeve_fund.store import Store
+    from sleeve_fund.strategies.base import LongFlatStrategy
+
+    seen, real = [], LongFlatStrategy._wiped_out_why
+
+    def spy(self, shortfall=0.0):
+        why = real(self, shortfall)
+        seen.append((shortfall, self._mark()[0] + LongFlatStrategy._funded(self), why))
+        return why
+
+    monkeypatch.setattr(LongFlatStrategy, "_wiped_out_why", spy)
+    store, name, params = Store.in_memory(), "ping-pong-test", {"rise": 0.01, "dip": 0.005, **PERP}
+    gap = tmp_path / "gap.jsonl.gz"
+    _record(gap, _meta(10_000, params), [(5, 0.0), (20, 0.015), (0, 0.6), (5, 0.0)])  # short, then +60%
+    replay(gap, store=store)
+    estimates = [(short, account, why) for short, account, why in seen if short > 0]
+    assert estimates, seen  # the halt while open (mF-1)
+    short, account, why = estimates[0]
+    assert account < 0 and short == pytest.approx(-account, abs=1e-6), estimates[0]
+    assert f"covers the shortfall, about {short:,.2f} at this price" in why
