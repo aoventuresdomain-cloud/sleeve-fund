@@ -16,11 +16,11 @@ from sleeve_fund import supervisor
 from sleeve_fund.store import WITHDRAWAL_DEFERRED, WITHDRAWAL_NONE
 
 
-def _kinds(store, *kinds):
+def _kinds(store, *kinds):  # noqa: F811
     return [e for e in store.events_of(kinds, limit=1_000)]
 
 
-def _round_trip_marked_mid_way(store, name, at):
+def _round_trip_marked_mid_way(store, name, at):  # noqa: F811
     """A round trip whose last mark was taken while it held: the mark's 1 is stale once the sell lands."""
     store.record_fill(name, side="BUY", qty=1.0, price=1_000.0, fee=0.0, order_id="o1", trade_id="t1", ts=at)
     store.record_equity(name, equity=1_000.0, cash=0.0, qty=1.0, price=1_000.0, benchmark=0.0, ts=at)
