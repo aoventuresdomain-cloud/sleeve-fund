@@ -429,3 +429,18 @@ def test_dip_buys_daily_pair_is_fed_only_on_day_closes():
     assert pair.fed == fed
     s._feed_seeds(None, (1, 1, 1, 61_000.0, 1, after + 86_400_000_000_000))
     assert pair.fed == fed + 1
+
+
+def test_a_boundary_indicator_whose_own_warm_up_is_shorter_than_the_agreeing_seed_holds():
+    """The model can't be fed more of a boundary indicator's candles than its warm-up gives it: settled only further
+    back than that, its own reading is the nearer seed, so it holds until a pair agrees live."""
+    from sleeve_fund.strategies.dip_buy import _Ema
+
+    s, events = _dip_buy(201, 600)
+    candles = _walk(600, seed=4, vol=0.03)
+    s._check_seeds([("EMA(20) on daily closes", _Ema(20))], candles, 0, 1440, fed=20)
+    (pair, of, _), = s._seed_pairs.values()
+    assert of == 1440 and pair.fed == 20 and "seeded 20 and 600 bars back" in s._seed_hold
+    s._seed_pairs, s._seed_hold = {}, None
+    s._check_seeds([("EMA(20) on daily closes", _Ema(20))], candles, 0, 1440, fed=400)
+    assert s._seed_hold is None
