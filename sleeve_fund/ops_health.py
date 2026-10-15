@@ -77,6 +77,19 @@ def stopless_at_1x(s) -> bool:
             and leverage_cap(profile, s.params) <= STOPLESS_MAX_LEVERAGE)
 
 
+def _undersized(store, name: str) -> bool:
+    """A15-F2: the stop the journal shows working covers less than the position held (a live stop is a journaled stop
+    for the open quantity). None working at all is judged by the plan, as book_open_risk does."""
+    from sleeve_fund.store import OPEN_ORDER_STATUSES
+
+    working = store.orders(name, statuses=OPEN_ORDER_STATUSES, intents=("stop_loss",), limit=50)
+    if not working:
+        return False
+    # held from the fills, not the last mark: a stop resized with a fill is judged against that same fill
+    held = abs(float(store.journal_book(name, store.sleeve(name).starting_balance)["qty"]))
+    return held > 0 and sum(float(o["qty"]) - float(o["filled_qty"] or 0) for o in working) < held - 1e-12
+
+
 class NoStopWatch:
     """Open perp positions of stop-built Models with no live stop, from the same reader as the dashboard's Open risk
     (open_risk.book_open_risk), so the alert and the tile never disagree on which positions have no stop."""
@@ -92,7 +105,7 @@ class NoStopWatch:
         rows = {r["sleeve"]: r for r in open_risk.book_open_risk(store, lambda s: None)}
         bad = {}
         for name, r in rows.items():
-            if r["basis"] == "stop":
+            if r["basis"] == "stop" and not _undersized(store, name):
                 continue
             s = store.sleeve(name)
             if not stopless_at_1x(s):
@@ -109,6 +122,7 @@ class NoStopWatch:
                 continue
             self.out.add(name)
             what = ("the price has gone through its stop and it is still open" if basis == "gapped"
+                    else "its working stop covers less than the position" if basis == "stop"
                     else "it has no stop in place")
             store.event(name, "error", "position_without_stop",
                         f"Open position without a live stop for {_minutes(now - first)}: {what}. Check it now", ts=now)
