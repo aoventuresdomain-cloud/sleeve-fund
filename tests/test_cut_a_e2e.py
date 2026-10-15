@@ -9,19 +9,12 @@ import pandas as pd
 import pytest
 from test_exposure_gate_xfails import _offline  # noqa: F401
 
-from sleeve_fund import supervisor as _sup
 from sleeve_fund.gate_ledger import DbLedger
 from sleeve_fund.portfolio.gate import PortfolioState
 from sleeve_fund.store import Store
 
-# Red first until PE2's fund-held book is on the head (supervisor.sizing_equity, the simulated account's virtual
-# funding and the replay's netting of it); strict, so the merged head must pass them and drop nothing.
-PE2_BUILT = pytest.mark.xfail(not hasattr(_sup, "sizing_equity"), strict=True,
-                              reason="needs PE2's fund-held book (sizing_equity, virtual funding)")
-
 
 # ---- End to end: a Strategy with a starting balance of 0 inside the fund ---------------------------------------------
-@PE2_BUILT
 @pytest.mark.parametrize("headroom", [10, 1])
 def test_a_zero_balance_strategy_sizes_off_the_fund_fills_pays_its_fee_marks_and_renders(tmp_path, monkeypatch,
                                                                                          headroom):
@@ -64,6 +57,38 @@ def test_a_zero_balance_strategy_sizes_off_the_fund_fills_pays_its_fee_marks_and
     monkeypatch.setattr(app_mod, "TEARSHEETS", tmp_path)
     page = TestClient(app_mod.create_app(store)).get(f"/sleeves/{h.NAME}", auth=("pm", "test-pw"))
     assert page.status_code == 200 and "Traceback" not in page.text and "division" not in page.text.lower()
+
+
+@pytest.mark.parametrize("headroom", [10, 1])
+def test_a_fund_held_losing_trade_books_no_insurance_and_the_fund_falls_by_exactly_the_loss(tmp_path, monkeypatch,
+                                                                                            headroom):
+    """MUST-FUNDCASH-LOSS (HoQA GOLD-FUNDCASH F3): a Strategy made with 0 is below zero after any loss, which is the
+    fund's loss. The insurance fund covers only a simulated account taken past its balance, never an ordinary stop-out:
+    nothing is credited back and the fund's total falls by exactly what the trade lost, fees included."""
+    import test_exposure_gate_xfails as h
+    from test_portfolio_paper_entry import END
+
+    from sleeve_fund import supervisor
+    from sleeve_fund.supervisor import Supervisor
+
+    store = Store(f"sqlite:///{tmp_path}/loss.db", portfolio_gate=True)
+    store.create_sleeve(name=h.NAME, strategy="egx", instrument=h.PAIR, bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=0, risk_profile="balanced", params={**h.PERP, "stop_loss": h.STOP})
+    before = h.STD_T0.to_pydatetime() - pd.Timedelta(hours=1)
+    store.settle_flow(store.fund_flow("deposit", 20_000, actor="pm", reason="QA: the fund's capital", rebase=True,
+                                      now=before), before)
+    Supervisor(store).mark_portfolio(END)
+    t0 = h.STD_T0
+    plan = h.Plan(t0=t0, minutes=18, windows=[(h.M(t0, 2), h.M(t0, 17), 1)],
+                  price=lambda s: 60_000 + s * 0.01 if s < 720 else 58_000.0, balance=20_000.0 * headroom)
+    h.run(tmp_path, store, plan, monkeypatch)
+
+    book = store.journal_book(h.NAME, 0)
+    assert float(book["qty"]) == 0 and float(book["cash"]) < -100, book  # stopped out, flat, at a real loss
+    assert float(store.insurance_total(h.NAME)) == 0.0
+    assert "insurance_fund" not in {e["kind"] for e in h._events(store)}
+    assert float(supervisor.fund_book(store).total) == pytest.approx(20_000 + float(book["cash"]), abs=0.01)
+    assert abs(supervisor.identity_gap(store)) <= D("0.01")
 
 
 @pytest.mark.parametrize("age, sized", [(59, True), (61, False)])

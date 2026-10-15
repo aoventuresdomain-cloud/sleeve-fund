@@ -10,26 +10,19 @@ Red first on 3a272149 (the per-Strategy halt in force; paper sized off its own e
 from __future__ import annotations
 
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal as D
 from types import SimpleNamespace
 
 import pytest
 
-from sleeve_fund import supervisor as _sup
 from sleeve_fund.gate_ledger import DbLedger
 from sleeve_fund.paper.runtime import SleeveRuntime
 from sleeve_fund.portfolio.gate import PortfolioState
 from sleeve_fund.store import Store
 from sleeve_fund.strategies.base import LongFlatStrategy
 
-# Red first until PE2's fund-held book is on the head (supervisor.sizing_equity, the simulated account's virtual
-# funding and the replay's netting of it); strict, so the merged head must pass them and drop nothing.
-PE2_BUILT = pytest.mark.xfail(not hasattr(_sup, "sizing_equity"), strict=True,
-                              reason="needs PE2's fund-held book (sizing_equity, virtual funding)")
-
-
-T0 = datetime(2025, 10, 3, 9, 0, tzinfo=timezone.utc)
+T0 = datetime(2025, 10, 3, 9, 0, tzinfo=UTC)
 HELD = {"cash": 0.0, "qty": 1.0}
 
 
@@ -126,7 +119,6 @@ def test_a_fund_held_strategy_never_falls_back_to_its_own_equity():
     assert LongFlatStrategy._sizing_base(s, 0.0) == 19_887.78
 
 
-@PE2_BUILT
 def test_a_gain_not_yet_taken_anywhere_in_the_fund_never_sizes_an_entry_up(tmp_path):
     """TEC-QD-CUTA (HoE): base = deposits net of withdrawals + realised + min(0, unrealised). A Strategy holding 10 from
     1,000, marked at 1,200, adds 2,000 of unrealised gain to the fund's mark; the next entry anywhere sizes off the
@@ -158,7 +150,85 @@ def test_the_fund_figure_is_pe2s_reader_once_it_is_there(tmp_path, monkeypatch):
     import sleeve_fund.supervisor as sup
 
     s = SimpleNamespace(runtime=SimpleNamespace(store=None, now=lambda: T0), log=SimpleNamespace(warning=print))
-    monkeypatch.setattr(sup, "sizing_equity", lambda store, now=None: D("18000"), raising=False)
+    monkeypatch.setattr(sup, "sizing_equity", lambda store, now=None: D(18000), raising=False)
     assert LongFlatStrategy._paper_fund_equity(s) == 18_000.0
     monkeypatch.setattr(sup, "sizing_equity", lambda store, now=None: None, raising=False)
     assert LongFlatStrategy._paper_fund_equity(s) is None
+
+
+# ---- MUST-FUNDCASH-LOSS: who keeps the shortfall cover (CR F-FC-1, F-FC-2) ------------------------------------------
+@pytest.mark.parametrize("held, rebased, bridged", [(True, True, True), (True, False, False), (False, True, False),
+                                                    (False, False, False)])
+def test_only_a_fund_held_strategy_after_the_re_base_loses_its_own_shortfall_cover(tmp_path, held, rebased, bridged):
+    """Before the PM's re-base deposit a Strategy still carries its own capital (F-FC-1), and one outside the fund's
+    book keeps its own account after it (F-FC-2): both keep the cover. Only a fund-held one after the bridge doesn't."""
+    store = _store(tmp_path, True)
+    if rebased:
+        store.settle_flow(store.fund_flow("deposit", 20_000, actor="pm", reason="QA", rebase=True, now=T0), T0)
+    s = SimpleNamespace(runtime=SimpleNamespace(fund_held=held, store=store))
+    assert LongFlatStrategy._fund_bridged(s) is bridged
+
+
+@pytest.mark.parametrize("bridged, credit", [(True, 0.0), (False, 250.0)])
+def test_a_book_below_zero_once_flat_is_covered_only_outside_the_bridged_fund(monkeypatch, bridged, credit):
+    rows = []
+    monkeypatch.setattr(LongFlatStrategy, "_fund_bridged", lambda self: bridged)
+    s = SimpleNamespace(_mark=lambda: (-250.0, -250.0, 0.0, 60_000.0), _cash_adj=0.0,
+                        insurance_log=[], clock=SimpleNamespace(utc_now=lambda: T0),
+                        runtime=SimpleNamespace(name="s1", now=lambda: T0, store=SimpleNamespace(
+                            record_insurance=lambda *a, **k: rows.append(k) or "new", event=lambda *a, **k: None)))
+    LongFlatStrategy._cover_shortfall(s, 60_000.0, ("o1", "t1"))
+    assert s._cash_adj == credit and len(rows) == (1 if credit else 0)
+
+
+# ---- MARK-ON-STOP inside the fund: the stop marks a Strategy whose own equity is below zero --------------------------
+@pytest.mark.parametrize("funded, marked", [(200_000.0, True), (0.0, False)])
+def test_the_stop_marks_a_fund_held_strategy_below_zero_and_skips_a_wiped_out_one(funded, marked):
+    """A fund-held Strategy's own equity starts at 0, so after a loss it is below zero: its P&L, not a book that can't
+    be valued. Its simulated account (with the fund's virtual funding back in) is what has to be above zero, so its
+    stop still leaves a last mark holding every fill (no tie for the start check). Outside the fund an account at or
+    below zero is wiped out and is not marked, as before."""
+    got = []
+    s = SimpleNamespace(_restore=None, _mark=lambda: (-1_716.15, -1_716.15, 0.0, 58_000.0),
+                        log=SimpleNamespace(warning=print),
+                        runtime=SimpleNamespace(backtest=False, funded=funded, final_mark=lambda **k: got.append(k)))
+    LongFlatStrategy._final_mark(s)
+    assert got == ([{"equity": -1_716.15, "cash": -1_716.15, "qty": 0.0, "price": 58_000.0}] if marked else [])
+
+
+@pytest.mark.parametrize("held, funded, breached", [(True, 200_000.0, False), (False, 0.0, True)])
+def test_a_trade_calls_the_guards_off_the_account_and_inside_the_fund_never_off_its_own_equity(held, funded, breached):
+    """Paper on a perp, on every trade (_guard_breached): a fund-held Strategy holding a position is below zero after
+    its entry's fee alone, and its own halt and pause don't act inside the fund, so neither may call a tick on every
+    trade; its account (the fund's funding back in) and its liquidation distance still do. Outside the fund an
+    account at or below zero still acts at once."""
+    s = SimpleNamespace(_entry_px=60_000.0, _mark=lambda: (-30.0, -6_030.0, 0.1, 60_000.0), pair=None,
+                        _guard_book=lambda e, c, q, p: (e, c, q), _liq_now=lambda c, q: None,
+                        runtime=SimpleNamespace(status="running", fund_held=held, funded=funded, _day_open=0.0, peak=0.0,
+                                                halts=True, profile=SimpleNamespace(min_liquidation_distance=0.1)))
+    assert LongFlatStrategy._guard_breached(s, 60_000.0) is breached
+
+
+def test_inside_the_fund_a_perp_nearing_liquidation_still_calls_the_guards_on_the_trade():
+    """F-GUARD-OWN-EQ (a), HoE: the per-trade call still acts inside the fund when the position is within the profile's
+    distance of its liquidation price (the cut), whatever the Strategy's own equity reads."""
+    s = SimpleNamespace(_entry_px=60_000.0, _mark=lambda: (-30.0, -6_030.0, 0.1, 60_000.0), pair=None,
+                        _guard_book=lambda e, c, q, p: (e, c, q), _liq_now=lambda c, q: 57_000.0,
+                        runtime=SimpleNamespace(status="running", fund_held=True, funded=200_000.0, _day_open=0.0,
+                                                peak=0.0, halts=True, profile=SimpleNamespace(min_liquidation_distance=0.1)))
+    assert LongFlatStrategy._guard_breached(s, 60_000.0) is True  # 5% from liquidation, inside the 10% distance
+    s._liq_now = lambda c, q: 40_000.0
+    assert LongFlatStrategy._guard_breached(s, 60_000.0) is False  # 33% away: nothing to act on
+
+
+def test_inside_the_fund_an_account_at_or_below_zero_calls_the_guards_on_the_trade_on_its_own():
+    """F-GE-1 (CR): the per-trade call's account check stands alone. A fund-held perp whose simulated account (its own
+    equity with the fund's funding back in) is at or below zero acts on the trade even with no liquidation price near
+    and the Strategy's own halt and pause not asked inside the fund."""
+    s = SimpleNamespace(_entry_px=60_000.0, _mark=lambda: (-30.0, -6_030.0, 0.1, 60_000.0), pair=None,
+                        _guard_book=lambda e, c, q, p: (e, c, q), _liq_now=lambda c, q: None,
+                        runtime=SimpleNamespace(status="running", fund_held=True, funded=30.0, _day_open=0.0, peak=0.0,
+                                                halts=True, profile=SimpleNamespace(min_liquidation_distance=0.1)))
+    assert LongFlatStrategy._guard_breached(s, 60_000.0) is True
+    s.runtime.funded = 31.0
+    assert LongFlatStrategy._guard_breached(s, 60_000.0) is False
