@@ -254,3 +254,16 @@ def stop_drift(row: dict | None, *, side: str, qty, level) -> list[str]:
     if _dec(row.get("qty")) != _dec(qty):
         out.append(f"quantity {row.get('qty')} instead of {qty}")
     return out
+
+
+class TriggerAmendRefused(ValueError):
+    """Advisor STOP-EXEC line 14: an amend through the exchange client that would move a trigger price. The client
+    would send the quantity alone and drop the level without a word, so it is refused instead."""
+
+
+def guard_modify(*, on: bool, trigger_price) -> None:
+    """Raises TriggerAmendRefused for a trigger-price amend while the exchange client is on; the simulated client
+    moves triggers itself, so OFF passes."""
+    if on and trigger_price is not None:
+        raise TriggerAmendRefused(f"a stop's level ({trigger_price}) moves by placing a new stop, then cancelling the "
+                                  "old one: the exchange client's amend would drop the new level")

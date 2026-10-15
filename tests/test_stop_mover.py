@@ -75,7 +75,7 @@ def test_d_never_more_than_two_resting_a_third_move_waits_for_the_earlier_cancel
 
 
 def test_e_a_move_while_the_new_stop_is_still_unconfirmed_waits_too(mover):
-    m, old = mover
+    m, _ = mover
     m.move("61000.0")
     assert m.move("62000.0") == []
 
