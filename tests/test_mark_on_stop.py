@@ -16,7 +16,7 @@ import pytest
 import tests.qa_ir_hub_path_parity_lib as hp
 from sleeve_fund import lifecycle
 from sleeve_fund.paper.runtime import SleeveRuntime
-from sleeve_fund.start_check import FAIL, NOTE, PASS, check_books
+from sleeve_fund.start_check import FAIL, PASS, check_books
 from sleeve_fund.store import Store
 from tests.qa_ir_hub_path_parity_lib import (
     _probe,  # noqa: F401 - autouse: registers the probe strategy
@@ -115,12 +115,14 @@ def test_iv_a_backtest_takes_no_mark_on_stop():
 
 def test_v_without_the_stops_mark_the_start_check_names_the_tie(monkeypatch):
     """A process killed, not stopped: the flatten tick's mark is the latest, in the fill's own second, and doesn't hold
-    it. Not compared, never a FAIL, and not on its own "nothing compared" (HoQA, #289): a NOTE naming the tie."""
+    it. Not compared, and not on its own "nothing compared" (HoQA, #289): a FAIL naming the Strategy and the tie
+    (F289-2, HoE OK 18:48 UK 14 Oct: no start check or re-base is signed off it; compare again after the next mark)."""
     monkeypatch.setattr(SleeveRuntime, "final_mark", lambda self, **k: None, raising=False)
     _, _, store = _stopped_after(monkeypatch, flatten)
     lines = check_books(store).lines
-    assert [r[0] for r in lines] == [NOTE], lines
-    assert "a fill in its latest mark's own second" in lines[0][1] and "which the mark predates" in lines[0][1]
+    assert [r[0] for r in lines] == [FAIL], lines
+    assert lines[0][1].startswith("hubqa: its latest mark predates a fill in the same second") \
+        and lines[0][1].endswith("compare again after the next mark"), lines
 
 
 def _tie(tmp_path, held: float):
@@ -141,9 +143,10 @@ def test_v_a_tie_the_mark_holds_is_compared_and_passes(tmp_path):
     assert [r[0] for r in lines] == [PASS], lines
 
 
-def test_v_a_tie_the_mark_doesnt_hold_is_a_note_not_a_fail(tmp_path):
+def test_v_a_tie_the_mark_doesnt_hold_is_a_fail_naming_the_strategy(tmp_path):
     lines = check_books(_tie(tmp_path, 0.0)).lines
-    assert [r[0] for r in lines] == [NOTE], lines
+    want = "s1: its latest mark predates a fill in the same second (16:56:09 UTC): compare again after the next mark"
+    assert lines == [(FAIL, want)], lines
 
 
 def test_v_a_mark_short_of_a_fill_before_it_names_the_position(tmp_path):
@@ -178,3 +181,99 @@ def test_vi_the_stops_mark_never_pauses_or_halts_on_its_own(tmp_path):
     s = store.sleeve("s1")
     assert s.status == "stopped" and s.paused_until is None and len(store.events("s1")) == events
     assert float(store.last_equity("s1")["equity"]) == 9_650.0
+
+
+# ---- F289-3 (CR #289): the stop's mark, each guard pinned on its own --------------------------------------------------
+def _stopping(mark=lambda: (10_050.0, 4_050.0, 0.1, 60_000.0), restore=None, backtest=False, funded=0.0):
+    from types import SimpleNamespace
+
+    got, warned = [], []
+    s = SimpleNamespace(_restore=restore, _mark=mark, log=SimpleNamespace(warning=warned.append),
+                        runtime=SimpleNamespace(backtest=backtest, funded=funded, final_mark=lambda **k: got.append(k)))
+    return s, got, warned
+
+
+def test_f289_3_the_stop_marks_the_book_as_it_stands():
+    from sleeve_fund.strategies.base import LongFlatStrategy
+
+    s, got, _ = _stopping()
+    LongFlatStrategy._final_mark(s)
+    assert got == [{"equity": 10_050.0, "cash": 4_050.0, "qty": 0.1, "price": 60_000.0}]
+
+
+def test_f289_3_r8_a_mark_that_fails_is_logged_and_never_stops_the_stop():
+    from sleeve_fund.strategies.base import LongFlatStrategy
+
+    def boom():
+        raise RuntimeError("no price yet")
+
+    s, got, warned = _stopping(mark=boom)
+    LongFlatStrategy._final_mark(s)  # no exception out of it
+    assert got == [] and warned == ["no final mark on stop: no price yet"]
+
+
+@pytest.mark.parametrize("why", ["restore", "backtest"])
+def test_f289_3_r6_a_carried_over_book_or_a_backtest_takes_no_stop_mark(why):
+    from sleeve_fund.strategies.base import LongFlatStrategy
+
+    s, got, _ = _stopping(restore=object() if why == "restore" else None, backtest=why == "backtest")
+    LongFlatStrategy._final_mark(s)
+    assert got == []
+
+
+@pytest.mark.parametrize("equity", [0.0, -5.0])
+def test_f289_3_r7_a_wiped_out_account_takes_no_stop_mark(equity):
+    from sleeve_fund.strategies.base import LongFlatStrategy
+
+    s, got, _ = _stopping(mark=lambda: (equity, equity, 0.0, 60_000.0))
+    LongFlatStrategy._final_mark(s)
+    assert got == []
+
+
+@pytest.mark.parametrize("price", [0.0, -1.0])
+def test_f289_3_r4_a_stop_mark_with_no_price_is_not_written(tmp_path, price):
+    store = Store(f"sqlite:///{tmp_path}/m.db")
+    store.create_sleeve(name="s1", strategy="ping_pong", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=10_000)
+    rt = SleeveRuntime(store, "s1", now=lambda: datetime(2026, 10, 15, 1, 0, tzinfo=UTC))
+    rt.on_start(0.0005)
+    rt.final_mark(equity=10_000.0, cash=10_000.0, qty=0.0, price=price)
+    assert store.last_equity("s1") is None
+
+
+def test_f289_3_r2_the_stop_marks_before_the_runtime_stops():
+    from types import SimpleNamespace
+
+    from sleeve_fund.strategies.base import LongFlatStrategy
+
+    order = []
+    s = SimpleNamespace(_drop_kept=lambda: None, _maker={}, cancel_all_orders=lambda i: None, recorder=None,
+                        _cfg=SimpleNamespace(instrument_id=None), clock=SimpleNamespace(timer_names=lambda: []),
+                        _final_mark=lambda: order.append("mark"),
+                        runtime=SimpleNamespace(on_stop=lambda: order.append("runtime stopped")))
+    LongFlatStrategy.on_stop(s)
+    assert order == ["mark", "runtime stopped"]
+
+
+# ---- F289-4 (CR #289): the tie's cash half, and the benchmark's base set once -----------------------------------------
+def test_f289_4_r13_a_tie_whose_position_matches_but_whose_cash_does_not_is_a_fail(tmp_path):
+    store = _tie(tmp_path, 0.1)
+    t = datetime(2026, 10, 14, 16, 56, 9, tzinfo=UTC)
+    store.record_fill("s1", side="BUY", qty=0.0, price=100.0, fee=5.0, order_id="o2", trade_id="t2", ts=t)  # a fee only
+    lines = check_books(store).lines
+    assert [r[0] for r in lines] == [FAIL] and "predates a fill in the same second" in lines[0][1], lines
+
+
+def test_f289_4_r10_the_benchmark_keeps_the_first_marks_price_through_the_stops_mark(tmp_path):
+    store = Store(f"sqlite:///{tmp_path}/b.db")
+    store.create_sleeve(name="s1", strategy="ping_pong", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=10_000)
+    t = [datetime(2026, 10, 15, 1, 0, tzinfo=UTC)]
+    rt = SleeveRuntime(store, "s1", now=lambda: t[0])
+    rt.on_start(0.0)
+    rt.tick(equity=10_000.0, cash=10_000.0, qty=0.0, price=100.0)
+    t[0] += timedelta(minutes=1)
+    rt.final_mark(equity=10_000.0, cash=10_000.0, qty=0.0, price=150.0)
+    assert rt.bench_base_price == 100.0
+    assert store.last_equity("s1")["benchmark"] == pytest.approx(rt.starting_balance * (
+        1 - rt.profile.max_position_pct + rt.profile.max_position_pct * 1.5))

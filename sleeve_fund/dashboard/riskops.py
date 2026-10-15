@@ -10,7 +10,8 @@ from pathlib import Path
 import pandas as pd
 
 from sleeve_fund import backups, markets, risk
-from sleeve_fund.dashboard import trading
+from sleeve_fund.dashboard import legs, trading
+from sleeve_fund.dashboard.legs import label
 from sleeve_fund.store import Store, utcnow
 from sleeve_fund.venues import venue as venue_profile
 
@@ -32,13 +33,18 @@ def risk_view(store: Store, summaries: list[dict], book: dict) -> dict:
         s, p = x["sleeve"], x["profile"]
         peak = store.peak_equity(s.name) or s.starting_balance
         shocks, at_stake = [], most_it_can_lose(x)
+        perp_held = bool(x.get("qty")) and markets.is_perp(s.params)
         for shock in SHOCKS:
             # Signed: a long loses in a fall, a short in a rally, at most what it has at stake (most_it_can_lose).
-            loss = min(x["position_value"] * -shock, at_stake)
+            raw = x["position_value"] * -shock
+            loss = min(raw, at_stake)
             after = x["equity"] - loss
             dd_after = 1 - after / max(peak, x["equity"]) if peak else 0.0
             # A strategy with nothing left (wiped out) can't breach again: it is already halted (m12 fix re-check, mF-3).
-            shocks.append({"loss": loss, "breach": x["equity"] > 0 and dd_after >= p.max_drawdown})
+            shocks.append({"loss": loss, "breach": x["equity"] > 0 and dd_after >= p.max_drawdown,
+                           # A perp whose move reaches what it has at stake is liquidated in the gap (its margin
+                           # and the liquidation fee lost): a two-leg Strategy's other leg is then left unhedged.
+                           "liquidated": perp_held and at_stake > 0 and raw >= at_stake})
         rows.append({
             "x": x,
             "dd_used": x["dd_used"],
@@ -51,14 +57,17 @@ def risk_view(store: Store, summaries: list[dict], book: dict) -> dict:
             "position": pos,
             "shocks": shocks,
         })
+    rows = _fold_pairs(store, rows)
     equity = book["equity"] or 1.0
     scenarios = []
     for i, shock in enumerate(SHOCKS):
-        # The book's P&L is the fund's: a test-account Strategy is outside its book (it still halts on its own limit).
+        # The book's loss is every leg's, a pair's row carrying its two legs' signed sum; a test-account Strategy is
+        # outside the fund's book (it still halts on its own limit).
         loss = sum(r["shocks"][i]["loss"] for r in rows
                    if r["x"]["sleeve"].desired_state == "running" and not r["x"].get("test_account"))
         scenarios.append({"shock": shock, "loss": loss, "pnl": -loss, "loss_pct": loss / equity,
-                          "breaches": [r["x"]["sleeve"].name for r in rows if r["shocks"][i]["breach"]]})
+                          "breaches": [r["x"]["sleeve"].name for r in rows if r["shocks"][i]["breach"]],
+                          "unhedged": [r["x"]["sleeve"].name for r in rows if r["shocks"][i].get("unhedged")]})
     largest = largest_asset(book["allocation"], book["equity"])
     return {"rows": rows, "scenarios": scenarios, "largest": largest,
             **{k: held[k] for k in ("accounts", "book", "unallocated", "margin", "open_risk", "estimated", "through", "left_out", "trailing", "hint", "spot",
@@ -66,6 +75,51 @@ def risk_view(store: Store, summaries: list[dict], book: dict) -> dict:
             "down20": next(sc for sc in scenarios if sc["shock"] == -0.20),
             "up20": next(sc for sc in scenarios if sc["shock"] == 0.20),
             "history": store.events_of(BREACH_KINDS, limit=50)}
+
+
+def _fold_pairs(store: Store, rows: list[dict]) -> list[dict]:
+    """A two-leg Strategy's legs as one row (F-P28-UI1; Independent Quant Advisor, 14 Oct 10:05 UK), at its first
+    leg's place, the legs nested under it (`legs`). Its limits are the summed guard's (ruling E): drawdown from the
+    pair's high-water mark, today's loss from the pair's day start, the profile's limits once on the summed equity.
+    Its cap use is gross, both legs' notional against the Strategy's cap, with no hedge credit (ruling A); each leg
+    keeps its own. A shock is an instant gap: each leg's loss is its own (a perp at most its margin and the
+    liquidation fee), the pair's their signed sum, and the halt is judged on the summed equity. A leg liquidated in
+    the gap leaves the other unhedged, which the row names (`unhedged`)."""
+    by_name = {r["x"]["sleeve"].name: r for r in rows}
+    pairs = {p: n for p, n in legs.legs_of([r["x"]["sleeve"] for r in rows]).items() if p in by_name}
+    second = set(pairs.values())
+    out = []
+    for r in rows:
+        name = r["x"]["sleeve"].name
+        if name in second:
+            continue
+        out.append(_pair_row(store, r, by_name[pairs[name]]) if name in pairs else r)
+    return out
+
+
+def _pair_row(store: Store, first: dict, second: dict) -> dict:
+    x = legs.fold_one(store, first["x"], second["x"])
+    p, pair = x["profile"], x["pair"]
+    day_start = float(pair["day_start_equity"]) if pair.get("day_start_equity") else x["equity"] - x["day_pnl"]
+    x["day_ret"] = x["equity"] / day_start - 1 if day_start else 0.0
+    shocks = []
+    for a, b in zip(first["shocks"], second["shocks"], strict=True):
+        loss = a["loss"] + b["loss"]
+        after = x["equity"] - loss
+        dd_after = 1 - after / x["peak"] if x["peak"] else 0.0
+        shocks.append({"loss": loss, "breach": x["equity"] > 0 and dd_after >= p.max_drawdown,
+                       "liquidated": a["liquidated"] or b["liquidated"],
+                       "unhedged": [n for n, leg in ((1, a), (2, b)) if leg["liquidated"]]})
+    for leg in (first, second):
+        leg["perp"] = markets.is_perp(leg["x"]["sleeve"].params)
+    return {
+        "x": x, "legs": [first, second],
+        "dd_used": x["dd_used"],
+        "day_used": min(max(-x["day_ret"], 0.0) / p.daily_loss, 1.0) if p.daily_loss else 0.0,
+        "headroom": x["room"],
+        "has_stop": first["has_stop"] and second["has_stop"], "stop_dist": None, "position": None,
+        "shocks": shocks,
+    }
 
 
 # Total size turns amber from this share of its limit: a display threshold only, as the gate has the one limit
@@ -240,11 +294,11 @@ def status_items(rows: list[dict], health: dict) -> list[dict]:
     for r in rows:
         s = r["x"]["sleeve"]
         if s.status in ("halted", "error"):
-            bad.append(f"{s.name} is {s.status}" + (f": {s.status_reason}" if s.status_reason else ""))
+            bad.append(f"{label(s.name)} is {s.status}" + (f": {s.status_reason}" if s.status_reason else ""))
         elif s.status == "paused":
-            warn.append(f"{s.name} is paused" + (f": {s.status_reason}" if s.status_reason else ""))
-    bad += [f"{name} is not reporting" for name in health["down"]]
-    bad += [f"{name}'s balance doesn't match the venue's" for name in health["mismatched"]]
+            warn.append(f"{label(s.name)} is paused" + (f": {s.status_reason}" if s.status_reason else ""))
+    bad += [f"{label(name)} is not reporting" for name in health["down"]]
+    bad += [f"{label(name)}'s balance doesn't match the venue's" for name in health["mismatched"]]
     for r in rows:
         s = r["x"]["sleeve"]
         if s.status in ("halted", "error"):
@@ -253,8 +307,8 @@ def status_items(rows: list[dict], health: dict) -> list[dict]:
         used = [(r["dd_used"], "drawdown"), (r["day_used"], "daily loss")]
         share, which = max(used, key=lambda u: u[0])
         if share > NEAR_LIMIT:
-            warn.append(f"{s.name} has used {share:.0%} of its {which} limit")
-    warn += [f"{name} has had no trade or quote from the venue lately" for name in health["stale_feeds"]]
+            warn.append(f"{label(s.name)} has used {share:.0%} of its {which} limit")
+    warn += [f"{label(name)} has had no trade or quote from the venue lately" for name in health["stale_feeds"]]
     if health["backup_issue"]:
         warn.append(health["backup_issue"])
     return [{"level": "bad", "text": t} for t in bad] + [{"level": "warn", "text": t} for t in warn]

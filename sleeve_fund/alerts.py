@@ -9,7 +9,8 @@ Both are set on the server only, never in code:
                           the pings stop, which nothing on this server can do for itself.
 The supervisor runs both, on a thread of their own, so neither the sleeves nor the supervisor's
 loop ever waits on the network. It also raises an alert when the nightly database backup is late or
-failed (BACKUP_DIR, read only), and when the server clock drifts from a time server (sleeve_fund.clock).
+failed (BACKUP_DIR, read only), when the server clock drifts from a time server (sleeve_fund.clock), and
+when the nightly recon finds a dashboard that disagrees with the journal (RECON_DIR, sleeve_fund.nightly_recon).
 
 A send that times out after the far end got it is sent again next minute: a duplicate is the safer
 way to be wrong.
@@ -26,9 +27,9 @@ from datetime import timedelta
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from sleeve_fund import backups, clock
+from sleeve_fund import backups, clock, nightly_recon
 from sleeve_fund.store import Store, utcnow
-from sleeve_fund.wording import no_venues
+from sleeve_fund.wording import leg_name, no_venues
 
 MAX_LINES = 10  # alerts listed in one message; the rest are counted
 TIMEOUT = 8  # per socket read
@@ -85,7 +86,7 @@ def where(url: str | None) -> str:
 def message(events: list[dict]) -> str:
     lines = [f"Multi-Strategy Fund: {len(events)} alert{'s' if len(events) != 1 else ''}"]
     for e in events[:MAX_LINES]:
-        lines.append(f"[{e['level']}] {e['sleeve'] or 'system'}: {no_venues(e['message'])}")
+        lines.append(f"[{e['level']}] {leg_name(e['sleeve']) or 'system'}: {no_venues(e['message'])}")
     if len(events) > MAX_LINES:
         lines.append(f"and {len(events) - MAX_LINES} more on the Alerts page")
     return "\n".join(lines)
@@ -102,6 +103,9 @@ class Forwarder:
         self.store, self.send, self.pinger, self.now = store, send, pinger, now
         self.url, self.ping_url = env.get("ALERT_WEBHOOK_URL") or None, env.get("HEALTHCHECK_PING_URL") or None
         self.backup_dir = Path(env["BACKUP_DIR"]) if env.get("BACKUP_DIR") else None
+        self.recon_dir = Path(env["RECON_DIR"]) if env.get("RECON_DIR") else None
+        self.recon_alert = env.get("NIGHTLY_ALERT") == "on"  # off (the default): a FAIL is journaled, not sent
+        self._recon_tried = None  # the night last tried: a record that can't be written isn't retried every minute
         self.cursor = self._resume()
         self._failing = False
         self._backup_checked = None
@@ -133,6 +137,31 @@ class Forwarder:
         if issue and kind != self._backup_said:
             self.store.event(None, "warning", "backup_problem", issue[1])
         self._backup_said = kind
+
+    def check_recon(self) -> None:
+        """Nightly (sleeve_fund.nightly_recon): every Strategy's dashboard against its journal, read-only, into a dated
+        record. A FAIL is a warning, the level stale data alerts at, once NIGHTLY_ALERT is on; until then (the default)
+        it is journaled as info and reaches no one. A PASS is journaled as info."""
+        now = self.now()
+        if self.recon_dir is None or self.store.url is None or self._recon_tried == now.date():
+            return
+        if not nightly_recon.due(self.recon_dir, now):
+            return
+        self._recon_tried = now.date()
+        try:
+            ok, path, fails = nightly_recon.run(self.recon_dir, self.store.url, now)
+        except OSError as exc:  # the record couldn't be written: the night isn't proven, so it's a fail
+            self.store.event(None, "warning" if self.recon_alert else "info", "recon_failed",
+                             f"nightly recon couldn't write its record in {self.recon_dir}: {type(exc).__name__}")
+            return
+        if ok:
+            self.store.event(None, "info", "recon_passed", f"nightly recon passed: every Strategy's dashboard "
+                             f"matches its journal ({path.name})")
+            return
+        more = f"; and {len(fails) - 3} more" if len(fails) > 3 else ""
+        quiet = "" if self.recon_alert else " (not sent: NIGHTLY_ALERT is off)"
+        self.store.event(None, "warning" if self.recon_alert else "info", "recon_failed",
+                         f"nightly recon FAILED ({path.name}): " + "; ".join(fails[:3]) + more + quiet)
 
     def check_clock(self) -> None:
         """Every CLOCK_CHECK: the server clock's offset from a time server. The first reading is journaled so
@@ -166,6 +195,7 @@ class Forwarder:
     def step(self) -> None:
         self.check_backup()
         self.check_clock()
+        self.check_recon()
         if self.ping_url:
             try:
                 self.pinger(self.ping_url)

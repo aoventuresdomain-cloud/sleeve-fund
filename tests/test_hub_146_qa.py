@@ -27,6 +27,7 @@ and is flat otherwise, so every order is placed by design and only the stop, the
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
@@ -238,7 +239,7 @@ class Run:
 
 def paper(prices, *, enter=5, leave=60, side=1, minutes=1, perp=False, profile="aggressive", stop=0.01, tp=None,
           extra=None, lag=S // 2, gone=frozenset(), away=None, back_at=None, refill_after_live=False, lost=(), recover=None,
-          held=None, heartbeat=None, history=None, warmup=0, end=None, holes=()) -> Run:
+          held=None, heartbeat=None, history=None, warmup=0, end=None, holes=(), trades=None) -> Run:
     """The hub-fed paper node replayed (see the module doc). held=(qty, entry_px, entry_ts_ns): a restart with
     that position in the journal (signed qty), its entry order journaled with this stop and target; heartbeat:
     the previous process's last heartbeat (ns); history: 1-minute Bars for the strategy's history_loader."""
@@ -325,6 +326,8 @@ def paper(prices, *, enter=5, leave=60, side=1, minutes=1, perp=False, profile="
         st = cls(cfg).attach_runtime(runtime)
         if history is not None:
             st.attach_history(history(inst))
+        if trades is not None:  # TEC-GAPDOWN: the venue's trades a replayed stop's minute reads; () serves none
+            st.attach_trade_loader(lambda a, b: [t for t in trades if a <= t[0] < b])
         st.simulated_venue, st.fee_model, st.hub_fed = True, fee_model, True
         engine.add_strategy(st)
         engine.run()
@@ -482,6 +485,17 @@ def tp_model(level: float, side: int) -> float:
     return level * (1 - side * TP_SLIP)
 
 
+NO_TRADES = ()  # TEC-GAPDOWN: the replay's trade loader serves nothing for the stop's minute: GAP-DOWN (c), "extreme"
+
+
+def gapdown_extreme(p, close_minute: int, level: float, side: int) -> float:
+    """TEC-GAPDOWN (Advisor GAP-DOWN (c), HoE 02:34 UK): a stop touched inside the minute closing at close_minute,
+    with no trade data for it, is booked at the worse of its level less TP_SLIP and that minute's adverse extreme (its
+    low for a long, high for a short), derived here from the cell's own prices: seconds [(k-1)*60, k*60)."""
+    sec = np.round(p[(close_minute - 1) * 60:close_minute * 60], 1)  # as the ticks trade it (F-GD-TICK)
+    return min(tp_model(level, side), float(sec.min())) if side > 0 else max(tp_model(level, side), float(sec.max()))
+
+
 def is_modelled(signal: dict | None) -> bool:
     """The replay row says its price is modelled, not a fill: a key or a text value naming it."""
     return any("model" in str(k).lower() or (isinstance(v, str) and "model" in v.lower())
@@ -528,9 +542,12 @@ def assert_na1_price(run: Run, p, what: str, side: int, back: float) -> None:
     elif what == "gap_through_stop":  # Advisor 20:39: a replayed stop books as the backtest: the gap open less TP_SLIP
         gap_open = price_at(p, 7.0)
         assert ex[0] == "stop_loss" and abs(ex[3] / tp_model(gap_open, side) - 1) < 1e-4, (ex, tp_model(gap_open, side))
-    else:  # Advisor 20:39: the level less max(half spread, 0.05 %)
+    else:  # TEC-GAPDOWN: touched in the minute to 00:08, no trades served: GAP-DOWN (c), the minute's extreme
         level = entry * (1 - side * 0.01)
-        assert ex[0] == "stop_loss" and abs(ex[3] / tp_model(level, side) - 1) < 1e-4, (ex, tp_model(level, side))
+        want = gapdown_extreme(p, 8, level, side)
+        assert ex[0] == "stop_loss" and abs(ex[3] / want - 1) < 1e-4, (ex, want)
+        (o,) = filled_orders(run, ex[0])
+        assert (o["signal"] or {}).get("fill_source") == "extreme", o["signal"]
     (o,) = filled_orders(run, ex[0])
     assert is_modelled(o["signal"]), o["signal"]  # Advisor 20:39: every replayed exit row is marked modelled
     found = {k: v for k, v in (o["signal"] or {}).items() if "return" in k.lower()}
@@ -545,7 +562,8 @@ def test_c1_reconnect_long_outage_late_refills_exit_on_the_missed_high_low(label
     booked at the NA-1 price (assert_na1_price). Rewritten after the Advisor's NA-1 ruling: it used to accept the
     market-on-return price."""
     p = _outage_prices(what, side, 30)
-    run = paper(p, side=side, perp=perp, profile=profile, tp=0.02, leave=25, gone=GONE, away=AWAY, back_at=BACK)
+    run = paper(p, side=side, perp=perp, profile=profile, tp=0.02, leave=25, gone=GONE, away=AWAY, back_at=BACK,
+                trades=NO_TRADES)
     seq = run.sequence()
     assert seq[0][0] == "entry" and seq[0][2] == minute(5)
     assert first_exit(seq)[0] == ("take_profit" if what == "target" else "stop_loss"), seq
@@ -656,7 +674,7 @@ def test_c1_restart_checks_the_stored_minutes_since_the_last_heartbeat(label, pe
     and lows are checked, adverse first in one minute, and the exit is booked at the NA-1 price (assert_na1_price).
     Rewritten after the Advisor's NA-1 ruling: it used to accept the market-on-return price."""
     p = _outage_prices(what, side, 40)
-    run = restart(p, 6, 12, side=side, perp=perp, profile=profile, tp=0.02, leave=30)
+    run = restart(p, 6, 12, side=side, perp=perp, profile=profile, tp=0.02, leave=30, trades=NO_TRADES)
     seq = run.sequence()
     if what == "nothing":
         assert first_exit(seq)[0] == "exit" and first_exit(seq)[2] == minute(30) and not run.kinds("outage_exit")
@@ -1049,12 +1067,13 @@ NA_IDS = [s[0] for s in NA_SETUPS]
 ENTRY_PX = BASE * (1 + 1e-7 * 300)  # the price at 00:05, where the probe's entry fills
 
 
-def _outage(path, p, *, side, perp, profile, tp=None, stop=0.01, leave=25, qty=0.05, history=None):
+def _outage(path, p, *, side, perp, profile, tp=None, stop=0.01, leave=25, qty=0.05, history=None, trades=None):
     if path == "reconnect":
         return paper(p, side=side, perp=perp, profile=profile, tp=tp, stop=stop, leave=leave, gone=GONE, away=AWAY,
-                     back_at=BACK)
+                     back_at=BACK, trades=trades)
     kw = {} if history is None else {"history": history}
-    run = restart(p, 6, 12, side=side, perp=perp, profile=profile, tp=tp, stop=stop, leave=leave, qty=qty, **kw)
+    run = restart(p, 6, 12, side=side, perp=perp, profile=profile, tp=tp, stop=stop, leave=leave, qty=qty,
+                  trades=trades, **kw)
     return run
 
 
@@ -1077,12 +1096,22 @@ def _gap_prices(side):
 @pytest.mark.parametrize("path", ["reconnect", "restart"])
 def test_l6_na1_an_outage_stop_fills_at_its_level_like_the_backtest(path, label, perp, profile, side):
     p = shape(flat_prices(30), 7.5, 7 + 50 / 60, adverse(side, 0.02))
-    run = _outage(path, p, side=side, perp=perp, profile=profile, tp=0.02)
+    run = _outage(path, p, side=side, perp=perp, profile=profile, tp=0.02, trades=NO_TRADES)
     ex = first_exit(run.sequence())
-    level = _entry(run) * (1 - side * 0.01)  # Advisor 20:39: the level less TP_SLIP, the row marked modelled
-    assert ex[0] == "stop_loss" and abs(ex[3] / tp_model(level, side) - 1) < 1e-4, (ex, tp_model(level, side))
+    level = _entry(run) * (1 - side * 0.01)
+    # TEC-GAPDOWN: no trades for the minute to 00:08, so GAP-DOWN (c): the worse of the level less TP_SLIP and that
+    # minute's extreme, the row marked modelled
+    want = gapdown_extreme(p, 8, level, side)
+    assert ex[0] == "stop_loss" and abs(ex[3] / want - 1) < 1e-4, (ex, want)
     (o,) = filled_orders(run, "stop_loss")
-    assert is_modelled(o["signal"]), o["signal"]
+    assert is_modelled(o["signal"]) and o["signal"].get("fill_source") == "extreme", o["signal"]
+    # One-sided parity (GAP-DOWN 2: paper may be worse than the backtest, never better): the backtest books the touch
+    # at the level less TP_SLIP; paper is at or below that for a long (above for a short), and by no more than the
+    # gap through the level this cell's prices make in that minute.
+    bt = tp_model(level, side)
+    through = side * (bt - want)
+    assert side * (bt - ex[3]) >= -1e-6 * bt, ("paper booked better than the backtest", ex[3], bt)
+    assert side * (bt - ex[3]) <= through + 1e-6 * bt, ("paper worse than the gap through the level", ex[3], want)
     # The backtest-side comparison moved to test_na1_the_backtest_books_a_stop_at_its_level_less_the_slippage_floor
     # (strict xfail until D13 lands), not a loosened tolerance here.
 
@@ -1229,11 +1258,55 @@ def test_l8_na3_a_missed_minute_opening_beyond_liquidation_liquidates(path, labe
 @pytest.mark.parametrize("label, perp, profile, side", LIQ_SETUPS, ids=LIQ_IDS)
 @pytest.mark.parametrize("path", LIQ_PATHS)
 def test_na3_a_minute_opening_short_of_liquidation_takes_the_reachable_stop_first(path, label, perp, profile, side):
-    """Already true on ebe39c5 (the stop is checked, liquidation isn't): pinned. The minute opens flat and wicks
-    beyond liquidation; the 10 % stop is reached first."""
+    """The minute opens flat and wicks beyond liquidation; the 10 % stop is reached first. TEC-GAPDOWN, Advisor ~02:45
+    UK (GAP-DOWN (c) vs NA-3, option B): with no trade data for the minute (explicit), the stop books at the worse of
+    its level less the floor and the minute's extreme, capped one tick short of the liquidation price: the extreme
+    is past it, so the cap books it. No liquidation fill, halt or incident; the one alert says so and names the loss.
+    Outside the fund (this store has no portfolio gate) the loss trips the profile's drawdown halt, as any loss would
+    (Advisor ~03:05 UK: kept)."""
     p = shape(flat_prices(30), 7.25, 7.5, adverse(side, LIQ_DEPTH[profile]))
-    run = _outage(path, p, side=side, perp=perp, profile=profile, stop=0.10, qty=0.25)
-    assert first_exit(run.sequence())[0] == "stop_loss", run.sequence()
+    run = _outage(path, p, side=side, perp=perp, profile=profile, stop=0.10, qty=0.25, trades=NO_TRADES)
+    ex = first_exit(run.sequence())
+    assert ex[0] == "stop_loss", run.sequence()
+    (alert,) = run.kinds("outage_exit")
+    assert alert["level"] == "warning" and "outage fill: pessimistic, capped at liquidation" in alert["message"]
+    # The liquidation price now (_liq_now: the entry's, less the fees taken from the isolated margin), as the alert
+    # states it; cross-checked against the entry's own where the journal carries it.
+    liq = float(re.search(r"past the ([\d,]+\.\d\d) liquidation price", alert["message"]).group(1).replace(",", ""))
+    # C-NA3-LIQ: derived here too, independently of the engine: isolated margin = notional / the profile's leverage
+    # cap, less the entry fee; liquidated where that margin plus the move equals the maintenance margin on the value
+    # there: p = (entry - side x margin / qty) / (1 - side x mm).
+    from sleeve_fund import markets
+
+    (fill,) = [f for f in run.fills if f["order_id"] == filled_orders(run, "entry")[0]["order_id"]]
+    qty, px, fee = float(fill["qty"]), float(fill["price"]), float(fill["fee"])
+    lev, mm = {"balanced": 2.0, "aggressive": 3.0}[profile], markets.LOW_FEE_PERP.maintenance_margin
+    derived = (px - side * (qty * px / lev - fee) / qty) / (1 - side * mm)
+    assert abs(liq / derived - 1) < 0.001, (liq, derived)
+    extreme = np.round(p[7 * 60:8 * 60], 1)
+    assert side * (float(extreme.min() if side > 0 else extreme.max()) - liq) <= 0  # at or past it: branch "capped"
+    assert ex[3] == pytest.approx(liq + side * 0.1, abs=0.006), (ex, liq)  # one tick short of it, never at or past
+    (o,) = filled_orders(run, "stop_loss")
+    assert o["signal"].get("fill_source") == "extreme_capped", o["signal"]
+    assert "inferred loss about " in alert["message"]
+    # No liquidation: no liquidation fill, halt or incident. The loss booked is past the profile's drawdown limit,
+    # so the drawdown halt acts on it as on any loss.
+    assert not [x for x in run.sequence() if x[0] == "liquidation"]
+    assert not [e for e in run.events if "liquidat" in e["kind"] or (e["kind"] == "risk_halt"
+                                                                     and "liquidat" in e["message"].lower())]
+    assert all(e["message"].startswith("drawdown ") for e in run.kinds("risk_halt"))
+
+
+@pytest.mark.parametrize("label, perp, profile, side", LIQ_SETUPS, ids=LIQ_IDS)
+@pytest.mark.parametrize("path", LIQ_PATHS)
+def test_na3_a_minute_opening_past_liquidation_with_no_trade_data_is_still_a_liquidation(path, label, perp, profile,
+                                                                                        side):
+    """Advisor ~02:45 UK: the cap is for a touch inside the minute only; a minute that OPENS at or past the
+    liquidation price is a liquidation (NA-3 order, GAP-LIQ-CAP at bankruptcy), trade data or none."""
+    p = shape(flat_prices(30), 7.0, 8.0, adverse(side, LIQ_DEPTH[profile]))
+    run = _outage(path, p, side=side, perp=perp, profile=profile, stop=0.10, qty=0.25, trades=NO_TRADES)
+    assert first_exit(run.sequence())[0] == "liquidation", run.sequence()
+    assert not filled_orders(run, "stop_loss")
 
 
 # PE2 (stop-safety, master 02845fb6): passes (mark removed)
@@ -1372,7 +1445,7 @@ def _u35_fired(path: str, perp: bool, profile: str, side: int) -> Run:
         return paper(shape(flat_prices(30), 10.5, 30, adverse(side, 0.02)), side=side, perp=perp, profile=profile,
                      leave=25, stop=0.01)
     return _outage("reconnect", shape(flat_prices(30), 7.5, 7 + 50 / 60, adverse(side, 0.02)), side=side, perp=perp,
-                   profile=profile, tp=0.02)
+                   profile=profile, tp=0.02, trades=NO_TRADES)
 
 
 def _the_stop_rows(run: Run) -> tuple[dict, dict]:
@@ -1405,9 +1478,10 @@ def test_u35_a_fired_stop_has_one_watched_row_and_one_filled_market_stop_loss_pr
     if path == "live":  # the market stop-loss records the level it fired at: the watched one
         sig = market["signal"] or {}
         assert sig["entry_px"] * (1 - side * sig["stop_loss"]) == pytest.approx(level, rel=1e-9), (sig, level)
-    else:  # the replay's modelled price: the watched level less TP_SLIP (NA-1, Advisor 20:39)
-        assert is_modelled(market["signal"]), market["signal"]
-        assert abs(market["avg_px"] / tp_model(level, side) - 1) < 1e-4, (market["avg_px"], tp_model(level, side))
+    else:  # TEC-GAPDOWN: the replay's modelled price, GAP-DOWN (c) with no trades served for the minute to 00:08
+        assert is_modelled(market["signal"]) and market["signal"].get("fill_source") == "extreme", market["signal"]
+        want = gapdown_extreme(shape(flat_prices(30), 7.5, 7 + 50 / 60, adverse(side, 0.02)), 8, level, side)
+        assert abs(market["avg_px"] / want - 1) < 1e-4, (market["avg_px"], want)
 
 
 # PE2 (stop-safety, master 02845fb6): passes (mark removed)

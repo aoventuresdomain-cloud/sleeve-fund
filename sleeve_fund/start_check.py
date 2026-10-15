@@ -9,6 +9,8 @@ round. One page, pass or fail:
    the dashboard reads) match the journal (fills, the source of truth) within the reconcile's tolerances, and so does
    the mark's equity, which Book, P&L and Return show. If every Strategy with fills had a fill after its latest mark,
    nothing was compared and the check fails.
+4. Assets. A multi-asset Strategy has a row for every listed asset, and every journal row is keyed to its own row's
+   asset. One failing asset fails, named.
 
 Strictly read-only. It opens the database read-only (SQLite mode=ro; Postgres default_transaction_read_only), never
 the Store's own engine, and imports nothing that places an order or opens a network connection.
@@ -147,16 +149,24 @@ def _qty(x):
     return 0 if x == 0 else float(x)
 
 
-def check_books(store) -> Section:
+CENT = 0.01  # NIGHTLY-RECON (Advisor): a gap of a cent or more between the dashboard and the journal alerts
+
+
+def check_books(store, cent: bool = False) -> Section:
     """The dashboard's figures against the journal, for exactly the Strategies the dashboard's book counts
     (app.current_sleeves: every one but an earlier book's, store.previous_book, which holds the reset runs; an archived
     Strategy still holding stays in the book and is checked). Position and cash come from the latest equity mark
     (book.sleeve_extras); Book, P&L and Return from that mark's own equity column (metrics.sleeve_summary), which must
-    be the journal's cash plus its position at the mark's price (the identity Strategy._mark writes)."""
+    be the journal's cash plus its position at the mark's price (the identity Strategy._mark writes).
+
+    cent (NIGHTLY-RECON): cash and equity must match the journal to under a CENT, not to the reconcile's cent per
+    fill. A Strategy withdrawn from the book with dust no order can close is listed as known (Advisor, FC3BA-28B):
+    the dust left with it, so it is no gap."""
     from sleeve_fund import markets
 
     sec = Section("Dashboard against the journal")
     earlier = store.previous_book()
+    withdrawn = store.withdrawn()
     checked = compared = 0
     late_with_fills = []
     for s in store.sleeves():
@@ -180,7 +190,7 @@ def check_books(store) -> Section:
                           "again after the next mark")
             continue
         # The reconcile's tolerances (SleeveRuntime.reconcile): a cent per fill for cash, float steps for the qty.
-        cash_tol = 0.01 * (1 + 2 * book["fills"])
+        cash_tol = CENT * (1 - 1e-6) if cent else 0.01 * (1 + 2 * book["fills"])
         scale = max(abs(float(last["qty"])), abs(float(book["qty"])))
         qty_tol = max(1e-8, (2 + book["fills"]) * math.ulp(scale))
         d_qty = float(Decimal(repr(float(last["qty"]))) - Decimal(repr(float(book["qty"]))))
@@ -189,14 +199,16 @@ def check_books(store) -> Section:
             # A fill in the mark's own second (the runtime stamps both to the second) that the mark doesn't hold: the
             # tick that sends a flatten marks before its fill is booked (MARK-ON-STOP). Not a wrong book, and not
             # a skip that makes "nothing compared": a tie the mark does hold is compared below, as a tick that books
-            # a fill and then marks in one second is the usual case (HALT-REF-1's re-base reads it).
-            sec.add(NOTE, f"{s.name}: a fill in its latest mark's own second ({last['ts']:%H:%M:%S} UTC), which the "
-                          "mark predates; compare again after the next mark")
+            # a fill and then marks in one second is the usual case (HALT-REF-1's re-base reads it). A FAIL, never a
+            # NOTE (F289-2, HoE 18:48 UK 14 Oct): nothing is signed or re-based off a book the dashboard can't show yet.
+            sec.add(FAIL, f"{s.name}: its latest mark predates a fill in the same second ({last['ts']:%H:%M:%S} UTC): "
+                          "compare again after the next mark")
             continue
         compared += 1
         price, equity = float(last["price"]), float(last["equity"])
         want = float(book["cash"]) + float(book["qty"]) * price
         equity_tol = cash_tol + qty_tol * abs(price) + 4 * math.ulp(max(abs(want), abs(equity)))
+        equity_tol = min(equity_tol, CENT * (1 - 1e-6)) if cent else equity_tol
         what = (f"{s.name}: position {_qty(last['qty']):.12g} vs journal {_qty(book['qty']):.12g}; "
                 f"cash {last['cash']:,.2f} vs journal {book['cash']:,.2f} ({book['fills']} fills)")
         if abs(d_qty) > qty_tol:
@@ -212,12 +224,39 @@ def check_books(store) -> Section:
                           f"{price:,.2f}): the Book and P&L shown are wrong")
         else:
             sec.add(PASS, f"{what}; equity {equity:,.2f}")
+        if s.name in withdrawn and abs(book["qty"]) > 1e-12:
+            sec.add(NOTE, f"{s.name}: known, it left the fund's book holding dust of {_qty(book['qty']):.12g} no "
+                          "order can close, which left with it")
     if not checked:
         sec.add(NOTE, "no Strategy to compare")
     elif not compared and late_with_fills:
         # Every Strategy with a book was skipped: nothing was actually checked, which is not a pass.
         sec.add(FAIL, f"nothing was compared: {'; '.join(late_with_fills)} after the latest mark; run again after "
                       "the next mark")
+    return sec
+
+
+def check_assets(store) -> Section:
+    """A multi-asset Strategy asset by asset (multi-asset spec §7): every listed asset has its row, and every journal
+    row is keyed to its own row's asset (DA 0028's reconcile, store.asset_mismatches). One failing asset fails, named."""
+    sec = Section("Multi-asset Strategies")
+    for s in store.sleeves(include_legs=False):
+        want = list((s.params or {}).get("assets") or [])
+        if not want:
+            continue
+        have = [a["instrument"] for a in store.strategy_assets(s.name)]
+        missing, extra = [a for a in want if a not in have], [a for a in have if a not in want]
+        for a in missing:
+            sec.add(FAIL, f"{s.name}: {a} has no row, so that asset can't trade or be put away")
+        for a in extra:
+            sec.add(FAIL, f"{s.name}: a row trades {a}, which is not on its list")
+        if not missing and not extra:
+            sec.add(PASS, f"{s.name}: {', '.join(want)}, each with its row")
+    for m in store.asset_mismatches():
+        sec.add(FAIL, f"{m['table']} row {m['id']}: {m['sleeve']} is keyed to {m['instrument'] or 'nothing'}, not its "
+                      f"{m['expected'] or 'row (gone)'}")
+    if not sec.lines:
+        sec.add(NOTE, "no multi-asset Strategy; every journal row is keyed to its own asset")
     return sec
 
 
@@ -228,7 +267,8 @@ def run(url: str, environ: dict[str, str] | None = None) -> tuple[bool, str]:
     env = dict(os.environ if environ is None else environ)
     store = read_only_store(url)
     engine = store.engine
-    sections = [check_store(engine), check_keys(env, engine), check_venues(engine), check_books(store)]
+    sections = [check_store(engine), check_keys(env, engine), check_venues(engine), check_books(store),
+                check_assets(store)]
     ok = not any(s.failed for s in sections)
     out = [f"Start check: {'PASS' if ok else 'FAIL'}",
            f"{datetime.now(UTC):%Y-%m-%d %H:%M} UTC, {journal_kind(url)} journal, read-only",

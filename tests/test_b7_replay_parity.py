@@ -277,3 +277,23 @@ def test_dashboard_passes_when_the_page_s_fees_trip_and_equity_are_the_journal_s
 def test_dashboard_fails_an_equity_marked_before_the_last_fill(capfd):
     assert b7.dashboard(_journal(mark_after=False), NAME, T0) == 1
     assert "a mark before the last fill" in capfd.readouterr().out
+
+
+def test_dashboard_leaves_an_old_book_close_out_out_of_the_cash_it_compares_the_trips_with(capfd):
+    """CR F-RN-5: the page pairs trips with Store.insurance, which leaves an old book close-out (RESET-NEG) out, so the
+    cash the trips are held to leaves it out too; it is a transfer, never a trip's P&L. Written mid-trip, the worst case."""
+    from sleeve_fund.store import CLOSE_OUT
+
+    store = _journal()
+    store.create_sleeve(name=f"{NAME}--20261006101219", strategy="ping_pong", instrument="BTC/USDT",
+                        bar_spec="1-MINUTE-LAST-INTERNAL", starting_balance=0.0, params={"market": "perp"},
+                        venue="BINANCE")
+    assert store.close_out_run(f"{NAME}--20261006101219", NAME, D("82.51"), CLOSE_OUT, BAR + timedelta(seconds=30),
+                               "operator", "book_reset_pm", "close-out")
+    cash = store.journal_book(NAME, 10_000.0)["cash"]
+    store.record_equity(NAME, equity=cash, cash=cash, qty=0.0, price=60_030.0, benchmark=10_000.0,
+                        ts=BAR + timedelta(minutes=1, seconds=10))
+    assert b7.dashboard(store, NAME, T0) == 0, capfd.readouterr().out
+    out = capfd.readouterr().out
+    assert "B7 dashboard = journal: PASS" in out
+    assert "an old book close-out of -82.51 left out (a transfer, not a trip's)" in out

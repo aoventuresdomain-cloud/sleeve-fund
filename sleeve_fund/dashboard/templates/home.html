@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "_macros.html" import chip, test_chip, signed, money_signed, usage, spark, pts, tag, cost_share, open_risk_text, open_risk_hint, open_risk_warn, open_risk_room, limits_after %}
+{% from "_macros.html" import chip, test_chip, signed, money_signed, usage, spark, pts, tag, cost_share, open_risk_text, open_risk_hint, open_risk_warn, open_risk_room, limits_after, leg_flag, legs_list %}
 {% from "_reasons.html" import reason_picker %}
 {% from "_positions.html" import positions_table %}
 {% block title %}Portfolio · Multi-Strategy Fund{% endblock %}
@@ -23,7 +23,7 @@
 {% if alerts %}{% set a = alerts[0] %}
 <section class="needs-you" aria-label="Needs you" data-live-forms>
   <span class="tag">Needs you</span>
-  <span class="grow">{% if a.sleeve %}<a href="/sleeves/{{ a.sleeve }}">{{ a.sleeve }}</a>: {% endif %}{{ a.message|no_venues }} <span class="when" title="{{ a.ts|ts }}">{{ a.ts|ago }}</span>{% if alerts|length > 1 %} · <a href="/alerts">{{ alerts|length - 1 }} more</a>{% endif %}</span>
+  <span class="grow">{% if a.sleeve %}<a href="/sleeves/{{ a.sleeve }}">{{ a.sleeve|leg_label }}</a>: {% endif %}{{ a.message|no_venues }} <span class="when" title="{{ a.ts|ts }}">{{ a.ts|ago }}</span>{% if alerts|length > 1 %} · <a href="/alerts">{{ alerts|length - 1 }} more</a>{% endif %}</span>
   <form method="post" action="/alerts/{{ a.id }}/ack"><input type="hidden" name="next" value="/"><button class="secondary" title="Mark as seen">Acknowledge</button></form>
 </section>
 {% endif %}
@@ -103,7 +103,7 @@
       <td title="Notional over book value">{{ h.weight|pct0 }} <span class="wbar" aria-hidden="true"><i style="width:{{ (h.notional / holdings.rows[0].notional * 100 if holdings.rows[0].notional else 0)|round(1) }}%"></i></span></td>
       <td class="num" data-m="hide">{% if h.margin is not none %}{{ h.margin|money }}{% else %}<span class="faint" title="Waiting on the corrected isolated-margin figures">–</span>{% endif %}</td>
       <td class="num">{{ money_signed(h.unrealised) }}</td>
-      <td class="held-by" data-m="hide">{% for p in h.held %}<a href="/sleeves/{{ p.sleeve }}">{{ p.sleeve }}</a>{% if h.crossing %} <span class="muted">{{ 'long' if p.side > 0 else 'short' }}</span>{% endif %}{{ ', ' if not loop.last }}{% endfor %}{% if h.crossing %} <span class="chip warn" title="Strategies hold opposite sides of this instrument">crossing</span>{% endif %}</td></tr>
+      <td class="held-by" data-m="hide">{% for p in h.held %}<a href="/sleeves/{{ p.sleeve }}">{{ p.sleeve|leg_label }}</a>{% if h.crossing %} <span class="muted">{{ 'long' if p.side > 0 else 'short' }}</span>{% endif %}{{ ', ' if not loop.last }}{% endfor %}{% if h.crossing %} <span class="chip warn" title="Strategies hold opposite sides of this instrument">crossing</span>{% endif %}</td></tr>
     {% endfor %}</tbody>
   </table>
   {% else %}<p class="empty" style="padding:4px 18px 16px">No open positions.</p>{% endif %}
@@ -143,7 +143,7 @@
     {% if not summaries %}<tr><td colspan="12" class="empty">Every strategy is archived. <a href="/sleeves/new">Start a new strategy</a> or restore one below.</td></tr>{% endif %}
     {% for x in summaries %}{% set s = x.sleeve %}{% set room = x.room %}
     <tr>
-      <td class="cell-name" data-v="{{ s.name }}"><a href="/sleeves/{{ s.name }}">{{ s.name }}</a><span class="sub2">{{ s.instrument }} · {{ s.strategy|replace('_', ' ') }} · {{ bar_short(s.bar_spec) }}</span></td>
+      <td class="cell-name" data-v="{{ s.name }}"><a href="/sleeves/{{ s.name }}">{{ s.name }}</a>{% if x.legs %} {{ leg_flag(leg_flags.get(s.name)) }}{% endif %}<span class="sub2">{% if x.legs %}Two legs, {{ x.pair.words|lower }}{% else %}{{ s.instrument }}{% endif %} · {{ s.strategy|replace('_', ' ') }} · {{ bar_short(s.bar_spec) }}</span>{{ legs_list(x) }}</td>
       <td data-v="{{ s.status }}" data-m="right">{{ chip(s.status) }}{% if x.mode != 'paper' %} <span class="chip {{ x.mode }}">{{ x.mode|capitalize }}</span>{% endif %}</td>
       <td data-m="hide">{{ spark(x.spark, x.spark_up) }}</td>
       <td class="num" data-v="{{ x.equity }}" data-label="Equity">{{ x.equity|money }}</td>
@@ -166,9 +166,31 @@
   </table>
 </section>
 
+{# F-A1-FUNDLINE: each Strategy's contribution to the fund's return, and the fund line for what no Strategy's closed
+   trades carry, so the rows add up to the fund's total to the cent. #}
+{% if fund_attr %}
+<section class="panel flush" aria-labelledby="attrib-h">
+  <div class="panel-head"><h2 id="attrib-h">Contribution to the fund</h2><span class="hint">{{ fund_attr.label }}{% if fund_attr.fund_start %}, on a book of {{ fund_attr.fund_start|money }} at the start{% endif %}</span></div>
+  <table class="compact fund-attrib">
+    <thead><tr><th>Strategy</th><th class="num">Closed trades</th><th class="num">P&amp;L</th><th class="num">Contribution</th></tr></thead>
+    <tbody>{% for r in fund_attr.rows %}
+      <tr data-attrib="{{ r.name }}"><td><a href="/sleeves/{{ r.name }}?tab=attribution">{{ r.name }}</a></td><td class="num">{{ r.trades }}</td>
+        <td class="num">{{ money_signed(r.pnl) }}</td>
+        <td class="num">{% if r.contribution is not none %}{{ '%+.2f'|format(r.contribution * 100) }}%{% else %}<span class="muted" title="The fund's book has no mark yet">–</span>{% endif %}</td></tr>{% endfor %}
+    {% if fund_attr.total %}
+      <tr data-attrib="_fund"><td title="Open positions, and costs and cash outside any Strategy's closed trades">Fund: open positions, costs and cash</td><td class="num"></td>
+        <td class="num">{{ money_signed(fund_attr.fund.pnl) }}</td><td class="num">{{ '%+.2f'|format(fund_attr.fund.contribution * 100) }}%</td></tr>
+      <tr class="tot" data-attrib="_total"><th scope="row">Fund total</th><td class="num"></td>
+        <td class="num">{{ money_signed(fund_attr.total.pnl) }}</td><td class="num">{{ '%+.2f'|format(fund_attr.total.contribution * 100) }}%</td></tr>
+    {% endif %}</tbody>
+  </table>
+  {% if not fund_attr.total %}<p class="empty" style="padding:4px 18px 16px">The fund's book has no mark yet, so there is no total to add up to.</p>{% endif %}
+</section>
+{% endif %}
+
 {% if archived %}
 <details class="panel archived" id="archived">
-  <summary><strong>Archived strategies ({{ archived|length }})</strong> <span class="muted">stopped and put away; their equity is out of the fund's book{% set kept = (still_counted|length) + (waiting_flat|length) + (nothing_out|length) %}{% if kept %}, except {{ kept }} still in it{% if waiting_flat %} ({{ waiting_flat|length }} waiting to go flat){% endif %}{% endif %}</span></summary>
+  <summary><strong>Archived strategies ({{ archived|length }})</strong> <span class="muted">stopped and put away; none of the fund's book is theirs any more{% set kept = (still_counted|length) + (waiting_flat|length) + (nothing_out|length) %}{% if kept %}, except {{ kept }} still in it{% if waiting_flat %} ({{ waiting_flat|length }} waiting to go flat){% endif %}{% endif %}</span></summary>
   <ul class="feed" style="margin-top:10px">{% for x in archived %}{% set s = x.sleeve %}
     <li><span class="when">{{ x.equity|money }}</span><span class="what"><a href="/sleeves/{{ s.name }}">{{ s.name }}</a>{% if s.name in waiting_flat %} <span class="warn">waiting to go flat: {{ waiting_flat[s.name] }}</span>{% elif s.name in leaving %} <span class="{{ 'warn' if leaving[s.name] else 'muted' }}">{{ leaving[s.name] or 'leaving the fund\'s book at the supervisor\'s next mark' }}</span>{% elif s.name in nothing_out %} <span class="muted">nothing to withdraw (equity {{ nothing_out[s.name]|money }})</span>{% endif %} <span class="muted">{{ s.instrument }} · {{ s.strategy|replace('_', ' ') }} · {{ signed(x.ret) }} since start</span></span></li>{% endfor %}
   </ul>
@@ -203,8 +225,8 @@
     <thead><tr><th>Sent</th><th>Strategy</th><th>Side</th><th>For</th><th class="num">Quantity</th><th>Type</th><th>Status</th><th>Reason</th></tr></thead>
     <tbody>{% for o in working %}
     <tr><td data-m="hide">{{ o.ts|ts }}</td>
-      <td data-m="hide"><a href="/sleeves/{{ o.sleeve }}">{{ o.sleeve }}</a></td>
-      <td><span class="side {{ o.side|lower }}">{{ 'Buy' if o.side == 'BUY' else 'Sell' }}</span> <span class="m-only">{{ o.sleeve }}</span> <span class="muted m-only">{{ o.intent_label }}</span></td>
+      <td data-m="hide"><a href="/sleeves/{{ o.sleeve }}">{{ o.sleeve|leg_label }}</a></td>
+      <td><span class="side {{ o.side|lower }}">{{ 'Buy' if o.side == 'BUY' else 'Sell' }}</span> <span class="m-only">{{ o.sleeve|leg_label }}</span> <span class="muted m-only">{{ o.intent_label }}</span></td>
       <td data-m="hide">{{ tag(o.intent_label, o.intent) }}</td>
       <td class="num" data-m="right">{{ o.qty|qty }}{% if o.filled_qty %}<div class="sub">{{ o.filled_qty|qty }} filled</div>{% endif %}</td>
       <td data-m="hide">{{ o.order_type|capitalize }}</td>
@@ -225,8 +247,8 @@
     <thead><tr><th>Time</th><th>Strategy</th><th>Side</th><th>Instrument</th><th class="num">Quantity</th><th class="num">Price</th><th class="num">Fee</th><th>For</th><th>Reason</th></tr></thead>
     <tbody>{% for f in book_fills %}
     <tr><td data-m="hide">{{ f.ts|ts }}</td>
-      <td data-m="hide"><a href="/sleeves/{{ f.sleeve }}">{{ f.sleeve }}</a>{% if f.sleeve in test_names %} {{ test_chip() }}{% endif %}</td>
-      <td><span class="side {{ f.side|lower }}">{{ 'Buy' if f.side == 'BUY' else 'Sell' }}</span> <span class="m-only">{{ f.sleeve }}</span> <span class="muted m-only">{{ f.ts|ts }}</span></td>
+      <td data-m="hide"><a href="/sleeves/{{ f.sleeve }}">{{ f.sleeve|leg_label }}</a>{% if f.sleeve in test_names %} {{ test_chip() }}{% endif %}</td>
+      <td><span class="side {{ f.side|lower }}">{{ 'Buy' if f.side == 'BUY' else 'Sell' }}</span> <span class="m-only">{{ f.sleeve|leg_label }}</span> <span class="muted m-only">{{ f.ts|ts }}</span></td>
       <td data-m="hide">{{ f.pair }}</td>
       <td class="num" data-m="right">{{ f.qty|qty }} {{ f.pair.split('/')[0] }}<span class="muted m-only"> at {{ f.price|px }}</span></td>
       <td class="num" data-m="hide">{{ f.price|px }}</td>
@@ -247,7 +269,7 @@
     <thead><tr><th>Settled</th><th>Strategy</th><th>Instrument</th><th class="num">Rate</th><th class="num">Position</th><th class="num">Paid / received</th></tr></thead>
     <tbody>{% for f in funding.payments %}
     <tr><td data-m="hide">{{ f.ts|ts }}</td>
-      <td><a href="/sleeves/{{ f.sleeve }}">{{ f.sleeve }}</a>{% if f.sleeve in test_names %} {{ test_chip() }}{% endif %} <span class="muted m-only">{{ f.ts|ts }}</span></td>
+      <td><a href="/sleeves/{{ f.sleeve }}">{{ f.sleeve|leg_label }}</a>{% if f.sleeve in test_names %} {{ test_chip() }}{% endif %} <span class="muted m-only">{{ f.ts|ts }}</span></td>
       <td data-m="hide">{{ f.pair }}</td>
       <td class="num" data-m="hide">{{ '%.4f%%'|format(f.rate * 100) }}</td>
       <td class="num" data-m="hide">{{ 'Short' if f.qty < 0 else 'Long' }} {{ f.qty|abs|qty }}</td>
@@ -255,7 +277,7 @@
     {% endfor %}</tbody>
     <tfoot><tr><th scope="row" colspan="5">Since start, {{ funding.totals|length }} perpetual strateg{{ 'ies' if funding.totals|length != 1 else 'y' }}{% if test_names %}, test accounts not counted{% endif %}</th><td class="num">{{ money_signed(funding.total) }}</td></tr></tfoot>
   </table>
-  {% if funding.totals|length > 1 %}<p class="muted fund-split">{% for t in funding.totals %}<a href="/sleeves/{{ t.sleeve }}">{{ t.sleeve }}</a> {{ money_signed(t.total) }}{{ ' · ' if not loop.last }}{% endfor %}</p>{% endif %}
+  {% if funding.totals|length > 1 %}<p class="muted fund-split">{% for t in funding.totals %}<a href="/sleeves/{{ t.sleeve }}">{{ t.sleeve|leg_label }}</a> {{ money_signed(t.total) }}{{ ' · ' if not loop.last }}{% endfor %}</p>{% endif %}
   {% elif funding.perps %}<p class="empty" style="padding:4px 18px 16px">No funding settled yet. A perpetual position pays or receives it at each funding time while it is open.</p>
   {% else %}<p class="empty" style="padding:4px 18px 16px">No perpetual strategies in the book, so no funding to show.</p>{% endif %}
 </section>
@@ -263,14 +285,14 @@
 
 {# Close sends the strategy's own flatten, as Flatten on its page does: at market, then the strategy pauses. #}
 <div data-live="close-dialogs" data-live-forms>
-{% for p in positions.rows %}{% set s = p.x.sleeve %}{% set base = p.pair.split('/')[0] %}{% set quote = p.pair.split('/')[1] %}
+{% for p in positions.rows if p.leg != 2 %}{% set s = p.x.sleeve %}{% set base = p.pair.split('/')[0] %}{% set quote = p.pair.split('/')[1] %}
 <dialog id="dlg-close-{{ p.sleeve }}" aria-labelledby="dlg-close-{{ p.sleeve }}-h">
   <form method="post" action="/sleeves/{{ p.sleeve }}/command">
-    <h2 id="dlg-close-{{ p.sleeve }}-h">Close {{ p.sleeve }}'s {{ 'short' if p.side < 0 else 'position' }}</h2>
-    <p>{% if s.desired_state != 'running' %}It is stopped, so it starts only to {{ 'buy back' if p.side < 0 else 'sell' }}{% else %}{{ 'Buys back' if p.side < 0 else 'Sells' }}{% endif %} {{ p.qty|abs|qty }} {{ base }} (about {{ p.value|abs|money }} {{ quote }}) at market, paying the taker fee, then pauses the strategy.</p>
+    <h2 id="dlg-close-{{ p.sleeve }}-h">Close {{ p.sleeve }}'s {{ 'legs' if p.leg else ('short' if p.side < 0 else 'position') }}</h2>
+    {% if p.leg %}<p>Closes both legs at market, paying the taker fee on each, then pauses the Strategy.</p>{% else %}<p>{% if s.desired_state != 'running' %}It is stopped, so it starts only to {{ 'buy back' if p.side < 0 else 'sell' }}{% else %}{{ 'Buys back' if p.side < 0 else 'Sells' }}{% endif %} {{ p.qty|abs|qty }} {{ base }} (about {{ p.value|abs|money }} {{ quote }}) at market, paying the taker fee, then pauses the strategy.</p>{% endif %}
     <input type="hidden" name="reason_for" value="close">
     {{ reason_picker('close', 'r-close-' ~ p.sleeve) }}
-    <div class="dlg-actions"><button type="button" class="secondary" data-close>Cancel</button><button name="command" value="flatten" class="danger" data-needs-reason disabled>{{ 'Close to cash and pause' if p.side < 0 else 'Sell to cash and pause' }}</button></div>
+    <div class="dlg-actions"><button type="button" class="secondary" data-close>Cancel</button><button name="command" value="flatten" class="danger" data-needs-reason disabled>{{ 'Close both legs and pause' if p.leg else ('Close to cash and pause' if p.side < 0 else 'Sell to cash and pause') }}</button></div>
   </form>
 </dialog>
 {% endfor %}

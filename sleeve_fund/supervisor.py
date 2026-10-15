@@ -116,6 +116,16 @@ def fund_book(store: Store, since: datetime | None = None) -> FundBook:
     plus every Strategy's cash P&L since then, put away or not (the cash is the fund's), plus its positions at the mark.
     The one book reader for the mark, sizing and the per-poll identity check."""
     since = since if since is not None else bridge_start(store)
+    pnl = positions = Decimal(0)
+    for s in store.sleeves():
+        if _in_book(store, s):
+            pnl += to_decimal(store.strategy_cash_pnl(s.name, since=since), "cash")
+            positions += _position_value(store, s)
+    return FundBook(since, _fund_capital(store, since), pnl, positions)
+
+
+def _fund_capital(store: Store, since: datetime | None) -> Decimal:
+    """The cash put in: applied flows from `since` (fund_book)."""
     flows = [f for f in store.fund_flows() if f["applied_at"] is not None]
     # The capital starts at the re-base flow itself, by journal order, not its time: a flow applied at the same poll
     # but ahead of it in id order went into the book the re-base replaced (PE1's reset cell a3)
@@ -125,12 +135,7 @@ def fund_book(store: Store, since: datetime | None = None) -> FundBook:
         if since is None or (f["id"] >= base if base is not None else f["applied_at"] >= since):
             amount = to_decimal(f["amount"], "amount")
             capital += -amount if f["kind"] == "withdraw" else amount
-    pnl = positions = Decimal(0)
-    for s in store.sleeves():
-        if _in_book(store, s):
-            pnl += to_decimal(store.strategy_cash_pnl(s.name, since=since), "cash")
-            positions += _position_value(store, s)
-    return FundBook(since, capital, pnl, positions)
+    return capital
 
 
 def sizing_equity(store: Store, now: datetime | None = None) -> Decimal | None:
@@ -195,7 +200,9 @@ def positions_breaks(store: Store) -> list[str]:
     # HOLD-STALE-1 (15 Oct 03:59 UK): a Strategy put away (withdrawn, or an earlier book's: a reset run, a clean slate's)
     # keeps the last mark its runtime wrote, which can be a moment behind its closing fill for good. Skipped only when
     # that is all it is: by its stored state, never its name, its journal flat and its last mark from before it was put
-    # away. A put-away Strategy still holding, or marked since, is a real fault and still breaks.
+    # away (its archived() time, else its previous_book() time). Only withdrawn or earlier-book Strategies: one archived
+    # but still waiting for its withdrawal is in the book and checked (F-HS-1). A put-away Strategy still holding, or
+    # marked since, is a real fault and still breaks.
     archived, earlier = store.archived(), store.previous_book()
     out_at = {n: archived.get(n, earlier.get(n)) for n in set(store.withdrawn()) | set(earlier)}
     for s in store.sleeves():
@@ -288,6 +295,91 @@ def resume_identity_hold(store: Store, actor: str, reason: str, now: datetime | 
     store.decide(actor.strip(), IDENTITY_RESUME_ACTION, words, ts=now)
     led.alert("book_identity_resumed", f"The PM resumed new entries after the book check: {words}", now or utcnow())
     return words
+
+
+def fund_state(store: Store, now: datetime | None = None) -> dict:
+    """C7 (the fund state banner on Portfolio Settings, the Strategy page and Portfolio): the one state the fund is in
+    for new trades, read from what the gate itself reads (gate._block), worst first:
+      halt        T5b: flattened and halted until the PM restarts it (portfolio_state.halt_reason)
+      book_check  RECON-B: new entries held until the PM's Resume (identity_hold, latched in the decisions log)
+      brake       T5a: new entries paused until the next day begins (paused_until)
+      stale       the fund's value hasn't been marked for over gate.MARK_STALE, so the gate refuses new entries
+      normal      none of these: no banner
+    Returns {"state", "reason" (the engine's words, None when normal), "since" (when it began, None when unknown),
+    "until" (the brake's end, else None)}. Times are UTC; the page shows them in UK time."""
+    from sleeve_fund.portfolio.gate import block_reason
+
+    now = now or utcnow()
+    led = DbLedger(store, lambda: ())
+    st = led.state()
+
+    def last_event(kind: str) -> datetime | None:
+        rows = store.events_of((kind,), limit=1)
+        return rows[0]["ts"] if rows else None
+
+    if st.halted:
+        return {"state": "halt", "reason": st.halted, "since": last_event("portfolio_halt"), "until": None}
+    if (held := led.identity_hold()) is not None:
+        rows = store.decisions(action=IDENTITY_HOLD_ACTION, limit=1)
+        return {"state": "book_check", "reason": held, "since": rows[0]["ts"] if rows else None, "until": None}
+    hit = block_reason(st, now)
+    if hit is not None and hit[0] == "pause":
+        return {"state": "brake", "reason": st.paused, "since": last_event("portfolio_pause"),
+                "until": st.paused_until}
+    if hit is not None and hit[0] == "portfolio_state_stale":
+        return {"state": "stale", "reason": hit[1], "since": st.mark_ts, "until": None}
+    return {"state": "normal", "reason": None, "since": None, "until": None}
+
+
+def compliance_use(store: Store, version: int | None = None) -> dict:
+    """C2 "In use now": how much of each compliance test the fund uses, on the book the gate checks an entry against
+    (PaperGate: the last mark's equity, every Strategy's position from fund_holdings and every live reservation) and
+    the tests in force (portfolio.compliance.load, or the version named), so a bar equals the gate's own figure to the
+    cent. Keyed by the test's key (compliance_rules.KEYS), each {"test": "T1".."T5", "limit": the money it allows, or
+    None while it is off or the book was never marked, "used": the money used}. "used" is per asset for
+    asset_stop_loss and asset_net (net signed: long > 0; the limit bounds its size), per asset group for
+    type_stop_loss (an asset outside the map under "unmapped"), else one figure. T5's are the loss since the day's
+    start (fund_day_loss) and since the peak or the PM's last Resume (fund_drawdown), 0 when the fund is up.
+    Also "version", "equity" and "marked_at". Raises, as the gate does, when a position can't be read."""
+    from sleeve_fund import compliance_rules as rules
+    from sleeve_fund.money import scale
+    from sleeve_fund.portfolio import compliance
+
+    profile = compliance.load(store, "paper", version)
+    led = DbLedger(store, lambda: ())
+    st = led.state()
+    held = (*fund_holdings(store), *(r.holding for r in led.reservations()))
+    book = Book(st.equity if st.equity is not None else Decimal(0), held)
+    groups = dict(profile.groups or {})
+    zero = Decimal(0)
+
+    def per(key, amount) -> dict[str, Decimal]:
+        out: dict[str, Decimal] = {}
+        for h in held:
+            out[key(h)] = out.get(key(h), zero) + amount(h)
+        return out
+
+    def limit(field: str, base: Decimal | None) -> Decimal | None:
+        ratio = getattr(profile, field)
+        return None if ratio is None or base is None else scale(base, ratio)
+
+    eq = st.equity
+    top = None if eq is None else max(st.reference() or eq, eq)
+    day = st.day_start_equity
+    used = {
+        "asset_stop_loss": per(lambda h: h.underlying, lambda h: h.risk),
+        "type_stop_loss": per(lambda h: groups.get(h.underlying, "unmapped"), lambda h: h.risk),
+        "fund_stop_loss": book.open_risk(),
+        "fund_gross": book.gross(),
+        "asset_net": per(lambda h: h.underlying, lambda h: h.notional),
+        "fund_margin": book.margin(),
+        "fund_day_loss": zero if eq is None or day is None else max(day - eq, zero),
+        "fund_drawdown": zero if top is None else max(top - eq, zero),
+    }
+    base = {"fund_day_loss": day, "fund_drawdown": top}
+    tests = {k: {"test": rules.BY_KEY[k].test, "limit": limit(compliance.FIELD[k], base.get(k, eq)), "used": used[k]}
+             for k in rules.KEYS}
+    return {"version": profile.version, "equity": eq, "marked_at": st.mark_ts, "tests": tests}
 
 
 def free_cash(store: Store, led) -> Decimal:
@@ -836,12 +928,15 @@ class Supervisor:
         refresh, waiting forever. Each one still in the book (not yet withdrawn) has those orders closed and the room
         released (Store.close_dead_orders), but only once its process is confirmed gone: none of ours alive, and its
         single-instance lock free, so no process started elsewhere holds it either. The lock is held while it closes,
-        so none can start meanwhile. Flat ones only, paper only; a failure is said once, and never holds up the rest."""
+        so none can start meanwhile. Flat ones only, paper only; a failure is said once, and never holds up the rest.
+        Only the runs with an order open or room held are looked at (Store.put_away_left_open, F-RRP-5)."""
         from sleeve_fund.paper.single_lock import instance_lock
 
-        withdrawn = self.store.withdrawn()
-        for name in self.store.archived():
-            if name in withdrawn or is_backtest(name):
+        names = self.store.put_away_left_open()  # F-RRP-5: one read, however many runs are put away
+        for gone in set(self._dead_told) - set(names):  # nothing left open: a failure said before is over
+            self._dead_told.pop(gone)
+        for name in names:
+            if is_backtest(name):
                 continue
             runner = name.split("~", 1)[0]  # a leg is traded by its Strategy's own process
             if self.procs.get(runner, Proc()).alive or self.procs.get(name, Proc()).alive:
@@ -1330,7 +1425,8 @@ def book_line(store: Store) -> str:
 
 
 def book_figures(store: Store) -> str:
-    """The book's headline figures as the Portfolio counts them (every strategy not in an earlier book):
+    """The book's headline figures as the Portfolio counts them (every strategy not in an earlier book; once the fund
+    holds the book, its capital and equity are the fund's, F-SC-1):
     starting capital, equity, fees, open positions and the first mark, for the deploy log. A Strategy outside the
     fund's book (F229-6, outside_fund_book) is left out, as fund_equity leaves it out, and named after the figures
     (F-HALTREF-4); so is one whose create waits for the supervisor's next mark (F-ASSIGN-STALE)."""
@@ -1340,12 +1436,29 @@ def book_figures(store: Store) -> str:
     current = [s for s in every if s.name not in outside]
     joining = [n for n in outside if store.joining(n)]  # created on a marked book, its deposit waits (F-ASSIGN-STALE)
     tests = [n for n in outside if n not in joining]
-    start = sum(s.starting_balance for s in current)
-    equity = sum(float((store.last_equity(s.name) or {"equity": s.starting_balance})["equity"]) for s in current)
+    if bridge_start(store) is not None:
+        # F-SC-1: once the fund holds the book its capital is the fund's cash, not any Strategy's balance (each holds
+        # 0), so its figures are the fund's: the cash put in since the re-base and the book as the identity reads it
+        try:
+            book = fund_book(store)
+            start, equity = book.capital, f"{book.total:,.2f}"
+        except RuntimeError:  # F-SC1-1: a held position with no mark; the fund's reader refuses, the log line says so
+            start, unmarked = _fund_capital(store, bridge_start(store)), []
+            for s in store.sleeves():
+                if _in_book(store, s):
+                    try:
+                        _position_value(store, s)
+                    except RuntimeError:
+                        qty = to_decimal(store.journal_book(s.name, s.starting_balance)["qty"], "qty")
+                        unmarked.append(f"{s.name} holds {qty.normalize():f} with no mark")
+            equity = f"not marked ({'; '.join(unmarked)})"
+    else:
+        start = sum(s.starting_balance for s in current)
+        equity = f'{sum(float((store.last_equity(s.name) or {"equity": s.starting_balance})["equity"]) for s in current):,.2f}'
     fees = sum(float(f["fee"]) for s in current for f in store.fills(s.name, limit=1_000_000))
     held = [s.name for s in current if abs(store.journal_book(s.name, s.starting_balance)["qty"]) > 1e-12]
     firsts = [m["ts"] for s in current if (m := store.first_equity(s.name))]
-    return (f"from {start:,.2f}, equity {equity:,.2f}, fees {fees:,.2f}, "
+    return (f"from {start:,.2f}, equity {equity}, fees {fees:,.2f}, "
             f"positions {', '.join(held) or 'none'}, first mark {min(firsts).isoformat() if firsts else 'none'}"
             + (f"; outside the book (a test account): {', '.join(tests)}" if tests else "")
             + (f"; joining the book at the supervisor's next mark: {', '.join(joining)}" if joining else ""))

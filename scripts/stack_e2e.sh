@@ -9,7 +9,28 @@ POSTGRES_PASSWORD=e2e-db-pw
 DASHBOARD_PASSWORD=e2e-dash-pw
 SITE_ADDRESS=localhost
 ENV
-trap 'docker compose logs --no-color --tail=80 supervisor dashboard; docker compose down -v' EXIT
+q() { docker compose exec -T db psql -U sleeve -d sleeve_fund -tAc "$1"; }
+# On the way out: the last lines of the supervisor and dashboard, and (F-E2E-LOG) when the run failed or a Strategy's
+# process crashed, the crashes and every traceback in the supervisor's full log, which its Strategy processes write to;
+# the last 80 lines alone usually miss them.
+on_exit() {
+  local code=$? crashes
+  docker compose logs --no-color --tail=80 supervisor dashboard || true
+  crashes=$(q "select ts, sleeve, message from events where kind = 'process_crash' order by id" 2>/dev/null || true)
+  if [ "$code" -ne 0 ] || [ -n "$crashes" ]; then
+    echo "process crashes: ${crashes:-none}"
+    echo "tracebacks in the supervisor's full log (each with the 5 lines before it):"
+    docker compose logs --no-color --no-log-prefix supervisor 2>/dev/null | traceback_blocks | tail -n 600 || true
+  fi
+  docker compose down -v
+}
+# Each Python traceback, from its "Traceback" line to its exception line, with up to 5 lines before it (since the last).
+traceback_blocks() {
+  awk '/^Traceback \(most recent call last\):/ { print "----"; for (i = (n > 5 ? n - 4 : 1); i <= n; i++) print b[i % 5]; n = 0; t = 1 }
+       t { print; if ($0 !~ /^[ \t]/ && $0 !~ /^Traceback/) t = 0; next }
+       { n++; b[n % 5] = $0 }'
+}
+trap on_exit EXIT
 # The server's volumes predate the non-root image: root-owned, with folders a root process made.
 # Start from that, so the run proves volume-init hands them to the image's user.
 docker compose run --rm --no-deps --build --entrypoint sh volume-init \
@@ -18,7 +39,6 @@ docker compose up -d --build
 # A fresh database is built by the migrations, and the result matches the code.
 docker compose logs --no-color migrate | grep -q "schema: at migration" || { echo "FAIL: migrate did not run"; exit 1; }
 docker compose exec -T supervisor python -m sleeve_fund.schema check
-q() { docker compose exec -T db psql -U sleeve -d sleeve_fund -tAc "$1"; }
 # The supervisor applies configs/clear.toml before it starts; a strategy added before that is put away
 # with the rest. So add SUI only once the supervisor is up (the dashboard can be ready first).
 for i in $(seq 1 90); do
