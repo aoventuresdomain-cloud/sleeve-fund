@@ -166,6 +166,28 @@
   </table>
 </section>
 
+{# F-A1-FUNDLINE: each Strategy's contribution to the fund's return, and the fund line for what no Strategy's closed
+   trades carry, so the rows add up to the fund's total to the cent. #}
+{% if fund_attr %}
+<section class="panel flush" aria-labelledby="attrib-h">
+  <div class="panel-head"><h2 id="attrib-h">Contribution to the fund</h2><span class="hint">{{ fund_attr.label }}{% if fund_attr.fund_start %}, on a book of {{ fund_attr.fund_start|money }} at the start{% endif %}</span></div>
+  <table class="compact fund-attrib">
+    <thead><tr><th>Strategy</th><th class="num">Closed trades</th><th class="num">P&amp;L</th><th class="num">Contribution</th></tr></thead>
+    <tbody>{% for r in fund_attr.rows %}
+      <tr data-attrib="{{ r.name }}"><td><a href="/sleeves/{{ r.name }}?tab=attribution">{{ r.name }}</a></td><td class="num">{{ r.trades }}</td>
+        <td class="num">{{ money_signed(r.pnl) }}</td>
+        <td class="num">{% if r.contribution is not none %}{{ '%+.2f'|format(r.contribution * 100) }}%{% else %}<span class="muted" title="The fund's book has no mark yet">–</span>{% endif %}</td></tr>{% endfor %}
+    {% if fund_attr.total %}
+      <tr data-attrib="_fund"><td title="Open positions, and costs and cash outside any Strategy's closed trades">Fund: open positions, costs and cash</td><td class="num"></td>
+        <td class="num">{{ money_signed(fund_attr.fund.pnl) }}</td><td class="num">{{ '%+.2f'|format(fund_attr.fund.contribution * 100) }}%</td></tr>
+      <tr class="tot" data-attrib="_total"><th scope="row">Fund total</th><td class="num"></td>
+        <td class="num">{{ money_signed(fund_attr.total.pnl) }}</td><td class="num">{{ '%+.2f'|format(fund_attr.total.contribution * 100) }}%</td></tr>
+    {% endif %}</tbody>
+  </table>
+  {% if not fund_attr.total %}<p class="empty" style="padding:4px 18px 16px">The fund's book has no mark yet, so there is no total to add up to.</p>{% endif %}
+</section>
+{% endif %}
+
 {% if archived %}
 <details class="panel archived" id="archived">
   <summary><strong>Archived strategies ({{ archived|length }})</strong> <span class="muted">stopped and put away; their equity is out of the fund's book{% set kept = (still_counted|length) + (waiting_flat|length) + (nothing_out|length) %}{% if kept %}, except {{ kept }} still in it{% if waiting_flat %} ({{ waiting_flat|length }} waiting to go flat){% endif %}{% endif %}</span></summary>

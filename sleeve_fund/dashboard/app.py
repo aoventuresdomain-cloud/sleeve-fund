@@ -306,7 +306,10 @@ def create_app(store: Store | None = None) -> FastAPI:
                     positions=positions, working=working, holdings=bookm.holdings(positions["rows"], book["equity"]),
                     book_fills=trading.book_fills(st(), sleeves + [x["sleeve"] for x in tests]), funding=funding,
                     fill_count=sum(x["fills"] for x in summaries), tests=tests,
-                    test_names={x["sleeve"].name for x in tests}, **_archived_now(request, put_away))
+                    test_names={x["sleeve"].name for x in tests},
+                    # F-A1-FUNDLINE: every Strategy in the book, archived ones too, so the rows add up to the fund.
+                    fund_attr=attribution.fund(st(), [x["sleeve"] for x in summaries], utcnow()),
+                    **_archived_now(request, put_away))
 
     def _archived_now(request: Request, put_away) -> dict:
         """F-C3B-A-UI on the Portfolio: right after an archive, which Strategy went and the fund's book as it now is
