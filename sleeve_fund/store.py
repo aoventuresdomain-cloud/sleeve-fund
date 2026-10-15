@@ -1663,6 +1663,10 @@ RESET_STAYS = {
     gate_reservations_t: ("keyed by the Strategy's id, kept as history; any still active is released as the run is "
                           "put away (its process is stopped first, so its order can't fill), so none from before a "
                           "reset counts against the tests after it"),
+    # No Strategy column: each hangs off a row the reset moves or keeps by id (a move is an UPDATE of its sleeve, so
+    # ids hold), and follows it
+    acks_t: "an ack names its event by id: the event moves with the run, and the ack still points at it",
+    shadow_outcomes_t: "one per gate decision, which stays with the Strategy (above); write-once, never moved",
 }
 STRATEGY_COLUMNS = frozenset({"sleeve", "sleeve_id", "parent", "strategy_id"})
 
