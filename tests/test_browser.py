@@ -722,3 +722,122 @@ def test_the_portfolio_positions_table_fits_a_desktop_with_every_risk_readout(tm
     finally:
         server.should_exit = True
         thread.join(timeout=5)
+
+
+class _Served:
+    """A stand-alone dashboard on its own store, for cells whose Strategies must not join the module's site."""
+
+    def __init__(self, store):
+        import uvicorn
+
+        from sleeve_fund.dashboard import app as app_mod
+
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            self.base = f"http://127.0.0.1:{s.getsockname()[1]}"
+        self.server = uvicorn.Server(uvicorn.Config(app_mod.create_app(store), port=int(self.base.rsplit(":", 1)[1]),
+                                                    log_level="warning"))
+
+    def __enter__(self):
+        threading.Thread(target=self.server.run, daemon=True).start()
+        for _ in range(100):
+            if self.server.started:
+                break
+            time.sleep(0.05)
+        return self.base
+
+    def __exit__(self, *exc):
+        self.server.should_exit = True
+
+
+@pytest.mark.no_maintenance_tables
+@pytest.mark.venue_terms_live
+@pytest.mark.parametrize("width", [1440, 390])
+def test_the_fee_panel_shows_each_row_as_the_engine_reads_it_and_fits(tmp_path, browser, monkeypatch, width):
+    """FEE-LIVE display QA (HoE, head 3): Setup's "Fees and margin tiers in use" in a real browser. A perp with a fresh
+    fee and a 30-hour-old tier table reads amber on the tier row only; a spot Strategy with nothing recorded yet trades
+    on at the published schedule (amber, as the engine reads it), so nothing on the panel is red. No script errors, no venue's name, and the panel
+    fits a desktop and a phone."""
+    import json
+    from datetime import UTC, datetime, timedelta
+    from pathlib import Path
+
+    from sleeve_fund import venue_terms
+    from sleeve_fund.dashboard import app as app_mod
+    from sleeve_fund.store import Store
+    from sleeve_fund.venues import venue
+
+    monkeypatch.setenv("DASHBOARD_PASSWORD", PASSWORD)
+    monkeypatch.setattr(app_mod, "TEARSHEETS", tmp_path)
+    now = datetime.now(UTC)
+    store = Store(f"sqlite:///{tmp_path}/fee.db")
+    store.create_sleeve(name="p1", strategy="ping_pong", instrument="BTC/USDT", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=20_000, venue="BINANCE", params={"market": "perp"})
+    store.create_sleeve(name="k1", strategy="ping_pong", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=10_000, venue="KRAKEN")
+    store.record_venue_fetch("BINANCE", "fee", "BTC/USDT", source=venue_terms.FEE_RATE, ok=True,
+                             account=store.account_of("p1"), at=now - timedelta(hours=2),
+                             bounds=venue("BINANCE").fee_bounds,
+                             payload={"symbol": "BTCUSDT", "maker": "0.0002", "taker": "0.00055"})
+    recorded = json.loads((Path(__file__).parent / "data" / "fee_live" / "risk-limit-BTCUSDT-2026-10-15.json").read_text())
+    store.record_venue_fetch("BINANCE", "tiers", "BTC/USDT", source=venue_terms.RISK_LIMIT, ok=True,
+                             at=now - timedelta(hours=30), payload=venue_terms.tier_payload(recorded["result"], "BTCUSDT"))
+    with _Served(store) as base:
+        ctx = browser.new_context(http_credentials={"username": "pm", "password": PASSWORD},
+                                  viewport={"width": width, "height": 900})
+        page = ctx.new_page()
+        errors = []
+        page.on("pageerror", lambda e: errors.append(f"script error: {e}"))
+        page.goto(f"{base}/setup")
+        page.wait_for_load_state("networkidle")
+        page.click("[data-tab=settings]")
+        panel = page.locator("#fee-terms")
+        assert panel.is_visible()
+        text = panel.inner_text()
+        assert "Fees: 0.02% maker, 0.055% taker" in text and "from the account" in text
+        amber = panel.locator(".warn").all_inner_texts()  # the tier row, and spot's schedule not recorded yet: both trade on
+        assert len(amber) == 2 and "margin tiers" in amber[0] and "over 24 hours" in amber[0], amber
+        assert "not recorded yet" in amber[1], amber
+        assert panel.locator(".loss").count() == 0, panel.locator(".loss").all_inner_texts()
+        assert "Margin tiers: none, a spot market" in text
+        assert not any(v in text.lower() for v in ("binance", "bybit", "kraken"))
+        assert page.evaluate("() => document.documentElement.scrollWidth") <= width
+        box = panel.bounding_box()
+        assert box and box["x"] >= 0 and box["x"] + box["width"] <= width
+        assert errors == []
+        ctx.close()
+
+
+@pytest.mark.parametrize("status", ["paused", "halted"])
+def test_resume_on_a_strategy_page_says_what_happens_and_sends_one_resume(tmp_path, browser, monkeypatch, status):
+    """Resume QA (HoE, head 3): a paused or drawdown-halted Strategy's page offers Resume; the dialog says it trades
+    again on its next signal (a halted one also that its drawdown reference resets to today's equity), and confirming
+    queues exactly one resume and says so, with no script errors."""
+    from sleeve_fund.dashboard import app as app_mod
+    from sleeve_fund.store import Store
+
+    monkeypatch.setenv("DASHBOARD_PASSWORD", PASSWORD)
+    monkeypatch.setattr(app_mod, "TEARSHEETS", tmp_path)
+    store = Store(f"sqlite:///{tmp_path}/resume.db")
+    store.create_sleeve(name="r1", strategy="ping_pong", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=10_000, venue="KRAKEN")
+    store.record_equity("r1", equity=9_500, cash=9_500, qty=0, price=60_000, benchmark=10_000)
+    store.set_desired_state("r1", "running")
+    store.set_status("r1", status, "Drawdown halt: down 15% from its peak" if status == "halted" else "Paused by the PM")
+    with _Served(store) as base:
+        page, errors = _open(browser, f"{base}/sleeves/r1")
+        page.click("button[data-open=dlg-resume]")
+        dialog = page.locator("#dlg-resume")
+        assert dialog.is_visible()
+        words = dialog.inner_text()
+        assert "The strategy trades again on its next signal." in words
+        assert ("drawdown reference resets to today's equity of 9,500.00" in words) is (status == "halted")
+        confirm = dialog.locator("button", has_text="Resume trading")
+        assert confirm.is_disabled()  # waits for the reason, which the decision log keeps
+        dialog.locator("label.opt").first.click()
+        confirm.click()
+        page.wait_for_load_state("networkidle")
+        assert "Resume sent" in page.inner_text("main")
+        assert [c["command"] for c in store.pending_commands("r1")] == ["resume"]
+        assert errors == []
+        page.context.close()

@@ -13,7 +13,7 @@ import time
 
 import pandas as pd
 
-from sleeve_fund.instruments import history_price_decimals
+from sleeve_fund.instruments import history_price_decimals, pct
 from sleeve_fund.research.metrics import (fills_to_rows, max_drawdown, returns_from_equity, summary, trade_stats,
                                           trades)
 from sleeve_fund.research.runner import BOOK_SHARE, run_backtest
@@ -266,7 +266,7 @@ def _fee_view(params: dict, inst, quote_fees) -> dict:
 
     t = markets.terms(params, str(inst.id.venue))
     if t is not None and t.fees is not None:
-        text = f"{t.label}: {t.fees.maker:.2%} maker, {t.fees.taker:.2%} taker"
+        text = f"{t.label}: {pct(t.fees.maker)} maker, {pct(t.fees.taker)} taker"
         return {"maker": float(t.fees.maker), "taker": float(t.fees.taker), "text": text, "short": text,
                 "source": "market"}
     fees = markets.fees_for(params, FeeSchedule(Decimal(str(inst.maker_fee)), Decimal(str(inst.taker_fee))), str(inst.id.venue))

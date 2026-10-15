@@ -67,14 +67,16 @@ LIQUIDATED_WORDS = (fold(WIPED_OUT), "wiped out", "position margin lost")  # a l
 # one, and says what alone clears it; no venue names.
 CODES = ("liquidated", "drawdown_halt", "halted", "portfolio_halt", "daily_pause", "portfolio_pause", "retired",
          "winding_down", "stopped", "paused", "exits_only", "stale_data", "degraded_candle", "funding_missing",
-         "portfolio_stale", "book_moving", "exit_rejects", "account_shared")
+         "portfolio_stale", "book_moving", "exit_rejects", "account_shared", "resting_orphan",
+         "exec_target")
 LABELS = {"liquidated": "Liquidated", "drawdown_halt": "Drawdown halt", "halted": "Halted",
           "portfolio_halt": "Portfolio halted", "daily_pause": "Daily loss pause", "portfolio_pause": "Portfolio paused",
           "retired": "Retired", "winding_down": "Winding down", "stopped": "Stopped",
           "paused": "Paused", "exits_only": "Exits only", "stale_data": "Stale data",
           "degraded_candle": "Degraded candle", "funding_missing": "No funding rate",
           "portfolio_stale": "Portfolio unchecked", "book_moving": "Entry refused",
-          "exit_rejects": "Exits rejected", "account_shared": "Account shared"}
+          "exit_rejects": "Exits rejected", "account_shared": "Account shared", "resting_orphan": "Resting entry",
+          "exec_target": "Order client"}
 # The portfolio gate's entry blocks (portfolio.gate.entry_block's kinds) as CHOKE codes, with the words their own
 # reason starts with, which the label already says.
 PORTFOLIO_CODES = {"halt": ("portfolio_halt", "Portfolio halted: "),
@@ -193,7 +195,8 @@ def blocked_state(sleeve, now: datetime | None = None, *, liquidated: str | None
                   holds: dict[str, str] | None = None, starting: bool = False,
                   since: datetime | None = None, portfolio: Why | None = None,
                   moving: str | None = None, exit_rejects: Why | None = None,
-                  account: Why | None = None) -> tuple[bool, Why | None]:
+                  account: Why | None = None, resting: Why | None = None,
+                  exec_target: Why | None = None) -> tuple[bool, Why | None]:
     """CHOKE (HoE 6 Oct 20:52, Advisor): the one "nothing opens" gate, as (blocked, why). Blocked: liquidated until a
     reset after liquidation (`liquidated`, from the journal: liquidation_head), a halt, the daily-loss pause, retired,
     then (not when `starting`: the supervisor's Stop and the dashboard's Start and Resume, which act on these
@@ -202,7 +205,9 @@ def blocked_state(sleeve, now: datetime | None = None, *, liquidated: str | None
     strategy clears. `moving`: the account a create or move of this Strategy waits to land on at the supervisor's
     next mark (F-ASSIGN-STALE, Advisor ADV-ASSIGN), which no Start or Resume clears either. `exit_rejects`: closing
     orders rejected repeatedly on its instrument anywhere in the fund (exit_reject_block, F-RX-2), cleared only by a
-    close that goes through. The why lists every cause
+    close that goes through. `resting`: ORPHAN-GUARD's block for a resting entry left over or past its bar
+    (resting_block). `account` and `exec_target`: A7's shared account and the order client's key or host
+    mismatch (exec_target_block), each refusing entries only. The why lists every cause
     that applies (Advisor 00:20). The engine checks every order
     that would make the position bigger, at submit and at fill; the supervisor and the dashboard's Start and Resume
     read the same answer. Stops, reduce-only orders, the PM's close and a liquidation are never gated."""
@@ -227,6 +232,10 @@ def blocked_state(sleeve, now: datetime | None = None, *, liquidated: str | None
         causes.append(exit_rejects)
     if account is not None:
         causes.append(account)
+    if resting is not None:
+        causes.append(resting)
+    if exec_target is not None:
+        causes.append(exec_target)
     if not starting:  # Start and Resume act on a stopped or paused strategy: what they can't clear is above
         if "stopped" in (sleeve.status, getattr(sleeve, "desired_state", "running")):
             causes.append(STOPPED)
@@ -377,7 +386,8 @@ def entry_blocked(store, name: str, now: datetime | None = None, *, starting: bo
                          holds=held or None, starting=starting, since=_halted_since(store, name, sleeve),
                          portfolio=portfolio_block(store, now), moving=moving_to(store, name),
                          exit_rejects=exit_reject_block(store, sleeve.instrument, now),
-                         account=account_block(store, name))
+                         account=account_block(store, name), resting=resting_block(store, name, now),
+                         exec_target=exec_target_block())
 
 
 def account_block(store, name: str) -> Why | None:
@@ -399,6 +409,23 @@ def account_block(store, name: str) -> Why | None:
         return None
     return _cause("account_shared", f"account {account} is shared with {', '.join(others)}; one account per Strategy "
                   "is on. Exits and stops still run; move one Strategy to its own account to trade again.")
+
+
+def exec_target_block(environ=None) -> Why | None:
+    """Head 3 (Advisor KEYHOST MUST): while the order client's key or host is wrong (exec_target.problems, the start
+    check's "Order client" FAIL), nothing opens or adds; exits, stops, the liquidation cut and Stop still run. Off
+    (EXEC_MODE unset) or sound: None. Unreadable, it fails closed."""
+    import os
+
+    from sleeve_fund import exec_target
+
+    try:
+        found = exec_target.problems(exec_target.read(os.environ if environ is None else environ))
+    except Exception:  # noqa: BLE001 - fail closed, never an error out of CHOKE
+        found = ["its key and host couldn't be read"]
+    if not found:
+        return None
+    return _cause("exec_target", "; ".join(found) + ". Exits and stops still run; fix the key or host to trade again.")
 
 
 def _live_account(store, account: str) -> bool:
@@ -435,6 +462,18 @@ def moving_to(store, name: str) -> str | None:
     except Exception:  # noqa: BLE001 - fail closed: an unread move refuses entries, never errors out of CHOKE
         return "an account the journal couldn't read"
     return None if move is None else move["account"]
+def resting_block(store, name: str, now: datetime | None = None) -> Why | None:
+    """ORPHAN-GUARD og3/og4 as a CHOKE cause (orphan_guard.resting_block), on a journal under the portfolio gate. One
+    that can't be read blocks, never an error out of CHOKE."""
+    from sleeve_fund.paper import orphan_guard
+
+    if not getattr(store, "portfolio_gate", False):
+        return None
+    try:
+        why = orphan_guard.resting_block(store, name, now or utcnow())
+    except Exception as exc:  # noqa: BLE001 - fail closed
+        why = f"its resting entries couldn't be read ({type(exc).__name__}: {exc})"
+    return None if why is None else _cause("resting_orphan", why)
 
 
 def portfolio_block(store, now: datetime | None = None) -> Why | None:
@@ -552,6 +591,11 @@ class SleeveRuntime:
         # CUT-A (Advisor Q3-MARGIN): what the simulated account was funded with beyond the journal's own cash, a view
         # of the fund's equity so isolated margin can be posted; never journaled, never in the book, netted out here.
         self.funded = 0.0
+        # The kind of venue that ran inside this process (orphan_guard.in_process_kind: "sandbox", "backtest"), set
+        # from its type by whatever builds the node; None for a venue outside it, whose orders a restart never ends.
+        self.in_process_venue: str | None = None
+        # Whether this process holds the strategy's single-instance lock (single_lock.instance_lock); None: not taken.
+        self.sole_instance: bool | None = None
         self._day = None
         self._day_open = None
         self._last_equity = None
@@ -708,12 +752,21 @@ class SleeveRuntime:
         else:
             self._running()
         if not self.backtest:
-            # Paper's venue is simulated in the process, so orders still working when it stopped went
-            # with it; without this they would read "Working" for ever (review round 8, m8-9).
+            # A watched stop (P1-U35) is the process's own watch, never a venue order, so it always went with the
+            # process. Paper's other orders went with it only where the venue's type says it ran in the process
+            # (Advisor 13 Oct 17:35 UK): never on testnet or live. Without this they would read "Working" for ever
+            # (review round 8, m8-9).
+            down = self.store.last_event(self.name, ("owner_down",))
+            seen = f" (owner_down event {down['id']})" if down is not None else ""
             for o in self.store.orders(self.name, statuses=OPEN_ORDER_STATUSES, limit=1000):
-                self.store.update_order(o["order_id"], status="canceled",
-                                        message="cancelled when the strategy restarted: paper's simulated venue "
-                                                "went with the process that sent it")
+                if (o.get("signal") or {}).get("watched"):
+                    self.store.update_order(o["order_id"], status="canceled", message="cancelled when the strategy "
+                                            "restarted: its stop was watched by the process before this one")
+                elif self.in_process_venue is not None:
+                    self.store.update_order(o["order_id"], status="canceled",
+                                            message="cancelled when the strategy restarted: paper's simulated venue "
+                                                    f"({self.in_process_venue}) went with the process that sent it"
+                                                    f"{seen}")
         self._owed_flatten = self._interrupted_flatten()
         if self.book["fills"]:
             self.store.event(self.name, "info", "restore",
@@ -923,7 +976,10 @@ class SleeveRuntime:
                                      moving=None if self.backtest else moving_to(self.store, self.name),
                                      exit_rejects=None if self.backtest or sleeve is None
                                      else exit_reject_block(self.store, sleeve.instrument, self.now()),
-                                     account=None if self.backtest else account_block(self.store, self.name))
+                                     account=None if self.backtest else account_block(self.store, self.name),
+                                     resting=None if self.backtest else resting_block(self.store, self.name,
+                                                                                       self.now()),
+                                     exec_target=None if self.backtest else exec_target_block())
         self._episode(why if blocked else None)
         return blocked, why
 

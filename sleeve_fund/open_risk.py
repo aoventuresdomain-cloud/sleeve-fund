@@ -31,23 +31,41 @@ ATR_DAYS = 14
 ATR_WINDOW = ATR_DAYS * 3  # whole days the daily ATR is measured over, in paper and backtest alike
 
 
-def position_risk(qty, mark, stop=None, atr_pct: float | None = None):
-    """What a position (signed qty) risks at `mark`: to its stop price when it has one, else at the stopless move.
-    Floats in, a float out (the interim check); Decimal qty, mark and stop in, an exact Decimal out (the portfolio
-    gate, through portfolio.holding_for): one formula for both."""
+def position_risk(qty, mark, stop=None, atr_pct: float | None = None, *, taker):
+    """What a position (signed qty) risks at `mark`: to its stop price when it has one, else at the stopless move, plus
+    the taker fee on that exit's notional, |qty| x exit x taker (FEE-LIVE (5), Advisor 15 Oct: T1-T3 count the stop's
+    fee, from the same fee source the fills are charged at). Floats in, a float out (the interim check); Decimal qty,
+    mark, stop and taker in, an exact Decimal out (the portfolio gate, through portfolio.holding_for): one formula for
+    both. The rate is required: one that isn't a rate in [0, 5%) raises, and the caller refuses (fail closed)."""
     exact = isinstance(mark, Decimal)
+    fee = _taker(taker, exact)
     if not qty or mark <= 0:
         return Decimal(0) if exact else 0.0
     if stop is not None and (mark - stop) * qty > 0:
-        return (mark - stop) * qty  # a short (qty < 0) loses as the price rises to its stop
+        return (mark - stop) * qty + abs(qty) * stop * fee  # a short (qty < 0) loses as the price rises to its stop
     # No stop, or one the price has gone through with the position still open (its exit not filled yet): it counts
-    # at the stopless measure, never 0 (Independent Quant Advisor, QA P1-S9).
+    # at the stopless measure, never 0 (Independent Quant Advisor, QA P1-S9), and the fee on that exit.
     if atr_pct is None or not math.isfinite(atr_pct):
         raise ValueError("the daily ATR isn't known, so a position with no stop can't be measured")
     if exact:  # the move from its terms exactly, so 3 x 5% is 15%, not 0.15000000000000002
         move = max(Decimal(repr(STOPLESS_FLOOR)), Decimal(repr(STOPLESS_ATRS)) * Decimal(repr(float(atr_pct))))
-        return abs(qty) * mark * move
-    return abs(qty) * mark * stopless_move(atr_pct)
+        exit_px = mark * (1 - move) if qty > 0 else mark * (1 + move)
+        return abs(qty) * mark * move + abs(qty) * exit_px * fee
+    move = stopless_move(atr_pct)
+    exit_px = mark * (1 - move) if qty > 0 else mark * (1 + move)
+    return abs(qty) * mark * move + abs(qty) * exit_px * fee
+
+
+def _taker(rate, exact: bool):
+    """The taker rate position_risk charges, as a Decimal for the exact path and a float otherwise; raises when it
+    isn't a rate in [0, 5%), as FeeSchedule bounds it."""
+    try:
+        value = Decimal(str(rate)) if rate is not None and not isinstance(rate, bool) else None
+    except ArithmeticError:
+        value = None
+    if value is None or not value.is_finite() or not 0 <= value < Decimal("0.05"):
+        raise ValueError(f"the venue's taker fee rate isn't known ({rate!r}), so the loss at the stop can't include it")
+    return value if exact else float(value)
 
 
 def stopless_move(atr_pct: float) -> float:
@@ -130,6 +148,13 @@ def history_atr_pct(venue: str, pair: str, now: datetime, history=None) -> float
             _ATR_CACHE.pop(next(iter(_ATR_CACHE)))
         _ATR_CACHE[key] = value
     return value
+
+
+def taker_of(store, sleeve):
+    """The taker rate the strategy's exit is charged at (fees.taker_of), as a float for the interim check."""
+    from sleeve_fund.fees import taker_of as taker
+
+    return float(taker(store, sleeve))
 
 
 def _journal_stop(store, sleeve, qty: float) -> float | None:
@@ -215,7 +240,7 @@ def book_open_risk(store, atr_pct, account: str | None = None) -> list[dict]:
             if atr is not None and not math.isfinite(atr):
                 atr = None
         try:
-            risk = position_risk(qty, mark, stop if basis == "stop" else None, atr)
+            risk = position_risk(qty, mark, stop if basis == "stop" else None, atr, taker=taker_of(store, s))
         except ValueError:  # stopless or gapped with no daily ATR: can't be measured
             risk = None
         rows.append({"sleeve": s.name, "risk": risk, "basis": basis, "atr_pct": atr})
@@ -278,5 +303,6 @@ def account_book(store, sleeve_name: str, own_equity: float, atr_pct) -> tuple[f
         if gapped(last["qty"], last["price"], stop):
             through.append(s.name)
         measured = stop is not None and s.name not in through
-        risk += position_risk(last["qty"], last["price"], stop, None if measured else atr_pct(s))
+        risk += position_risk(last["qty"], last["price"], stop, None if measured else atr_pct(s),
+                              taker=taker_of(store, s))
     return book, risk, through

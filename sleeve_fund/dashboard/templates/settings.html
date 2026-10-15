@@ -38,4 +38,20 @@
       <tr><th scope="row">Journal kept</th><td>Everything, indefinitely ({{ '{:,}'.format(counts.equity) }} marks so far)</td></tr>
     </table>
   </section>
+  {% if fee_terms %}{# FEE-LIVE (Advisor FEE-UI): the fee and the margin tiers per instrument, each as the engine reads it (venue_terms.live_terms) #}
+  {% macro state(l) %}<div class="{{ {'refused': 'loss', 'stale': 'warn'}.get(l.state, 'muted') }}">{{ l.words }}</div>{% endmacro %}
+  <section class="panel span-7" id="fee-terms" aria-labelledby="fee-terms-h">
+    <div class="panel-head"><h2 id="fee-terms-h">Fees and margin tiers in use</h2></div>
+    {% if fee_terms.instruments %}<table class="compact kv">
+      {% for i in fee_terms.instruments %}{% set f = i.fee %}
+      <tr><th scope="row">{{ i.instrument }} {{ i.market|lower }}</th><td>
+        {% if f.maker is not none %}<div>Fees: {{ f.maker|rate }} maker, {{ f.taker|rate }} taker</div>{% endif %}
+        {{ state(f) }}
+        {% if f.out_of_range %}<div class="warn">The latest fetched fee was outside the published range and was not used; the last good fee, fetched {{ f.fetched_at|uk }}, is still the one in use.</div>{% endif %}
+        {% set t = i.tiers %}{% if t %}{% if t.tiers is not none %}<div>Margin tiers: {{ t.tiers }} tier{{ 's' if t.tiers != 1 }}</div>{% endif %}
+        {{ state(t) }}{% if t.out_of_range %}<div class="warn">The latest fetched tier table was refused and was not used; the last good one is still in use.</div>{% endif %}{% else %}<div class="muted">Margin tiers: none, a spot market</div>{% endif %}
+      </td></tr>{% endfor %}
+    </table>{% else %}<p class="muted">No Strategy on the book trades an instrument whose fees are followed yet.</p>{% endif %}
+    <p class="hint">Research tests use the standard published fee or higher, never a lower one.</p>
+  </section>{% endif %}
 </div>

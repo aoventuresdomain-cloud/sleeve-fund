@@ -21,7 +21,7 @@ NOW = datetime(2026, 10, 15, tzinfo=UTC)
 def _idea(side, stop_frac=0.02, tp_frac=0.04):
     return {"side": side, "qty": D("0.5"), "close": D(100), "price": D(100), "stop_frac": stop_frac, "tp_frac": tp_frac,
             "what": "entry", "step": D("0.001"), "min_qty": D("0.001"), "instrument": "ETH/USDT", "opens": True,
-            "leverage": None, "atr_pct": None}
+            "leverage": None, "atr_pct": None, "taker": D(0)}
 
 
 def test_the_tagged_intent_carries_the_planned_stop_and_target_on_the_ideas_side():

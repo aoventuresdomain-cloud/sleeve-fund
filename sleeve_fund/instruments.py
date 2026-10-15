@@ -38,6 +38,14 @@ MAX_PRICE_DECIMALS = 9
 MAX_TICK_SHARE = 0.0005  # a price step coarser than 0.05% of the price distorts stops and fills
 
 
+def pct(rate) -> str:
+    """A fee rate as people read it: two decimals of a percent, more where the rate has them (0.055% stays 0.055%,
+    never 0.06%), at most four."""
+    text = f"{float(rate) * 100:.4f}".rstrip("0")
+    whole, _, frac = text.partition(".")
+    return f"{whole}.{frac.ljust(2, '0')}%"
+
+
 def price_decimals(price: float) -> int:
     """Price decimals for an instrument built from stored history, where the venue's own increment isn't
     to hand: 2 at 100 or more, 4 from 1, else at least 6, and enough that a step is at most about 0.01% of

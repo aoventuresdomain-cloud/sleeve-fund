@@ -207,6 +207,7 @@ def _entry_intent(qty="0.1"):
         "instrument": "BTC",
         "leverage": None,
         "atr_pct": None,
+        "taker": D(0),
     }
 
 

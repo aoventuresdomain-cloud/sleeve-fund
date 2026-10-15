@@ -81,8 +81,9 @@ class Intent:
     for the side, the same number sizing used (Advisor 17:20 UK). Per unit of quantity: margin_per_unit (price /
     leverage on a perp, price on spot) and risk_per_unit (from the expected fill to its planned stop, or the stopless
     measure; open_risk.position_risk, as holding_for uses it), from sizing's intent_for. Both are above 0 for any order
-    that raises a position: a zero would switch its limit off, so it is refused (CR208-1). Fees and slippage stay in
-    sizing, out of the open-risk measure (HoE 20:12 UK). step and min_qty: the venue's quantity step and minimum."""
+    that raises a position: a zero would switch its limit off, so it is refused (CR208-1). risk_per_unit includes the
+    taker fee on the stop's notional (Advisor FEE-LIVE 5); slippage stays in sizing. step and min_qty: the venue's
+    quantity step and minimum."""
 
     underlying: str
     side: int

@@ -25,7 +25,15 @@ Verdicts (Advisor 03:05 UK):
 - FOLLOW-UP: a difference that can't make paper accept what the venue refuses: a coarser lot or a higher minimum,
   the funding cap, and the maintenance margin and half spread, which are one constant each and checked by hand
   (VS-1 is due before G2).
-- PASS: equal."""
+- PASS: equal.
+
+With the journal (DATABASE_URL, which the hub container has), each traded pair also gets the venue data FEE-LIVE
+fetched (venue_terms_fetch, its last-known-good row) beside the engine's: "maint. tiers (fetched)" against the kept
+maintenance table, and "taker fee (fetched)" / "maker fee (fetched)" against the fees paper charges on the pair
+(fees.resolve with the instrument and the fetch's account); an account's fetched rate is never printed, the log being public, only whether the engine's is
+equal, higher or lower (the published stand-in's rates print). A tier that differs, or an engine fee below the fetched one (paper cheaper than the venue), is a MUST;
+an engine fee above it is a FOLLOW-UP. Age as FEE-LIVE judges it: over 24 h FOLLOW-UP, over 72 h or never fetched
+MUST. The published stand-in, and a newer fetch that was refused, are FOLLOW-UPs that say so. It only reads them."""
 
 from __future__ import annotations
 
@@ -37,6 +45,7 @@ import sys
 import tomllib
 import urllib.request
 from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from sleeve_fund import markets
@@ -48,6 +57,8 @@ from sleeve_fund.venues import (
 )
 
 TIMEOUT = 30
+STALE, REFUSED = timedelta(hours=24), timedelta(hours=72)  # FEE-LIVE: alert after a day, no new entries after three
+WORST = ("PASS", "FOLLOW-UP", "MUST")
 # The perpetual venues whose published terms this reads: venue name -> (exchangeInfo URL, fundingInfo URL).
 READERS = {"BINANCE": (f"{BINANCE_FAPI}/exchangeInfo", f"{BINANCE_FAPI}/fundingInfo")}
 
@@ -147,13 +158,110 @@ def rows(pair: str, info: dict, funding: dict, inst) -> list[tuple[str, object, 
     return out
 
 
+def _worst(*verdicts: str) -> str:
+    return max(verdicts, key=WORST.index)
+
+
+def _age(row: dict, now: datetime) -> tuple[str, str]:
+    """(verdict, words) for a good fetch's age, as FEE-LIVE judges it."""
+    at = row["fetched_at"]
+    at = at if at.tzinfo else at.replace(tzinfo=UTC)
+    age = now - at
+    words = f"fetched {at:%d %b %H:%M} UTC, {age.total_seconds() / 3600:.0f} h ago"
+    return ("MUST" if age > REFUSED else "FOLLOW-UP" if age > STALE else "PASS"), words
+
+
+def _tier_gap(fetched: tuple, kept: tuple) -> str:
+    """"" when the tables are the same, else the first tier that differs, in words."""
+    import math
+
+    for n, (a, b) in enumerate(zip(fetched, kept), 1):
+        if not all(math.isclose(x, y, rel_tol=1e-12) for x, y in zip(a, b)):
+            return (f"tier {n} differs: venue up to {a.ceiling:,.0f} at {a.rate:g} less {a.amount:,.0f}, "
+                    f"engine up to {b.ceiling:,.0f} at {b.rate:g} less {b.amount:,.0f}")
+    return "" if len(fetched) == len(kept) else f"the venue has {len(fetched)} tiers, the engine {len(kept)}"
+
+
+def fetched_rows(store, name: str, pair: str, now: datetime) -> tuple[list[tuple[str, object, object, str]], list[str]]:
+    """The fetched venue data (FEE-LIVE's last-known-good rows) beside the engine's maintenance tiers and fees, and a
+    note for each row that needs words. Reads the journal only."""
+    from sleeve_fund import fees
+    from sleeve_fund.store import PUBLISHED_FEES, margin_tiers_of, venue_fees_of
+
+    out: list[tuple[str, object, object, str]] = []
+    notes: list[str] = []
+
+    def said(term: str, words: str) -> None:
+        notes.append(f"  {pair} {term}: {words}")
+
+    def refused_since(kind: str, good: dict | None) -> str:
+        last = store.latest_venue_fetch(name, kind, pair)
+        if last and not last["ok"] and (good is None or last["id"] != good["id"]):
+            if kind == "fee":  # its reason can carry the account's rate, and this log is public (HoE 15:41 UK)
+                oob = str(last["reason"]).startswith("out of bounds")
+                return ("latest fetch not used: " + ("out of bounds (fee fetch refused, outside the published range)"
+                                                     if oob else "fee fetch refused (the venue's answer couldn't be used)"))
+            return f"latest fetch not used: {last['reason']}"
+        return ""
+
+    term = "maint. tiers (fetched)"
+    good = store.latest_good_venue_fetch(name, "tiers", pair)
+    try:
+        kept = markets.maintenance_for(venue(name), pair)
+    except markets.NoMaintenanceTable:
+        kept = None
+    if good is None:
+        out.append((term, "none", len(kept) if kept else "none", "MUST"))
+        said(term, "never fetched")
+    else:
+        table = margin_tiers_of(good)
+        verdict, words = _age(good, now)
+        gap = "the engine keeps no table" if kept is None else _tier_gap(table, kept)
+        if gap:
+            verdict, words = "MUST", f"{gap}; {words}"
+        out.append((term, len(table), len(kept) if kept else "none", verdict))
+        said(term, words)
+    if why := refused_since("tiers", good):
+        out[-1] = (*out[-1][:3], _worst(out[-1][3], "FOLLOW-UP"))
+        said(term, why)
+
+    good = store.latest_good_venue_fetch(name, "fee", pair)
+    # What paper's fills on the pair are charged (its account's last-known-good rate), never the published VIP 0.
+    charged = fees.resolve(name.lower(), store, pair, now=now, account=good["account"] if good else None).fees
+    why = refused_since("fee", good)
+    for side in ("taker", "maker"):
+        term, engine = f"{side} fee (fetched)", Decimal(str(getattr(charged, side)))
+        if good is None:
+            out.append((term, "none", engine, "MUST"))
+            said(term, "never fetched")
+            continue
+        got = getattr(venue_fees_of(good), side)
+        verdict, words = _age(good, now)
+        if engine < got:  # paper charges less than the venue: its results would look better than they are
+            verdict, words = "MUST", f"the engine charges less than the venue; {words}"
+        elif engine > got:
+            verdict, words = _worst(verdict, "FOLLOW-UP"), f"the engine charges more than the venue; {words}"
+        if good["source"] == PUBLISHED_FEES:
+            verdict, words = _worst(verdict, "FOLLOW-UP"), f"published, not account: {words}"
+        if why:
+            verdict, words = _worst(verdict, "FOLLOW-UP"), f"{words}; {why}"
+        if good["source"] == PUBLISHED_FEES:
+            out.append((term, got, engine, verdict))
+        else:  # an account's rate never reaches the public job log (HoE): only how the engine's compares with it
+            out.append((term, "account", "equal" if engine == got else "higher" if engine > got else "lower", verdict))
+        said(term, words)
+    return out, notes
+
+
 def main(argv: list[str], get: Callable[[str], object] = get_json, pattern: str = "configs/sleeves/*.toml",
-         build: Callable[[str], object] = engine_instrument, hub: Callable[..., dict] | None = None) -> int:
+         build: Callable[[str], object] = engine_instrument, hub: Callable[..., dict] | None = None, store=None,
+         now: datetime | None = None) -> int:
     traded = configured(pattern)
     pairs = traded + [("BINANCE", a.upper()) for a in argv]
     fetched: dict[str, tuple[dict, dict]] = {}
     served: dict[str, dict | str] = {}  # venue -> {pair: hub definition}, or why the hub couldn't be read
     must = compared = 0
+    now = now or datetime.now(UTC)
     print(f"{'instrument':14} {'term':22} {'venue':>14} {'engine':>14}  verdict")
     for name, pair in dict.fromkeys(pairs):
         if name not in READERS:
@@ -177,10 +285,16 @@ def main(argv: list[str], get: Callable[[str], object] = get_json, pattern: str 
                 print(f"{pair}: no paper terms to compare ({why})")
             else:
                 out += paper_rows(pair, fetched[name][0], got[pair])
+        notes: list[str] = []
+        if store is not None and (name, pair) in traded:
+            more, notes = fetched_rows(store, name, pair, now)
+            out += more
         for term, v, e, verdict in out:
             must += verdict == "MUST"
             compared += 1
             print(f"{pair:14} {term:22} {v!s:>14} {e!s:>14}  {verdict}")
+        for line in notes:
+            print(line)
     if not compared:  # F267-1: no instrument on a venue with published terms; a PASS here would mean nothing
         print("B8: NOTHING CHECKED")
         return 1
@@ -189,4 +303,9 @@ def main(argv: list[str], get: Callable[[str], object] = get_json, pattern: str 
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    journal = None
+    if os.environ.get("DATABASE_URL"):  # the hub container's journal: the fetched rows are read from it, never written
+        from sleeve_fund.store import Store
+
+        journal = Store()
+    sys.exit(main(sys.argv[1:], store=journal))

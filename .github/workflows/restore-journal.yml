@@ -1,0 +1,55 @@
+name: restore-journal
+# Restore-journal (DA, head 3; hoe/premerge-3a.md step 4.3): one proved dump beside the backups put back as the
+# journal, on the server (deploy/restore_journal.sh): the app stopped, the dump restored into a stage database and
+# counted, the journal renamed aside (kept whole, never dropped) and the stage renamed into its place, the code's
+# migrations run, the app started again. A failure before the swap starts the app again on the untouched journal.
+# By hand only, from main, and only while the repository variable RESTORE_JOURNAL_ENABLED is 'true', which is set only
+# on the PM's go and unset after. The dump is typed twice (dump, confirm). Nothing leaves the server, and the log is
+# public: step names, the migration and row counts only; ssh runs quiet. With the deploy workflow's secrets
+# (DEPLOY_HOST, DEPLOY_SSH_KEY) and variable DEPLOY_USER, as restore-drill.yml.
+on:
+  workflow_dispatch:
+    inputs:
+      dump:
+        description: "The dump's file name beside the backups, e.g. predeploy-20261015-120000.pgdump"
+        required: true
+        type: string
+      confirm:
+        description: "Type: restore <the dump's file name>"
+        required: true
+        type: string
+# The deploy's group (and canon's, the funding backfill's): a push to main waits for the restore, never overlaps it.
+concurrency: { group: history-writer, cancel-in-progress: false }
+jobs:
+  restore:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions: { contents: read }
+    if: ${{ vars.DEPLOY_ENABLED == 'true' && vars.RESTORE_JOURNAL_ENABLED == 'true' && github.ref == 'refs/heads/main' }}
+    env:
+      USER_AT: ${{ vars.DEPLOY_USER || 'root' }}
+      DUMP: ${{ inputs.dump }}
+      CONFIRM: ${{ inputs.confirm }}
+    steps:
+      - name: Check the inputs
+        # Inputs reach the shell through the environment only, and only a dump's file name gets past here.
+        run: |
+          [[ "$DUMP" =~ ^(predeploy-[0-9]{8}-[0-9]{6}\.pgdump|sleeve_fund-[0-9A-Za-z_-]+\.dump)$ ]] \
+            || { echo "restore journal: FAIL, not a dump's name"; exit 1; }
+          [ "$CONFIRM" = "restore $DUMP" ] || { echo "restore journal: FAIL, the confirmation doesn't name the dump"; exit 1; }
+      - name: Configure SSH
+        env:
+          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/id_deploy && chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts 2>/dev/null
+      - name: Restore the journal
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+        # The script's exit code passes through ssh: 0 PASS, 1 FAIL, 2 journal out of place, 255 ssh itself (quiet). DUMP and CONFIRM were
+        # checked above to be a file name and its echo, so they are safe on the remote command line.
+        run: |
+          ssh -o LogLevel=QUIET -i ~/.ssh/id_deploy "$USER_AT@$HOST" \
+            "cd /opt/sleeve-fund && sudo RESTORE_JOURNAL_GO=pm-go DUMP='$DUMP' CONFIRM='restore $DUMP' bash deploy/restore_journal.sh"

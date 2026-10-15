@@ -27,7 +27,7 @@ NAME = "ping-pong-ls-binance"
 T0 = datetime(2026, 10, 14, 9, 0, 3, tzinfo=UTC)  # the round trip's "since"
 BAR = datetime(2026, 10, 14, 9, 1, tzinfo=UTC)  # paper's first decided bar
 CLOSE = 60_000.0
-FEES = FeeSchedule(D("0.0002"), D("0.0005"))
+FEES = FeeSchedule(D("0.0002"), D("0.00055"))
 INST = perpetual("BTC", "USDT", FEES, Venue("BINANCE"), "BTCUSDT-PERP", price_precision=1)
 
 
@@ -51,12 +51,13 @@ def _gate(store, intent_id: str, bar: datetime, qty=D("0.110"), with_bar=True, o
     price = fill_price(D(str(CLOSE)), 1, 0.0002)
     intent = {"side": 1, "qty": qty, "close": D(str(CLOSE)), "price": price, "stop_frac": None, "what": "entry",
               "step": D("0.001"), "min_qty": D("0.001"), "instrument": "BTC", "leverage": 2.0, "atr_pct": 0.03,
+              "taker": D(0),
               "intent_id": intent_id, **({"bar": _ns(bar)} if with_bar else {})}
     gated = PaperGate(store)(NAME, intent, _ns(bar) + 1)
     signal = {"close": CLOSE, **({"bar": _ns(bar)} if with_bar else {})}
     store.record_order(NAME, order_id=order_id, side="BUY", qty=float(qty), intent="entry", reason="start of the cycle",
                        signal=signal, ts=bar + timedelta(seconds=1), reservation=gated.checked.reservation)
-    store.book_fill(NAME, side="BUY", qty=float(qty), price=fill, fee=round(float(qty) * fill * 0.0005, 8),
+    store.book_fill(NAME, side="BUY", qty=float(qty), price=fill, fee=round(float(qty) * fill * 0.00055, 8),
                     order_id=order_id, trade_id=f"t-{order_id}", ts=bar + timedelta(seconds=2))
 
 
@@ -72,7 +73,7 @@ def _journal(qty=D("0.110"), equity=50_000, mark_after=True) -> Store:
     _gate(store, "i1", BAR, qty)
     store.record_order(NAME, order_id="x1", side="SELL", qty=float(qty), intent="pm_flatten", reason="flatten",
                        ts=BAR + timedelta(minutes=1))
-    store.book_fill(NAME, side="SELL", qty=float(qty), price=60_030.0, fee=round(float(qty) * 60_030 * 0.0005, 8),
+    store.book_fill(NAME, side="SELL", qty=float(qty), price=60_030.0, fee=round(float(qty) * 60_030 * 0.00055, 8),
                     order_id="x1", trade_id="t2", ts=BAR + timedelta(minutes=1, seconds=1))
     cash = store.journal_book(NAME, 10_000.0)["cash"]
     store.record_equity(NAME, equity=cash, cash=cash, qty=0.0, price=60_030.0, benchmark=10_000.0,

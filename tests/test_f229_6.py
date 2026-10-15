@@ -112,18 +112,24 @@ def _atr(s):
     return 0.02
 
 
+# FEE-LIVE (5): the loss at the 1% stop counts the taker fee on the stop's notional at the paper venue's published
+# 0.055%: a long of 0.1 at 60,000 stops at 59,400 (60 + 3.267), a short at 60,600 (60 + 3.333).
+LONG_RISK = Decimal(60) + Decimal("0.1") * 59_400 * Decimal("0.00055")  # 63.267
+SHORT_RISK = Decimal(60) + Decimal("0.1") * 60_600 * Decimal("0.00055")  # 63.333
+
+
 def test_a_an_archived_strategy_still_holding_counts_in_gross_net_margin_and_open_risk(tmp_path):
     store = _archived_holder(tmp_path)
     [h] = portfolio_gate.fund_holdings(store, atr_pct=_atr)
     assert (h.underlying, h.notional, h.margin) == ("BTC", Decimal(6_000), Decimal(3_000))
-    assert h.risk == Decimal(60)  # to its 1% stop
+    assert h.risk == LONG_RISK  # to its 1% stop
     book = Book(Decimal(10_000), (h,))
-    assert (book.gross(), book.net("BTC"), book.margin(), book.open_risk()) == (6_000, 6_000, 3_000, 60)
+    assert (book.gross(), book.net("BTC"), book.margin(), book.open_risk()) == (6_000, 6_000, 3_000, LONG_RISK)
     # The interim 5% limit and the dashboard tile count it too (open_risk.account_book, book_open_risk).
     from sleeve_fund import open_risk
 
     assert [r["sleeve"] for r in open_risk.book_open_risk(store, _atr)] == ["usdt"]
-    assert open_risk.account_book(store, "other", 0.0, _atr)[1] == pytest.approx(60.0)
+    assert open_risk.account_book(store, "other", 0.0, _atr)[1] == pytest.approx(float(LONG_RISK))
 
 
 def test_b_an_entry_that_breaches_gross_only_with_that_holding_is_trimmed(tmp_path):
@@ -188,13 +194,15 @@ def test_a1_an_archived_holding_counts_as_the_same_position_held_by_a_running_st
     run_h, arch_h = (portfolio_gate.fund_holdings(st, atr_pct=_atr) for st in (running, archived))
     assert run_h == arch_h and len(arch_h) == 1
     book = Book(Decimal(10_000), arch_h)
-    assert (book.gross(), book.net("BTC"), book.margin(), book.open_risk()) == (6_000, sign * 6_000, 3_000, 60)
+    assert (book.gross(), book.net("BTC"), book.margin(), book.open_risk()) == (6_000, sign * 6_000, 3_000,
+                                                                          LONG_RISK if sign > 0 else SHORT_RISK)
     assert open_risk.book_open_risk(running, _atr) == open_risk.book_open_risk(archived, _atr)
     assert open_risk.account_book(running, "x", 0.0, _atr) == open_risk.account_book(archived, "x", 0.0, _atr)
 
 
 def test_a2_an_entry_that_breaches_open_risk_only_with_that_holding_is_trimmed(tmp_path):
-    """HoQA A2, the open-risk cell: 430 elsewhere plus a 50 entry is inside 5% of 10,000; the holding's 60 is not."""
+    """HoQA A2, the open-risk cell: 430 elsewhere plus a 50 entry is inside 5% of 10,000; the holding's 63.267 is not.
+    With it, 500 - 430 - 63.267 = 6.733 is left, 0.134 of the entry's 50 per unit on its 0.001 step."""
     store = _archived_holder(tmp_path)
     others = (Holding("ETH", Decimal(1_000), Decimal(100), Decimal(430)),)
     entry = Intent("XRP", 1, Decimal(1), Decimal(100), Decimal(20), Decimal(50), Decimal("0.001"), Decimal("0.001"))
@@ -202,7 +210,7 @@ def test_a2_an_entry_that_breaches_open_risk_only_with_that_holding_is_trimmed(t
     without = decide(Book(Decimal(10_000), others), entry, PORTFOLIO)
     counted = decide(Book(Decimal(10_000), (*held, *others)), entry, PORTFOLIO)
     assert without.outcome == "approved"
-    assert counted.outcome == "trimmed" and counted.limit_hit == "open_risk" and counted.approved_qty == Decimal("0.2")
+    assert counted.outcome == "trimmed" and counted.limit_hit == "open_risk" and counted.approved_qty == Decimal("0.134")
 
 
 def test_a3_a_flat_archived_run_put_away_by_a_reset_adds_nothing(tmp_path):
@@ -293,14 +301,14 @@ def test_c3_an_archived_holder_counts_in_all_three_readers_until_flat(tmp_path):
 
     store = _fund(tmp_path, "c3", 0.1)
     before = open_risk.account_book(store, "entry", 10_000.0, _atr)
-    assert before[1] == pytest.approx(60.0 + 60.0)  # fund's and held's 1% stops
+    assert before[1] == pytest.approx(float(LONG_RISK + SHORT_RISK))  # fund's long and held's short, 1% stops
     store.record_fill("held", side="BUY", qty=0.1, price=60_000.0, fee=0.0, order_id="x-held", trade_id="x-held",
                       ts=T_MARK + timedelta(minutes=2))
     store.record_equity("held", equity=10_000.0, cash=10_000.0, qty=0.0, price=60_000.0, benchmark=10_000.0,
                         ts=T_MARK + timedelta(minutes=3))
     assert [r["sleeve"] for r in open_risk.book_open_risk(store, _atr)] == ["fund"]
     assert open_risk.account_equity(store, "paper") == 30_000  # Advisor C3: held's equity stays in, at no risk
-    assert open_risk.account_book(store, "entry", 10_000.0, _atr)[1] == pytest.approx(60.0)
+    assert open_risk.account_book(store, "entry", 10_000.0, _atr)[1] == pytest.approx(float(LONG_RISK))
 
 
 def test_c3b_a_strategy_an_earlier_book_put_away_is_out_of_both(tmp_path):
@@ -318,13 +326,13 @@ def test_c3b_a_strategy_an_earlier_book_put_away_is_out_of_both(tmp_path):
     # Advisor C3b, option B: out of the holdings and the risk, its cash still in the book, as fund_equity counts it.
     assert open_risk.account_equity(store, "paper") == 30_000
     assert [r["sleeve"] for r in open_risk.book_open_risk(store, _atr)] == ["fund"]
-    assert open_risk.account_book(store, "entry", 10_000.0, _atr)[:2] == (30_000.0, pytest.approx(60.0))
+    assert open_risk.account_book(store, "entry", 10_000.0, _atr)[:2] == (30_000.0, pytest.approx(float(LONG_RISK)))
     # Advisor C3b, option B: the tile measures against the gate's book, the fund's equity, put-away cash included.
     from sleeve_fund.dashboard import trading
 
     tile = trading.open_risk([{"sleeve": "fund", "perp_limit": True, "margin": 0.0}], store)
     assert tile["book"] == float(supervisor.fund_equity(store)) == open_risk.account_equity(store, "paper") == 30_000
-    assert tile["open_risk"] / tile["book"] == pytest.approx(60.0 / 30_000)  # the tile's % is the interim check's
+    assert tile["open_risk"] / tile["book"] == pytest.approx(float(LONG_RISK) / 30_000)  # the tile's % is the interim check's
     assert [h.notional for h in portfolio_gate.fund_holdings(store, atr_pct=_atr)] == [Decimal(6_000)]
 
 

@@ -52,6 +52,7 @@ def test_venue():
     profile = venues.register(venues.VenueProfile(
         name="TESTX", label="Test venue", fees=FeeSchedule(maker=Decimal("0.001"), taker=Decimal("0.002")),
         fee_basis="test", daily_history=lambda pair: synthetic_ohlcv(days=200, seed=4, vol=0.03),
+        fee_bounds={"maker": (Decimal(0), Decimal("0.001")), "taker": (Decimal(0), Decimal("0.002"))},  # FEE-LIVE
     ))
     yield profile
     venues.VENUES.pop("TESTX")
@@ -94,6 +95,8 @@ MAY_NAME_A_VENUE = {
     "accounts.py": "recognises the note older versions saved, so it can replace it on read",
     "wording.py": "turns a venue name into what it is (\"the demo account\") in what the PM reads, so it names each one",
     "0020_orders_venue.py": "freezes the default venue of the day as a literal, so the orders backfill never moves (DA)",
+    "exec_target.py": "the order client's closed list of hosts and key variables per mode, refusing everything else "
+                      "(KEYHOST; as mirror.py, TEC approved by the HoE 15 Oct)",
 }
 
 
