@@ -99,7 +99,7 @@ def _iso(ns: int) -> str:
 
 # The chart's panes (P1-3s): blocks in price units are drawn over the candles, the rest in the lower pane.
 PRICE_KINDS = frozenset({"sma", "ema", "wma", "vwap", "bollinger", "donchian", "keltner", "rolling_max",
-                         "rolling_min", "prior_period"})
+                         "rolling_min", "prior_period", "session_levels"})
 LOWER_OUTPUTS = frozenset({"width", "pct_b"})  # a band's width and %b are ratios
 MARKER_KINDS = frozenset({"rsi_divergence"})  # events, not lines: drawn as markers once the chart takes them
 
