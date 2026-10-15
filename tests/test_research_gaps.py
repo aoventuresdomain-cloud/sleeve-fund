@@ -253,5 +253,5 @@ def test_g4_week_in_a_named_zone_and_its_warm_up_by_candle_size():
     assert check_definition(on_days, bar_minutes=60).warmup[1440] == 2 * 7 + 1
     with pytest.raises(ValueError, match="Mars/Olympus"):
         check_definition({**level, "blocks": {"wk": {"kind": "prior_period", "tz": "Mars/Olympus"}}})
-    with pytest.raises(ValueError, match="week, day"):
+    with pytest.raises(ValueError, match="day, week"):
         check_definition({**level, "blocks": {"wk": {"kind": "prior_period", "period": "month"}}})

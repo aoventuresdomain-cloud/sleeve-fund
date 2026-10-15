@@ -13,8 +13,9 @@ never changes because a file did. Design: /mnt/project-files/sleeve-fund/v2/p1-5
 
 A condition is {left, op, right}. An operand is a number, a price field (open, high, low, close, volume), a block
 ("rsi", or "bb.upper" for one of several outputs; its value as set at the last close), {prev = x} (x on the decision
-candle before), {add|sub|mul|div = [a, b]}, {time = "hour"|"weekday", tz = "Europe/London"} (at the candle's close,
-Monday 0; UTC unless tz names a zone, whose summer time it follows), or {max_since_entry = x} / {min_since_entry = x}
+candle before), {add|sub|mul|div = [a, b]}, {time = "hour"|"weekday"|"day"|"days_to_month_end", tz = "Europe/London"} (at the candle's
+close, Monday 0, the day of the month from 1, days_to_month_end 0 on its last day (G3); UTC unless tz names a zone,
+whose summer time it follows), or {max_since_entry = x} / {min_since_entry = x}
 (since the leg's entry candle, that candle included). Conditions combine with {all = [...]},
 {any = [...]}, {only_when = gate, then = rule}, {event = rule, confirm = rule, within = N} (the event, confirmed on
 its candle or one of the next N) and {setup = rule, trigger = rule, expire_after = {bars, timeframe}, cancel = rule}
@@ -22,7 +23,10 @@ its candle or one of the next N) and {setup = rule, trigger = rule, expire_after
 passed, a trigger on the last of their closes included; the cancel holding on a later close, or on the same one as a
 trigger, disarms it; a fresh setup re-arms it from that close).
 
-Exits: time_stop = {minutes = N} or {bars = N} is wall-clock, ending the leg on the first candle at or after the
+Exits: [exits] holds the exits both sides trade on; [exits.long] and [exits.short] may each hold that side's own, which
+replace the shared one of the same kind for that side only (tool gap G1: an ATR stop sits below a long and above a
+short). The sides agree on whether they carry a stop, and on whether they carry any level exit, since a stopless leg
+is held to 1x. time_stop = {minutes = N} or {bars = N} is wall-clock, ending the leg on the first candle at or after the
 deadline, so missing candles never lengthen a hold; {bars = N, count = "bars"} counts the candles that came, as
 rsi_cross does. stop = {level} is set when the position opens; trail = {level, ratchet} follows its level and with
 ratchet never loosens; exit_at_level = {level, rest = "previous_close"} follows its level both ways. Each rests in
@@ -34,6 +38,7 @@ model evaluates (sleeve_fund.strategies.rules)."""
 
 from __future__ import annotations
 
+import calendar
 import copy
 import hashlib
 import inspect
@@ -55,10 +60,11 @@ COMPARE = {">": lambda a, b: a > b, "<": lambda a, b: a < b, ">=": lambda a, b: 
 CROSSES = ("crosses_above", "crosses_below")
 ARITHMETIC = {"add": lambda a, b: a + b, "sub": lambda a, b: a - b, "mul": lambda a, b: a * b,
               "div": lambda a, b: a / b if b else None}
-TIMES = ("hour", "weekday")
+TIMES = ("hour", "weekday", "day", "days_to_month_end")
 SINCE_ENTRY = {"max_since_entry": max, "min_since_entry": min}
 TOP_KEYS = ("version", "name", "reason", "blocks", "long", "short", "exits", "costs")
 LEVEL_EXITS = ("stop", "trail", "exit_at_level")
+SIDE_EXITS = ("time_stop", *LEVEL_EXITS)  # what [exits.long] and [exits.short] may hold (G1)
 MAX_BREAKOUT_SLIPPAGE_BP = 500
 
 class ClosedChannel(Donchian):
@@ -104,7 +110,8 @@ CATALOGUE = {
     "sma": "SMA", "ema": "EMA", "wma": "WMA", "vwap": "VWAP", "rsi": "RSI", "bollinger": "Bollinger bands",
     "atr": "ATR", "atr_sma": "ATR (simple average)", "relative_volume": "Relative volume",
     "efficiency_ratio": "Efficiency ratio", "donchian": "Donchian channel", "rsi_divergence": "RSI divergence",
-    "stochastic": "Stochastic", "keltner": "Keltner channel",
+    "stochastic": "Stochastic", "keltner": "Keltner channel", "rolling": "Rolling high and low",
+    "prior_period": "Previous day or week",
 }
 _ID = re.compile(r"^[a-z_][a-z0-9_]*$")
 _TIMEFRAME = re.compile(r"^(\d+)(m|h|d)$")
@@ -253,7 +260,11 @@ def check_definition(defn: dict, bar_spec: str | None = None, bar_minutes: int |
     longest: dict = {}
     for bid in order:
         b = blocks[bid]
-        own = BUILDER_BLOCKS[b["kind"]].warmup_bars(**b["settings"])
+        cls = BUILDER_BLOCKS[b["kind"]]
+        if hasattr(cls, "warmup_minutes"):  # a warm-up in time (a calendar period): in candles of the block's size
+            own = -(-cls.warmup_minutes(b["settings"]) // (b["timeframe"] or bar_minutes or 1)) + 1
+        else:
+            own = cls.warmup_bars(**b["settings"])
         src = b["input"]
         b["warmup"] = own + (blocks[src[1]]["warmup"] if src and src[0] == "block" else 0)
         if b["warmup"] > warmup.get(b["timeframe"], 0):
@@ -497,38 +508,70 @@ def _never_stop_side(level, side: str, blocks: dict) -> bool:
             and output == ("upper" if side == "long" else "lower"))
 
 
+def side_exits(exits: dict | None, side: str) -> dict:
+    """The exits one side trades on: the shared ones, each replaced by the same kind in the side's own table (G1)."""
+    exits = exits or {}
+    own = exits.get(side) or {}
+    return {**{k: v for k, v in exits.items() if k not in ("long", "short")}, **own}
+
+
 def _check_exits(exits: dict, blocks: dict, bar_minutes, uses_prev: list, sides=("long", "short")) -> None:
     if not isinstance(exits, dict):
-        raise ValueError("exits is a table: time_stop, stop, trail, exit_at_level")
-    unknown = set(exits) - {"time_stop", *LEVEL_EXITS}
+        raise ValueError("exits is a table: time_stop, stop, trail, exit_at_level, and long and short for one side's")
+    unknown = set(exits) - {*SIDE_EXITS, "long", "short"}
     if unknown:
-        raise ValueError(f"exits has no {', '.join(sorted(unknown))}; it takes time_stop, {', '.join(LEVEL_EXITS)}")
+        raise ValueError(f"exits has no {', '.join(sorted(unknown))}; it takes {', '.join(SIDE_EXITS)}, and long "
+                         "and short for one side's own")
+    for side in ("long", "short"):
+        if side not in exits:
+            continue
+        if side not in sides:
+            raise ValueError(f"exits.{side} is for the {side} side, and the definition has none")
+        if not isinstance(exits[side], dict):
+            raise ValueError(f"exits.{side} is a table of the {side} side's own exits: {', '.join(SIDE_EXITS)}")
+        odd = set(exits[side]) - set(SIDE_EXITS)
+        if odd:
+            raise ValueError(f"exits.{side} has no {', '.join(sorted(map(str, odd)))}; it takes {', '.join(SIDE_EXITS)}")
+    for side in sides:
+        own = exits.get(side) or {}
+        _check_exit_table(side_exits(exits, side), blocks, uses_prev, side,
+                          lambda kind, s=side, o=own: f"exits.{s}.{kind}" if kind in o else f"exits.{kind}")
+    if len(sides) == 2:
+        for kinds, what in (({"stop", "trail"}, "a stop"), (set(LEVEL_EXITS), "a level exit")):
+            has = {s: bool(kinds & set(side_exits(exits, s))) for s in sides}
+            if has["long"] != has["short"]:
+                yes, no = ("long", "short") if has["long"] else ("short", "long")
+                raise ValueError(f"exits: the {yes} has {what} and the {no} has none; a leg without one is held to "
+                                 "1x, so both sides carry one or neither does")
+
+
+def _check_exit_table(exits: dict, blocks: dict, uses_prev: list, side: str, name) -> None:
+    """One side's exits, as side_exits() merges them; name(kind) is where the reason says it was written."""
     if "time_stop" in exits:
         ts = exits["time_stop"]
         form = isinstance(ts, dict) and (set(ts) == {"minutes"} or set(ts) in ({"bars"}, {"bars", "count"}))
         n = (ts.get("minutes", ts.get("bars")) if form else None)
         if not form or isinstance(n, bool) or not isinstance(n, int) or n < 1 or ts.get("count", "bars") != "bars":
-            raise ValueError("exits.time_stop is {minutes = N} (wall-clock), {bars = N} (that many candles of time) "
-                             "or {bars = N, count = \"bars\"} (the candles that came), N a whole number, at least 1")
+            raise ValueError(f"{name('time_stop')} is {{minutes = N}} (wall-clock), {{bars = N}} (that many candles of "
+                             "time) or {bars = N, count = \"bars\"} (the candles that came), N a whole number, at least 1")
     for kind in LEVEL_EXITS:
         if kind not in exits:
             continue
-        e = exits[kind]
+        e, where = exits[kind], name(kind)
         allowed = {"level", "ratchet"} if kind == "trail" else {"level", "rest"} if kind == "exit_at_level" else {"level"}
         if not isinstance(e, dict) or "level" not in e or not set(e) <= allowed:
-            raise ValueError(f"exits.{kind} is {{{', '.join(sorted(allowed))}}}")
+            raise ValueError(f"{where} is {{{', '.join(sorted(allowed))}}}")
         if e.get("rest", "previous_close") != "previous_close":
-            raise ValueError(f"exits.{kind}.rest: it rests at the level set at the previous close "
+            raise ValueError(f"{where}.rest: it rests at the level set at the previous close "
                              "(\"previous_close\"); a candle's own level isn't known until it closes, so it can't rest "
                              f"on it ({e['rest']!r}) without reading ahead")
         if not isinstance(e.get("ratchet", True), bool):
-            raise ValueError("exits.trail.ratchet is true or false")
-        _check_operand(e["level"], f"exits.{kind}", blocks, uses_prev)
-        for side in sides:
-            if _never_stop_side(e["level"], side, blocks):
-                raise ValueError(f"exits.{kind}: {e['level']} is never {'below' if side == 'long' else 'above'} the "
-                                 f"close, so as the {side} side's stop it would hold back every {side} entry; a level "
-                                 "exit works only on the stop side")
+            raise ValueError(f"{where}.ratchet is true or false")
+        _check_operand(e["level"], where, blocks, uses_prev)
+        if _never_stop_side(e["level"], side, blocks):
+            raise ValueError(f"{where}: {e['level']} is never {'below' if side == 'long' else 'above'} the "
+                             f"close, so as the {side} side's stop it would hold back every {side} entry; a level "
+                             "exit works only on the stop side")
 
 
 def _check_costs(costs: dict, defn: dict) -> None:
@@ -602,14 +645,18 @@ class Compiled:
                                     "exit": self.rule(s["exit"], True, f"{name}.exit") if "exit" in s else None,
                                     "breakout": bool(s.get("breakout", False)),
                                     "reverse": bool(s.get("reverse", False))}
-        exits = defn.get("exits") or {}
-        ts = exits.get("time_stop") or {}
-        # ("minutes", n) wall-clock, ("bars", n) n candles of wall-clock time, ("count", n) the candles that came
-        self.time_stop = (("minutes", ts["minutes"]) if "minutes" in ts else ("count", ts["bars"]) if "count" in ts
-                          else ("bars", ts["bars"]) if ts else None)
-        self.levels = {k: self.operand(exits[k]["level"])[0] for k in LEVEL_EXITS if k in exits}  # level fns
-        self.ratchet = bool((exits.get("trail") or {}).get("ratchet", True))
+        # Each side's exits (G1), by its sign: "time_stop" ("minutes", n) wall-clock, ("bars", n) n candles of
+        # wall-clock time, ("count", n) the candles that came, or None; "levels" kind -> level fn; "ratchet".
+        self.exits = {sign: self._exits(side_exits(defn.get("exits"), name)) for sign, name in ((1, "long"), (-1, "short"))
+                      if name in defn}
         self.slippage_bp = float((defn.get("costs") or {}).get("breakout_slippage_bp", 0) or 0)
+
+    def _exits(self, exits: dict) -> dict:
+        ts = exits.get("time_stop") or {}
+        return {"time_stop": (("minutes", ts["minutes"]) if "minutes" in ts else ("count", ts["bars"]) if "count" in ts
+                              else ("bars", ts["bars"]) if ts else None),
+                "levels": {k: self.operand(exits[k]["level"])[0] for k in LEVEL_EXITS if k in exits},
+                "ratchet": bool((exits.get("trail") or {}).get("ratchet", True))}
 
     # operands: (fn(env) -> float | None, key, slowest timeframe read)
     def operand(self, x):
@@ -627,10 +674,14 @@ class Compiled:
             what, zone = x["time"], _zone(x["tz"], "") if "tz" in x else None
 
             def clock(env):
-                if zone is None:
+                if zone is None and what in ("hour", "weekday"):
                     days, rest = divmod(env.ts // MINUTE_NS, DAY_MINUTES)
                     return float(rest // 60) if what == "hour" else float((days + 3) % 7)  # 1 Jan 1970: a Thursday
-                local = datetime.fromtimestamp(env.ts / 1e9, tz=zone)
+                local = datetime.fromtimestamp(env.ts // 1_000_000_000, tz=zone or timezone.utc)
+                if what == "day":
+                    return float(local.day)
+                if what == "days_to_month_end":
+                    return float(calendar.monthrange(local.year, local.month)[1] - local.day)
                 return float(local.hour if what == "hour" else local.weekday())
 
             return clock, f"time({what}{',' + x['tz'] if zone else ''})", None

@@ -13,7 +13,7 @@ import pytest
 from nautilus_trader.indicators import ExponentialMovingAverage
 
 from sleeve_fund.strategies.indicators import (
-    BLOCKS, DAY_OF_MINUTE_BARS, FLAT_BAND, NS_PER_DAY, Atr, AtrSma, Bollinger, Donchian, EfficiencyRatio, Ema, Keltner, RelativeVolume, Rsi, RsiDivergence, Sma, Stochastic, Vwap,
+    BLOCKS, DAY_OF_MINUTE_BARS, FLAT_BAND, NS_PER_DAY, Atr, AtrSma, Bollinger, Donchian, EfficiencyRatio, Ema, Keltner, PriorPeriod, RelativeVolume, Rolling, Rsi, RsiDivergence, Sma, Stochastic, Vwap,
     Wma, make_block, settle_bars, warmup_for,
 )
 
@@ -77,6 +77,10 @@ def _hlc(b, r):
 
 def _ohlcv(b, r):
     b.update_raw(r.high, r.low, r.close, r.volume, int(r.ts))
+
+
+def _hlct(b, r):
+    b.update_raw(r.high, r.low, r.close, int(r.ts))
 
 
 def _vol(b, r):
@@ -344,14 +348,15 @@ def _all_blocks():
     return [(Sma(20), _close), (Ema(20), _close), (Wma(20), _close), (Vwap("day"), _ohlcv),
             (Vwap("rolling", 30), _ohlcv), (Rsi(14), _close), (Bollinger(20), _close), (AtrSma(14), _hlc), (Atr(14), _hlc),
             (RelativeVolume(20), _vol), (EfficiencyRatio(10), _close), (Donchian(20), _hlc),
-            (RsiDivergence(), _hlc), (Stochastic(), _hlc), (Keltner(), _hlc)]
+            (RsiDivergence(), _hlc), (Stochastic(), _hlc), (Keltner(), _hlc), (Rolling(30), _close),
+            (PriorPeriod("day"), _hlct)]
 
 
 def test_every_named_block_is_tested_here():
     assert {type(b) for b, _ in _all_blocks()} == set(BLOCKS.values())
 
 
-@pytest.mark.parametrize("i", range(15))
+@pytest.mark.parametrize("i", range(17))
 def test_no_look_ahead(i):
     """A value at a bar is the same whether or not later bars exist: each prefix reads as the full run did."""
     block, feed = _all_blocks()[i]
@@ -362,7 +367,7 @@ def test_no_look_ahead(i):
         np.testing.assert_array_equal(part, full[:cut])
 
 
-@pytest.mark.parametrize("i", range(15))
+@pytest.mark.parametrize("i", range(17))
 def test_reset_gives_a_fresh_block(i):
     block, feed = _all_blocks()[i]
     fresh = copy.deepcopy(block)
@@ -375,7 +380,7 @@ def test_reset_gives_a_fresh_block(i):
     assert block.values == fresh.values and block.initialized == fresh.initialized
 
 
-@pytest.mark.parametrize("i", range(15))
+@pytest.mark.parametrize("i", range(17))
 def test_settled_after_its_warmup(i):
     """Fed warmup_bars bars, every block is initialized: warm-up from warmup_bars is always enough."""
     block, feed = _all_blocks()[i]
@@ -436,7 +441,7 @@ def test_bad_settings_are_refused(kind, settings):
         make_block(kind, **settings)
 
 
-@pytest.mark.parametrize("i", range(15))
+@pytest.mark.parametrize("i", range(17))
 def test_update_ohlcv_and_handle_bar_match_update_raw(i):
     """Any block can be fed whole bars, ignoring what it doesn't use, and reads as update_raw fed it."""
     block, feed = _all_blocks()[i]
@@ -464,7 +469,7 @@ def test_update_ohlcv_and_handle_bar_match_update_raw(i):
         assert from_bar.values == raw.values
 
 
-@pytest.mark.parametrize("i", range(15))
+@pytest.mark.parametrize("i", range(17))
 def test_values_are_none_until_initialized_and_never_nan(i):
     block, feed = _all_blocks()[i]
     assert set(block.values) == set(type(block).OUTPUTS) and all(v is None for v in block.values.values())
@@ -479,7 +484,7 @@ def test_values_are_none_until_initialized_and_never_nan(i):
                 assert block.value is None
 
 
-@pytest.mark.parametrize("i", range(15))
+@pytest.mark.parametrize("i", range(17))
 def test_warmup_from_the_class_matches_the_block(i):
     block, _ = _all_blocks()[i]
     assert type(block).warmup_bars(**block.settings) == block.warmup_bars
@@ -505,13 +510,18 @@ def test_day_vwap_needs_close_times():
 
 # ---- QA round on P1-3 (quant-review/v2-p1/indicators.md) ----------------------------------------------------
 
-@pytest.mark.parametrize("i", range(15))
+@pytest.mark.parametrize("i", range(17))
 def test_settled_exactly_at_its_warmup(i):
     """F1: every block reads as settled from its warm-up on, and not before; library blocks are not initialized
     before it either. Sma, AtrSma and Rsi keep the `initialized` the hand-coded models trade on."""
     block, feed = _all_blocks()[i]
     for n, row in enumerate(DATA["synthetic"].iloc[: block.warmup_bars + 5].itertuples(index=False), start=1):
         feed(block, row)
+        if type(block) is PriorPeriod:
+            # G4: its warm-up is in time, not candles (warmup_bars counts the 1-minute bars of two periods, the most
+            # it can wait); it is exact, and so settled, from the first whole period it saw.
+            assert block.settled == block.initialized
+            continue
         if n < block.warmup_bars:
             assert not block.settled
             if type(block) not in (Sma, AtrSma, Rsi, Vwap):  # a day VWAP is exact from a day start, before 1,441
@@ -520,7 +530,7 @@ def test_settled_exactly_at_its_warmup(i):
 
 
 @pytest.mark.parametrize("bad", [float("nan"), float("inf"), -float("inf")])
-@pytest.mark.parametrize("i", range(15))
+@pytest.mark.parametrize("i", range(17))
 def test_non_finite_input_is_refused(i, bad):
     """F5: a NaN or infinite input raises rather than poisoning every later value."""
     block, feed = _all_blocks()[i]
