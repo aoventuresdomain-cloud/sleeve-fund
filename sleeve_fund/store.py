@@ -1676,7 +1676,9 @@ RESET_STAYS = {
     book_moves_t: "the fund's record of the Strategy's capital landing in the book, not one run's",
     pair_state_t: "a two-leg Strategy's coordinator; a reset happens only when flat, and the state is a hint",
     gate_decisions_t: "keyed by the Strategy's id, which the reset keeps: the gate's record across runs",
-    gate_reservations_t: "keyed by the Strategy's id; a reset needs every order closed, so none is active",
+    gate_reservations_t: ("keyed by the Strategy's id, kept as history; any still active is released as the run is "
+                          "put away (its process is stopped first, so its order can't fill), so none from before a "
+                          "reset counts against the tests after it"),
 }
 STRATEGY_COLUMNS = frozenset({"sleeve", "sleeve_id", "parent", "strategy_id"})
 
@@ -3618,7 +3620,7 @@ class Store:
             if locked is not None:  # a PM Stop since the request (Store.hold_on_reset) keeps the fresh run stopped
                 request["restart"] = locked.restart
             row = dict(c.execute(select(sleeves_t).where(sleeves_t.c.name == name)).first()._mapping)
-            row.pop("id")
+            row_id = row.pop("id")
             c.execute(insert(sleeves_t).values(**{**row, "name": run, "desired_state": "stopped", "status": "stopped",
                                                   "status_reason": f"run put away by a reset on {now:%d %b %Y %H:%M}",
                                                   "updated_at": now}))
@@ -3633,6 +3635,11 @@ class Store:
             # (m13-E2).
             for t in RESET_CLEARS:
                 c.execute(t.delete().where(t.c.sleeve == name))
+            # A reservation still active is room the old run held for an order that can no longer fill (the process
+            # is stopped before the split): released, so no claim from before the reset counts after it (HoE, DA-6).
+            r = gate_reservations_t
+            c.execute(update(r).where(r.c.sleeve_id == row_id, r.c.released_at.is_(None))
+                      .values(released_at=now, release_reason="cancel"))
             c.execute(insert(sleeve_archive_t).values(sleeve=run, archived_at=now))
             hold = c.execute(select(reset_holds_t).where(reset_holds_t.c.reset_id == request["id"])).first()
             # A strategy paused or halted before the reset starts afresh still paused or halted (U13-4): the paper
