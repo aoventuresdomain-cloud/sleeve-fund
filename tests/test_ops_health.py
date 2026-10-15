@@ -425,3 +425,59 @@ def test_4j_alerts_are_counted_however_many_the_journal_holds():
     store.event("bt:1", "error", "x", "a saved backtest's", ts=T0)
     assert alert_counts(store, T0 - timedelta(days=1), T0 + timedelta(hours=1)) == (0, 1)
     assert "0 warnings, 1 error" in digest(store, T0 + timedelta(hours=1))
+
+
+# ---- 5. Wired into the forwarder (Drop 3a): what the supervisor runs every minute ------------------------------
+
+def test_5a_the_forwarder_sends_a_position_without_a_stop_in_the_minute_it_is_found(tmp_path):
+    store, sent = _holder(tmp_path, params={"stop_loss": 0.01}, stop_frac=None), []
+    t = [T0 + timedelta(minutes=1)]
+    fwd = Forwarder(store, environ={"ALERT_WEBHOOK_URL": HOOK}, send=lambda url, text: sent.append(text),
+                    now=lambda: t[0])
+    fwd.step()
+    assert not any("without a live stop" in m for m in sent)
+    t[0] += timedelta(seconds=61)
+    fwd.step()
+    assert len(_no_stop_errors(store)) == 1
+    assert any("[error] s1: Open position without a live stop" in m for m in sent)  # same step: found, then sent
+    t[0] += timedelta(minutes=1)
+    fwd.step()
+    assert len(_no_stop_errors(store)) == 1  # one per episode
+
+
+def test_5b_the_forwarder_sends_the_daily_digest_at_08_00_uk_once():
+    store, sent = Store.in_memory(), []
+    t = [T0 + timedelta(minutes=59)]  # 07:59 UK
+    fwd = Forwarder(store, environ={"ALERT_WEBHOOK_URL": HOOK}, send=lambda url, text: sent.append(text),
+                    now=lambda: t[0])
+    fwd.step()
+    assert not any(m.startswith("Multi-Strategy Fund daily digest") for m in sent)
+    t[0] = T0 + timedelta(hours=1)  # 08:00 UK
+    fwd.step()
+    fwd.step()
+    assert sum(m.startswith("Multi-Strategy Fund daily digest") for m in sent) == 1
+
+
+def test_5c_a_failing_ops_check_is_one_error_and_never_stops_the_alerts_or_the_uptime_ping(monkeypatch):
+    from sleeve_fund import ops_health
+
+    store, sent, pings = Store.in_memory(), [], []
+
+    def broken(self, store, now):
+        raise RuntimeError("journal busy")
+
+    monkeypatch.setattr(ops_health.NoStopWatch, "check", broken)
+    fwd = Forwarder(store, environ={"ALERT_WEBHOOK_URL": HOOK, "HEALTHCHECK_PING_URL": PING},
+                    send=lambda url, text: sent.append(text), pinger=pings.append)
+    for _ in range(3):
+        fwd.step()
+    store.event("s1", "warning", "stale_price", "No trade or quote for 5 minutes")
+    fwd.step()
+    assert pings == [PING] * 4
+    [e] = _kinds(store, "ops_check_failed")
+    assert e["level"] == "error" and "no-stop" in e["message"] and "RuntimeError" in e["message"]
+    assert any("No trade or quote for 5 minutes" in m for m in sent)
+    monkeypatch.undo()
+    fwd.step()
+    [back] = _kinds(store, "ops_check_back")
+    assert back["level"] == "info"
