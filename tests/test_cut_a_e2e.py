@@ -14,7 +14,6 @@ from sleeve_fund.portfolio.gate import PortfolioState
 from sleeve_fund.store import Store
 
 
-
 # ---- End to end: a Strategy with a starting balance of 0 inside the fund ---------------------------------------------
 @pytest.mark.parametrize("headroom", [10, 1])
 def test_a_zero_balance_strategy_sizes_off_the_fund_fills_pays_its_fee_marks_and_renders(tmp_path, monkeypatch,
