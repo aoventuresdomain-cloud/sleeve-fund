@@ -49,7 +49,7 @@ def _creep(after, n, step=0.01):
 
 def test_converging_seeds_settle_at_n_and_2n():
     r = seeding.check(Rsi(14), _walk(1_000), "rsi")
-    assert r.settled and r.seeds == (140, 280) and r.gap is None and r.feed_bars == 140
+    assert r.settled and r.seeds == (140, 280) and r.gap is None and r.feed_bars == 280  # fed the farther seed (Advisor 08:49 UK)
 
 
 def test_a_gap_above_tolerance_moves_both_seeds_back_and_the_extension_settles_it():
@@ -58,7 +58,7 @@ def test_a_gap_above_tolerance_moves_both_seeds_back_and_the_extension_settles_i
     far = seeding._seeded(Rsi(14), candles[-280:])
     assert near.value == 100.0 and far.value < 30  # set-up: N and 2N are far apart
     r = seeding.check(Rsi(14), candles, "rsi")
-    assert r.settled and r.seeds == (280, 1_000) and r.feed_bars == 280  # the model is fed the nearer agreeing seed
+    assert r.settled and r.seeds == (280, 1_000) and r.feed_bars == 1_000  # fed the farther agreeing seed
 
 
 def test_seeds_still_apart_at_the_cap_hold_and_name_the_gap_in_points():
@@ -180,18 +180,18 @@ def _bar_at(s, c):
 def test_a_strategy_whose_seeds_agree_warms_up_as_before_and_opens_entries():
     s, events, bars, asked = _rsi_bands(_walk(1_000))
     s._warm_from_history()
-    assert s._decision_bars == 140 and s._seed_hold is None  # fed its own warm-up, as today
+    assert s._decision_bars == 280 and s._seed_hold is None  # fed the farther agreeing seed (Advisor 08:49 UK)
     assert not [e for e in events if e[2] == "seed_unsettled"]
     assert not s._entry_held(bars[-1], "long entry")
     assert max(asked) == seeding.CAP
 
 
-def test_a_strategy_the_extension_settles_is_fed_the_nearer_agreeing_seed():
+def test_a_strategy_the_extension_settles_is_fed_the_farther_agreeing_seed():
     candles = _crash_then_creep()
     s, events, bars, _ = _rsi_bands(candles)
     s._warm_from_history()
-    assert s._seed_hold is None and s._decision_bars == 280
-    assert s.rsi.value == pytest.approx(seeding._seeded(Rsi(14), candles[-280:]).value, abs=1e-6)  # bars at the pair's price precision
+    assert s._seed_hold is None and s._decision_bars == 1_000
+    assert s.rsi.value == pytest.approx(seeding._seeded(Rsi(14), candles[-1_000:]).value, abs=1e-6)  # bars at the pair's price precision
     assert not [e for e in events if e[2] == "seed_unsettled"]
 
 
