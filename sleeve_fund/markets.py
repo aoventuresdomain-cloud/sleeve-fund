@@ -50,6 +50,8 @@ class PerpTerms:
     # The venue whose settled funding rates are charged (sleeve_fund.funding); None charges funding_rate. With a
     # venue, funding_rate is only the fallback for a settlement the venue's records don't have.
     funding_venue: str | None = None
+    # VS-1-TABLE: the venue's largest published tier ceiling for the instrument; an entry at or past it is refused
+    max_notional: float = float("inf")
 
 
 # Published rates of the large perp venues' entry tiers (0.02% maker, 0.05% taker), a tight BTC book
@@ -101,7 +103,9 @@ def native_terms(profile, pair: str | None = None) -> PerpTerms:
     and, for `pair`, the venue's own maintenance tiers (VS-1; maintenance_for). None without a pair."""
     return PerpTerms(profile.label, None, None, LOW_FEE_PERP.funding_rate, profile.funding_hours,
                      maintenance_for(profile, pair) if pair is not None else None,  # type: ignore[arg-type]
-                     funding_venue=profile.name)
+                     funding_venue=profile.name,
+                     max_notional=profile.maintenance_limits.get(_table_key(profile, pair), float("inf"))
+                     if pair is not None else float("inf"))
 
 
 class NoMaintenanceTable(ValueError):
@@ -109,15 +113,19 @@ class NoMaintenanceTable(ValueError):
     assumed rate."""
 
 
+def _table_key(profile, pair: str) -> str:
+    """The pair a venue's tables are kept under, given BASE/QUOTE or the venue's own symbol (BTCUSDT-PERP)."""
+    if "/" not in pair and profile.symbol is not None:
+        return next((p for p in profile.maintenance_tiers if profile.symbol(p) == pair), pair)
+    return pair
+
+
 def maintenance_for(profile, pair: str) -> tuple:
     """The venue's maintenance tiers for `pair`, given as BASE/QUOTE or as the venue's own symbol (BTCUSDT-PERP).
     Raises NoMaintenanceTable, naming the instrument, when the venue's table for it isn't kept."""
     from sleeve_fund.margin import tiers
 
-    key = pair
-    if "/" not in pair and profile.symbol is not None:
-        key = next((p for p in profile.maintenance_tiers if profile.symbol(p) == pair), pair)
-    table = profile.maintenance_tiers.get(key)
+    table = profile.maintenance_tiers.get(_table_key(profile, pair))
     if not table:
         raise NoMaintenanceTable(f"{pair} on {profile.label} has no maintenance table kept, so its liquidation price "
                                  "is unknown: a perp on it is refused until the venue's published tiers are kept (VS-1)")

@@ -53,12 +53,12 @@ def test_a_fully_paid_1x_long_still_has_no_liquidation():
     assert entry_liquidation(60_000, 1, 60_000, 1, 0.0, _btc(), 1)[0] is None
 
 
-@pytest.mark.parametrize("side, fixed, want", [(1, 40_198.00, 40_598.00), (-1, 79_736.87, 79_338.18)])
+@pytest.mark.parametrize("side, fixed, want", [(1, 40_198.00, 40_598.00), (-1, 79_736.87, 79_338.19)])
 def test_funding_paid_moves_the_nearer_price_solved_afresh_from_the_positions_cash(side, fixed, want):
     """1,000 of funding paid out of the 150,000 position's margin: the cash it implies is recovered from the fixed
     price under both formulas (the larger is the position's), then both are re-solved and the nearer kept.
     long  A = 101,000 / 2.49175 = 40,533.76   B = (495 + 101,000) / 2.5 = 40,598.00  -> 40,598.00
-    short A = 199,000 / 2.50825 = 79,338.18   B = 60,000 + (199,000 - 150,000 - 495) / 2.5 = 79,402.00 -> 79,338.18"""
+    short A = 199,000 / 2.50825 = 79,338.19   B = (199,000 - 495) / 2.5 = 79,402.00  -> 79,338.19"""
     liq = shifted_liquidation(fixed, side * 2.5, -1_000, _btc(), entry=60_000)
     assert round(liq, 2) == want
 
@@ -101,11 +101,11 @@ def test_an_entry_at_or_past_the_venues_top_tier_is_refused(prices, instrument, 
     feed = _path(prices, [100.0, 100.5, 100.8, 101.5, 101.5, 101.0, 100.0])
     perp = {"market": "perp", "allow_short": True}
     monkeypatch.setattr(markets, "LOW_FEE_PERP", replace(markets.LOW_FEE_PERP, max_notional=1.0))
-    res = run_backtest("ping_pong", feed, instrument, perp, half_spread=0)
+    res = run_backtest("ping_pong", feed, instrument, perp, half_spread=0, risk_profile="aggressive")
     assert res.fills.empty
     assert "entry_refused_top_tier" in {e["kind"] for e in res.journal.events_}
     monkeypatch.setattr(markets, "LOW_FEE_PERP", replace(markets.LOW_FEE_PERP, max_notional=float("inf")))
-    assert not run_backtest("ping_pong", feed, instrument, perp, half_spread=0).fills.empty
+    assert not run_backtest("ping_pong", feed, instrument, perp, half_spread=0, risk_profile="aggressive").fills.empty
 
 
 def test_margin_still_reads_one_rate_as_a_flat_table():

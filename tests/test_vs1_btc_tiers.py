@@ -26,14 +26,19 @@ def test_btc_keeps_the_paper_venues_published_tiers_with_their_source():
                                      "paper-venue-risk-limit-BTCUSDT-2026-10-15.json"
 
 
-@pytest.mark.parametrize("side, at_tiers, at_flat", [(1, 40_132.44, 40_201.01), (-1, 79_736.87, 79_601.99)])
-def test_a_3x_btc_position_of_150000_liquidates_where_the_da_worked_it_out(side, at_tiers, at_flat):
+@pytest.mark.parametrize("side, a_tiers, nearer, a_flat", [(1, 40_132.44, 40_198.00, 40_201.01),
+                                                          (-1, 79_736.87, 79_736.87, 79_601.99)])
+def test_a_3x_btc_position_of_150000_liquidates_where_the_da_worked_it_out(side, a_tiers, nearer, a_flat):
     """The DA's worked example: 3x at 60,000, qty 2.5 (150,000 notional, the most the fund's gross cap allows), on a
-    100,000 balance. Both ends stay in tier 1; the tiers move the price from the old flat 0.5% stand-in's."""
+    100,000 balance. Both ends stay in tier 1. The DA's figures are formula A's (margin.liquidation_price); the price
+    used is the nearer of A and B (VS-1-TABLE): B's 40,198.00 for the long, A's for the short."""
+    from sleeve_fund.margin import isolated_margin, liquidation_price
+
     table = markets.maintenance_for(venue("BINANCE"), "BTC/USDT")
-    liq, _ = entry_liquidation(100_000, 2.5, 60_000, side, 0.0, table, 3)
-    assert round(liq, 2) == at_tiers
-    assert round(entry_liquidation(100_000, 2.5, 60_000, side, 0.0, flat(0.005), 3)[0], 2) == at_flat
+    cash = isolated_margin(2.5, 60_000, 3) - side * 2.5 * 60_000
+    assert round(liquidation_price(cash, side * 2.5, table), 2) == a_tiers
+    assert round(liquidation_price(cash, side * 2.5, flat(0.005)), 2) == a_flat
+    assert round(entry_liquidation(100_000, 2.5, 60_000, side, 0.0, table, 3)[0], 2) == nearer
 
 
 @pytest.mark.parametrize("pair", ["ETH/USDT", "SOL/USDT", "XRP/USDT", "SUI/USDT"])
