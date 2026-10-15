@@ -861,7 +861,7 @@ def a19(tmp_path, monkeypatch):
 
 
 def _a19_form(page):
-    v = lambda sel: page.input_value(sel)  # noqa: E731
+    v = page.input_value
     return {"strategy": v("#strategy"), "market": v("#market"), "shorts": page.is_checked("#allow_short"),
             "mirror_shown": page.evaluate("() => !document.getElementById('demo_mirror').closest('[data-when-perp]').hidden"),
             "mirror": page.is_checked("#demo_mirror"),
