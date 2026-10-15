@@ -822,7 +822,6 @@ def test_ral_resets_the_day_baseline_to_the_remaining_equity(store, tmp_path):
     assert rt2.status == "paused", (rt2.status, store.sleeve(NAME).status_reason)
 
 
-@xf_cap
 def test_ral_keeps_the_old_high_water_mark_in_history(store, tmp_path):
     """[R17:57] / [HoE17:55]: a NEW high-water mark, so the old one is kept: no mark is deleted or moved, the highest
     mark ever and the worst drawdown still show the liquidation, and the RAL's event names the old and the new
@@ -911,7 +910,6 @@ def test_ral_never_resets_the_book_level_figures(store, tmp_path):
     assert not store.archived() and not store.events_of(("book_cleared",))
 
 
-@xf_cap
 def test_ral_never_resets_the_track_record(store, tmp_path):
     """[R18:17] "Track record never reset (Sharpe, trials, G1/G2 evidence, fills-vs-model, trade log continuous)":
     after RAL the strategy keeps its name, creation time (the G2 six-week clock), fills, orders and trades, its daily

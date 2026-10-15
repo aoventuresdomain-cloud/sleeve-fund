@@ -64,3 +64,22 @@ def test_keep_sub_cost_target_is_a_strategy_setting_off_by_default():
 
     assert "keep_sub_cost_target" in LongFlatConfig.__init__.__code__.co_varnames
     assert LongFlatConfig.__init__.__kwdefaults__["keep_sub_cost_target"] is False
+
+
+@pytest.mark.parametrize("keep", [False, True])
+def test_the_settings_check_refuses_a_target_below_costs_unless_the_strategy_keeps_one(keep):
+    """The settings check (LongFlatConfig) still refuses a fixed take-profit below the round trip's costs for every
+    Strategy whose settings don't keep one; with keep_sub_cost_target on it is accepted, and the entry's check keeps
+    it (C8; PE1's candle-step co-sign, HoE 01:37 UK 15 Oct)."""
+    from nautilus_trader.model import BarType, InstrumentId
+
+    from sleeve_fund.strategies.base import LongFlatConfig
+
+    iid = InstrumentId.from_str("BTCUSDT-PERP.BINANCE")
+    kw = dict(instrument_id=iid, bar_type=BarType.from_str(f"{iid}-1-MINUTE-LAST-EXTERNAL"), market="perp",
+              assumed_taker_fee=0.0005, assumed_half_spread=0.0, take_profit=0.001, keep_sub_cost_target=keep)
+    if keep:
+        assert LongFlatConfig(**kw).take_profit == 0.001
+    else:
+        with pytest.raises(ValueError, match="doesn't cover the round trip's fees and spread"):
+            LongFlatConfig(**kw)

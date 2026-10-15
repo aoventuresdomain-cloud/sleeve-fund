@@ -10,6 +10,8 @@ name: deploy
 #   live account's API page), and DERIBIT_TESTNET_API_KEY and DERIBIT_TESTNET_API_SECRET, a Deribit TESTNET key (no
 #   withdrawals), for the demo mirror (sleeve_fund/mirror.py), which only the mirror container receives. Repository
 #   variable DEMO_MIRROR=off turns it off. No live exchange credentials are involved: this stack is paper only.
+# Optional variable NIGHTLY_ALERT=on: a failed nightly recon alerts the PM (off by default: it is only journaled until
+#   the HoE has read one clean read-only run, .github/workflows/nightly-recon.yml).
 # Deploys only main, and only a commit whose tests passed: it runs when the tests workflow finishes
 # green on a push to main, and a manual run (from main only) checks that the push run passed on the
 # commit it ships. The repository variable DEPLOY_ENABLED=true gates both.
@@ -107,6 +109,7 @@ jobs:
           ALERT_WEBHOOK_URL: ${{ secrets.ALERT_WEBHOOK_URL }}
           HEALTHCHECK_PING_URL: ${{ secrets.HEALTHCHECK_PING_URL }}
           DEMO_MIRROR: ${{ vars.DEMO_MIRROR || 'on' }}
+          NIGHTLY_ALERT: ${{ vars.NIGHTLY_ALERT || 'off' }}
           DERIBIT_TESTNET_API_KEY: ${{ secrets.DERIBIT_TESTNET_API_KEY }}
           DERIBIT_TESTNET_API_SECRET: ${{ secrets.DERIBIT_TESTNET_API_SECRET }}
           BYBIT_DEMO_API_KEY: ${{ secrets.BYBIT_DEMO_API_KEY }}
@@ -114,11 +117,11 @@ jobs:
         run: |
           SITE="${SITE_ADDRESS:-$HOST.sslip.io}"
           # Secrets go over stdin, never on a command line.
-          printf 'export DASHBOARD_PASSWORD=%q SITE_ADDRESS=%q ALERT_WEBHOOK_URL=%q HEALTHCHECK_PING_URL=%q DEMO_MIRROR=%q DERIBIT_TESTNET_API_KEY=%q DERIBIT_TESTNET_API_SECRET=%q BYBIT_DEMO_API_KEY=%q BYBIT_DEMO_API_SECRET=%q\n' \
+          printf 'export DASHBOARD_PASSWORD=%q SITE_ADDRESS=%q ALERT_WEBHOOK_URL=%q HEALTHCHECK_PING_URL=%q DEMO_MIRROR=%q NIGHTLY_ALERT=%q DERIBIT_TESTNET_API_KEY=%q DERIBIT_TESTNET_API_SECRET=%q BYBIT_DEMO_API_KEY=%q BYBIT_DEMO_API_SECRET=%q\n' \
             "$DASHBOARD_PASSWORD" "$SITE" "$ALERT_WEBHOOK_URL" "$HEALTHCHECK_PING_URL" \
-            "$DEMO_MIRROR" "$DERIBIT_TESTNET_API_KEY" "$DERIBIT_TESTNET_API_SECRET" "$BYBIT_DEMO_API_KEY" \
+            "$DEMO_MIRROR" "$NIGHTLY_ALERT" "$DERIBIT_TESTNET_API_KEY" "$DERIBIT_TESTNET_API_SECRET" "$BYBIT_DEMO_API_KEY" \
             "$BYBIT_DEMO_API_SECRET" | \
-            ssh -i ~/.ssh/id_deploy "$USER_AT@$HOST" 'eval "$(cat)"; sudo --preserve-env=DASHBOARD_PASSWORD,SITE_ADDRESS,ALERT_WEBHOOK_URL,HEALTHCHECK_PING_URL,DEMO_MIRROR,DERIBIT_TESTNET_API_KEY,DERIBIT_TESTNET_API_SECRET,BYBIT_DEMO_API_KEY,BYBIT_DEMO_API_SECRET bash /opt/sleeve-fund/deploy/remote_up.sh'
+            ssh -i ~/.ssh/id_deploy "$USER_AT@$HOST" 'eval "$(cat)"; sudo --preserve-env=DASHBOARD_PASSWORD,SITE_ADDRESS,ALERT_WEBHOOK_URL,HEALTHCHECK_PING_URL,DEMO_MIRROR,NIGHTLY_ALERT,DERIBIT_TESTNET_API_KEY,DERIBIT_TESTNET_API_SECRET,BYBIT_DEMO_API_KEY,BYBIT_DEMO_API_SECRET bash /opt/sleeve-fund/deploy/remote_up.sh'
           echo "Dashboard: https://$SITE"
       - name: Check the sleeves are live
         if: steps.tip.outputs.current == 'true'
