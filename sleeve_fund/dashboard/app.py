@@ -154,6 +154,7 @@ def create_app(store: Store | None = None) -> FastAPI:
     templates.env.filters["uk_time"] = legs.uk_time
     templates.env.filters["leg_label"] = legs.label  # a second leg's row "<name>~2" reads "<name>, leg 2" (P2-8)
     templates.env.filters["pct"] = lambda x: f"{x:+.2%}"
+    templates.env.filters["rate"] = pct  # a fee rate as people read it: 0.055%, never 0.06%
     templates.env.filters["pct0"] = lambda x: f"{x:.0%}"
     # Biggest contributor first, by size whatever its sign (UP-3): rows keep their sign colour and bar direction.
     templates.env.filters["by_size"] = lambda rows, field: sorted(rows, key=lambda x: -abs(x[field]))
