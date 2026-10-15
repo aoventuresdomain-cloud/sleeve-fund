@@ -22,6 +22,9 @@ def store(tmp_path):
     for name, inst in (("s1", "BTC/USDT"), ("s2", "BTC/USDT"), ("s3", "ETH/USDT")):
         s.create_sleeve(name=name, strategy="ping_pong", instrument=inst, bar_spec="1-MINUTE-LAST-INTERNAL",
                         starting_balance=10_000, venue="BINANCE", params={"market": "perp"})
+        if name != "s3":  # a closing reject only matters on a row that holds (a flat row's is benign, Advisor A1)
+            s.record_fill(name, side="BUY", qty=0.1, price=60_000.0, fee=0.0, order_id=f"{name}-in",
+                          trade_id=f"{name}-in", ts=T0 - MIN)
     return s
 
 
@@ -194,3 +197,25 @@ def test_k_the_forwarder_runs_the_watch_and_sends_the_episode_in_the_same_minute
         _order(store, "s1", "rejected", T0 + i * MIN)
     fwd.step()
     assert any("[error] s1:" in m and "BTC/USDT" in m for m in sent)
+
+
+def test_l_the_episode_also_clears_when_the_row_is_flat_however_it_got_there(store):
+    """Advisor F-RX-2: "cleared by closing fill or flat" (a liquidation's fill, which is not a closing order we send)."""
+    w = _watch()
+    _episode(store, w, at=T0 + MIN)
+    w.check(store, T0 + 5 * MIN)
+    assert _kinds(store, CLEARED) == []  # still holding
+    store.record_fill("s1", side="SELL", qty=0.1, price=50_000.0, fee=0.0, order_id="liq1", trade_id="tl1",
+                      ts=T0 + 6 * MIN)  # liquidated: no closing order of ours went through
+    w.check(store, T0 + 7 * MIN)
+    [c] = _kinds(store, CLEARED)
+    assert "flat" in c["message"]
+
+
+def test_m_closing_rejects_on_a_flat_row_never_open_an_episode(store):
+    """Advisor (A1 ruling): a reduce-only reject on a flat row is benign and never counts to F-RX-2."""
+    w = _watch()
+    for i in range(3):
+        _order(store, "s3", "rejected", T0 + i * MIN)
+    w.check(store, T0 + 3 * MIN)
+    assert _kinds(store, OPEN) == []

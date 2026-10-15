@@ -291,7 +291,8 @@ def exit_reject_streak(rows: list[dict]) -> int:
 
 
 class ExitRejectWatch:
-    """F-RX-2: closing orders rejected EXIT_REJECTS times in a row on one Strategy row, read through QD's F-RX-1 reader
+    """F-RX-2: closing orders rejected EXIT_REJECTS times in a row on one Strategy row that holds a position, read through
+    QD's F-RX-1 reader
     (Store.closing_orders, which owns which intents close). The episode lives in the journal (the latest open or
     cleared event per row), so a restart neither opens it again nor re-alerts it, and the gate reads the same answer
     (paper.runtime.exit_reject_block). Alert only: nothing here changes an order."""
@@ -307,7 +308,12 @@ class ExitRejectWatch:
             cleared = store.last_event(s.name, (REJECTS_CLEARED,))
             streak = exit_reject_streak(store.closing_orders(s.name, cleared["ts"] if cleared else None))
             inst = no_venues(s.instrument)
-            if not is_open and streak >= EXIT_REJECTS:
+            # Advisor F-RX-2: cleared by a closing fill or flat; a reduce-only reject on a flat row is benign (A1)
+            flat = store.lifecycle_flat(s.name)[1]
+            if is_open and flat:
+                store.event(s.name, "info", REJECTS_CLEARED,
+                            f"The position on {inst} is flat: entries on {inst} are allowed again", ts=now)
+            elif not is_open and streak >= EXIT_REJECTS and not flat:
                 store.event(s.name, "error", REJECTS_OPEN, no_venues(
                     f"Closing orders on {inst} rejected {streak} times in a row. No new entries on {inst} in the fund "
                     "until one goes through; exits and stops still go out. Check it now"), ts=now)
