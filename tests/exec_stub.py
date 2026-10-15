@@ -90,6 +90,9 @@ class VenueStub:
         with self._lock:
             if path.startswith("/v5/order/create"):
                 b = json.loads(body)
+                if len(b.get("orderLinkId", "")) > 36:  # SOURCES["order/create"]: orderLinkId max 36 characters
+                    return {"retCode": 10001, "retMsg": "params error: orderLinkId too long", "result": {},
+                            "retExtInfo": {}, "time": 1735809771618}
                 oid = str(next(self._ids))
                 self.orders[b["orderLinkId"]] = dict(b, orderId=oid, orderStatus="Untriggered")
                 return _ok({"orderId": oid, "orderLinkId": b["orderLinkId"]})

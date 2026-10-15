@@ -151,3 +151,11 @@ def test_h_a_cancel_goes_out_once_by_our_order_id(venue_run):
     [create] = venue.bodies("order/create")
     assert cancel["orderLinkId"] == create["orderLinkId"]
     assert next(iter(venue.orders.values()))["orderStatus"] == "Cancelled"
+
+
+@pytest.mark.xfail(strict=True, reason="Advisor STOP-EXEC MUST 1: the framework's client never sends the last-price "
+                                       "trigger; resting stops through it stay refused ON until this passes")
+def test_i_must_1_every_stop_create_sends_the_last_price_trigger_explicitly(venue_run):
+    venue, _ = venue_run
+    [create] = venue.bodies("order/create")
+    assert create.get("triggerBy") == "LastPrice"
