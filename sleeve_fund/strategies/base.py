@@ -2304,8 +2304,10 @@ class LongFlatStrategy(Strategy):
         finally:
             decided = self._deciding
             self._deciding = self._deciding_bar = self._lag = None
-            if self.leg_batch is not None and decided is not None:
+            if self.leg_batch is not None and decided is not None and self._flip is None:
                 self.leg_batch.decide(decided[0], self.runtime.name)  # this leg has decided on that close
+            # A flip has decided only once its open is posted, after its close fills (on_order_filled): until then the
+            # close's pass waits for it, or for close + WAIT_NS (F-B1-REPLAY).
         if self._waiting is not None and not self._still_missing():
             self._decide_waiting()  # every minute missing before it has landed: decide on it now, in order
         if self.pair is not None and str(bar.bar_type) == str(self._cfg.bar_type).split("@")[0]:
@@ -5840,7 +5842,18 @@ class LongFlatStrategy(Strategy):
                 # Turning from one side to the other: the close has filled, so open the new side now.
                 side, bar, reason, values = self._flip
                 self._flip = None
-                self._open(side, bar, reason, values)
+                if self.leg_batch is not None and self._deciding is None:
+                    # A multi-asset leg's flip opens on its close's idea: held for that close's pass with the other
+                    # legs' ideas (strongest first), as the backtest's CloseBatch holds it, never gated by which
+                    # leg's close filled first (F-B1-REPLAY).
+                    self._deciding = (int(bar.ts_event), int(bar.ts_init))
+                    try:
+                        self._open(side, bar, reason, values)
+                    finally:
+                        self._deciding = None
+                    self.leg_batch.decide(int(bar.ts_event), self.runtime.name)
+                else:
+                    self._open(side, bar, reason, values)
         if getattr(self, "pair", None) is not None and not self._backtest:
             self.pair.on_mark(self, px)  # Advisor M5: a two-leg Strategy's guards run on every fill of either leg
 
