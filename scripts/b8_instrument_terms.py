@@ -30,7 +30,8 @@ Verdicts (Advisor 03:05 UK):
 With the journal (DATABASE_URL, which the hub container has), each traded pair also gets the venue data FEE-LIVE
 fetched (venue_terms_fetch, its last-known-good row) beside the engine's: "maint. tiers (fetched)" against the kept
 maintenance table, and "taker fee (fetched)" / "maker fee (fetched)" against the fees the engine charges
-(fees.resolve). A tier that differs, or an engine fee below the fetched one (paper cheaper than the venue), is a MUST;
+(fees.resolve); an account's fetched rate is never printed, the log being public, only whether the engine's is
+equal, higher or lower (the published stand-in's rates print). A tier that differs, or an engine fee below the fetched one (paper cheaper than the venue), is a MUST;
 an engine fee above it is a FOLLOW-UP. Age as FEE-LIVE judges it: over 24 h FOLLOW-UP, over 72 h or never fetched
 MUST. The published stand-in, and a newer fetch that was refused, are FOLLOW-UPs that say so. It only reads them."""
 
@@ -239,7 +240,10 @@ def fetched_rows(store, name: str, pair: str, now: datetime) -> tuple[list[tuple
             verdict, words = _worst(verdict, "FOLLOW-UP"), f"published, not account: {words}"
         if why:
             verdict, words = _worst(verdict, "FOLLOW-UP"), f"{words}; {why}"
-        out.append((term, got, engine, verdict))
+        if good["source"] == PUBLISHED_FEES:
+            out.append((term, got, engine, verdict))
+        else:  # an account's rate never reaches the public job log (HoE): only how the engine's compares with it
+            out.append((term, "account", "equal" if engine == got else "higher" if engine > got else "lower", verdict))
         said(term, words)
     return out, notes
 
