@@ -131,3 +131,15 @@ def test_a_single_asset_strategys_flatten_words_are_unchanged(held):
     _db, client = held
     words, _html = _dialog(client, "solo", "flatten")
     assert "it starts only to sell 1 BTC (about" in words and "every leg" not in words
+
+
+def test_the_book_kill_switch_flattens_every_open_leg_of_a_multi_asset_strategy(held):
+    """HoE: the kill switch tells a Strategy through its first row (legs()[0]); every asset leg, ETH and SOL
+    included, gets the flatten, as every one of the Strategy's positions must close."""
+    db, client = held
+    r = client.post("/book/flatten", data={"reason": "kill switch drill"}, auth=AUTH, headers=HDR,
+                    follow_redirects=False)
+    assert r.status_code == 303 and "kill_error" not in r.headers["location"]
+    told = {n for n in [s.name for s in db.sleeves()] if any(c["command"] == "flatten"
+                                                            for c in db.pending_commands(n))}
+    assert {a["sleeve"] for a in db.strategy_assets("m")} <= told
