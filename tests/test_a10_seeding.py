@@ -16,12 +16,13 @@ from sleeve_fund.strategies.indicators import BLOCKS, Atr, Ema, Keltner, Rsi, Rs
 from sleeve_fund.strategies.indicators import seeding
 
 MIN = 60_000_000_000
+T0 = 1_760_000_000 * 1_000_000_000  # Oct 2025: no candle at the epoch, which a strategy takes as already seen
 
 
 def _walk(n, seed=1, vol=0.001, start=60_000.0):
     rng = np.random.default_rng(seed)
     close = start * np.exp(np.cumsum(rng.normal(0, vol, n)))
-    return [(c, c * (1 + vol), c * (1 - vol), c, 1.0, (k + 1) * MIN) for k, c in enumerate(close)]
+    return [(c, c * (1 + vol), c * (1 - vol), c, 1.0, T0 + (k + 1) * MIN) for k, c in enumerate(close)]
 
 
 def _crash_then_creep():
@@ -37,7 +38,7 @@ def _crash_then_creep():
     for _ in range(140):
         x += 0.01
         closes.append(x)
-    return [(c, c, c, c, 1.0, (k + 1) * MIN) for k, c in enumerate(closes)]
+    return [(c, c, c, c, 1.0, T0 + (k + 1) * MIN) for k, c in enumerate(closes)]
 
 
 def _creep(after, n, step=0.01):

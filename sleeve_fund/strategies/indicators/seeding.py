@@ -219,7 +219,7 @@ def _seeded(obj, candles) -> object:
 @dataclass
 class Result:
     """One unit's check: settled, the two seeds compared (bars back), the bars the model itself should be fed so
-    its own reading is the nearer agreeing seed's or better, the gap when apart, why when the store is too short,
+    its own reading is the farther agreeing seed's, the gap when apart, why when the store is too short,
     and the pair to carry on live while not settled."""
 
     label: str
@@ -256,11 +256,11 @@ def check(obj, candles: list, label: str, cap: int = CAP) -> Result:
     near, far = _seeded(obj, candles[-n1:]), _seeded(obj, candles[-n2:])
     gap = worst(near, far)
     if gap is None:
-        return Result(label, True, (n1, n2), n1)
+        return Result(label, True, (n1, n2), n2)  # the farther seed is the better settled (Advisor 08:49 UK)
     if have > n2:
         longest = _seeded(obj, candles[-have:])
         again = worst(far, longest)
         if again is None:
-            return Result(label, True, (n2, have), n2)
+            return Result(label, True, (n2, have), have)
         return Result(label, False, (n2, have), have, gap=again, pair=Pair(far, longest, n2, n1))
     return Result(label, False, (n1, n2), n2, gap=gap, pair=Pair(near, far, n1, n1))

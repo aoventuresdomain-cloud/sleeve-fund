@@ -1267,8 +1267,8 @@ class LongFlatStrategy(Strategy):
 
     def _check_seeds(self, units: list, candles: list, want: int, slower=None, fed: int | None = None) -> int:
         """A10: each unit seeded twice on the loaded candles (seeding.check), oldest first as (open, high, low, close,
-        volume, close ns). Returns how many of them to feed: the warm-up `want`, or more where the check settled only
-        further back. Seeds still apart, or a store too short to tell, hold new entries (_entry_held) until a pair
+        volume, close ns). Returns how many of them to feed: the warm-up `want`, or the farther
+        agreeing seed when that is longer (Advisor 08:49 UK). Seeds still apart, or a store too short to tell, hold new entries (_entry_held) until a pair
         carried on over live candles agrees; said once. slower: the SlowerCandles the pairs are fed from, minutes for
         decision candles closing on that boundary, or None for every decision candle. fed: the candles the model itself
         was fed, when it can't be fed more (a unit on its own boundary): settled only further back than that, it holds."""
