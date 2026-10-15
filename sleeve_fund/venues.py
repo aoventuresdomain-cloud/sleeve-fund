@@ -24,6 +24,11 @@ from nautilus_trader.model import Venue
 from sleeve_fund.instruments import FeeSchedule, perpetual, spot_pair
 from sleeve_fund.margin import Tier
 
+# FEE-LIVE: the paper venue's published perp VIP 0 (the PM's pasted schedule, 15 Oct 2026; research/venue-data): the one
+# place a perp fee rate is written. What the paper venue charges until its account's own rate is fetched (venue_terms),
+# what research charges at least, the simulated perp's rates and the shadow outcomes' fee.
+PAPER_PERP_FEES = FeeSchedule(maker=Decimal("0.0002"), taker=Decimal("0.00055"))
+
 
 @dataclass
 class VenueProfile:
@@ -636,10 +641,10 @@ BINANCE = register(VenueProfile(
     # FEE-LIVE: the paper venue's published perp VIP 0 (the PM's pasted schedule, 15 Oct 2026; research/venue-data),
     # what a new account pays, what research charges at least, and what a demo account with no fee endpoint is
     # charged on paper. Running strategies are charged the account's own rate per instrument (venue_terms).
-    fees=FeeSchedule(maker=Decimal("0.0002"), taker=Decimal("0.00055")),
+    fees=PAPER_PERP_FEES,
     fee_basis="VIP 0, published schedule, 15 Oct 2026",
     # A fetched rate outside [the lowest published (Supreme VIP), VIP 0] is missing, never a wider range (Advisor (c)).
-    fee_bounds={"maker": (Decimal("0"), Decimal("0.0002")), "taker": (Decimal("0.0003"), Decimal("0.00055"))},
+    fee_bounds={"maker": (Decimal("0"), PAPER_PERP_FEES.maker), "taker": (Decimal("0.0003"), PAPER_PERP_FEES.taker)},
     fee_bounds_basis="perp maker and taker, Supreme VIP to VIP 0, the PM's pasted schedule of 15 Oct 2026 "
                      "(research/venue-data/paper-venue-fee-schedule-2026-10-15.md), DA hand-check",
     daily_history=binance_daily,
