@@ -261,12 +261,64 @@ def test_the_script_starts_with_exactly_twice_the_newest_dump_free(tmp_path):
     assert "disk: PASS" in done.stdout and any(c.startswith("exec drill-x-db pg_restore") for c in calls)
 
 
-def test_every_deploy_recreates_the_backup_so_it_runs_the_new_script():
-    """HoE: backup.sh is bind-mounted, so compose up leaves the backup running the old script; every deploy recreates
-    it, after the stack is up (one extra dump per deploy)."""
+REFRESH = ROOT / "deploy" / "backup_refresh.sh"
+
+
+def _refresh(tmp_path: Path, script: str, fail: bool = False) -> tuple[subprocess.CompletedProcess, list[str]]:
+    """deploy/backup_refresh.sh run as remote_up.sh runs it (from the app folder), with a stand-in docker."""
+    (tmp_path / "deploy").mkdir(exist_ok=True)
+    (tmp_path / "deploy" / "backup.sh").write_text(script)
+    log = tmp_path / "docker.log"
+    log.touch()
+    (tmp_path / "bin").mkdir(exist_ok=True)
+    (tmp_path / "bin" / "docker").write_text(f'#!/usr/bin/env bash\necho "$*" >> {log}\n{"exit 1" if fail else "exit 0"}\n')
+    (tmp_path / "bin" / "docker").chmod(0o755)
+    env = {**os.environ, "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}"}
+    done = subprocess.run(["bash", str(REFRESH)], cwd=tmp_path, env=env, capture_output=True, text=True, timeout=30,
+                          check=False)
+    return done, log.read_text().splitlines()
+
+
+RECREATE = "compose up -d --force-recreate --no-deps backup"
+
+
+@pytestmark_script
+def test_a_changed_backup_script_recreates_the_backup_and_stamps_it(tmp_path):
+    """HoE: backup.sh is bind-mounted, so compose up leaves the backup on the old script. A deploy recreates it when
+    the script changed (the first deploy too: no stamp yet), and stamps the script it now runs."""
+    done, calls = _refresh(tmp_path, "echo one\n")
+    assert done.returncode == 0 and calls == [RECREATE]
+    stamp = (tmp_path / ".backup_sha").read_text().strip()
+    done, calls = _refresh(tmp_path, "echo two\n")
+    assert done.returncode == 0 and calls == [RECREATE, RECREATE]
+    assert (tmp_path / ".backup_sha").read_text().strip() not in ("", stamp)
+
+
+@pytestmark_script
+def test_an_unchanged_backup_script_leaves_the_backup_running(tmp_path):
+    """Each recreate dumps at once and the backup keeps 14 dumps by count: a deploy that didn't change the script
+    must not spend a night of history."""
+    _refresh(tmp_path, "echo one\n")
+    done, calls = _refresh(tmp_path, "echo one\n")
+    assert done.returncode == 0 and calls == [RECREATE]  # the first deploy's only
+
+
+@pytestmark_script
+def test_a_failed_recreate_keeps_the_old_stamp_and_fails_the_deploy(tmp_path):
+    _refresh(tmp_path, "echo one\n")
+    stamp = (tmp_path / ".backup_sha").read_text()
+    done, calls = _refresh(tmp_path, "echo two\n", fail=True)
+    assert done.returncode != 0 and calls == [RECREATE, RECREATE]
+    assert (tmp_path / ".backup_sha").read_text() == stamp  # the next deploy tries again
+
+
+def test_the_deploy_refreshes_the_backup_after_the_stack_and_keeps_the_stamp():
     lines = [ln.strip() for ln in (ROOT / "deploy" / "remote_up.sh").read_text().splitlines()]
     up = lines.index("docker compose up -d --build --remove-orphans")
-    assert lines[up + 1] == "docker compose up -d --force-recreate --no-deps backup"
+    assert lines[up + 1] == "bash deploy/backup_refresh.sh"
+    assert "--force-recreate" not in (ROOT / "deploy" / "remote_up.sh").read_text()  # only when the script changed
+    # the deploy's rsync --delete would remove the stamp, and every deploy would recreate
+    assert "--exclude .backup_sha" in (ROOT / ".github" / "workflows" / "deploy.yml").read_text()
 
 
 def test_the_workflow_is_by_hand_on_main_quiet_and_copies_nothing_off_the_server():
