@@ -2,12 +2,13 @@
 the venue data FEE-LIVE fetched (venue_terms_fetch), with a verdict per row. Read-only: it reads the journal's fetch
 rows and writes nothing. Without a journal (no store) B8 is as it was."""
 
+import os
 from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from sleeve_fund.store import PUBLISHED_FEES, Store
-from test_b8_instrument_terms import BTC_FUNDING, _sleeve, _symbol, _venue, b8
+from sleeve_fund.store import PUBLISHED_FEES, Store, make_engine, metadata
+from test_b8_instrument_terms import BTC_FUNDING, _sleeve, _symbol, _venue, b8, contract, hub  # noqa: F401 - autouse stubs
 
 NOW = datetime(2026, 10, 15, 12, 0, tzinfo=UTC)
 BOUNDS = {"maker": ("0", "0.0002"), "taker": ("0.0002", "0.0005")}
@@ -27,8 +28,14 @@ def _tiers_payload():
 
 
 @pytest.fixture
-def store():
-    s = Store.in_memory()
+def store(tmp_path):
+    url = os.environ.get("TEST_DATABASE_URL")  # CI also runs these against Postgres, as test_sleeve_runtime does
+    if url:
+        engine = make_engine(url)
+        metadata.drop_all(engine)
+        s = Store(engine=engine)
+    else:
+        s = Store(f"sqlite:///{tmp_path}/t.db")
     s.create_account("paper-main", "paper")
     return s
 
