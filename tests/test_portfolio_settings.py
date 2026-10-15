@@ -59,7 +59,7 @@ def test_the_page_shows_the_five_tests_their_limits_and_the_fixed_lines(ps):
                   "If the compliance tests can't be read, no new trade goes out.",  # TEC-FE-WORD (HoE)
                   "An asset with no group can't take a new trade while the per-group test is on."):
         assert words in t
-    assert "1.5x" in t and "15%" in t and "50%" in t
+    assert "1.50x" in t and "15%" in t and "50%" in t  # B-18 TEC: "x" values show 2 dp
     assert t.count("Locked on") == 3  # T3 and both loss brakes
     assert t.count("No group · ideas refused") == 2  # ADA and DOGE: not in the v1 map
     assert "sleeve" not in t.lower()
