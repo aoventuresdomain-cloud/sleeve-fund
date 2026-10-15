@@ -1879,7 +1879,10 @@ class LongFlatStrategy(Strategy):
         """An opening order of `qty` went out from _open with these values (a STEPPED model reads its size here)."""
 
     def _lock_resumed(self, r: dict) -> None:
-        self._exit_lock = r["side"] if self._margin else True
+        if self.REENTER_AFTER_EXIT_LEG:  # its stop or target ended the leg, as before the restart (_lock_exit_leg):
+            self.exit_leg_closed()  # a side lock here was never cleared, so it never entered again (PE1 restart cell)
+        else:
+            self._exit_lock = r["side"] if self._margin else True
         r["lock_ns"] = None
 
     def _finish_resume(self) -> None:

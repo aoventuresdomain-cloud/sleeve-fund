@@ -88,6 +88,35 @@ def test_a_restart_before_sell_half_resumes_the_carried_cycle_and_never_doubles(
     assert tail(b) == tail(a)
 
 
+@pytest.mark.parametrize("drop_at", [615, 640], ids=["stop_filled_before_it_went_down", "stop_crossed_while_down"])
+def test_a_stop_before_the_restart_starts_the_cycle_flat_and_carries_nothing(drop_at):
+    """HoE 02:06 UK, with the cell above: the price falls through the protective stop (2%) after step 0 carried the
+    long in and before B is back, so the cycle's position is gone. Either the stop filled just before B went down (the
+    journal shows it at the restart) or the price crossed it while B was down (it fills on B's first tick). Either way
+    B must not carry Q into the cycle: it opens nothing until the next cycle's step 0 sizes afresh from flat, as the
+    straight-through run does."""
+    secs = 20 * 60
+    feed = ([60_000.0] * drop_at + [58_200.0] * (secs - drop_at), None, [0.05] * secs)
+    a, b, close, (restart, _) = _ab("candle_step", PARAMS, feed, lambda a: _step_close(1, step=1))
+    qa = D(str(_orders(a)[0]["filled_qty"]))
+    nxt = close + timedelta(minutes=5)  # step 0 of the next cycle, which sizes a new Q from the fund after the stop
+    upto = len([o for o in _orders(b) if o["ts"] < nxt])
+    assert max(abs(h) for h in _path(b)[:upto]) <= qa, ("a position above Q after the restart", _path(b))
+    stops = [o for o in _orders(b) if o["intent"] == "stop_loss"]
+    assert stops and stops[0]["ts"] < close + timedelta(minutes=1), ("set-up: the stop didn't fill", _orders(b))
+    between = [(o["ts"], o["side"], o["filled_qty"], o["intent"]) for o in _orders(b)
+               if stops[0]["ts"] < o["ts"] < nxt]
+    assert between == [], ("B carried Q into a cycle its stop had ended", between)
+    assert _path(b)[[o["id"] for o in _orders(b)].index(stops[0]["id"])] == 0
+    # From the next cycle on B trades the cycle as A does, on a Q sized afresh from the fund after the stop, never the
+    # old one. Its equity may differ a little: a stop crossed while down is booked at its level as the venue would
+    # have filled it in that minute (Advisor NA-1), where A, up, fills on the tick that gapped through it.
+    tail = lambda s: [(o["side"], o["intent"], o["signal"].get("step")) for o in _orders(s) if o["ts"] >= nxt]
+    assert tail(b) == tail(a) and tail(a)
+    qb, qa2 = (D(str(next(o for o in _orders(s) if o["ts"] >= nxt)["filled_qty"])) for s in (b, a))
+    assert qb != qa and abs(qb / qa2 - 1) < D("0.01"), (qb, qa2, qa)
+
+
 def test_a_restart_after_the_run_window_opens_nothing():
     """The window counts from the first start, journaled with every step: B, restarted after it has passed, only
     closes what it holds and opens nothing (design: run_for_hours)."""
