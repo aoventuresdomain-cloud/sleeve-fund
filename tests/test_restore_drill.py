@@ -152,6 +152,35 @@ def test_no_log_line_carries_data(tmp_path, capfd):
     assert all(LINE.match(ln) for ln in out.splitlines()), out
 
 
+def _counts_against(tmp_path: Path, restored) -> tuple[str, str]:
+    from sqlalchemy import create_engine
+
+    from sleeve_fund.restore_drill import check_counts
+    from sleeve_fund.store import metadata
+
+    engine = create_engine("sqlite://")
+    metadata.create_all(engine)
+    (tmp_path / "status.json").write_text(json.dumps({"ok": True, "file": "x.dump", "restored": restored}))
+    try:
+        return check_counts(engine, tmp_path)
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.parametrize("restored", [None, {}])
+def test_a_backup_that_counted_nothing_fails_the_counts(tmp_path, restored):
+    """CR F-RD-1 (a): no count to match is no proof, never a pass."""
+    status, words = _counts_against(tmp_path, restored)
+    assert status == "FAIL" and "no count" in words
+
+
+def test_a_counted_table_the_schema_hasnt_fails_without_a_query(tmp_path):
+    """CR F-RD-1 (b): a name the backup counted that the restored schema lacks is a FAIL, and is never put in SQL."""
+    want = {t: 0 for t in ("sleeves", "orders", "fills", "events")} | {"x; drop table sleeves": 0}
+    status, words = _counts_against(tmp_path, want)
+    assert status == "FAIL" and "apart from the backup's count: x; drop table sleeves" in words
+
+
 def test_a_step_that_raises_prints_its_error_type_only(capfd):
     from sleeve_fund.restore_drill import Drill
 
