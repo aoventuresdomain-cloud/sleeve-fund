@@ -62,23 +62,13 @@ def taker_of(store, sleeve) -> Decimal:
 
 def resolve(venue: str | None = None, store=None, instrument: str | None = None, now: datetime | None = None,
             live: bool = False, account: str | None = None) -> FeeQuote:
-    """The fee schedule to use for `venue` now: the latest one fetched from a connected account,
-    else the venue profile's published schedule. On a FEE-LIVE venue (published fee bounds) with an instrument, the
+    """The fee schedule to use for `venue` now. Every venue is a FEE-LIVE venue (published fee bounds) with an instrument, the
     instrument's last-known-good rate (venue_terms.term); one never fetched is charged at the published VIP 0, its
     entries refused (venue_terms.entry_refusal) while its exits run."""
     profile = venue_profile(venue)
-    if profile.fee_bounds:
-        return _live_quote(profile, store, instrument, now, live, account)
-    row = None
-    if store is not None:
-        try:
-            row = store.latest_fees(profile.name)
-        except Exception:  # noqa: BLE001 - no table yet (an old database) or no database: published fees
-            row = None
-    if row:
-        fees = FeeSchedule(Decimal(str(row["maker"])), Decimal(str(row["taker"])))
-        return FeeQuote(fees, "account", row["account"], row["fetched_at"], profile.label)
-    return FeeQuote(profile.fees, "published", None, None, profile.label, profile.fee_basis)
+    if not profile.fee_bounds:  # every venue's fees are FEE-LIVE's: never a silent fallback (HoE)
+        raise ValueError(f"{profile.label} has no published fee bounds: its fees can't be read through FEE-LIVE")
+    return _live_quote(profile, store, instrument, now, live, account)
 
 
 def _live_quote(profile, store, instrument: str | None, now: datetime | None, live: bool,

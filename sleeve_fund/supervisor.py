@@ -1241,24 +1241,8 @@ class Supervisor:
             self.store.report_keys({a["name"]: accounts.key_present(a["name"], venue=a["venue"]) for a in live})
 
     def check_fees(self, environ=None) -> None:
-        """Read each connected live account's fee schedule from its venue, so backtests and paper
-        charge what the exchange actually charges that account. Query-only; the key never leaves
-        this process."""
-        from sleeve_fund.venues import venue as venue_profile
-
-        for a in self.store.accounts():
-            if a["kind"] != "live":
-                continue
-            creds = accounts.credentials(a["name"], a["venue"], environ)
-            profile = venue_profile(a["venue"])
-            if creds is None or profile.fetch_fees is None:
-                continue
-            try:
-                fees = profile.fetch_fees(*creds)
-                self.store.record_fees(profile.name, a["name"], float(fees.maker), float(fees.taker))
-            except Exception as exc:  # noqa: BLE001 - keep the last good schedule; show why on the dashboard
-                msg = str(exc).replace(creds[0], "***").replace(creds[1], "***")
-                self.store.event(None, "warning", "fee_fetch_failed", f"{a['name']}: {msg}")
+        """FEE-LIVE: every followed Strategy's fee rates and margin tiers, kept in venue_terms_fetch
+        (check_venue_terms). The old per-account write to fee_schedules is retired: nothing reads it."""
         self.check_venue_terms(environ)
 
     def check_venue_terms(self, environ=None, now=None, get=None) -> None:
