@@ -1270,20 +1270,21 @@ def test_na3_a_minute_opening_short_of_liquidation_takes_the_reachable_stop_firs
     assert ex[0] == "stop_loss", run.sequence()
     (alert,) = run.kinds("outage_exit")
     assert alert["level"] == "warning" and "outage fill: pessimistic, capped at liquidation" in alert["message"]
-    # The liquidation price now (_liq_now: the entry's, less the fees taken from the isolated margin), as the alert
+    # The liquidation price now (_liq_now: the entry's, from the isolated margin the engine holds), as the alert
     # states it; cross-checked against the entry's own where the journal carries it.
     liq = float(re.search(r"past the ([\d,]+\.\d\d) liquidation price", alert["message"]).group(1).replace(",", ""))
     # C-NA3-LIQ: derived here too, independently of the engine: isolated margin = notional / the profile's leverage
-    # cap, less the entry fee; liquidated where that margin plus the move equals the maintenance margin on the value
-    # there: p = (entry - side x margin / qty) / (1 - side x mm).
+    # cap, the entry fee left in it (TEC LIQ-FEE fallback, HoE: the engine's model until the DA's LIQ-FEE lands; the
+    # fee taken off moved the price by fee / qty = 0.055% of entry, 33.0 here); liquidated where that margin plus the
+    # move equals the maintenance margin on the value there: p = (entry - side x margin / qty) / (1 - side x mm).
     from sleeve_fund import markets
 
     (fill,) = [f for f in run.fills if f["order_id"] == filled_orders(run, "entry")[0]["order_id"]]
-    qty, px, fee = float(fill["qty"]), float(fill["price"]), float(fill["fee"])
+    qty, px = float(fill["qty"]), float(fill["price"])
     lev, mm = {"balanced": 2.0, "aggressive": 3.0}[profile], markets.LOW_FEE_PERP.maintenance_margin
-    a = (px - side * (qty * px / lev - fee) / qty) / (1 - side * mm)
+    a = (px - side * (qty * px / lev) / qty) / (1 - side * mm)
     # and on the entry value (VS-1-TABLE): p = entry - side x (margin - mm x notional at entry) / qty; the nearer kept
-    b = px - side * (qty * px / lev - fee - mm * qty * px) / qty
+    b = px - side * (qty * px / lev - mm * qty * px) / qty
     derived = max(a, b) if side > 0 else min(a, b)
     assert abs(liq / derived - 1) < 0.001, (liq, derived)
     extreme = np.round(p[7 * 60:8 * 60], 1)
