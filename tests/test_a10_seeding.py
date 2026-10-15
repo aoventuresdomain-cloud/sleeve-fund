@@ -467,3 +467,17 @@ def test_the_ema_and_atr_tolerances_are_pinned(unit, near, apart):
     assert seeding.worst(seeded(1 + near), base) is None
     gap = seeding.worst(seeded(1 + apart), base)
     assert gap is not None and gap.gap == pytest.approx(apart, rel=0.05), gap
+
+
+@pytest.mark.parametrize("unit, cap", [(Ema, 1_442), (ExponentialMovingAverage, 1_442), (Rsi, 721), (Atr, 721)])
+def test_a_period_whose_start_still_shows_after_the_check_is_refused(unit, cap):
+    """Advisor (15 Oct ~07:59 UK): the 500/1,000 pair bounds the 1,000-bar seed's error while r^500 <= 1/2, r the
+    average's decay: 1 - 2 / (N + 1) for an EMA (up to N = 1,442), 1 - 1 / N for Wilder's RSI and ATR (up to 721).
+    A longer period could never settle within the cap, so it is refused where a Strategy is made."""
+    decay = (lambda n: 1 - 2 / (n + 1)) if cap > 1_000 else (lambda n: 1 - 1 / n)
+    assert decay(cap) ** (seeding.CAP // 2) <= 0.5 < decay(cap + 1) ** (seeding.CAP // 2)
+    assert seeding.period_cap(unit) == cap
+    assert seeding.too_long(unit(cap)) == []
+    (why,) = seeding.too_long(unit(cap + 1))
+    assert why == (f"{seeding.name(unit(cap + 1))} is longer than the warm-up seed check can judge: the longest it can "
+                   f"settle within {seeding.CAP:,} bars is {cap:,} (A10)"), why
