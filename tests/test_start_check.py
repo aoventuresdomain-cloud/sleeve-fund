@@ -293,17 +293,28 @@ def test_journal_store_a_postgres_journal_passes_the_whole_page():
     assert ok and "Journal store: PASS\n  PASS  Postgres" in page, page
 
 
-def test_every_strategys_recursive_indicators_are_covered_by_the_warm_up_seed_check(tmp_path):
+def test_every_strategys_recursive_indicators_are_covered_by_the_warm_up_seed_check(tmp_path, monkeypatch):
     """A10 (Advisor 15 Oct 07:02 UK): until an indicator the warm-up's seed-twice check can't judge is covered, the
     start check names it, and a Strategy using it doesn't go to paper."""
     url, _ = _journal(tmp_path)
     ok, page = start_check.run(url, environ={})
     assert ok and "Warm-up seed check: PASS" in page, page
+    from sleeve_fund.strategies.dip_buy import _Ema
+    from sleeve_fund.strategies.indicators import seeding
+
+    store = Store(url)
+    store.create_sleeve(name="d2", strategy="dip_buy", instrument="BTC/USDT", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=10_000, venue="BINANCE")
+    store.engine.dispose()
+    ok, page = start_check.run(url, environ={})
+    assert ok and "Warm-up seed check: PASS" in page, page  # its daily EMA is covered, as an EMA
+    monkeypatch.delitem(seeding.TOLERANCE, _Ema)  # a recursive average the check doesn't know
+    monkeypatch.delitem(seeding.NAMES, _Ema)
     store = Store(url)
     store.create_sleeve(name="d1", strategy="dip_buy", instrument="BTC/USDT", bar_spec="1-MINUTE-LAST-INTERNAL",
                         starting_balance=10_000, venue="BINANCE")
     store.engine.dispose()
     ok, page = start_check.run(url, environ={})
     assert not ok and "Warm-up seed check: FAIL" in page
-    assert ("  FAIL  d1: day_ema (_Ema) is a recursive average the warm-up seed check doesn't cover (A10); it "
+    assert ("  FAIL  d1: EMA(20) on daily closes (_Ema(20)) is a recursive average the warm-up seed check doesn't cover (A10); it "
             "doesn't go to paper until it is") in page, page

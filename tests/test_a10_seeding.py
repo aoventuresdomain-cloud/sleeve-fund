@@ -127,10 +127,19 @@ def test_every_block_is_classified_and_composites_are_checked_on_their_recursive
     assert seeding.check(ema, _walk(1_000), "ema").settled
 
 
-def test_an_unknown_recursive_average_is_named_uncovered():
+def test_an_unknown_recursive_average_is_named_uncovered_and_dip_buys_daily_ema_is_covered_as_an_ema():
     from sleeve_fund.strategies.dip_buy import _Ema
 
-    assert seeding.uncovered(_Ema(20)) == ["_Ema"]
+    class Smoothed:  # a model's own average the check doesn't know
+        def __init__(self):
+            self.initialized, self.value = False, 0.0
+
+        def update_raw(self, x):
+            self.value = x
+
+    assert seeding.uncovered(Smoothed()) == ["Smoothed"]
+    assert seeding.uncovered(_Ema(20)) == [] and seeding.TOLERANCE[_Ema] == (seeding.RELATIVE, 1e-4)
+    assert seeding.name(_Ema(20)) == "EMA(20)" and seeding.need(_Ema(20)) == 200
 
 
 # --- the Strategy ----------------------------------------------------------------------------------------------------
@@ -235,7 +244,7 @@ def test_a_strategy_held_on_its_seeds_still_exits():
     assert opened == [] and [e[2] for e in events] == ["entry_held"]
 
 
-def test_every_hand_coded_model_names_its_recursive_indicators_and_only_dip_buys_daily_ema_is_uncovered():
+def test_every_hand_coded_model_names_its_recursive_indicators_and_none_is_uncovered():
     from sleeve_fund.strategies import REGISTRY
     from sleeve_fund.strategies.series import build
     from sleeve_fund.venues import venue
@@ -249,13 +258,13 @@ def test_every_hand_coded_model_names_its_recursive_indicators_and_only_dip_buys
             s = build(name, instrument, {}, 1)
         except ValueError:  # a model on daily candles only
             s = build(name, instrument, {}, 1440)
-        units = s.seeding_units()
+        units = s.seeding_units() + [u for us in s.seeding_timeframes().values() for u in us]
         found[name] = (sorted(seeding.name(x) for _, u in units for x in seeding.leaves(u)),
                        sorted(f"{k}: {u}" for k, o in units for u in seeding.uncovered(o)))
     assert found["rsi_bands"] == (["RSI(14)"], [])
     assert found["rsi_pullback"][0] == sorted(["RSI(14)", f"EMA({build('rsi_pullback', instrument, {}, 1).c.ema_period})"])
-    assert found["dip_buy"][1] == ["day_ema: _Ema"]
-    assert all(not unc for n, (_, unc) in found.items() if n != "dip_buy"), found
+    assert found["dip_buy"][0] == ["EMA(20)", "RSI(2)"]
+    assert all(not unc for _, unc in found.values()), found
 
 
 def test_a_rules_strategy_checks_its_decision_blocks_chained_as_they_are_fed():
@@ -359,3 +368,64 @@ def test_a_forced_restart_at_several_points_matches_one_continuous_run_on_every_
             assert s.want_side(all_bars[k]) == signals[k][0], (cut, k)
             assert abs(s.rsi.value - signals[k][1]) <= 0.1, (cut, k)  # within the tolerance the check held it to
     assert {sig for sig, _ in signals} >= {-1, 0, 1}  # long, short and flat all occur
+
+
+# --- an indicator fed on a longer boundary: dip_buy's daily EMA ----------------------------------------------------
+
+def _dip_buy(days_loaded, daily_candles):
+    """dip_buy on 1-hour decision candles: its warm-up loads `days_loaded` days of them; the store holds
+    `daily_candles` daily ones, to the same last close."""
+    from sleeve_fund.data import to_bars
+    from sleeve_fund.strategies.dip_buy import DipBuy, DipBuyConfig
+    from sleeve_fund.venues import venue
+
+    instrument = venue("kraken").instrument("BTC", "USD")
+    hourly = BarType.from_str("BTC/USD.KRAKEN-1-HOUR-LAST-INTERNAL")
+    n = max(days_loaded, daily_candles) * 24
+    end = pd.Timestamp("2026-10-15", tz="UTC")
+    rng = np.random.default_rng(9)
+    close = 60_000 * np.exp(np.cumsum(rng.normal(0, 0.004, n)))
+    idx = pd.date_range(end=end - pd.Timedelta(hours=1), periods=n, freq="1h", tz="UTC")  # by open time
+    df = pd.DataFrame({"open": close, "high": close, "low": close, "close": close, "volume": 1.0}, index=idx)
+    daily = df.resample("1D").agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"})
+
+    def loader(inst, bt, limit):
+        if str(bt).startswith("BTC/USD.KRAKEN-1-DAY"):
+            return to_bars(daily.tail(min(limit, daily_candles)), inst, bt)
+        return to_bars(df.tail(min(limit, days_loaded * 24)), inst, bt)
+
+    cfg = DipBuyConfig(instrument_id=instrument.id, bar_type=hourly, assumed_taker_fee=0.001,
+                       warmup_bars=days_loaded * 24)
+    s = DipBuy(cfg).attach_history(loader)
+    s.instrument = instrument
+    events = []
+    s.runtime = type("R", (), {"name": "s1", "backtest": True, "now": lambda self: None,
+                               "store": type("S", (), {"event": lambda self, *a, **k: events.append(a)})()})()
+    return s, events
+
+
+def test_dip_buys_daily_ema_settles_when_the_stores_daily_candles_cover_twice_its_settle():
+    s, events = _dip_buy(201, 600)
+    s._warm_from_history()
+    assert s._seed_hold is None and not [e for e in events if e[2] == "seed_unsettled"], events
+    assert s.day_ema.count == 201
+
+
+def test_dip_buys_daily_ema_holds_when_the_store_has_too_few_daily_candles_and_says_so():
+    s, events = _dip_buy(201, 300)  # 300 daily candles: short of 2 x 200
+    s._warm_from_history()
+    (_, _, _, msg), = [e for e in events if e[2] == "seed_unsettled"]
+    assert "EMA(20) on daily closes: the history store holds 300 bars" in msg
+    assert s._entry_held(type("B", (), {"ts_event": 0})(), "long entry")
+
+
+def test_dip_buys_daily_pair_is_fed_only_on_day_closes():
+    s, events = _dip_buy(201, 300)
+    s._warm_from_history()
+    (pair, of, after), = s._seed_pairs.values()
+    assert of == 1440
+    fed = pair.fed
+    s._feed_seeds(None, (1, 1, 1, 61_000.0, 1, after + 3_600_000_000_000))  # an hour after: not a day close
+    assert pair.fed == fed
+    s._feed_seeds(None, (1, 1, 1, 61_000.0, 1, after + 86_400_000_000_000))
+    assert pair.fed == fed + 1
