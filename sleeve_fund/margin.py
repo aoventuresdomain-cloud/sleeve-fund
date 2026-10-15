@@ -51,7 +51,8 @@ def tier_at(maintenance: Maintenance, notional: float) -> Tier:
     """The tier a notional falls in: the first whose ceiling is above it, so a notional exactly on a ceiling takes the
     higher tier (Advisor, VS-1 (b)(1))."""
     table = _table(maintenance)
-    return next((t for t in table if abs(notional) < t.ceiling), table[-1])
+    # an open-ended last tier isn't compared: a journal Money can't be compared with infinity (liquidation_price)
+    return next((t for t in table if math.isinf(t.ceiling) or abs(notional) < t.ceiling), table[-1])
 
 
 def isolated_margin(qty: float, entry: float, leverage: float, balance: float | None = None) -> float:
