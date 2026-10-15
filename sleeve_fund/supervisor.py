@@ -1420,7 +1420,8 @@ def book_line(store: Store) -> str:
 
 
 def book_figures(store: Store) -> str:
-    """The book's headline figures as the Portfolio counts them (every strategy not in an earlier book):
+    """The book's headline figures as the Portfolio counts them (every strategy not in an earlier book; once the fund
+    holds the book, its capital and equity are the fund's, F-SC-1):
     starting capital, equity, fees, open positions and the first mark, for the deploy log. A Strategy outside the
     fund's book (F229-6, outside_fund_book) is left out, as fund_equity leaves it out, and named after the figures
     (F-HALTREF-4); so is one whose create waits for the supervisor's next mark (F-ASSIGN-STALE)."""
@@ -1430,8 +1431,14 @@ def book_figures(store: Store) -> str:
     current = [s for s in every if s.name not in outside]
     joining = [n for n in outside if store.joining(n)]  # created on a marked book, its deposit waits (F-ASSIGN-STALE)
     tests = [n for n in outside if n not in joining]
-    start = sum(s.starting_balance for s in current)
-    equity = sum(float((store.last_equity(s.name) or {"equity": s.starting_balance})["equity"]) for s in current)
+    if bridge_start(store) is not None:
+        # F-SC-1: once the fund holds the book its capital is the fund's cash, not any Strategy's balance (each holds
+        # 0), so its figures are the fund's: the cash put in since the re-base and the book as the identity reads it
+        book = fund_book(store)
+        start, equity = book.capital, book.total
+    else:
+        start = sum(s.starting_balance for s in current)
+        equity = sum(float((store.last_equity(s.name) or {"equity": s.starting_balance})["equity"]) for s in current)
     fees = sum(float(f["fee"]) for s in current for f in store.fills(s.name, limit=1_000_000))
     held = [s.name for s in current if abs(store.journal_book(s.name, s.starting_balance)["qty"]) > 1e-12]
     firsts = [m["ts"] for s in current if (m := store.first_equity(s.name))]
