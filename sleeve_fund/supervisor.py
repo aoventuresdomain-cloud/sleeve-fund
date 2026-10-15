@@ -195,7 +195,9 @@ def positions_breaks(store: Store) -> list[str]:
     # HOLD-STALE-1 (15 Oct 03:59 UK): a Strategy put away (withdrawn, or an earlier book's: a reset run, a clean slate's)
     # keeps the last mark its runtime wrote, which can be a moment behind its closing fill for good. Skipped only when
     # that is all it is: by its stored state, never its name, its journal flat and its last mark from before it was put
-    # away. A put-away Strategy still holding, or marked since, is a real fault and still breaks.
+    # away (its archived() time, else its previous_book() time). Only withdrawn or earlier-book Strategies: one archived
+    # but still waiting for its withdrawal is in the book and checked (F-HS-1). A put-away Strategy still holding, or
+    # marked since, is a real fault and still breaks.
     archived, earlier = store.archived(), store.previous_book()
     out_at = {n: archived.get(n, earlier.get(n)) for n in set(store.withdrawn()) | set(earlier)}
     for s in store.sleeves():

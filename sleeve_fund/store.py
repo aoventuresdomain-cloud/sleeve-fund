@@ -3234,6 +3234,17 @@ class Store:
                              Decimal(0))
             return total
 
+    def close_out_cash(self, sleeve: str, since: datetime | None = None) -> Decimal:
+        """What old book close-outs (CLOSE_OUT) moved the strategy's cash by after `since`, as strategy_cash_pnl counts
+        them: a transfer, so what compares that cash with the trips (paired from insurance, without them) takes it
+        back out (CR F-RN-5)."""
+        i = insurance_t.c
+        w = (i.sleeve == sleeve) & (i.order_id == CLOSE_OUT)
+        if since is not None:
+            w &= i.ts > since
+        with self.engine.connect() as c:
+            return sum((to_decimal(a) for a in c.execute(select(i.amount).where(w)).scalars()), Decimal(0))
+
     def fill_totals(self, sleeve: str) -> tuple[int, Decimal]:
         """Every fill the strategy has and the fees they paid, uncapped (CASH-2), exact as strategy_cash_pnl."""
         with self.engine.connect() as c:

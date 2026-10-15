@@ -192,6 +192,8 @@ def test_the_dry_run_names_what_it_would_do_and_writes_nothing(store, monkeypatc
     assert _flows(store) == [] and out[:3] == ["dry run, nothing written:", f"reset {SLATE}: not run", "the book now: 20,100.00"]
     assert sorted(out[3].removeprefix("would put away: ").split(", ")) == ["ping-pong-ls-binance", "rsi-bands-ls-binance"]
     assert out[4:] == ["would flatten first: rsi-bands-ls-binance holds 0.1",
+                       "would withdraw as each is put away, after any close-out: ping-pong-ls-binance 10,100.00, "
+                       "rsi-bands-ls-binance 10,000.00; 20,100.00 in all",  # F-RN-4 (TEC-RESET-F-RN-4)
                        "then deposit 100,000.00 into the fund's cash, once the book is empty, as its fresh start"]
 
 
