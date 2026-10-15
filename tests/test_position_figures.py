@@ -58,7 +58,9 @@ def test_every_page_shows_the_same_margin_and_liquidation_for_a_position(client,
         # Isolated: notional at entry over the leverage cap, and liquidated from that margin alone.
         margin = abs(qty) * entry / lev
         t = markets.tier_at(mm, abs(qty) * entry)  # the stand-in table's one tier; a real table re-checks it
-        liq = (margin - qty * entry + t.amount) / (t.rate * abs(qty) - qty)
+        a = (margin - qty * entry + t.amount) / (t.rate * abs(qty) - qty)  # maintenance on the value at the price
+        b = (abs(qty) * entry * t.rate - t.amount - (margin - qty * entry)) / qty  # on the entry value
+        liq = max(a, b) if qty > 0 else min(a, b)  # the nearer of the two (VS-1-TABLE)
         for where, p in page.items():
             assert p["margin"] == pytest.approx(margin), where
             assert p["leverage"] == pytest.approx(lev), where
