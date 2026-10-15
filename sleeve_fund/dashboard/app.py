@@ -31,7 +31,7 @@ from fastapi.templating import Jinja2Templates
 from sleeve_fund import compliance_rules, lifecycle, liquidation, markets, open_risk
 from sleeve_fund.dashboard import book as bookm
 from sleeve_fund.dashboard import development as dev
-from sleeve_fund.dashboard import attribution, compliance, gates, legs, reasons, reports, riskops, trading, withdrawal
+from sleeve_fund.dashboard import assets, attribution, compliance, gates, legs, reasons, reports, riskops, trading, withdrawal
 from sleeve_fund.dashboard.jobs import Jobs
 from sleeve_fund.dashboard.metrics import STALE, sleeve_summary
 from sleeve_fund.data import spec_minutes
@@ -565,6 +565,21 @@ def create_app(store: Store | None = None) -> FastAPI:
         funding = st().funding(name, limit=None) if perp else []
         trips = trading.trips(fills, st().events(name, limit=5000), orders, plans, perp, funding if perp else None,
                               st().insurance(name, limit=None) if perp else None)
+        # F-B5-PAGE (HoQA): a multi-asset Strategy's page covers every asset: a row each, its total, every asset's
+        # trades and the header's figures over them all; the parent row alone is its first asset.
+        multi = None if bt_id or two else assets.view(st(), s, x)
+        if multi:
+            for tr in trips:
+                tr["base"] = multi["rows"][0]["asset"]
+            for r in multi["rows"][1:]:
+                g = st().sleeve(r["sleeve"])
+                g_perp = markets.is_perp(g.params)
+                for tr in trading.trips(st().fills(g.name, limit=100_000), st().events(g.name, limit=5000),
+                                        trading.orders_by_id(st(), g.name), st().exit_plans(g.name), g_perp,
+                                        st().funding(g.name, limit=None) if g_perp else None,
+                                        st().insurance(g.name, limit=None) if g_perp else None):
+                    trips.append(tr | {"base": r["asset"]})
+            trips.sort(key=lambda tr: tr["closed"], reverse=True)
         feed = _feed(events, request.query_params.get("feed", "all"))
         recent = [trading.order_view(o) for o in st().orders(name, limit=ORDER_HISTORY_ROWS)]
         order_total = sum(st().order_counts(name).values())
@@ -602,12 +617,14 @@ def create_app(store: Store | None = None) -> FastAPI:
         positions = trading.book_positions(st(), [x])
         working = [trading.order_view(o) for o in st().orders(name, trading.STATUS_TABS["open"][1], limit=200)]
         fees_funding = x.get("costs", x["fees"] - (perp_x["funding_total"] if perp_x else 0.0))  # funding is + received
+        if multi:
+            fees_funding = multi["kpi"]["fees_funding"]
         # F-T-2: the fill-handler hold is its own flag, journaled (paper.runtime FILL_HOLD / FILL_HOLD_CLEARED).
         hold = None if bt_id else st().last_event(name, ("fill_hold", "fill_hold_cleared"))
         fill_hold = hold if hold is not None and hold["kind"] == "fill_hold" else None
         attr = None if bt_id else attribution.strategy(st(), name, trips, utcnow(), q.get("attr") if q.get("attr")
                                                        in attribution.PERIODS else "all")
-        return page(request, "sleeve.html", x=x, two=two, fills=fills[:200], trips=trips, feed=feed, orders=recent, attr=attr, fill_hold=fill_hold,
+        return page(request, "sleeve.html", x=x, two=two, multi=multi, fills=fills[:200], trips=trips, feed=feed, orders=recent, attr=attr, fill_hold=fill_hold,
                     order_total=order_total, liquidated=liquidated, ral=ral, clearing=clearing,
                     reset_dropped=reset_dropped,
                     positions=positions, working=working, fees_funding=fees_funding,
@@ -637,7 +654,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                     strategy_errors=st().strategy_errors(name, since_start=not bt_id),
                     path=path, journey=None if bt_id else _journey(s, x, path, st().mirror_rows(name, limit=200)),
                     rules=_order_rules(s, x), tp_drop=None if bt_id else _tp_drop(recent, x),
-                    contribution=None if bt_id else _contribution(st(), x),
+                    contribution=None if bt_id else _contribution(st(), multi["kpi"] if multi else x),
                     fund_halt=None if bt_id else compliance.fund_halt(st()),
                     bars=[] if bt_id else compliance.strategy_bars(
                         st(), s.instrument.split("/")[0], _risk_to_stop(x, position), s.params.get("risk_per_trade")))

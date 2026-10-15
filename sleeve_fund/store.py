@@ -4543,13 +4543,18 @@ class Store:
                     self._hold_on_reset(c, sleeve, command, reason)
                 # A two-leg Strategy's pause, resume and flatten reach both legs' runtimes, in the same transaction:
                 # each leg keeps its own status, and a leg left halted or paused would refuse its half of the next
-                # pair (P2-8, Advisor M2).
+                # pair (P2-8, Advisor M2). A multi-asset Strategy's reach every asset leg's runtime the same way
+                # (F-B5-FLATTEN, HoE): each asset runs on its own row, so a flatten told to the parent alone would
+                # close its first asset only, and a resume after it would leave the others paused.
                 # The leg's queue follows the parent's in order: only a repeat of the leg's own last waiting command
                 # is not queued twice (CR F283-3: resume, pause, resume must leave both legs resumed).
-                if (command in ("pause", "resume", "flatten") and (leg := self._leg_of(sleeve, c)) is not None
-                        and c.execute(select(commands_t.c.command).where(
+                legs = [] if command not in ("pause", "resume", "flatten") else (
+                    [leg] if (leg := self._leg_of(sleeve, c)) is not None else self._asset_legs(sleeve, c))
+                for leg in legs:
+                    if c.execute(select(commands_t.c.command).where(
                             commands_t.c.sleeve == leg, commands_t.c.applied_at.is_(None))
-                            .order_by(commands_t.c.id.desc()).limit(1)).scalar() != command):
+                            .order_by(commands_t.c.id.desc()).limit(1)).scalar() == command:
+                        continue
                     c.execute(insert(commands_t).values(sleeve=leg, command=command, reason=reason.strip(),
                                                         created_at=now))
                     if holds_through_reset and command in ("pause", "flatten"):
