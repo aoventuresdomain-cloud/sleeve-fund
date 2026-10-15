@@ -38,6 +38,9 @@ class Trade:
     # liquidated as the engine books one, losing exactly its margin, 1 / leverage, plus fees (GAP-LIQ-CAP,
     # Independent Quant Advisor 7 Oct 00:19 (4)). None: unlevered, the close-to-close move whatever it is.
     leverage: float | None = None
+    # ABSORB-GAP (Advisor 15 Oct ~02:55 UK, option A): the gap past bankruptcy the venue absorbed on this trade's
+    # liquidation, over its entry notional (the base of its return): charged to the strategy's trade, never a draw's.
+    charge: float = 0.0
 
 
 @dataclass
@@ -203,7 +206,8 @@ def random_side(closes, trades: list[Trade], windows: list[tuple[int, int]], cos
     holds = np.concatenate([w[3] for w in per_window])
     sides = np.concatenate([w[4] for w in per_window])
     levs = _levs([t for w in per_window for t in w[5]], leverage)
-    actual = _compound(_trade_returns(c, entries, holds, sides, cost_per_side, levs))
+    charges = np.array([t.charge for w in per_window for t in w[5]])
+    actual = _compound(_trade_returns(c, entries, holds, sides, cost_per_side, levs) - charges)
     long_ = _trade_returns(c, entries, holds, np.ones_like(sides), cost_per_side, levs)
     short = _trade_returns(c, entries, holds, -np.ones_like(sides), cost_per_side, levs)
     drawn = rng.choice(np.array([-1, 1]), size=(draws, len(holds)))
@@ -229,8 +233,8 @@ def random_entry(closes, trades: list[Trade], windows: list[tuple[int, int]], co
     if n == 0:
         return RandomEntryResult(math.nan, math.nan, 0.0, 0.0, 0, 0.0, draws, False, False)
     levs = [_levs(w[5], leverage) for w in per_window]
-    actual = np.concatenate([_trade_returns(c, e, h, s, cost_per_side, lv)
-                             for (_, _, e, h, s, _), lv in zip(per_window, levs)])
+    actual = np.concatenate([_trade_returns(c, e, h, s, cost_per_side, lv) - np.array([t.charge for t in inside])
+                             for (_, _, e, h, s, inside), lv in zip(per_window, levs)])
     rets, sharpes = np.empty(draws), np.empty(draws)
     for d in range(draws):
         parts = []

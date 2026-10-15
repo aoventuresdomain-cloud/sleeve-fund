@@ -54,6 +54,9 @@
       <span class="clock" id="clock" data-now="{{ shell.now.isoformat() }}">{{ shell.now.strftime('%H:%M') }} UTC</span>
     </div>
     <main>
+{% if fund_banner %}{% set fb = fund_banner %}<div class="banner {{ fb.tone }} fund-banner" role="alert" data-fund-state="{{ fb.state }}"><b>{{ fb.text }}.</b>{% if fb.reason and fb.state != 'book_check' %} {{ fb.reason }}{% endif %}
+  {% if fb.restart %}<form method="post" action="{{ fb.restart }}" class="inline"><button class="primary">Restart the fund</button></form>{% endif %}
+  {% if fb.resume_off %}<button type="button" class="secondary" disabled title="{{ fb.resume_off }}">Resume</button>{% endif %}</div>{% endif %}
 {% block content %}{% endblock %}
     </main>
   </div>

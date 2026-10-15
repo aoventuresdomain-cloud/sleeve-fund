@@ -54,8 +54,14 @@ LOCKING_INTENTS = (*EXIT_LEGS, "liquidation", "liquidation_cut")
 # The resting stops a backtest keeps: the model's own, and the risk guard's (_rest_risk_stop).
 STOP_INTENTS = ("stop_loss", "risk_halt", "risk_pause", "liquidation_cut", "liquidation")
 MINUTE_NS = 60_000_000_000
+# GAP-DOWN (F-GD-DEADLINE): the longest a restart replay waits for a stop's trigger minute of trades, every page of it
+# together. It runs on the first trade after the restart, ahead of every stop and tick behind it, so past this the
+# minute's extreme books the stop instead.
+TRADES_DEADLINE = 5.0
 DAY_NS = 86_400_000_000_000
 SAFETY_STOP_SHARE = 0.5  # of the way from the mark to the liquidation price (_safety_stop_on_restore)
+# A liquidation slice's cash true-up (P1-GLC-3) covers the venue's cent rounding of its P&L, no more
+LIQ_TRUE_UP_MAX = 0.01
 # The status reason the supervisor gives a refused start that still holds a position: it runs for its exits only
 # (EXITS_ONLY, from the runtime).
 
@@ -289,6 +295,11 @@ def _hhmm(ns: int) -> str:
     return f"{datetime.fromtimestamp(ns / 1e9, tz=timezone.utc):%H:%M}"
 
 
+def _step_values(values: dict, qty: Decimal | None) -> dict:
+    """A STEPPED model's open: its step's quantity as a limit in _open (none on the cycle's first, sized by share)."""
+    return values if qty is None else {**values, "step_qty": float(qty)}
+
+
 def _side_word(side: int) -> str:
     return "long" if side > 0 else "short" if side < 0 else "flat"
 
@@ -326,6 +337,7 @@ class LongFlatConfig(StrategyConfig):
         market: str = markets.SPOT,
         allow_short: bool = False,
         demo_mirror: bool = False,
+        keep_sub_cost_target: bool = False,
         trade_from: int | None = None,
         leg: dict | None = None,
         **kwargs: Any,
@@ -398,8 +410,9 @@ class LongFlatConfig(StrategyConfig):
                 raise ValueError("maker-first orders aren't available on a perpetual yet: every order goes at market")
             if rebalance_band is not None:
                 raise ValueError("rebalancing to a target weight isn't available on a perpetual yet")
-        # A target in R is after costs by construction (r_target); a fixed one must clear them itself.
-        if take_profit is not None:
+        # A target in R is after costs by construction (r_target); a fixed one must clear them itself, unless the
+        # Strategy's settings keep one below costs (C8 keep_sub_cost_target: the candle-step test, PM 22:38 UK).
+        if take_profit is not None and not keep_sub_cost_target:
             leg = assumed_taker_fee + assumed_half_spread
             cost = leg + (1 + take_profit) * leg  # the fee and half spread in, then out on the larger value
             if take_profit <= cost:
@@ -466,6 +479,9 @@ class LongFlatConfig(StrategyConfig):
         self.perp = markets.terms({"market": market}, str(instrument_id.venue))
         # Read by the demo mirror (sleeve_fund.mirror), not by the strategy: paper is unchanged.
         self.demo_mirror = bool(demo_mirror)
+        # C8 (Drop B): keep a take-profit even when a hit would not cover the round trip's costs (the entry's check
+        # otherwise drops it). Either way the entry's order says what the check found (_check_target).
+        self.keep_sub_cost_target = bool(keep_sub_cost_target)
 
 
 # Handlers whose exceptions the engine would swallow or only log: market data, order events, the bar
@@ -521,6 +537,7 @@ class LongFlatStrategy(Strategy):
     want_long() for all-or-nothing, or target_weight() for anything in between."""
 
     REENTER_AFTER_EXIT_LEG = False  # True: a stop or target ends the model's leg, not locks its side (_lock_exit_leg)
+    STEPPED = False  # True: a perp model that trades by step_orders (part opens and reduces), not want_side
 
     def __init__(self, config: LongFlatConfig) -> None:
         super().__init__(config)
@@ -593,6 +610,9 @@ class LongFlatStrategy(Strategy):
         self.funding_marks: list[tuple] = []
         # (time, amount) for every credit that only brought a flat book's equity back to zero (_cover_shortfall)
         self.insurance_log: list[tuple] = []
+        # ABSORB-GAP (INSURE-RULE point 5): (time, amount) for every liquidation the market took past its bankruptcy
+        # price, the gap the venue absorbed beyond the margin booked (_liquidation_diagnostic); recorded, never booked
+        self.absorbed_log: list[tuple] = []
         # GAP-LIQ-CAP: each liquidation order's booking, {order id: (bankruptcy price, its liquidation fees)}, which a
         # backtest's fills report takes in place of the venue's (research.runner); and the one being closed now
         self.liquidation_books: dict[str, tuple[float, float]] = {}
@@ -609,6 +629,9 @@ class LongFlatStrategy(Strategy):
         # (from the % settings, or from the market for an ATR or swing-low stop); None when flat.
         self._stop_frac: float | None = None
         self._tp_frac: float | None = None
+        # What the entry's target check found when it dropped or kept a target below costs, for that entry's order
+        # (_check_target; _send_entry adds it to the signal once)
+        self._tp_signal: dict = {}
         self._stop_basis = ""  # how the stop was set, in words, for the journal
         # After a restart: a new ATR or swing-low stop to set from the market on the next bar, with the old
         # stop working until then (_replan), as ("edit" or "restart", the settings-change event it applies).
@@ -708,6 +731,8 @@ class LongFlatStrategy(Strategy):
         # the venue's candles instead.
         self.history_loader = None
         self.gap_loader = None  # paper: (instrument, bar_type, since_ns, until_ns) -> the venue's own closed bars
+        # Paper (GAP-DOWN): (start ns, end ns) -> the venue's trades in that span as (ns, price), oldest first
+        self.trade_loader = None
         # Paper on its own feed: (instrument id, after ns, before ns) -> the 1-minute bars the history store holds
         # closing strictly between, as (close ns, open, high, low, close, volume) (paper.node.stored_minutes).
         self.minutes_loader = None
@@ -776,6 +801,9 @@ class LongFlatStrategy(Strategy):
         # BRIDGE-3 (Advisor 14 Oct ~21:55 UK): the fund's equity an entry is sized from, () -> float, set where the fund
         # holds the cash (paper's book, a portfolio run). Unset, the Strategy is the whole fund: its own equity.
         self.fund_equity = None
+        # A multi-asset Strategy's legs on paper (paper.leg_batch): same-close entries wait for every leg, then are
+        # gated strongest first and by asset place. None for every other Strategy: its entries are gated at once.
+        self.leg_batch = None
         # In a portfolio run, what its gate did to each opening order: "<entry|rebalance>_<outcome>" -> count, outcome
         # one of sent, trimmed (sent smaller), below_minimum (trimmed under the venue's minimum, not sent), refused.
         self.portfolio_gate: dict[str, int] = {}
@@ -1016,6 +1044,12 @@ class LongFlatStrategy(Strategy):
         oldest first, as (close ns, open, high, low, close, volume): the first bar after a start is built from them
         (_first_bar_from_store)."""
         self.minutes_loader = loader
+        return self
+
+    def attach_trade_loader(self, loader) -> "LongFlatStrategy":
+        """loader(start_ns, end_ns) -> the venue's trades in [start, end) as (ns, price), oldest first: a replayed
+        stop's trigger minute, read once (GAP-DOWN)."""
+        self.trade_loader = loader
         return self
 
     def attach_gap_loader(self, loader) -> "LongFlatStrategy":
@@ -1938,8 +1972,26 @@ class LongFlatStrategy(Strategy):
     def exit_leg_closed(self) -> None:
         """For a model with REENTER_AFTER_EXIT_LEG: its stop or target closed the position."""
 
+    def step_orders(self, bar: Bar, held: Decimal) -> tuple[list[tuple[str, int, Decimal | None]], str, dict]:
+        """For a STEPPED model: the orders this bar asks for, given the signed quantity held, as (kind, side, qty),
+        kind "close" (all of it, then any open once it fills), "reduce" or "open" (qty None: sized by the limits
+        alone), with the reason and values to journal (_on_bar_stepped)."""
+        raise NotImplementedError
+
+    def idea_strength(self) -> float:
+        """How strong this bar's idea is, for ordering a multi-asset Strategy's ideas on one close (multi-asset spec §4,
+        Advisor MA-SPEC): from bar data only, on a scale comparable across assets (a z-score or ATRs, never a raw
+        price), and part of the idea's hash. 0 by default, so the asset list's order decides."""
+        return 0.0
+
+    def entry_sent(self, qty: Decimal, values: dict) -> None:
+        """An opening order of `qty` went out from _open with these values (a STEPPED model reads its size here)."""
+
     def _lock_resumed(self, r: dict) -> None:
-        self._exit_lock = r["side"] if self._margin else True
+        if self.REENTER_AFTER_EXIT_LEG:  # its stop or target ended the leg, as before the restart (_lock_exit_leg):
+            self.exit_leg_closed()  # a side lock here was never cleared, so it never entered again (PE1 restart cell)
+        else:
+            self._exit_lock = r["side"] if self._margin else True
         r["lock_ns"] = None
 
     def _finish_resume(self) -> None:
@@ -2237,6 +2289,37 @@ class LongFlatStrategy(Strategy):
             return
         self._open(side, bar, reason, values)
 
+    def _on_bar_stepped(self, bar: Bar) -> None:
+        """A STEPPED model's decision (the candle-step test): part opens and reduces, from step_orders. A reduce is
+        an exit for what it asks (reduce-only, never gated) and never adds. A flip is two orders, never one double-size
+        order: everything held closes first and the open goes out once the close has filled (_flip, on_order_filled).
+        An open is gated and sized like any entry, with the step's quantity as one more limit."""
+        if self._busy() or self._pending_exit is not None:
+            return  # the last step is still being carried out
+        orders, reason, values = self.step_orders(bar, self._signed_qty())
+        if not orders:
+            return
+        values = {**values, "close": bar.close.as_double()}
+        kind, side, qty = orders[0]
+        opening = next(((s, q) for k, s, q in orders if k == "open"), None)
+        if kind == "close":
+            flip = opening is not None and not self._entry_held(bar, f"{_side_word(opening[0])} entry after closing "
+                                                                     f"the {_side_word(-side)}")
+            self._flip = (opening[0], bar, reason, _step_values(values, opening[1])) if flip else None
+            self._sell_all("exit", reason, values)
+            return
+        if kind == "reduce":
+            qty = qty.quantize(self._lot(), rounding=ROUND_DOWN)
+            if qty <= 0 or qty < self._min_qty():
+                self._note("step_skipped", f"Step skipped: its reduce of {qty} is below the smallest order the venue "
+                           f"takes ({self._min_qty()})", level="info")
+                return
+            self._submit(OrderSide.BUY if side > 0 else OrderSide.SELL, qty, "exit", reason, values)
+            return
+        if self._entry_held(bar, f"{_side_word(side)} entry"):
+            return
+        self._open(side, bar, reason, _step_values(values, qty))
+
     def _open(self, side: int, bar: Bar, reason: str, values: dict) -> None:
         """Open a position on a perpetual, all of it at market: long (side 1) or short (-1). Sized by the
         smallest of the leverage cap, the risk profile's position cap, the largest order cap, the risk per
@@ -2267,13 +2350,7 @@ class LongFlatStrategy(Strategy):
                 return
             self._noted.discard("stop_not_ready")
             self._stop_frac, self._tp_frac, self._stop_basis = plan
-            leg = self._round_trip_cost()
-            if self._tp_frac and gain_at_target(self._tp_frac, leg, side) <= 0:
-                self._note("target_below_costs", f"No take-profit on this entry: the {self._tp_frac:.2%} target "
-                           "doesn't cover the round trip's fees and spread at the venue's spread now")
-                self._tp_frac = None
-            else:
-                self._noted.discard("target_below_costs")
+            LongFlatStrategy._check_target(self, self._round_trip_cost(), side)
         equity, cash, _, _ = self._mark()
         # CUT-A: sized off the fund's equity, never the Strategy's own (which starts at 0 once the fund holds the cash).
         base = self._sizing_base(equity)
@@ -2301,6 +2378,10 @@ class LongFlatStrategy(Strategy):
             limits["risk per trade"] = Decimal(str(base * self._cfg.risk_per_trade / self._loss_at_stop(side)))
         if (cap := self._volume_cap(bar)) is not None:
             limits["share of the bar's volume"] = cap
+        if (share := values.get("size_share")) is not None:  # a STEPPED model's first open (candle-step Q)
+            limits["the Strategy's size share"] = Decimal(str(base * share))
+        if (step := values.get("step_qty")) is not None:  # a STEPPED model's later open: Q, never more
+            limits["the step's size"] = Decimal(str(step)) * bar.close.as_decimal()
         size_by = min(limits, key=limits.get)
         budget = limits[size_by]
         qty = (budget / bar.close.as_decimal()).quantize(self._lot(), rounding=ROUND_DOWN)
@@ -2310,7 +2391,7 @@ class LongFlatStrategy(Strategy):
             return
         self._noted.discard("buy_skipped")
         signal = {**values, "close": close, "side": _side_word(side), "sized_by": size_by,
-                  "budget": round(float(budget), 2)}
+                  "budget": round(float(budget), 2), **self._fund_at_entry(base)}
         notional = float(qty) * close
         # CUT-A: the simulated account posts the margin, with the fund's virtual funding back in (_mark nets it out)
         liq, distance = entry_liquidation(cash + self._funded(), float(qty), close, side, self._cfg.assumed_taker_fee,
@@ -2343,13 +2424,19 @@ class LongFlatStrategy(Strategy):
             return
         self._noted.discard("entry_refused_open_risk")
         self._send_entry(OrderSide.BUY if side > 0 else OrderSide.SELL, qty, reason, signal)
+        self.entry_sent(qty, values)
 
     def on_bar(self, bar: Bar) -> None:
         self._deciding = self._deciding_bar = None
         try:
             self._on_bar(bar)
         finally:
+            decided = self._deciding
             self._deciding = self._deciding_bar = self._lag = None
+            if self.leg_batch is not None and decided is not None and self._flip is None:
+                self.leg_batch.decide(decided[0], self.runtime.name)  # this leg has decided on that close
+            # A flip has decided only once its open is posted, after its close fills (on_order_filled): until then the
+            # close's pass waits for it, or for close + WAIT_NS (F-B1-REPLAY).
         if self._waiting is not None and not self._still_missing():
             self._decide_waiting()  # every minute missing before it has landed: decide on it now, in order
         if self.pair is not None and str(bar.bar_type) == str(self._cfg.bar_type).split("@")[0]:
@@ -2686,10 +2773,39 @@ class LongFlatStrategy(Strategy):
         if intent == "take_profit":
             px = float(target_fill_px(target, side > 0, spread))
         gapped = px != level  # the minute opened past the level (replay_missed books the open), not a touch
+        source, pessimistic = "touch", ""
         if intent == "stop_loss":
             # Advisor 20:42 (NA-1 replay slippage): a replayed stop is a modelled fill, as the backtest's: its level
             # (or the price that gapped through it) less the taker's slippage, max(half spread, 0.05%), adverse.
-            px = float(Decimal(str(px)) * (1 - side * taker_slippage(spread)))
+            floor = taker_slippage(spread)
+            px = float(Decimal(str(px)) * (1 - side * floor))
+            source = "open"
+            if not gapped:
+                # GAP-DOWN (Advisor 15 Oct ~02:00 UK): touched inside the minute, the venue's resting stop filled on the
+                # first trade at or through its level, so never better than that trade less the floor; with no trade
+                # data for the minute, never better than its adverse extreme, said as pessimistic.
+                first = self._first_trade_through(at, side, level)
+                worse = min if side > 0 else max
+                if first is not None:
+                    px, source = worse(px, float(Decimal(str(first)) * (1 - side * floor))), "trade"
+                else:
+                    px, source = worse(px, worst), "extreme"
+                    pessimistic = "; outage fill: pessimistic (no trade data for that minute: its worst price)"
+                    liq_px = venue.get("liquidation")
+                    if liq_px is not None and side * (px - liq_px) <= 0:
+                        # Advisor 15 Oct ~02:45 UK (GAP-DOWN (c) vs NA-3, option B): the minute's extreme says how far
+                        # the price went, not how far the stop's fill did, and a stop inside half the distance
+                        # triggers first; so no liquidation is inferred: the stop books one tick short of the
+                        # liquidation price, said, and the alert names the loss. The rest of the way to the extreme
+                        # is not charged.
+                        tick = self.instrument.price_increment.as_double() if self.instrument is not None else 0.0
+                        px = liq_px + side * (tick or liq_px * 1e-6)
+                        loss = side * (entry - px) * abs(qty) if qty else None
+                        pessimistic = (f"; outage fill: pessimistic, capped at liquidation (no trade data for that "
+                                       f"minute: its worst price {worst:,.6g} is at or past the {liq_px:,.2f} "
+                                       "liquidation price, which the stop triggers before)"
+                                       + (f"; inferred loss about {loss:,.2f}" if loss is not None else ""))
+                        source = "extreme_capped"
         now = self._price()
         words = {"stop_loss": "stop", "take_profit": "target", "liquidation": "liquidation price",
                  "liquidation_cut": "cut before liquidation", "risk_halt": "drawdown halt's level",
@@ -2699,12 +2815,13 @@ class LongFlatStrategy(Strategy):
                   "stop_loss": "as the venue's stop would have filled it, less the taker's slippage"}.get(
                       intent, "as the venue would have filled it")
         reason = (f"{intent.replace('_', '-').capitalize()} reached {while_}: the price passed the {level:,.6g} "
-                  f"{words} in the minute to {_hhmm(at)}{gap}; booked at {px:,.6g}, {filled}, and closing now at "
-                  f"about {now:,.6g}")
+                  f"{words} in the minute to {_hhmm(at)}{gap}; booked at {px:,.6g}, {filled}{pessimistic}, and "
+                  f"closing now at about {now:,.6g}")
         self.runtime.store.event(self.runtime.name, "warning", "outage_exit", reason)
         # The booked price is the replay's model of the venue, not a venue fill: fills-against-model leaves it out.
         self._outage_book = {"book_px": round(px, 8), "price_source": "replay_model", "market_on_return": now,
                              "outage_level": round(level, 8), "outage_while": while_, "breached_at": _hhmm(at),
+                             "fill_source": source,
                              "half_spread_booked": spread, "half_spread_live": self._half_spread()}
         closed = datetime.fromtimestamp(at / 1e9, tz=timezone.utc)  # the close of the minute the venue's order filled in
         if intent in EXIT_LEGS or intent == "liquidation":  # read back after a restart (_position_at, CR #179)
@@ -2731,6 +2848,58 @@ class LongFlatStrategy(Strategy):
             if self._pending_exit is None:
                 self._outage_book = None  # taken by the order, or nothing was sent
         return True
+
+    def _first_trade_through(self, close_ns: int, side: int, level: float) -> float | None:
+        """GAP-DOWN: the first of the venue's trades in the minute closing at close_ns at or through a position's
+        stop level, or None when there are none, the venue serves none or the request fails (said)."""
+        if self.trade_loader is None:
+            return None
+        import threading
+
+        got: dict = {}
+
+        def load():
+            try:
+                got["trades"] = self.trade_loader(close_ns - MINUTE_NS, close_ns)
+            except Exception as exc:  # noqa: BLE001 - said below
+                got["error"] = exc
+
+        # The fetch runs beside the replay, which waits for it TRADES_DEADLINE at most, however slow the venue is
+        # (F-GD-DEADLINE); a fetch still going is left to finish on its own and read by nobody.
+        reader = threading.Thread(target=load, name="gap-down-trades", daemon=True)
+        reader.start()
+        reader.join(TRADES_DEADLINE)
+        outcome = {"error": f"no answer within {TRADES_DEADLINE:g} s"} if reader.is_alive() else dict(got)
+        trades = outcome.get("trades")
+        if trades is None:
+            exc = outcome.get("error", "no answer")
+            if self.runtime is not None:
+                self.runtime.store.event(self.runtime.name, "warning", "outage_trades_unavailable",
+                                         f"Couldn't read the trades of the minute to {_hhmm(close_ns)}: {exc}; the "
+                                         "stop is booked at that minute's worst price instead")
+            return None
+        return next((float(p) for _, p in trades if side * (float(p) - level) <= 0), None)
+
+    def _jump_bucket(self, coid: str, px: float) -> None:
+        """GAP-DOWN (4), D13-INTRAMINUTE-JUMP (1): a stop the venue filled with the engine up, past its level by more
+        than the floor and 7 bp, is recorded in the jump bucket with that excess, for fills-vs-model. Paper only."""
+        if self._backtest or self.runtime is None:
+            return
+        d = self.decisions.get(coid) or {}
+        sig = d.get("signal") or {}
+        side = self._entry_side
+        level = sig.get("stop_px", sig.get("trigger"))
+        if level is None and sig.get("entry_px") and sig.get("stop_loss") and side:
+            # a watched stop's market order (paper): its level from the entry and the stop as a share of it
+            level = float(sig["entry_px"]) * (1 - side * float(sig["stop_loss"]))
+        if d.get("intent") != "stop_loss" or not level or not side:
+            return
+        excess = side * (float(level) - px) / float(level) - float(taker_slippage(self._half_spread()))
+        if excess > 0.0007:
+            self.runtime.store.event(self.runtime.name, "info", "stop_jump",
+                                     f"Jump through a stop: filled at {px:,.6g} against its {float(level):,.6g} "
+                                     f"level, {excess * 1e4:.1f} bp worse than the level less the floor",
+                                     ts=self.runtime.now())
 
     def _on_bar(self, bar: Bar) -> None:
         self._snap_settlements(bar.ts_event, bar.close.as_double())
@@ -2827,7 +2996,7 @@ class LongFlatStrategy(Strategy):
                 # Funding moves the liquidation price: a stop that never moves is held inside its cap again here.
                 if self._stop_frac is not None and self._hold_stop_capped(self._stop_frac) and self._backtest:
                     self._rest_exits()
-                self._on_bar_sided(bar)
+                (self._on_bar_stepped if self.STEPPED else self._on_bar_sided)(bar)
             return
         raw = self.target_weight(bar)
         if raw is None:
@@ -2854,15 +3023,9 @@ class LongFlatStrategy(Strategy):
                     return
                 self._noted.discard("stop_not_ready")
                 self._stop_frac, self._tp_frac, self._stop_basis = plan
-                leg = self._round_trip_cost()
-                if self._tp_frac and self._tp_frac <= leg + (1 + self._tp_frac) * leg:
-                    # A fixed target checked against the assumed spread can still fall short when the
-                    # venue's spread is wider now; a hit would lose money, so this trade goes without one.
-                    self._note("target_below_costs", f"No take-profit on this entry: the {self._tp_frac:.2%} target "
-                               "doesn't cover the round trip's fees and spread at the venue's spread now")
-                    self._tp_frac = None
-                else:
-                    self._noted.discard("target_below_costs")
+                # A fixed target checked against the assumed spread can still fall short when the venue's spread is
+                # wider now; a hit would lose money, so this trade goes without one unless its settings keep it.
+                LongFlatStrategy._check_target(self, self._round_trip_cost())
             reason, values = self.explain(bar, True)
             extra = {"target_weight": round(float(raw), 6)} if raw < 1 else {}
             # The cap is its own limit in _buy_all, so the journal says which one set the size.
@@ -3222,7 +3385,7 @@ class LongFlatStrategy(Strategy):
             return
         self._noted.discard("buy_skipped")
         signal = {**(values or {}), "close": bar.close.as_double(), "sized_by": size_by,
-                  "budget": round(float(budget), 2)}
+                  "budget": round(float(budget), 2), **self._fund_at_entry(base)}
         if self._stop_frac:
             # What this position loses if the stop is hit, costs included: one R, for the trade's R multiple.
             loss = self._loss_at_stop()
@@ -3246,6 +3409,33 @@ class LongFlatStrategy(Strategy):
         0.05% half spread loses 7.65%, not 6%. A short's stop buys back above the entry (loss_at_stop)."""
         cost, stop = self._round_trip_cost(), self._stop_frac if self._stop_frac is not None else self._cfg.stop_loss
         return loss_at_stop(stop, cost, side)
+
+    def _check_target(self, leg: float, side: int = 1) -> None:
+        """C8 (Drop B): an entry's take-profit that a hit would not pay the round trip's costs on (leg: one leg's fee
+        and half spread) is dropped, so the trade goes without one, or kept when the Strategy's settings say so
+        (keep_sub_cost_target). Either way the entry's order carries what was found, the target and its break-even
+        (the target a hit would just pay the costs at) as shares of the entry price, in the PM's words and as a code."""
+        self._tp_signal = {}
+        tp = self._tp_frac
+        if not tp or gain_at_target(tp, leg, side) > 0:
+            self._noted.discard("target_below_costs")
+            self._noted.discard("target_kept_below_costs")
+            return
+        even = 2 * leg / (1 - side * leg)  # gain_at_target(even, leg, side) == 0
+        found = {"tp_drop_step": "entry_target_check", "tp_target": round(tp, 6), "tp_break_even": round(even, 6)}
+        if getattr(self._cfg, "keep_sub_cost_target", False):
+            self._note("target_kept_below_costs", f"Take-profit kept on this entry by its settings: the {tp:.2%} "
+                       f"target doesn't cover the round trip's fees and spread (break-even {even:.2%})", level="info")
+            self._tp_signal = {**found, "tp_drop_code": "kept_by_config",
+                               "tp_kept": f"Take-profit {tp:.2%} kept by its settings, below the round trip's costs "
+                                          f"(break-even {even:.2%})"}
+            return
+        self._note("target_below_costs", f"No take-profit on this entry: the {tp:.2%} target "
+                   "doesn't cover the round trip's fees and spread at the venue's spread now")
+        self._tp_frac = None
+        self._tp_signal = {**found, "tp_drop_code": "below_round_trip_cost",
+                           "tp_dropped": f"Take-profit {tp:.2%} dropped: below the round trip's costs "
+                                         f"(break-even {even:.2%})"}
 
     def _round_trip_cost(self) -> float:
         """Each leg's cost as a share of its notional: the taker fee and half the spread."""
@@ -3294,6 +3484,8 @@ class LongFlatStrategy(Strategy):
         the order's journal row holds the reservation, so its fills and end settle it (Store._settle_reservation).
         A two-leg Strategy's entry opens both legs through its Pair (strategies.pair), which sends each leg's own,
         checked for both legs at once on paper (`gated`: this leg's answer from PaperGate.pair, Advisor M1)."""
+        if what == "entry" and getattr(self, "_tp_signal", None):
+            signal, self._tp_signal = {**signal, **self._tp_signal}, {}
         if self.pair is not None and self.pair.sending is not self:
             self.pair.entry(self, side, qty, reason, signal, what, sent)
             return
@@ -3348,21 +3540,34 @@ class LongFlatStrategy(Strategy):
                        "(no stop, and the daily ATR isn't known)")
             return
         if paper is not None:
-            # The check reads the supervisor's last mark of the fund (never marks it, HoQA w2d) and journals its
-            # decision; a refusal's reason is on that row and in the strategy's events.
-            decision = paper(self.runtime.name, {**intent, "bar": self._deciding[0] if self._deciding else None},
-                             self.clock.timestamp_ns())
-            if decision.approved_qty > 0:
-                self._noted.discard(f"{what}_refused_by_portfolio")
-                send(intent, decision)
+            deciding, deciding_bar = self._deciding, self._deciding_bar
+
+            def gate_now() -> None:
+                # The check reads the supervisor's last mark of the fund (never marks it, HoQA w2d) and journals its
+                # decision; a refusal's reason is on that row and in the strategy's events. Held for a multi-asset
+                # Strategy's pass (leg_batch), it runs on this decision's own bar, whoever's callback runs the pass.
+                held, self._deciding, self._deciding_bar = (self._deciding, self._deciding_bar), deciding, deciding_bar
+                try:
+                    decision = paper(self.runtime.name, {**intent, "bar": deciding[0] if deciding else None},
+                                     self.clock.timestamp_ns())
+                    if decision.approved_qty > 0:
+                        self._noted.discard(f"{what}_refused_by_portfolio")
+                        send(intent, decision)
+                    else:
+                        count("refused")
+                        self._note(f"{what}_refused_by_portfolio", decision.decision.reason)
+                finally:
+                    self._deciding, self._deciding_bar = held
+
+            if self.leg_batch is not None and deciding is not None:
+                self.leg_batch.post(self.clock, deciding[0], self.runtime.name, self.idea_strength(), gate_now)
             else:
-                count("refused")
-                self._note(f"{what}_refused_by_portfolio", decision.decision.reason)
+                gate_now()
             return
         batch, name = self._portfolio
         bar = {"bar": self._deciding[0] if self._deciding else None}  # as paper's gate gets it: parity keys on it
         batch.post(self.clock, self.clock.timestamp_ns(),
-                   Pending(name, {**intent, **bar}, send, lambda i, d: count("refused")))
+                   Pending(name, {**intent, **bar}, send, lambda i, d: count("refused"), self.idea_strength()))
 
     def _gate_intent(self, side, qty: Decimal, signal: dict, what: str) -> tuple[dict, dict]:
         """(the signal with its decision bar, the intent the portfolio gate reads) for an opening order."""
@@ -3374,7 +3579,7 @@ class LongFlatStrategy(Strategy):
         # What the gate's Intent needs (research.portfolio.gate_intent): the expected fill, not the raw close; the
         # leverage (None on spot); and, with no stop, the daily ATR the stopless measure takes.
         intent = {"side": s, "qty": qty, "close": close, "price": fill_price(close, s, self._half_spread()),
-                  "stop_frac": self._stop_frac, "what": what, "step": self._lot(), "min_qty": self._min_qty(),
+                  "stop_frac": self._stop_frac, "tp_frac": self._tp_frac, "what": what, "step": self._lot(), "min_qty": self._min_qty(),
                   "instrument": self._base_code(), "opens": self._position_qty() < self._min_qty(),
                   "leverage": LongFlatStrategy._max_leverage(self)
                   if self._margin else None,
@@ -4943,6 +5148,20 @@ class LongFlatStrategy(Strategy):
         self.liquidation_books[coid] = (bankrupt, fees + booked_fee)
         return bankrupt, booked_fee
 
+    def _true_up_liquidation_cash(self, trade_id: str) -> None:
+        """P1-GLC-3 (Advisor 7 Oct: before NIGHTLY-RECON goes live): after each slice of a liquidation booked at the
+        bankruptcy price (_book_liquidation), the account's cash keeps the journal's to the last digit. The simulated
+        venue realises the market-price fill's P&L to the cent, which the float _cash_adj to the bankruptcy price
+        can't see, so the marks drifted up to half a cent per slice from the journal. Only once the slice is journaled
+        (a write still to retry would make the journal the one behind), and only a rounding's worth (under
+        LIQ_TRUE_UP_MAX): anything bigger is a real gap, left for the reconcile and the nightly check to catch."""
+        if not self._liquidation_figures(trade_id)[3]:
+            return
+        rt = self.runtime
+        diff = float(rt.store.journal_book(rt.name, rt.starting_balance)["cash"]) - self._mark()[1]
+        if abs(diff) < LIQ_TRUE_UP_MAX:
+            self._cash_adj += diff
+
     def _liquidation_diagnostic(self) -> None:
         """Once a liquidation has closed the position: where the market took it beside the bankruptcy price it was
         booked at, journaled as a diagnostic only (never P&L): past it, the venue's insurance fund covered the
@@ -4953,6 +5172,7 @@ class LongFlatStrategy(Strategy):
         market, past = c["market"] / c["qty"], c["past"]
         rt = self.runtime
         if past >= 0.005:
+            self.absorbed_log.append((rt.now(), past))
             rt.store.event(rt.name, "warning", "insurance_fund",
                            f"The market closed the position at {market:,.6g}, past the bankruptcy price "
                            f"{c['bankrupt']:,.6g}: the {past:,.2f} beyond it is covered by the venue's insurance fund. "
@@ -5017,7 +5237,13 @@ class LongFlatStrategy(Strategy):
         fees = (float(replay_book(rest, 0.0)["entry_fees"]) + sum(float(f["fee"]) for f in liq)
                 + notional * self.runtime.taker_fee)
         at_entry = None
-        if window:  # Y's base (Advisor 20:37): the equity at the position's first fill, flat then so all cash
+        if window and LongFlatStrategy._in_fund(self):
+            # F-FC-4 (Advisor 15 Oct ~02:35 UK): inside the fund, Y's base is the fund equity the position's first
+            # entry was sized off, journaled with it; None (Y reads "all") when it wasn't, never the Strategy's own.
+            first = next((o for o in store.orders(name, limit=100_000) if o["order_id"] == window[0]["order_id"]), {})
+            at_entry = (first.get("signal") or {}).get("fund_equity")
+            at_entry = None if at_entry is None else float(at_entry)
+        elif window:  # Y's base (Advisor 20:37): the equity at the position's first fill, flat then so all cash
             opened = window[0]["ts"]
             at_entry = float(replay_book(fills[:flat], self.runtime.starting_balance,
                                          store.funding_total(name, before=opened),
@@ -5041,11 +5267,13 @@ class LongFlatStrategy(Strategy):
         to one decimal under 10% so a small loss never reads 0% (QA P1-D17, P1-D20)."""
         lev = LongFlatStrategy._max_leverage(self)
         lost = markets.isolated_margin(qty, entry, lev) + fees
-        if before is None:
+        fund = LongFlatStrategy._in_fund(self)
+        if before is None and not fund:
             before = (self.runtime._last_equity or self.runtime.peak) if self.runtime is not None else 0.0
         share = (f"{lost / before:.1%}" if lost / before < 0.1 else f"{lost / before:.0%}") if before and before > 0 \
             else "all"
-        return f"{WIPED_OUT}: {lost:,.2f}, {share} of strategy equity at entry"
+        # F-FC-4: inside the fund, Y is of the fund's equity at entry (the Strategy's own starts at 0 there)
+        return f"{WIPED_OUT}: {lost:,.2f}, {share} of {'the fund' if fund else 'strategy equity'} at entry"
 
     def _liquidation_incident(self) -> None:
         """The incident the engine opens on every liquidation, once the position is gone (Advisor 18:17; 20:37: with
@@ -5198,6 +5426,18 @@ class LongFlatStrategy(Strategy):
 
         start = getattr(supervisor, "bridge_start", None)
         return start is not None and start(rt.store) is not None
+
+    def _fund_at_entry(self, base: float) -> dict:
+        """F-FC-4: inside the fund, the fund equity an entry was sized off (_sizing_base: net deposits + realised +
+        min(0, unrealised), at its mark), journaled with it: a liquidation's Y is its X over this, the position's first
+        entry's, through adds and partial reductions (Advisor 15 Oct ~02:35 UK). Nothing outside the fund."""
+        return {"fund_equity": round(float(base), 2)} if self._in_fund() else {}
+
+    def _in_fund(self) -> bool:
+        """Paper inside the fund (_fund_held), where the fund holds the cash and the Strategy's own equity starts at 0.
+        A research run handed the fund's figure keeps its own wording (F-FC-4 is paper's halt). A stand-in without the
+        paper gate (a unit's namespace) is outside it."""
+        return hasattr(self, "_paper_gated") and LongFlatStrategy._fund_held(self)
 
     def _fund_held(self) -> bool:
         """Paper inside the fund (the portfolio gate on, and in the fund's book): the fund holds the cash, so the
@@ -5746,6 +5986,8 @@ class LongFlatStrategy(Strategy):
             # the fee (the venue's, with the rounding carried from earlier fees), as the fills report does
             # (runner._spread_into_prices).
             px, fee = booked[0], fee - booked[1]
+        if not book:  # a fill the venue made, not a replayed booking
+            self._jump_bucket(journal_id, px)
         note = outage_fill_note(self.decisions.get(journal_id), px)
         if note is not None and self.runtime is not None:
             self.runtime.store.event(self.runtime.name, "warning", "outage_exit_filled", note)
@@ -5823,6 +6065,8 @@ class LongFlatStrategy(Strategy):
                                  order_id=journal_id, trade_id=str(event.trade_id), ts=at)
             self.runtime.on_timing(journal_id, fill=int(event.ts_init), venue_ts=int(event.ts_event))
             self._flush_rebook(coid, at)
+            if self._margin and self._liq_closing is not None:
+                self._true_up_liquidation_cash(str(event.trade_id))
         if self._margin and opening and intrabar is not None and coid != self._restore_id:
             self._opened_in_bar.append((intrabar, sign * qty))  # charged with the bar's range in on_bar
         if self._margin and self._entry_side == 0:
@@ -5853,7 +6097,18 @@ class LongFlatStrategy(Strategy):
                 # Turning from one side to the other: the close has filled, so open the new side now.
                 side, bar, reason, values = self._flip
                 self._flip = None
-                self._open(side, bar, reason, values)
+                if self.leg_batch is not None and self._deciding is None:
+                    # A multi-asset leg's flip opens on its close's idea: held for that close's pass with the other
+                    # legs' ideas (strongest first), as the backtest's CloseBatch holds it, never gated by which
+                    # leg's close filled first (F-B1-REPLAY).
+                    self._deciding = (int(bar.ts_event), int(bar.ts_init))
+                    try:
+                        self._open(side, bar, reason, values)
+                    finally:
+                        self._deciding = None
+                    self.leg_batch.decide(int(bar.ts_event), self.runtime.name)
+                else:
+                    self._open(side, bar, reason, values)
         if getattr(self, "pair", None) is not None and not self._backtest:
             self.pair.on_mark(self, px)  # Advisor M5: a two-leg Strategy's guards run on every fill of either leg
 

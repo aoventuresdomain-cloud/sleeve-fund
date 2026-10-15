@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import math
 
@@ -43,6 +44,9 @@ RANDOM_SIDE_CHECK = "Beats random long or short"
 # isn't judged (funding.baseline_check; Advisor, 6 Oct 2026, QA P1-O17).
 FUNDING_CHECK = "Funding charged at the venue's own rates"
 LIQUIDATION_CHECK = "Liquidations"
+ABSORB_CHECK = "Gap absorbed by the venue past liquidation (shown, not a test)"
+ABSORB_FAIL_CHECK = "Passes with liquidation gaps charged"
+ABSORB_FAIL = "passes only because the venue absorbs liquidation gaps"
 # A G1 check that a person's acknowledgement can clear: shown, and it stops a pass until acknowledged.
 NEEDS_ACK = "ACK"
 OOS_CHECKS = (SHARPE_CHECK, "Holds up when parameters move", "Enough out-of-sample trades to judge",
@@ -227,6 +231,7 @@ def g1_checks(r: StudyResult, ledger: IdeaLedger, register=None,
         *([(CANDIDATE_CHECK, NOT_JUDGED, "a benchmark: buy and hold is never a G1 candidate")]
           if getattr(getattr(r, "spec", None), "family", None) == "benchmark" else []),
         ("Break-even fee (shown, not a test)", "INFO", _breakeven_words(r)),
+        _stop_stress_row(r, counts, register, insufficient),
         *([] if not getattr(r, "first_touch", None) else [(FIRST_TOUCH_CHECK, "INFO", first_touch_words(r))]),
         *_funding_rows(r),
         (
@@ -251,6 +256,7 @@ def g1_checks(r: StudyResult, ledger: IdeaLedger, register=None,
         ),
         _liquidation_check(r, liquidation_ack),
     ]
+    checks += _absorb_rows(r, checks, lambda view: g1_checks(view, ledger, register, liquidation_ack))
     if why_not:
         # Under a NOT JUDGED headline these can't fail: they measure the out-of-sample the study didn't get,
         # and red Fail chips there read as a verdict (review round 9, N6).
@@ -275,6 +281,80 @@ def _funding_rows(r: StudyResult) -> list[tuple[str, str, str]]:
         rows.append(("Full-period funding at the venue's own rates (shown, not a test)", "INFO",
                      funding.baseline_check(full.funding_at_baseline, full.funding_held,
                                             full.funding_baseline_longest, "full-period")[1]))
+    return rows
+
+
+STOP_STRESS_CHECK = "Stop slippage stress (shown, not a test)"
+
+
+def _stop_stress_row(r: StudyResult, counts: dict, register, insufficient: bool) -> tuple[str, str, str]:
+    """D13-INTRAMINUTE-JUMP (3): out-of-sample with 20 bp more on each stop exit, a jump through the stop paper may
+    see and a backtest's minutes can't; a Sharpe test that would fail under it is flagged to the PM. Required on the
+    sheet when the entries' median stop sits under 0.5% of the price (GAP-DOWN, Advisor 15 Oct)."""
+    st = getattr(r, "stop_stress", None) or {}
+    median, stops = st.get("median_stop"), st.get("stops", 0)
+    need = median is not None and median < st.get("required_below", 0.005)
+    head = (f"required, median stop {median:.2%} is under {st.get('required_below', 0.005):.1%}: " if need else
+            f"median stop {median:.2%}: " if median is not None else "")
+    if not stops:
+        return STOP_STRESS_CHECK, "INFO", head + "no stop exits out of sample, so nothing to stress"
+    charge = st["charge"]
+    base = r.compare_returns
+    stressed = base - charge.reindex(base.index).fillna(0.0)
+    s0, s1 = _bench(base)["sharpe"], _bench(stressed)["sharpe"]
+    words = f"{stops} stop exits out of sample at +{st.get('bp', 20):.0f} bp each: Sharpe {_num(s0)} to {_num(s1)}"
+    if not insufficient:
+        bench = _bench(r.oos_benchmark_returns)["sharpe"]
+        spread = _trial_spread(r, register)
+        b0, _ = sharpe_beats_probability(base, r.oos_benchmark_returns, counts["variants"], trial_spread=spread)
+        b1, _ = sharpe_beats_probability(stressed, r.oos_benchmark_returns, counts["variants"], trial_spread=spread)
+        passes = lambda s, b: not math.isnan(b) and s > bench and b >= G1_CONFIDENCE  # noqa: E731
+        if passes(s0, b0) and not passes(s1, b1):
+            words += "; the Sharpe test would FAIL under it: flagged to the PM"
+        elif passes(s0, b0):
+            words += "; the Sharpe test still passes under it"
+    return STOP_STRESS_CHECK, "INFO", head + words
+
+
+def _absorb_rows(r: StudyResult, checks: list, judge) -> list[tuple[str, str, str]]:
+    """ABSORB-GAP (INSURE-RULE point 5; Advisor 15 Oct ~02:05 UK): every test above read the curve with the gaps the
+    venue absorbed past liquidation charged, nothing re-sized. This says how much, per window, beside out-of-sample
+    and the holdout uncharged, for information only; and an idea that passes uncharged but fails charged FAILs, saying
+    so. judge: g1_checks on a result, to judge the uncharged view. None when nothing was absorbed."""
+    gaps = [(f"out-of-sample test window {k + 1}", f.absorbed) for k, f in enumerate(r.folds)
+            if getattr(f, "absorbed", None)]
+    if getattr(r, "holdout_absorbed", None):
+        gaps.append(("holdout", r.holdout_absorbed))
+    if not gaps:
+        return []
+    total, count = sum(a["amount"] for _, g in gaps for a in g), sum(len(g) for _, g in gaps)
+    per = "; ".join(f"{w} {sum(a['amount'] for a in g):,.2f} over {_n(len(g), 'liquidation')}" for w, g in gaps)
+    words = (f"{total:,.2f} over {_n(count, 'liquidation')} ({per}); every test here reads the curve gap charged, no "
+             "re-sizing. Uncharged, for information only:")
+    uncharged = getattr(r, "oos_uncharged_returns", None)
+    if uncharged is not None:
+        words += (f" out-of-sample Sharpe {_num(summary(uncharged)['sharpe'])} "
+                  f"(charged {_num(summary(r.oos_returns)['sharpe'])})")
+    if getattr(r, "holdout_uncharged", None) and r.holdout:
+        words += (f"{',' if uncharged is not None else ''} holdout Sharpe {_num(r.holdout_uncharged['sharpe'])} "
+                  f"(charged {_num(r.holdout['sharpe'])})")
+    re_free = getattr(r, "random_entry_uncharged", None)
+    if re_free is not None and r.random_entry is not None:
+        words += (f"; random entry beats {re_free.return_percentile:.0f}% uncharged "
+                  f"(charged {r.random_entry.return_percentile:.0f}%)")
+    rows = [(ABSORB_CHECK, "INFO", words)]
+    verdict, failed = g1_verdict(checks)
+    if uncharged is None or verdict != "FAIL":
+        return rows
+    compare = r.oos_compare_returns
+    view = dataclasses.replace(
+        r, oos_returns=uncharged, oos_compare_returns=None if compare is None else uncharged.reindex(compare.index),
+        folds=[dataclasses.replace(f, absorbed=[]) for f in r.folds], oos_uncharged_returns=None, holdout_absorbed=[],
+        **{k: getattr(r, f"{k}_uncharged") for k in ("random_entry", "random_side")
+           if getattr(r, f"{k}_uncharged", None) is not None})
+    if g1_verdict(judge(view))[0] == "PASS":
+        rows.append((ABSORB_FAIL_CHECK, "FAIL", f"{ABSORB_FAIL}: it passes G1 uncharged, and charged it fails "
+                                                 + ", ".join(failed)))
     return rows
 
 

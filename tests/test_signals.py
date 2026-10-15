@@ -246,11 +246,12 @@ def test_signals_tab_sits_after_overview_with_the_long_lights(client):
     _sleeve(store)
     store.set_signal_state("rsi-15m", _rsi_payload(30.6))
     html = c.get("/sleeves/rsi-15m", auth=AUTH).text
-    tabs = html[html.index('data-tabs'):html.index('</nav>', html.index('data-tabs'))]
-    assert tabs.index('data-tab="overview"') < tabs.index('data-tab="signals"') < tabs.index('data-tab="positions"')
+    # TEC-FE-C8: Signals is the first tab of the panel beside the chart, ahead of the Position view below it.
+    tabs = html[html.index('class="sub-tabs side"'):html.index('</div>', html.index('class="sub-tabs side"'))]
+    assert html.index('id="pc"') < html.index('data-sub="signals"') < html.index('id="tab-positions"')
     assert 'aria-label="Long side: 0 of 1 met"' in tabs and tabs.count("sig-lamp off") == 1
     panel = html[html.index('id="tab-signals"'):html.index('id="tab-positions"')]
-    assert 'data-live="signals"' in panel and "<form" not in panel
+    assert 'data-live="sig-side"' in panel and "<form" not in panel  # TEC-FE-C8: the side view's live region
     assert "RSI(14) at or below 30" in panel and "30.6" in panel and "≤ 30.0" in panel and "0.6 pts to go" in panel
     assert "0 of 1 met" in panel and "held flat on spot" in panel
     assert "Lights are live · model acts at the 15-minute close in" in panel

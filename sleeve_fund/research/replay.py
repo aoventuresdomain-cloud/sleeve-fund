@@ -142,6 +142,85 @@ def replay(path: Path | str, with_fills: bool = False, store=None,
         engine.dispose()
 
 
+
+def replay_legs(paths: list[Path | str], with_fills: bool = False, store=None, history: list[Path | str] | None = None):
+    """A multi-asset Strategy's legs replayed together through the paper runtime, as its one paper node runs them
+    (paper.node.build_legs_node, F-B1-REPLAY): one engine, the parent's first asset on its venue and each asset leg on
+    a clone of it, every leg its own model and journal, and the legs' same-close entries held in one LegBatch pass,
+    strongest first, then by the asset's place in the list. paths: one recording per leg, in the asset list's order,
+    each naming its leg's row ("<name>", then "<name>~<ASSET>"); the rows exist already (Store.create_legs, inside
+    the fund). history: per leg, as replay's. Returns {leg: orders}, or {leg: (orders, fills)} with_fills."""
+    from nautilus_trader.backtest import BacktestEngine, BacktestEngineConfig
+    from nautilus_trader.common import LoggerConfig, LogLevel
+    from nautilus_trader.model import AccountType, BarType, OmsType, TraderId
+
+    from sleeve_fund import markets
+    from sleeve_fund.exact import float_view
+    from sleeve_fund.instruments import FeeSchedule, ScheduleFeeModel, fill_model
+    from sleeve_fund.paper.leg_batch import LegBatch
+    from sleeve_fund.paper.node import LEG_CLONE
+    from sleeve_fund.paper.runtime import SleeveRuntime
+    from sleeve_fund.research.portfolio import clone_instrument, clone_venue
+    from sleeve_fund.store import Store, utcnow
+    from sleeve_fund.strategies import REGISTRY
+
+    recs = [read(p) for p in paths]
+    names = [h["sleeve"]["name"] for h, _ in recs]
+    store = store or Store.in_memory()
+    if len(names) < 2 or names[1:] != store._asset_legs(names[0]):
+        raise ValueError(f"the recordings must be the multi-asset Strategy {names[0]!r}'s legs in its asset list's "
+                         f"order: {names[0]!r}, then {store._asset_legs(names[0]) if names else []}")
+    if history is not None and len(history) != len(paths):
+        raise ValueError("one history recording per leg, or none")
+    engine = BacktestEngine(BacktestEngineConfig(trader_id=TraderId.from_str("REPLAY-001"),
+                                                 logging=LoggerConfig(stdout_level=LogLevel.ERROR)))
+    batch = LegBatch(tuple(names))
+    runtimes = []
+    try:
+        for i, (h, rows) in enumerate(recs):
+            s = h["sleeve"]
+            fees = FeeSchedule(Decimal(s["maker_fee"]), Decimal(s["taker_fee"]))
+            instrument = _instrument(h, fees)
+            if i:  # each asset leg on its own clone of the venue, as the node lists it
+                instrument = clone_instrument(instrument, clone_venue(instrument.id.venue, LEG_CLONE + i - 1))
+            perp = markets.is_perp(s["params"])
+            runtime = SleeveRuntime(store, s["name"], tick_seconds=s["tick_seconds"])
+            runtime.funded = _funded(store, runtime, h["balances"], instrument, perp)
+            runtimes.append(runtime)
+            fee_model = ScheduleFeeModel(fees)
+            engine.add_venue(venue=instrument.id.venue, oms_type=OmsType.NETTING,
+                             account_type=AccountType.MARGIN if perp else AccountType.CASH,
+                             default_leverage=markets.VENUE_LEVERAGE if perp else None,
+                             base_currency=None, starting_balances=[_money(b) for b in h["balances"]],
+                             fee_model=fee_model, fill_model=fill_model())
+            engine.add_instrument(instrument)
+            data = _data(instrument, rows)
+            engine.add_data(data)
+            strategy_cls, config_cls = REGISTRY[s["strategy"]]
+            config = config_cls(instrument_id=instrument.id,
+                                bar_type=BarType.from_str(f"{instrument.id}-{s['bar_spec']}"),
+                                max_notional=s.get("max_notional"), assumed_taker_fee=float(fees.taker),
+                                warmup_bars=WARMUP_BARS if history is not None else 0, **s["params"])
+            strategy = strategy_cls(config).attach_runtime(runtime)
+            if history is not None:
+                strategy.attach_history(_history(history[i], min(d.ts_event for d in data)))
+            strategy.simulated_venue = True
+            strategy.fee_model = fee_model
+            strategy.leg_batch = batch  # the node's one pass per close across the legs (spec §4)
+            engine.add_strategy(strategy)
+        engine.run()
+        journal = float_view(store)
+        out = {}
+        for name in names:
+            orders = [o for o in reversed(journal.orders(name, limit=100_000))
+                      if not (o.get("signal") or {}).get("watched")]
+            out[name] = (orders, list(reversed(journal.fills(name, limit=100_000)))) if with_fills else orders
+        return out
+    finally:
+        for runtime in runtimes:
+            runtime.now = utcnow
+        engine.dispose()
+
 def _funded(store, runtime, balances: list[str], instrument, perp: bool) -> float:
     """CUT-A: once the fund holds the cash, the recorded account opened with the fund's virtual funding on top of the
     journal's own cash (paper.node._balances); the engine nets it out as the paper runtime does. 0 before the bridge."""
