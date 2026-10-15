@@ -34,6 +34,7 @@ from sqlalchemy import select
 from sleeve_fund.money import to_decimal
 
 ZERO = Decimal(0)
+MISMATCHES = 1000  # asset_mismatches rows listed a night; past it the night says more exist
 
 
 @dataclass(frozen=True)
@@ -114,7 +115,18 @@ def _stored_rows(conn) -> tuple[dict[str, Decimal], dict[str, int]]:
     return stored, unanchored
 
 
+def _twins(rows: dict[str, tuple[str, str]]) -> dict[tuple[str, str], list[str]]:
+    """Keys more than one row gives (0028's asset index rules it out; never a row hidden behind another)."""
+    by_key: dict[tuple[str, str], list[str]] = {}
+    for row, key in rows.items():
+        by_key.setdefault(key, []).append(row)
+    return {k: sorted(v) for k, v in by_key.items() if len(v) > 1}
+
+
 def _keyed(rows: dict[str, tuple[str, str]], by_row: dict[str, Decimal]) -> dict[tuple[str, str], Decimal]:
+    if twins := _twins(rows):
+        raise ValueError("journal rows share a (Strategy, asset) key: " + "; ".join(
+            f"{k[0]}, {k[1]}: {', '.join(v)}" for k, v in sorted(twins.items())))
     return {key: by_row.get(row, ZERO) for row, key in rows.items()}
 
 
@@ -147,8 +159,16 @@ def nightly(store) -> list[Finding]:
             out.append(Finding(strategy, asset, row, "position", a, b,
                                f"{strategy}, {asset} (row {row}): its fills come to {a.normalize():f} but its orders "
                                f"record {b.normalize():f}, {(a - b).normalize():f} apart"))
+    for (strategy, asset), twins in sorted(_twins(rows).items()):
+        out.append(Finding(strategy, asset, ", ".join(twins), "key", None, None,
+                           f"{strategy}, {asset}: rows {' and '.join(twins)} share one key, so neither may stand for it"))
     reader = getattr(store, "asset_mismatches", None)
-    for m in (reader(limit=1000) if reader is not None else []):
+    found = reader(limit=MISMATCHES + 1) if reader is not None else []
+    if len(found) > MISMATCHES:
+        found = found[:MISMATCHES]
+        out.append(Finding("", "", "", "instrument", None, None, f"more than {MISMATCHES} journal rows are written "
+                           "under another asset: the first are listed, the rest are not"))
+    for m in found:
         strategy, asset = rows.get(m["sleeve"], (m["sleeve"], m["expected"] or "no row"))
         out.append(Finding(strategy, asset, m["sleeve"], "instrument", None, None,
                            f"{strategy}, {asset} (row {m['sleeve']}): {m['table']} row {m['id']} is written under "
