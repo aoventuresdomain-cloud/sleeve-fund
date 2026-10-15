@@ -3884,8 +3884,9 @@ class LongFlatStrategy(Strategy):
     def _late_safety_due(self, price: float) -> str | None:
         """A2-DW4 MUST 3 (Advisor's grace correction, 15 Oct): a late fill is never unprotected. Its close is an exit and
         is never blocked; if it isn't filled within backstop_grace_ms (A1's, no constant of its own), or is refused or
-        unknown here, or the price is past half the way from the late fill's entry to liquidation, the safety stop goes
-        on at once. Returns why, or None. A filled close is forgotten; a refusal feeds F-RX-2 as any exit's does."""
+        unknown here, or the price is past half the way from the position's average entry to its liquidation, both as
+        they stand after the late fill (A2-REF, Advisor 15 Oct: never the pre-fill values), the safety stop goes on at
+        once. Returns why, or None. A filled close is forgotten; a refusal feeds F-RX-2 as any exit's does."""
         now = self.clock.timestamp_ns()
         for cid, at in list(self._late_sent.items()):
             order = self.cache.order(ClientOrderId(cid))
@@ -3899,7 +3900,7 @@ class LongFlatStrategy(Strategy):
                 liq = self._liq_now(cash, qty) if qty else None
                 side = self._entry_side or 1
                 if liq is not None and side * (self._entry_px - price) > abs(self._entry_px - liq) / 2:
-                    return f"the price is past half the way from its late fill's entry to liquidation ({liq:,.6g})"
+                    return f"the price is past half the way from its average entry to liquidation ({liq:,.6g})"
             if now - at >= self._cfg.backstop_grace_ms * 1_000_000:
                 return f"its late fill's close {cid} wasn't filled within {self._cfg.backstop_grace_ms:,} ms"
         return None

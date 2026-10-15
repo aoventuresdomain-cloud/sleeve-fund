@@ -301,3 +301,64 @@ def test_dw4_6_a_live_owners_late_fill_holds_only_its_own_strategy(jstore):
     assert og.resting_block(jstore, "a", end + timedelta(seconds=4)) is not None
     assert og.resting_block(jstore, "b", end + timedelta(seconds=4)) is None
     assert not [e for e in jstore.events("a", limit=500) if e["kind"] == og.UNPROTECTED]
+
+
+@pytest.mark.parametrize("side", [1, -1], ids=["long", "short"])
+@pytest.mark.parametrize("move", [0.03, -0.03], ids=["add-above-average", "add-below-average"])
+def test_dw4_3_the_half_way_trigger_moves_to_the_post_fill_midpoint_after_a_late_add(side, move):
+    """A2-REF (Advisor, PE1 F2): MUST 3's half-way trigger is measured from the position's average entry and its
+    combined liquidation AFTER the late fill, never the values before it. A held position, then a late fill adding on
+    the same side above or below its average: the trigger sits at the post-fill midpoint, and a price between the
+    pre-fill and post-fill midpoints is judged by the post-fill one."""
+    from decimal import Decimal
+    from types import SimpleNamespace
+
+    from nautilus_trader.model import OrderStatus
+
+    from sleeve_fund import markets
+    from sleeve_fund.strategies.base import LongFlatStrategy
+
+    class Book:
+        _track_entry, _set_liq = LongFlatStrategy._track_entry, LongFlatStrategy._set_liq
+        _liq_from_entry, _liq, _liq_now = LongFlatStrategy._liq_from_entry, LongFlatStrategy._liq, LongFlatStrategy._liq_now
+        _late_safety_due = LongFlatStrategy._late_safety_due
+        _backtest, _margin, _liq_funded, _liq_from = True, True, 0.0, None
+        _entry_px, _entry_qty, _entry_side, _liq_px = None, 0.0, 0, None
+        runtime = SimpleNamespace(profile=SimpleNamespace(max_leverage=3.0))
+        _cfg = SimpleNamespace(perp=SimpleNamespace(maintenance_margin=0.005), backstop_grace_ms=1000)
+        cache = SimpleNamespace(order=lambda cid: SimpleNamespace(status=OrderStatus.ACCEPTED))
+        clock = SimpleNamespace(timestamp_ns=lambda: 10**18)
+        post, cash = Decimal(0), 10_000.0
+
+        def _signed_qty(self):
+            return self.post
+
+        def _lot(self):
+            return Decimal("0.001")
+
+        def _mark(self):
+            return 0.0, self.cash, float(self.post), 0.0
+
+        def fill(self, qty, px):
+            self.post += side * Decimal(str(qty))
+            self.cash -= side * qty * px + qty * px * 0.0005
+            assert self._track_entry(side, Decimal(str(qty)), qty, px)
+            self._set_liq("o")
+
+    book = Book()
+    book._late_sent = {"orphan-close-o-rest": 10**18}  # the late fill's close is out, inside its grace
+    book.fill(0.05, 60_000.0)
+    pre_mid = (book._entry_px + book._liq_px) / 2
+    book.fill(0.10, 60_000.0 * (1 + move))  # the late fill
+    avg = (0.05 * 60_000.0 + 0.10 * 60_000.0 * (1 + move)) / 0.15
+    assert book._entry_px == pytest.approx(avg)
+    liq = markets.isolated_liquidation(book.cash, side * 0.15, avg, 3.0, 0.005)  # the combined position's, afresh
+    assert book._liq_px == pytest.approx(liq, rel=1e-9)
+    post_mid = (avg + liq) / 2
+    assert abs(post_mid - pre_mid) > 500  # the add moved the trigger: the cell tells the two apart
+    # Just on the safe side of the post-fill midpoint: nothing due; just past it: the safety stop.
+    assert book._late_safety_due(post_mid + side * 50) is None
+    assert "liquidation" in book._late_safety_due(post_mid - side * 50)
+    # Between the two midpoints the post-fill one decides, whichever way the add moved it.
+    between = (pre_mid + post_mid) / 2
+    assert (book._late_safety_due(between) is not None) is (side * (between - post_mid) < 0)
