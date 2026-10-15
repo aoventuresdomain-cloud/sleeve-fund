@@ -317,6 +317,7 @@ def test_c5_hub_away_while_long_and_the_price_still_past_the_stop_the_stop_runs_
     # parity: never better than the backtest. Prices before fees: per_order's all-in price plus the fee per unit.
     hub_px, bt_px = (r[4] + r[5] / r[3] for r in (hub[1], bt[1]))
     low = float(np.round(_dip_prices(False)[6 * 60:7 * 60], 1).min())
+    # abs=0.051: half the 0.1 tick plus float rounding in the all-in price; anything looser hides a wrong branch
     assert hub_px == pytest.approx(min(bt_px, low), abs=0.051) and hub_px <= bt_px + 1e-6, (hub_px, bt_px, low)
     assert dec.late == 4  # the bars closing 00:07-00:10 came late: exits only
 
