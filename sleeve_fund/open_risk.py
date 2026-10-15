@@ -58,7 +58,7 @@ def position_risk(qty, mark, stop=None, atr_pct: float | None = None, *, taker):
 
 def _taker(rate, exact: bool):
     """The taker rate position_risk charges, as a Decimal for the exact path and a float otherwise; raises when it
-    isn't a rate in [0, 5%), as Store.record_fees bounds it."""
+    isn't a rate in [0, 5%), as FeeSchedule bounds it."""
     try:
         value = Decimal(str(rate)) if rate is not None and not isinstance(rate, bool) else None
     except ArithmeticError:
