@@ -111,10 +111,11 @@ def test_2c_the_hub_staleness_message_names_no_venue():
 
 # ---- 3. Open position without a stop ---------------------------------------------------------------------------
 
-def _holder(tmp_path, *, params, stop_frac=0.01, side="BUY", qty=0.1, mark=60_000.0):
+def _holder(tmp_path, *, params, stop_frac=0.01, side="BUY", qty=0.1, mark=60_000.0, risk_profile="balanced"):
     store = Store(f"sqlite:///{tmp_path}/j.db")
     store.create_sleeve(name="s1", strategy="ping_pong", instrument="BTC/USDT", bar_spec="1-MINUTE-LAST-INTERNAL",
-                        starting_balance=10_000, venue="BINANCE", params={"market": "perp", **params})
+                        starting_balance=10_000, venue="BINANCE", params={"market": "perp", **params},
+                        risk_profile=risk_profile)
     store.record_order("s1", order_id="e1", side=side, qty=qty, intent="entry", reason="r",
                        signal={} if stop_frac is None else {"stop_frac": stop_frac}, ts=T0)
     store.record_fill("s1", side=side, qty=qty, price=60_000.0, fee=0.0, order_id="e1", trade_id="t1", ts=T0)
@@ -129,16 +130,16 @@ def _no_stop_errors(store):
 
 
 @pytest.mark.parametrize("case", ["missing", "gapped"])
-def test_3a_a_position_with_no_live_stop_errors_once_after_one_bar_plus_60s(tmp_path, case):
+def test_3a_a_position_with_no_live_stop_errors_once_after_60s(tmp_path, case):
     from sleeve_fund.ops_health import NoStopWatch
 
     store = (_holder(tmp_path, params={"stop_loss": 0.01}, stop_frac=None) if case == "missing"
              else _holder(tmp_path, params={"stop_loss": 0.01}, mark=59_000.0))  # 1% stop at 59,400: gone through
     watch = NoStopWatch()
     watch.check(store, T0 + timedelta(minutes=1))
-    watch.check(store, T0 + timedelta(minutes=2))  # one 1-minute bar plus 60 s since first seen: not yet over it
+    watch.check(store, T0 + timedelta(minutes=1, seconds=59))  # Advisor A15-OPS: 60 s, absolute
     assert _no_stop_errors(store) == []
-    for s in (1, 30, 90):
+    for s in (0, 30, 90):
         watch.check(store, T0 + timedelta(minutes=2, seconds=s))
     [e] = _no_stop_errors(store)
     assert e["level"] == "error" and e["sleeve"] == "s1"
@@ -154,14 +155,26 @@ def test_3b_a_position_with_its_stop_in_place_never_alerts(tmp_path):
     assert _no_stop_errors(store) == []
 
 
-def test_3c_a_model_built_stopless_is_exempt(tmp_path):
+def test_3c_a_model_that_places_no_stop_is_exempt_at_1x(tmp_path):
     from sleeve_fund.ops_health import NoStopWatch
 
-    store = _holder(tmp_path, params={}, stop_frac=None)  # no stop_loss, stop_atr or stop_swing_bars: held to 1x
+    store = _holder(tmp_path, params={}, stop_frac=None, risk_profile="conservative")  # places no stop, held to 1x
     watch = NoStopWatch()
     for m in range(1, 10):
         watch.check(store, T0 + timedelta(minutes=m))
     assert _no_stop_errors(store) == []
+
+
+def test_3c2_the_same_model_above_1x_alerts(tmp_path):
+    """HoQA: the stopless exemption is for 1x only. Paper refuses to start such a Model (strategies.check_perp_stop),
+    so this is a position that got there another way (a profile edited under it)."""
+    from sleeve_fund.ops_health import NoStopWatch
+
+    store = _holder(tmp_path, params={}, stop_frac=None, risk_profile="balanced")  # 2x
+    watch = NoStopWatch()
+    watch.check(store, T0 + timedelta(minutes=1))
+    watch.check(store, T0 + timedelta(minutes=2))
+    assert len(_no_stop_errors(store)) == 1
 
 
 def test_3d_the_episode_ends_when_the_stop_is_back_or_the_position_is_flat_and_a_new_one_alerts_again(tmp_path):
@@ -221,7 +234,7 @@ def test_4a_the_digest_shows_equity_each_strategy_open_positions_alert_counts_an
     assert text.startswith("Multi-Strategy Fund daily digest")
     assert "20,150.00" in text  # fund equity
     assert "s1: 10,250.00, 250.00" in text and "s2: 9,900.00, -100.00" in text
-    assert "1 warning" in text and "1 error" in text  # the last 24 hours only
+    assert "1 warning" in text and "1 error" in text  # since the last digest (none: 24 hours)
     assert "Open positions: none" in text
     for word in ("Backup", "Recon", "Clock"):
         assert word in text
@@ -272,3 +285,123 @@ def test_4d_08_00_uk_follows_the_clock_change():
     assert sent == []
     d.step(winter + timedelta(minutes=1))
     assert len(sent) == 1
+
+
+def _book_marks(store, rows):
+    from decimal import Decimal as D
+
+    from sqlalchemy import insert
+
+    from sleeve_fund.store import book_marks_t
+
+    with store.engine.begin() as conn:
+        conn.execute(insert(book_marks_t), [{
+            "ts": ts, "equity": D(eq), "gross": D(0), "net_max": D(0), "margin_used": D(0), "open_risk": D(0),
+            "hwm": D(eq), "reference_equity": D(eq), "day_start_equity": D(eq), "status": "ok", "profile_version": 1}
+            for ts, eq in rows])
+
+
+def test_4e_the_last_completed_trading_day_is_its_own_block_measured_as_the_brake_measures_it():
+    """Advisor A15-OPS (b): the T5 day (UTC) as a labelled block, from the book's last mark before each midnight."""
+    from sleeve_fund.ops_health import digest
+
+    store = Store.in_memory()
+    _book_marks(store, [(datetime(2026, 10, 17, 23, 59, tzinfo=UTC), "100000"),
+                        (datetime(2026, 10, 18, 0, 0, 30, tzinfo=UTC), "99000"),  # after midnight: not the start
+                        (datetime(2026, 10, 18, 23, 59, tzinfo=UTC), "98500"),
+                        (datetime(2026, 10, 19, 0, 1, tzinfo=UTC), "97000")])  # today: not in the block
+    text = digest(store, T0 + timedelta(hours=1))
+    line = next(x for x in text.splitlines() if x.startswith("Last completed trading day"))
+    assert "Sun 18 Oct 01:00 UK to Mon 19 Oct 01:00 UK" in line
+    assert "100,000.00 to 98,500.00, -1,500.00 (-1.50%)" in line
+
+
+def test_4f_the_digest_covers_everything_since_the_last_one():
+    from sleeve_fund.ops_health import DailyDigest
+
+    store, sent = Store.in_memory(), []
+    d = DailyDigest(store, environ={"ALERT_WEBHOOK_URL": HOOK}, send=lambda u, t: sent.append(t))
+    d.step(T0 + timedelta(hours=1))  # Mon 08:00 UK
+    store.event(None, "error", "x", "after Monday's digest", ts=T0 + timedelta(hours=2))
+    late = T0 + timedelta(days=2, hours=3)  # the server was down on Tuesday morning: Wednesday 10:00 UK
+    store.event(None, "warning", "y", "Wednesday", ts=late - timedelta(minutes=5))
+    d.step(late)
+    assert "covering since Mon 19 Oct 08:00 UK" in sent[1]
+    assert "1 warning, 1 error" in sent[1]
+
+
+@pytest.mark.parametrize("utc, sends", [
+    (datetime(2026, 10, 24, 6, 59, tzinfo=UTC), False),  # Sat, BST: 07:59 UK
+    (datetime(2026, 10, 24, 7, 0, tzinfo=UTC), True),  # Sat 08:00 UK
+    (datetime(2026, 10, 25, 7, 59, tzinfo=UTC), False),  # Sun, clocks went back at 02:00: 07:59 GMT
+    (datetime(2026, 10, 25, 8, 0, tzinfo=UTC), True),  # Sun 08:00 UK
+], ids=["sat-0759", "sat-0800", "sun-0759", "sun-0800"])
+def test_4g_08_00_uk_on_the_day_before_and_the_day_of_the_clock_change(utc, sends):
+    from sleeve_fund.ops_health import DailyDigest
+
+    store, sent = Store.in_memory(), []
+    DailyDigest(store, environ={"ALERT_WEBHOOK_URL": HOOK}, send=lambda u, t: sent.append(t)).step(utc)
+    assert bool(sent) is sends
+
+
+def test_4h_the_digest_names_no_venue_from_the_venue_list():
+    """HoQA: a regex over the whole body against every venue name the wording knows."""
+    import re
+
+    from sleeve_fund.ops_health import digest
+    from sleeve_fund.wording import _NAMES
+
+    store = _two_strategies()
+    store.event("s1", "warning", "w", "BTCUSDT-PERP.BINANCE at api.binance.com stalled", ts=T0)
+    assert not re.search(rf"(?i)\b(?:{_NAMES})", digest(store, T0 + timedelta(hours=1)))
+
+
+def test_4i_the_fund_and_strategy_figures_tie_to_the_journal_to_the_cent():
+    """HoQA: the same readers as the start check and the dashboard (supervisor.fund_equity, strategy_cash_pnl)."""
+    from sleeve_fund import supervisor
+    from sleeve_fund.ops_health import digest
+
+    store = _two_strategies()
+    text = digest(store, T0 + timedelta(hours=1))
+    assert f"Fund equity: {float(supervisor.fund_equity(store)):,.2f}" in text
+    for s in ("s1", "s2"):
+        pnl = store.strategy_cash_pnl(s, since=T0 + timedelta(hours=1) - timedelta(days=1), at=T0 + timedelta(hours=1))
+        assert f"{float(pnl):,.2f}" in next(x for x in text.splitlines() if x.strip().startswith(f"{s}:"))
+
+
+def test_2d_a_strategy_on_another_hub_is_unaffected():
+    from sleeve_fund.ops_health import HubStaleness
+
+    store = Store.in_memory()
+    quiet, live = HubStaleness("hub-1"), HubStaleness("hub-2")
+    quiet.seen("BTC/USDT", T0)
+    live.seen("BTC/USDT", T0)
+    live.seen("BTC/USDT", T0 + timedelta(minutes=5))
+    for w in (quiet, live):
+        w.check(store, T0 + timedelta(minutes=5, seconds=1))
+    [w] = _kinds(store, "hub_data_stale")
+    assert "hub-1" in w["message"] and "hub-2" not in w["message"]
+
+
+def test_2e_the_hub_relay_feeds_the_watch_from_its_ticks_and_journals_on_the_store_thread(monkeypatch):
+    """The relay's own wiring: the last trade or quote per instrument, by pair, checked on the minute's build."""
+    import time as _time
+
+    from test_hub import BTC, _relay
+
+    from sleeve_fund.hub import relay as relay_mod
+    from sleeve_fund.ops_health import HubStaleness
+
+    r, _ = _relay()
+    events = []
+    r.stale, r.event = HubStaleness("hub-1"), lambda *a, **k: events.append((a, k))
+    now = _time.time_ns()
+    monkeypatch.setattr(relay_mod.time, "time_ns", lambda: now)
+    r._since[BTC] = now - 10 * 60 * 1_000_000_000
+    r._seen_ns[BTC] = now - 6 * 60 * 1_000_000_000
+    r._check_stale()
+    [(args, _kw)] = events
+    assert args[:3] == (None, "warning", "hub_data_stale") and "BTC/USDT" in args[3]
+    r._seen_ns[BTC] = now
+    r._check_stale()
+    assert [a[2] for a, _ in events] == ["hub_data_stale", "hub_data_back"]

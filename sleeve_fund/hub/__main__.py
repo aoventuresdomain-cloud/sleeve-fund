@@ -92,6 +92,23 @@ def seeder(profile, pairs: dict[str, str], history):
     return seed
 
 
+def _journal_event(sleeve, level, kind, message, ts=None) -> None:
+    """A15: a hub staleness event in the journal, where the forwarder sends warnings on. The journal is opened on
+    first use, so a hub with no database (locally) still runs and says so in its log."""
+    global _journal
+    try:
+        if _journal is None:
+            from sleeve_fund.store import Store
+
+            _journal = Store()
+        _journal.event(sleeve, level, kind, message, ts=ts)
+    except Exception as exc:  # noqa: BLE001 - the log line still says it
+        print(f"hub: could not journal {kind}: {exc!r} ({message})")
+
+
+_journal = None
+
+
 def build(profile, port: int, sink=None):
     from nautilus_trader.common import Environment, LoggerConfig, LogLevel
     from nautilus_trader.live import LiveNode
@@ -104,6 +121,7 @@ def build(profile, port: int, sink=None):
     fanout = Fanout(profile.name, known=relay.known, want=relay.want, venue_up=relay.venue_up,
                     instruments=relay.instruments)
     from sleeve_fund.history import HistoryStore, _alert
+    from sleeve_fund.ops_health import HubStaleness
 
     store = HistoryStore()
     if sink is None:
@@ -114,7 +132,8 @@ def build(profile, port: int, sink=None):
                  holes=start_holes(profile, pairs, store),
                  alert=lambda key, message: _alert(key, "warning", "hub_refill_failed", message),
                  seed=seeder(profile, pairs, store),
-                 discover=lambda: instruments(profile), late_path=store.root / f"hub-late-{profile.name}.json")
+                 discover=lambda: instruments(profile), late_path=store.root / f"hub-late-{profile.name}.json",
+                 stale=HubStaleness(profile.name), event=_journal_event)
     data_factory, data_config = profile.data_client()
     node = (
         LiveNode.builder(f"HUB-{profile.name}", TraderId.from_str(f"HUB-{profile.name}"), Environment.SANDBOX)

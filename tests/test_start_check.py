@@ -27,6 +27,13 @@ def _postgres_journal(request, monkeypatch):
             return sec
 
         monkeypatch.setattr(start_check, "check_store", postgres)
+    if "real_alerts" not in request.node.name:  # TEC-A15-STUB (HoE 15 Oct): the Alerts section is pinned on its own
+        def alerts(environ):
+            sec = start_check.Section("Alerts")
+            sec.add(start_check.PASS, "alerts and uptime pings set")
+            return sec
+
+        monkeypatch.setattr(start_check, "check_alerts", alerts)
 
 
 def _journal(tmp_path, *, mark_qty=0.1, mark_cash=4_000.0 - 3.0, params=None):
@@ -291,3 +298,22 @@ def test_journal_store_a_postgres_journal_passes_the_whole_page():
     engine.dispose()
     ok, page = start_check.run(url, environ={})
     assert ok and "Journal store: PASS\n  PASS  Postgres" in page, page
+
+
+HOOK, PING = "https://hooks.example.com/services/T0/B0/token", "https://hc-ping.example.com/uuid-token"
+
+
+def test_real_alerts_both_set_pass_the_whole_page_and_show_hosts_only(tmp_path):
+    url, _ = _journal(tmp_path)
+    ok, page = start_check.run(url, environ={"ALERT_WEBHOOK_URL": HOOK, "HEALTHCHECK_PING_URL": PING})
+    assert ok and "Alerts: PASS" in page, page
+    assert "hooks.example.com" in page and "hc-ping.example.com" in page and "token" not in page
+
+
+@pytest.mark.parametrize("missing", ["ALERT_WEBHOOK_URL", "HEALTHCHECK_PING_URL"])
+def test_real_alerts_one_missing_fails_the_whole_page(tmp_path, missing):
+    url, _ = _journal(tmp_path)
+    env = {"ALERT_WEBHOOK_URL": HOOK, "HEALTHCHECK_PING_URL": PING}
+    del env[missing]
+    ok, page = start_check.run(url, environ=env)
+    assert not ok and "Alerts: FAIL" in page and f"  FAIL  not set: {missing}" in page, page

@@ -4,9 +4,10 @@ is alive and protected, on top of what the forwarder already sends (sleeve_fund.
 - HubStaleness: one warning per episode when a hub has had no trade or quote on an instrument for STALE_AFTER, and one
   line when it is back. Each Strategy already holds its own entries on a stale price (base.STALE_PRICE_WARN_MINUTES);
   this says which hub and instrument, once, instead of one note per Strategy.
-- NoStopWatch: one error per episode when an open perp position of a Model built with a stop has had no live stop
-  (none journaled, or the price has gone through it) for one bar plus NO_STOP_GRACE. A Model built stopless is held to
-  1x by design and is not watched.
+- NoStopWatch: one error per episode when an open perp position has had no live stop (none journaled, or the price
+  has gone through it, S2) for NO_STOP_AFTER (Advisor A15-OPS: absolute, not a bar, so a 1-hour Strategy is never an
+  hour unprotected). A Model that places no stop is exempt only while it is held to 1x; above 1x it alerts. The safety
+  stop and flatten that follow (S3, F-T-2) are the Strategy's, on the order path, not here.
 - DailyDigest: once a day at DIGEST_AT UK, even on a quiet day, so a missing digest is itself the alarm.
 
 Everything here only reads the journal and writes events; none of it places, cancels or holds an order."""
@@ -22,11 +23,8 @@ from sleeve_fund.wording import no_venues
 
 UK = ZoneInfo("Europe/London")
 STALE_AFTER = timedelta(minutes=5)  # matches the per-Strategy hold (strategies.base.STALE_PRICE_WARN_MINUTES)
-NO_STOP_GRACE = timedelta(seconds=60)  # on top of one bar: a stop is set again at the next bar after a restart
+NO_STOP_AFTER = timedelta(seconds=60)  # Advisor A15-OPS, 15 Oct
 DIGEST_AT = time(8, 0)  # UK
-STOP_KEYS = ("stop_loss", "stop_atr", "stop_swing_bars")  # strategies.base._stop_designed
-_BAR = re.compile(r"^(\d+)-(SECOND|MINUTE|HOUR|DAY)\b")
-_UNIT = {"SECOND": 1, "MINUTE": 60, "HOUR": 3_600, "DAY": 86_400}
 _DAY = re.compile(r"daily digest for (\d{4}-\d{2}-\d{2})")
 
 
@@ -67,22 +65,23 @@ class HubStaleness:
                     f"Market data hub {hub}: {inst} has trades or quotes again"), ts=now)
 
 
-def stop_designed(params: dict | None) -> bool:
-    return any((params or {}).get(k) for k in STOP_KEYS)
+def stopless_at_1x(s) -> bool:
+    """A Model that places no stop, margined at 1x or less: held there by design (strategies.check_perp_stop), so its
+    having no stop is not an incident. The same Model above 1x is."""
+    from sleeve_fund.risk import PROFILES, leverage_cap
+    from sleeve_fund.strategies import STOPLESS_MAX_LEVERAGE, places_stop
 
-
-def bar_seconds(bar_spec: str) -> int:
-    """The decision bar's length from a spec such as 1-MINUTE-LAST-INTERNAL; a minute when it can't be read."""
-    m = _BAR.match(bar_spec or "")
-    return int(m.group(1)) * _UNIT[m.group(2)] if m else 60
+    profile = PROFILES.get(s.risk_profile)
+    return (not places_stop(s.strategy, s.params) and profile is not None
+            and leverage_cap(profile, s.params) <= STOPLESS_MAX_LEVERAGE)
 
 
 class NoStopWatch:
     """Open perp positions of stop-built Models with no live stop, from the same reader as the dashboard's Open risk
     (open_risk.book_open_risk), so the alert and the tile never disagree on which positions have no stop."""
 
-    def __init__(self, grace: timedelta = NO_STOP_GRACE) -> None:
-        self.grace = grace
+    def __init__(self, after: timedelta = NO_STOP_AFTER) -> None:
+        self.after = after
         self.since: dict[str, datetime] = {}  # Strategy -> first seen without a live stop
         self.out: set[str] = set()
 
@@ -95,17 +94,17 @@ class NoStopWatch:
             if r["basis"] == "stop":
                 continue
             s = store.sleeve(name)
-            if stop_designed(s.params):
-                bad[name] = (r["basis"], s)
+            if not stopless_at_1x(s):
+                bad[name] = r["basis"]
         for name in sorted(set(self.since) - set(bad)):
             del self.since[name]
             if name in self.out:
                 self.out.discard(name)
                 why = "has its stop again" if name in rows else "is flat"
                 store.event(name, "info", "position_stop_back", f"The open position {why}", ts=now)
-        for name, (basis, s) in sorted(bad.items()):
+        for name, basis in sorted(bad.items()):
             first = self.since.setdefault(name, now)
-            if name in self.out or now - first < timedelta(seconds=bar_seconds(s.bar_spec)) + self.grace:
+            if name in self.out or now - first < self.after:
                 continue
             self.out.add(name)
             what = ("the price has gone through its stop and it is still open" if basis == "gapped"
@@ -118,20 +117,40 @@ def _money(x) -> str:
     return f"{float(x):,.2f}"
 
 
-def digest(store, now: datetime, backup_dir=None) -> str:
-    """The daily digest's text: the fund, each Strategy, open positions with their stops, the last 24 hours' alerts,
-    and the backup, recon and clock checks. Names no venue."""
+def _uk(ts: datetime) -> str:
+    return f"{_aware(ts).astimezone(UK):%a %d %b %H:%M} UK"
+
+
+def t5_day(store, now: datetime) -> str:
+    """The last completed T5 day (the UTC day the daily pause measures, 00:00 UTC = 01:00 UK in summer): the book at
+    its last mark before the day began and before it ended, as the brake reads its day start (portfolio.gate)."""
+    from datetime import UTC
+
+    end = _aware(now).astimezone(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+    start = end - timedelta(days=1)
+    a, b = store.book_equity_at_or_before(start), store.book_equity_at_or_before(end)
+    head = f"Last completed trading day ({_uk(start)} to {_uk(end)}): "
+    if not a or b is None:
+        return head + "no book marks"
+    return head + f"{_money(a)} to {_money(b)}, {_money(b - a)} ({float(b / a - 1):+.2%})"
+
+
+def digest(store, now: datetime, backup_dir=None, since: datetime | None = None) -> str:
+    """The daily digest's text: the fund, the last completed T5 day, each Strategy, open positions with their stops,
+    the alerts since the last digest (`since`, else 24 hours), and the backup, recon and clock checks. Names no
+    venue."""
     from sleeve_fund import backups, open_risk, supervisor
     from sleeve_fund.store import is_backtest
 
-    day_ago = now - timedelta(days=1)
-    lines = [f"Multi-Strategy Fund daily digest, {now.astimezone(UK):%a %d %b %H:%M} UK"]
+    day_ago = _aware(since) if since is not None else now - timedelta(days=1)
+    lines = [f"Multi-Strategy Fund daily digest, {_uk(now)}, covering since {_uk(day_ago)}"]
     try:
         lines.append(f"Fund equity: {_money(supervisor.fund_equity(store))}")
     except Exception as exc:  # noqa: BLE001 - the digest still goes; the reason is the line
         lines.append(f"Fund equity: can't be marked ({type(exc).__name__})")
+    lines.append(t5_day(store, now))
     strategies = [s for s in store.sleeves() if not is_backtest(s.name) and not supervisor.outside_fund_book(store, s)]
-    lines.append("Strategies (equity at last mark, cash P&L last 24h):")
+    lines.append("Strategies (equity at last mark, cash P&L since the last digest):")
     for s in strategies:
         last = store.last_equity(s.name)
         eq = _money(last["equity"]) if last else "not marked"
@@ -148,7 +167,7 @@ def digest(store, now: datetime, backup_dir=None) -> str:
     events = [e for e in store.events_after(0, limit=100_000) if _aware(e["ts"]) > day_ago]
     n_warn = sum(e["level"] == "warning" for e in events)
     n_err = sum(e["level"] in ("error", "critical") for e in events)
-    lines.append(f"Alerts in the last 24h: {n_warn} warning{'s' if n_warn != 1 else ''}, "
+    lines.append(f"Alerts since the last digest: {n_warn} warning{'s' if n_warn != 1 else ''}, "
                  f"{n_err} error{'s' if n_err != 1 else ''}")
     issue = backups.problem(backup_dir, now) if backup_dir else None
     lines.append("Backup: " + ("not checked here (BACKUP_DIR)" if not backup_dir else (issue[1] if issue else "ok")))
@@ -179,13 +198,14 @@ class DailyDigest:
             from sleeve_fund.alerts import post as send
         self.send = send
         self._sent: str | None = None
+        self._sent_at: datetime | None = None
         self._failing = False
 
     def _sent_day(self) -> str | None:
         if self._sent is None:
             last = self.store.last_event(None, ("digest_sent",))
             m = _DAY.search(last["message"]) if last else None
-            self._sent = m.group(1) if m else ""
+            self._sent, self._sent_at = (m.group(1) if m else ""), (last["ts"] if last else None)
         return self._sent
 
     def step(self, now: datetime) -> None:
@@ -200,7 +220,8 @@ class DailyDigest:
         from sleeve_fund.alerts import where
 
         try:
-            self.send(self.url, digest(self.store, now, Path(self.backup_dir) if self.backup_dir else None))
+            self.send(self.url, digest(self.store, now, Path(self.backup_dir) if self.backup_dir else None,
+                                       since=self._sent_at))
         except Exception as exc:  # noqa: BLE001 - kept and tried again next step
             if not self._failing:
                 self._failing = True
@@ -208,5 +229,5 @@ class DailyDigest:
                                  f"couldn't send the daily digest to {where(self.url)}: {type(exc).__name__}; "
                                  "retrying every minute", ts=now)
             return
-        self._failing, self._sent = False, day
+        self._failing, self._sent, self._sent_at = False, day, now
         self.store.event(None, "info", "digest_sent", f"daily digest for {day} sent to {where(self.url)}", ts=now)

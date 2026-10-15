@@ -11,6 +11,8 @@ round. One page, pass or fail:
    nothing was compared and the check fails.
 4. Assets. A multi-asset Strategy has a row for every listed asset, and every journal row is keyed to its own row's
    asset. One failing asset fails, named.
+5. Alerts (A15). Alerts have somewhere to go (ALERT_WEBHOOK_URL) and an outside monitor is pinged (HEALTHCHECK_PING_URL),
+   named by host only.
 
 Strictly read-only. It opens the database read-only (SQLite mode=ro; Postgres default_transaction_read_only), never
 the Store's own engine, and imports nothing that places an order or opens a network connection.
@@ -279,8 +281,8 @@ def run(url: str, environ: dict[str, str] | None = None) -> tuple[bool, str]:
     env = dict(os.environ if environ is None else environ)
     store = read_only_store(url)
     engine = store.engine
-    sections = [check_store(engine), check_keys(env, engine), check_venues(engine), check_books(store),
-                check_assets(store)]
+    sections = [check_store(engine), check_keys(env, engine), check_alerts(env), check_venues(engine),
+                check_books(store), check_assets(store)]
     ok = not any(s.failed for s in sections)
     out = [f"Start check: {'PASS' if ok else 'FAIL'}",
            f"{datetime.now(UTC):%Y-%m-%d %H:%M} UTC, {journal_kind(url)} journal, read-only",
