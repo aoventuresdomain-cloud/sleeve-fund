@@ -116,6 +116,7 @@ class Forwarder:
         # A15 (Drop 3a): the open positions with no live stop and the 08:00 UK digest, checked each step
         self.no_stop = ops_health.NoStopWatch()
         self.digest = ops_health.DailyDigest(store, env, send=send)
+        self.exit_rejects = ops_health.ExitRejectWatch()  # F-RX-2
         self._ops_failing: set[str] = set()
 
     def _resume(self) -> int:
@@ -217,6 +218,7 @@ class Forwarder:
         self.check_recon()
         now = self.now()
         self._ops_check("no-stop", lambda: self.no_stop.check(self.store, now))
+        self._ops_check("rejected-exit", lambda: self.exit_rejects.check(self.store, now))
         self._ops_check("daily digest", lambda: self.digest.step(now))
         if self.ping_url:
             try:

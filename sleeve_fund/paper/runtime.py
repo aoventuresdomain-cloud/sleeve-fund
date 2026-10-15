@@ -67,13 +67,14 @@ LIQUIDATED_WORDS = (fold(WIPED_OUT), "wiped out", "position margin lost")  # a l
 # one, and says what alone clears it; no venue names.
 CODES = ("liquidated", "drawdown_halt", "halted", "portfolio_halt", "daily_pause", "portfolio_pause", "retired",
          "winding_down", "stopped", "paused", "exits_only", "stale_data", "degraded_candle", "funding_missing",
-         "portfolio_stale", "book_moving")
+         "portfolio_stale", "book_moving", "exit_rejects")
 LABELS = {"liquidated": "Liquidated", "drawdown_halt": "Drawdown halt", "halted": "Halted",
           "portfolio_halt": "Portfolio halted", "daily_pause": "Daily loss pause", "portfolio_pause": "Portfolio paused",
           "retired": "Retired", "winding_down": "Winding down", "stopped": "Stopped",
           "paused": "Paused", "exits_only": "Exits only", "stale_data": "Stale data",
           "degraded_candle": "Degraded candle", "funding_missing": "No funding rate",
-          "portfolio_stale": "Portfolio unchecked", "book_moving": "Entry refused"}
+          "portfolio_stale": "Portfolio unchecked", "book_moving": "Entry refused",
+          "exit_rejects": "Exits rejected"}
 # The portfolio gate's entry blocks (portfolio.gate.entry_block's kinds) as CHOKE codes, with the words their own
 # reason starts with, which the label already says.
 PORTFOLIO_CODES = {"halt": ("portfolio_halt", "Portfolio halted: "),
@@ -190,14 +191,16 @@ def block_codes(why: str | None) -> tuple[str, ...]:
 def blocked_state(sleeve, now: datetime | None = None, *, liquidated: str | None = None, archived: bool = False,
                   holds: dict[str, str] | None = None, starting: bool = False,
                   since: datetime | None = None, portfolio: Why | None = None,
-                  moving: str | None = None) -> tuple[bool, Why | None]:
+                  moving: str | None = None, exit_rejects: Why | None = None) -> tuple[bool, Why | None]:
     """CHOKE (HoE 6 Oct 20:52, Advisor): the one "nothing opens" gate, as (blocked, why). Blocked: liquidated until a
     reset after liquidation (`liquidated`, from the journal: liquidation_head), a halt, the daily-loss pause, retired,
     then (not when `starting`: the supervisor's Stop and the dashboard's Start and Resume, which act on these
     themselves) stopped, a pause with no end time, or a hold the engine has raised (`holds`: stale data, a degraded
     candle, no funding rate). `portfolio`: the whole fund's block (portfolio_block), which no Start or Resume of one
     strategy clears. `moving`: the account a create or move of this Strategy waits to land on at the supervisor's
-    next mark (F-ASSIGN-STALE, Advisor ADV-ASSIGN), which no Start or Resume clears either. The why lists every cause
+    next mark (F-ASSIGN-STALE, Advisor ADV-ASSIGN), which no Start or Resume clears either. `exit_rejects`: closing
+    orders rejected repeatedly on its instrument anywhere in the fund (exit_reject_block, F-RX-2), cleared only by a
+    close that goes through. The why lists every cause
     that applies (Advisor 00:20). The engine checks every order
     that would make the position bigger, at submit and at fill; the supervisor and the dashboard's Start and Resume
     read the same answer. Stops, reduce-only orders, the PM's close and a liquidation are never gated."""
@@ -218,6 +221,8 @@ def blocked_state(sleeve, now: datetime | None = None, *, liquidated: str | None
         causes.append(portfolio)
     if moving is not None:
         causes.append(_cause("book_moving", f"this Strategy is moving to {moving} at the next mark."))
+    if exit_rejects is not None:
+        causes.append(exit_rejects)
     if not starting:  # Start and Resume act on a stopped or paused strategy: what they can't clear is above
         if "stopped" in (sleeve.status, getattr(sleeve, "desired_state", "running")):
             causes.append(STOPPED)
@@ -366,7 +371,30 @@ def entry_blocked(store, name: str, now: datetime | None = None, *, starting: bo
     sleeve = store.sleeve(name)
     return blocked_state(sleeve, now, liquidated=liquidation_head(store, name), archived=name in store.archived(),
                          holds=held or None, starting=starting, since=_halted_since(store, name, sleeve),
-                         portfolio=portfolio_block(store, now), moving=moving_to(store, name))
+                         portfolio=portfolio_block(store, now), moving=moving_to(store, name),
+                         exit_rejects=exit_reject_block(store, sleeve.instrument, now))
+
+
+def exit_reject_block(store, instrument: str, now: datetime | None = None) -> Why | None:
+    """F-RX-2 (Advisor, 15 Oct): while any Strategy row on `instrument` has an open repeated-rejected-exit episode
+    (ops_health.ExitRejectWatch, read from the journal), no Strategy in the fund opens or adds on it; exits and stops
+    are never gated. A journal that can't be read refuses the entry (fail closed, as moving_to)."""
+    from sleeve_fund.ops_health import EXIT_REJECTS, REJECTS_CLEARED, REJECTS_OPEN
+    from sleeve_fund.store import is_backtest
+
+    try:
+        for s in store.sleeves():
+            if s.instrument != instrument or is_backtest(s.name):
+                continue
+            last = store.last_event(s.name, (REJECTS_OPEN, REJECTS_CLEARED))
+            if last is not None and last["kind"] == REJECTS_OPEN:
+                return _cause("exit_rejects", f"No new entries on {instrument}: closing orders were rejected "
+                              f"{EXIT_REJECTS} times in a row on {s.name}; exits and stops still go out, and entries "
+                              "come back once a closing order on it goes through.")
+    except Exception:  # noqa: BLE001 - fail closed: an unread journal refuses entries, never errors out of CHOKE
+        return _cause("exit_rejects", f"No new entries on {instrument}: whether its exits are being rejected "
+                      "couldn't be read from the journal.")
+    return None
 
 
 def moving_to(store, name: str) -> str | None:
@@ -862,7 +890,9 @@ class SleeveRuntime:
                                      archived=sleeve is not None and self.name in self.store.archived(),
                                      holds=self.holds, since=_halted_since(self.store, self.name, state),
                                      portfolio=None if self.backtest else portfolio_block(self.store, self.now()),
-                                     moving=None if self.backtest else moving_to(self.store, self.name))
+                                     moving=None if self.backtest else moving_to(self.store, self.name),
+                                     exit_rejects=None if self.backtest or sleeve is None
+                                     else exit_reject_block(self.store, sleeve.instrument, self.now()))
         self._episode(why if blocked else None)
         return blocked, why
 

@@ -254,3 +254,55 @@ class DailyDigest:
             return
         self._failing, self._sent, self._sent_at = False, day, now
         self.store.event(None, "info", "digest_sent", f"daily digest for {day} sent to {where(self.url)}", ts=now)
+
+
+# F-RX-2 (Advisor, 15 Oct): repeated rejected exits -------------------------------------------------------------------
+EXIT_REJECTS = 3  # closing orders in a row, per Strategy row, no time window
+EXIT_REJECT_REALERT = timedelta(minutes=30)
+EXIT_REJECTED = ("rejected", "denied", "unfilled_unknown")  # unfilled_unknown: confirmed no fill (DA 15 Oct)
+EXIT_WENT = ("accepted", "partially_filled", "filled", "triggered")  # a close that went through ends the streak
+REJECTS_OPEN, REJECTS_STILL, REJECTS_CLEARED = "exit_rejected_repeatedly", "exit_rejected_still", "exit_rejects_cleared"
+
+
+def exit_reject_streak(rows: list[dict]) -> int:
+    """How many closing orders in a row, from the newest, were rejected, denied or confirmed unfilled. One that went
+    through ends it; one still in flight, cancelled or expired neither counts nor ends it."""
+    n = 0
+    for r in reversed(rows):
+        if r["status"] in EXIT_REJECTED:
+            n += 1
+        elif r["status"] in EXIT_WENT:
+            break
+    return n
+
+
+class ExitRejectWatch:
+    """F-RX-2: closing orders rejected EXIT_REJECTS times in a row on one Strategy row, read through QD's F-RX-1 reader
+    (Store.closing_orders, which owns which intents close). The episode lives in the journal (the latest open or
+    cleared event per row), so a restart neither opens it again nor re-alerts it, and the gate reads the same answer
+    (paper.runtime.exit_reject_block). Alert only: nothing here changes an order."""
+
+    def check(self, store, now: datetime) -> None:
+        from sleeve_fund.store import is_backtest
+
+        for s in store.sleeves():
+            if is_backtest(s.name):
+                continue
+            last = store.last_event(s.name, (REJECTS_OPEN, REJECTS_CLEARED))
+            is_open = last is not None and last["kind"] == REJECTS_OPEN
+            cleared = store.last_event(s.name, (REJECTS_CLEARED,))
+            streak = exit_reject_streak(store.closing_orders(s.name, cleared["ts"] if cleared else None))
+            inst = no_venues(s.instrument)
+            if not is_open and streak >= EXIT_REJECTS:
+                store.event(s.name, "error", REJECTS_OPEN, no_venues(
+                    f"Closing orders on {inst} rejected {streak} times in a row. No new entries on {inst} in the fund "
+                    "until one goes through; exits and stops still go out. Check it now"), ts=now)
+            elif is_open and streak < EXIT_REJECTS:
+                store.event(s.name, "info", REJECTS_CLEARED,
+                            f"A closing order on {inst} went through: entries on {inst} are allowed again", ts=now)
+            elif is_open and now - _aware(last["ts"]) >= EXIT_REJECT_REALERT:
+                still = store.last_event(s.name, (REJECTS_STILL,))
+                if still is None or still["ts"] < last["ts"]:
+                    store.event(s.name, "error", REJECTS_STILL, no_venues(
+                        f"Closing orders on {inst} are still being rejected ({_minutes(now - _aware(last['ts']))} "
+                        f"since the alert). No new entries on {inst}; exits and stops still go out"), ts=now)
