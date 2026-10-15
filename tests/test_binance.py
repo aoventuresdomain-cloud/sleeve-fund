@@ -28,7 +28,7 @@ def _kline(t_ms, o, h, lo, c, v):
 def test_the_venue_lists_perpetuals_under_its_own_symbol_with_its_fees_and_contract_limits():
     b = venue("binance")
     assert b.perpetual and b.symbol_of("BTC/USDT") == "BTCUSDT-PERP"
-    assert (float(b.fees.maker), float(b.fees.taker)) == (0.0002, 0.0005)
+    assert (float(b.fees.maker), float(b.fees.taker)) == (0.0002, 0.00055)
     assert b.list_instruments(get_json=lambda url: INFO) == ["BTC/USDT"]  # quarterlies and settling ones left out
     assert binance_contract("BTC/USDT", get_json=lambda url: INFO) == {
         "price_precision": 1, "size_precision": 3, "min_quantity": 0.001, "min_notional": 100.0}
@@ -44,7 +44,7 @@ def test_a_backtest_instrument_is_the_perpetual_paper_receives(monkeypatch):
     inst = b.instrument("BTC", "USDT")
     assert str(inst.id) == "BTCUSDT-PERP.BINANCE" and type(inst).__name__ == "CryptoPerpetual"
     assert (inst.price_precision, inst.size_precision, float(inst.min_notional)) == (1, 3, 100.0)
-    assert float(inst.taker_fee) == 0.0005
+    assert float(inst.taker_fee) == 0.00055
 
 
 def test_minute_pages_resume_on_the_last_minute_and_stop_at_the_forming_one():
@@ -92,7 +92,7 @@ def test_a_strategy_on_the_venue_must_trade_its_perpetual():
         SleeveConfig(**base, params={"rise": 0.01, "dip": 0.005})
     cfg = SleeveConfig(**base, params={"rise": 0.01, "dip": 0.005, "market": "perp", "allow_short": True})
     assert cfg.instrument_id == "BTCUSDT-PERP.BINANCE" and cfg.bar_type.startswith("BTCUSDT-PERP.BINANCE-1-MINUTE")
-    assert float(cfg.fees.taker) == 0.0005
+    assert float(cfg.fees.taker) == 0.00055
     t = markets.terms(cfg.params, "BINANCE")
     assert t.funding_venue == "BINANCE" and t.label == "Binance USD-M perpetuals"
     with pytest.raises(ValueError, match="choose the perp market"):

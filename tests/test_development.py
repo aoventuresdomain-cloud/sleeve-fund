@@ -133,7 +133,7 @@ def test_rsi_cross_comes_with_research_recommended_settings(client):
     assert "Recommended by research" in page and "<b>Answers:</b> Does buying after a sharp 15-minute dip" in page
     assert 'name="minutes" value="15" checked' in page and 'value="730"' in page and 'name="stop_atr"' in page
     assert 'name="venue" value="binance" data-pl-venue' in page and 'value="BTC/USDT"' in page
-    assert "Runs 4 variants and the cost ladder at 0.05% (the venue's taker fee). Long only." in page
+    assert "Runs 4 variants and the cost ladder at 0.055% (the venue's taker fee). Long only." in page
     other = c.get("/research?strategy=trend_filter", auth=AUTH).text
     assert "Daily candles. Learn on 1 year, test on the next 180 days. Latest year sealed." in other
     assert dev.GENERIC_WHY.replace("'", "&#39;") in other and 'name="venue" value="kraken" data-pl-venue' in other

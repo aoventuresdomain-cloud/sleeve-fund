@@ -699,7 +699,7 @@ def test_a_perp_studys_benchmark_pays_the_fee_its_strategy_pays(tmp_path, instru
     monkeypatch.setattr(study, "run_backtest", lambda *a, **k: runs.append((a[3], k, r := real_bt(*a, **k))) and r or r)
     r = run_study(perp, synthetic_ohlcv(days=1100, seed=3), instrument, dataset="syn", ledger=IdeaLedger(tmp_path / "l"),
                   synthetic=True, holdout_days=0, train_days=365, test_days=365, half_spread=0)
-    perp_taker = 0.0005  # the simulated low-fee perp market's
+    perp_taker = 0.00055  # the simulated low-fee perp market's
     assert float(instrument.taker_fee) != perp_taker
     assert costs[0] == pytest.approx(perp_taker)  # the headline benchmark; the cost ladder's follow
     # The strategy's own runs (not the cost ladder's, nor buy and hold's), on the same basis: every fill paid that fee
@@ -710,7 +710,7 @@ def test_a_perp_studys_benchmark_pays_the_fee_its_strategy_pays(tmp_path, instru
     for res in paid:
         notional = sum(float(q) * float(p) for q, p in zip(res.fills["filled_qty"], res.fills["avg_px"]))
         assert res.fees_paid == pytest.approx(notional * perp_taker, abs=0.02)
-    assert f"{perp_taker:.2%} taker" in r.fee_note and f"break-even: {r.breakeven}" in r.fee_note
+    assert "0.055% taker" in r.fee_note and f"break-even: {r.breakeven}" in r.fee_note
     # The Quant Researcher's line: the benchmark at each rung's own fee, costlier rungs never better for random entry.
     rand = [rung.random_return for rung in r.cost_ladder]
     assert None not in rand and rand == sorted(rand, reverse=True) and rand[0] > rand[-1]
