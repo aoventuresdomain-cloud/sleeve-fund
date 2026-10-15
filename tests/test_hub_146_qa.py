@@ -1261,7 +1261,9 @@ def test_na3_a_minute_opening_short_of_liquidation_takes_the_reachable_stop_firs
     """The minute opens flat and wicks beyond liquidation; the 10 % stop is reached first. TEC-GAPDOWN, Advisor ~02:45
     UK (GAP-DOWN (c) vs NA-3, option B): with no trade data for the minute (explicit), the stop books at the worse of
     its level less the floor and the minute's extreme, capped one tick short of the liquidation price: the extreme
-    is past it, so the cap books it. No liquidation, no drawdown halt; the one alert says so and names the loss."""
+    is past it, so the cap books it. No liquidation fill, halt or incident; the one alert says so and names the loss.
+    Outside the fund (this store has no portfolio gate) the loss trips the profile's drawdown halt, as any loss would
+    (Advisor ~03:05 UK: kept)."""
     p = shape(flat_prices(30), 7.25, 7.5, adverse(side, LIQ_DEPTH[profile]))
     run = _outage(path, p, side=side, perp=perp, profile=profile, stop=0.10, qty=0.25, trades=NO_TRADES)
     ex = first_exit(run.sequence())
@@ -1271,9 +1273,16 @@ def test_na3_a_minute_opening_short_of_liquidation_takes_the_reachable_stop_firs
     # The liquidation price now (_liq_now: the entry's, less the fees taken from the isolated margin), as the alert
     # states it; cross-checked against the entry's own where the journal carries it.
     liq = float(re.search(r"past the ([\d,]+\.\d\d) liquidation price", alert["message"]).group(1).replace(",", ""))
-    (entry,) = filled_orders(run, "entry")
-    if entry["signal"].get("liquidation_px"):
-        assert abs(liq / float(entry["signal"]["liquidation_px"]) - 1) < 0.001
+    # C-NA3-LIQ: derived here too, independently of the engine: isolated margin = notional / the profile's leverage
+    # cap, less the entry fee; liquidated where that margin plus the move equals the maintenance margin on the value
+    # there: p = (entry - side x margin / qty) / (1 - side x mm).
+    from sleeve_fund import markets
+
+    (fill,) = [f for f in run.fills if f["order_id"] == filled_orders(run, "entry")[0]["order_id"]]
+    qty, px, fee = float(fill["qty"]), float(fill["price"]), float(fill["fee"])
+    lev, mm = {"balanced": 2.0, "aggressive": 3.0}[profile], markets.LOW_FEE_PERP.maintenance_margin
+    derived = (px - side * (qty * px / lev - fee) / qty) / (1 - side * mm)
+    assert abs(liq / derived - 1) < 0.001, (liq, derived)
     extreme = np.round(p[7 * 60:8 * 60], 1)
     assert side * (float(extreme.min() if side > 0 else extreme.max()) - liq) <= 0  # at or past it: branch "capped"
     assert ex[3] == pytest.approx(liq + side * 0.1, abs=0.006), (ex, liq)  # one tick short of it, never at or past
