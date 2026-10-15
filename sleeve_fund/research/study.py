@@ -207,6 +207,9 @@ class StudyResult:
     oos_compare_returns: pd.Series | None = None
     spot_hold_returns: pd.Series | None = None  # "holding spot instead", out-of-sample, shown beside a perp hold
     funding_stress: dict | None = None  # a simulated perp's research period at FUNDING_STRESS_RATE
+    # D13-INTRAMINUTE-JUMP (3), GAP-DOWN: out-of-sample again with STOP_STRESS more on each stop exit. charge: the
+    # daily returns that costs, by day; stops: the stop exits; median_stop: the entries' median stop distance.
+    stop_stress: dict = field(default_factory=dict)
     # The probability of backtest overfitting (research.pbo, R4) over the sensitivity grid and every other counted
     # setting of the idea family, with its variant count.
     pbo: object = None
@@ -786,6 +789,7 @@ def run_study(
     fold_runs: list = []
     windows = []  # (index in folds, inputs, run) of each window that chose a setting
     oos_parts, bench_parts, compare_by = [], [], []  # compare_by: fold_benchmark's parts, per window
+    stress_parts = []  # _stop_stress, per window that chose a setting
     start = 0
     while start + train_bars + test_bars <= len(research):
         train = research.iloc[start : start + train_bars]
@@ -821,6 +825,7 @@ def run_study(
         run = bt(spec.name, through_test, best, oos=True, trade_from=test_idx[0] - bar, count_from=test_idx[0])
         fold_runs.append((through_test, test_idx, best, run))
         fold, test_ret, b_ret, parts, run = scored(len(folds), *window, run)
+        stress_parts.append(_stop_stress(run, test_idx, bar, test_ret))
         windows.append((len(folds), window, run))
         folds.append(fold)
         compare_by.append(parts)
@@ -870,7 +875,13 @@ def run_study(
                           "random entry still judges")
     else:
         hold_note = ""
+    dists = [x for _, _, d in stress_parts for x in d]
+    stop_stress = {"charge": pd.concat([c for c, _, _ in stress_parts]) if stress_parts else pd.Series(dtype=float),
+                   "stops": sum(n for _, n, _ in stress_parts), "bp": STOP_STRESS * 1e4,
+                   "median_stop": float(pd.Series(dists).median()) if dists else None,
+                   "required_below": STOP_STRESS_REQUIRED_BELOW}
     result = StudyResult(
+        stop_stress=stop_stress,
         idea_hash=idea_hash,
         spec=spec,
         dataset=dataset,
@@ -1066,6 +1077,37 @@ def run_study(
         if locks is not None:
             locks.settle(idea, underlying, trial)
     return result
+
+
+STOP_STRESS = 0.002  # D13-INTRAMINUTE-JUMP (3): 20 bp more on each stop exit, a jump through the stop paper may see
+STOP_STRESS_REQUIRED_BELOW = 0.005  # GAP-DOWN (Advisor 15 Oct): the line is required under this median stop distance
+
+
+def _stop_stress(run: BacktestResult, test_idx, bar: pd.Timedelta, test_ret: pd.Series) -> tuple[pd.Series, int, list]:
+    """A test window's stop stress: the daily returns lost if each stop exit filled in it cost STOP_STRESS more of its
+    notional, charged on the equity curve from its fill on, with no re-sizing after it; how many stop exits; and
+    the stop distance of each entry filled in it."""
+    fills = run.fills
+    lo, hi = test_idx[0] - bar, test_idx[-1]
+    cost = pd.Series(0.0, index=run.equity.index)
+    stops, dist = 0, []
+    for o, f in (fills.iterrows() if fills is not None and len(fills) else ()):
+        ts = pd.to_datetime(f["ts_last"], utc=True)
+        if not lo < ts <= hi:
+            continue
+        d = run.decisions.get(o) or {}
+        if d.get("intent") == "stop_loss":  # a resting stop's exit; a liquidation books at bankruptcy
+            stops += 1
+            cost[cost.index >= ts] += STOP_STRESS * float(f["filled_qty"]) * float(f["avg_px"])
+        elif d.get("intent") == "entry" and (d.get("signal") or {}).get("stop_frac"):
+            dist.append(float(d["signal"]["stop_frac"]))
+    if not stops:
+        return pd.Series(0.0, index=test_ret.index), 0, dist
+    from types import SimpleNamespace
+
+    stressed = SimpleNamespace(equity=run.equity - cost, starting_capital=run.starting_capital)
+    s_ret = whole_days(daily_returns(_flat_until(stressed, lo)), test_idx[0], bar)
+    return (test_ret - s_ret.reindex(test_ret.index)).fillna(0.0), stops, dist
 
 
 def _flat_until(run: BacktestResult, start) -> pd.Series:
