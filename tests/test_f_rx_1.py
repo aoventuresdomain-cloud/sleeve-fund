@@ -138,3 +138,13 @@ def test_a_refused_resize_is_journaled_and_leaves_the_order_as_it_was(store):
     assert row["status"] == "accepted"  # still working at the venue at its old size: not a refused close
     assert [r["status"] for r in store.closing_orders("s")] == ["accepted"]
 
+
+
+def test_a_benign_refusal_is_listed_and_marked_so_it_never_counts(store):
+    """A1 (Advisor 15 Oct): a reduce-only close refused with the position already flat is marked benign on its row."""
+    _order(store, "x1", "stop_loss", 1)
+    store.update_order("x1", status="rejected", message="ReduceOnly Order is rejected")
+    store.merge_order_signal("x1", {"benign_reject": True})
+    _order(store, "x2", "exit", 2)
+    store.update_order("x2", status="rejected", message="margin")
+    assert [(r["order_id"], r["benign"]) for r in store.closing_orders("s")] == [("x1", True), ("x2", False)]

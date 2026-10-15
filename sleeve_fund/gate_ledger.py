@@ -394,8 +394,13 @@ class DbLedger:
         t = portfolio_state_t
         with self._tx() as conn:
             row["profile_version"] = conn.execute(select(func.max(portfolio_profile_t.c.version))).scalar()
+            was = conn.execute(select(t.c.status).where(t.c.id == 1)).scalar()
             if conn.execute(update(t).where(t.c.id == 1).values(**row)).rowcount == 0:
                 conn.execute(insert(t), [{"id": 1, **row}])
+            if self._pg and was != status:  # A3: the fund's pause or halt wakes every Strategy's gate read at once
+                from sleeve_fund.store import GATE_ALL, GATE_CHANNEL
+
+                conn.execute(select(func.pg_notify(GATE_CHANNEL, GATE_ALL)))
 
     def ensure_state(self) -> None:
         """Write the state row (never marked: entries blocked as stale) if there is none. The portfolio gate is in
