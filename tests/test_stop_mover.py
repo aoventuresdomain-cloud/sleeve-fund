@@ -172,7 +172,8 @@ def test_n_any_other_refusal_is_not_retried_and_is_critical_when_no_stop_is_left
     (10006, "Too many visits!", "transient"), (10016, "Server error", "transient"), (None, "timeout", "transient"),
     (110092, "expect Rising, but trigger_price[59000] <= current[59500]", "crossed"),
     (110093, "expect Falling, but trigger_price[61000] >= current[60500]", "crossed"),
-    (110017, "reduce-only rule not satisfied", "other"), (10001, "params error", "other")])
+    (110017, "reduce-only rule not satisfied", "other"), (10001, "params error", "other"),
+    (999999, "a code nobody listed", "other")])  # never guessed into transient (Advisor STOP-RETRY)
 def test_o_the_venue_s_reject_codes_map_to_their_class(code, msg, kind):
     from sleeve_fund.paper.exec_client import reject_class
 
