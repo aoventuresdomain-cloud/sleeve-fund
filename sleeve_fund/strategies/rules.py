@@ -21,7 +21,7 @@ from nautilus_trader.model import Bar
 from sleeve_fund.data import bar_minutes
 from sleeve_fund.strategies.base import MAX_STOP, MIN_STOP, IdeaSpec, LongFlatConfig, LongFlatStrategy
 from sleeve_fund.strategies.definitions import (CATALOGUE, LEVEL_EXITS, Checked, Compiled, Env, block_value,
-                                                check_definition, definition_hash, load_definition_file,
+                                                check_definition, definition_hash, load_definition_file, side_exits,
                                                 timeframe_label, to_params)
 from sleeve_fund.strategies.timeframes import MINUTE_NS
 
@@ -61,7 +61,8 @@ class RulesConfig(LongFlatConfig):
                              "created with: it, or its venue's day start, changed after it was copied in")
         if definition_version is not None and definition_version != checked.version:
             raise ValueError(f"definition version {definition_version} isn't one this engine runs ({checked.version})")
-        levels = [k for k in LEVEL_EXITS if k in (definition.get("exits") or {})]
+        levels = [k for side in ("long", "short") if side in definition
+                  for k in LEVEL_EXITS if k in side_exits(definition.get("exits"), side)]
         if levels and (self.stop_loss or self.stop_atr or self.stop_swing_bars):
             raise ValueError("choose the definition's stop or the strategy's stop-loss setting, not both")
         self.definition = definition
@@ -97,7 +98,8 @@ def _iso(ns: int) -> str:
 
 
 # The chart's panes (P1-3s): blocks in price units are drawn over the candles, the rest in the lower pane.
-PRICE_KINDS = frozenset({"sma", "ema", "wma", "vwap", "bollinger", "donchian", "keltner"})
+PRICE_KINDS = frozenset({"sma", "ema", "wma", "vwap", "bollinger", "donchian", "keltner", "rolling_max",
+                         "rolling_min", "prior_period", "session_levels"})
 LOWER_OUTPUTS = frozenset({"width", "pct_b"})  # a band's width and %b are ratios
 MARKER_KINDS = frozenset({"rsi_divergence"})  # events, not lines: drawn as markers once the chart takes them
 
@@ -319,15 +321,20 @@ class Rules(LongFlatStrategy):
         """The time stop: wall-clock by default, so missing candles never lengthen a hold; it ends the leg on the
         first candle at or after the deadline. A definition can count the candles that came instead, as rsi_cross
         does (Independent Quant Advisor, 6 Oct, 5.2)."""
-        if self.rules.time_stop is None:
+        if self._time_stop is None:
             return False
-        kind, n = self.rules.time_stop
+        kind, n = self._time_stop
         if kind == "count":
             return self._held >= n
         return self.env.ts >= self._leg_ts + (n * MINUTE_NS if kind == "minutes" else n * step)
 
+    @property
+    def _time_stop(self) -> tuple | None:
+        """The time stop of the leg the rules are on (G1: each side may have its own)."""
+        return self.rules.exits[self._leg]["time_stop"] if self._leg else None
+
     def _held_words(self, step: int) -> str:
-        kind, n = self.rules.time_stop
+        kind, n = self._time_stop
         if kind == "count":
             return f"{self._held} candles"
         return f"{(self.env.ts - self._leg_ts) // MINUTE_NS:,} minutes"
@@ -434,31 +441,49 @@ class Rules(LongFlatStrategy):
 
     # --- level exits ------------------------------------------------------------------------------------------
 
+    def _side_exits(self, side: int) -> dict:
+        """The exits of a `side` position (G1: each side may have its own); a definition with one side has those."""
+        return self.rules.exits.get(side) or next(iter(self.rules.exits.values()), {})
+
+    def _side_levels(self, side: int) -> dict:
+        """The level exits of a `side` position, by kind."""
+        return self._side_exits(side).get("levels") or {}
+
+    @property
+    def _any_levels(self) -> set:
+        # check_definition holds the sides to one answer on carrying a stop, and on carrying any level exit
+        return {k for e in self.rules.exits.values() for k in e["levels"]}
+
     @property
     def _has_exits(self) -> bool:
-        return bool(self.rules.levels) or super()._has_exits
+        return bool(self._any_levels) or super()._has_exits
 
     @property
     def _stop_designed(self) -> bool:
-        return bool({"stop", "trail"} & set(self.rules.levels)) or super()._stop_designed
+        return bool({"stop", "trail"} & self._any_levels) or super()._stop_designed
 
     def _stop_cfg(self) -> dict:
-        if not self.rules.levels:
+        if not self._any_levels:
             return super()._stop_cfg()
         exits = self.c.definition.get("exits") or {}
-        return {"definition_exits": {k: exits[k] for k in LEVEL_EXITS if k in exits}}
+        out = {k: exits[k] for k in LEVEL_EXITS if k in exits}
+        for side in ("long", "short"):  # a side's own, only where it has any: a shared-exits definition's is as before
+            own = {k: v for k, v in (exits.get(side) or {}).items() if k in LEVEL_EXITS}
+            if own:
+                out[side] = own
+        return {"definition_exits": out}
 
-    def _level_values(self) -> dict | None:
-        out = {k: fn(self.env) for k, fn in self.rules.levels.items()}
+    def _level_values(self, side: int) -> dict | None:
+        out = {k: fn(self.env) for k, fn in self._side_levels(side).items()}
         return None if any(v is None for v in out.values()) else out
 
     def _tightest(self, levels: dict, side: int) -> float:
         return max(levels.values()) if side > 0 else min(levels.values())
 
     def _plan_exits(self, close: float, side: int = 1):
-        if not self.rules.levels:
+        if not self._side_levels(side):
             return super()._plan_exits(close, side)
-        levels = self._level_values()
+        levels = self._level_values(side)
         if levels is None or close <= 0:
             return None
         level = self._tightest(levels, side)
@@ -483,19 +508,19 @@ class Rules(LongFlatStrategy):
         """Each close while a position is open: `trail` follows its level (never loosening with `ratchet`),
         `exit_at_level` follows its own, `stop` stays where it opened; the tightest becomes the position's stop
         from the next candle. Returns (kind, level) when this close is already past it."""
-        if self._entry_px is None or not self.rules.levels:
-            return None
         side = self._entry_side or 1
-        now = self._level_values() or {}
+        if self._entry_px is None or not self._side_levels(side):
+            return None
+        now = self._level_values(side) or {}
         if self._levels is None:  # after a restart: from the stop the journal kept
             if self._stop_frac is None:
                 return None
             kept = self._entry_px * (1 - side * self._stop_frac)
-            self._levels = {k: kept for k in self.rules.levels}
+            self._levels = {k: kept for k in self._side_levels(side)}
         for kind in ("trail", "exit_at_level"):
             if kind in now:
                 was = self._levels.get(kind)
-                ratchet = kind == "trail" and self.rules.ratchet and was is not None
+                ratchet = kind == "trail" and self._side_ratchet(side) and was is not None
                 self._levels[kind] = (max(was, now[kind]) if side > 0 else min(was, now[kind])) if ratchet else now[kind]
         level = self._tightest(self._levels, side)
         close = self.env.ohlcv[3]
@@ -507,6 +532,9 @@ class Rules(LongFlatStrategy):
         if self._hold_stop_capped(side * (1 - level / self._entry_px)) and self._backtest:
             self._rest_exits()  # moves the resting stop
         return None
+
+    def _side_ratchet(self, side: int) -> bool:
+        return self._side_exits(side).get("ratchet", True)
 
     def _fill_stop(self) -> float | None:
         """A level is a price: after a fill that re-averaged the entry, the stop is the same level as a share of the

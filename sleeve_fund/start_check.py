@@ -125,6 +125,46 @@ def check_alerts(environ: dict[str, str]) -> Section:
     return sec
 
 
+def check_account_sharing(environ: dict[str, str], engine: Engine) -> Section:
+    """A7: with one account per Strategy on (ACCOUNT_PER_STRATEGY=on), every live or test-network account is one
+    Strategy's; each shared one FAILs, named with its Strategies. Off, it says so and passes."""
+    from sleeve_fund.accounts import per_strategy
+    from sleeve_fund.store import (
+        OPEN_ORDER_STATUSES,
+        accounts_t,
+        is_backtest,
+        orders_t,
+        sleeve_accounts_t,
+        sleeve_archive_t,
+        sleeves_t,
+    )
+
+    sec = Section("One account per Strategy")
+    if not per_strategy(environ):
+        sec.add(NOTE, "off (ACCOUNT_PER_STRATEGY): Strategies may share an account")
+        return sec
+    s, a, link = sleeves_t.c, accounts_t.c, sleeve_accounts_t.c
+    with engine.connect() as c:
+        rows = c.execute(select(link.account, link.sleeve, s.parent).join(sleeves_t, s.name == link.sleeve)
+                         .join(accounts_t, a.name == link.account).where(a.kind == "live")).all()
+        # put away, out of the book and no order open (Advisor (b)); a withdrawal is only ever made flat (F-C3B-A)
+        released = set(c.execute(select(sleeve_archive_t.c.sleeve)
+                                 .where(sleeve_archive_t.c.withdrawn.is_not(None))).scalars())
+        released -= set(c.execute(select(orders_t.c.sleeve).where(orders_t.c.status.in_(OPEN_ORDER_STATUSES)))
+                        .scalars())
+    by: dict[str, set[str]] = {}
+    for acc, row, parent in rows:
+        if not is_backtest(row) and row not in released:  # put away and out of the book: released (A7 (b))
+            by.setdefault(acc, set()).add(parent or row)
+    for acc, who in sorted(by.items()):
+        if len(who) > 1:
+            sec.add(FAIL, f"account {acc} is shared by {', '.join(sorted(who))}: their new entries are refused "
+                          "(exits and stops run) until each has its own")
+    if not sec.failed:
+        sec.add(PASS, "every live or test-network account trades for one Strategy")
+    return sec
+
+
 def check_venues(engine: Engine) -> Section:
     from sleeve_fund.accounts import PAPER
     from sleeve_fund.store import accounts_t, sleeve_accounts_t
@@ -294,6 +334,31 @@ def check_books(store, cent: bool = False) -> Section:
     return sec
 
 
+def check_maintenance(store, now=None) -> Section:
+    """VS-1 (Advisor, 15 Oct): a perp Strategy's liquidation is priced at its venue's published maintenance tiers for
+    the instrument. One on a pair whose table isn't kept is a FAIL, named, never run at an assumed rate. A table read
+    more than 30 days ago is noted, once per pair (VS-1-TABLE; the supervisor's alerts say it too)."""
+    from datetime import UTC, datetime
+
+    from sleeve_fund import markets
+
+    sec, live = Section("Maintenance tables"), []
+    for s in store.sleeves():
+        if s.lifecycle == "retired" or (s.params or {}).get("market") != "perp":
+            continue
+        try:
+            markets.terms(s.params, s.venue, s.instrument)
+        except markets.NoMaintenanceTable as exc:
+            sec.add(FAIL, f"{s.name}: {exc}")
+            continue
+        live.append(s)
+    for line in markets.stale_maintenance(live, (now or datetime.now(UTC)).date()):
+        sec.add(NOTE, line)
+    if not sec.failed:
+        sec.add(PASS, "every perp Strategy's instrument has its venue's maintenance tiers")
+    return sec
+
+
 def check_assets(store) -> Section:
     """A multi-asset Strategy asset by asset (multi-asset spec §7): every listed asset has its row, and every journal
     row is keyed to its own row's asset (DA 0028's reconcile, store.asset_mismatches). One failing asset fails, named."""
@@ -318,6 +383,39 @@ def check_assets(store) -> Section:
     return sec
 
 
+def _build_config(sleeve) -> None:
+    """Build the Strategy's config from its row as the dashboard's create check does: bad settings raise here."""
+    from nautilus_trader.model import BarType, InstrumentId
+
+    from sleeve_fund.paper.config import from_store
+    from sleeve_fund.strategies import REGISTRY
+
+    cfg = from_store(sleeve)
+    _, config_cls = REGISTRY[cfg.strategy]
+    config_cls(instrument_id=InstrumentId.from_str(cfg.instrument_id), bar_type=BarType.from_str(cfg.bar_type),
+               assumed_taker_fee=float(cfg.fees.taker), **cfg.params)
+
+
+def check_strength(store) -> Section:
+    """G5: every Strategy set to size by signal strength builds the config its node will: a valid setting, not
+    rebalancing to a target weight (CR F-G5-1; a band the Model injects counts, QD F-G5-3) and not a pair's leg (QD
+    F-G5-4). Any of them fails, named."""
+    sec = Section("Sizing by signal strength")
+    for s in store.sleeves(include_legs=False):
+        params = s.params or {}
+        if params.get("signal_strength") is None:
+            continue
+        try:  # the config the node builds (QD F-G5-3): a Model may inject a rebalance band of its own
+            _build_config(s)
+        except Exception as exc:  # noqa: BLE001 - whatever stops it building stops the Strategy at start: named
+            sec.add(FAIL, f"{s.name}: {exc}")
+            continue
+        sec.add(PASS, f"{s.name}: sizes by signal strength ({params['signal_strength']['mapping']})")
+    if not sec.lines:
+        sec.add(NOTE, "no Strategy sizes by signal strength (it is off for every one)")
+    return sec
+
+
 def run(url: str, environ: dict[str, str] | None = None) -> tuple[bool, str]:
     """The checks against the journal at url, and the one-page report."""
     from datetime import UTC, datetime
@@ -326,7 +424,8 @@ def run(url: str, environ: dict[str, str] | None = None) -> tuple[bool, str]:
     store = read_only_store(url)
     engine = store.engine
     sections = [check_store(engine), check_keys(env, engine), check_alerts(env), check_venues(engine),
-                check_books(store), check_assets(store), check_warmups(store)]
+                check_maintenance(store), check_books(store), check_assets(store), check_warmups(store),
+                check_account_sharing(env, engine), check_strength(store)]
     ok = not any(s.failed for s in sections)
     out = [f"Start check: {'PASS' if ok else 'FAIL'}",
            f"{datetime.now(UTC):%Y-%m-%d %H:%M} UTC, {journal_kind(url)} journal, read-only",

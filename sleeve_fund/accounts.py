@@ -18,6 +18,13 @@ PAPER_NOTE = "Simulated money at each strategy's own venue prices and fees"
 PAPER_NOTES_BEFORE = ("Simulated money at live Kraken prices and fees",)  # old defaults, replaced on read
 
 
+def per_strategy(environ=None) -> bool:
+    """A7 (Advisor default, OFF until the PM answers): ACCOUNT_PER_STRATEGY=on makes each live or test-network account
+    one Strategy's, so venue positions never net across Strategies. Paper accounts are shared by design."""
+    env = os.environ if environ is None else environ
+    return (env.get("ACCOUNT_PER_STRATEGY") or "").strip().lower() == "on"
+
+
 def env_names(account: str, venue: str | None = None) -> tuple[str, str]:
     """The two environment variables that hold a live account's key and secret for its venue."""
     from sleeve_fund.venues import venue as venue_profile

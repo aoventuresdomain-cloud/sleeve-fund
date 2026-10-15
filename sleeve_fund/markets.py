@@ -18,6 +18,8 @@ from sleeve_fund.margin import (  # noqa: F401 (re-exported)
     isolated_liquidation,
     isolated_margin,
     liquidation_price,
+    shifted_liquidation,
+    tier_at,
 )
 
 SPOT = "spot"
@@ -42,10 +44,14 @@ class PerpTerms:
     half_spread: float | None  # None: the venue's assumption
     funding_rate: float  # per funding interval, as a share of the position's value: longs pay, shorts receive
     funding_hours: tuple[int, ...]  # UTC hours funding is exchanged at
-    maintenance_margin: float  # share of the position's value the account must keep, or it is liquidated
+    # What the account must keep, or it is liquidated: one share of the position's value (a simulated perp), or a
+    # venue's tiers for one instrument (margin.Tier; VS-1); None when asked for no instrument (markets.terms)
+    maintenance_margin: float | tuple | None
     # The venue whose settled funding rates are charged (sleeve_fund.funding); None charges funding_rate. With a
     # venue, funding_rate is only the fallback for a settlement the venue's records don't have.
     funding_venue: str | None = None
+    # VS-1-TABLE: the venue's largest published tier ceiling for the instrument; an entry at or past it is refused
+    max_notional: float = float("inf")
 
 
 # Published rates of the large perp venues' entry tiers (0.02% maker, 0.05% taker), a tight BTC book
@@ -67,10 +73,12 @@ def is_perp(params: dict | None) -> bool:
     return market_of(params) != SPOT
 
 
-def terms(params: dict | None, venue: str | None = None) -> PerpTerms | None:
+def terms(params: dict | None, venue: str | None = None, pair: str | None = None) -> PerpTerms | None:
     """What the strategy's market costs and risks. On a venue that lists perpetuals (sleeve_fund.venues), the
-    perp market is that venue's own: its fees, spread and settled funding. Elsewhere a perp is simulated on
-    the venue's spot prices at a low-fee perp venue's published rates."""
+    perp market is that venue's own: its fees, spread, settled funding and, for `pair` (BASE/QUOTE or the venue's
+    own symbol), its maintenance tiers (VS-1). Without a pair its maintenance_margin is None: only what reads no
+    liquidation (fees, funding, labels) asks so. Elsewhere a perp is simulated on the venue's spot prices at a
+    low-fee perp venue's published rates."""
     m = market_of(params)
     if m == SPOT:
         return None
@@ -81,7 +89,7 @@ def terms(params: dict | None, venue: str | None = None) -> PerpTerms | None:
         if profile.perpetual:
             if m != PERP:
                 raise ValueError("this venue trades its own perpetuals: choose the perp market")
-            return native_terms(profile)
+            return native_terms(profile, pair)
     if m == PERP_FUNDING_STRESS:
         from dataclasses import replace
 
@@ -90,12 +98,71 @@ def terms(params: dict | None, venue: str | None = None) -> PerpTerms | None:
     return LOW_FEE_PERP if m == PERP else VENUE_FEE_PERP
 
 
-def native_terms(profile) -> PerpTerms:
+def held_terms(params: dict | None, venue: str | None, pair: str | None) -> tuple[PerpTerms | None, bool]:
+    """terms() for a position the journal already holds, which a page reads and must never fail on: (its terms, True),
+    or, on a pair whose venue tiers aren't kept, its terms without the tiers and False: its liquidation is unknown
+    (CR MUST 1). New perps on such a pair are still refused (NoMaintenanceTable)."""
+    try:
+        return terms(params, venue, pair), True
+    except NoMaintenanceTable:
+        return terms(params, venue), False
+
+
+def native_terms(profile, pair: str | None = None) -> PerpTerms:
     """A perpetual venue's own terms: its fee schedule and spread (None: the venue's), the funding it settles,
-    and a 0.5% maintenance margin, cautious for BTC and ETH (0.4% at the smallest tier), light for small
-    instruments (sleeve_fund.risk keeps the stop well inside liquidation either way)."""
+    and, for `pair`, the venue's own maintenance tiers (VS-1; maintenance_for). None without a pair."""
     return PerpTerms(profile.label, None, None, LOW_FEE_PERP.funding_rate, profile.funding_hours,
-                     LOW_FEE_PERP.maintenance_margin, funding_venue=profile.name)
+                     maintenance_for(profile, pair) if pair is not None else None,  # type: ignore[arg-type]
+                     funding_venue=profile.name,
+                     max_notional=profile.maintenance_limits.get(_table_key(profile, pair), float("inf"))
+                     if pair is not None else float("inf"))
+
+
+class NoMaintenanceTable(ValueError):
+    """VS-1 (Advisor, 15 Oct): a perp on an instrument whose venue tiers aren't kept is refused, never liquidated at an
+    assumed rate."""
+
+
+def _table_key(profile, pair: str) -> str:
+    """The pair a venue's tables are kept under, given BASE/QUOTE or the venue's own symbol (BTCUSDT-PERP)."""
+    if "/" not in pair and profile.symbol is not None:
+        return next((p for p in profile.maintenance_tiers if profile.symbol(p) == pair), pair)
+    return pair
+
+
+def maintenance_for(profile, pair: str) -> tuple:
+    """The venue's maintenance tiers for `pair`, given as BASE/QUOTE or as the venue's own symbol (BTCUSDT-PERP).
+    Raises NoMaintenanceTable, naming the instrument, when the venue's table for it isn't kept."""
+    from sleeve_fund.margin import tiers
+
+    table = profile.maintenance_tiers.get(_table_key(profile, pair))
+    if not table:
+        # No venue name: these words reach the create page and the start check (CR MUST 2).
+        raise NoMaintenanceTable(f"{pair} has no maintenance table kept, so its liquidation price is unknown: a perp "
+                                 "on it is refused until the venue's published tiers are kept (VS-1)")
+    return tiers(table)
+
+
+def stale_maintenance(sleeves, today, days: int = 30) -> list[str]:
+    """VS-1-TABLE: one line per instrument a live perp Strategy trades whose venue table was read more than `days`
+    ago (the venue changes its tiers from time to time; DA-11 keeps them). No venue names: it can reach the PM."""
+    from sleeve_fund.venues import venue as venue_profile
+
+    out, seen = [], set()
+    for s in sleeves:
+        if s.lifecycle == "retired" or (s.params or {}).get("market") != PERP or s.instrument in seen:
+            continue
+        try:
+            profile = venue_profile(s.venue)
+        except (KeyError, ValueError):
+            continue
+        read_on = getattr(profile, "maintenance_read_on", None)
+        if not profile.perpetual or read_on is None or (today - read_on).days <= days:
+            continue
+        seen.add(s.instrument)
+        out.append(f"{s.instrument}: its maintenance table was read on {read_on.day} {read_on:%b %Y}, "
+                   f"{(today - read_on).days} days ago; re-paste and re-check it (DA-11)")
+    return out
 
 
 def check_venue(params: dict | None, venue: str) -> None:

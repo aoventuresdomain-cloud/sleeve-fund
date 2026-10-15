@@ -191,7 +191,7 @@ def test_d3_the_risk_pages_stress_loss_matches_what_the_engine_books_on_a_gap(tm
     e = sorted(res.journal.fills_, key=lambda f: f["ts"])[0]
     before = float(res.equity[res.equity.index < idx[20]].iloc[-1])
     booked = before - float(res.equity.iloc[-1])
-    s = type("S", (), {"params": dict(PERP), "venue": "BINANCE", "name": "x"})()
+    s = type("S", (), {"params": dict(PERP), "venue": "BINANCE", "name": "x", "instrument": "BTC/USDT"})()
     x = {"sleeve": s, "profile": risk.profile("aggressive"), "equity": before, "qty": e["qty"], "price": 60_000.0,
          "entry_px": e["price"], "cash": 10_000.0 - e["fee"] - e["qty"] * e["price"], "unrealised": 0.0,
          "position_value": e["qty"] * 60_000.0}

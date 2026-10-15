@@ -184,8 +184,8 @@
       <div><dt>Side</dt><dd>{% if position %}{{ "Short" if position.side < 0 else "Long" }}{% else %}<span class="muted">Flat</span>{% endif %}</dd></div>
       <div><dt title="Position value at entry ÷ the margin set aside for it (isolated): the leverage it opened at. Effective: position value now ÷ the same margin, which moves with the price.">Leverage</dt><dd>{% if position and perp.leverage %}{{ '%g'|format((perp.leverage * 10)|round / 10) }}×{% if perp.effective_leverage %} <span class="faint">· effective {{ '%.2f'|format(perp.effective_leverage) }}×</span>{% endif %}{% else %}<span class="muted">–</span>{% endif %}</dd></div>
       <div><dt title="Position value at the current price ÷ the strategy's equity.">Exposure</dt><dd>{% if position and perp.exposure is not none %}{{ '%.2f'|format(perp.exposure) }}× equity{% else %}<span class="muted">–</span>{% endif %}</dd></div>
-      <div><dt title="Isolated: the notional at entry over the leverage cap">Margin used</dt><dd>{{ perp.margin|money }} {{ quote }} <span class="faint">maintenance {{ perp.maintenance|money }} ({{ perp.maintenance_rate|pct1 }} of notional)</span></dd></div>
-      <div><dt>Liquidation</dt><dd>{% if perp.liq_px %}{{ perp.liq_px|px }} <span class="{{ 'loss' if perp.to_liq < 0.1 else 'faint' }}">{{ perp.to_liq|pct1 }} {{ "above" if position and position.side < 0 else "below" }}</span>{% elif position %}<span class="muted">None at any price</span>{% else %}<span class="muted">–</span>{% endif %}</dd></div>
+      <div><dt title="Isolated: the notional at entry over the leverage cap">Margin used</dt><dd>{{ perp.margin|money }} {{ quote }} <span class="faint">{% if perp.maintenance is not none %}maintenance {{ perp.maintenance|money }} ({{ perp.maintenance_rate|pct1 }} of notional){% else %}maintenance unknown: no venue table kept for it{% endif %}</span></dd></div>
+      <div><dt>Liquidation</dt><dd>{% if perp.liq_px %}{{ perp.liq_px|px }} <span class="{{ 'loss' if perp.to_liq < 0.1 else 'faint' }}">{{ perp.to_liq|pct1 }} {{ "above" if position and position.side < 0 else "below" }}</span>{% elif perp.liq_unknown %}<span class="warn">Unknown: no venue table kept for it</span>{% elif position %}<span class="muted">None at any price</span>{% else %}<span class="muted">–</span>{% endif %}</dd></div>
     </dl></div>
     <div class="pos-card"><h3>Funding <span class="faint">{{ quote }}, + received</span></h3><dl>
       <div><dt>Last payment</dt><dd>{% if perp.funding_last %}{{ perp.funding_last.amount|smoney }} <span class="faint">{{ perp.funding_last.ts|ts }} at {{ '%.4f%%'|format(perp.funding_last.rate * 100) }}</span>{% else %}<span class="muted">None yet</span>{% endif %}</dd></div>
@@ -466,19 +466,6 @@
       <button name="command" value="reset_after_liquidation" class="danger">Reset after liquidation</button></div>
   </form>{% endif %}
   {% if ral.incident %}<div class="dlg-actions"><button type="button" class="secondary" data-close>Close</button></div>{% endif %}
-</dialog>{% endif %}
-{% if not archived %}<dialog id="dlg-reset" aria-labelledby="dlg-reset-h">
-  <form method="post" action="/sleeves/{{ s.name }}/reset">
-    <h2 id="dlg-reset-h">Reset {{ s.name|leg_label }}</h2>
-    <ul class="reset-plan">
-      <li>{% if held %}Closes the {{ "short" if held < 0 else "long" }} of {{ held|abs|qty }} {{ base }} on paper at market{% if demo %}, and the copy on {{ demo.label }}{% endif %}.{% else %}No position to close{% if demo %}; {{ demo.label }} is set flat too{% endif %}.{% endif %} Open orders are cancelled{% if demo %} on both{% endif %}. Closing fills are marked "reset".</li>
-      <li>Puts this run away under Previous book: since {{ s.created_at|ts }}, equity {{ x.equity|money }}, profit and loss {{ money_signed(x.pnl) }}, fees {{ x.fees|money }}, {{ x.fills }} fills. Kept and still viewable, not counted in the book. Nothing is deleted.</li>
-      <li>Starts {{ s.name|leg_label }} again at {{ s.starting_balance|money }} {{ quote }}, with profit and loss, drawdown and fees at zero{% if s.desired_state != 'running' %}, stopped as it is now{% endif %}. Its settings stay as they are.</li>
-      {% if demo %}<li>Sets {{ demo.label }} to isolated margin at {{ '%g'|format(demo.leverage) }}×, as paper, before it trades again.</li>{% endif %}
-    </ul>
-    {{ reason_picker('reset', 'r-reset') }}
-    <div class="dlg-actions"><button type="button" class="secondary" data-close>Cancel</button><button class="danger" data-needs-reason disabled>Reset strategy</button></div>
-  </form>
 </dialog>{% endif %}
 <dialog id="dlg-move" aria-labelledby="dlg-move-h">
   <form method="post" action="/sleeves/{{ s.name }}/account">

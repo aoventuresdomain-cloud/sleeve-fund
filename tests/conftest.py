@@ -75,6 +75,35 @@ def _open_risk_setup(monkeypatch, request):
         monkeypatch.setattr(LongFlatStrategy, "_safety_stop_on_restore", lambda self, book: None)
 
 
+class _EveryPair(dict):
+    """Every pair at one rate: a venue table standing in for the published tiers until they are kept (VS-1)."""
+
+    def __init__(self, table):
+        super().__init__()
+        self.table = table
+
+    def get(self, key, default=None):
+        return self.table
+
+    def __contains__(self, key):
+        return True
+
+    def __iter__(self):
+        return iter(())
+
+
+@pytest.fixture(autouse=True)
+def _vs1_interim_tables(monkeypatch, request):
+    """VS-1 (A12): a perp on a pair with no maintenance table is refused. Until the DA's published tables are kept on
+    the venue profile, every test runs the perp venue at the one 0.5% rate it ran at before, so nothing else moves; a
+    test marked no_maintenance_tables sees the venue as it is."""
+    if request.node.get_closest_marker("no_maintenance_tables"):
+        return
+    from sleeve_fund.margin import flat
+
+    monkeypatch.setattr(venue("BINANCE"), "maintenance_tiers", _EveryPair(flat(0.005)))
+
+
 # TEC-BTWAIT (HoE, Drop B): how long a dashboard backtest request waits for its job before showing the queued-job page.
 # Production waits 8 s (BACKTEST_WAIT_SECONDS); a loaded test box can take longer, and a cell expecting the finished
 # run then reads the queued page instead (Drop A round, 14 Oct). A test that means the queued page sets its own.

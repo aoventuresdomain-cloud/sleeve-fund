@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% from "_macros.html" import book_tabs %}
+{% block title %}Fills vs model · Multi-Strategy Fund{% endblock %}
+{% macro bp(x) %}{% if x is none %}n/a{% elif x|abs < 0.05 %}0.0 bp{% else %}{{ '+' if x > 0 else '−' }}{{ '%.1f'|format(x|abs) }} bp{% endif %}{% endmacro %}
+{% macro line(label, o) %}{% if o.fills %}{{ label }}: {{ bp(o.slip_bp) }} (model assumes {{ bp(o.assumed_bp) }}; gap {{ bp(o.gap_bp) }}) · n = {{ o.fills }}{% if not o.judged %}, too few to judge{% endif %}{% else %}{{ label }}: none yet{% endif %}{% endmacro %}
+{% block content %}
+<div class="page-head">
+  <h1>Portfolio</h1>
+</div>
+{{ book_tabs('fills') }}
+<p class="muted">Each paper fill against the price the Strategy decided at, or the stop or trigger level it was set to fill at. Slippage is in basis points of that price: positive is a cost. Each Strategy's lines are weighted by the value of each fill and set against what the backtest assumes for that kind of fill. A line with fewer than {{ r.min_fills }} fills says so.</p>
+
+<section class="panel" data-live="fills-by-strategy">
+  <h2>By strategy</h2>
+  {% if r.by_strategy %}
+  <table class="responsive">
+    <thead><tr><th>Strategy</th><th>Paper</th><th>Test network</th></tr></thead>
+    <tbody>{% for name, s in r.by_strategy|dictsort %}
+    <tr><td><a href="/sleeves/{{ name }}">{{ name|leg_label }}</a></td>
+      <td><div>{{ line('Decision fills', s.decision) }}</div>
+        <div>{{ line('Trigger fills', s.trigger) }}</div>
+        <div>Execution cost: {{ s.cost|money }} over {{ s.all_fills }} fill{{ 's' if s.all_fills != 1 }} (fees {{ s.fees|money }}, slippage {{ s.slip_cost|smoney }})</div></td>
+      <td class="muted">none yet</td></tr>{% endfor %}
+    </tbody>
+  </table>
+  {% else %}<p class="muted">No paper fills yet.</p>{% endif %}
+</section>
+
+{% if r.by_instrument %}<section class="panel" data-live="fills-by-instrument">
+  <h2>By instrument</h2>
+  <table class="responsive">
+    <thead><tr><th>Instrument</th><th class="num">Fills with a model price</th><th class="num">Slippage</th></tr></thead>
+    <tbody>{% for inst, a in r.by_instrument|dictsort %}<tr><td>{{ inst }}</td><td class="num">{{ a.fills }}</td><td class="num">{{ bp(a.slip_bp) }}</td></tr>{% endfor %}</tbody>
+  </table>
+</section>{% endif %}
+
+<section class="panel flush" data-live="fills">
+  <h2>Fills, newest first</h2>
+  {% if r.rows %}
+  <table class="responsive" data-hide-md="5 7">
+    <thead><tr><th>Filled</th><th>Strategy</th><th>Side</th><th class="num">Model price</th><th class="num">Fill price</th><th class="num">Slippage</th><th class="num">Fee</th><th class="num">Decision to fill</th></tr></thead>
+    <tbody>{% for f in r.rows %}
+    <tr><td>{{ f.ts|ts }}</td>
+      <td><a href="/sleeves/{{ f.sleeve }}">{{ f.sleeve|leg_label }}</a> <span class="muted">{{ f.instrument }}</span></td>
+      <td><span class="side {{ f.side|lower }}">{{ 'Buy' if f.side == 'BUY' else 'Sell' }}</span> {{ f.qty|qty }}</td>
+      <td class="num">{% if f.model_px is none %}<span class="muted">no model price</span>{% else %}{{ f.model_px|px }}{% if f.model_source == 'trigger' %}<div class="sub">trigger price</div>{% endif %}{% endif %}</td>
+      <td class="num">{{ f.fill_px|px }}</td>
+      <td class="num">{{ bp(f.slip_bp) if f.slip_bp is not none else '–' }}</td>
+      <td class="num">{{ f.fee|money }}</td>
+      <td class="num">{{ '%.1f s'|format(f.delay_s) if f.delay_s is not none else 'n/a' }}</td></tr>{% endfor %}
+    </tbody>
+  </table>
+  {% else %}<p class="muted">No paper fills yet.</p>{% endif %}
+</section>
+{% endblock %}

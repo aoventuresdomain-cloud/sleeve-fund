@@ -9,11 +9,12 @@ means registering a profile here, not changing the engine.
 from __future__ import annotations
 
 import json
+import math
 import re
 import sys
 import urllib.request
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import date, timedelta
 from decimal import Decimal
 from typing import Callable
 
@@ -21,6 +22,7 @@ import pandas as pd
 from nautilus_trader.model import Venue
 
 from sleeve_fund.instruments import FeeSchedule, perpetual, spot_pair
+from sleeve_fund.margin import Tier
 
 
 @dataclass
@@ -95,6 +97,13 @@ class VenueProfile:
     # to it, so a daily candle closes there. 00:00 UTC on every venue so far (Independent Quant Advisor, 5 Oct); the
     # history store's resample assumes it, so a venue set otherwise can't warm slower candles from the store.
     daily_anchor_minutes: int = 0
+    # VS-1 (A12; Advisor 15 Oct): pair -> the venue's published maintenance tiers (margin.Tier: notional ceiling, rate,
+    # maintenance amount), and where and when they were read. A perp on a pair with no table is refused, never
+    # liquidated at an assumed rate (markets.maintenance_for). Kept from the venue by DA-11 before G2.
+    maintenance_tiers: dict[str, tuple] = field(default_factory=dict)
+    maintenance_basis: str | None = None
+    maintenance_read_on: date | None = None  # when the tables were read: the start check notes them past 30 days
+    maintenance_limits: dict[str, float] = field(default_factory=dict)  # pair -> the venue's last published ceiling
 
     @property
     def venue(self) -> Venue:
@@ -570,6 +579,51 @@ def _binance_data_client() -> tuple:
 
 # USD-M futures take a GTD order only if it expires more than 600 s ahead (the published goodTillDate rule).
 # ORPHAN-GUARD og1 clamps a short bar's expiry past it; the testnet drill confirms the figure (HoQA, 13 Oct).
+# VS-1 tables (DA, hand-checked 15 Oct 2026, pe1-plans/vs1-tiers.md): the paper venue's published maintenance tiers for
+# linear BTCUSDT, as margin.Tier(notional ceiling, rate, deduction): maintenance = notional x rate - deduction. Tier
+# 1's blank deduction is 0; the last ceiling is unbounded (the venue refuses a position past 1.2bn anyway). Checked
+# continuous at every ceiling. Refreshed by DA-11 before G2; re-paste and re-check when the venue announces a change.
+BTCUSDT_TIERS = (
+    Tier(300_000, 0.0033, 0),
+    Tier(2_000_000, 0.005, 510),
+    Tier(2_600_000, 0.0056, 1_710),
+    Tier(3_200_000, 0.0063, 3_530),
+    Tier(3_800_000, 0.0067, 4_810),
+    Tier(4_400_000, 0.0071, 6_330),
+    Tier(5_000_000, 0.0077, 8_970),
+    Tier(5_600_000, 0.0091, 15_970),
+    Tier(8_500_000, 0.01, 21_010),
+    Tier(10_000_000, 0.013, 46_510),
+    Tier(14_000_000, 0.015, 66_510),
+    Tier(20_000_000, 0.016, 80_510),
+    Tier(28_000_000, 0.02, 160_510),
+    Tier(38_000_000, 0.025, 300_510),
+    Tier(50_000_000, 0.029, 452_510),
+    Tier(55_000_000, 0.03, 502_510),
+    Tier(60_000_000, 0.035, 777_510),
+    Tier(65_000_000, 0.036, 837_510),
+    Tier(70_000_000, 0.038, 967_510),
+    Tier(75_000_000, 0.04, 1_107_510),
+    Tier(80_000_000, 0.045, 1_482_510),
+    Tier(85_000_000, 0.05, 1_882_510),
+    Tier(90_000_000, 0.055, 2_307_510),
+    Tier(95_000_000, 0.06, 2_757_510),
+    Tier(100_000_000, 0.065, 3_232_510),
+    Tier(105_000_000, 0.07, 3_732_510),
+    Tier(110_000_000, 0.085, 5_307_510),
+    Tier(115_000_000, 0.095, 6_407_510),
+    Tier(120_000_000, 0.1, 6_982_510),
+    Tier(150_000_000, 0.12, 9_382_510),
+    Tier(200_000_000, 0.14, 12_382_510),
+    Tier(250_000_000, 0.18, 20_382_510),
+    Tier(400_000_000, 0.3, 50_382_510),
+    Tier(800_000_000, 0.42, 98_382_510),
+    Tier(math.inf, 0.6, 242_382_510),
+)
+BTCUSDT_TIERS_BASIS = ("paper venue risk-limit BTCUSDT, 15 Oct 2026, research/venue-data/"
+                       "paper-venue-risk-limit-BTCUSDT-2026-10-15.json")
+
+
 BINANCE_GTD_MIN_LEAD = timedelta(seconds=600)
 
 BINANCE = register(VenueProfile(
@@ -598,6 +652,11 @@ BINANCE = register(VenueProfile(
     # 75% of the first-tier maintenance margin rate (0.4%), Binance's rule for its cap; confirmed against fundingInfo
     # once caps are kept from the venue (DA-11).
     published_funding_caps={"BTC/USDT": 0.003},
+    # VS-1: only BTC/USDT's table is kept so far; a perp on any other pair is refused until its table is checked in.
+    maintenance_tiers={"BTC/USDT": BTCUSDT_TIERS},
+    maintenance_basis=BTCUSDT_TIERS_BASIS,
+    maintenance_read_on=date(2026, 10, 15),
+    maintenance_limits={"BTC/USDT": 1_200_000_000},  # past it the venue takes no position; nor do we
     core_pairs=("BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "SUI/USDT"),
     hub=True,
 ))

@@ -219,3 +219,32 @@ def test_m_closing_rejects_on_a_flat_row_never_open_an_episode(store):
         _order(store, "s3", "rejected", T0 + i * MIN)
     w.check(store, T0 + 3 * MIN)
     assert _kinds(store, OPEN) == []
+
+
+def test_n_a_benign_refusal_neither_counts_nor_breaks_a_streak():
+    """Advisor (A1 ruling): a reduce-only close refused with the position already flat never counts to F-RX-2; QD's
+    closing_orders marks it benign, and it is read as absent."""
+    from sleeve_fund.ops_health import exit_reject_streak
+
+    def row(status, benign=False):
+        return {"status": status, "benign": benign}
+
+    assert exit_reject_streak([row("rejected"), row("rejected", True), row("rejected", True)]) == 1
+    assert exit_reject_streak([row("rejected"), row("filled", True), row("rejected"), row("rejected")]) == 3
+
+
+def test_o_two_benign_refusals_and_one_real_reject_never_open_an_episode(store):
+    """CR (head 2): the A1 writer (SleeveRuntime.on_benign_reject) marks two refusals benign; with one real reject that
+    is one in a row, not three, so no episode opens on a row that holds. A third real one would."""
+    w = _watch()
+    rt = runtime.SleeveRuntime(store, "s1", now=lambda: T0 + 3 * MIN)
+    for i in range(2):
+        rt.on_benign_reject(_order(store, "s1", "submitted", T0 + i * MIN), "ReduceOnly Order is rejected")
+    _order(store, "s1", "rejected", T0 + 2 * MIN)
+    w.check(store, T0 + 3 * MIN)
+    assert [r["benign"] for r in store.closing_orders("s1")] == [True, True, False]
+    assert _kinds(store, OPEN) == []
+    _order(store, "s1", "rejected", T0 + 4 * MIN)
+    _order(store, "s1", "rejected", T0 + 5 * MIN)
+    w.check(store, T0 + 6 * MIN)
+    assert len(_kinds(store, OPEN)) == 1

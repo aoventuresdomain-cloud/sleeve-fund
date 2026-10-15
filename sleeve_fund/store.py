@@ -1250,6 +1250,8 @@ PAIR_REBASED = "pair_rebase"
 TWO_LEG_FENCE = "isn't built for a two-leg Strategy yet, so nothing was changed"
 # Backtest names can't collide with a strategy's: those are lower-case letters, digits and dashes.
 BACKTEST_PREFIX = "bt:"
+GATE_CHANNEL = "sleeve_gate"  # A3: Postgres NOTIFY channel; the payload is the Strategy's name (Store._push_gate)
+GATE_ALL = "*"  # A3: the payload for the fund's own pause or halt (gate_ledger.set_state): every Strategy reads its gate
 # "triggered": paper's watched stop (not an order at the venue) when it fired, its market stop-loss sent for it.
 # "unfilled_unknown" (F-RX-1, DA): the order-state check could not find the order at the venue and confirmed nothing
 # filled. Finished, never open; a late fill still lands on it, and its gate room is released as a reject's.
@@ -1627,6 +1629,13 @@ class BookResetRefused(ValueError):
     def __init__(self, code: str, text: str) -> None:
         super().__init__(text)
         self.code = code
+
+
+def _push_gate(c, sleeve: str | None) -> None:
+    """A3: on Postgres, wake the Strategy's process to read its entry gate now, as this transaction commits. Only a
+    wake-up: the process reads the gate from the journal and never acts on the payload."""
+    if sleeve and c.dialect.name == "postgresql":
+        c.execute(select(func.pg_notify(GATE_CHANNEL, sleeve)))
 
 
 def _drop_carried(c) -> bool:
@@ -2012,6 +2021,8 @@ class Store:
         with self.engine.begin() as c:  # a two-leg or multi-asset Strategy starts and stops as one (P2-8)
             c.execute(update(sleeves_t).where(sleeves_t.c.name.in_(names)).values(updated_at=utcnow(),
                                                                                   desired_state=state))
+            for n in names:
+                _push_gate(c, n)
 
     def _leg_of(self, name: str, c=None) -> str | None:
         """A two-leg Strategy's second leg row, when `name` is its first leg's (P2-8); else None. A multi-asset
@@ -2063,6 +2074,9 @@ class Store:
         if status not in STATUSES:
             raise ValueError(f"bad status {status!r}")
         self._update_sleeve(name, status=status, status_reason=reason, paused_until=paused_until)
+        if self.engine.dialect.name == "postgresql":  # A3: a halt or pause, wherever written, wakes its gate read
+            with self.engine.begin() as c:
+                _push_gate(c, name)
 
     def heartbeat(self, name: str, at: datetime | None = None) -> None:
         """at: the strategy's clock (the wall clock in paper, the engine's in a replay); now by default."""
@@ -2423,12 +2437,15 @@ class Store:
         status, the venue's or risk engine's words (message) and when it last moved (updated_at). Every one is
         listed, refused or not, so a reader counts refused closes in a row from the tail (F-RX-2)."""
         o = orders_t.c
-        q = (select(o.order_id, o.intent, o.status, o.message, o.ts, o.updated_at, o.instrument)
+        q = (select(o.order_id, o.intent, o.status, o.message, o.ts, o.updated_at, o.instrument, o.signal)
              .where(o.sleeve == sleeve, o.intent.in_(CLOSING_INTENTS)))
         if since is not None:
             q = q.where(o.ts >= since)
         with self.engine.connect() as c:
-            return _rows(c.execute(q.order_by(o.ts, o.id)))
+            rows = _rows(c.execute(q.order_by(o.ts, o.id)))
+        # A1 (Advisor): benign: refused with nothing left to close (paper.runtime.BENIGN_REJECT): never one in a row
+        return [{**{k: v for k, v in r.items() if k != "signal"},
+                 "benign": bool((r["signal"] or {}).get("benign_reject"))} for r in rows]
 
     def order_counts(self, sleeve: str | None = None) -> dict[str, int]:
         q = select(orders_t.c.status, func.count()).group_by(orders_t.c.status)
@@ -2563,6 +2580,7 @@ class Store:
         side of the book until the poll lands it (land_move); a later request replaces it. One whose create is still
         waiting takes the new account as where it joins. A move that flows nothing is made at once, as is any move on
         a book never marked."""
+        self._check_one_each(sleeve, account)
         ts = utcnow()
         joining = self.book_moves_pending().get(sleeve, {}).get("kind") == "create"
         moved, waits = [], []
@@ -2596,6 +2614,50 @@ class Store:
                 # a move made at once (no flow: back to the side it is on) replaces any that waited (DA 0024 rule 2)
                 self._end_waiting(c, sleeve, ts, f"a move to account {account} on the same side of the book was "
                                                  "made at once")
+
+    def account_holders(self, account: str) -> list[str]:
+        """A7: the Strategies (a two-leg's legs as one) whose rows are on `account` and not yet released. Advisor (b):
+        released only once put away and out of the book (its balance back to the fund by its journaled withdrawal),
+        flat, and with no order open; a saved backtest never holds one."""
+        out = set()
+        gone = self.withdrawn()
+        for r in self.accounts_links(account):
+            if is_backtest(r):
+                continue
+            if r in gone and self.lifecycle_flat(r)[1] and not self.orders(r, statuses=OPEN_ORDER_STATUSES, limit=1):
+                continue
+            out.add(self.sleeve(r).parent or r)
+        return sorted(out)
+
+    def account_kind(self, account: str) -> str | None:
+        """paper or live, or None for no such account. A read only (accounts() also makes the paper row)."""
+        with self.engine.connect() as c:
+            return c.execute(select(accounts_t.c.kind).where(accounts_t.c.name == account)).scalar()
+
+    def accounts_links(self, account: str) -> list[str]:
+        with self.engine.connect() as c:
+            return list(c.execute(select(sleeve_accounts_t.c.sleeve)
+                                  .where(sleeve_accounts_t.c.account == account)).scalars())
+
+    def _check_one_each(self, sleeve: str, account: str) -> None:
+        """A7 ON (accounts.per_strategy): a live or test-network account is one Strategy's, and a Strategy that holds
+        a position or has an order open is never moved off its account (HoQA line 5). OFF: nothing is checked."""
+        from sleeve_fund.accounts import per_strategy
+
+        if not per_strategy():
+            return
+        if self.account_of(sleeve) != account:
+            if not self.lifecycle_flat(sleeve)[1]:
+                raise ValueError(f"{sleeve} holds a position: it stays on its account until it is flat")
+            if self.orders(sleeve, statuses=OPEN_ORDER_STATUSES, limit=1):
+                raise ValueError(f"{sleeve} has an open order: it stays on its account until the order is done")
+        if self.account_kind(account) != "live":
+            return
+        me = self.sleeve(sleeve).parent or sleeve
+        others = [h for h in self.account_holders(account) if h != me]
+        if others:
+            raise ValueError(f"account {account} is {', '.join(others)}'s: one account per Strategy is on, so each "
+                             "live or test-network account trades for one Strategy only")
 
     # --- F-ASSIGN-STALE: moves waiting for the supervisor's poll -------------------------------------------------
 
@@ -4892,9 +4954,12 @@ class Store:
 
     def decide(self, actor: str, action: str, reason: str, sleeve: str | None = None,
                ts: datetime | None = None) -> None:
+        """A3 (Advisor 05:47): on Postgres, a decision on a Strategy (a Stop above all) is pushed to its process on
+        GATE_CHANNEL as it commits, so a resting entry's cancel goes out at acceptance, not at the next gate read."""
         with self.engine.begin() as c:
             c.execute(insert(decisions_t).values(ts=ts or utcnow(), actor=actor, action=action, sleeve=sleeve,
                                                  reason=reason.strip()))
+            _push_gate(c, sleeve)
 
     def decisions(self, sleeve: str | None = None, limit: int = 200, action: str | None = None,
                   since: datetime | None = None, until: datetime | None = None) -> list[dict]:

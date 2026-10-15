@@ -14,6 +14,7 @@ import heapq
 import math
 import os
 import re
+import threading
 import time
 import traceback
 from collections import deque
@@ -34,8 +35,10 @@ from sleeve_fund import bars as bar_rule
 from sleeve_fund import lifecycle, markets, open_risk, risk
 from sleeve_fund.data import bar_minutes
 from sleeve_fund import router
+from sleeve_fund import compliance_rules, ramp, strength
 from sleeve_fund.instruments import BOOK_SHARE, lot_decimals, pair_of, taker_slippage, target_fill_px
 from sleeve_fund.margin import entry_liquidation
+from sleeve_fund.portfolio.compliance import KEY as COMPLIANCE_KEY
 from sleeve_fund.paper.runtime import FILL_HANDLER_PAUSE  # noqa: F401  (T-FIX8's name, kept for its callers)
 from sleeve_fund.paper.runtime import ENTRY_CANCELLED, EXITS_ONLY, RACED_FILL, RESUMABLE, WIPED_OUT, block_codes, liquidation_reason
 from sleeve_fund.paper.runtime import WIND_STOP as WIND_STOP_INTENT
@@ -143,6 +146,10 @@ STALE_AT_START = "no trade or quote yet since this process started. It clears wh
 # does, so a block's cancel goes out within it: a resting entry fills on at most a print inside it, never past 1 s.
 GATE_WATCH_SECONDS = 0.5
 GATE_WATCH = "entry-gate-watch"
+# A3: how often the engine looks whether the journal pushed a decision (Store.decide's NOTIFY, on Postgres): a flag
+# set by the listener thread, read on the engine's own thread, so the cancel goes out within this of the Stop.
+GATE_PUSH_SECONDS = 0.025
+GATE_PUSH = "entry-gate-push"
 STALE_PRICE_RESTART_MINUTES = 15
 # Paper: how often at most the model's conditions on the forming candle are written for the Signals tab
 # (and straight after each bar). Display only: never in a backtest.
@@ -300,6 +307,10 @@ def _step_values(values: dict, qty: Decimal | None) -> dict:
     return values if qty is None else {**values, "step_qty": float(qty)}
 
 
+# G5: a Model's own sizing limits, its configured size; the rest are caps on it (sleeve_fund.strength).
+OWN_SIZE_LIMITS = ("risk per trade", "risk profile cap", "the Strategy's size share", "the step's size", "target weight")
+
+
 def _side_word(side: int) -> str:
     return "long" if side > 0 else "short" if side < 0 else "flat"
 
@@ -309,6 +320,27 @@ def exit_warmup(params: dict) -> int:
     if params.get("stop_atr"):
         return int(params.get("atr_bars") or 14) + 1
     return int(params.get("stop_swing_bars") or 0)
+
+
+def listen_gate(dsn: str, name: str, pushed: threading.Event, done: threading.Event) -> None:
+    """A3: LISTEN on the journal's GATE_CHANNEL until `done`; set `pushed` for every decision on Strategy `name`. Runs
+    on its own thread and never touches the engine. A dropped connection is retried; the gate read covers the gap."""
+    import psycopg
+
+    from sleeve_fund.store import GATE_ALL, GATE_CHANNEL
+
+    while not done.is_set():
+        try:
+            with psycopg.connect(dsn, autocommit=True) as conn:
+                conn.execute(f"LISTEN {GATE_CHANNEL}")
+                pushed.set()  # anything decided while it wasn't listening is read once
+                while not done.is_set():
+                    for note in conn.notifies(timeout=1.0):
+                        # its own name, its parent's (an asset or second leg's process), or the fund's
+                        if note.payload in (name, name.split("~")[0], GATE_ALL):
+                            pushed.set()
+        except Exception:  # noqa: BLE001 - the gate read every GATE_WATCH_SECONDS still cancels; try again shortly
+            done.wait(5)
 
 
 class LongFlatConfig(StrategyConfig):
@@ -332,6 +364,9 @@ class LongFlatConfig(StrategyConfig):
         position_cap_pct: float | None = None,
         rebalance_band: float | None = None,
         maker_wait_minutes: int | None = None,
+        resting_stops: bool = False,
+        backstop_grace_ms: int = 1000,
+        raced_fill_window_ms: int | None = None,
         max_participation: float | None = MAX_PARTICIPATION,
         volume_scale: float = 1.0,
         market: str = markets.SPOT,
@@ -340,6 +375,7 @@ class LongFlatConfig(StrategyConfig):
         keep_sub_cost_target: bool = False,
         trade_from: int | None = None,
         leg: dict | None = None,
+        signal_strength: dict | None = None,
         **kwargs: Any,
     ) -> None:
         leg_spec = leg  # `leg` is reused below for a fee and a half spread
@@ -427,6 +463,12 @@ class LongFlatConfig(StrategyConfig):
         # A leg of a two-leg Strategy (P2-8; two_legs.leg_params): it trades only through its Pair, and with no Pair it
         # opens nothing (Advisor M4), whoever built it.
         self.leg = dict(leg_spec) if leg_spec is not None else None
+        # G5, off when None: scale the configured size by the entry signal's strength (sleeve_fund.strength).
+        self.signal_strength = strength.check(signal_strength)
+        if self.signal_strength is not None and rebalance_band is not None:
+            raise ValueError(strength.NO_REBALANCE)
+        if self.signal_strength is not None and self.leg is not None:
+            raise ValueError(strength.NO_LEG)
         self.instrument_id = instrument_id
         self.bar_type = bar_type
         # Backtest only: no trade on a bar that closes before this time (ns), so a study's out-of-sample window starts
@@ -472,11 +514,25 @@ class LongFlatConfig(StrategyConfig):
         # and rebalances first rest as a post-only limit one tick inside the last price (maker fee
         # if filled); whatever is unfilled after this many minutes is cancelled and sent at market.
         self.maker_wait_minutes = maker_wait_minutes
+        # A1 (BGL-1): paper rests the stop at the venue as a reduce-only order, as a backtest does, and keeps watching
+        # it in the process as a backstop. Built OFF: the supervisor refuses it until the test-network drills pass.
+        self.resting_stops = bool(resting_stops)
+        # A1 (Advisor b): with a stop resting, the watched level waits this long for the venue's stop to fill before it
+        # closes at market itself (none past half the way to liquidation, or for a stop the venue refused).
+        if int(backstop_grace_ms) != backstop_grace_ms or not 0 <= backstop_grace_ms <= 3_000:  # Advisor: 3 s at most
+            raise ValueError("backstop_grace_ms must be a whole number of milliseconds from 0 to 3,000")
+        self.backstop_grace_ms = int(backstop_grace_ms)
+        # A3: the longest a resting entry may still fill after a Stop with no push from the journal: the gate read's
+        # period (GATE_WATCH_SECONDS when unset), to be set to the test-network's cancel-latency p99.
+        if raced_fill_window_ms is not None and (int(raced_fill_window_ms) != raced_fill_window_ms
+                                                 or not 10 <= raced_fill_window_ms <= 5_000):
+            raise ValueError("raced_fill_window_ms must be a whole number of milliseconds from 10 to 5,000")
+        self.raced_fill_window_ms = raced_fill_window_ms
         # spot: a cash account, long or flat. perp / perp-venue-fees: a perpetual on margin, with funding,
         # a liquidation price and leverage limits (sleeve_fund.markets); allow_short lets it go short.
         self.market = market
         self.allow_short = bool(allow_short)
-        self.perp = markets.terms({"market": market}, str(instrument_id.venue))
+        self.perp = markets.terms({"market": market}, str(instrument_id.venue), str(instrument_id.symbol))
         # Read by the demo mirror (sleeve_fund.mirror), not by the strategy: paper is unchanged.
         self.demo_mirror = bool(demo_mirror)
         # C8 (Drop B): keep a take-profit even when a hit would not cover the round trip's costs (the entry's check
@@ -661,6 +717,9 @@ class LongFlatStrategy(Strategy):
         self._pending_exit = None  # a sell waiting for every working order to close first
         self._sent: list = []  # client order ids of orders sent, until the venue has them (see _unsent)
         self._cancel_on_accept: set[str] = set()  # orders to cancel as soon as the venue has them
+        self._backstop_since: int | None = None  # A1: when the price first went through a resting stop's level
+        self._gate_pushed: threading.Event | None = None  # A3: set by the journal's push (_listen_gate)
+        self._gate_done = threading.Event()
         self._exec_type = None  # backtest: the shorter bars the decision bars are built from
         # Volumes of the last day's decision bars, for the participation cap on buys.
         self._volumes: deque[float] = deque(maxlen=max(1, 1440 // bar_minutes(config.bar_type)))
@@ -726,6 +785,10 @@ class LongFlatStrategy(Strategy):
         # SleeveRuntime in paper/live (journal, PM controls, risk guard); None in backtest.
         # Attach with attach_runtime() before the strategy is added to a node or engine.
         self.runtime = None
+        # A9: the minimum-size ramp's switch, read once when the Strategy starts (never mid-run), and its gate, read
+        # once a UTC day: (day, Gate).
+        self._ramp_on = ramp.enabled()
+        self._ramp_day = None
         # Paper/live on bars built from live trades: loads warm-up bars from the venue history store
         # (the venue can't serve those bars). Attach with attach_history(); None requests them from
         # the venue's candles instead.
@@ -1688,8 +1751,16 @@ class LongFlatStrategy(Strategy):
         The journal still shows it, as the resting stop_loss order it stands for (P1-U35: a position is never shown
         unwatched): one open row while a position is held with a stop, replaced when the level or size changes, and
         cancelled when the position closes (a stop that fires sends its own market stop-loss, journaled as usual). A
-        backtest's stop is a real resting order (_rest_exits)."""
+        backtest's stop is a real resting order (_rest_exits), and so is paper's with resting stops on (A1): then the
+        venue order is the journal's row, placed, resized and moved here on every tick."""
         if self._backtest or self.runtime is None:
+            return
+        if self._resting_stops():
+            # Not while a market order is working: one part filled leaves a position the next fill may close or turn,
+            # and a reduce-only stop sized to the first part is refused (or rests on nothing) once it does.
+            if (self._restore is None and self._pending_exit is None
+                    and not any(o.order_type == OrderType.MARKET for o in self._working())):
+                self._rest_exits()
             return
         want = None
         if self._entry_px is not None and self._stop_frac is not None and self._entry_qty > 1e-12:
@@ -1717,6 +1788,47 @@ class LongFlatStrategy(Strategy):
                                ts=self.runtime.now())
             store.update_order(oid, status="accepted")
             self._watched = (oid, want)
+
+    def _backstop_waits(self, price: float, side: int) -> bool:
+        """A1 (Advisor b): the price has gone through the stop's level while a stop rests at the venue for it. The
+        watched backstop waits backstop_grace_ms for that stop to fill, so one stop sends one order, then closes what is
+        left at market (a part fill included). No wait for a stop the venue hasn't accepted, refused or lost, nor once
+        the price is more than half the way from the level to the liquidation price."""
+        if not self._resting_stops():
+            return False
+        order = self._resting_exits().get("stop_loss")
+        if order is None or order.status not in (OrderStatus.ACCEPTED, OrderStatus.TRIGGERED,
+                                                 OrderStatus.PARTIALLY_FILLED):
+            return False
+        if self._margin:
+            _, cash, qty, _ = self._mark()
+            liq = self._liq_now(cash, qty) if qty else None
+            level = order.trigger_price.as_double()
+            if liq is not None and side * (level - price) > abs(level - liq) / 2:
+                return False
+        now = self.clock.timestamp_ns()
+        if self._backstop_since is None:
+            self._backstop_since = now
+        return now - self._backstop_since < self._cfg.backstop_grace_ms * 1_000_000
+
+    def _benign_reject(self, event) -> bool:
+        """A1 (Advisor): a closing order refused because there is nothing left to close (a reduce-only order on a
+        position already flat, the backstop and the resting stop crossing). Journaled as benign: never one of F-RX-2's
+        refused closes in a row, never an alert."""
+        if self._backtest or self.runtime is None or self._pos_side() != 0:
+            return False
+        order = self.cache.order(event.client_order_id)
+        intent = self.decisions.get(str(event.client_order_id), {}).get("intent")
+        if order is None or not order.is_reduce_only or intent in (None, *OPENING_INTENTS):
+            return False
+        # Flat at the venue and in the journal both: a journal still holding where the venue has nothing to reduce is
+        # drift, not benign, and counts and alerts as any refused close (HoQA F-RX-1B-WRITER).
+        rt = self.runtime
+        return abs(float(rt.store.journal_book(rt.name, rt.starting_balance)["qty"])) < 1e-12
+
+    def _resting_stops(self) -> bool:
+        """A1: paper with resting stops on (off by default, and refused by the supervisor until the drills pass)."""
+        return not self._backtest and getattr(self._cfg, "resting_stops", False)
 
     def _exits_reason(self) -> str:
         if self._exits_why:
@@ -2385,9 +2497,18 @@ class LongFlatStrategy(Strategy):
             limits["the Strategy's size share"] = Decimal(str(base * share))
         if (step := values.get("step_qty")) is not None:  # a STEPPED model's later open: Q, never more
             limits["the step's size"] = Decimal(str(step)) * bar.close.as_decimal()
+        if (strength_words := LongFlatStrategy._strength_limit(self, limits, values, base)) is False:
+            return
+        ramp_gate = LongFlatStrategy._ramp_limit(  # A9, off by default: only ever shrinks an entry or add
+            self, limits, side, lambda: self._signed_qty() if held_qty else Decimal(0), bar.close.as_decimal())
         size_by = min(limits, key=limits.get)
         budget = limits[size_by]
         qty = (budget / bar.close.as_decimal()).quantize(self._lot(), rounding=ROUND_DOWN)
+        if ramp_gate is not None and size_by == ramp.LIMIT and qty <= 0:
+            self._note("entry_held_ramp", f"Entry skipped: the position is already at its minimum size, and it "
+                       f"{ramp_gate.words}", level="info")
+            return
+        self._noted.discard("entry_held_ramp")
         if qty <= 0 or qty < self._min_qty():
             self._note("buy_skipped", f"Entry skipped: the {size_by} limit ({float(budget):,.2f}) comes to {qty}, "
                        f"below the smallest order the venue takes ({self._min_qty()})")
@@ -2395,7 +2516,18 @@ class LongFlatStrategy(Strategy):
         self._noted.discard("buy_skipped")
         signal = {**values, "close": close, "side": _side_word(side), "sized_by": size_by,
                   "budget": round(float(budget), 2), **self._fund_at_entry(base)}
+        if strength_words:
+            signal["strength"] = strength_words
+        if ramp_gate is not None and size_by == ramp.LIMIT:  # with the size it would have had, for its track
+            signal["ramp"] = ramp_gate.words
+            signal[ramp.UNRAMPED] = round(float(min(v for k, v in limits.items() if k != ramp.LIMIT)), 2)
         notional = float(qty) * close
+        if notional >= self._cfg.perp.max_notional:  # VS-1-TABLE: past the venue's last tier, fail closed
+            self._note("entry_refused_top_tier",
+                       f"Entry refused: its {notional:,.0f} notional is at or past the venue's largest published "
+                       f"maintenance tier ({self._cfg.perp.max_notional:,.0f}), so its liquidation price is unknown")
+            return
+        self._noted.discard("entry_refused_top_tier")
         # CUT-A: the simulated account posts the margin, with the fund's virtual funding back in (_mark nets it out)
         liq, distance = entry_liquidation(cash + self._funded(), float(qty), close, side, self._cfg.assumed_taker_fee,
                                           self._cfg.perp.maintenance_margin, lev)
@@ -3213,8 +3345,13 @@ class LongFlatStrategy(Strategy):
         move = price / self._entry_px - 1
         gain = side * move  # what the position made: a short gains as the price falls
         hit = ("stop_loss" if stop is not None and gain <= -stop else "take_profit" if tp and gain >= tp else None)
+        if hit != "stop_loss":
+            self._backstop_since = None
         if hit is None:
             return False
+        if hit == "stop_loss" and self._backstop_waits(price, side):
+            return False
+        self._backstop_since = None
         self.log.info(f"{hit} at {price} ({move:+.2%} from entry {self._entry_px})")
         if self.runtime is not None:
             self.runtime.store.event(self.runtime.name, "info", hit, f"exit at {price:,.4f}, {move:+.2%} from entry",
@@ -3379,10 +3516,18 @@ class LongFlatStrategy(Strategy):
             limits["risk per trade"] = Decimal(str(base * self._cfg.risk_per_trade / self._loss_at_stop()))
         if (cap := self._volume_cap(bar)) is not None:
             limits["share of the bar's volume"] = cap
+        if (strength_words := LongFlatStrategy._strength_limit(self, limits, values or {}, base)) is False:
+            return
+        ramp_gate = LongFlatStrategy._ramp_limit(self, limits, 1, self._signed_qty, bar.close.as_decimal())  # A9
         size_by = min(limits, key=limits.get)
         budget = limits[size_by]
         step = self._lot()
         qty = (budget / bar.close.as_decimal()).quantize(step, rounding=ROUND_DOWN)
+        if ramp_gate is not None and size_by == ramp.LIMIT and qty <= 0:
+            self._note("entry_held_ramp", f"Buy skipped: the position is already at its minimum size, and it "
+                       f"{ramp_gate.words}", level="info")
+            return
+        self._noted.discard("entry_held_ramp")
         min_qty = self._min_qty()
         if qty <= 0 or qty < min_qty:
             self._note("buy_skipped", f"Buy skipped: the {size_by} limit ({float(budget):,.2f}) buys {qty}, below "
@@ -3391,6 +3536,11 @@ class LongFlatStrategy(Strategy):
         self._noted.discard("buy_skipped")
         signal = {**(values or {}), "close": bar.close.as_double(), "sized_by": size_by,
                   "budget": round(float(budget), 2), **self._fund_at_entry(base)}
+        if strength_words:
+            signal["strength"] = strength_words
+        if ramp_gate is not None and size_by == ramp.LIMIT:  # with the size it would have had, for its track
+            signal["ramp"] = ramp_gate.words
+            signal[ramp.UNRAMPED] = round(float(min(v for k, v in limits.items() if k != ramp.LIMIT)), 2)
         if self._stop_frac:
             # What this position loses if the stop is hit, costs included: one R, for the trade's R multiple.
             loss = self._loss_at_stop()
@@ -3518,6 +3668,19 @@ class LongFlatStrategy(Strategy):
                            f"allowed {approved}, below the smallest order the venue takes ({self._min_qty()})")
                 if hasattr(decision, "release"):
                     decision.release("cancel")  # never sent: its room goes back to the book
+                return
+            under = self._under_min_notional(approved, intent) if paper is not None else None
+            if under is not None:
+                # F-TRIM-MIN (HoQA): what the compliance tests leave is under the venue's smallest order value, which
+                # the venue would deny on every bar; refused here in words, once until an entry is sent.
+                count("below_minimum")
+                hit = getattr(getattr(decision, "decision", decision), "limit_hit", None)  # paper: Gated.decision
+                test = hit if hit in compliance_rules.BY_KEY else COMPLIANCE_KEY.get(hit)
+                self._note(f"{what}_trimmed_below_minimum", f"{what.capitalize()} refused: "
+                           f"{compliance_rules.name(test) if test else 'its size'} leaves {approved} ({under[0]:,.2f}), under "
+                           f"the venue minimum {under[1]:,.2f}")
+                if hasattr(decision, "release"):
+                    decision.release("cancel")
                 return
             self._noted.discard(f"{what}_trimmed_below_minimum")
             trimmed = approved != qty
@@ -4036,9 +4199,9 @@ class LongFlatStrategy(Strategy):
         liq = self._liq(cash, qty)
         if liq is None or not qty or self._liq_px is None or not self._liq_funded or self._cfg.perp is None:
             return liq
-        denom = self._cfg.perp.maintenance_margin * abs(qty) - qty
-        moved = liq + self._liq_funded / denom if denom else liq
-        return moved if moved > 0 else None
+        # Solved afresh at the funded cash, never shifted at the tier it was at (VS-1, Advisor (b)(2))
+        entry = self._entry_px if self._entry_px else self._net_position()[1]  # as _liq_from_entry fixed it
+        return markets.shifted_liquidation(liq, qty, self._liq_funded, self._cfg.perp.maintenance_margin, entry=entry)
 
     def _capped_stop(self, frac: float | None) -> tuple[float | None, float | None]:
         """The stop a margin position may hold for `frac` (a share of the entry, as _stop_frac), and the liquidation
@@ -5479,6 +5642,83 @@ class LongFlatStrategy(Strategy):
             return None
         return float(st.equity)
 
+    def _strength_limit(self, limits: dict, values: dict, base: float) -> str | None | bool:
+        """G5: with the Model's signal_strength set, the signal strength limit: f(strength) x its configured size, the
+        smallest of its own sizing limits (risk per trade, the risk profile's cap, a size share or step), so the
+        configured size is the ceiling and every other limit still applies after it. Returns the journal's words, None
+        when off (limits untouched, values never read), or False when the entry is skipped: below its floor or before
+        the Model's indicators have settled (A10), journaled, or a missing, NaN or out-of-range strength (journaled as
+        an alert, never full size)."""
+        cfg = self._cfg.signal_strength
+        if cfg is None:
+            return None
+        if values.get("step_qty") is not None:  # a stepped Model's later open: Q, already scaled at its first (F-G5-6)
+            return "the step's size, its first open's signal strength already applied"
+        st = strength.factor(cfg, values)
+        if st.f is not None and LongFlatStrategy._unsettled(self):  # A10: an unsettled block gives no strength
+            st = strength.Strength(None, "entry skipped: the Model's indicators haven't settled (warm-up), so its "
+                                         "signal strength can't be read yet")
+        # Written once per change (QD F-G5-5), not every bar: once per level (an alert after an info skip is still
+        # written) until a strength passes again.
+        seen = {"info": "entry_skipped_strength:info", "error": "entry_skipped_strength:error"}
+        if st.f is None:
+            level = "error" if st.alert else "info"
+            if seen[level] not in self._noted:
+                self._noted.add(seen[level])
+                self._noted.discard("entry_skipped_strength")
+                self._note("entry_skipped_strength", st.words[0].upper() + st.words[1:], level=level)
+            return False
+        self._noted.difference_update(seen.values())
+        own = [v for k, v in limits.items() if k in OWN_SIZE_LIMITS or k.endswith("risk profile cap")]
+        configured = min(own) if own else min(limits.values())
+        limits[strength.LIMIT] = configured * Decimal(repr(st.f))
+        return strength.words(st, float(configured) / base if base else 0.0)
+
+    def _ramp_limit(self, limits: dict, side: int, held, price: Decimal) -> ramp.Gate | None:
+        """A9: while switched on (read at start) and paper inside the fund, a Strategy short of its gate adds the
+        minimum-size ramp to `limits`: one minimum order from flat, no add. held reads the signed position, only once
+        the ramp applies. Returns the gate when the ramp applies, None when it doesn't (switched off, outside the fund,
+        a backtest, or the gate passed). Only an entry or add reads it; exits never do."""
+        if not self._ramp_on or not self._in_fund():
+            return None
+        g = LongFlatStrategy._ramp_gate(self)
+        if g.passed:
+            return None
+        least = ramp.minimum_qty(self._min_qty(), self._lot(), LongFlatStrategy._min_notional(self), price)
+        limits[ramp.LIMIT] = ramp.cap(least, held(), side, price)
+        return g
+
+    def _ramp_gate(self) -> ramp.Gate:
+        """The gate, re-evaluated once a UTC day (Advisor A9 Q6); a change either way is journaled in words."""
+        day = self.runtime.now().astimezone(timezone.utc).date()
+        if self._ramp_day is not None and self._ramp_day[0] == day:
+            return self._ramp_day[1]
+        g = ramp.read_gate(self.runtime.store, self.runtime.name, self.runtime.now())
+        before = self._ramp_day[1] if self._ramp_day is not None else None
+        self._ramp_day = (day, g)
+        if before is not None and before.passed != g.passed:
+            self._noted.discard("ramp_gate")
+            self._note("ramp_gate", ("Minimum-size ramp passed: new entries size normally; it " if g.passed else
+                                     "Back on the minimum-size ramp for new entries (open positions are kept); it ")
+                       + g.words, level="info")
+        return g
+
+    def _under_min_notional(self, qty: Decimal, intent: dict) -> tuple[Decimal, Decimal] | None:
+        """(the order's value, the venue's smallest) when `qty` at the gate's expected fill price is worth less than
+        the smallest order the venue takes; None when it isn't, or the venue names no minimum value."""
+        least = LongFlatStrategy._min_notional(self)
+        price = Decimal(str(intent.get("price") or 0))
+        if least <= 0 or price <= 0:
+            return None
+        value = qty * price
+        return (value, least) if value < least else None
+
+    def _min_notional(self) -> Decimal:
+        """The venue's smallest order value in the quote currency (the instrument's min_notional), 0 when it names
+        none."""
+        m = getattr(getattr(self, "instrument", None), "min_notional", None)
+        return m.as_decimal() if m is not None else Decimal(0)
+
     def _sizing_base(self, equity: float) -> float | None:
         """BRIDGE-3: the equity an entry's size is a share of: the fund's when the fund holds the cash (fund_equity),
         else this Strategy's own, which is then the whole fund; in both without a gain not yet taken (+ min(0,
@@ -5691,14 +5931,47 @@ class LongFlatStrategy(Strategy):
         venue, so a block accepted between prints (a Stop) has its cancel sent within that time, not on the next print
         or tick: a slow feed can't widen the window in which a resting entry may still fill."""
         if GATE_WATCH not in self.clock.timer_names() and self._resting_openers():
-            self.clock.set_timer(GATE_WATCH, timedelta(seconds=GATE_WATCH_SECONDS), callback=self._on_gate_watch)
+            self.clock.set_timer(GATE_WATCH, timedelta(seconds=self._gate_watch_seconds()),
+                                 callback=self._on_gate_watch)
+            if self._listen_gate():
+                self.clock.set_timer(GATE_PUSH, timedelta(seconds=GATE_PUSH_SECONDS), callback=self._on_gate_push)
+
+    def _gate_watch_seconds(self) -> float:
+        ms = getattr(self._cfg, "raced_fill_window_ms", None)
+        return GATE_WATCH_SECONDS if ms is None else ms / 1000
+
+    def _listen_gate(self) -> bool:
+        """A3: paper on Postgres listens for the journal's pushes (Store.decide) on a thread of its own, which only sets
+        a flag; True while it does. The gate read every _gate_watch_seconds stays, for a push that is lost."""
+        if self._backtest or self.runtime is None:
+            return False
+        if abs(self.clock.timestamp_ns() - time.time_ns()) > 300 * 1_000_000_000:
+            return False  # a replay's simulated clock: no process to push to, and the gate read alone judges it
+        if self._gate_pushed is None:
+            url = getattr(getattr(self.runtime.store, "engine", None), "url", None)
+            if url is None or url.get_backend_name() != "postgresql":
+                return False
+            self._gate_pushed = threading.Event()
+            dsn = url.set(drivername="postgresql").render_as_string(hide_password=False)
+            threading.Thread(target=listen_gate, args=(dsn, self.runtime.name, self._gate_pushed, self._gate_done),
+                             name=f"gate-push-{self.runtime.name}", daemon=True).start()
+        return True
+
+    def _on_gate_push(self, event) -> None:
+        if self._gate_pushed is not None and self._gate_pushed.is_set():
+            self._gate_pushed.clear()
+            self._on_gate_watch(event)
+        elif not self._resting_openers() and GATE_PUSH in self.clock.timer_names():
+            self.clock.cancel_timer(GATE_PUSH)
 
     def _on_gate_watch(self, event) -> None:
         try:
             if self._resting_openers():
                 self._cancel_resting_entries()
-            elif GATE_WATCH in self.clock.timer_names():
-                self.clock.cancel_timer(GATE_WATCH)  # nothing opening rests: nothing to watch until one is accepted
+            else:  # nothing opening rests: nothing to watch until one is accepted
+                for name in (GATE_WATCH, GATE_PUSH):
+                    if name in self.clock.timer_names():
+                        self.clock.cancel_timer(name)
         except Exception as exc:  # never let bookkeeping kill the sleeve silently: counted, kept and journaled
             self._report("_on_gate_watch", exc)
 
@@ -5821,7 +6094,10 @@ class LongFlatStrategy(Strategy):
             self.pair.order_closed(self, coid)
 
     def on_order_rejected(self, event) -> None:
-        self._order_status(event, "rejected")
+        if self._benign_reject(event):
+            self.runtime.on_benign_reject(str(event.client_order_id), str(getattr(event, "reason", "") or ""))
+        else:
+            self._order_status(event, "rejected")
         if str(event.client_order_id) == self._restore_id:
             self._restore_id = None  # sent again on the next price
             return
@@ -6038,8 +6314,10 @@ class LongFlatStrategy(Strategy):
                     self._stop_frac, self._tp_frac, self._stop_basis = plan
             self._gated_fill(coid, qty, px)
         self._sync_watched_stop()  # an add or a partial close resizes the journal's stop in the same step (QA)
-        if self._backtest:
-            if opening and self._pending_exit is None:
+        rested = self._resting_stops() and getattr(self.cache.order(event.client_order_id), "order_type",
+                                                   None) == OrderType.STOP_MARKET  # A1: paper's resting stop filled
+        if self._backtest or rested:
+            if opening and self._pending_exit is None and self._backtest:
                 # On every entry fill, not only the last: a post-only entry can fill in slices through its
                 # maker wait, and paper guards each slice from its first trade (review round 9, M9-4).
                 self._rest_exits()
@@ -6190,7 +6468,8 @@ class LongFlatStrategy(Strategy):
             level = self._entry_px * (1 - side * stop)
             orders.append((StopMarketOrder(
                 self.trader_id, self.strategy_id, cfg.instrument_id, self.order_factory.generate_client_order_id(),
-                exit_side, quantity, Price(level, self.instrument.price_precision), TriggerType.DEFAULT,
+                exit_side, quantity, Price(level, self.instrument.price_precision),
+                TriggerType.LAST_PRICE if self._resting_stops() else TriggerType.DEFAULT,  # A1: as the watched stop
                 TimeInForce.GTC, self._margin, False, UUID4(), now), "stop_loss", "STOP",
                 f"Stop-loss: resting {exit_word} at {level:,.6g}, {_from_entry(stop, side).replace(' the entry', '')} "
                 f"the {self._entry_px:,.6g} entry"
@@ -6400,7 +6679,7 @@ class LongFlatStrategy(Strategy):
 
     def _resize_if_due(self) -> None:
         """Backtests: an entry slice filled while an exit couldn't be resized; size it to the position now."""
-        if self._resize_due and self._backtest and self._pending_exit is None:
+        if self._resize_due and (self._backtest or self._resting_stops()) and self._pending_exit is None:
             self._resize_due = False
             self._rest_exits()
 
@@ -6420,6 +6699,8 @@ class LongFlatStrategy(Strategy):
             self.log.warning(f"no final mark on stop: {e}")
 
     def on_stop(self) -> None:
+        if (done := getattr(self, "_gate_done", None)) is not None:  # A3: stop the gate listener thread
+            done.set()
         self._drop_kept()
         for coid in list(self._maker):
             self._cancel_alert(coid)

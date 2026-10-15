@@ -32,7 +32,8 @@ def test_isolated_liquidation_is_on_the_notional_over_the_leverage_not_the_whole
     liq = markets.isolated_liquidation(cash, qty, entry, 2, 0.005)
     assert liq == pytest.approx(entry * 1.5 / 1.005) and liq == pytest.approx(149_253.73, abs=0.01)
     assert markets.liquidation_price(cash, qty, 0.005) > 2.9 * entry  # the old, whole-equity answer
-    assert markets.isolated_liquidation(balance - 0.1 * entry, 0.1, entry, 2, 0.005) == pytest.approx(entry * 0.5 / 0.995)
+    # A long's is the nearer of the two formulas, the one on its entry value (VS-1-TABLE): entry x (1 - 1/2 + 0.5%)
+    assert markets.isolated_liquidation(balance - 0.1 * entry, 0.1, entry, 2, 0.005) == pytest.approx(entry * 0.505)
     assert markets.isolated_liquidation(balance - 0.1 * entry, 0.1, entry, 1, 0.005) is None  # paid for in full
     # Never more margin than the balance: a 2x position worth 3x the balance has only the balance behind it.
     assert markets.isolated_margin(-0.6, entry, 2, balance) == balance
