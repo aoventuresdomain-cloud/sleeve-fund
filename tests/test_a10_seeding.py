@@ -334,3 +334,28 @@ def test_a_slower_pair_is_fed_only_on_its_own_closed_candles():
     assert r.pair.fed == fed
     s._feed_seeds(slow, (1, 1, 1, 1, 1, 160 * MIN))
     assert r.pair.fed == fed + 1
+
+
+def test_a_forced_restart_at_several_points_matches_one_continuous_run_on_every_signal():
+    """Done when 4: restarted from the store at several points, the warm-up's seeds agree and the model decides
+    exactly what one continuous run decides on every later candle (its leg put back, as the journal gives it)."""
+    candles = _walk(4_000, seed=11, vol=0.002)
+    whole, _, all_bars, _ = _rsi_bands(candles)
+    signals = []
+    for b in all_bars:
+        whole._accept(b)
+        signals.append((whole.want_side(b), round(whole.rsi.value, 6)))
+    for cut in (1_200, 2_000, 2_750, 3_500):
+        cont, _, bars, _ = _rsi_bands(candles)
+        for b in bars[:cut]:
+            cont._accept(b)
+            cont.want_side(b)
+        s, events, _, _ = _rsi_bands(candles[:cut])  # the store, at the restart, ends at the cut
+        s._warm_from_history()
+        assert s._seed_hold is None, events
+        s._side = cont._side  # the journal's leg (resume_leg)
+        for k in range(cut, len(all_bars)):
+            assert s._accept(all_bars[k])
+            assert s.want_side(all_bars[k]) == signals[k][0], (cut, k)
+            assert abs(s.rsi.value - signals[k][1]) <= 0.1, (cut, k)  # within the tolerance the check held it to
+    assert {sig for sig, _ in signals} >= {-1, 0, 1}  # long, short and flat all occur
