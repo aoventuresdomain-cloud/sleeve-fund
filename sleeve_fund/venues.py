@@ -104,6 +104,10 @@ class VenueProfile:
     maintenance_basis: str | None = None
     maintenance_read_on: date | None = None  # when the tables were read: the start check notes them past 30 days
     maintenance_limits: dict[str, float] = field(default_factory=dict)  # pair -> the venue's last published ceiling
+    # FEE-LIVE: the published range a fetched fee rate must fall in ({"maker": (lowest, VIP 0), "taker": ...}) and
+    # where it was read; a profile without one has no fetched rates (venue_terms refuses to read them)
+    fee_bounds: dict[str, tuple] | None = None
+    fee_bounds_basis: str = ""
 
     @property
     def venue(self) -> Venue:
@@ -629,9 +633,15 @@ BINANCE_GTD_MIN_LEAD = timedelta(seconds=600)
 BINANCE = register(VenueProfile(
     name="BINANCE",
     label="Binance USD-M perpetuals",
-    # The published base tier (VIP 0) for USD-M futures, without the BNB discount: what a new account pays.
-    fees=FeeSchedule(maker=Decimal("0.0002"), taker=Decimal("0.0005")),
-    fee_basis="VIP 0, published schedule, 5 Oct 2026",
+    # FEE-LIVE: the paper venue's published perp VIP 0 (the PM's pasted schedule, 15 Oct 2026; research/venue-data),
+    # what a new account pays, what research charges at least, and what a demo account with no fee endpoint is
+    # charged on paper. Running strategies are charged the account's own rate per instrument (venue_terms).
+    fees=FeeSchedule(maker=Decimal("0.0002"), taker=Decimal("0.00055")),
+    fee_basis="VIP 0, published schedule, 15 Oct 2026",
+    # A fetched rate outside [the lowest published (Supreme VIP), VIP 0] is missing, never a wider range (Advisor (c)).
+    fee_bounds={"maker": (Decimal("0"), Decimal("0.0002")), "taker": (Decimal("0.0003"), Decimal("0.00055"))},
+    fee_bounds_basis="perp maker and taker, Supreme VIP to VIP 0, the PM's pasted schedule of 15 Oct 2026 "
+                     "(research/venue-data/paper-venue-fee-schedule-2026-10-15.md), DA hand-check",
     daily_history=binance_daily,
     ohlc_history=binance_ohlc,
     trade_history=binance_trades,

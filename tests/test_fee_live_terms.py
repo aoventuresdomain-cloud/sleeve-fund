@@ -20,6 +20,7 @@ from sleeve_fund import venue_terms
 from sleeve_fund.store import PUBLISHED_FEES, Store, make_engine, margin_tiers_of, metadata
 from sleeve_fund.venues import venue
 
+pytestmark = pytest.mark.no_maintenance_tables  # the venue's own BTC/USDT table, not the tests' flat stand-in
 DATA = Path(__file__).parent / "data" / "fee_live"
 T = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
 PAPER = venue("BINANCE")  # the engine's paper perp venue profile
@@ -51,7 +52,7 @@ def store(tmp_path):
     metadata.drop_all(eng)
     s = Store(engine=eng)
     s.create_account("paper-main", "paper")
-    s.create_account("live-main", "live")
+    s.create_account("live-main", "live", venue="BINANCE")
     yield s
     metadata.drop_all(eng)
 
