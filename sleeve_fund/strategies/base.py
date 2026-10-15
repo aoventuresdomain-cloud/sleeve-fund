@@ -5126,8 +5126,9 @@ class LongFlatStrategy(Strategy):
 
     def _in_fund(self) -> bool:
         """Paper inside the fund (_fund_held), where the fund holds the cash and the Strategy's own equity starts at 0.
-        A research run handed the fund's figure keeps its own wording (F-FC-4 is paper's halt)."""
-        return LongFlatStrategy._fund_held(self)
+        A research run handed the fund's figure keeps its own wording (F-FC-4 is paper's halt). A stand-in without the
+        paper gate (a unit's namespace) is outside it."""
+        return hasattr(self, "_paper_gated") and LongFlatStrategy._fund_held(self)
 
     def _fund_held(self) -> bool:
         """Paper inside the fund (the portfolio gate on, and in the fund's book): the fund holds the cash, so the
