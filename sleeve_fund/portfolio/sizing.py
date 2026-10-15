@@ -41,7 +41,7 @@ from dataclasses import dataclass, field
 from decimal import ROUND_DOWN, ROUND_UP, Decimal
 from types import MappingProxyType
 
-from sleeve_fund.margin import entry_liquidation
+from sleeve_fund.margin import Maintenance, entry_liquidation, tiers
 from sleeve_fund.money import money, scale
 
 ATR_STOP_MULTIPLE = 2.5  # the fallback stop, in Wilder ATR(14)s, when a definition declares none
@@ -82,7 +82,7 @@ class SizingInputs:
     position_cap_pct: float  # profile cap, on margin (perp) or notional (spot)
     leverage: float = 1.0
     perp: bool = False
-    maintenance_margin: float = 0.0
+    maintenance_margin: Maintenance = 0.0  # one rate, or the venue's tiers for the instrument (VS-1)
     stop_frac: float | None = None  # the definition's stop; None means the fallback stop (2.5 x Wilder ATR)
     atr: Decimal | None = None
     stop_slippage: float | None = None  # None: max(half spread, 0.05%), the D13 rule
@@ -164,8 +164,10 @@ def _validate(i: SizingInputs) -> None:
         raise ValueError(f"the fraction of full size is between 0 and 1, got {i.fraction}")
     if i.price <= 0 or i.lot <= 0 or i.min_qty < 0:
         raise ValueError(f"price and lot must be above 0 and min_qty not below it, got {i.price}, {i.lot}, {i.min_qty}")
-    for name in ("leg_cost", "half_spread", "risk_per_trade", "position_cap_pct", "maintenance_margin", "risk_long",
-                 "risk_short"):
+    if not isinstance(i.maintenance_margin, int | float):
+        tiers(i.maintenance_margin)  # a venue's table: checked as the engine checks it (VS-1)
+    for name in ("leg_cost", "half_spread", "risk_per_trade", "position_cap_pct", "risk_long", "risk_short") + (
+            ("maintenance_margin",) if isinstance(i.maintenance_margin, int | float) else ()):
         if getattr(i, name) is None:
             continue
         if getattr(i, name) < 0:
@@ -187,10 +189,14 @@ def liquidation_distance(i: SizingInputs) -> float:
     engine's own margin.entry_liquidation (isolated margin at the leverage, the venue's maintenance margin, measured
     from the entry with the fee paid), not a copy of it. On isolated margin the distance doesn't depend on the size
     while the margin and fee fit the balance, so it is measured on half the equity's notional, which always fits.
-    inf when nothing liquidates it (a long at 1x or less is fully paid for)."""
+    inf when nothing liquidates it (a long at 1x or less is fully paid for).
+
+    On a venue's tiers (VS-1) the distance shrinks as the notional reaches a higher tier, so it is measured at the
+    most this equity can put on at the leverage (all of it as margin, the fee aside): never further than any size's."""
     equity, price = float(i.allocated_equity), float(i.price)
-    _, distance = entry_liquidation(equity, equity / 2 / price, price, i.side, float(i.leg_cost),
-                                    i.maintenance_margin, i.leverage)
+    flat_rate = isinstance(i.maintenance_margin, int | float)
+    qty = equity / 2 / price if flat_rate else equity * i.leverage / (1 + i.leverage * float(i.leg_cost)) / price
+    _, distance = entry_liquidation(equity, qty, price, i.side, float(i.leg_cost), i.maintenance_margin, i.leverage)
     return distance
 
 

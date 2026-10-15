@@ -22,6 +22,10 @@ last=$(ls -1t "$DIR"/*.dump "$DIR"/predeploy-*.pgdump 2>/dev/null | head -n 1 ||
 size=$(if [ -n "$last" ]; then stat -c %s "$last"; else echo 0; fi)
 free=$(df -PB1 "$DIR" | awk 'NR == 2 { print $4 }')
 [[ "$free" =~ ^[0-9]+$ ]] && [ "$free" -ge $((2 * size)) ] || { echo "pre-deploy dump: FAIL, not enough disk"; exit 1; }
+# Each tool's own words can name a host or a row: never in the public log, but kept for the operator beside the dumps,
+# private (umask 077) and started afresh each run (CR F-PDD-3), as backup.sh keeps last_error.txt.
+ERR="$DIR/predeploy-last.err"
+: > "$ERR"
 # The journal's own rows (backtests excluded: the dashboard may prune those meanwhile), counted before and after the
 # dump: the running code only adds them, so the copy must hold at least the first count and at most the second.
 COUNT="select (select version_num from alembic_version) || ' ' ||
@@ -30,16 +34,16 @@ COUNT="select (select version_num from alembic_version) || ' ' ||
   (select count(*) from events where sleeve is null or sleeve not like 'bt:%') || ' ' ||
   (select count(*) from fund_flows) || ' ' || (select count(*) from book_moves) || ' ' || (select count(*) from decisions)"
 NAMES="migration orders fills events fund_flows book_moves decisions"
-# Each tool's own words can name a host or a row: they go nowhere, and a failure says which step (QT3 N2).
-before=$(psql -d "$DB" -At -c "$COUNT" 2>/dev/null) || { rc=$?; echo "pre-deploy dump: FAIL, couldn't read the journal (exit $rc)"; exit 1; }
-pg_dump -d "$DB" -Fc -f "$f.part" 2>/dev/null || { rc=$?; echo "pre-deploy dump: FAIL, the dump didn't complete (exit $rc)"; exit 1; }
-after=$(psql -d "$DB" -At -c "$COUNT" 2>/dev/null) || { rc=$?; echo "pre-deploy dump: FAIL, couldn't read the journal (exit $rc)"; exit 1; }
+# A failure says which step and the tool's exit code (QT3 N2, HoE).
+before=$(psql -d "$DB" -At -c "$COUNT" 2>>"$ERR") || { rc=$?; echo "pre-deploy dump: FAIL, couldn't read the journal (exit $rc), details beside the dumps"; exit 1; }
+pg_dump -d "$DB" -Fc -f "$f.part" 2>>"$ERR" || { rc=$?; echo "pre-deploy dump: FAIL, the dump didn't complete (exit $rc), details beside the dumps"; exit 1; }
+after=$(psql -d "$DB" -At -c "$COUNT" 2>>"$ERR") || { rc=$?; echo "pre-deploy dump: FAIL, couldn't read the journal (exit $rc), details beside the dumps"; exit 1; }
 dropdb --if-exists "$CHECK" >/dev/null 2>&1 || true
-createdb "$CHECK" 2>/dev/null || { rc=$?; echo "pre-deploy dump: FAIL, couldn't make the scratch database (exit $rc)"; exit 1; }
-pg_restore --no-owner --no-privileges --exit-on-error -d "$CHECK" "$f.part" 2>/dev/null \
-  || { rc=$?; echo "pre-deploy dump: FAIL, it didn't restore (exit $rc)"; exit 1; }
-copy=$(psql -d "$CHECK" -At -c "$COUNT" 2>/dev/null) || { rc=$?; echo "pre-deploy dump: FAIL, couldn't read the copy (exit $rc)"; exit 1; }
-dropdb "$CHECK"
+createdb "$CHECK" 2>>"$ERR" || { rc=$?; echo "pre-deploy dump: FAIL, couldn't make the scratch database (exit $rc), details beside the dumps"; exit 1; }
+pg_restore --no-owner --no-privileges --exit-on-error -d "$CHECK" "$f.part" 2>>"$ERR" \
+  || { rc=$?; echo "pre-deploy dump: FAIL, it didn't restore (exit $rc), details beside the dumps"; exit 1; }
+copy=$(psql -d "$CHECK" -At -c "$COUNT" 2>>"$ERR") || { rc=$?; echo "pre-deploy dump: FAIL, couldn't read the copy (exit $rc), details beside the dumps"; exit 1; }
+dropdb "$CHECK" >/dev/null 2>&1 || true  # the exit trap drops it again if this one failed (CR nit)
 read -r -a b <<< "$before"; read -r -a a <<< "$after"; read -r -a c <<< "$copy"; read -r -a n <<< "$NAMES"
 [ "${c[0]}" = "${b[0]}" ] && [ "${c[0]}" = "${a[0]}" ] \
   || { echo "pre-deploy dump: FAIL, the copy is at another migration"; exit 1; }

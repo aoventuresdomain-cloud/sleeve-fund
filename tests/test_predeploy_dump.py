@@ -96,16 +96,17 @@ def test_a_real_journal_is_dumped_and_restores_whole_and_only_three_are_kept(tmp
 # --- with stand-in Postgres tools ------------------------------------------------------------------------------------
 
 def _tools(bin_dir: Path, log: Path, restore_ok: bool = True, copy: str = "0028 5 4 9 1 2 3",
-           dump_ok: bool = True, read_ok: bool = True) -> None:
+           dump_ok: bool = True, read_ok: bool = True, make_ok: bool = True, copy_ok: bool = True) -> None:
     bin_dir.mkdir(exist_ok=True)
     stubs = {
         "pg_dump": ('while [ $# -gt 0 ]; do [ "$1" = -f ] && { echo dump > "$2"; }; shift; done' if dump_ok
                     else "echo 'pg_dump: error: secret-host' >&2; exit 1"),
-        "createdb": "exit 0",
+        "createdb": "exit 0" if make_ok else "echo 'createdb: error: secret-host' >&2; exit 3",
         "dropdb": "exit 0",
         "pg_restore": "exit 0" if restore_ok else "echo 'pg_restore: error: secret-host row' >&2; exit 1",
         # the live journal answers the same before and after; the scratch copy answers $copy
-        "psql": (f'case "$*" in *predeploy_check*) echo "{copy}";; *) echo "0028 5 4 9 1 2 3";; esac' if read_ok
+        "psql": (f'case "$*" in *predeploy_check*) {f"echo {copy!r}" if copy_ok else "exit 4"};; '
+                 '*) echo "0028 5 4 9 1 2 3";; esac' if read_ok
                  else "echo 'psql: error: secret-host' >&2; exit 2"),
     }
     for name, body in stubs.items():
@@ -128,9 +129,10 @@ def _run(tmp_path: Path, **kw) -> tuple[subprocess.CompletedProcess, list[str]]:
 def test_a_copy_that_doesnt_restore_fails_and_drops_the_scratch_database(tmp_path):
     done, calls = _run(tmp_path, restore_ok=False)
     assert done.returncode == 1 and "pre-deploy dump: FAIL, it didn't restore (exit 1)" in done.stdout
+    assert "secret-host" in (tmp_path / "b" / "predeploy-last.err").read_text()
     assert "secret-host" not in done.stdout + done.stderr
     assert calls[-1].startswith("dropdb") and "predeploy_check" in calls[-1]
-    assert not list((tmp_path / "b").iterdir())  # CR F-PDD-1: an unproved copy never stays under a good name
+    assert not list((tmp_path / "b").glob("*.pgdump*"))  # CR F-PDD-1: an unproved copy never stays under a good name
 
 
 @pytest.mark.parametrize("copy, words", [("0028 5 3 9 1 2 3", "fills doesn't match the journal"),
@@ -141,12 +143,14 @@ def test_a_copy_that_doesnt_restore_fails_and_drops_the_scratch_database(tmp_pat
 def test_a_copy_unlike_the_journal_fails_and_leaves_no_copy(tmp_path, copy, words):
     done, _ = _run(tmp_path, copy=copy)
     assert done.returncode == 1 and done.stdout.startswith("pre-deploy dump: FAIL") and words in done.stdout, done.stdout
-    assert not list((tmp_path / "b").iterdir())
+    assert not list((tmp_path / "b").glob("*.pgdump*"))
 
 
-@pytest.mark.parametrize("check", ["postgres", "sleeve_fund", "restore_check", "predeploy"])
+@pytest.mark.parametrize("check, journal", [("postgres", "sleeve_fund"), ("sleeve_fund", "sleeve_fund"),
+                                            ("restore_check", "sleeve_fund"), ("predeploy", "sleeve_fund"),
+                                            ("predeploy_x", "predeploy_x")])  # CR nit: never the journal itself
 @needs_bash
-def test_the_scratch_database_is_never_one_it_could_harm(tmp_path, check):
+def test_the_scratch_database_is_never_one_it_could_harm(tmp_path, check, journal):
     """It drops its scratch database on every exit: that name can only be its own (predeploy_*), never the journal's,
     the server's maintenance database or the nightly check's."""
     log = tmp_path / "calls.log"
@@ -154,7 +158,7 @@ def test_the_scratch_database_is_never_one_it_could_harm(tmp_path, check):
     _tools(tmp_path / "bin", log)
     (tmp_path / "b").mkdir()
     env = {**os.environ, "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}", "BACKUP_DIR": str(tmp_path / "b"),
-           "PREDEPLOY_CHECK_DB": check, "BACKUP_DB": "sleeve_fund"}
+           "PREDEPLOY_CHECK_DB": check, "BACKUP_DB": journal}
     done = subprocess.run(["bash", str(SCRIPT)], env=env, capture_output=True, text=True, timeout=30, check=False)
     assert done.returncode == 1 and done.stdout.strip() == "pre-deploy dump: FAIL, not a scratch database name"
     assert log.read_text() == ""  # no tool ran, nothing dropped
@@ -182,14 +186,30 @@ echo "/dev/x 99999999999 1 {free} 1% /"
 
 
 @pytest.mark.parametrize("kw, words", [({"dump_ok": False}, "the dump didn't complete (exit 1)"),
-                                       ({"read_ok": False}, "couldn't read the journal (exit 2)")])  # HoE: the code
+                                       ({"read_ok": False}, "couldn't read the journal (exit 2)"),
+                                       ({"make_ok": False}, "couldn't make the scratch database (exit 3)"),
+                                       ({"copy_ok": False}, "couldn't read the copy (exit 4)")])  # HoE; CR pins
 @needs_bash
 def test_a_tool_that_fails_says_so_and_leaves_nothing(tmp_path, kw, words):
     """QT3 N2: a failed pg_dump (or psql) once exited through set -e with no line in the deploy log."""
     done, _ = _run(tmp_path, **kw)
-    assert done.returncode == 1 and done.stdout.strip() == f"pre-deploy dump: FAIL, {words}"
+    assert done.returncode == 1 and done.stdout.strip() == f"pre-deploy dump: FAIL, {words}, details beside the dumps"
     assert "secret-host" not in done.stdout + done.stderr
-    assert not list((tmp_path / "b").iterdir())
+    assert [p.name for p in (tmp_path / "b").iterdir()] == ["predeploy-last.err"]
+    # CR F-PDD-3: the tool's own words are kept for the operator, beside the dumps and private, never in the log
+    err = tmp_path / "b" / "predeploy-last.err"
+    assert err.stat().st_mode & 0o077 == 0
+    assert ("secret-host" in err.read_text()) == (kw != {"copy_ok": False})  # that stand-in fails silently
+
+
+@needs_bash
+def test_the_error_file_starts_afresh_each_run(tmp_path):
+    """CR: an older run's words never sit above today's."""
+    (tmp_path / "b").mkdir()
+    (tmp_path / "b" / "predeploy-last.err").write_text("yesterday's words\n")
+    done, _ = _run(tmp_path, dump_ok=False)
+    assert done.returncode == 1
+    assert "yesterday" not in (tmp_path / "b" / "predeploy-last.err").read_text()
 
 
 @needs_bash
@@ -198,7 +218,7 @@ def test_a_whole_copy_passes_and_is_never_named_like_a_nightly_dump(tmp_path):
     assert done.returncode == 0, done.stdout + done.stderr
     assert done.stdout.strip() == ("pre-deploy dump: PASS, restored at migration 0028, orders 5, fills 4, events 9, "
                                    "fund_flows 1, book_moves 2, decisions 3")
-    (dump,) = (tmp_path / "b").glob("predeploy-*")
+    (dump,) = (tmp_path / "b").glob("predeploy-*.pgdump")
     assert re.fullmatch(r"predeploy-\d{8}-\d{6}\.pgdump", dump.name)
     assert dump.stat().st_mode & 0o077 == 0  # QT3 N1: docker exec runs with umask 0000; the copy is the owner's only
     assert any(c.startswith("pg_restore") and "--exit-on-error" in c for c in calls)
@@ -208,8 +228,80 @@ def test_a_whole_copy_passes_and_is_never_named_like_a_nightly_dump(tmp_path):
 
 
 def test_the_deploy_dumps_before_the_new_code_starts():
-    lines = [ln.strip() for ln in (ROOT / "deploy" / "remote_up.sh").read_text().splitlines()]
-    dump = next(i for i, ln in enumerate(lines) if "deploy/predeploy_dump.sh" in ln)
-    assert lines[dump] == "docker compose exec -T backup bash -s < deploy/predeploy_dump.sh"
-    assert dump < lines.index("docker compose up -d --build --remove-orphans")
+    lines = [ln.strip() for ln in (ROOT / "deploy" / "predeploy.sh").read_text().splitlines()]
+    assert "docker compose exec -T backup bash -s < deploy/predeploy_dump.sh" in lines
     assert "set -euo pipefail" in lines  # a failed dump stops the deploy
+    assert "set -euo pipefail" in (ROOT / "deploy" / "remote_up.sh").read_text()
+
+
+# --- the host side (HoQA F-PDD-1): skip only on a true first deploy -----------------------------------------------------
+
+HOST = ROOT / "deploy" / "predeploy.sh"
+
+
+def _host(tmp_path: Path, volume: bool, running: bool, ready: bool = True) -> tuple[subprocess.CompletedProcess, list]:
+    """deploy/predeploy.sh as remote_up.sh runs it, with a stand-in docker: the journal's volume there or not, its
+    containers running or stopped, the database answering or not."""
+    log = tmp_path / "docker.log"
+    log.touch()
+    (tmp_path / "bin").mkdir(exist_ok=True)
+    (tmp_path / "deploy").mkdir(exist_ok=True)
+    (tmp_path / "deploy" / "predeploy_dump.sh").write_text("echo 'pre-deploy dump: PASS, stand-in'\n")
+    (tmp_path / "bin" / "docker").write_text(f"""#!/usr/bin/env bash
+echo "$*" >> {log}
+case "$*" in
+  "volume ls"*) {"echo sleeve-fund_pgdata" if volume else "true"};;
+  "compose start"*) {"exit 0" if running or volume else "exit 1"};;
+  *pg_isready*) {"exit 0" if ready else "exit 2"};;
+  "compose exec -T backup bash -s") cat;;
+esac
+""")
+    (tmp_path / "bin" / "docker").chmod(0o755)
+    (tmp_path / "bin" / "sleep").write_text("#!/usr/bin/env bash\nexit 0\n")
+    (tmp_path / "bin" / "sleep").chmod(0o755)
+    env = {**os.environ, "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}"}
+    done = subprocess.run(["bash", str(HOST)], cwd=tmp_path, env=env, capture_output=True, text=True, timeout=30,
+                          check=False)
+    return done, log.read_text().splitlines()
+
+
+@needs_bash
+def test_a_first_deploy_with_no_journal_volume_skips_the_dump(tmp_path):
+    done, calls = _host(tmp_path, volume=False, running=False)
+    assert done.returncode == 0 and done.stdout.strip() == "pre-deploy dump: SKIP, no journal yet (first deploy)"
+    assert not any(c.startswith(("compose start", "compose exec")) for c in calls)
+
+
+@needs_bash
+@pytest.mark.parametrize("running", [True, False])
+def test_a_journal_volume_means_a_dump_even_with_the_database_stopped(tmp_path, running):
+    """HoQA F-PDD-1: a stopped db once skipped the dump and the deploy went on with no proved copy. Now the journal's
+    containers are started as they are (never recreated: the new config must not start before the dump), then dumped."""
+    done, calls = _host(tmp_path, volume=True, running=running)
+    assert done.returncode == 0 and "pre-deploy dump: PASS, stand-in" in done.stdout, done.stdout
+    start = calls.index("compose start db backup")
+    assert start < calls.index("compose exec -T backup bash -s")
+    assert not any(c.startswith(("compose up", "compose create", "compose restart")) for c in calls)
+
+
+@needs_bash
+def test_docker_not_answering_is_never_read_as_a_first_deploy(tmp_path):
+    _host(tmp_path, volume=True, running=True)
+    (tmp_path / "bin" / "docker").write_text("#!/usr/bin/env bash\nexit 1\n")
+    env = {**os.environ, "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}"}
+    done = subprocess.run(["bash", str(HOST)], cwd=tmp_path, env=env, capture_output=True, text=True, timeout=30,
+                          check=False)
+    assert done.returncode != 0 and "SKIP" not in done.stdout
+
+
+@needs_bash
+def test_a_database_that_never_answers_stops_the_deploy(tmp_path):
+    done, calls = _host(tmp_path, volume=True, running=True, ready=False)
+    assert done.returncode == 1 and "pre-deploy dump: FAIL, the journal's database didn't answer" in done.stdout
+    assert "compose exec -T backup bash -s" not in calls
+
+
+def test_the_deploy_runs_the_host_side_before_the_new_code_starts():
+    lines = [ln.strip() for ln in (ROOT / "deploy" / "remote_up.sh").read_text().splitlines()]
+    assert lines.index("bash deploy/predeploy.sh") < lines.index("docker compose up -d --build --remove-orphans")
+    assert not any("compose ps -q db" in ln for ln in lines)  # never keyed on "db running" again

@@ -119,7 +119,7 @@ def test_an_archive_from_before_the_withdrawal_is_said_to_still_count(held, clie
 
     held.set_desired_state("b", "stopped")
     _archived_before(held, "b")
-    assert "none of the fund's book is theirs any more, except 1 still in it<" in _get(client, "/")  # TEC-FE-WN2
+    assert "none of the fund's book is theirs any more, apart from 1 still in it<" in _get(client, "/")  # TEC-FE-WN2
 
 
 def test_a_retire_shows_the_book_after_it(held, client):
@@ -170,7 +170,7 @@ def test_a_strategy_not_flat_takes_nothing_out_and_shows_as_waiting_to_go_flat(h
     held.archive("b")
     assert held.withdrawal_pending() == ["b"] and "b" not in held.withdrawn()
     home = _get(client, "/")
-    assert "waiting to go flat: it holds" in home and "except 1 still in it (1 waiting to go flat)" in home
+    assert "waiting to go flat: it holds" in home and "apart from 1 still in it (1 waiting to go flat)" in home
     page = _get(client, "/sleeves/b")
     assert "Archived, waiting to go flat: it holds" in page and "It stays in the fund's book in full until then." in page
 
@@ -195,7 +195,7 @@ def test_a_strategy_with_nothing_to_withdraw_says_so_and_stays_in_the_book(store
     assert store.nothing_withdrawn() == {"b": D(-4)}
     client = TestClient(dash.create_app(store))
     home = _get(client, "/")
-    assert "nothing to withdraw (equity -4.00)" in home and "except 1 still in it<" in home
+    assert "nothing to withdraw (equity -4.00)" in home and "apart from 1 still in it<" in home  # TEC-FE-WN2
     assert "Archived, nothing to withdraw (equity -4.00). It stays in the fund's book at that figure." in _get(
         client, "/sleeves/b")
 

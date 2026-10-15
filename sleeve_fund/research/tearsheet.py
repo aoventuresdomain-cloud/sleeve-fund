@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 
 from sleeve_fund import funding
-from sleeve_fund.research import regime_split
+from sleeve_fund.research import mintrl, regime_split
 from sleeve_fund.research.guardrails import CANDIDATE_CHECK, G1_RULES, MIN_OOS_TRADES, nearby_scored
 from sleeve_fund.research.ledger import IdeaLedger
 from sleeve_fund.research.metrics import (
@@ -232,6 +232,7 @@ def g1_checks(r: StudyResult, ledger: IdeaLedger, register=None,
           if getattr(getattr(r, "spec", None), "family", None) == "benchmark" else []),
         ("Break-even fee (shown, not a test)", "INFO", _breakeven_words(r)),
         _stop_stress_row(r, counts, register, insufficient),
+        mintrl.g1_row(r.compare_returns),  # R5: shown at G1, gates G2
         *([] if not getattr(r, "first_touch", None) else [(FIRST_TOUCH_CHECK, "INFO", first_touch_words(r))]),
         *_funding_rows(r),
         (

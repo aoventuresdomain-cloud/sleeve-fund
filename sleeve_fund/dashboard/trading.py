@@ -242,7 +242,7 @@ def position_margin(x: dict) -> tuple[float, float | None]:
     entry = x.get("entry_px") or x["price"]
     if not qty:
         return 0.0, None
-    t = markets.terms(x["sleeve"].params, getattr(x["sleeve"], "venue", None))
+    t = markets.terms(x["sleeve"].params, getattr(x["sleeve"], "venue", None), x["sleeve"].instrument)
     if t is None:
         return abs(qty) * entry, None
     lev = risk.leverage_cap(x["profile"], x["sleeve"].params)
@@ -498,12 +498,13 @@ def perp_view(x: dict, position: dict | None, funding: list[dict]) -> dict | Non
     exposure is its notional at the mark over the strategy's equity (QA U2, as the Advisor worded them). Effective
     leverage is the notional at the mark over the same margin: it moves with the price, so it is always labelled
     "effective" and never shown in the leverage's own format (UP-2, Advisor ADV1940)."""
-    t = markets.terms(x["sleeve"].params, getattr(x["sleeve"], "venue", None))
+    t = markets.terms(x["sleeve"].params, getattr(x["sleeve"], "venue", None), x["sleeve"].instrument)
     if t is None:
         return None
     qty, price, equity = x["qty"], x["price"], x["equity"]
     notional = abs(qty * price)
     margin, liq = position_margin(x)
+    tier = markets.tier_at(t.maintenance_margin, notional)  # the venue's tier at the mark (VS-1)
     opened = position["opened"] if position else None
     held = [f for f in funding if opened is not None and f["ts"] >= opened]
     return {
@@ -511,8 +512,8 @@ def perp_view(x: dict, position: dict | None, funding: list[dict]) -> dict | Non
         "exposure": notional / equity if equity > 0 else None,
         "effective_leverage": notional / margin if position and margin else None,
         "margin": margin,
-        "maintenance": notional * t.maintenance_margin,
-        "maintenance_rate": t.maintenance_margin,
+        "maintenance": notional * tier.rate - tier.amount,
+        "maintenance_rate": tier.rate,
         "liq_px": liq,
         "to_liq": abs(liq / price - 1) if liq and price else None,
         "funding_rate": t.funding_rate,
