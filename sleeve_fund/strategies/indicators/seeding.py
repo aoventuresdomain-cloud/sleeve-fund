@@ -92,14 +92,32 @@ def need(obj) -> int:
                default=0)
 
 
+class Group:
+    """Blocks fed the same candles side by side, as slower candles feed theirs: one unit to check."""
+
+    def __init__(self, blocks, warmup_bars: int) -> None:
+        self.nodes = [(b, None) for b in blocks]
+        self.warmup_bars = warmup_bars
+
+    def update_ohlcv(self, *candle) -> None:
+        for b, _ in self.nodes:
+            b.update_ohlcv(*candle)
+
+
+def _reset(obj) -> None:
+    if hasattr(obj, "reset"):
+        obj.reset()  # a block's reset builds its own parts afresh
+    else:
+        for m in _members(obj):
+            _reset(m)
+
+
 def fresh(obj):
     """A copy of the unit with nothing fed."""
     if _engine(obj):
         return type(obj)(obj.period)
     out = copy.deepcopy(obj)
-    for b in [out, *_members(out)] if hasattr(out, "nodes") else [out]:
-        if hasattr(b, "reset"):
-            b.reset()
+    _reset(out)
     return out
 
 
