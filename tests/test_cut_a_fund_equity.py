@@ -232,3 +232,26 @@ def test_inside_the_fund_an_account_at_or_below_zero_calls_the_guards_on_the_tra
     assert LongFlatStrategy._guard_breached(s, 60_000.0) is True
     s.runtime.funded = 31.0
     assert LongFlatStrategy._guard_breached(s, 60_000.0) is False
+
+
+@pytest.mark.parametrize("fund_held", [True, False])
+def test_f_ge_2_a_two_leg_perp_leg_past_half_its_entry_distance_acts_on_the_trade(fund_held):
+    """F-GE-2 (CR 01:36 UK 15 Oct): the per-trade call acts when a two-leg Strategy's perp leg comes nearer its
+    liquidation price than half the distance it was entered at (Pair.distance_breached, Advisor B), in or out of the
+    fund, with the account well above zero and the venue's minimum liquidation distance still clear."""
+    from sleeve_fund.strategies.pair import CLAMP, Pair
+
+    pair = SimpleNamespace(state="hedged", _entry_dist={})
+    pair.distance_breached = lambda leg, price, liq: Pair.distance_breached(pair, leg, price, liq)
+    s = SimpleNamespace(_entry_px=60_000.0, _mark=lambda: (10_000.0, 4_000.0, 0.1, 60_000.0), pair=pair,
+                        _guard_book=lambda e, c, q, p: (e, c, q), _liq_now=lambda c, q: 30_000.0,
+                        runtime=SimpleNamespace(status="running", fund_held=fund_held, funded=0.0, _day_open=10_000.0,
+                                                peak=10_000.0, halts=True, profile=SimpleNamespace(
+                                                    min_liquidation_distance=0.01, max_drawdown=0.99,
+                                                    daily_loss=0.99)))
+    # Entered 50% from liquidation, so it acts nearer than 25%: 0.4 at 50,000 leaves it; 0.1667 at 36,000 acts.
+    assert CLAMP == 0.5
+    assert LongFlatStrategy._guard_breached(s, 50_000.0) is False
+    assert LongFlatStrategy._guard_breached(s, 36_000.0) is True
+    pair.state = "flat"  # a pair not legging or hedged has no entry distance to keep
+    assert LongFlatStrategy._guard_breached(s, 36_000.0) is False
