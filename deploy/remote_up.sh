@@ -33,7 +33,15 @@ for var in ALERT_WEBHOOK_URL HEALTHCHECK_PING_URL DEMO_MIRROR DERIBIT_TESTNET_AP
   if [ -n "${!var:-}" ]; then printf '%s=%s\n' "$var" "${!var}" >> .env.tmp; fi
   mv .env.tmp .env
 done
+# Before the new code starts, a dump of the journal as the running code left it, proved by a restore
+# (predeploy_dump.sh, in the backup container): no proved copy, no deploy. A server with no journal yet has none.
+if [ -n "$(docker compose ps -q db 2>/dev/null)" ]; then
+  docker compose exec -T backup bash -s < deploy/predeploy_dump.sh
+else
+  echo "pre-deploy dump: SKIP, no journal running yet"
+fi
 docker compose up -d --build --remove-orphans
+bash deploy/backup_refresh.sh
 docker image prune -f >/dev/null
 docker compose ps
 # The demo mirror's first lines say whether each demo key signed in (sleeve_fund/mirror.py); never a key.

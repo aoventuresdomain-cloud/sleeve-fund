@@ -44,6 +44,16 @@ def test_a_euro_quote_is_held_to_2_places_too_and_refused_off_the_test_account()
         check_quote_places(_s("BTC/EUR"), "desk-live")
 
 
+@pytest.mark.parametrize("account, venue", [("paper", "KRAKEN"), ("desk-live", "BINANCE")],
+                         ids=["the-test-account", "another-account"])
+def test_a_quote_the_engine_does_not_list_is_refused_on_every_account(account, venue):
+    """F-WED1-2: an unlisted currency would be made up at 8 places and pass; it is refused instead (fail closed)."""
+    with pytest.raises(ValueError, match="quote currency ZZZ is not one the engine lists") as got:
+        check_quote_places(_s("BTC/ZZZ", venue), account)
+    assert venue not in str(got.value)
+    assert check_quote_places(_s("BTC/USDT", venue), account) is None  # a listed 8-place quote still passes
+
+
 def test_the_supervisor_starts_the_test_strategy_with_a_warning_and_refuses_a_live_one(tmp_path):
     store = Store(f"sqlite:///{tmp_path}/t.db")
     store.create_sleeve(name="usd-test", strategy="ping_pong", instrument="BTC/USD",

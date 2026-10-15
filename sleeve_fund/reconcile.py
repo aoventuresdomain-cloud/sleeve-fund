@@ -9,7 +9,7 @@ spot and on perp, so a "~2" row's asset carries its contract, "BTC/USDT (perp)":
 MUST 1). Every row counts but saved backtests, reset runs included: a run put away that isn't flat is what this is for.
 
 The two sides, both exact Decimal sums of the EXACT columns' values (summed here, row by row: SQLite's SUM is a
-float's), compared with no tolerance (DA MUST 3):
+float's), each rounded to 8 dp and then compared exactly, with no tolerance (DA MUST 3; F-RECON-DUST):
 - rebuilt: the row's fills, BUY less SELL (rebuild_positions).
 - stored: what its orders say filled (stored_positions, Store.positions_by_asset): an order's filled_qty, which the
   runtime's book_fill moves in the fill's own transaction, or, for an order marked filled with nothing booked onto it
@@ -27,13 +27,14 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import ROUND_HALF_EVEN, Decimal
 
 from sqlalchemy import select
 
 from sleeve_fund.money import to_decimal
 
 ZERO = Decimal(0)
+STEP = Decimal("1e-8")  # F-RECON-DUST: both sides are rounded to 8 dp, then compared exactly
 MISMATCHES = 1000  # asset_mismatches rows listed a night; past it the night says more exist
 
 
@@ -146,6 +147,13 @@ def stored_positions(store, conn=None) -> dict[tuple[str, str], Decimal]:
     return _keyed(_rows(conn), _stored_rows(conn)[0])
 
 
+def _8dp(x: Decimal) -> Decimal:
+    """F-RECON-DUST (HoE, HoQA 15 Oct): a quantity at 8 dp, half to even. Rows from before the journal kept quantities
+    exact (DA-9) can carry an 18-place residue in an order's filled_qty; at 8 dp it is equal, and one 8-dp step still
+    differs, so no tolerance band hides a real break (DA MUST 3)."""
+    return x.quantize(STEP, ROUND_HALF_EVEN)
+
+
 def nightly(store) -> list[Finding]:
     """Every break, [] when clean: each row whose rebuilt position isn't exactly its stored one, then each journal row
     written under another asset (Store.asset_mismatches, the DA's reconcile reader)."""
@@ -155,7 +163,7 @@ def nightly(store) -> list[Finding]:
     out = []
     for row, (strategy, asset) in sorted(rows.items(), key=lambda kv: (kv[1], kv[0])):
         a, b = rebuilt.get(row, ZERO), stored.get(row, ZERO)
-        if a != b:
+        if _8dp(a) != _8dp(b):
             out.append(Finding(strategy, asset, row, "position", a, b,
                                f"{strategy}, {asset} (row {row}): its fills come to {a.normalize():f} but its orders "
                                f"record {b.normalize():f}, {(a - b).normalize():f} apart"))

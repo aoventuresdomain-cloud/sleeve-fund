@@ -21,15 +21,15 @@ STATUS_TABS = {
     "open": ("Open", OPEN_ORDER_STATUSES),
     "filled": ("Filled", ("filled", "triggered")),
     "canceled": ("Cancelled", ("canceled", "expired")),
-    "rejected": ("Rejected", ("rejected", "denied")),
+    "rejected": ("Rejected", ("rejected", "denied", "unfilled_unknown")),
     "all": ("All", None),
 }
 STATUS_LABELS = {"submitted": "Sent", "accepted": "Working", "partially_filled": "Part filled", "filled": "Filled",
                  "canceled": "Cancelled", "rejected": "Rejected", "denied": "Blocked", "expired": "Expired",
-                 "triggered": "Triggered"}
+                 "triggered": "Triggered", "unfilled_unknown": "Not filled"}
 STATUS_TONES = {"submitted": "paused", "accepted": "paused", "partially_filled": "paused", "filled": "running",
                 "canceled": "stopped", "expired": "stopped", "rejected": "halted", "denied": "halted",
-                "triggered": "running"}
+                "triggered": "running", "unfilled_unknown": "halted"}
 
 _PX = ("close", "price", "entry_px", "peak", "trail_stop")
 _PCT = ("gap", "move", "stop_loss", "take_profit")

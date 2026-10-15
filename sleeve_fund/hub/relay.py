@@ -22,6 +22,8 @@ import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
+from types import SimpleNamespace
 
 import pandas as pd
 
@@ -183,10 +185,16 @@ class HubRelay(DataActor):
         self.holes: dict[str, list[tuple[int, int]]] = {}
         self.alert: Callable[[str, str], None] = lambda key, message: print(message)
         self.seed: Callable[[str], tuple[int | None, list[tuple[int, int]]]] | None = None
+        # A15: per instrument, when its last trade or quote arrived (ns), checked once a minute by `stale`
+        # (ops_health.HubStaleness), whose events `event` journals on the store's thread.
+        self.stale = None
+        self.event: Callable[..., None] | None = None
+        self._seen_ns: dict[str, int] = {}
 
     def attach(self, fanout, sink=None, pairs: dict[str, str] | None = None, recent=None,
                last_close: dict[str, int] | None = None, discover=None, late_path=None,
-               holes: dict[str, list[tuple[int, int]]] | None = None, alert=None, seed=None) -> "HubRelay":
+               holes: dict[str, list[tuple[int, int]]] | None = None, alert=None, seed=None, stale=None,
+               event=None) -> "HubRelay":
         """pairs: {instrument id: pair}, kept up to date in place (the sink may hold the same dict). last_close:
         per instrument, the close of the last bar already stored, so the minutes the hub was down are refilled
         from its first bar. holes: per instrument, (first, last) closes of the minutes the store is missing,
@@ -195,7 +203,8 @@ class HubRelay(DataActor):
         strategy added while the hub runs is relayed and stored without a restart. seed(instrument id) -> (last
         close, holes): the same two read from the store for an instrument relayed without them (one discover()
         found after start, or one the store couldn't be read for at start), so its first bar refills what the
-        store is missing too (P1-L16)."""
+        store is missing too (P1-L16). stale, event(sleeve, level, kind, message, ts=): A15's per-hub staleness
+        watch (ops_health.HubStaleness) and where its events are journaled."""
         self.fanout, self.recent, self.discover = fanout, recent, discover
         self.sink = sink or self.sink
         self.pairs = pairs if pairs is not None else {}
@@ -204,6 +213,7 @@ class HubRelay(DataActor):
         self.holes = dict(holes or {})
         self.alert = alert or self.alert
         self.seed = seed
+        self.stale, self.event = stale, event
         return self
 
     # --- the fan-out asks, from its own thread ------------------------------------------
@@ -305,6 +315,7 @@ class HubRelay(DataActor):
     def on_trade(self, tick) -> None:
         self._last_tick = time.time()
         iid = str(tick.instrument_id)
+        self._seen_ns[iid] = time.time_ns()
         n = self.late.setdefault(iid, [0, 0])
         late = tick.ts_event < self.gaps.last.get(iid, 0)  # its minute's bar already built: never put in a later one
         if not late:
@@ -315,6 +326,7 @@ class HubRelay(DataActor):
 
     def on_quote(self, tick) -> None:
         self._last_tick = time.time()
+        self._seen_ns[str(tick.instrument_id)] = time.time_ns()
         self.fanout.publish(protocol.quote(tick, time.time_ns()))
 
     def _build(self, event=None, now_ns: int | None = None) -> None:
@@ -324,6 +336,27 @@ class HubRelay(DataActor):
             now_ns = getattr(event, "ts_event", None) or self.clock.timestamp_ns()
         for iid, close, o, h, l, c, v in self.minutes.close(now_ns, BAR_GRACE_SECONDS * 1_000_000_000):  # noqa: E741
             self._closed(protocol.bar(iid, o, h, l, c, v, close, time.time_ns()))
+        self._check_stale()
+
+    def _check_stale(self) -> None:
+        """A15, once a minute on the node's thread (the watch is only touched here): each relayed instrument's last
+        trade or quote, or its subscription if none came yet. The events are written on the store's thread."""
+        if self.stale is None or self.event is None:
+            return
+        from datetime import UTC, datetime
+
+        def at(ns: int) -> datetime:
+            return datetime.fromtimestamp(ns / 1e9, UTC)
+
+        for iid, since in self._since.items():
+            self.stale.want(self.pairs.get(iid, iid), at(since))
+        for iid, ns in self._seen_ns.items():
+            self.stale.seen(self.pairs.get(iid, iid), at(ns))
+        journal = SimpleNamespace(event=lambda *a, **k: self._store.submit(partial(self.event, *a, **k)))
+        try:
+            self.stale.check(journal, at(time.time_ns()))
+        except Exception as exc:  # noqa: BLE001 - the watch never stops the bars
+            self.log.warning(f"hub: staleness check failed: {exc!r}")
 
     def on_bar(self, bar) -> None:
         """A closed bar built elsewhere (a Nautilus bar), handled as the hub's own."""

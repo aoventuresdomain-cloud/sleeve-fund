@@ -638,7 +638,14 @@ def check_quote_places(s: Sleeve, account: str) -> str | None:
     """Raises ValueError when the Strategy's quote currency is held to fewer than 8 places on an account its venue
     doesn't name as a test account; returns the warning to log when it does; None when the currency holds 8. The
     words name no venue (they reach the PM)."""
+    from nautilus_trader.model import Currency
+
     quote, places = _quote_places(s)
+    try:  # as the engine holds it; one it doesn't list would be made up at 8, so it is refused (F-WED1-2)
+        Currency.from_str(quote, strict=True)
+    except ValueError:
+        raise ValueError(f"its quote currency {quote} is not one the engine lists, so the places its fills are held "
+                         f"to are unknown; it can't run on any account until it is listed") from None
     if places >= FILL_PLACES:
         return None
     why = _test_account_reason(account, getattr(s, "venue", None))

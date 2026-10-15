@@ -200,6 +200,9 @@ class Rules(LongFlatStrategy):
     def _unsettled(self) -> bool:
         return False  # every value its rules read has settled (block_value), or the rule doesn't hold
 
+    def seeding_units(self) -> list[tuple[str, object]]:
+        return [("its rules' blocks", self._feed)] if self._feed.nodes else []  # chained as they are fed (A10)
+
     def update_indicators(self, bar: Bar) -> None:
         env = self.env
         if env.bar:

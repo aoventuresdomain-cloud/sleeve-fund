@@ -1251,9 +1251,11 @@ TWO_LEG_FENCE = "isn't built for a two-leg Strategy yet, so nothing was changed"
 # Backtest names can't collide with a strategy's: those are lower-case letters, digits and dashes.
 BACKTEST_PREFIX = "bt:"
 # "triggered": paper's watched stop (not an order at the venue) when it fired, its market stop-loss sent for it.
+# "unfilled_unknown" (F-RX-1, DA): the order-state check could not find the order at the venue and confirmed nothing
+# filled. Finished, never open; a late fill still lands on it, and its gate room is released as a reject's.
 ORDER_STATUSES = ("submitted", "accepted", "partially_filled", "filled", "canceled", "rejected", "denied", "expired",
-                  "triggered")
-FINISHED_ORDER_STATUSES = ("filled", "canceled", "rejected", "denied", "expired", "triggered")
+                  "triggered", "unfilled_unknown")
+FINISHED_ORDER_STATUSES = ("filled", "canceled", "rejected", "denied", "expired", "triggered", "unfilled_unknown")
 OPEN_ORDER_STATUSES = ("submitted", "accepted", "partially_filled")
 # F-C3B-A: a Strategy archived while not yet flat waits for its withdrawal; one with nothing to withdraw says so
 WITHDRAWAL_DEFERRED, WITHDRAWAL_NONE = "withdrawal_deferred", "withdrawal_none"
@@ -1269,6 +1271,10 @@ GATED_INTENTS = ("entry", "rebalance")  # the orders the portfolio gate reserves
 INTENTS = ("entry", "exit", "stop_loss", "take_profit", "risk_halt", "risk_pause", "pm_flatten", "rebalance",
            "liquidation", "liquidation_cut", "wind_down", "wind_down_stop",  # the venue would take it; cut back before it does (String(16))
            "leg_unwind")  # P2-8: a two-leg Strategy's leg closed because its other leg couldn't be held
+# F-RX-1: the orders that close or cut a position the Strategy holds (store.closing_orders). Not the venue's own
+# liquidation, which the Strategy never sent.
+CLOSING_INTENTS = ("exit", "stop_loss", "take_profit", "risk_halt", "risk_pause", "pm_flatten", "liquidation_cut",
+                   "wind_down", "wind_down_stop", "leg_unwind")
 
 
 def _traded_venue(c, sleeve: str) -> str | None:
@@ -1722,6 +1728,15 @@ RESET_STAYS = {
 }
 STRATEGY_COLUMNS = frozenset({"sleeve", "sleeve_id", "parent", "strategy_id"})
 
+
+
+LEG_IDENTITY = ("assets", "universe_date")  # create_legs: a multi-asset Strategy's identity, kept in every row's params
+
+
+def model_params(params: dict | None) -> dict:
+    """A row's settings as its model takes them: a multi-asset Strategy's asset list and universe_date (create_legs)
+    are its identity, not the model's, and the model's config refuses them (CR A10-M2)."""
+    return {k: v for k, v in (params or {}).items() if k not in LEG_IDENTITY}
 
 class Store:
     def __init__(self, url: str | None = None, engine: Engine | None = None, portfolio_gate: bool = False) -> None:
@@ -2288,8 +2303,8 @@ class Store:
         with led.using(c):
             if fill_qty:
                 led.reduce(rid, fill_qty)
-            reason = {"filled": "fill", "rejected": "reject", "denied": "reject", "canceled": "cancel",
-                      "expired": "cancel"}.get(status)
+            reason = {"filled": "fill", "rejected": "reject", "denied": "reject", "unfilled_unknown": "reject",
+                      "canceled": "cancel", "expired": "cancel"}.get(status)
             if reason in ("reject", "cancel") and order_id in self._retry_held:
                 reason = None  # a two-leg Strategy's second leg: what is left stays reserved for its retry (hand_on)
             if reason is not None:
@@ -2402,6 +2417,18 @@ class Store:
         with self.engine.connect() as c:
             rows = _rows(c.execute(q))
         return rows[0] if rows else None
+
+    def closing_orders(self, sleeve: str, since: datetime | None = None) -> list[dict]:
+        """F-RX-1: a Strategy's closing orders (CLOSING_INTENTS) sent at or after since, oldest first, each with its
+        status, the venue's or risk engine's words (message) and when it last moved (updated_at). Every one is
+        listed, refused or not, so a reader counts refused closes in a row from the tail (F-RX-2)."""
+        o = orders_t.c
+        q = (select(o.order_id, o.intent, o.status, o.message, o.ts, o.updated_at, o.instrument)
+             .where(o.sleeve == sleeve, o.intent.in_(CLOSING_INTENTS)))
+        if since is not None:
+            q = q.where(o.ts >= since)
+        with self.engine.connect() as c:
+            return _rows(c.execute(q.order_by(o.ts, o.id)))
 
     def order_counts(self, sleeve: str | None = None) -> dict[str, int]:
         q = select(orders_t.c.status, func.count()).group_by(orders_t.c.status)
@@ -4810,7 +4837,7 @@ class Store:
             # One settings block for every leg (multi-asset spec §2); the asset list is the Strategy's identity (QT3 b3c).
             if s.parent is not None:
                 raise ValueError(f"{sleeve} is an asset leg of {s.parent}: change the Strategy's settings")
-            for key in ("assets", "universe_date"):
+            for key in LEG_IDENTITY:
                 if params.get(key) != s.params.get(key):
                     raise ValueError(f"a multi-asset Strategy's {key} is fixed when it is made: a new list is a new "
                                      "Strategy")

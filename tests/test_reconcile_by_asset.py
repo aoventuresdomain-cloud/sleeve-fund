@@ -106,8 +106,9 @@ def test_must2_a_tampered_leg_is_named_on_that_asset_and_the_parents_key_is_clea
 
 
 def test_must3_a_gap_of_one_unit_in_the_last_place_the_journal_keeps_is_a_break(store):  # noqa: F811
-    """The eighteenth place on Postgres (NUMERIC(38, 18)); SQLite keeps a REAL (DA-9), so a ninth-place gap there."""
-    gap = D("1e-18") if store.engine.dialect.name == "postgresql" else D("1e-9")
+    """One step at 8 dp, on both engines: both sides are rounded to 8 dp and then compared exactly (TEC-RECON-8DP, HoE
+    OK and DA co-sign 15 Oct: below it is pre-DA-9 float noise, F-RECON-DUST), so no tolerance band hides this gap."""
+    gap = D("1e-8")
     _multi(store, "e", ("BTC/USDT",))
     _fill(store, "e", "BUY", 0.1, "e1")
     _tamper(store, "e1", D("0.1") + gap)

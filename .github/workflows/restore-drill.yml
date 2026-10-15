@@ -1,0 +1,35 @@
+name: restore-drill
+# DA-7, the restore drill (HoE, 15 Oct): the newest nightly backup restored on the server into a throwaway Postgres on
+# a network and volume of its own (deploy/restore_drill.sh), never the journal's database and never a port on the
+# host, then checked (python -m sleeve_fund.restore_drill): migrations to head, the backup's own counts, every
+# table's rows, every link between them, the research archive, and the start check's book rebuild. Each step timed;
+# everything made is removed at the end, on failure too. Nothing leaves the server: no dump or row is copied here and
+# nothing is uploaded. The log is public: it prints step names, counts, timings and PASS or FAIL only, and ssh runs
+# quiet so it names no host or user. With the deploy workflow's secrets (DEPLOY_HOST, DEPLOY_SSH_KEY) and variable
+# DEPLOY_USER, as nightly-recon.yml. The job fails when the drill does.
+on:
+  workflow_dispatch:
+concurrency: { group: restore-drill, cancel-in-progress: false }
+jobs:
+  drill:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions: { contents: read }
+    if: ${{ vars.DEPLOY_ENABLED == 'true' && github.ref == 'refs/heads/main' }}
+    env:
+      USER_AT: ${{ vars.DEPLOY_USER || 'root' }}
+    steps:
+      - name: Configure SSH
+        env:
+          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/id_deploy && chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts 2>/dev/null
+      - name: Restore drill
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+        # The script's exit code passes through ssh: 0 PASS, 1 FAIL, and 255 is ssh itself failing (quiet).
+        run: |
+          ssh -o LogLevel=QUIET -i ~/.ssh/id_deploy "$USER_AT@$HOST" 'cd /opt/sleeve-fund && sudo bash deploy/restore_drill.sh'

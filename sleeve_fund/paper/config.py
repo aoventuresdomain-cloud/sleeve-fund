@@ -12,6 +12,7 @@ from sleeve_fund import markets
 from sleeve_fund.instruments import FeeSchedule
 from sleeve_fund.strategies import REGISTRY
 from sleeve_fund.router import venue_for
+from sleeve_fund.store import model_params
 from sleeve_fund.venues import DEFAULT_VENUE, venue as venue_profile
 
 # Any spot pair (SUI/USD, XRP/GBP, ...). Whether the venue lists it is checked when the sleeve starts.
@@ -45,7 +46,7 @@ def auto_warmup(strategy: str, params: dict, bar_spec: str) -> int:
 
     cls = REGISTRY[strategy][0]
     defaults = dict(getattr(importlib.import_module(cls.__module__), "SPEC").default_params or {})
-    p = {**defaults, **params}
+    p = {**defaults, **model_params(params)}
     cap = MAX_WARMUP_BARS if bar_spec.endswith("INTERNAL") else VENUE_WARMUP_BARS
     return min(cap, max(cls.warmup_needed(p, spec_minutes(bar_spec)), exit_warmup(p)))
 
@@ -149,8 +150,8 @@ def load_sleeve(path: str | Path) -> SleeveConfig:
 
 
 def from_store(sleeve, fee_schedule: FeeSchedule | None = None) -> SleeveConfig:
-    """SleeveConfig from a database row (sleeve_fund.store.Sleeve)."""
-    params = dict(sleeve.params)
+    """SleeveConfig from a database row (sleeve_fund.store.Sleeve): its model's params (store.model_params)."""
+    params = model_params(sleeve.params)
     max_notional = params.pop("max_notional", None)
     return SleeveConfig(
         name=sleeve.name,

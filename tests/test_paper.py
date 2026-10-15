@@ -409,9 +409,11 @@ def test_a_restart_with_no_stored_history_warms_up_on_the_venues_candles_so_a_lo
     s.instrument, s.runtime = instrument, runtime
     s._side = 1  # the long restored from the journal (on_start)
     s._warm_from_history()
-    assert events == [("rb", "info", "warmup", "Loaded 140 of 140 warm-up bars from the venue's recent candles")]
+    # TEC-A10-WARMMSG: the model is fed the farther agreeing seed (A10), 280 bars, and the line says so
+    assert events == [("rb", "info", "warmup", "Loaded 140 of 140 warm-up bars from the venue's recent candles, and "
+                       "140 more before them so its averages settle")]
     expected = Rsi(14)
-    for b in bars:
+    for b in load(instrument, bt, 280):  # TEC-A10-WARMMSG: what the model was fed, the farther agreeing seed (A10)
         expected.update_raw(b.close.as_double())
     assert s.rsi.initialized and s.rsi.value == pytest.approx(expected.value) and s.rsi.value >= 55
     assert s.target_side(s.rsi.value) != 1  # the long ends on the first live bar, not 15 bars later
