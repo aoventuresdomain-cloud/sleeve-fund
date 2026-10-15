@@ -34,9 +34,10 @@ from sleeve_fund import bars as bar_rule
 from sleeve_fund import lifecycle, markets, open_risk, risk
 from sleeve_fund.data import bar_minutes
 from sleeve_fund import router
-from sleeve_fund import ramp, strength
+from sleeve_fund import compliance_rules, ramp, strength
 from sleeve_fund.instruments import BOOK_SHARE, lot_decimals, pair_of, taker_slippage, target_fill_px
 from sleeve_fund.margin import entry_liquidation
+from sleeve_fund.portfolio.compliance import KEY as COMPLIANCE_KEY
 from sleeve_fund.paper.runtime import FILL_HANDLER_PAUSE  # noqa: F401  (T-FIX8's name, kept for its callers)
 from sleeve_fund.paper.runtime import ENTRY_CANCELLED, EXITS_ONLY, RACED_FILL, RESUMABLE, WIPED_OUT, block_codes, liquidation_reason
 from sleeve_fund.paper.runtime import WIND_STOP as WIND_STOP_INTENT
@@ -3562,6 +3563,19 @@ class LongFlatStrategy(Strategy):
                 if hasattr(decision, "release"):
                     decision.release("cancel")  # never sent: its room goes back to the book
                 return
+            under = self._under_min_notional(approved, intent) if paper is not None else None
+            if under is not None:
+                # F-TRIM-MIN (HoQA): what the compliance tests leave is under the venue's smallest order value, which
+                # the venue would deny on every bar; refused here in words, once until an entry is sent.
+                count("below_minimum")
+                hit = getattr(getattr(decision, "decision", decision), "limit_hit", None)  # paper: Gated.decision
+                test = hit if hit in compliance_rules.BY_KEY else COMPLIANCE_KEY.get(hit)
+                self._note(f"{what}_trimmed_below_minimum", f"{what.capitalize()} refused: "
+                           f"{compliance_rules.name(test) if test else 'its size'} leaves {approved} ({under[0]:,.2f}), under "
+                           f"the venue minimum {under[1]:,.2f}")
+                if hasattr(decision, "release"):
+                    decision.release("cancel")
+                return
             self._noted.discard(f"{what}_trimmed_below_minimum")
             trimmed = approved != qty
             count("trimmed" if trimmed else "sent")
@@ -5582,6 +5596,16 @@ class LongFlatStrategy(Strategy):
                                      "Back on the minimum-size ramp for new entries (open positions are kept); it ")
                        + g.words, level="info")
         return g
+
+    def _under_min_notional(self, qty: Decimal, intent: dict) -> tuple[Decimal, Decimal] | None:
+        """(the order's value, the venue's smallest) when `qty` at the gate's expected fill price is worth less than
+        the smallest order the venue takes; None when it isn't, or the venue names no minimum value."""
+        least = LongFlatStrategy._min_notional(self)
+        price = Decimal(str(intent.get("price") or 0))
+        if least <= 0 or price <= 0:
+            return None
+        value = qty * price
+        return (value, least) if value < least else None
 
     def _min_notional(self) -> Decimal:
         """The venue's smallest order value in the quote currency (the instrument's min_notional), 0 when it names
