@@ -132,6 +132,28 @@ def maintenance_for(profile, pair: str) -> tuple:
     return tiers(table)
 
 
+def stale_maintenance(sleeves, today, days: int = 30) -> list[str]:
+    """VS-1-TABLE: one line per instrument a live perp Strategy trades whose venue table was read more than `days`
+    ago (the venue changes its tiers from time to time; DA-11 keeps them). No venue names: it can reach the PM."""
+    from sleeve_fund.venues import venue as venue_profile
+
+    out, seen = [], set()
+    for s in sleeves:
+        if s.lifecycle == "retired" or (s.params or {}).get("market") != PERP or s.instrument in seen:
+            continue
+        try:
+            profile = venue_profile(s.venue)
+        except (KeyError, ValueError):
+            continue
+        read_on = getattr(profile, "maintenance_read_on", None)
+        if not profile.perpetual or read_on is None or (today - read_on).days <= days:
+            continue
+        seen.add(s.instrument)
+        out.append(f"{s.instrument}: its maintenance table was read on {read_on.day} {read_on:%b %Y}, "
+                   f"{(today - read_on).days} days ago; re-paste and re-check it (DA-11)")
+    return out
+
+
 def check_venue(params: dict | None, venue: str) -> None:
     """Raises ValueError when the market can't trade on the venue: a perpetual venue has no spot."""
     from sleeve_fund.venues import venue as venue_profile
