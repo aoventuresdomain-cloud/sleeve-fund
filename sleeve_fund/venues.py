@@ -108,6 +108,9 @@ class VenueProfile:
     maintenance_tiers: dict[str, tuple] = field(default_factory=dict)
     maintenance_basis: str | None = None
     maintenance_read_on: date | None = None  # when the tables were read: the start check notes them past 30 days
+    # FEE-LIVE: where the venue's public margin tiers are read ({symbol} filled in) and its account fee-rate path
+    risk_limit_url: str = ""
+    fee_rate_path: str = ""
     maintenance_limits: dict[str, float] = field(default_factory=dict)  # pair -> the venue's last published ceiling
     # FEE-LIVE: the published range a fetched fee rate must fall in ({"maker": (lowest, VIP 0), "taker": ...}) and
     # where it was read; a profile without one has no fetched rates (venue_terms refuses to read them)
@@ -675,6 +678,10 @@ BINANCE = register(VenueProfile(
     maintenance_tiers={"BTC/USDT": BTCUSDT_TIERS},
     maintenance_basis=BTCUSDT_TIERS_BASIS,
     maintenance_read_on=date(2026, 10, 15),
+    # The PM's paper venue's public V5 risk-limit page (public market data, read-only, no key) and its signed
+    # read-only fee-rate call (FEE-LIVE).
+    risk_limit_url="https://api.bybit.com/v5/market/risk-limit?category=linear&symbol={symbol}",
+    fee_rate_path="/v5/account/fee-rate",
     maintenance_limits={"BTC/USDT": 1_200_000_000},  # past it the venue takes no position; nor do we
     core_pairs=("BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "SUI/USDT"),
     hub=True,

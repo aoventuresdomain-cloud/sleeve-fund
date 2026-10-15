@@ -119,7 +119,7 @@
       </div></div>
 
       <div class="study-foot">
-        <span class="faint" id="study-runs">Runs {{ chosen.variants }} variant{{ 's' if chosen.variants != 1 }} and the cost ladder at {{ '%.2f'|format(on_venue.fee * 100) }}% (the venue's taker fee). Long only.</span>
+        <span class="faint" id="study-runs">Runs {{ chosen.variants }} variant{{ 's' if chosen.variants != 1 }} and the cost ladder at {{ on_venue.fee|rate }} (the venue's taker fee). Long only.</span>
         <button>Run study</button>
       </div>
     </form>
@@ -189,6 +189,8 @@ Console.orderFields("study-form");
   const venue = () => form.elements.venue.value || data.default_venue;
   const val = (n) => { const el = form.elements[n]; return el && !el.disabled ? el.value.trim() : ""; };
   const p2 = (x) => `${(x * 100).toFixed(2)}%`;
+  // A fee rate as instruments.pct words it: two decimals of a percent, more where the rate has them (0.055%).
+  const rate = (x) => { const [w, f = ""] = (x * 100).toFixed(4).replace(/0+$/, "").split("."); return `${w}.${f.padEnd(2, "0")}%`; };
 
   // One sentence each for steps 2 and 3, worded as the server words them (development.py how_sentence,
   // exits_sentence): keep the two in step.
@@ -235,7 +237,7 @@ Console.orderFields("study-form");
     $("how-text").textContent = howSentence();
     $("exit-text").textContent = exitsSentence();
     const v = V[venue()], n = (P[current] || {}).variants || 1;
-    $("study-runs").textContent = `Runs ${n} variant${n === 1 ? "" : "s"} and the cost ladder at ${p2(v.fee)} (the venue's taker fee). Long only.`;
+    $("study-runs").textContent = `Runs ${n} variant${n === 1 ? "" : "s"} and the cost ladder at ${rate(v.fee)} (the venue's taker fee). Long only.`;
   };
 
   // Study windows sized to the stored history (UI v2, item 8; twin of development.py fit_windows), until the

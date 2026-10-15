@@ -57,7 +57,10 @@ def taker_of(store, sleeve) -> Decimal:
     (resolve). What the loss at its stop counts (open_risk.position_risk, FEE-LIVE (5))."""
     from sleeve_fund import markets
 
-    return markets.fees_for(sleeve.params, resolve(sleeve.venue, store).fees, sleeve.venue).taker
+    account = store.account_of(sleeve.name) if store is not None else None
+    live = account is not None and store.account_kind(account) == "live"
+    quote = resolve(sleeve.venue, store, sleeve.instrument, live=live, account=account)  # what its fills are charged
+    return markets.fees_for(sleeve.params, quote.fees, sleeve.venue).taker
 
 
 def resolve(venue: str | None = None, store=None, instrument: str | None = None, now: datetime | None = None,

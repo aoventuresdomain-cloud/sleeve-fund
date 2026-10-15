@@ -261,7 +261,7 @@ def test_the_stand_in_ages_like_any_fetch_a_fresh_row_each_daily_attempt(store):
     good = store.latest_good_venue_fetch("BINANCE", "fee", "BTC/USDT", account="paper-main")
     at = good["fetched_at"] if good["fetched_at"].tzinfo else good["fetched_at"].replace(tzinfo=timezone.utc)
     assert good["id"] == ids[-1] and good["source"] == PUBLISHED_FEES and at == T + timedelta(days=2)
-    assert good["payload"] == {"maker": "0.0002", "taker": "0.0005"}  # the venue profile's published VIP0, as strings
+    assert good["payload"] == {"maker": "0.0002", "taker": "0.00055"}  # the venue profile's published VIP0, as strings
     assert (T + timedelta(days=2, hours=1)) - at == timedelta(hours=1)  # one hour old, not three days
 
 

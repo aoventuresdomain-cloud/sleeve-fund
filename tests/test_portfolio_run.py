@@ -432,7 +432,7 @@ def test_f237_1_while_open_risk_is_unmarked_the_gate_refuses_every_entry_and_sti
     from sleeve_fund.research.portfolio import PortfolioGate
 
     order = dict(side=1, qty=D(2), close=D(100), price=D("100.05"), stop_frac=0.02, step=D("0.001"),
-                 min_qty=D("0.001"), instrument="XBT", leverage=None, atr_pct=None)
+                 min_qty=D("0.001"), instrument="XBT", leverage=None, atr_pct=None, taker=D(0))
     t0 = int(pd.Timestamp("2026-10-08 12:00", tz="UTC").value)
 
     equity, missing = {"now": D(1000)}, {"why": None}

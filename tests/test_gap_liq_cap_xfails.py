@@ -180,7 +180,7 @@ def _recording(path: Path, side: int, profile: str, gap_factor: float) -> None:
     meta = {"balances": ["10000.00 USD"],
             "sleeve": {"name": NAME, "strategy": "qa_gap_probe", "instrument": "BTC/USD",
                        "bar_spec": "1-MINUTE-LAST-INTERNAL", "starting_balance": 10_000, "risk_profile": profile,
-                       "params": _params(side), "maker_fee": "0.0002", "taker_fee": "0.0005", "tick_seconds": 30}}
+                       "params": _params(side), "maker_fee": "0.0002", "taker_fee": "0.00055", "tick_seconds": 30}}
     tls._record(path, meta, [(20, 0.0), (0, gap_factor - 1.0), (20, 0.0)], px=BASE)
 
 

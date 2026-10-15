@@ -1807,7 +1807,8 @@ class LongFlatStrategy(Strategy):
         alerts (QA P1-S9). A two-leg Strategy's first leg adds what its entry opens on the second leg, in full: no
         hedge credit (Advisor M6); a backtest judges it against both legs' equity summed."""
         stop = close * (1 - side * self._stop_frac) if self._stop_frac else None
-        taker = self._cfg.assumed_taker_fee  # the loss at the stop counts the exit's taker fee (FEE-LIVE (5))
+        # The loss at the stop counts the exit's taker fee (FEE-LIVE (5)); None fails closed where it is read.
+        taker = getattr(getattr(self, "_cfg", None), "assumed_taker_fee", None)
         pair = getattr(self, "pair", None)
         follow = pair.follower_entry(Decimal(repr(qty)), close) if pair is not None and pair.lead is self else None
         if self._backtest:
@@ -4202,7 +4203,9 @@ class LongFlatStrategy(Strategy):
         from sleeve_fund.venues import venue as venue_profile
 
         store = self.runtime.store
-        row = store.sleeve(self.runtime.name)
+        row = store.sleeve(self.runtime.name) if hasattr(store, "latest_good_venue_fetch") else None
+        if row is None:  # no journal to read pulled tables from
+            return None
         profile = venue_profile(getattr(self.runtime, "venue", None) or row.venue)
         if not profile.perpetual:
             return None

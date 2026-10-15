@@ -34,9 +34,6 @@ ALERT_AFTER = timedelta(hours=24)
 REFUSE_AFTER = timedelta(hours=72)
 FRESH, STALE, REFUSED = "fresh", "stale", "refused"
 FEE_RATE, RISK_LIMIT, PASTED = "fee-rate", "risk-limit", "hand-checked-pasted"
-FEE_RATE_PATH = "/v5/account/fee-rate"
-# The paper venue's public V5 risk-limit page: public market data, read-only, no key.
-RISK_LIMIT_URL = "https://api.bybit.com/v5/market/risk-limit?category=linear&symbol={symbol}"
 UK = ZoneInfo("Europe/London")  # times the PM reads are UK times, labelled UK
 KIND_WORDS = {"fee": "fee rates", "tiers": "margin tiers"}
 SOURCE_WORDS = {FEE_RATE: "the account", PUBLISHED_FEES: "the published schedule (published, not account)",
@@ -85,7 +82,7 @@ def fetch_fees(store, profile, instrument: str, *, client, account: str, live: b
     (Advisor HEAD3, FEE-LIVE-DW (a)); live never does, and its entries are refused until the account answers."""
     symbol, at = symbol_of(instrument), now or datetime.now(timezone.utc)
     try:
-        payload = fee_payload(client.call("GET", FEE_RATE_PATH, {"category": "linear", "symbol": symbol}), symbol)
+        payload = fee_payload(client.call("GET", profile.fee_rate_path, {"category": "linear", "symbol": symbol}), symbol)
     except Exception as e:  # noqa: BLE001 - every failed attempt is kept, with why
         store.record_venue_fetch(profile.name, "fee", instrument, source=FEE_RATE, ok=False, reason=_failed(e),
                                  account=account, at=at)
@@ -105,7 +102,9 @@ def fetch_tiers(store, profile, instrument: str, *, get=_get_json, now: datetime
     """One attempt at the public margin tiers for `instrument`, kept good (if margin.tiers accepts it) or failed."""
     symbol, at = symbol_of(instrument), now or datetime.now(timezone.utc)
     try:
-        answer = get(RISK_LIMIT_URL.format(symbol=symbol))
+        if not profile.risk_limit_url:
+            raise ValueError("the venue profile has no public risk-limit page")
+        answer = get(profile.risk_limit_url.format(symbol=symbol))
         if not isinstance(answer, dict) or answer.get("retCode") != 0:
             raise ValueError(f"the venue refused: {(answer or {}).get('retMsg', answer)}")
         payload = tier_payload(answer.get("result"), symbol)
