@@ -25,6 +25,8 @@ SOURCES = {
     "fee-rate": f"{DOCS}/account/fee-rate",
     "wallet-balance": f"{DOCS}/account/wallet-balance",
     "ws auth": f"{DOCS}/ws/connect",
+    "ws order": f"{DOCS}/websocket/private/order",
+    "ws execution": f"{DOCS}/websocket/private/execution",
 }
 SYMBOL = "BTCUSDT"
 INSTRUMENT = {"symbol": SYMBOL, "contractType": "LinearPerpetual", "status": "Trading", "baseCoin": "BTC",
@@ -65,6 +67,7 @@ class VenueStub:
         self._ws_loop: asyncio.AbstractEventLoop | None = None
         self._ws_port: int | None = None
         self._ws_stop: asyncio.Event | None = None
+        self._clients: set = set()
 
     # what a cell reads ---------------------------------------------------------------------------------------------
     def bodies(self, endpoint: str) -> list[dict]:
@@ -162,6 +165,7 @@ class VenueStub:
         from websockets.asyncio.server import serve
 
         async def handler(ws):
+            self._clients.add(ws)
             async for raw in ws:
                 self.ws_seen.append(raw)
                 try:
@@ -180,6 +184,19 @@ class VenueStub:
                 await self._ws_stop.wait()
 
         asyncio.run(main())
+
+    def push(self, message: dict) -> None:
+        """Send `message` to every connected private WebSocket, as the venue's order or execution stream would."""
+        raw = json.dumps(message)
+
+        async def send():
+            for ws in list(self._clients):
+                try:
+                    await ws.send(raw)
+                except Exception:  # noqa: BLE001 - a closed client is dropped
+                    self._clients.discard(ws)
+
+        asyncio.run_coroutine_threadsafe(send(), self._ws_loop).result(5)
 
     def stop(self) -> None:
         if self._http is not None:
