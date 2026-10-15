@@ -1251,8 +1251,10 @@ TWO_LEG_FENCE = "isn't built for a two-leg Strategy yet, so nothing was changed"
 # Backtest names can't collide with a strategy's: those are lower-case letters, digits and dashes.
 BACKTEST_PREFIX = "bt:"
 # "triggered": paper's watched stop (not an order at the venue) when it fired, its market stop-loss sent for it.
+# "unfilled_unknown" (F-RX-1): the order-state check could not find the order at the venue and confirmed nothing filled.
+# Neither open nor finished: the venue's own answer (rejected, cancelled, filled) still lands on it when it comes.
 ORDER_STATUSES = ("submitted", "accepted", "partially_filled", "filled", "canceled", "rejected", "denied", "expired",
-                  "triggered")
+                  "triggered", "unfilled_unknown")
 FINISHED_ORDER_STATUSES = ("filled", "canceled", "rejected", "denied", "expired", "triggered")
 OPEN_ORDER_STATUSES = ("submitted", "accepted", "partially_filled")
 # F-C3B-A: a Strategy archived while not yet flat waits for its withdrawal; one with nothing to withdraw says so
@@ -1269,6 +1271,10 @@ GATED_INTENTS = ("entry", "rebalance")  # the orders the portfolio gate reserves
 INTENTS = ("entry", "exit", "stop_loss", "take_profit", "risk_halt", "risk_pause", "pm_flatten", "rebalance",
            "liquidation", "liquidation_cut", "wind_down", "wind_down_stop",  # the venue would take it; cut back before it does (String(16))
            "leg_unwind")  # P2-8: a two-leg Strategy's leg closed because its other leg couldn't be held
+# F-RX-1: the orders that close or cut a position the Strategy holds (store.closing_orders). Not the venue's own
+# liquidation, which the Strategy never sent.
+CLOSING_INTENTS = ("exit", "stop_loss", "take_profit", "risk_halt", "risk_pause", "pm_flatten", "liquidation_cut",
+                   "wind_down", "wind_down_stop", "leg_unwind")
 
 
 def _traded_venue(c, sleeve: str) -> str | None:
@@ -2402,6 +2408,18 @@ class Store:
         with self.engine.connect() as c:
             rows = _rows(c.execute(q))
         return rows[0] if rows else None
+
+    def closing_orders(self, sleeve: str, since: datetime | None = None) -> list[dict]:
+        """F-RX-1: a Strategy's closing orders (CLOSING_INTENTS) sent at or after since, oldest first, each with its
+        status, the venue's or risk engine's words (message) and when it last moved (updated_at). Every one is
+        listed, refused or not, so a reader counts refused closes in a row from the tail (F-RX-2)."""
+        o = orders_t.c
+        q = (select(o.order_id, o.intent, o.status, o.message, o.ts, o.updated_at, o.instrument)
+             .where(o.sleeve == sleeve, o.intent.in_(CLOSING_INTENTS)))
+        if since is not None:
+            q = q.where(o.ts >= since)
+        with self.engine.connect() as c:
+            return _rows(c.execute(q.order_by(o.ts, o.id)))
 
     def order_counts(self, sleeve: str | None = None) -> dict[str, int]:
         q = select(orders_t.c.status, func.count()).group_by(orders_t.c.status)

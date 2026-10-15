@@ -1430,6 +1430,12 @@ class SleeveRuntime:
         if status in ("rejected", "denied"):
             self.store.event(self.name, "warning", f"order_{status}", f"order {order_id} {status}: {message}", ts=self.now())
 
+    def on_order_modify_rejected(self, order_id: str, message: str = "") -> None:
+        """F-RX-1: the venue refused to resize a working order (a resting stop). Journaled as an event only: the
+        order still works at its old size, so its status stays and it never counts as a refused close."""
+        self.store.event(self.name, "warning", "order_modify_rejected",
+                         f"order {order_id} resize refused: {message or 'no reason given'}", ts=self.now())
+
     def on_fill(self, *, side: str, qty: float, price: float, fee: float, order_id: str, trade_id: str,
                 ts: datetime | None = None) -> None:
         """ts: when it filled, when that isn't now (a backtest's fill on a gap, at the bar's open)."""

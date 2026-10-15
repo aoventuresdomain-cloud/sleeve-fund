@@ -6272,6 +6272,8 @@ class LongFlatStrategy(Strategy):
 
     def on_order_modify_rejected(self, event) -> None:
         self._resizing.pop(str(event.client_order_id), None)
+        if self.runtime is not None:
+            self.runtime.on_order_modify_rejected(str(event.client_order_id), str(getattr(event, "reason", "") or ""))
         self._resize_if_due()
 
     def _resize_if_due(self) -> None:
