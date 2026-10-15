@@ -158,3 +158,40 @@ def test_r1_def_the_default_sessions_load_on_candles_up_to_an_hour_and_are_refus
     else:
         with pytest.raises(ValueError, match="session levels are read on candles of 1 hour or less"):
             check_definition(defn, bar_minutes=minutes)
+
+
+def test_r1_a_restart_straight_after_gappy_sessions_is_not_warm_until_a_complete_session_is_in(instrument):
+    """HoE 15 Oct: Asia on the 19th is complete, the 20th and 21st each miss 4 of 32 candles. A node running all along
+    still holds the 19th's levels; one restarted at 08:15 UTC on the 21st warms up on its two days of candles, which
+    hold only the two gappy sessions, so it has no levels. It never trades on missing levels: no entry until the 22nd's
+    session, the first complete one it sees, is behind it (its levels move on the 08:15 close)."""
+    from sleeve_fund.research.runner import run_backtest
+    from sleeve_fund.strategies.definitions import to_params
+
+    df = _candles("2026-10-18 12:00", 4 * 24 * 5)
+    df["open"], df["volume"] = df["close"].shift(1).fillna(df["close"]), 1.0
+    df["high"], df["low"] = df[["open", "close"]].max(axis=1) * 1.001, df[["open", "close"]].min(axis=1) * 0.999
+    key = _keys(df, *WINDOWS["asia"])
+    for day in ("2026-10-20", "2026-10-21"):
+        df = df.drop(df[key == pd.Timestamp(day)].index[10:14])
+        key = _keys(df, *WINDOWS["asia"])
+    defn = {"version": 1, "reason": "Above the Asia session's low: in at the first settled close.",
+            "blocks": {"asia": {"kind": "session_levels", "session": "asia"}},
+            "long": {"entry": {"left": "close", "op": ">", "right": "asia.low"}}}
+    restart = pd.Timestamp("2026-10-21 08:15", tz="UTC")
+    warm = check_definition(defn, bar_minutes=15).warmup[None]
+    fresh_from = df.index[df.index.get_loc(restart) - warm + 1]
+
+    def first_entry(feed):
+        res = run_backtest("rules", feed, instrument, params=to_params(defn), bar_minutes=15, half_spread=0)
+        f = res.fills.sort_values("ts_last")
+        return min(pd.Timestamp(f.loc[o, "ts_last"]) for o in f.index
+                   if res.decisions[o]["intent"] == "entry")
+
+    blk = BLOCKS["session_levels"](session="asia")
+    seen = dict(zip(df[df.index >= fresh_from].index, _feed(blk, df[df.index >= fresh_from])))
+    assert blk.skipped == [("2026-10-20", 28, 32), ("2026-10-21", 28, 32)]
+    assert seen[restart] is None and seen[pd.Timestamp("2026-10-22 08:00", tz="UTC")] is None
+    assert seen[pd.Timestamp("2026-10-22 08:15", tz="UTC")] is not None
+    assert first_entry(df) < restart  # the node running all along trades on the 19th's levels
+    assert first_entry(df[df.index >= fresh_from]) >= pd.Timestamp("2026-10-22 08:15", tz="UTC")
