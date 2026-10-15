@@ -75,6 +75,20 @@ RAL = "reset_after_liquidation"
 # references re-based at its equity now, journaled as an event of this kind; the command tells a running process.
 BOOK_RESET = "book_reset"
 COMMANDS = {"pause", "resume", "flatten", RAL, BOOK_RESET}
+# The reason the supervisor gives the flatten it sends every holder under a portfolio halt (Supervisor.
+# _halt_every_strategy). A command carries no actor, so the words a flatten leaves on a strategy come from this
+# (F-HALTREF-2): "flattened by the portfolio halt", not "flattened by PM".
+HALT_FLATTEN = "Portfolio halted: "
+HALT_WORDS = "flattened by the portfolio halt"
+
+
+def flattened_words(reason: str) -> str:
+    """A strategy's status words for a flatten given with this reason."""
+    if reason.startswith(HALT_FLATTEN):
+        return f"{HALT_WORDS}: {reason[len(HALT_FLATTEN):]}"
+    return f"flattened by PM: {reason}"
+
+
 # Applied by the supervisor, not the strategy: restart the process so it trades under settings the PM
 # changed (Store.change_settings).
 RELOAD = "reload"
@@ -3291,16 +3305,20 @@ class Store:
             rows = _rows(c.execute(q))
         return rows[0] if rows else None
 
-    def refused_ideas(self, sleeve: str, since: datetime | None = None, limit: int = 200) -> list[dict]:
-        """The gate's refusals and trims of `sleeve`'s ideas, newest first, one per idea (its submit check; the fill
-        backstop only when it decided alone): decided_at, underlying, intent, requested_qty, approved_qty, outcome,
-        limit_hit, price, book_equity and open_risk."""
+    def refused_ideas(self, sleeve: str | None, since: datetime | None = None, limit: int = 200) -> list[dict]:
+        """The gate's refusals and trims of `sleeve`'s ideas (every Strategy's when None), newest first, one per idea
+        (its submit check; the fill backstop only when it decided alone): sleeve, decided_at, underlying, intent,
+        requested_qty, approved_qty, outcome, test_hit, limit_hit, compliance_version, price, book_equity,
+        open_risk, would_be (the refused test's measure at the requested size, a share of the book) and side (+1/-1)."""
         d = gate_decisions_t
-        q = (select(d.c.decided_at, d.c.underlying, d.c.intent, d.c.requested_qty, d.c.approved_qty, d.c.outcome,
-                    d.c.limit_hit, d.c.price, d.c.book_equity, d.c.open_risk, d.c.stage)
+        q = (select(sleeves_t.c.name.label("sleeve"), d.c.decided_at, d.c.underlying, d.c.intent, d.c.requested_qty,
+                    d.c.approved_qty, d.c.outcome, d.c.test_hit, d.c.limit_hit, d.c.compliance_version, d.c.price,
+                    d.c.book_equity, d.c.open_risk, d.c.stage, d.c.would_be, d.c.side)
              .join(sleeves_t, sleeves_t.c.id == d.c.sleeve_id)
-             .where(sleeves_t.c.name == sleeve, d.c.outcome.in_(("rejected", "trimmed")))
+             .where(d.c.outcome.in_(("rejected", "trimmed")))
              .order_by(d.c.decided_at.desc(), d.c.seq.desc()).limit(limit))
+        if sleeve is not None:
+            q = q.where(sleeves_t.c.name == sleeve)
         if since is not None:
             q = q.where(d.c.decided_at >= since)
         with self.engine.connect() as c:
@@ -3590,8 +3608,9 @@ class Store:
                     commands_t.c.sleeve == sleeve, commands_t.c.applied_at.is_(None),
                     commands_t.c.command.in_(("pause", "flatten"))).order_by(commands_t.c.id)) if r.reason not in system]
                 if asked:
-                    words = "flattened by PM" if asked[-1].command == "flatten" else "paused by PM"
-                    hold = {"status": "paused", "status_reason": f"{words}: {asked[-1].reason}", "paused_until": None}
+                    words = (flattened_words(asked[-1].reason) if asked[-1].command == "flatten"
+                             else f"paused by PM: {asked[-1].reason}")
+                    hold = {"status": "paused", "status_reason": words, "paused_until": None}
             if hold:
                 c.execute(insert(reset_holds_t).values(reset_id=rid, **hold))
         if cleared:
@@ -4733,10 +4752,10 @@ class Store:
         if held != "halted":  # never downgrade a halt, as the paper process doesn't
             # The reset drops pending commands and starts the run afresh, so record the pause the paper process
             # would have set (paper.runtime) as the hold split_run carries over.
-            words = "flattened by PM" if command == "flatten" else "paused by PM"
+            words = flattened_words(reason.strip()) if command == "flatten" else f"paused by PM: {reason.strip()}"
             c.execute(reset_holds_t.delete().where(reset_holds_t.c.reset_id == req.id))
-            c.execute(insert(reset_holds_t).values(reset_id=req.id, status="paused",
-                                                   status_reason=f"{words}: {reason.strip()}", paused_until=None))
+            c.execute(insert(reset_holds_t).values(reset_id=req.id, status="paused", status_reason=words,
+                                                   paused_until=None))
         return True
 
     def add_missing_param(self, sleeve: str, key: str, value) -> bool:

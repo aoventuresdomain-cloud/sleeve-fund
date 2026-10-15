@@ -31,7 +31,7 @@ from fastapi.templating import Jinja2Templates
 from sleeve_fund import compliance_rules, lifecycle, liquidation, markets, open_risk
 from sleeve_fund.dashboard import book as bookm
 from sleeve_fund.dashboard import development as dev
-from sleeve_fund.dashboard import attribution, compliance, gates, reasons, reports, riskops, trading, withdrawal
+from sleeve_fund.dashboard import attribution, compliance, gates, legs, reasons, reports, riskops, trading, withdrawal
 from sleeve_fund.dashboard.jobs import Jobs
 from sleeve_fund.dashboard.metrics import STALE, sleeve_summary
 from sleeve_fund.data import spec_minutes
@@ -54,7 +54,7 @@ from sleeve_fund.research.ledger import IdeaLedger, opened_words
 from sleeve_fund.research.holdout import HoldoutLocks
 from sleeve_fund.research.trials import TrialsRegister
 from sleeve_fund.risk import PROFILES, leverage_cap
-from sleeve_fund.store import BACKTEST_PREFIX, LIQUIDATION_RESET, RAL, Store, is_backtest, utcnow
+from sleeve_fund.store import BACKTEST_PREFIX, HALT_FLATTEN, LIQUIDATION_RESET, RAL, Store, is_backtest, utcnow
 from sleeve_fund.paper.runtime import (EXITS_ONLY, RESUMABLE, clearing_action, entry_blocked, liquidation_event,
                                       pair_ral_figures)
 from sleeve_fund.strategies import REGISTRY, check_perp_sizing, check_perp_stop
@@ -66,6 +66,7 @@ ROOT = HERE.parent.parent
 TEARSHEETS = study_run.TEARSHEETS
 LEDGER = study_run.LEDGER
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,40}$")
+FUND_BANNER_PAGES = {"home.html", "sleeve.html", "portfolio_settings.html"}  # C7: Portfolio, a Strategy, Portfolio Settings
 VERSION = os.environ.get("APP_VERSION", "dev")[:12]
 ORDER_HISTORY_ROWS = 15  # the strategy page's Order history; the Blotter has the rest
 
@@ -150,6 +151,8 @@ def create_app(store: Store | None = None) -> FastAPI:
     templates.env.globals["exit_ways"] = trading.exit_ways
     templates.env.globals["open_risk_limit"] = open_risk.LIMIT  # the share of the book the gate allows
     templates.env.filters["no_venues"] = no_venues  # stored reasons and messages name no venue (QA U18)
+    templates.env.filters["uk_time"] = legs.uk_time
+    templates.env.filters["leg_label"] = legs.label  # a second leg's row "<name>~2" reads "<name>, leg 2" (P2-8)
     templates.env.filters["pct"] = lambda x: f"{x:+.2%}"
     templates.env.filters["pct0"] = lambda x: f"{x:.0%}"
     # Biggest contributor first, by size whatever its sign (UP-3): rows keep their sign colour and bar direction.
@@ -212,23 +215,27 @@ def create_app(store: Store | None = None) -> FastAPI:
         now = utcnow()
         wanted = [x for x in sleeves if x.desired_state == "running"]
         put_away = st().archived()
+        ones = legs.without_legs(sleeves)  # a two-leg Strategy is one strategy (P2-8 step 7)
         return {
             "mode": "paper",  # live mode arrives with the G2 work; until then nothing can trade real money
             "live_locked": True,
             "now": now,
             "version": VERSION,
             "alerts": st().open_alert_count(),
-            "total": len(sleeves),
-            "running": sum(1 for x in sleeves if x.status == "running"),
-            "attention": sum(1 for x in sleeves if x.status in ("halted", "error")),
-            "unhealthy": sum(1 for x in wanted if not (x.heartbeat_at and now - x.heartbeat_at < STALE)),
+            "total": len(ones),
+            "running": sum(1 for x in ones if x.status == "running"),
+            "attention": sum(1 for x in ones if x.status in ("halted", "error")),
+            "unhealthy": len({x.parent or x.name for x in wanted
+                              if not (x.heartbeat_at and now - x.heartbeat_at < STALE)}),
             # The rail lists every strategy not put away, so each is one click from anywhere.
             "strategies": [{"name": x.name, "status": x.status, "test": bookm.is_test_account(st(), x)}
-                           for x in sleeves if x.name not in put_away],
+                           for x in ones if x.name not in put_away],
         }
 
     def page(request: Request, name: str, **ctx) -> HTMLResponse:
         ctx.setdefault("shell", shell())
+        if name in FUND_BANNER_PAGES:  # C7: one banner at the top, only when it applies
+            ctx.setdefault("fund_banner", compliance.fund_banner(st()))
         return templates.TemplateResponse(request, name, ctx)
 
     def _saved_backtest_summary(name: str | None) -> dict | None:
@@ -288,15 +295,21 @@ def create_app(store: Store | None = None) -> FastAPI:
         # Margin used and Open risk, as the position figures compute them (UI v2, item 7), once they exist.
         if "open_risk" in positions:
             book.update(margin_used=positions["margin"], open_risk=positions["open_risk"])
-        return page(request, "home.html", summaries=[x for x in summaries if x["sleeve"].name not in put_away],
-                    archived=[x for x in summaries if x["sleeve"].name in put_away],
+        return page(request, "home.html",
+                    summaries=legs.fold(st(), [x for x in summaries if x["sleeve"].name not in put_away], frames),
+                    leg_flags=legs.flags(st()),
+                    # A two-leg Strategy is archived whole: one row, its legs summed (CR F283-2).
+                    archived=legs.fold(st(), [x for x in summaries if x["sleeve"].name in put_away], frames),
                     earlier=[st().sleeve(n) for n in earlier], book_start=st().book_start(),
                     earlier_resets=bool(set(earlier) & set(st().reset_runs())),
                     book=book, alerts=st().alerts(limit=30), shell=shell(),
                     positions=positions, working=working, holdings=bookm.holdings(positions["rows"], book["equity"]),
                     book_fills=trading.book_fills(st(), sleeves + [x["sleeve"] for x in tests]), funding=funding,
                     fill_count=sum(x["fills"] for x in summaries), tests=tests,
-                    test_names={x["sleeve"].name for x in tests}, **_archived_now(request, put_away))
+                    test_names={x["sleeve"].name for x in tests},
+                    # F-A1-FUNDLINE: every Strategy in the book, archived ones too, so the rows add up to the fund.
+                    fund_attr=attribution.fund(st(), [x["sleeve"] for x in summaries], utcnow()),
+                    **_archived_now(request, put_away))
 
     def _archived_now(request: Request, put_away) -> dict:
         """F-C3B-A-UI on the Portfolio: right after an archive, which Strategy went and the fund's book as it now is
@@ -541,7 +554,9 @@ def create_app(store: Store | None = None) -> FastAPI:
         except KeyError:
             raise HTTPException(404, "no such strategy") from None
         bt_id = name[len(BACKTEST_PREFIX):] if is_backtest(name) else None
-        x = bookm.sleeve_extras(st(), sleeve_summary(st(), s), bookm.daily(st(), name))
+        frame = bookm.daily(st(), name)
+        x = bookm.sleeve_extras(st(), sleeve_summary(st(), s), frame)
+        two = None if bt_id else _two_legs(s, x, frame)
         fills = st().fills(name, limit=100_000)
         events = st().events(name, limit=400)
         orders = trading.orders_by_id(st(), name)
@@ -592,7 +607,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         fill_hold = hold if hold is not None and hold["kind"] == "fill_hold" else None
         attr = None if bt_id else attribution.strategy(st(), name, trips, utcnow(), q.get("attr") if q.get("attr")
                                                        in attribution.PERIODS else "all")
-        return page(request, "sleeve.html", x=x, fills=fills[:200], trips=trips, feed=feed, orders=recent, attr=attr, fill_hold=fill_hold,
+        return page(request, "sleeve.html", x=x, two=two, fills=fills[:200], trips=trips, feed=feed, orders=recent, attr=attr, fill_hold=fill_hold,
                     order_total=order_total, liquidated=liquidated, ral=ral, clearing=clearing,
                     reset_dropped=reset_dropped,
                     positions=positions, working=working, fees_funding=fees_funding,
@@ -620,7 +635,25 @@ def create_app(store: Store | None = None) -> FastAPI:
                     clone_qs=_clone_qs(s), backtest_id=bt_id, tested=_tested(bt_id),
                     demo=None if bt_id else _demo_copy(st(), s),
                     strategy_errors=st().strategy_errors(name, since_start=not bt_id),
-                    path=path, journey=None if bt_id else _journey(s, x, path, st().mirror_rows(name, limit=200)))
+                    path=path, journey=None if bt_id else _journey(s, x, path, st().mirror_rows(name, limit=200)),
+                    rules=_order_rules(s, x), tp_drop=None if bt_id else _tp_drop(recent, x),
+                    contribution=None if bt_id else _contribution(st(), x),
+                    fund_halt=None if bt_id else compliance.fund_halt(st()),
+                    bars=[] if bt_id else compliance.strategy_bars(
+                        st(), s.instrument.split("/")[0], _risk_to_stop(x, position), s.params.get("risk_per_trade")))
+
+    def _two_legs(s, x: dict, frame) -> dict | None:
+        """A two-leg Strategy's part of its page (P2-8 step 7): on its first leg, the Strategy folded (legs.fold_one)
+        with its flags; on its second, which Strategy it belongs to. None on a one-leg strategy."""
+        if s.parent:
+            return {"of": s.parent}
+        second = st()._leg_of(s.name)
+        if second is None:
+            return None
+        frame2 = bookm.daily(st(), second)
+        y = bookm.sleeve_extras(st(), sleeve_summary(st(), st().sleeve(second)), frame2)
+        folded = legs.fold_one(st(), x, y, {s.name: frame, second: frame2})
+        return {**folded, "flags": legs.flags(st()).get(s.name, [])}
 
     def _strategy_indicators(name: str) -> list[dict]:
         """The strategy's own indicator values for the chart (P1-3s, agreed shape v2/chart-indicators-shape.md):
@@ -1701,6 +1734,10 @@ def create_app(store: Store | None = None) -> FastAPI:
             reason = _reason("compliance", form.get("reason", ""), form.get("reason_pick"), form.get("reason_note", ""))
             if not reason:
                 errors.append("a reason is required")
+            if not errors:
+                cur = compliance.as_set(st().compliance())
+                if not compliance_rules.changes(cur[0], tests, cur[1], groups):  # F-LOCKED-OFF: no no-op version
+                    errors.append(f"Nothing changes from version {st().compliance().version}, so nothing was saved")
             if errors:
                 raise ValueError("; ".join(errors))
             version = st().add_compliance_version(compliance.rows(tests), groups, created_by="pm", note=reason,
@@ -2320,7 +2357,8 @@ KIND_WORDS = {"handler_failed": "Strategy error", "maker_fill_above_tape": "Make
               "backup_problem": "Backup problem", "exits_change": "Exits changed", "settings_applied": "Settings applied",
               "stop_rejected": "Stop refused", "stop_reset": "Stop reset", "exits_applied": "Exits applied", "warmup_short": "Short warm-up",
               "start_refused": "Start refused",
-              "account_move": "Moved account", "portfolio_carried_invalid": "Portfolio not marked"}
+              "account_move": "Moved account", "portfolio_carried_invalid": "Portfolio not marked",
+              "pm_flatten": "Flattened by PM"}
 
 
 def action_words(action: str) -> str:
@@ -2690,7 +2728,10 @@ def _timeline(events: list[dict], decisions: list[dict]) -> list[dict]:
             continue
         kind = ("decisions" if k.startswith("pm_") else "trades" if k in _TRADE_KINDS
                 else "risk" if k in _RISK_KINDS or e["level"] in ("warning", "error") else "system")
-        rows.append({"ts": e["ts"], "kind": kind, "level": e["level"], "title": kind_words(k), "text": e["message"]})
+        # The portfolio halt's flatten rides the PM's (its intent is pm_flatten) but isn't the PM's (F-HALTREF-2).
+        title = ("Flattened by the portfolio halt" if k == "pm_flatten" and e["message"].startswith(HALT_FLATTEN)
+                 else kind_words(k))
+        rows.append({"ts": e["ts"], "kind": kind, "level": e["level"], "title": title, "text": e["message"]})
     for d in decisions:
         rows.append({"ts": d["ts"], "kind": "decisions", "level": "info", "title": action_words(d["action"]),
                      "text": f"by {d['actor']}: {d['reason']}"})
@@ -2713,6 +2754,44 @@ def _position_history(events: list[dict], funding: list[dict], position: dict | 
              for f in funding if f["ts"] >= since]
     rows.sort(key=lambda r: r["ts"], reverse=True)
     return rows[:60]
+
+
+def _order_rules(s, x: dict) -> dict:
+    """The Strategy's own settings as the Settings panel reads them (C8): risk per trade as a share of the fund, the
+    leverage its orders may use and whether a stop is required. A Strategy without a stop trades at 1x only."""
+    rpt = s.params.get("risk_per_trade")
+    stop = bool(s.params.get("stop_loss") or s.params.get("stop_atr"))
+    lev = leverage_cap(x["profile"], s.params) if markets.is_perp(s.params) and stop else 1.0
+    return {"risk_pct": float(rpt) * 100 if rpt else None, "leverage": lev, "stop": stop}
+
+
+def _risk_to_stop(x: dict, position: dict | None) -> float | None:
+    """The open position's loss if its stop is hit, at the last mark (open_risk.position_risk, the gate's formula);
+    0 when flat, None with no stop to measure from."""
+    if not position or not x.get("qty"):
+        return 0.0
+    try:
+        return float(open_risk.position_risk(x["qty"], x["price"], position.get("stop_px")))
+    except ValueError:
+        return None
+
+
+def _tp_drop(orders: list[dict], x: dict) -> dict | None:
+    """The take-profit the engine dropped on the open position's entry (QD's signal keys: tp_dropped in the PM's
+    words, tp_target and tp_break_even as fractions), or None. Read from the newest entry order."""
+    if not x.get("qty"):
+        return None
+    entry = next((o for o in orders if o.get("intent") == "entry"), None)
+    sig = (entry or {}).get("signal") or {}
+    if not sig.get("tp_dropped"):
+        return None
+    return {"words": sig["tp_dropped"], "target": sig.get("tp_target"), "break_even": sig.get("tp_break_even")}
+
+
+def _contribution(store, x: dict) -> float | None:
+    """Its P&L since start over the fund's book at its first mark; None before the book's first mark."""
+    first = store.first_book_mark()
+    return float(x["pnl"]) / float(first["equity"]) if first and first["equity"] else None
 
 
 def _journey(s, x: dict, path: list[dict] | None, mirror: list[dict]) -> list[dict]:

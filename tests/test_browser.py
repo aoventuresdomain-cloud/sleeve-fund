@@ -309,7 +309,7 @@ def test_the_strategy_page_puts_signals_beside_the_chart_and_the_position_below_
     page = ctx.new_page()
     page.goto(f"{site}/sleeves/eth-trend")
     page.wait_for_load_state("networkidle")
-    chart, signals = page.locator(".ov-price").bounding_box(), page.locator(".ov-signals").bounding_box()
+    chart, signals = page.locator(".ov-price").bounding_box(), page.locator(".ov-side").bounding_box()  # C8: Signals is a tab of the side panel
     lower = page.locator(".ov-lower").bounding_box()
     if os.environ.get("SCREENSHOT_DIR"):
         page.screenshot(path=os.path.join(os.environ["SCREENSHOT_DIR"], "strategy-1440.png"), full_page=True)
