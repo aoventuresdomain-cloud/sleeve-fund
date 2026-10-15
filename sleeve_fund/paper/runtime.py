@@ -67,14 +67,14 @@ LIQUIDATED_WORDS = (fold(WIPED_OUT), "wiped out", "position margin lost")  # a l
 # one, and says what alone clears it; no venue names.
 CODES = ("liquidated", "drawdown_halt", "halted", "portfolio_halt", "daily_pause", "portfolio_pause", "retired",
          "winding_down", "stopped", "paused", "exits_only", "stale_data", "degraded_candle", "funding_missing",
-         "portfolio_stale", "book_moving", "exit_rejects")
+         "portfolio_stale", "book_moving", "exit_rejects", "account_shared")
 LABELS = {"liquidated": "Liquidated", "drawdown_halt": "Drawdown halt", "halted": "Halted",
           "portfolio_halt": "Portfolio halted", "daily_pause": "Daily loss pause", "portfolio_pause": "Portfolio paused",
           "retired": "Retired", "winding_down": "Winding down", "stopped": "Stopped",
           "paused": "Paused", "exits_only": "Exits only", "stale_data": "Stale data",
           "degraded_candle": "Degraded candle", "funding_missing": "No funding rate",
           "portfolio_stale": "Portfolio unchecked", "book_moving": "Entry refused",
-          "exit_rejects": "Exits rejected"}
+          "exit_rejects": "Exits rejected", "account_shared": "Account shared"}
 # The portfolio gate's entry blocks (portfolio.gate.entry_block's kinds) as CHOKE codes, with the words their own
 # reason starts with, which the label already says.
 PORTFOLIO_CODES = {"halt": ("portfolio_halt", "Portfolio halted: "),
@@ -191,7 +191,8 @@ def block_codes(why: str | None) -> tuple[str, ...]:
 def blocked_state(sleeve, now: datetime | None = None, *, liquidated: str | None = None, archived: bool = False,
                   holds: dict[str, str] | None = None, starting: bool = False,
                   since: datetime | None = None, portfolio: Why | None = None,
-                  moving: str | None = None, exit_rejects: Why | None = None) -> tuple[bool, Why | None]:
+                  moving: str | None = None, exit_rejects: Why | None = None,
+                  account: Why | None = None) -> tuple[bool, Why | None]:
     """CHOKE (HoE 6 Oct 20:52, Advisor): the one "nothing opens" gate, as (blocked, why). Blocked: liquidated until a
     reset after liquidation (`liquidated`, from the journal: liquidation_head), a halt, the daily-loss pause, retired,
     then (not when `starting`: the supervisor's Stop and the dashboard's Start and Resume, which act on these
@@ -223,6 +224,8 @@ def blocked_state(sleeve, now: datetime | None = None, *, liquidated: str | None
         causes.append(_cause("book_moving", f"this Strategy is moving to {moving} at the next mark."))
     if exit_rejects is not None:
         causes.append(exit_rejects)
+    if account is not None:
+        causes.append(account)
     if not starting:  # Start and Resume act on a stopped or paused strategy: what they can't clear is above
         if "stopped" in (sleeve.status, getattr(sleeve, "desired_state", "running")):
             causes.append(STOPPED)
@@ -372,7 +375,33 @@ def entry_blocked(store, name: str, now: datetime | None = None, *, starting: bo
     return blocked_state(sleeve, now, liquidated=liquidation_head(store, name), archived=name in store.archived(),
                          holds=held or None, starting=starting, since=_halted_since(store, name, sleeve),
                          portfolio=portfolio_block(store, now), moving=moving_to(store, name),
-                         exit_rejects=exit_reject_block(store, sleeve.instrument, now))
+                         exit_rejects=exit_reject_block(store, sleeve.instrument, now),
+                         account=account_block(store, name))
+
+
+def account_block(store, name: str) -> Why | None:
+    """A7 ON (accounts.per_strategy): the live or test-network account `name` is on is shared with another
+    Strategy, so it opens and adds nothing; its exits, stops, the safety stop and a PM flatten still run (Advisor MUST:
+    a Strategy holding on a restart is never left unmanaged). Unread, it fails closed. OFF: None."""
+    from sleeve_fund.accounts import per_strategy
+
+    if not per_strategy():
+        return None
+    try:
+        account = store.account_of(name)
+        holders = store.account_holders(account)
+        me = store.sleeve(name).parent or name
+    except Exception:  # noqa: BLE001 - fail closed, never an error out of CHOKE
+        return _cause("account_shared", "whether its account is its own couldn't be read from the journal.")
+    others = [h for h in holders if h != me]
+    if not others or account == "paper" or not _live_account(store, account):
+        return None
+    return _cause("account_shared", f"account {account} is shared with {', '.join(others)}; one account per Strategy "
+                  "is on. Exits and stops still run; move one Strategy to its own account to trade again.")
+
+
+def _live_account(store, account: str) -> bool:
+    return store.account_kind(account) == "live"
 
 
 def exit_reject_block(store, instrument: str, now: datetime | None = None) -> Why | None:
@@ -892,7 +921,8 @@ class SleeveRuntime:
                                      portfolio=None if self.backtest else portfolio_block(self.store, self.now()),
                                      moving=None if self.backtest else moving_to(self.store, self.name),
                                      exit_rejects=None if self.backtest or sleeve is None
-                                     else exit_reject_block(self.store, sleeve.instrument, self.now()))
+                                     else exit_reject_block(self.store, sleeve.instrument, self.now()),
+                                     account=None if self.backtest else account_block(self.store, self.name))
         self._episode(why if blocked else None)
         return blocked, why
 

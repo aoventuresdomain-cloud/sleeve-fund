@@ -2563,6 +2563,7 @@ class Store:
         side of the book until the poll lands it (land_move); a later request replaces it. One whose create is still
         waiting takes the new account as where it joins. A move that flows nothing is made at once, as is any move on
         a book never marked."""
+        self._check_one_each(sleeve, account)
         ts = utcnow()
         joining = self.book_moves_pending().get(sleeve, {}).get("kind") == "create"
         moved, waits = [], []
@@ -2596,6 +2597,47 @@ class Store:
                 # a move made at once (no flow: back to the side it is on) replaces any that waited (DA 0024 rule 2)
                 self._end_waiting(c, sleeve, ts, f"a move to account {account} on the same side of the book was "
                                                  "made at once")
+
+    def account_holders(self, account: str) -> list[str]:
+        """A7: the Strategies (a two-leg's legs as one) whose rows are on `account` and not yet released: put away and
+        out of the book (withdrawn) releases it (Advisor (b)); a saved backtest never holds one."""
+        out = set()
+        gone = self.withdrawn()
+        for r in self.accounts_links(account):
+            if is_backtest(r) or r in gone:
+                continue
+            out.add(self.sleeve(r).parent or r)
+        return sorted(out)
+
+    def account_kind(self, account: str) -> str | None:
+        """paper or live, or None for no such account. A read only (accounts() also makes the paper row)."""
+        with self.engine.connect() as c:
+            return c.execute(select(accounts_t.c.kind).where(accounts_t.c.name == account)).scalar()
+
+    def accounts_links(self, account: str) -> list[str]:
+        with self.engine.connect() as c:
+            return list(c.execute(select(sleeve_accounts_t.c.sleeve)
+                                  .where(sleeve_accounts_t.c.account == account)).scalars())
+
+    def _check_one_each(self, sleeve: str, account: str) -> None:
+        """A7 ON (accounts.per_strategy): a live or test-network account is one Strategy's, and a Strategy that holds
+        a position or has an order open is never moved off its account (HoQA line 5). OFF: nothing is checked."""
+        from sleeve_fund.accounts import per_strategy
+
+        if not per_strategy():
+            return
+        if self.account_of(sleeve) != account:
+            if not self.lifecycle_flat(sleeve)[1]:
+                raise ValueError(f"{sleeve} holds a position: it stays on its account until it is flat")
+            if self.orders(sleeve, statuses=OPEN_ORDER_STATUSES, limit=1):
+                raise ValueError(f"{sleeve} has an open order: it stays on its account until the order is done")
+        if self.account_kind(account) != "live":
+            return
+        me = self.sleeve(sleeve).parent or sleeve
+        others = [h for h in self.account_holders(account) if h != me]
+        if others:
+            raise ValueError(f"account {account} is {', '.join(others)}'s: one account per Strategy is on, so each "
+                             "live or test-network account trades for one Strategy only")
 
     # --- F-ASSIGN-STALE: moves waiting for the supervisor's poll -------------------------------------------------
 
