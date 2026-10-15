@@ -318,6 +318,39 @@ def check_assets(store) -> Section:
     return sec
 
 
+def _build_config(sleeve) -> None:
+    """Build the Strategy's config from its row as the dashboard's create check does: bad settings raise here."""
+    from nautilus_trader.model import BarType, InstrumentId
+
+    from sleeve_fund.paper.config import from_store
+    from sleeve_fund.strategies import REGISTRY
+
+    cfg = from_store(sleeve)
+    _, config_cls = REGISTRY[cfg.strategy]
+    config_cls(instrument_id=InstrumentId.from_str(cfg.instrument_id), bar_type=BarType.from_str(cfg.bar_type),
+               assumed_taker_fee=float(cfg.fees.taker), **cfg.params)
+
+
+def check_strength(store) -> Section:
+    """G5: every Strategy set to size by signal strength builds the config its node will: a valid setting, not
+    rebalancing to a target weight (CR F-G5-1; a band the Model injects counts, QD F-G5-3) and not a pair's leg (QD
+    F-G5-4). Any of them fails, named."""
+    sec = Section("Sizing by signal strength")
+    for s in store.sleeves(include_legs=False):
+        params = s.params or {}
+        if params.get("signal_strength") is None:
+            continue
+        try:  # the config the node builds (QD F-G5-3): a Model may inject a rebalance band of its own
+            _build_config(s)
+        except Exception as exc:  # noqa: BLE001 - whatever stops it building stops the Strategy at start: named
+            sec.add(FAIL, f"{s.name}: {exc}")
+            continue
+        sec.add(PASS, f"{s.name}: sizes by signal strength ({params['signal_strength']['mapping']})")
+    if not sec.lines:
+        sec.add(NOTE, "no Strategy sizes by signal strength (it is off for every one)")
+    return sec
+
+
 def run(url: str, environ: dict[str, str] | None = None) -> tuple[bool, str]:
     """The checks against the journal at url, and the one-page report."""
     from datetime import UTC, datetime
@@ -326,7 +359,7 @@ def run(url: str, environ: dict[str, str] | None = None) -> tuple[bool, str]:
     store = read_only_store(url)
     engine = store.engine
     sections = [check_store(engine), check_keys(env, engine), check_alerts(env), check_venues(engine),
-                check_books(store), check_assets(store), check_warmups(store)]
+                check_books(store), check_assets(store), check_warmups(store), check_strength(store)]
     ok = not any(s.failed for s in sections)
     out = [f"Start check: {'PASS' if ok else 'FAIL'}",
            f"{datetime.now(UTC):%Y-%m-%d %H:%M} UTC, {journal_kind(url)} journal, read-only",
