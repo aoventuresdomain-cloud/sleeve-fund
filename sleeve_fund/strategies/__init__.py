@@ -1,5 +1,6 @@
 from sleeve_fund.strategies.base import IdeaSpec, LongFlatConfig, LongFlatStrategy
 from sleeve_fund.strategies.buy_and_hold import BuyAndHold, BuyAndHoldConfig
+from sleeve_fund.strategies.candle_step import CandleStep, CandleStepConfig
 from sleeve_fund.strategies.dip_buy import DipBuy, DipBuyConfig
 from sleeve_fund.strategies.donchian import Donchian, DonchianConfig
 from sleeve_fund.strategies.ping_pong import PingPong, PingPongConfig
@@ -11,6 +12,7 @@ from sleeve_fund.strategies.trend_filter import TrendFilter, TrendFilterConfig
 
 REGISTRY = {
     "buy_and_hold": (BuyAndHold, BuyAndHoldConfig),
+    "candle_step": (CandleStep, CandleStepConfig),
     "dip_buy": (DipBuy, DipBuyConfig),
     "donchian": (Donchian, DonchianConfig),
     "ping_pong": (PingPong, PingPongConfig),
