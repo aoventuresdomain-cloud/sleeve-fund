@@ -124,3 +124,56 @@ def test_k_a_trigger_price_amend_through_the_client_is_refused_never_sent_withou
         guard_modify(on=True, trigger_price="61000.0")
     guard_modify(on=True, trigger_price=None)  # a quantity-only amend passes
     guard_modify(on=False, trigger_price="61000.0")  # the simulated client moves triggers itself
+
+
+# Advisor STOP-RETRY: a refused place is retried by its reject class ------------------------------------------------
+def _refused(mover, level="61000.0"):
+    m, old = mover
+    new = m.move(level)[0][1]
+    return m, old, new
+
+
+def test_l_a_transient_refusal_is_retried_once_after_the_back_off_then_alerted_never_looped(mover):
+    m, old, new = _refused(mover)
+    acts = m.on_rejected(new, "rate limit", kind="transient")
+    [retry] = [a for a in acts if a[0] == "retry"]
+    assert retry[2:] == ("61000.0", "0.010") and retry[1] != new  # a fresh order id, placed after the back-off
+    assert m.resting() == {old, retry[1]}
+    acts = m.on_rejected(retry[1], "timeout", kind="transient")
+    assert kinds(acts) == ["alert"] and m.resting() == {old}  # once only: left to the next stop update
+    assert m.move("61000.0")[0][0] == "place"  # the next update tries again, fresh
+
+
+def test_m_a_refusal_because_the_price_is_already_past_the_new_level_closes_at_market_at_once(mover):
+    """A tightening move in a fast fall: the venue refuses the new stop because it would trigger at once. The
+    Strategy's stop has been hit, so its quantity closes now; only the old looser stop resting would be wrong."""
+    m, old, new = _refused(mover)
+    acts = m.on_rejected(new, "trigger price would trigger immediately", kind="crossed")
+    assert ("close", "0.010", "stop level already crossed") in acts
+    assert not [a for a in acts if a[0] in ("retry", "place")]
+    assert m.resting() == {old}  # reduce-only: harmless while the close goes out
+    assert m.on_filled(None, "0.010") == [("cancel", old)]  # the close filled: nothing left to protect
+
+
+@pytest.mark.parametrize("current", [True, False])
+def test_n_any_other_refusal_is_not_retried_and_is_critical_when_no_stop_is_left(current):
+    m = StopMover(side="SELL", qty="0.010")
+    first = m.move("60000.0")[0][1]
+    if current:
+        m.on_accepted(first)
+        first = m.move("61000.0")[0][1]
+    acts = m.on_rejected(first, "reduce-only conflict", kind="other")
+    [alert] = [a for a in acts if a[0] == "alert"]
+    assert alert[1] == ("warning" if current else "critical")
+    assert not [a for a in acts if a[0] in ("retry", "place", "close")]
+
+
+@pytest.mark.parametrize("code, msg, kind", [
+    (10006, "Too many visits!", "transient"), (10016, "Server error", "transient"), (None, "timeout", "transient"),
+    (110092, "expect Rising, but trigger_price[59000] <= current[59500]", "crossed"),
+    (110093, "expect Falling, but trigger_price[61000] >= current[60500]", "crossed"),
+    (110017, "reduce-only rule not satisfied", "other"), (10001, "params error", "other")])
+def test_o_the_venue_s_reject_codes_map_to_their_class(code, msg, kind):
+    from sleeve_fund.paper.exec_client import reject_class
+
+    assert reject_class(code, msg) == kind
