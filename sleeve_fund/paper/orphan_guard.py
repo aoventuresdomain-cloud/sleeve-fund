@@ -596,7 +596,8 @@ def qa_resting_entry(store, name: str, order_id: str, decision_close: datetime, 
     s = 1 if side == "BUY" else -1
     intent = {"side": s, "qty": Decimal("0.1"), "close": Decimal(60_000), "price": Decimal(60_000), "stop_frac": 0.02,
               "what": "entry", "step": Decimal("0.001"), "min_qty": Decimal("0.001"), "instrument": "BTC",
-              "leverage": None, "atr_pct": None, "bar": int(decision_close.timestamp()) * 1_000_000_000}
+              "leverage": None, "atr_pct": None, "taker": Decimal(0),  # a fee-less set-up, as PE1's a256490d
+              "bar": int(decision_close.timestamp()) * 1_000_000_000}
     g = paper_gate(store)(name, intent, int(decision_close.timestamp()) * 1_000_000_000 + 1_000_000)
     if g.checked.reservation is None:
         raise RuntimeError(f"set-up: the gate didn't approve {name}'s entry: {g.decision}")

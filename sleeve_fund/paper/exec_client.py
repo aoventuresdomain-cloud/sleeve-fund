@@ -2,7 +2,7 @@
 and HEAD3 (1); spec /mnt/project-files/sleeve-fund/pe3-plans/exec-client-spec.md).
 
 It ships OFF: with EXEC_MODE unset (or anything but demo or live) paper keeps the simulated client and nothing here
-reaches the exchange. One client for demo and live: the framework's Bybit execution adapter, built by one function
+reaches the exchange. One client for demo and live: the framework's execution adapter for the venue, built by one function
 from the host and keys in the environment, with no demo-only path. ON is gated in code by two journaled records of the
 PM's (EXEC-SPEC MUST 1): drill-go lets demo ON for the drills, drills-passed lets the fund's paper Strategies onto the
 demo client; live is refused until G2. Only a trade-only key passes. Every line here names hosts and settings, never a
@@ -17,11 +17,11 @@ from datetime import UTC, datetime, timedelta
 from sleeve_fund import exec_target
 
 # Where the client sends orders is read by exec_target, the one reader the start check's "Order client" line shares
-# (PE4, head 3): EXEC_MODE, EXEC_VENUE, EXEC_HOST and the venue's own key pair for that mode (BYBIT_DEMO_API_KEY and
-# _SECRET in demo). This module adds the gates on top: the PM's records, the G2 lock, the key's permissions.
+# (PE4, head 3): EXEC_MODE, EXEC_VENUE, EXEC_HOST and the venue's own key pair for that mode (exec_target.KEYS). Hosts,
+# key variables and documentation links live there, never here (test_venues). This module adds the gates on top: the PM's records, the G2 lock, the key's permissions.
 MODE_ENV, HOST_ENV = exec_target.MODE_ENV, exec_target.HOST_ENV
 OFF, DEMO, LIVE = "off", "demo", "live"
-ENVIRONMENT = {DEMO: "DEMO", LIVE: "MAINNET"}  # the adapter's BybitEnvironment, by mode
+ENVIRONMENT = {DEMO: "DEMO", LIVE: "MAINNET"}  # the adapter's environment, by mode
 LIVE_BEFORE_G2 = False  # the live lock (store's live accounts): nothing trades real money before G2
 DRILL_GO = "exec_drill_go"  # the PM's journaled go for the demo drills: lets demo ON
 DRILLS_PASSED = "exec_drills_passed"  # the PM's journaled record that they passed: the fund's paper Strategies may use it
@@ -29,13 +29,13 @@ QUEUE_ENV = "EXEC_ENTRY_QUEUE_MAX_S"  # how long an entry over the limit may que
 QUEUE_DEFAULT_S, QUEUE_MAX_S = 5.0, 10.0
 # The venue's orderLinkId: at most 36 letters, digits, dashes and underscores (EXEC-SPEC MUST 5).
 LINK_ID = re.compile(r"[A-Za-z0-9_-]{1,36}")
-LINK_ID_SOURCE = "https://bybit-exchange.github.io/docs/v5/order/create-order"
+LINK_ID_SOURCE = exec_target.DOC_ORDER_LINK_ID
 # Every venue figure this module holds names its documented source (HEAD3 (1) c); recorded responses join it when the
 # ON path is built (drill prep).
 
 # Production per-UID limits for linear perpetuals, used in demo as well: a demo's own looser limits are never trusted
 # (DRILL-VENUE-2 (b)). endpoint -> (requests, per seconds, source). Checked against the source before QA.
-_RATE_DOC = "https://bybit-exchange.github.io/docs/v5/rate-limit"
+_RATE_DOC = exec_target.DOC_RATE_LIMITS
 LIMITS = {
     "order/create": (10, 1.0, _RATE_DOC),
     "order/amend": (10, 1.0, _RATE_DOC),

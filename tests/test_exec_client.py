@@ -35,6 +35,24 @@ def test_any_other_mode_is_on_and_fails_closed(mode):
     assert ec.exec_settings(env).on and any("unknown mode" in w for w in _fails(_lines(env, drill_go=True)))
 
 
+@pytest.mark.parametrize("mode", [None, "", "off", "none", "OFF", "Off", "junk"])
+def test_the_client_and_the_start_check_read_exec_mode_the_same_way(mode):
+    """fx2 (QT3 x1a[OFF], HoE: one EXEC_MODE reader): the client, the node's refusal and exec_target agree on every
+    mode, so "OFF", "Off" or junk is ON and refused everywhere, never NOTEd off by one and failed by the other."""
+    from sleeve_fund import exec_target
+    from sleeve_fund.paper.safety import PaperSafetyError
+
+    env = {**KEYS, "EXEC_HOST": DEMO} | ({} if mode is None else {"EXEC_MODE": mode})
+    target_on = exec_target.read(env) is not None
+    assert ec.exec_settings(env).on is target_on
+    assert target_on is (mode not in (None, "", "off", "none"))
+    if target_on:
+        with pytest.raises(PaperSafetyError):
+            ec.assert_off(env)
+    else:
+        ec.assert_off(env)
+
+
 def test_demo_with_a_production_host_and_live_with_a_demo_host_are_refused():
     """DRILL-VENUE-2 MUST 4: the start check refuses a production host in demo mode and a demo host in live mode."""
     assert any("production host" in w for w in _fails(_lines({**KEYS, "EXEC_MODE": "demo", "EXEC_HOST": PROD},

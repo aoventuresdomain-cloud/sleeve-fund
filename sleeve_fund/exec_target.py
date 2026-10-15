@@ -33,6 +33,10 @@ KEYS = {
     ("BYBIT", "demo"): ("BYBIT_DEMO_API_KEY", "BYBIT_DEMO_API_SECRET"),
     ("BYBIT", "live"): ("BYBIT_TRADE_API_KEY", "BYBIT_TRADE_API_SECRET"),
 }
+# The venue's own documentation for the figures the order client holds (HEAD3 (1) c: every venue figure names its
+# source); here so the client itself names no venue (HoE TEC 15 Oct).
+DOC_ORDER_LINK_ID = "https://bybit-exchange.github.io/docs/v5/order/create-order"
+DOC_RATE_LIMITS = "https://bybit-exchange.github.io/docs/v5/rate-limit"
 OFF = "off (simulated paper client)"
 SCOPE_UNCHECKED = "key scope not yet checked: trade-only is verified with the venue when the order client goes on"
 
