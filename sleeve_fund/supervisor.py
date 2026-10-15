@@ -218,13 +218,16 @@ def insurance_breaks(store: Store, since: datetime | None = None) -> list[str]:
     or the PM's last Resume) on, per Strategy in the book, whatever fill it names. Returns each in words, [] for none."""
     from sqlalchemy import select
 
-    from sleeve_fund.store import insurance_t
+    from sleeve_fund.store import CLOSE_OUT, insurance_t
 
     names = [s.name for s in store.sleeves() if _in_book(store, s)]
     if not names or since is None:
         return []
     i = insurance_t.c
-    q = select(i.sleeve, i.amount).where(i.sleeve.in_(names), i.ts >= since).order_by(i.id)
+    # An old book close-out (RESET-NEG) is a transfer inside the book, not a credit from outside it (DA, cell 10); a
+    # credit naming no fill (before 0013) still counts
+    q = (select(i.sleeve, i.amount).where(i.sleeve.in_(names), i.ts >= since, i.order_id.is_distinct_from(CLOSE_OUT))
+         .order_by(i.id))
     with store.engine.connect() as c:
         rows = list(c.execute(q))
     return [f"{r.sleeve}: an insurance credit of {to_decimal(r.amount, 'amount'):,.2f} booked inside the fund, which "

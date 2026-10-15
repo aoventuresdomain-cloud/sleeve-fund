@@ -98,7 +98,9 @@ def test_a3_a_second_reset_once_the_fund_holds_the_book_starts_it_afresh_again(s
 
 
 def test_c1_a_reset_run_that_lost_is_a_pocket_no_withdrawal_takes_so_it_is_refused_by_name(store):
-    _make(store, "a", 10_000)
+    # RESET-NEG (Advisor, 15 Oct): a loss its Strategy's cash covers is closed out (test_reset_close_out); one it can't
+    # (100 against a 120 loss) is still refused
+    _make(store, "a", 100)
     _mark(store, T0)
     _trade(store, "a", -120, T0)
     run = _reset(store, "a")

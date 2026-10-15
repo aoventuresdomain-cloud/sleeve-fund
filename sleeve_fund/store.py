@@ -1151,6 +1151,9 @@ FINISHED_ORDER_STATUSES = ("filled", "canceled", "rejected", "denied", "expired"
 OPEN_ORDER_STATUSES = ("submitted", "accepted", "partially_filled")
 # F-C3B-A: a Strategy archived while not yet flat waits for its withdrawal; one with nothing to withdraw says so
 WITHDRAWAL_DEFERRED, WITHDRAWAL_NONE = "withdrawal_deferred", "withdrawal_none"
+# RESET-NEG (Advisor, 15 Oct): the key of an old book close-out's cash rows (close_out_run). A transfer inside the book,
+# never trading: the book's cash readers count it, the rows trades are paired with (insurance) leave it out.
+CLOSE_OUT = "old-book-close-out"
 NEXT_MARK = "flat, waiting for the supervisor's next mark"  # why a flat Strategy put away is deferred (F286-CR1)
 # F-ASSIGN-STALE: a create or a move waiting for the poll (book_moves), and its landing
 BOOK_MOVE_WAITING, BOOK_MOVE_LANDED = "book_move_waiting", "book_move_landed"
@@ -3183,7 +3186,11 @@ class Store:
         return booked
 
     def insurance(self, sleeve: str, limit: int | None = 1000) -> list[dict]:
-        q = select(insurance_t).where(insurance_t.c.sleeve == sleeve).order_by(insurance_t.c.ts.desc()).limit(limit)
+        """The insurance fund's covers, newest first, as the trades are paired with them (the Trades tab, attribution):
+        an old book close-out (CLOSE_OUT) is a transfer, not a trade's, so it isn't one (HoQA RESET-NEG cell 9)."""
+        i = insurance_t.c
+        q = (select(insurance_t).where(i.sleeve == sleeve, (i.order_id.is_(None)) | (i.order_id != CLOSE_OUT))
+             .order_by(i.ts.desc()).limit(limit))
         with self.engine.connect() as c:
             return _rows(c.execute(q))
 
@@ -3396,6 +3403,32 @@ class Store:
         with self.engine.connect() as c:
             return {r.run: _aware(r.done_at) for r in c.execute(
                 select(resets_t).where(resets_t.c.done_at.is_not(None), resets_t.c.run != ""))}
+
+    def reset_from(self) -> dict[str, str]:
+        """Each run a reset put away, and the Strategy it was reset from: {run name: Strategy name}."""
+        with self.engine.connect() as c:
+            return {r.run: r.sleeve for r in c.execute(
+                select(resets_t.c.run, resets_t.c.sleeve).where(resets_t.c.done_at.is_not(None), resets_t.c.run != ""))}
+
+    def close_out_run(self, run: str, into: str, amount: Decimal, key: str, ts: datetime, actor: str, action: str,
+                      said: str) -> bool:
+        """RESET-NEG (Advisor, 15 Oct): a reset run of the old book below zero closed out against the Strategy it was
+        reset from, whose capital it ran on (split_run): `amount` (the run's loss, > 0) credited to the run, bringing it
+        to exactly 0, and debited from `into`, with the decision `said`, in one transaction. A transfer inside the book,
+        so its total doesn't move. The rows are cash rows both of the book's readers count (journal_book and
+        strategy_cash_pnl), so its identity doesn't move either, keyed by `key` and the run: once only (insurance_once),
+        a second call writes nothing and returns False."""
+        if amount <= 0:
+            raise ValueError(f"a close-out credits a run below zero, not {amount}")
+        i = insurance_t.c
+        with self.engine.begin() as c:
+            if c.execute(select(i.id).where(i.sleeve == run, i.order_id == key, i.trade_id == run)).first():
+                return False
+            c.execute(insert(insurance_t), [
+                {"sleeve": run, "ts": ts, "price": 0, "amount": amount, "order_id": key, "trade_id": run},
+                {"sleeve": into, "ts": ts, "price": 0, "amount": -amount, "order_id": key, "trade_id": run}])
+            c.execute(insert(decisions_t).values(ts=ts, actor=actor, action=action, sleeve=into, reason=said.strip()))
+        return True
 
     def refuse_reset(self, request: dict, why: str) -> None:
         """Close a reset the supervisor won't carry out: done, with no run put away, and journaled with why."""
