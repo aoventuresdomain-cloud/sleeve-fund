@@ -4,6 +4,7 @@ rows and writes nothing. Without a journal (no store) B8 is as it was."""
 
 import os
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 
 import pytest
 
@@ -95,18 +96,51 @@ def test_age_is_judged_as_fee_live_does(tmp_path, capfd, store, hours, verdict):
     assert rows["maint. tiers (fetched)"] == verdict and rows["taker fee (fetched)"] == verdict, out
 
 
-def test_the_engine_charging_less_than_the_fetched_fee_is_a_must_and_more_a_follow_up(tmp_path, capfd, store,
-                                                                                       monkeypatch):
+def test_the_fee_compared_is_what_paper_charges_the_instrument_not_the_published_vip0(tmp_path, capfd, store):
+    """X1 (PE4 cross-check, HoE 15:33 UK): an account fetch below the published VIP 0 is what paper charges on the
+    instrument (fees.resolve with the instrument), so the rows read equal and PASS, never "engine higher"."""
     from sleeve_fund import fees
 
     _tiers(store, NOW - timedelta(hours=1))
     _fees(store, NOW - timedelta(hours=1), taker="0.0004", maker="0.0001")  # the account pays less than published
-    code, rows, out = _run(tmp_path, capfd, store)  # the engine charges the published 0.05% / 0.02%: more, cautious
-    assert rows["taker fee (fetched)"] == "FOLLOW-UP" and rows["maker fee (fetched)"] == "FOLLOW-UP", out
-    real = fees.resolve
-    monkeypatch.setattr(fees, "resolve", lambda venue=None, store=None: _cheaper(real(venue, None)))
+    charged = fees.resolve("binance", store, "BTC/USDT", now=NOW, account="paper-main").fees
+    assert (charged.taker, charged.maker) == (Decimal("0.0004"), Decimal("0.0001"))  # what paper's fills pay
     code, rows, out = _run(tmp_path, capfd, store)
-    assert rows["taker fee (fetched)"] == "MUST" and code == 1, out
+    assert rows["taker fee (fetched)"] == "PASS" and rows["maker fee (fetched)"] == "PASS" and code == 0, out
+    assert "account          equal" in out and "higher" not in out, out
+
+
+def test_the_engine_charging_less_than_the_fetched_fee_is_a_must_and_more_a_follow_up(tmp_path, capfd, store,
+                                                                                       monkeypatch):
+    """The comparison can fire both ways against the instrument-aware rate: paper charging less than the venue is a
+    MUST, more a FOLLOW-UP (TEC on the 15 Oct cell: it pinned the published VIP 0 as "the engine's")."""
+    from sleeve_fund import fees
+
+    _tiers(store, NOW - timedelta(hours=1))
+    _fees(store, NOW - timedelta(hours=1), taker="0.0004", maker="0.0001")
+    real, asked = fees.resolve, []
+
+    def shifted(change):
+        def resolve(venue=None, store=None, instrument=None, **kw):
+            asked.append(instrument)
+            return change(real(venue, store, instrument, **kw))
+        return resolve
+
+    monkeypatch.setattr(fees, "resolve", shifted(_cheaper))
+    code, rows, out = _run(tmp_path, capfd, store)
+    assert rows["taker fee (fetched)"] == "MUST" and code == 1 and "lower" in out, out
+    assert asked and set(asked) == {"BTC/USDT"}  # asked for the instrument's rate, never the venue's published one
+    monkeypatch.setattr(fees, "resolve", shifted(_dearer))
+    code, rows, out = _run(tmp_path, capfd, store)
+    assert rows["taker fee (fetched)"] == "FOLLOW-UP" and rows["maker fee (fetched)"] == "FOLLOW-UP", out
+
+
+def _dearer(quote):
+    from dataclasses import replace
+
+    from sleeve_fund.instruments import FeeSchedule
+
+    return replace(quote, fees=FeeSchedule(Decimal("0.0002"), Decimal("0.00055")))
 
 
 def _cheaper(quote):
@@ -145,9 +179,10 @@ def test_an_accounts_fetched_rates_never_reach_the_public_log(tmp_path, capfd, s
     _tiers(store, NOW - timedelta(hours=1))
     _fees(store, NOW - timedelta(hours=1), taker="0.000437", maker="0.000123")
     code, rows, out = _run(tmp_path, capfd, store)
-    assert rows["taker fee (fetched)"] == "FOLLOW-UP" and rows["maker fee (fetched)"] == "FOLLOW-UP", out
+    # X1: paper is charged the fetched rate, so the rows read equal (TEC: they read "more" against the published VIP 0)
+    assert rows["taker fee (fetched)"] == "PASS" and rows["maker fee (fetched)"] == "PASS", out
     assert "437" not in out and "123" not in out, out
-    assert "engine charges more" in out
+    assert "account          equal" in out
 
 
 def test_the_published_stand_in_may_print_its_rates(tmp_path, capfd, store):
