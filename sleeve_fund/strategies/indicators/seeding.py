@@ -45,11 +45,33 @@ def _engine(x) -> bool:
 
 
 NAMES: dict[type, str] = {Rsi: "RSI", Ema: "EMA", ExponentialMovingAverage: "EMA", Atr: "ATR"}
+# How each forgets its start: an EMA by 1 - 2 / (N + 1) a bar, Wilder's smoothing (RSI, ATR) by 1 - 1 / N.
+EXPONENTIAL, WILDER = "exponential", "wilder"
+SMOOTHING: dict[type, str] = {Rsi: WILDER, Atr: WILDER, Ema: EXPONENTIAL, ExponentialMovingAverage: EXPONENTIAL}
 
 
-def register(cls: type, label: str, kind: str, tolerance: float) -> None:
+def register(cls: type, label: str, kind: str, tolerance: float, smoothing: str = EXPONENTIAL) -> None:
     """A model's own recursive average, under the Advisor's tolerance for its kind (an EMA's 1 bp)."""
-    TOLERANCE[cls], NAMES[cls] = (kind, tolerance), label
+    TOLERANCE[cls], NAMES[cls], SMOOTHING[cls] = (kind, tolerance), label, smoothing
+
+
+def period_cap(cls: type) -> int:
+    """The longest period the check can judge (Advisor, 15 Oct ~07:59 UK): the CAP/2 and CAP seeds bound the CAP
+    seed's error while the decay r over CAP/2 bars is at most a half, r^(CAP/2) <= 1/2."""
+    per_bar = 1 - 0.5 ** (1 / (CAP // 2))  # the most a bar may forget: 1 - r at the bound
+    return math.floor(2 / per_bar - 1) if SMOOTHING[cls] == EXPONENTIAL else math.floor(1 / per_bar)
+
+
+def too_long(unit) -> list[str]:
+    """Each recursive average in `unit` whose period is past period_cap: its start would still show after CAP bars,
+    so it could never settle within the check; refused where a Strategy is made."""
+    out = []
+    for leaf in leaves(unit):
+        n, cap = _length(leaf), period_cap(type(leaf))
+        if n is not None and int(n) > cap:
+            out.append(f"{name(leaf)} is longer than the warm-up seed check can judge: the longest it can settle "
+                       f"within {CAP:,} bars is {cap:,} (A10)")
+    return out
 
 
 def _length(leaf) -> int | None:

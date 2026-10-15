@@ -130,29 +130,36 @@ def check_venues(engine: Engine) -> Section:
     return sec
 
 
-def check_warmups(store) -> Section:
-    """A10 (Independent Quant Advisor, 15 Oct 07:02 UK): every Strategy in the book is built as the engine builds it and
-    each indicator it decides on is classified for the warm-up's seed-twice check (strategies.indicators.seeding). One
-    the check can't judge, a recursive average it doesn't know, is a FAIL: the Strategy doesn't go to paper until it is
-    covered."""
+def build_model(strategy: str, venue: str, instrument: str, params: dict, bar_spec: str):
+    """A Strategy's model built as the engine builds it, from its model settings alone (store.model_params), and the
+    units the warm-up seed check seeds: its decision candles' and each slower timeframe's (A10)."""
     from sleeve_fund.dashboard.charts import spec_minutes
     from sleeve_fund.instruments import spot_pair
-    from sleeve_fund.strategies import REGISTRY
-    from sleeve_fund.strategies.indicators import seeding
     from sleeve_fund.store import model_params
     from sleeve_fund.strategies.series import build
     from sleeve_fund.venues import venue as venue_profile
+
+    profile = venue_profile(venue)
+    base, quote = instrument.split("/")
+    inst = spot_pair(base, quote, fees=profile.fees, venue=profile.venue, price_precision=8)
+    model = build(strategy, inst, model_params(params), spec_minutes(bar_spec))
+    return model, model.seeding_units() + [u for us in model.seeding_timeframes().values() for u in us]
+
+
+def check_warmups(store) -> Section:
+    """A10 (Independent Quant Advisor, 15 Oct 07:02 UK): every Strategy in the book is built as the engine builds it and
+    each indicator it decides on is classified for the warm-up's seed-twice check (strategies.indicators.seeding). One
+    the check can't judge, a recursive average it doesn't know or one too long to settle within it, is a FAIL: the
+    Strategy doesn't go to paper until it is covered."""
+    from sleeve_fund.strategies import REGISTRY
+    from sleeve_fund.strategies.indicators import seeding
 
     sec = Section("Warm-up seed check")
     for s in store.sleeves():
         if s.lifecycle == "retired" or s.strategy not in REGISTRY:
             continue
         try:
-            profile = venue_profile(s.venue)
-            base, quote = s.instrument.split("/")
-            inst = spot_pair(base, quote, fees=profile.fees, venue=profile.venue, price_precision=8)
-            model = build(s.strategy, inst, model_params(s.params), spec_minutes(s.bar_spec))
-            units = model.seeding_units() + [u for us in model.seeding_timeframes().values() for u in us]
+            _, units = build_model(s.strategy, s.venue, s.instrument, s.params, s.bar_spec)
         except Exception as exc:  # noqa: BLE001 - said, as a failure: an unbuilt Strategy isn't checked
             sec.add(FAIL, f"{s.name}: couldn't be built to check its indicators ({exc})")
             continue
@@ -160,6 +167,8 @@ def check_warmups(store) -> Section:
             for kind in seeding.uncovered(unit):
                 sec.add(FAIL, f"{s.name}: {label} ({kind}) is a recursive average the warm-up seed check doesn't cover "
                               "(A10); it doesn't go to paper until it is")
+            for why in seeding.too_long(unit):
+                sec.add(FAIL, f"{s.name}: {label}: {why}")
     if not sec.failed:
         sec.add(PASS, "every indicator a Strategy decides on is covered by the warm-up seed check")
     return sec
