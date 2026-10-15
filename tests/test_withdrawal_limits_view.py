@@ -105,7 +105,7 @@ def test_the_archive_dialog_previews_the_book_and_the_page_after_shows_it(held, 
     assert "Archived, its equity leaves the fund's book at the supervisor's next mark" in _get(client, "/sleeves/b")
     _mark(held, T0 + timedelta(seconds=5))
     assert "Archived, its equity left the fund's book, which isn't a loss." in _get(client, "/sleeves/b")
-    assert "their equity is out of the fund's book</span>" in _get(client, "/")
+    assert "none of the fund's book is theirs any more</span>" in _get(client, "/")  # TEC-FE-WN2 (HoE)
     r = client.post("/sleeves/b/archive", data={"action": "restore", "reason": "back"}, auth=AUTH, headers=HDR,
                     follow_redirects=False)
     assert r.headers["location"] == "/sleeves/b?put_away=restored"
@@ -119,7 +119,7 @@ def test_an_archive_from_before_the_withdrawal_is_said_to_still_count(held, clie
 
     held.set_desired_state("b", "stopped")
     _archived_before(held, "b")
-    assert "their equity is out of the fund's book, except 1 still in it<" in _get(client, "/")
+    assert "none of the fund's book is theirs any more, except 1 still in it<" in _get(client, "/")  # TEC-FE-WN2
 
 
 def test_a_retire_shows_the_book_after_it(held, client):
@@ -270,6 +270,35 @@ def test_a_strategy_put_away_with_nothing_withdrawn_says_its_pnl_stays_in_the_fu
     assert r.status_code == 303
     _mark(held, T0 + timedelta(seconds=5))
     monkeypatch.setattr(type(held), "withdrawn", lambda self: {"b": D(0)})  # as F-WN-1 journals it
+    monkeypatch.setattr(supervisor, "bridge_start", lambda store: T0)  # the fund held the cash before it went
     page = _get(client, "/sleeves/b")
     assert ("Archived, it left with nothing to move: its P&L stays in the fund's cash, which isn't a loss." in page)
     assert "its equity left the fund's book" not in page
+
+
+@pytest.mark.parametrize("out", [D(0), D(10_000)])
+def test_portfolios_archived_summary_reads_true_whatever_was_withdrawn(held, client, monkeypatch, out):
+    """F-WN-2 (HoE): the Archived summary on Portfolio reads true whether a Strategy left with its own equity or, under
+    fund-held cash, with nothing to move and its P&L kept in the fund's cash: none of the book is its own any more."""
+    client.post("/sleeves/b/archive", data={"action": "archive", "reason": "done with it"}, auth=AUTH, headers=HDR,
+                follow_redirects=False)
+    _mark(held, T0 + timedelta(seconds=5))
+    monkeypatch.setattr(type(held), "withdrawn", lambda self: {"b": out})
+    home = _get(client, "/")
+    assert "stopped and put away; none of the fund's book is theirs any more</span>" in home
+    assert "their equity is out of the fund's book" not in home
+
+
+def test_a_strategy_wiped_out_before_the_fund_held_the_cash_never_reads_as_no_loss(held, client, monkeypatch):
+    """F-WN2-2 (CR): before the fund held the cash, a Strategy put away at 0 equity also withdrew 0, having lost all
+    its own capital; it keeps the old words, never "its P&L stays in the fund's cash, which isn't a loss". Nor does
+    one put away before the bridge began, read after it."""
+    client.post("/sleeves/b/archive", data={"action": "archive", "reason": "done with it"}, auth=AUTH, headers=HDR,
+                follow_redirects=False)
+    _mark(held, T0 + timedelta(seconds=5))
+    monkeypatch.setattr(type(held), "withdrawn", lambda self: {"b": D(0)})
+    for start in (None, held.archived()["b"] + timedelta(seconds=1)):
+        monkeypatch.setattr(supervisor, "bridge_start", lambda store, start=start: start)
+        page = _get(client, "/sleeves/b")
+        assert "its P&L stays in the fund's cash" not in page, start
+        assert "Archived, its equity left the fund's book" in page, start
