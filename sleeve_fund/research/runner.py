@@ -73,6 +73,9 @@ class BacktestResult:
     # ABSORB-GAP: the gap past the bankruptcy price the venue absorbed on each liquidation, as {"ts", "amount"};
     # recorded, never booked (GAP-LIQ-CAP books the liquidation at bankruptcy), so research can charge it.
     absorbed: list = field(default_factory=list)
+    # Research's charged view (study._charge_absorbed): `equity` less the absorbed gaps, and the engine's own curve
+    # here, for information only. None when nothing was absorbed: then `equity` is the engine's curve.
+    uncharged_equity: pd.Series | None = None
     # How far the fills can be trusted, when they relied on what traded first inside a bar (P1-D13): e.g.
     # "bars-only: stop fills pessimistic". Empty when no resting level ever lay inside a bar.
     labels: list = field(default_factory=list)

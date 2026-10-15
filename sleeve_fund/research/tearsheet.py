@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import math
 
@@ -43,6 +44,9 @@ RANDOM_SIDE_CHECK = "Beats random long or short"
 # isn't judged (funding.baseline_check; Advisor, 6 Oct 2026, QA P1-O17).
 FUNDING_CHECK = "Funding charged at the venue's own rates"
 LIQUIDATION_CHECK = "Liquidations"
+ABSORB_CHECK = "Gap absorbed by the venue past liquidation (shown, not a test)"
+ABSORB_FAIL_CHECK = "Passes with liquidation gaps charged"
+ABSORB_FAIL = "passes only because the venue absorbs liquidation gaps"
 # A G1 check that a person's acknowledgement can clear: shown, and it stops a pass until acknowledged.
 NEEDS_ACK = "ACK"
 OOS_CHECKS = (SHARPE_CHECK, "Holds up when parameters move", "Enough out-of-sample trades to judge",
@@ -251,6 +255,7 @@ def g1_checks(r: StudyResult, ledger: IdeaLedger, register=None,
         ),
         _liquidation_check(r, liquidation_ack),
     ]
+    checks += _absorb_rows(r, checks, lambda view: g1_checks(view, ledger, register, liquidation_ack))
     if why_not:
         # Under a NOT JUDGED headline these can't fail: they measure the out-of-sample the study didn't get,
         # and red Fail chips there read as a verdict (review round 9, N6).
@@ -275,6 +280,48 @@ def _funding_rows(r: StudyResult) -> list[tuple[str, str, str]]:
         rows.append(("Full-period funding at the venue's own rates (shown, not a test)", "INFO",
                      funding.baseline_check(full.funding_at_baseline, full.funding_held,
                                             full.funding_baseline_longest, "full-period")[1]))
+    return rows
+
+
+def _absorb_rows(r: StudyResult, checks: list, judge) -> list[tuple[str, str, str]]:
+    """ABSORB-GAP (INSURE-RULE point 5; Advisor 15 Oct ~02:05 UK): every test above read the curve with the gaps the
+    venue absorbed past liquidation charged, nothing re-sized. This says how much, per window, beside out-of-sample
+    and the holdout uncharged, for information only; and an idea that passes uncharged but fails charged FAILs, saying
+    so. judge: g1_checks on a result, to judge the uncharged view. None when nothing was absorbed."""
+    gaps = [(f"out-of-sample test window {k + 1}", f.absorbed) for k, f in enumerate(r.folds)
+            if getattr(f, "absorbed", None)]
+    if getattr(r, "holdout_absorbed", None):
+        gaps.append(("holdout", r.holdout_absorbed))
+    if not gaps:
+        return []
+    total, count = sum(a["amount"] for _, g in gaps for a in g), sum(len(g) for _, g in gaps)
+    per = "; ".join(f"{w} {sum(a['amount'] for a in g):,.2f} over {_n(len(g), 'liquidation')}" for w, g in gaps)
+    words = (f"{total:,.2f} over {_n(count, 'liquidation')} ({per}); every test here reads the curve gap charged, no "
+             "re-sizing. Uncharged, for information only:")
+    uncharged = getattr(r, "oos_uncharged_returns", None)
+    if uncharged is not None:
+        words += (f" out-of-sample Sharpe {_num(summary(uncharged)['sharpe'])} "
+                  f"(charged {_num(summary(r.oos_returns)['sharpe'])})")
+    if getattr(r, "holdout_uncharged", None) and r.holdout:
+        words += (f"{',' if uncharged is not None else ''} holdout Sharpe {_num(r.holdout_uncharged['sharpe'])} "
+                  f"(charged {_num(r.holdout['sharpe'])})")
+    re_free = getattr(r, "random_entry_uncharged", None)
+    if re_free is not None and r.random_entry is not None:
+        words += (f"; random entry beats {re_free.return_percentile:.0f}% uncharged "
+                  f"(charged {r.random_entry.return_percentile:.0f}%)")
+    rows = [(ABSORB_CHECK, "INFO", words)]
+    verdict, failed = g1_verdict(checks)
+    if uncharged is None or verdict != "FAIL":
+        return rows
+    compare = r.oos_compare_returns
+    view = dataclasses.replace(
+        r, oos_returns=uncharged, oos_compare_returns=None if compare is None else uncharged.reindex(compare.index),
+        folds=[dataclasses.replace(f, absorbed=[]) for f in r.folds], oos_uncharged_returns=None, holdout_absorbed=[],
+        **{k: getattr(r, f"{k}_uncharged") for k in ("random_entry", "random_side")
+           if getattr(r, f"{k}_uncharged", None) is not None})
+    if g1_verdict(judge(view))[0] == "PASS":
+        rows.append((ABSORB_FAIL_CHECK, "FAIL", f"{ABSORB_FAIL}: it passes G1 uncharged, and charged it fails "
+                                                 + ", ".join(failed)))
     return rows
 
 
