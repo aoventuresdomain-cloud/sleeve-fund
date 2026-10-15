@@ -789,6 +789,7 @@ class LongFlatStrategy(Strategy):
         # once a UTC day: (day, Gate).
         self._ramp_on = ramp.enabled()
         self._ramp_day = None
+        self._strength_f = None  # G5: the last entry's size factor f, journaled as signal["size_factor"]
         # Paper/live on bars built from live trades: loads warm-up bars from the venue history store
         # (the venue can't serve those bars). Attach with attach_history(); None requests them from
         # the venue's candles instead.
@@ -2539,6 +2540,8 @@ class LongFlatStrategy(Strategy):
                   "budget": round(float(budget), 2), **self._fund_at_entry(base)}
         if strength_words:
             signal["strength"] = strength_words
+            if self._strength_f is not None:  # G5 research side: the size factor, the same field in every engine
+                signal["size_factor"] = self._strength_f
         if ramp_gate is not None and size_by == ramp.LIMIT:  # with the size it would have had, for its track
             signal["ramp"] = ramp_gate.words
             signal[ramp.UNRAMPED] = round(float(min(v for k, v in limits.items() if k != ramp.LIMIT)), 2)
@@ -3559,6 +3562,8 @@ class LongFlatStrategy(Strategy):
                   "budget": round(float(budget), 2), **self._fund_at_entry(base)}
         if strength_words:
             signal["strength"] = strength_words
+            if self._strength_f is not None:  # G5 research side: the size factor, the same field in every engine
+                signal["size_factor"] = self._strength_f
         if ramp_gate is not None and size_by == ramp.LIMIT:  # with the size it would have had, for its track
             signal["ramp"] = ramp_gate.words
             signal[ramp.UNRAMPED] = round(float(min(v for k, v in limits.items() if k != ramp.LIMIT)), 2)
@@ -5671,6 +5676,7 @@ class LongFlatStrategy(Strategy):
         the Model's indicators have settled (A10), journaled, or a missing, NaN or out-of-range strength (journaled as
         an alert, never full size)."""
         cfg = self._cfg.signal_strength
+        self._strength_f = None
         if cfg is None:
             return None
         if values.get("step_qty") is not None:  # a stepped Model's later open: Q, already scaled at its first (F-G5-6)
@@ -5693,6 +5699,7 @@ class LongFlatStrategy(Strategy):
         own = [v for k, v in limits.items() if k in OWN_SIZE_LIMITS or k.endswith("risk profile cap")]
         configured = min(own) if own else min(limits.values())
         limits[strength.LIMIT] = configured * Decimal(repr(st.f))
+        self._strength_f = st.f
         return strength.words(st, float(configured) / base if base else 0.0)
 
     def _ramp_limit(self, limits: dict, side: int, held, price: Decimal) -> ramp.Gate | None:
