@@ -148,3 +148,24 @@ def test_the_fee_is_booked_once_to_cash_and_only_the_liquidation_price_moves(mon
     liq_now = entry_now["signal"]["position_liquidation_px"]
     liq_was = entry_was["signal"]["position_liquidation_px"]
     assert liq_now - liq_was == pytest.approx(float(fill["fee"]) / float(fill["qty"]), rel=1e-6)
+
+
+def test_the_liquidation_price_rounds_to_the_tick_toward_the_entry():
+    """Advisor MUST (LIQ-FEE close, 15 Oct): the float result is rounded to the instrument's tick on the conservative
+    side, up for a long and down for a short, so float error can only bring it nearer the entry. Each raw value sits a
+    hair inside a tick boundary (1e-6 past it); without a tick the price is left as worked."""
+    tick, entry, lev = 0.1, 60_000.0, 2.0
+    # Long, qty 1: formula B binds, liq = 30,300 + fees; fees 0.1 + 1e-6 puts it just past 30,300.1
+    raw = margin.isolated_liquidation(500_000.0, 1.0, entry, lev, MM, fees=0.1 + 1e-6)
+    assert raw == pytest.approx(30_300.100001, abs=1e-7)
+    assert margin.isolated_liquidation(500_000.0, 1.0, entry, lev, MM, fees=0.1 + 1e-6, tick=tick) == 30_300.2
+    # Short, qty -1: formula A binds, liq = (90,000 - fees) / 1.005; fees put it just short of 89,552.3
+    fees = 90_000.0 - 1.005 * (89_552.3 - 1e-6)
+    raw = margin.isolated_liquidation(500_000.0, -1.0, entry, lev, MM, fees=fees)
+    assert raw == pytest.approx(89_552.299999, abs=1e-7)
+    assert margin.isolated_liquidation(500_000.0, -1.0, entry, lev, MM, fees=fees, tick=tick) == 89_552.2
+    # On the tick already: left there, never moved a tick by float noise in the division
+    assert margin.isolated_liquidation(500_000.0, 1.0, entry, lev, MM, fees=0.5, tick=tick) == 30_300.5
+    # The decision's estimate rounds the same way
+    liq, _ = margin.entry_liquidation(500_000.0, 1.0, entry, 1, 0.0, MM, lev, tick=tick)
+    assert liq == margin.isolated_liquidation(500_000.0 - entry, 1.0, entry, lev, MM, tick=tick)
