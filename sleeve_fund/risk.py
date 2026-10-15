@@ -6,7 +6,8 @@ out of the strategy process into an independent risk service.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 
 
@@ -50,6 +51,13 @@ class PortfolioProfile:
     open_risk: float = 0.05  # loss if every stop is hit, stopless positions at their measured move
     drawdown: float = 0.15  # from the high-water mark: flatten and halt every strategy; only the PM restarts
     daily_loss: float = 0.03  # from the 00:00 UTC book: no new entries until the next 00:00 UTC
+    # Bridge Drop A (Advisor COMPLIANCE-5): loss if every stop is hit, per asset (T1) and per asset group (T2), on new
+    # entries only; None = switched off, as a profile from before the compliance tests is. The PM's seeded values are
+    # portfolio.compliance.SEEDED. groups: {underlying: group}, the PM's map, versioned with the tests; with no map at
+    # all T2 has nothing to judge, with one an asset left out of it is refused while T2 is on (Advisor BRIDGE-A-FE-2).
+    asset_open_risk: float | None = None
+    group_open_risk: float | None = None
+    groups: Mapping[str, str] | None = field(default=None, compare=False)
 
 
 PORTFOLIO = PortfolioProfile()

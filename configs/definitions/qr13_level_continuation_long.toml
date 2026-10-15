@@ -1,0 +1,36 @@
+# QR bench: liquidity-level continuation, long leg. Decision candle: 1h.
+# Approximation: "last week's high" is the highest high of the last 7 daily candles (rolling), because the builder has
+# no calendar-week levels yet (tool gap R1). The 1 ATR filter was added after the first version lost: every version
+# tried so far counts against the 20-per-idea budget, and it is judged only on data it has not seen (Advisor 14 Oct).
+version = 1
+name = "qr13-level-continuation-long"
+reason = """Stops cluster just beyond last week's high. When price breaks it and reaches 1 ATR(14) beyond it before
+coming back to the level, those stops have fired and the move tends to continue. Out on a close back below the level,
+after 48 hours, or on a stop 1 ATR below the level."""
+
+[blocks.wk]
+kind = "donchian"
+period = 7
+timeframe = "1d"
+
+[blocks.atr]
+kind = "atr"
+period = 14
+
+[long]
+# Only from a previous close between the level and 1 ATR beyond it (Quant Developer review, 14 Oct): from below,
+# the level is always touched first; from beyond, first_touch would turn into a pullback buy.
+entry = { all = [
+    { left = { prev = "close" }, op = ">", right = { prev = "wk.upper" } },
+    { left = { prev = "close" }, op = "<", right = { add = [{ prev = "wk.upper" }, { prev = "atr" }] } },
+    { first_touch = { reach = { add = ["wk.upper", "atr"] }, before = "wk.upper" } },
+] }
+exit = { left = "close", op = "<", right = "wk.upper" }
+breakout = true
+
+[exits]
+time_stop = { minutes = 2880 }
+stop = { level = { sub = ["wk.upper", "atr"] } }
+
+[costs]
+breakout_slippage_bp = 5

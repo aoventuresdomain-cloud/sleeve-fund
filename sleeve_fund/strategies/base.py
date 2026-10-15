@@ -1503,13 +1503,13 @@ class LongFlatStrategy(Strategy):
         # Held while nothing may open (halted, paused, stopped, liquidated: a fill that raced the block's cancel):
         # never left unwatched (P1-U35, Advisor 20:56), so it gets the safety stop and an incident too.
         orphan, held = self.runtime.entry_blocked()
-        if orphan and set(block_codes(held)) <= {"stale_data", "portfolio_stale", "portfolio_pause"}:
+        if orphan and set(block_codes(held)) <= {"stale_data", "portfolio_stale", "portfolio_pause", "book_moving"}:
             # Stale data alone is not a block a position was held under: a process holds entries from its first moment
             # until its first trade or quote (P1-SG21), so every restart would otherwise swap the model's restored stop
             # for a safety stop and raise an incident before the feed has had a second to arrive. The same for the
             # fund's book not marked yet (a restart before the supervisor's first mark: limits unchecked) and for the
-            # portfolio's daily pause, which keeps positions; a portfolio halt flattens, so it stays a block (CR F229-1,
-            # HoQA MF229-1).
+            # portfolio's daily pause, which keeps positions, and a move to another account waiting for the next mark
+            # (F-ASSIGN-STALE); a portfolio halt flattens, so it stays a block (CR F229-1, HoQA MF229-1).
             orphan = False
         if not (unrestored or self._exits_only or orphan):
             return
@@ -5170,6 +5170,9 @@ class LongFlatStrategy(Strategy):
         # the same objects as the sandbox account's, so balance_total(currency) can miss.
         totals = {str(cur.code): m.as_double() for cur, m in account.balances_total().items()}
         cash = sum(totals.get(c, 0.0) for c in self._codes("quote"))
+        # CUT-A: the simulated account's virtual funding from the fund (paper.node.virtual_funding) is not this
+        # Strategy's cash: the journal's starts at 0, so marks and reconcile see it netted out
+        cash -= getattr(self.runtime, "funded", 0.0) or 0.0
         if self._margin:
             # A margin account holds realised money only; the journal keeps spot-style cash (a short holds
             # its sale's proceeds), so take the open position's cost back out: cash = balance - qty x entry.

@@ -21,6 +21,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import (
     JSON,
     BigInteger,
+    Boolean,
     CheckConstraint,
     DDL,
     Column,
@@ -40,11 +41,13 @@ from sqlalchemy import (
     create_engine,
     delete,
     event,
+    false,
     func,
     case,
     inspect,
     insert,
     literal,
+    and_,
     or_,
     select,
     text,
@@ -144,6 +147,10 @@ fills_t = Table(
     Column("order_id", String(64), nullable=False),
     Column("trade_id", String(64), nullable=False),
     Index("fills_sleeve_ts", "sleeve", "ts"),
+    # Bridge A (DA, 0026): the instrument it was in, so a Strategy on several assets reads per asset. Filled from the
+    # Strategy's own instrument at the database when the writer names none (INSTRUMENT_FILL triggers below).
+    Column("instrument", String(32), nullable=False, server_default=""),
+    Index("fills_sleeve_instrument_ts", "sleeve", "instrument", "ts"),
     # DA-2: a fill is booked once. Keyed with its order: the paper venue's trade ids are deterministic per process
     # (Nautilus sandbox), so after a restart a new order's fill can carry an earlier trade id; the client order id
     # is unique (orders.order_id), so (order, trade) is not.
@@ -171,6 +178,9 @@ funding_t = Table(
     # CASH-4: when a true-up moved cash, the real rate's arrival (ts stays the settlement's), so an as-of read before
     # it shows the baseline only (Advisor 8 Oct 04:10, ruling 2). Only a true-up has one; every other row moved cash at ts.
     Column("arrived_at", TS),
+    # Bridge A (DA, 0026): the instrument it was in, so a Strategy on several assets reads per asset. Filled from the
+    # Strategy's own instrument at the database when the writer names none (INSTRUMENT_FILL triggers below).
+    Column("instrument", String(32), nullable=False, server_default=""),
     CheckConstraint("kind IN ('settled', 'baseline', 'true_up', 'reversal')", name="funding_kind"),
     CheckConstraint("(kind = 'true_up') = (arrived_at IS NOT NULL)", name="funding_true_up_arrived"),
     Index("funding_sleeve_ts", "sleeve", "ts"),
@@ -195,6 +205,9 @@ insurance_t = Table(
     Column("order_id", String(64)),
     Column("trade_id", String(64)),
     Index("insurance_sleeve_ts", "sleeve", "ts"),
+    # Bridge A (DA, 0026): the instrument it was in, so a Strategy on several assets reads per asset. Filled from the
+    # Strategy's own instrument at the database when the writer names none (INSTRUMENT_FILL triggers below).
+    Column("instrument", String(32), nullable=False, server_default=""),
     Index("insurance_once", "sleeve", "order_id", "trade_id", unique=True, sqlite_where=text("order_id IS NOT NULL"),
           postgresql_where=text("order_id IS NOT NULL")),
 )
@@ -307,6 +320,12 @@ orders_t = Table(
     # P2-8 (DA, 0022): one id for every order of a two-leg trade, across both leg rows; none for a single leg.
     Column("parent_trade_id", String(64)),
     Index("orders_sleeve_ts", "sleeve", "ts"),
+    # Bridge A (DA, 0026): the instrument it was in, so a Strategy on several assets reads per asset. Filled from the
+    # Strategy's own instrument at the database when the writer names none (INSTRUMENT_FILL triggers below).
+    Column("instrument", String(32), nullable=False, server_default=""),
+    # Bridge A (DA, 0026): what the order risks at entry, in money: qty x distance to its stop with fees, or the charged
+    # risk of a stopless one. Written by sizing; none on orders before it. R per trade = its P&L / this.
+    Column("entry_risk", EXACT),
     Index("orders_parent_trade_id", "parent_trade_id"),
     CheckConstraint("venue = upper(venue)", name="orders_venue_upper"),
 )
@@ -365,6 +384,28 @@ sleeve_accounts_t = Table(
     Column("sleeve", String(64), ForeignKey("sleeves.name"), primary_key=True),
     Column("account", String(41), ForeignKey("accounts.name"), nullable=False),
     Column("assigned_at", TS, nullable=False),
+)
+# F-ASSIGN-STALE (Advisor ADV-ASSIGN, 14 Oct 17:41 UK): a create or an account move asked for on a marked book waits
+# here for the supervisor's poll, which lands it after its own mark with its flow, so P&L made since the last mark is
+# judged at the book's scale first. At most one waiting row per Strategy (landed_at and superseded_at both NULL); a
+# later request supersedes it. Rows are never deleted: each ends once, landed or superseded (DA, migration 0024).
+book_moves_t = Table(
+    "book_moves",
+    metadata,
+    Column("id", Integer, primary_key=True),
+    Column("sleeve", String(64), ForeignKey("sleeves.name"), nullable=False),
+    Column("account", String(41), ForeignKey("accounts.name"), nullable=False),  # where it lands
+    Column("kind", String(8), nullable=False),  # create | move
+    Column("requested_at", TS, nullable=False),
+    Column("landed_at", TS),
+    Column("superseded_at", TS),
+    CheckConstraint("kind IN ('create', 'move')", name="book_moves_kind"),
+    CheckConstraint("landed_at IS NULL OR superseded_at IS NULL", name="book_moves_one_end"),
+    CheckConstraint("(landed_at IS NULL OR landed_at >= requested_at) "
+                    "AND (superseded_at IS NULL OR superseded_at >= requested_at)", name="book_moves_order"),
+    Index("ux_book_moves_waiting", "sleeve", unique=True,
+          postgresql_where=text("landed_at IS NULL AND superseded_at IS NULL"),
+          sqlite_where=text("landed_at IS NULL AND superseded_at IS NULL")),
 )
 # The venue a strategy trades on, where it isn't the default (sleeve_fund.venues). A table of its own, so
 # it arrives as CREATE TABLE: a strategy with no row here trades on the default venue, as every one did.
@@ -698,6 +739,9 @@ portfolio_state_t = Table(
     Column("carried_day_return", EXACT),  # book / day_start_equity - 1, for carried_day
     Column("carried_day", Date),  # the UTC day carried_day_return belongs to
     Column("profile_version", Integer, ForeignKey("portfolio_profile.version"), nullable=False),
+    # Bridge A (DA, 0027): the compliance tests' version this row was checked under. Nullable: rows before it have the
+    # profile only.
+    Column("compliance_version", Integer, ForeignKey("compliance_versions.version")),
     Column("updated_at", TS, nullable=False),
     CheckConstraint("id = 1", name="portfolio_state_one_row"),
     CheckConstraint("status IN ('ok', 'paused', 'halted')", name="portfolio_state_status"),
@@ -729,6 +773,9 @@ book_marks_t = Table(
     Column("day_start_equity", EXACT, nullable=False),
     Column("status", String(16), nullable=False),
     Column("profile_version", Integer, ForeignKey("portfolio_profile.version"), nullable=False),
+    # Bridge A (DA, 0027): the compliance tests' version this row was checked under. Nullable: rows before it have the
+    # profile only.
+    Column("compliance_version", Integer, ForeignKey("compliance_versions.version")),
 )
 # One row per check of an order that raises a position, at submit or as the backstop at fill. seq is the first-come
 # order, taken inside the gate's lock (Postgres: the gate_decision_seq sequence; SQLite: max + 1 under the lock).
@@ -788,6 +835,12 @@ gate_decisions_t = Table(
     Column("underlying", String(16), nullable=False),  # what net is counted by, e.g. BTC
     Column("order_id", String(64), ForeignKey("orders.order_id")),  # set with the order row when sent
     Column("profile_version", Integer, ForeignKey("portfolio_profile.version"), nullable=False),
+    # Bridge A (DA, 0027): the compliance tests' version this row was checked under. Nullable: rows before it have the
+    # profile only.
+    Column("compliance_version", Integer, ForeignKey("compliance_versions.version")),
+    # the test that refused or trimmed it, in that version (a trigger checks it is one); limit_hit keeps the outcomes
+    # that are not a test (lock_error, portfolio_state_stale, below_min)
+    Column("test_hit", String(32)),
     Column("outcome", String(24), nullable=False),
     Column("limit_hit", String(24)),
     Column("requested_qty", EXACT, nullable=False),
@@ -838,6 +891,220 @@ gate_reservations_t = Table(
     Index("gate_reservations_active_sleeve", "sleeve_id", sqlite_where=text("released_at IS NULL"),
           postgresql_where=text("released_at IS NULL")),  # the sweep, and DA-6's reset guard
 )
+# Bridge A (DA, 0027; Advisor BRIDGE-3): the PM's compliance tests, versioned whole. One version is every test and the
+# asset-group map together, so a decision that records its version re-checks exactly. Written only through
+# Store.add_compliance_version (the PM's Portfolio Settings, or a migration's seed); never updated or deleted. The gate
+# reads the latest version inside its lock, at evaluation, so an edit applies to the next order and never back.
+COMPLIANCE_SCOPES = ("fund", "asset", "asset_type", "strategy")
+COMPLIANCE_MEASURES = ("open_risk", "gross", "net", "margin", "day_loss", "drawdown", "strategy_risk", "contrib_dd")
+# trim: to fit, refused below the venue minimum; pause_day: no entries until 00:00 UTC; pause_pm: the Strategy holds
+# until the PM resumes it; halt: flatten everything and halt, only the PM restarts.
+COMPLIANCE_ACTIONS = ("refuse", "trim", "pause_day", "pause_pm", "halt")
+compliance_versions_t = Table(
+    "compliance_versions",
+    metadata,
+    Column("version", Integer, primary_key=True, autoincrement=False),
+    Column("created_at", TS, nullable=False),  # effective from: the next gate evaluation
+    Column("created_by", Text, nullable=False),  # 'pm', or 'migration 0027' for the seed
+    Column("note", Text),
+    CheckConstraint("created_by <> 'pm' OR (note IS NOT NULL AND note <> '')", name="compliance_versions_pm_note"),
+)
+compliance_tests_t = Table(
+    "compliance_tests",
+    metadata,
+    Column("version", Integer, ForeignKey("compliance_versions.version"), primary_key=True),
+    Column("test", String(32), primary_key=True),  # a fixed key, e.g. asset_stop_loss (compliance_rules.KEYS)
+    Column("label", Text, nullable=False),
+    Column("scope", String(12), nullable=False),
+    Column("measure", String(16), nullable=False),
+    Column("limit_value", LIMIT, nullable=False),  # a share of fund equity; gross and net: times the book
+    Column("action", String(12), nullable=False),
+    Column("enabled", Boolean, nullable=False),
+    CheckConstraint(_in("scope", COMPLIANCE_SCOPES), name="compliance_tests_scope"),
+    CheckConstraint(_in("measure", COMPLIANCE_MEASURES), name="compliance_tests_measure"),
+    CheckConstraint(_in("action", COMPLIANCE_ACTIONS), name="compliance_tests_action"),
+    CheckConstraint("limit_value > 0", name="compliance_tests_limit"),
+)
+compliance_asset_types_t = Table(
+    "compliance_asset_types",
+    metadata,
+    Column("version", Integer, ForeignKey("compliance_versions.version"), primary_key=True),
+    Column("underlying", String(16), primary_key=True),
+    Column("asset_type", String(32), nullable=False),  # the PM's group, e.g. large
+    CheckConstraint("underlying = upper(underlying)", name="compliance_asset_types_upper"),
+    CheckConstraint("asset_type <> ''", name="compliance_asset_types_named"),
+)
+COMPLIANCE_TABLES = ("compliance_versions", "compliance_tests", "compliance_asset_types")
+COMPLIANCE_WORM_PG = (
+    "CREATE OR REPLACE FUNCTION compliance_write_once() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+    "RAISE EXCEPTION USING ERRCODE = 'check_violation', "
+    "MESSAGE = TG_TABLE_NAME || ' is write-once: a version is never edited or deleted, a change is a new version'; "
+    "END $$",
+)
+
+
+def _compliance_worm_pg(table: str) -> str:
+    return (f"CREATE TRIGGER {table}_write_once BEFORE UPDATE OR DELETE ON {table} FOR EACH ROW "
+            "EXECUTE FUNCTION compliance_write_once()")
+
+
+def _compliance_worm_sqlite(table: str) -> tuple[str, str]:
+    return tuple(f"CREATE TRIGGER {table}_no_{op.lower()} BEFORE {op} ON {table} BEGIN SELECT RAISE(ABORT, "
+                 f"'{table} is write-once: a version is never edited or deleted, a change is a new version'); END"
+                 for op in ("UPDATE", "DELETE"))
+
+
+# A decision's test_hit names a test of the version it records (so never without a version). A trigger, not a composite
+# foreign key and a CHECK, so 0027 adds it without rebuilding gate_decisions on SQLite.
+GATE_TEST_HIT_PG = (
+    "CREATE OR REPLACE FUNCTION gate_test_hit_known() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+    "IF NEW.test_hit IS NOT NULL AND NOT EXISTS (SELECT 1 FROM compliance_tests WHERE version = NEW.compliance_version "
+    "AND test = NEW.test_hit) THEN RAISE EXCEPTION USING ERRCODE = 'foreign_key_violation', "
+    "MESSAGE = 'gate_decisions.test_hit ' || NEW.test_hit || ' is not a test of version ' "
+    "|| COALESCE(NEW.compliance_version::text, 'none'); END IF; RETURN NEW; END $$",
+    "CREATE TRIGGER gate_decisions_test_hit BEFORE INSERT OR UPDATE ON gate_decisions FOR EACH ROW "
+    "EXECUTE FUNCTION gate_test_hit_known()",
+)
+GATE_TEST_HIT_SQLITE = tuple(
+    f"CREATE TRIGGER gate_decisions_test_hit_{op.lower()} BEFORE {op} ON gate_decisions WHEN NEW.test_hit IS NOT NULL "
+    "AND NOT EXISTS (SELECT 1 FROM compliance_tests WHERE version = NEW.compliance_version AND test = NEW.test_hit) "
+    "BEGIN SELECT RAISE(ABORT, 'gate_decisions.test_hit is not a test of the version it records'); END"
+    for op in ("INSERT", "UPDATE"))
+for _t in (compliance_versions_t, compliance_tests_t, compliance_asset_types_t):
+    for _sql in COMPLIANCE_WORM_PG:
+        event.listen(_t, "after_create", DDL(_sql).execute_if(dialect="postgresql"))
+    event.listen(_t, "after_create", DDL(_compliance_worm_pg(_t.name)).execute_if(dialect="postgresql"))
+    for _sql in _compliance_worm_sqlite(_t.name):
+        event.listen(_t, "after_create", DDL(_sql).execute_if(dialect="sqlite"))
+for _sql in GATE_TEST_HIT_PG:
+    event.listen(gate_decisions_t, "after_create", DDL(_sql).execute_if(dialect="postgresql"))
+for _sql in GATE_TEST_HIT_SQLITE:
+    event.listen(gate_decisions_t, "after_create", DDL(_sql).execute_if(dialect="sqlite"))
+
+COMPLIANCE_V1_AT = datetime(2026, 10, 14, 21, 0, tzinfo=timezone.utc)
+COMPLIANCE_V1_NOTE = "the PM's defaults (DEFAULTS-2, 14 Oct 2026); Advisor BRIDGE-3"
+
+
+def _seed_compliance(target, conn, **kw) -> None:
+    """Version 1 on a store made by create_all, as migration 0027 seeds it, so no database has a gate without tests.
+    After every table is made (the map reads instruments), and only on an empty table."""
+    from sleeve_fund import compliance_rules as rules
+
+    if conn.execute(select(func.count()).select_from(compliance_versions_t)).scalar():
+        return
+    conn.execute(insert(compliance_versions_t).values(version=1, created_at=COMPLIANCE_V1_AT,
+                                                      created_by="migration 0027", note=COMPLIANCE_V1_NOTE))
+    conn.execute(insert(compliance_tests_t), [{"version": 1, "test": t["test"], "label": t["label"],
+                                               "scope": t["scope"], "measure": t["measure"],
+                                               "limit_value": t["limit"], "action": t["action"],
+                                               "enabled": t["enabled"]} for t in rules.default_tests()])
+    held = {u for (u,) in conn.execute(select(instruments_t.c.underlying).distinct())}
+    groups = rules.DEFAULT_GROUPS | {u: rules.OTHER_GROUP for u in held if u not in rules.DEFAULT_GROUPS}
+    conn.execute(insert(compliance_asset_types_t), [{"version": 1, "underlying": u, "asset_type": g}
+                                                    for u, g in sorted(groups.items())])
+
+# Bridge A (DA, 0025): the fund holds the capital, a Strategy none of its own. fund_flows is its only external capital,
+# append-only: a row is never deleted or edited, only ended once at the poll (applied, or refused with the reason), in
+# id order, so an inflow never overtakes a pending outflow (Advisor CAP5-RESET). rebase: the clean-slate deposit only,
+# onto a book of exactly 0 (carry=False), checked in code.
+FUND_FLOW_KINDS = ("deposit", "withdraw")
+fund_flows_t = Table(
+    "fund_flows",
+    metadata,
+    Column("id", BIG_ID, primary_key=True),
+    Column("kind", String(8), nullable=False),
+    Column("amount", EXACT, nullable=False),
+    Column("rebase", Boolean, nullable=False, default=False, server_default=false()),
+    Column("actor", String(32), nullable=False),
+    Column("reason", Text, nullable=False),
+    Column("requested_at", TS, nullable=False),
+    Column("applied_at", TS),
+    Column("refused_at", TS),
+    Column("refuse_reason", Text),
+    CheckConstraint(_in("kind", FUND_FLOW_KINDS), name="fund_flows_kind"),
+    CheckConstraint("amount > 0", name="fund_flows_amount"),
+    CheckConstraint("NOT rebase OR kind = 'deposit'", name="fund_flows_rebase"),
+    CheckConstraint("actor <> ''", name="fund_flows_actor"),
+    CheckConstraint("applied_at IS NULL OR refused_at IS NULL", name="fund_flows_one_end"),
+    CheckConstraint("(refused_at IS NULL) = (refuse_reason IS NULL)", name="fund_flows_refuse_reason"),
+    Index("fund_flows_pending", "id", sqlite_where=text("applied_at IS NULL AND refused_at IS NULL"),
+          postgresql_where=text("applied_at IS NULL AND refused_at IS NULL")),
+)
+# What can be traded: static facts, one row per venue, symbol and contract. The asset type is not here: it is versioned
+# with the compliance tests, so a decision's recorded version re-checks exactly (DA bridge spec 3).
+CONTRACTS = ("spot", "perp")
+instruments_t = Table(
+    "instruments",
+    metadata,
+    Column("id", Integer, primary_key=True),
+    Column("venue", String(16), nullable=False),
+    Column("symbol", String(32), nullable=False),  # as sleeves.instrument, e.g. BTC/USDT
+    Column("contract", String(8), nullable=False),
+    Column("underlying", String(16), nullable=False),  # what the gate nets by, e.g. BTC
+    Column("created_at", TS, nullable=False),
+    CheckConstraint("venue = upper(venue)", name="instruments_venue_upper"),
+    CheckConstraint(_in("contract", CONTRACTS), name="instruments_contract"),
+    UniqueConstraint("venue", "symbol", "contract", name="instruments_venue_symbol_contract"),
+)
+# The ledger is write-once at the database: no delete; an update may only end a pending row, once. Migration 0025
+# writes the same triggers (spelled out there).
+FUND_FLOWS_FROZEN = ("id", "kind", "amount", "rebase", "actor", "reason", "requested_at")
+FUND_FLOWS_WORM_PG = (
+    "CREATE OR REPLACE FUNCTION fund_flows_write_once() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+    "IF TG_OP = 'DELETE' THEN RAISE EXCEPTION USING ERRCODE = 'check_violation', "
+    "MESSAGE = 'fund_flows is append-only: ' || OLD.id || ' cannot be deleted'; END IF; "
+    f"IF ({', '.join('NEW.' + c for c in FUND_FLOWS_FROZEN)}) IS DISTINCT FROM "
+    f"({', '.join('OLD.' + c for c in FUND_FLOWS_FROZEN)}) "
+    "OR OLD.applied_at IS NOT NULL OR OLD.refused_at IS NOT NULL THEN RAISE EXCEPTION USING ERRCODE = 'check_violation', "
+    "MESSAGE = 'fund_flows is append-only: ' || OLD.id || ' may only be ended once'; END IF; "
+    "RETURN NEW; END $$",
+    "CREATE TRIGGER fund_flows_write_once BEFORE UPDATE OR DELETE ON fund_flows FOR EACH ROW "
+    "EXECUTE FUNCTION fund_flows_write_once()",
+)
+FUND_FLOWS_WORM_SQLITE = (
+    "CREATE TRIGGER fund_flows_no_delete BEFORE DELETE ON fund_flows BEGIN "
+    "SELECT RAISE(ABORT, 'fund_flows is append-only: a row cannot be deleted'); END",
+    "CREATE TRIGGER fund_flows_no_edit BEFORE UPDATE ON fund_flows WHEN "
+    + " OR ".join(f"NEW.{c} IS NOT OLD.{c}" for c in FUND_FLOWS_FROZEN)
+    + " OR OLD.applied_at IS NOT NULL OR OLD.refused_at IS NOT NULL"
+    + " BEGIN SELECT RAISE(ABORT, 'fund_flows is append-only: a row may only be ended once'); END",
+)
+for _sql in FUND_FLOWS_WORM_PG:
+    event.listen(fund_flows_t, "after_create", DDL(_sql).execute_if(dialect="postgresql"))
+for _sql in FUND_FLOWS_WORM_SQLITE:
+    event.listen(fund_flows_t, "after_create", DDL(_sql).execute_if(dialect="sqlite"))
+event.listen(metadata, "after_create", _seed_compliance)
+
+# A row written without an instrument takes its Strategy's (bridge A, 0026): every writer today has one instrument per
+# Strategy, so none of them changes, and Drop B's multi-asset writers name theirs. Postgres fills it before the insert;
+# SQLite can't edit NEW, so the column defaults to '' and an AFTER INSERT trigger fills that row. Migration 0026 writes
+# the same triggers (spelled out there).
+INSTRUMENT_TABLES = ("orders", "fills", "funding", "insurance")
+INSTRUMENT_FILL_PG = (
+    "CREATE OR REPLACE FUNCTION fill_instrument() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+    "IF NEW.instrument IS NULL OR NEW.instrument = '' THEN "
+    "NEW.instrument := COALESCE((SELECT instrument FROM sleeves WHERE name = NEW.sleeve), ''); END IF; "
+    "RETURN NEW; END $$",
+)
+
+
+def _instrument_fill_pg(table: str) -> str:
+    return (f"CREATE TRIGGER {table}_fill_instrument BEFORE INSERT ON {table} FOR EACH ROW "
+            "EXECUTE FUNCTION fill_instrument()")
+
+
+def _instrument_fill_sqlite(table: str) -> str:
+    return (f"CREATE TRIGGER {table}_fill_instrument AFTER INSERT ON {table} WHEN NEW.instrument = '' BEGIN "
+            f"UPDATE {table} SET instrument = COALESCE((SELECT instrument FROM sleeves WHERE name = NEW.sleeve), '') "
+            f"WHERE id = NEW.id; END")
+
+
+for _t in (orders_t, fills_t, funding_t, insurance_t):
+    for _sql in INSTRUMENT_FILL_PG:
+        event.listen(_t, "after_create", DDL(_sql).execute_if(dialect="postgresql"))
+    event.listen(_t, "after_create", DDL(_instrument_fill_pg(_t.name)).execute_if(dialect="postgresql"))
+    event.listen(_t, "after_create", DDL(_instrument_fill_sqlite(_t.name)).execute_if(dialect="sqlite"))
+
 HOLDOUT_STATUSES = ("claimed", "opened", "crashed")
 # Stages a new trial records. Imported idea-counter rows keep the study's own stage names (sensitivity, wf_train...).
 TRIAL_STAGES = ("in_sample", "out_of_sample", "holdout")
@@ -885,6 +1152,9 @@ OPEN_ORDER_STATUSES = ("submitted", "accepted", "partially_filled")
 # F-C3B-A: a Strategy archived while not yet flat waits for its withdrawal; one with nothing to withdraw says so
 WITHDRAWAL_DEFERRED, WITHDRAWAL_NONE = "withdrawal_deferred", "withdrawal_none"
 NEXT_MARK = "flat, waiting for the supervisor's next mark"  # why a flat Strategy put away is deferred (F286-CR1)
+# F-ASSIGN-STALE: a create or a move waiting for the poll (book_moves), and its landing
+BOOK_MOVE_WAITING, BOOK_MOVE_LANDED = "book_move_waiting", "book_move_landed"
+BOOK_MOVE_SUPERSEDED = "book_move_superseded"
 GATED_INTENTS = ("entry", "rebalance")  # the orders the portfolio gate reserves for (engine OPENING_INTENTS)
 INTENTS = ("entry", "exit", "stop_loss", "take_profit", "risk_halt", "risk_pause", "pm_flatten", "rebalance",
            "liquidation", "liquidation_cut", "wind_down", "wind_down_stop",  # the venue would take it; cut back before it does (String(16))
@@ -950,6 +1220,12 @@ DUST_NOTIONAL = 1.0
 def is_dust(book: dict) -> bool:
     """A journal book (replay_book) holding a position too small for any venue to take an order for."""
     return 1e-12 < abs(book["qty"]) and abs(book["qty"]) * (book["entry_px"] or 0) < DUST_NOTIONAL
+
+
+def qty_words(qty: Decimal) -> str:
+    """A quantity as words read it, the same on every engine: Postgres hands a NUMERIC back at the column's scale
+    (1.000000000E-9), SQLite as 1E-9; plain digits either way, never an exponent (TEC-DUST-FMT)."""
+    return format(qty.normalize(), "f")
 
 
 def replay_book(fills, starting_balance, funding=0, insurance=0) -> dict:
@@ -1046,6 +1322,31 @@ def _insert_sleeve(c, ts: datetime, *, name: str, strategy: str, instrument: str
     ))
     if venue:
         c.execute(insert(sleeve_venues_t).values(sleeve=name, venue=venue.upper()))
+    if not is_backtest(name):  # what it trades is in instruments from its first row (bridge A, 0025)
+        from sleeve_fund.portfolio.holding import underlying
+        from sleeve_fund.venues import DEFAULT_VENUE
+
+        _ensure_instrument(c, (venue or DEFAULT_VENUE).upper(), instrument, _contract(params), underlying(instrument))
+
+
+def _contract(params: dict | None) -> str:
+    """The contract a Strategy trades: a perp when its params say a futures market, else spot (as 0025's seed)."""
+    return "spot" if ((params or {}).get("market") or "spot") == "spot" else "perp"
+
+
+def _ensure_instrument(c, venue: str, symbol: str, contract: str, underlying: str) -> int:
+    """The instrument's id, its row written if missing; refused when the row there nets as another underlying."""
+    if contract not in CONTRACTS:
+        raise ValueError(f"a contract is {' or '.join(CONTRACTS)}, not {contract!r}")
+    t, venue = instruments_t, venue.upper()
+    row = c.execute(select(t.c.id, t.c.underlying)
+                    .where(t.c.venue == venue, t.c.symbol == symbol, t.c.contract == contract)).first()
+    if row is not None:
+        if row.underlying != underlying:
+            raise ValueError(f"{venue} {symbol} {contract} nets as {row.underlying}, not {underlying}")
+        return row.id
+    return c.execute(insert(t).values(venue=venue, symbol=symbol, contract=contract, underlying=underlying,
+                                      created_at=utcnow())).inserted_primary_key[0]
 
 
 def utcnow() -> datetime:
@@ -1105,6 +1406,17 @@ class Sleeve:
         # A configured balance, read by the engine's float figures: the journal (journal_book) takes it exactly.
         d["starting_balance"] = float(d["starting_balance"])
         return cls(**d, venue=venue)
+
+
+def _end_move(c, row, **end: datetime) -> bool:
+    """End a waiting book_moves row once (DA 0024 rule 1): landed_at or superseded_at, guarded on its still waiting, so
+    a row two writers race for ends once; False when it had ended already. Never before it was asked for (CHECK
+    book_moves_order): a poll whose clock reads behind the request's ends it at the request's time."""
+    (col, ts), = end.items()
+    req = _aware(row.requested_at)
+    return bool(c.execute(update(book_moves_t).where(
+        book_moves_t.c.id == row.id, book_moves_t.c.landed_at.is_(None), book_moves_t.c.superseded_at.is_(None))
+        .values(**{col: max(_aware(ts), req)})).rowcount)
 
 
 def _rows(result) -> list[dict]:
@@ -1211,6 +1523,68 @@ def _drop_carried(c) -> bool:
                                   carried_day_return=None, carried_day=None)).rowcount)
 
 
+def _fund_held(store) -> bool:
+    """Whether the fund holds the cash (Bridge Drop A: the PM's re-base deposit applied), so a Strategy made, moved or
+    put away moves no capital (supervisor.bridge_start)."""
+    from sleeve_fund.supervisor import bridge_start
+
+    return bridge_start(store) is not None
+
+
+def _no_own_capital(store, name: str, starting_balance) -> None:
+    """CUT-A (a) (HoE, Advisor): once the fund holds the cash, a Strategy is made with no capital of its own."""
+    if not is_backtest(name) and to_decimal(starting_balance or 0) != 0 and _fund_held(store):
+        raise ValueError(f"Strategy {name} can't be made with {to_decimal(starting_balance):,.2f}: the fund holds the "
+                         "cash, so a Strategy has no capital of its own; make it with 0")
+
+
+def check_own_capital(store, name: str, starting_balance) -> None:
+    """F-ZS-1 (HoE, Drop A): until the fund holds the cash a Strategy is its own fund, so one with no balance of its own
+    could only halt on its first bar. It is refused at start (the supervisor, and a --db-sleeve process started by
+    hand) rather than at creation. A saved backtest is neither."""
+    if is_backtest(name) or to_decimal(starting_balance or 0) > 0 or _fund_held(store):
+        return
+    raise ValueError(f"{name} has {to_decimal(starting_balance or 0):,.2f} of its own and the fund doesn't hold the "
+                     "cash yet, so it would have nothing to trade with: until the fund holds the cash a Strategy "
+                     "needs a starting balance above 0")
+
+
+@dataclass(frozen=True)
+class Compliance:
+    """One version of the PM's compliance tests: the tests (dicts: test, label, scope, measure, limit, action,
+    enabled) and the asset-group map (underlying -> group)."""
+    version: int
+    created_at: datetime
+    created_by: str
+    note: str | None
+    tests: list
+    asset_types: dict
+
+    def test(self, key: str) -> dict | None:
+        return next((t for t in self.tests if t["test"] == key), None)
+
+
+def _compliance_changes(old: Compliance | None, rows: list[dict], groups: dict[str, str]) -> str:
+    """What a new version changes, old -> new, for the decision log."""
+    if old is None:
+        return "first version"
+    was = {t["test"]: t for t in old.tests}
+    said = []
+    for r in rows:
+        o = was.get(r["test"])
+        if o is None:
+            said.append(f"{r['test']} added")
+            continue
+        if Decimal(o["limit"]) != r["limit_value"]:
+            said.append(f"{r['test']} {o['limit']:f} -> {r['limit_value']:f}")
+        if o["enabled"] != r["enabled"]:
+            said.append(f"{r['test']} {'on' if r['enabled'] else 'off'}")
+    for u in sorted(set(old.asset_types) | set(groups)):
+        if old.asset_types.get(u) != groups.get(u):
+            said.append(f"{u} group {old.asset_types.get(u) or 'none'} -> {groups.get(u) or 'none'}")
+    return ", ".join(said) or "no change"
+
+
 class Store:
     def __init__(self, url: str | None = None, engine: Engine | None = None, portfolio_gate: bool = False) -> None:
         """portfolio_gate: the portfolio gate is in force on this journal, and with no state row its entries are
@@ -1253,14 +1627,23 @@ class Store:
         never made without being counted, nor counted without being made (QA P1-T8)."""
         if trial is not None:
             check_trial(trial)
+        _no_own_capital(self, name, starting_balance)
         ts = utcnow()
         made = SimpleNamespace(name=name, instrument=instrument, venue=venue.upper() if venue else None)
 
         def into() -> Decimal:  # its capital comes into the fund's book: a deposit, not a gain (HALT-REF-1)
             in_book = not is_backtest(name) and not _outside_book(self, made)  # no account row yet: it starts on paper
-            return to_decimal(starting_balance) if in_book else Decimal(0)
+            return to_decimal(starting_balance) if in_book and not _fund_held(self) else Decimal(0)
 
-        with self._book_move(into, f"Strategy {name} created with {to_decimal(starting_balance):,.2f}", ts) as c:
+        def joins(c) -> None:
+            # F-ASSIGN-STALE (Advisor ADV-ASSIGN): on a marked book its capital joins at the supervisor's next poll,
+            # after that poll's mark; outside the book until then (supervisor.outside_fund_book), entries refused.
+            self._ensure_paper_account(c)
+            self._wait_move(c, name, "paper", "create", ts)
+
+        defer = None if is_backtest(name) else joins
+        with self._book_move(into, f"Strategy {name} created with {to_decimal(starting_balance):,.2f}", ts,
+                             defer=defer) as c:
             _insert_sleeve(c, ts, name=name, strategy=strategy, instrument=instrument, bar_spec=bar_spec,
                            params=params, starting_balance=starting_balance, risk_profile=risk_profile,
                            warmup_bars=warmup_bars, desired_state=desired_state, venue=venue)
@@ -1280,19 +1663,31 @@ class Store:
         from sleeve_fund import two_legs
 
         first, second = two_legs.check_legs(first, second)
+        _no_own_capital(self, name, starting_balance)
         shares = two_legs.split_capital(starting_balance, (first, second))
         if trial is not None:
             check_trial(trial)
         ts = utcnow()
         legs = ((name, first, shares[0], None), (name + LEG, second, shares[1], name))
 
-        def into() -> Decimal:  # each leg's share in the fund's book comes in as a deposit (HALT-REF-1)
-            return sum((to_decimal(share) for leg_name, leg, share, _ in legs if not is_backtest(leg_name) and not
-                        _outside_book(self, SimpleNamespace(name=leg_name, instrument=leg["instrument"],
-                                                            venue=(leg.get("venue") or "").upper() or None))),
-                       Decimal(0))
+        def in_book(leg_name: str, leg: dict) -> bool:
+            return not is_backtest(leg_name) and not _outside_book(self, SimpleNamespace(
+                name=leg_name, instrument=leg["instrument"], venue=(leg.get("venue") or "").upper() or None))
 
-        with self._book_move(into, f"two-leg Strategy {name} created with {to_decimal(starting_balance):,.2f}", ts) as c:
+        def into() -> Decimal:  # each leg's share in the fund's book comes in as a deposit (HALT-REF-1)
+            if _fund_held(self):
+                return Decimal(0)
+            return sum((to_decimal(share) for leg_name, leg, share, _ in legs if in_book(leg_name, leg)), Decimal(0))
+
+        def joins(c) -> None:
+            # F-ASSIGN-STALE: on a marked book both legs join at the supervisor's next poll, together (Store.land_move)
+            self._ensure_paper_account(c)
+            for leg_name, leg, _, _ in legs:
+                if in_book(leg_name, leg):
+                    self._wait_move(c, leg_name, "paper", "create", ts)
+
+        with self._book_move(into, f"two-leg Strategy {name} created with {to_decimal(starting_balance):,.2f}", ts,
+                             defer=None if is_backtest(name) else joins) as c:
             for leg_name, leg, share, parent in legs:
                 _insert_sleeve(c, ts, name=leg_name, strategy=strategy, instrument=leg["instrument"],
                                bar_spec=bar_spec, params=two_legs.leg_params(leg), starting_balance=share,
@@ -1307,7 +1702,8 @@ class Store:
         return self.sleeve(name), self.sleeve(name + LEG)
 
     @contextmanager
-    def _book_move(self, amount, why, ts: datetime | None = None, leaving: str | None = None, carry: bool = True):
+    def _book_move(self, amount, why, ts: datetime | None = None, leaving: str | None = None, carry: bool = True,
+                   defer=None, waits_out: list | None = None):
         """A capital move into (amount() > 0) or out of (< 0) the fund's book (HALT-REF-1): the caller's writes, made on
         the connection this yields, and the flow they make commit together under the portfolio gate's lock, so the
         book moves by it and its HWM, the halt's reference and the day's start scale with it (portfolio.gate.apply_flow),
@@ -1316,7 +1712,12 @@ class Store:
         (Supervisor.mark_portfolio). Journaled as a portfolio_flow event. With no state ever marked there is nothing to
         move: the first mark reads the book as it is. leaving: the Strategy put away by this move, which never holds an
         emptied book open itself (supervisor.nothing_open, F286-1). carry: a move that empties the book carries its
-        drawdown and the day's change to the next capital's first mark (MUST-F286-H4); False for a clean slate's."""
+        drawdown and the day's change to the next capital's first mark (MUST-F286-H4); False for a clean slate's.
+        defer: on a marked book, a move that would flow waits for the supervisor's poll instead (F-ASSIGN-STALE,
+        Advisor ADV-ASSIGN: only the poll moves capital on a marked book): no flow now; defer(c) records the waiting
+        move after the caller's writes, on the same connection. A move that flows nothing (the same side of the book)
+        has no stale scale to fear, so it is made at once. waits_out: told (appended to) whether it waits, before the
+        caller's writes, which are then the waiting move's own (defer) rather than the move's."""
         from sleeve_fund.portfolio.gate import apply_flow
         from sleeve_fund.supervisor import nothing_open
 
@@ -1325,7 +1726,13 @@ class Store:
             c = led._local.conn
             marked = c.execute(select(portfolio_state_t.c.book_equity).where(portfolio_state_t.c.id == 1)).scalar()
             amount = amount() if marked is not None else Decimal(0)
+            waits = defer is not None and bool(amount)
+            amount = Decimal(0) if waits else amount
+            if waits_out is not None:
+                waits_out.append(waits)
             yield c
+            if waits:
+                defer(c)
             if amount:
                 before = led.state().reference()
                 emptied = apply_flow(led, amount, lambda: nothing_open(self, led, leaving), ts, carry=carry)
@@ -1599,6 +2006,43 @@ class Store:
             led = self.__dict__["_settle_ledger"] = DbLedger(self, no_book)
         return led
 
+    def close_dead_orders(self, sleeve: str, why: str, ts: datetime | None = None) -> list[str]:
+        """F-REFRESH-RES (HoE, Drop A SHOULD): a paper Strategy's process is confirmed stopped, so the simulated venue
+        its orders rested at went with it and none of them can fill. Each order the journal still shows open is
+        closed as canceled with `why` (its reservation released as 'cancel' with it, as any cancel's is), then every
+        reservation of the Strategy still active (one holding no order, or one an order left behind) is released as
+        'cancel' too, in one transaction with one event. Call it only after the process has exited (the caller checks
+        the process is gone). Refused for a live account: a venue order outlives the process. Returns the orders
+        closed."""
+        ts = ts or utcnow()
+        r = gate_reservations_t
+        held: list[str] = []  # a second leg's retry hold dies with its process too; put back if nothing commits
+        try:
+            with self.engine.begin() as c:
+                account = c.execute(select(sleeve_accounts_t.c.account)
+                                    .where(sleeve_accounts_t.c.sleeve == sleeve)).scalar() or "paper"
+                if account != "paper":
+                    raise ValueError(f"{sleeve} trades on a live account: its orders outlive its process, so none is "
+                                     "closed")
+                open_ids = [o for (o,) in c.execute(select(orders_t.c.order_id).where(
+                    orders_t.c.sleeve == sleeve, orders_t.c.status.in_(OPEN_ORDER_STATUSES)).order_by(orders_t.c.id))]
+                held = [o for o in open_ids if o in self._retry_held]
+                self._retry_held.difference_update(held)  # so each cancel below releases its room
+                for oid in open_ids:
+                    self._update_order(c, oid, status="canceled", message=f"closed: {why}")
+                sid = c.execute(select(sleeves_t.c.id).where(sleeves_t.c.name == sleeve)).scalar()
+                left = c.execute(update(r).where(r.c.sleeve_id == sid, r.c.released_at.is_(None))
+                                 .values(released_at=ts, release_reason="cancel")).rowcount
+                if open_ids or left:
+                    c.execute(insert(events_t).values(
+                        sleeve=sleeve, ts=ts, level="info", kind="orders_closed_stopped",
+                        message=f"{why}: its process has stopped, so {len(open_ids)} order(s) still shown open can't "
+                                "fill and are closed, and the room they or the Strategy held in the book is released"))
+        except Exception:
+            self._retry_held.update(held)
+            raise
+        return open_ids
+
     def _settle_reservation(self, c, order_id: str, fill_qty, status: str | None) -> None:
         """An entry's fills and end settle the reservation it holds, in the order's own transaction (HoQA w2b, w2c):
         a fill reduces it (filled to nothing, it is released as 'fill'); a filled order releases what is left as
@@ -1852,28 +2296,162 @@ class Store:
 
     def assign_account(self, sleeve: str, account: str) -> None:
         """A move onto or off a test account its venue names moves the Strategy's equity out of or into the fund's
-        book (F229-6), with its flow (HALT-REF-1)."""
-        moved = []
+        book (F229-6), with its flow (HALT-REF-1).
+
+        F-ASSIGN-STALE (Advisor ADV-ASSIGN, 14 Oct 17:41 UK): on a marked book only the supervisor's poll (land_move),
+        after its own mark, moves capital, so P&L made since the last mark is judged at the book's scale first. Asked for
+        anywhere else, a move that would flow waits (book_moves) and the Strategy stays on its old account and its old
+        side of the book until the poll lands it (land_move); a later request replaces it. One whose create is still
+        waiting takes the new account as where it joins. A move that flows nothing is made at once, as is any move on
+        a book never marked."""
+        ts = utcnow()
+        joining = self.book_moves_pending().get(sleeve, {}).get("kind") == "create"
+        moved, waits = [], []
 
         def amount() -> Decimal:
             if is_backtest(sleeve) or sleeve in self.withdrawn():  # out of the book already (F-C3B-A)
                 return Decimal(0)
             s = self.sleeve(sleeve)
+            if joining:
+                return Decimal(1)  # its create waits: where it joins is this account, landed by the poll
             was = _outside_book(self, s)
             if was == _outside_book(self, s, account):
                 return Decimal(0)
-            from sleeve_fund.supervisor import strategy_equity
+            from sleeve_fund.supervisor import book_part
 
             moved.append("into" if was else "out of")
-            part = strategy_equity(self, s)
+            part = book_part(self, s)
             return part if was else -part
 
-        with self._book_move(amount, lambda: f"{sleeve} moved {moved[0]} the fund's book (account {account})") as c:
+        def wait(c) -> None:
+            self._wait_move(c, sleeve, account, "create" if joining else "move", ts)
+
+        with self._book_move(amount, lambda: f"{sleeve} moved {moved[0]} the fund's book (account {account})",
+                             defer=wait, waits_out=waits) as c:
             self._ensure_paper_account(c)
             if c.execute(select(accounts_t.c.name).where(accounts_t.c.name == account)).first() is None:
                 raise ValueError(f"no account called {account}")
-            c.execute(sleeve_accounts_t.delete().where(sleeve_accounts_t.c.sleeve == sleeve))
-            c.execute(insert(sleeve_accounts_t).values(sleeve=sleeve, account=account, assigned_at=utcnow()))
+            if not waits[0]:
+                c.execute(sleeve_accounts_t.delete().where(sleeve_accounts_t.c.sleeve == sleeve))
+                c.execute(insert(sleeve_accounts_t).values(sleeve=sleeve, account=account, assigned_at=ts))
+                # a move made at once (no flow: back to the side it is on) replaces any that waited (DA 0024 rule 2)
+                self._end_waiting(c, sleeve, ts, f"a move to account {account} on the same side of the book was "
+                                                 "made at once")
+
+    # --- F-ASSIGN-STALE: moves waiting for the supervisor's poll -------------------------------------------------
+
+    def _end_waiting(self, c, sleeve: str, ts: datetime, why: str | None = None) -> list:
+        """Supersede `sleeve`'s waiting move, if any, journaled when `why` says what replaced it; the rows superseded.
+        Each row ends once (DA 0024 rule 1): a row another writer ended first is left as it is."""
+        rows = c.execute(select(book_moves_t).where(book_moves_t.c.sleeve == sleeve, book_moves_t.c.landed_at.is_(None),
+                                                    book_moves_t.c.superseded_at.is_(None))).all()
+        ended = [r for r in rows if _end_move(c, r, superseded_at=ts)]
+        for r in ended if why else ():
+            c.execute(insert(events_t).values(
+                sleeve=sleeve, ts=ts, level="info", kind=BOOK_MOVE_SUPERSEDED,
+                message=f"{sleeve}'s move to account {r.account}, waiting for the supervisor's next mark, is "
+                        f"cancelled: {why}"))
+        return ended
+
+    def _wait_move(self, c, sleeve: str, account: str, kind: str, ts: datetime) -> None:
+        """Record `sleeve`'s move to `account` as waiting for the poll (latest wins), journaled."""
+        before = self._end_waiting(c, sleeve, ts, f"a later request moves it to account {account}")
+        c.execute(insert(book_moves_t).values(sleeve=sleeve, account=account, kind=kind, requested_at=ts))
+        what = (f"{sleeve} joins the fund's book on account {account}" if kind == "create"
+                else f"{sleeve} moves to account {account}")
+        was = f" (replacing its move to account {before[-1].account})" if before and before[-1].account != account else ""
+        c.execute(insert(events_t).values(
+            sleeve=sleeve, ts=ts, level="info", kind=BOOK_MOVE_WAITING,
+            message=f"{what} at the supervisor's next mark{was}, so what the book made since its last mark counts "
+                    "first; its entries are refused until then"))
+
+    def book_moves_pending(self) -> dict[str, dict]:
+        """Each Strategy's waiting move: {name: {"id", "account", "kind", "requested_at"}}, oldest first."""
+        q = (select(book_moves_t).where(book_moves_t.c.landed_at.is_(None), book_moves_t.c.superseded_at.is_(None))
+             .order_by(book_moves_t.c.id))
+        with self.engine.connect() as c:
+            return {r.sleeve: {"id": r.id, "account": r.account, "kind": r.kind, "requested_at": _aware(r.requested_at)}
+                    for r in c.execute(q)}
+
+    def joining(self, sleeve: str) -> bool:
+        """Whether `sleeve` was created on a marked book and its joining deposit still waits for the poll."""
+        with self.engine.connect() as c:
+            return c.execute(select(book_moves_t.c.id).where(
+                book_moves_t.c.sleeve == sleeve, book_moves_t.c.kind == "create", book_moves_t.c.landed_at.is_(None),
+                book_moves_t.c.superseded_at.is_(None))).first() is not None
+
+    def land_move(self, sleeve: str, ts: datetime | None = None) -> bool:
+        """The supervisor's poll, after its mark: land `sleeve`'s waiting move with its flow at the fresh scale, in one
+        transaction with the account row and the landing (Advisor ADV-ASSIGN; DA 0024 rule 3). A create joins the book
+        with its equity; a move goes as assign_account would. A two-leg Strategy's create lands both legs together, on
+        its first leg's call, with one flow of their sum; its second leg's own call leaves it to the first. False when
+        nothing (of its own) waits."""
+        from sleeve_fund.supervisor import book_part
+
+        ts = ts or utcnow()
+        got, moved, gone, on = [], [], [], {}
+
+        def waiting(r, name: str):
+            return r.execute(select(book_moves_t).where(
+                book_moves_t.c.sleeve == name, book_moves_t.c.landed_at.is_(None),
+                book_moves_t.c.superseded_at.is_(None))).first()
+
+        def amount() -> Decimal:
+            with self.engine.connect() as r:
+                row = waiting(r, sleeve)
+                first = self.sleeve(sleeve).parent if row is not None else None
+                if row is not None and row.kind == "create" and first is not None and waiting(r, first) is not None:
+                    return Decimal(0)  # the second leg of a two-leg create: its first leg lands both (got stays empty)
+                rows = [row] if row is not None else []
+                if row is not None and row.kind == "create":
+                    rows += [w for leg in self.legs(sleeve) if leg != sleeve and (w := waiting(r, leg)) is not None
+                             and w.kind == "create"]
+            got.extend(rows)
+            # Read here, before this move writes (F286-ENG: on Store.in_memory a read after the writes loses them).
+            on.update({w.sleeve: self.account_of(w.sleeve) for w in rows})
+            if not rows:
+                return Decimal(0)
+            if sleeve in self.withdrawn() or sleeve in self.archived():
+                gone.append(True)  # put away while it waited (a put-away supersedes it, DA rule 4): it never lands
+                return Decimal(0)
+            total = Decimal(0)
+            for w in rows:
+                s = self.sleeve(w.sleeve)
+                into = not _outside_book(self, s, w.account)
+                was = True if w.kind == "create" else _outside_book(self, s)
+                if was == (not into):
+                    continue
+                moved.append("joins" if w.kind == "create" else "moved into" if was else "moved out of")
+                part = book_part(self, s)
+                total += part if was else -part
+            return total
+
+        def said() -> str:
+            names = " and ".join(w.sleeve for w in got)
+            verb = "join" if len(moved) > 1 else moved[0]  # a two-leg create's legs join together
+            return f"{names} {verb} the fund's book (account {got[0].account}) at the supervisor's mark"
+
+        with self._book_move(amount, said, ts) as c:
+            if not got:
+                return False
+            for row in got:
+                if not _end_move(c, row, **({"superseded_at": ts} if gone else {"landed_at": ts})):
+                    raise RuntimeError(f"{row.sleeve}'s move to account {row.account} had already ended, so it isn't "
+                                       "landed twice")
+                if gone:
+                    c.execute(insert(events_t).values(
+                        sleeve=row.sleeve, ts=ts, level="info", kind=BOOK_MOVE_SUPERSEDED,
+                        message=f"{row.sleeve} was put away while its move to account {row.account} waited, so it "
+                                "never lands"))
+                    continue
+                if not (row.kind == "create" and row.account == "paper" and on[row.sleeve] == "paper"):
+                    c.execute(sleeve_accounts_t.delete().where(sleeve_accounts_t.c.sleeve == row.sleeve))
+                    c.execute(insert(sleeve_accounts_t).values(sleeve=row.sleeve, account=row.account, assigned_at=ts))
+                c.execute(insert(events_t).values(
+                    sleeve=row.sleeve, ts=ts, level="info", kind=BOOK_MOVE_LANDED,
+                    message=(f"{row.sleeve} joined the fund's book" if row.kind == "create"
+                             else f"{row.sleeve} moved to account {row.account}") + " at the supervisor's mark"))
+        return True
 
     def archived(self) -> dict[str, datetime]:
         with self.engine.connect() as c:
@@ -1931,12 +2509,14 @@ class Store:
 
         def said() -> str:
             qty = dust_qty[0]
-            dust = f", with dust of {qty} no order can close, which leaves with it" if qty else ""
+            dust = f", with dust of {qty_words(qty)} no order can close, which leaves with it" if qty else ""
             return f"{sleeve} put away ({why}): its equity {seen[0][1]:,.2f} leaves the fund's book{dust}"
 
         # A clean slate's put-away (previous_book) starts a fresh book, so its emptying carries nothing (MUST-F286-H4)
         with self._book_move(amount, said, ts, leaving=sleeve, carry=sleeve not in self.previous_book()) as c:
             yield c
+            # A create or move still waiting never lands for a Strategy put away (DA 0024 rule 4, F-ASSIGN-STALE)
+            self._end_waiting(c, sleeve, ts, f"it was put away ({why})")
             # Put away again (archived, then retired; a second archive): already out, so it keeps its row, its
             # amount and when it went, with no second flow (DA, 14 Oct).
             if c.execute(select(sleeve_archive_t.c.sleeve).where(sleeve_archive_t.c.sleeve == sleeve,
@@ -2010,9 +2590,9 @@ class Store:
         s = self.sleeve(sleeve)
         if is_backtest(sleeve) or _outside_book(self, s):
             return Decimal(0)
-        from sleeve_fund.supervisor import strategy_equity
+        from sleeve_fund.supervisor import book_part
 
-        return strategy_equity(self, s)
+        return book_part(self, s)
 
     def book_start(self) -> datetime | None:
         """When the current book began: the latest clean slate (supervisor.clear), or None if never cleared."""
@@ -2421,6 +3001,33 @@ class Store:
             rows = _rows(c.execute(q))
         return rows[0] if rows else None
 
+    def book_equity_at_or_before(self, ts: datetime) -> Decimal | None:
+        """The fund's book at its last minute mark at or before `ts` (book_marks), or None before the first."""
+        q = select(book_marks_t.c.equity).where(book_marks_t.c.ts <= ts).order_by(book_marks_t.c.ts.desc()).limit(1)
+        with self.engine.connect() as c:
+            return c.execute(q).scalar()
+
+    def first_book_mark(self) -> dict | None:
+        q = select(book_marks_t.c.ts, book_marks_t.c.equity).order_by(book_marks_t.c.ts).limit(1)
+        with self.engine.connect() as c:
+            rows = _rows(c.execute(q))
+        return rows[0] if rows else None
+
+    def refused_ideas(self, sleeve: str, since: datetime | None = None, limit: int = 200) -> list[dict]:
+        """The gate's refusals and trims of `sleeve`'s ideas, newest first, one per idea (its submit check; the fill
+        backstop only when it decided alone): decided_at, underlying, intent, requested_qty, approved_qty, outcome,
+        limit_hit, price, book_equity and open_risk."""
+        d = gate_decisions_t
+        q = (select(d.c.decided_at, d.c.underlying, d.c.intent, d.c.requested_qty, d.c.approved_qty, d.c.outcome,
+                    d.c.limit_hit, d.c.price, d.c.book_equity, d.c.open_risk, d.c.stage)
+             .join(sleeves_t, sleeves_t.c.id == d.c.sleeve_id)
+             .where(sleeves_t.c.name == sleeve, d.c.outcome.in_(("rejected", "trimmed")))
+             .order_by(d.c.decided_at.desc(), d.c.seq.desc()).limit(limit))
+        if since is not None:
+            q = q.where(d.c.decided_at >= since)
+        with self.engine.connect() as c:
+            return _rows(c.execute(q))
+
     def fills(self, sleeve: str | None = None, limit: int = 200) -> list[dict]:
         q = select(fills_t)
         q = q.where(fills_t.c.sleeve == sleeve) if sleeve else q.where(_not_backtest(fills_t.c.sleeve))
@@ -2430,7 +3037,10 @@ class Store:
     def journal_book(self, sleeve: str, starting_balance: Decimal | float) -> dict:
         """Cash, signed position and average entry implied by the journal: the paper book's source of
         truth (replay_book), with the perp's funding and any insurance-fund cover booked to cash."""
-        q = select(fills_t).where(fills_t.c.sleeve == sleeve).order_by(fills_t.c.ts, fills_t.c.id)
+        # Every column the replay reads, not the table: the replay never needs the instrument (one per Strategy until
+        # Drop B), and a store opened on a journal migrated no further than DA-9 still reads it (QA DA-9 c1)
+        q = (select(*(c for c in fills_t.c if c.name != "instrument")).where(fills_t.c.sleeve == sleeve)
+             .order_by(fills_t.c.ts, fills_t.c.id))
         with self.engine.connect() as c:
             fills = _rows(c.execute(q))
         return replay_book(fills, starting_balance, self.funding_total(sleeve), self.insurance_total(sleeve))
@@ -3254,6 +3864,179 @@ class Store:
                 "margin_max": to_decimal(limits.margin), "open_risk_max": to_decimal(limits.open_risk),
                 "drawdown_halt": to_decimal(limits.drawdown), "daily_pause": to_decimal(limits.daily_loss)}])
         return version
+
+    # --- the fund's capital (bridge A, DA 0025) ----------------------------------------------------------------
+
+    def fund_flow(self, kind: str, amount, *, actor: str, reason: str, rebase: bool = False,
+                  now: datetime | None = None) -> int:
+        """Journal an external deposit or withdrawal of the fund's capital and return its id: the row and its decision
+        in one transaction. It moves nothing yet: the poll ends it in id order (settle_flow or refuse_flow). The dry run
+        is the command's (sleeve_fund.fund), which calls this only on --apply."""
+        if kind not in FUND_FLOW_KINDS:
+            raise ValueError(f"a fund flow is a {' or a '.join(FUND_FLOW_KINDS)}, not {kind!r}")
+        amount = to_decimal(amount, "amount")
+        if not amount > 0:
+            raise ValueError(f"a fund flow's amount is above zero: {amount}")
+        if rebase and kind != "deposit":
+            raise ValueError("only a deposit can re-base the book (the clean slate's)")
+        if not actor or not (reason or "").strip():
+            raise ValueError("a fund flow names who asked for it and why")
+        now = now or utcnow()
+        with self.engine.begin() as c:
+            fid = c.execute(insert(fund_flows_t).values(kind=kind, amount=amount, rebase=rebase, actor=actor,
+                                                        reason=reason.strip(), requested_at=now)).inserted_primary_key[0]
+            c.execute(insert(decisions_t).values(ts=now, actor=actor, action=f"fund_{kind}", sleeve=None,
+                                                 reason=f"{kind} {amount} (flow {fid}{', re-base' if rebase else ''}): "
+                                                        f"{reason.strip()}"))
+        return fid
+
+    def pending_flows(self) -> list[dict]:
+        """The flows the poll hasn't ended, in the order it must take them (id)."""
+        t = fund_flows_t
+        with self.engine.connect() as c:
+            return _rows(c.execute(select(t).where(t.c.applied_at.is_(None), t.c.refused_at.is_(None))
+                                   .order_by(t.c.id)))
+
+    def fund_flows(self) -> list[dict]:
+        """Every flow, oldest first."""
+        with self.engine.connect() as c:
+            return _rows(c.execute(select(fund_flows_t).order_by(fund_flows_t.c.id)))
+
+    def settle_flow(self, flow_id: int, at: datetime, conn=None) -> None:
+        """End a pending flow as applied at `at`. conn: the poll's own transaction, so the flow lands with the book's
+        figures; raises when the flow is not pending, or an earlier one is."""
+        self._end_flow(flow_id, {"applied_at": at}, conn)
+
+    def refuse_flow(self, flow_id: int, at: datetime, reason: str, conn=None) -> None:
+        """End a pending flow as refused, with the reason the PM sees."""
+        if not (reason or "").strip():
+            raise ValueError("a refused flow says why")
+        self._end_flow(flow_id, {"refused_at": at, "refuse_reason": reason.strip()}, conn)
+
+    def _end_flow(self, flow_id: int, values: dict, conn) -> None:
+        t = fund_flows_t
+        pending = and_(t.c.applied_at.is_(None), t.c.refused_at.is_(None))
+
+        def end(c):
+            first = c.execute(select(func.min(t.c.id)).where(pending)).scalar()
+            if first != flow_id:
+                raise ValueError(f"flow {flow_id} is not the first pending one ({first}): flows end in order")
+            c.execute(update(t).where(t.c.id == flow_id, pending).values(**values))
+
+        if conn is not None:
+            end(conn)
+        else:
+            with self.engine.begin() as c:
+                end(c)
+
+    def fund_capital(self, at: datetime | None = None) -> Decimal:
+        """The fund's external capital: applied deposits less applied withdrawals, all of them or (at) those applied
+        at or before then. Exact on either database."""
+        t = fund_flows_t
+        w = t.c.applied_at.is_not(None)
+        if at is not None:
+            w &= t.c.applied_at <= at
+        with self.engine.connect() as c:
+            rows = c.execute(select(t.c.kind, t.c.amount).where(w)).all()
+        return sum((-to_decimal(a) if k == "withdraw" else to_decimal(a) for k, a in rows), Decimal(0))
+
+    # --- instruments ------------------------------------------------------------------------------------------
+
+    def instrument_id(self, venue: str, symbol: str, contract: str, underlying: str, conn=None) -> int:
+        """The instrument's row, written if it is missing; conn: the caller's transaction."""
+        if conn is not None:
+            return _ensure_instrument(conn, venue, symbol, contract, underlying)
+        with self.engine.begin() as c:
+            return _ensure_instrument(c, venue, symbol, contract, underlying)
+
+    def instruments(self) -> list[dict]:
+        with self.engine.connect() as c:
+            return _rows(c.execute(select(instruments_t).order_by(instruments_t.c.id)))
+
+    # --- compliance tests (bridge A, DA 0027; Advisor BRIDGE-3) -----------------------------------------------
+
+    def compliance(self, version: int | None = None, conn=None) -> Compliance:
+        """The tests and the asset-group map of one version, the latest by default. The gate calls this inside its
+        lock, at evaluation, with its conn, and records the version on the decision (BRIDGE-3-QA)."""
+        def read(c) -> Compliance:
+            v = version or c.execute(select(func.max(compliance_versions_t.c.version))).scalar()
+            head = c.execute(select(compliance_versions_t).where(compliance_versions_t.c.version == v)).first()
+            if head is None:
+                raise ValueError(f"no compliance version {v}")
+            t, m = compliance_tests_t, compliance_asset_types_t
+            tests = [{"test": r.test, "label": r.label, "scope": r.scope, "measure": r.measure,
+                      "limit": Decimal(r.limit_value).quantize(LIMIT_PLACES), "action": r.action,
+                      "enabled": bool(r.enabled)}
+                     for r in c.execute(select(t).where(t.c.version == v).order_by(t.c.test))]
+            groups = {r.underlying: r.asset_type for r in c.execute(select(m).where(m.c.version == v))}
+            return Compliance(head.version, _aware(head.created_at), head.created_by, head.note, tests, groups)
+
+        if conn is not None:
+            return read(conn)
+        with self.engine.connect() as c:
+            return read(c)
+
+    def compliance_versions(self, limit: int | None = None) -> list[dict]:
+        """Every version, newest first: version, created_at, created_by, note."""
+        q = select(compliance_versions_t).order_by(compliance_versions_t.c.version.desc())
+        with self.engine.connect() as c:
+            return _rows(c.execute(q.limit(limit) if limit else q))
+
+    def unmapped(self, version: int | None = None) -> list[str]:
+        """Underlyings in instruments that the version's map leaves out: the gate refuses their entries while the
+        asset-group test is on (Advisor BRIDGE-A-FE-2), and Portfolio Settings shows them in amber."""
+        groups = self.compliance(version).asset_types
+        return sorted({r["underlying"] for r in self.instruments()} - set(groups))
+
+    def add_compliance_version(self, tests: list[dict], asset_types: dict[str, str], *, expected_version: int,
+                               note: str, created_by: str = "pm", now: datetime | None = None) -> int:
+        """The PM's edit: a whole new version (every test and the whole map), written only if the latest is still
+        expected_version, so two open forms never overwrite each other. Refused with the reasons in the PM's words.
+        Journaled with what changed, old and new. It applies from the gate's next evaluation."""
+        from sleeve_fund import compliance_rules as rules
+
+        if created_by != "pm" and not created_by.startswith("migration "):
+            raise ValueError(f"compliance tests are changed by the PM only, not {created_by!r}")
+        if not (note or "").strip():
+            raise ValueError("say why the tests change")
+        errors = rules.validate(tests)
+        rows = []
+        for t in tests:
+            limit = to_decimal(t.get("limit", 0), "limit")
+            if limit != limit.quantize(LIMIT_PLACES):
+                errors.append(f"{t.get('label') or t.get('test')}: a limit has at most four decimal places")
+            rows.append({"test": t["test"], "label": rules.LABELS.get(t["test"], t.get("label") or t["test"]),
+                         "scope": t.get("scope"), "measure": t.get("measure"), "limit_value": limit,
+                         "action": t.get("action"), "enabled": bool(t.get("enabled"))})
+        groups = {}
+        for u, g in (asset_types or {}).items():
+            u, g = str(u).strip().upper(), str(g or "").strip()
+            if not u or not g:
+                errors.append(f"asset {u or '?'} needs a group name")
+            groups[u] = g
+        if errors:
+            raise ValueError("; ".join(errors))
+        now = now or utcnow()
+        try:
+            with self.engine.begin() as c:
+                latest = c.execute(select(func.max(compliance_versions_t.c.version))).scalar() or 0
+                if latest != expected_version:
+                    raise ValueError("the compliance tests changed since this page was opened "
+                                     f"(now version {latest}): reload and edit again")
+                old = self.compliance(latest, conn=c) if latest else None
+                v = latest + 1
+                c.execute(insert(compliance_versions_t).values(version=v, created_at=now, created_by=created_by,
+                                                               note=note.strip()))
+                c.execute(insert(compliance_tests_t), [r | {"version": v} for r in rows])
+                if groups:
+                    c.execute(insert(compliance_asset_types_t),
+                              [{"version": v, "underlying": u, "asset_type": g} for u, g in sorted(groups.items())])
+                c.execute(insert(decisions_t).values(
+                    ts=now, actor=created_by, action="compliance_version", sleeve=None,
+                    reason=f"compliance tests v{v} ({note.strip()}): {_compliance_changes(old, rows, groups)}"))
+        except IntegrityError as exc:  # another write took the same version number first
+            raise ValueError("the compliance tests changed since this page was opened: reload and edit again") from exc
+        return v
 
     def prune_backtests(self, keep: int = 50) -> int:
         """Delete all but the latest `keep` saved backtests and their journals. Returns how many went."""

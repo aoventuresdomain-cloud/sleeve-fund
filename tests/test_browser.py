@@ -347,7 +347,8 @@ def test_a_models_sentence_fills_placeholders_that_carry_a_format(site, browser)
 
 
 def test_risk_limits_table_fits_its_panel_on_a_desktop(site, browser):
-    # QA U3: the nine-column Limits table fits the panel at 1440 wide, Risk to stop included, with no sideways scroll.
+    # QA U3: the Limits table fits the panel at 1440 wide, Risk to stop included, with no sideways scroll. Eight
+    # columns since TEC-FE-CAP (HoE, 14 Oct 2026) took the Exposure-against-cap column out.
     ctx = browser.new_context(http_credentials={"username": "pm", "password": PASSWORD}, viewport={"width": 1440, "height": 900})
     page = ctx.new_page()
     page.goto(site + "/risk#limits")
@@ -355,7 +356,7 @@ def test_risk_limits_table_fits_its_panel_on_a_desktop(site, browser):
     page.click('a[data-tab="limits"]')
     size = page.evaluate("() => { const s = document.querySelector('#lim-h').closest('section');"
                          " return [s.scrollWidth, s.clientWidth, s.querySelectorAll('thead th').length]; }")
-    assert size[2] == 9 and size[0] <= size[1], size
+    assert size[2] == 8 and size[0] <= size[1], size
     ctx.close()
 
 

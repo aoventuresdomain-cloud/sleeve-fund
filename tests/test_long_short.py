@@ -367,13 +367,13 @@ def test_the_dashboard_shows_a_short(client):  # noqa: F811
     assert page.status_code == 200
     html = page.text
     assert "Short BTC/USD" in html and "Why it was sold short" in html
-    # A perp's 33% cap on balanced is its margin, so at 2x leverage a notional of 66% (PM, 5 Oct 2026).
-    assert "of 0.66× cap" in html and "above entry cap" not in html
+    # TEC-FE-CAP (HoE, 14 Oct 2026): the per-Strategy position cap is gone from the engine, so none is shown.
+    assert "× cap" not in html and "entry cap" not in html
     # QA U2, the Advisor's wording: leverage is notional at entry over isolated margin (3,030 / 1,515), exposure
     # the notional at the mark over equity (3,007 / 10,050), so exposure / leverage is the margin's share (15%).
     # UP-2: the leverage it opened at in the cap format, and the one from the mark (3,007 / 1,515) labelled effective.
     assert ">Leverage</dt><dd>2× <span class=\"faint\">· effective 1.98×" in html
-    assert "0.30× equity <span class=\"faint\">· cap 0.66×" in html
+    assert "0.30× equity</dd>" in html
     assert "Side and leverage" not in html
     assert "Tap a buy or sell arrow" not in html and "TradingView Lightweight Charts" in html  # QA U9: attribution in the rail
     # QA U12: the strategy's Fees and funding hover gives the costs' share of gross P&L, as the Portfolio's does.
@@ -393,13 +393,11 @@ def test_the_dashboard_shows_a_short(client):  # noqa: F811
     # A losing short grows: at 92,000 against 2,000 of equity it is 230%, past the 66% it was sized to.
     store.record_equity("pp-ls", equity=2_000.0, cash=6_600.0, qty=-0.05, price=92_000.0, benchmark=10_000)
     drift = c.get("/sleeves/pp-ls", auth=AUTH).text
-    assert "above entry cap because the price moved" in drift
+    assert "2.30× equity</dd>" in drift and "entry cap" not in drift  # TEC-FE-CAP: no cap to drift above
     # P1-U16: on a gross loss the cost hover gives both figures, not a share (P&L -8,000 before 4.50 of fees).
     assert "· costs 4.50 on a gross loss of 7,995.50" in drift and "of gross P&amp;L" not in drift
-    # P1-U13: the drift meter is amber (mid), never red (high), and says its true share: 2.30x of 0.66x is 348%.
-    assert 'class="meter mid" role="img" aria-label="348% of the entry cap used"' in drift
-    assert 'aria-label="348% of the entry cap used"' in (risk := c.get("/risk", auth=AUTH).text)
-    assert "pp-ls&#39;s exposure is 348% of its entry cap because the price moved; no action" in risk
+    risk = c.get("/risk", auth=AUTH).text
+    assert "entry cap" not in risk and "position cap" not in risk  # TEC-FE-CAP: no cap line on Risk either
     # The 2% stop sits above the entry; the open short gains as the price falls.
     assert "61,812" in html
     trades_page = c.get("/trades", auth=AUTH).text
@@ -1320,21 +1318,19 @@ def test_the_largest_asset_counts_shorts_by_gross_exposure(client):  # noqa: F81
     assert "BTC 14%" in tile and "net" in tile and "6%" in tile, tile
 
 
-def test_drift_past_the_entry_cap_never_hides_a_drawdown_warning():
-    # Code Reviewer on #152: with cap_used uncapped, a max() over the three limits let a 104% drift line replace
-    # a drawdown at 90%. Each is judged on its own now.
+def test_the_risk_lines_judge_each_limit_on_its_own_with_no_position_cap_line():
+    # Code Reviewer on #152: each limit is judged on its own. TEC-FE-CAP (HoE, 14 Oct 2026): the per-Strategy position
+    # cap is gone from the engine, so no line reads exposure against it.
     from types import SimpleNamespace
 
     from sleeve_fund.dashboard import riskops
 
     s = SimpleNamespace(name="btc-rsi-long", status="running", status_reason=None)
-    row = {"x": {"sleeve": s}, "dd_used": 0.9, "day_used": 0.1, "cap_used": 1.04}
+    row = {"x": {"sleeve": s}, "dd_used": 0.9, "day_used": 0.1}
     health = {"down": [], "mismatched": [], "stale_feeds": [], "backup_issue": None}
     texts = [i["text"] for i in riskops.status_items([row], health)]
-    assert texts == ["btc-rsi-long has used 90% of its drawdown limit",
-                     "btc-rsi-long's exposure is 104% of its entry cap because the price moved; no action"]
-    texts = [i["text"] for i in riskops.status_items([{**row, "dd_used": 0.2, "cap_used": 0.85}], health)]
-    assert texts == ["btc-rsi-long has used 85% of its position cap"]
+    assert texts == ["btc-rsi-long has used 90% of its drawdown limit"]
+    assert [i["text"] for i in riskops.status_items([{**row, "dd_used": 0.2}], health)] == []
 
 
 def test_a_liquidation_counts_every_liquidation_order_since_the_position_was_last_flat():

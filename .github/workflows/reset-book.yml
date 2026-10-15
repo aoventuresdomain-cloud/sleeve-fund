@@ -1,0 +1,69 @@
+name: reset-book
+# CAP5-RESET only (Advisor, 14 Oct ~21:35 UK; bridge Drop A): the PM's clean slate of the paper book, then the fund's
+# fresh deposit (python -m sleeve_fund.supervisor reset-book). Run it by hand from main, on the PM's word: a dry run
+# first (the default) prints the book, the Strategies it would put away, any to flatten first, what leaves the old
+# book (an old archive, a reset run's cash: first reset only) and anything that would refuse it, and writes nothing. The real run (dry_run false) goes as far as it can and says where it stopped: it exits
+# 2 when it must be run again after the supervisor's next mark (a flatten, or a put-away still leaving the book, which
+# the day's pause holds until 00:00 UTC), 1 when it is refused (the book can't be emptied; what is left is named), 0
+# once the re-base deposit is written to the fund's flows. Running it again carries on, never repeats
+# a step. It runs inside the supervisor container, with the deploy workflow's secrets (DEPLOY_HOST, DEPLOY_SSH_KEY)
+# and variable DEPLOY_USER, as rebase.yml does. The log is public: the command names no host, user, key path or
+# database address, and ssh runs quiet so its own messages don't either.
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Only print what it would do (untick for the real run)"
+        type: boolean
+        default: true
+      actor:
+        description: "Who runs it on the PM's word, for the decision log (letters, digits, spaces, . _ -)"
+        type: string
+        required: true
+      reset_id:
+        description: "The reset's id, e.g. 2026-10-21-reset (letters, digits, . _ -); run again with the same id to carry on"
+        type: string
+        required: true
+      deposit:
+        description: "The fund's fresh capital, in whole units"
+        type: string
+        default: "100000"
+concurrency: { group: reset-book, cancel-in-progress: false }  # one run at a time; never cut one off mid-write
+jobs:
+  reset:
+    runs-on: ubuntu-24.04
+    permissions: { contents: read }
+    if: ${{ vars.DEPLOY_ENABLED == 'true' && github.ref == 'refs/heads/main' }}
+    env:
+      USER_AT: ${{ vars.DEPLOY_USER || 'root' }}
+    steps:
+      - name: Check the inputs
+        env:
+          ACTOR: ${{ inputs.actor }}
+          RESET_ID: ${{ inputs.reset_id }}
+          DEPOSIT: ${{ inputs.deposit }}
+        # They go into the remote command line, so only plain words and digits get through.
+        run: |
+          [[ "$ACTOR" =~ ^[A-Za-z0-9\ ._-]{1,40}$ ]] || { echo "actor: letters, digits, spaces, . _ - only"; exit 1; }
+          [[ "$RESET_ID" =~ ^[A-Za-z0-9._-]{1,40}$ ]] || { echo "reset_id: letters, digits, . _ - only"; exit 1; }
+          [[ "$DEPOSIT" =~ ^[1-9][0-9]{0,8}$ ]] || { echo "deposit: a whole number above 0"; exit 1; }
+      - name: Configure SSH
+        env:
+          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/id_deploy && chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts 2>/dev/null
+      - name: Reset the book
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          ACTOR: ${{ inputs.actor }}
+          RESET_ID: ${{ inputs.reset_id }}
+          DEPOSIT: ${{ inputs.deposit }}
+          COMMIT: ${{ github.sha }}
+          DRY: ${{ inputs.dry_run && '--dry-run' || '' }}
+        # ssh and docker compose exec pass the command's exit code through: 1 refused, 2 run again after the next mark,
+        # and 255 is ssh itself failing (quiet, so it names no host or user).
+        run: |
+          ssh -o LogLevel=QUIET -i ~/.ssh/id_deploy "$USER_AT@$HOST" "cd /opt/sleeve-fund && sudo docker compose exec -T supervisor python -m sleeve_fund.supervisor reset-book --actor '$ACTOR' --commit $COMMIT --id $RESET_ID --deposit $DEPOSIT $DRY"

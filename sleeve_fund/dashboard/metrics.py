@@ -52,8 +52,7 @@ def sleeve_summary(store: Store, s: Sleeve) -> dict:
         out.update(
             equity=last["equity"],
             benchmark=last["benchmark"],
-            # CUT-A: a Strategy the fund holds starts at 0, so it has no return of its own on a balance (its P&L
-            # stands); 0 rather than a division by zero until the page shows its share of the fund (FE)
+            # A Strategy with no capital of its own (the fund holds the cash, CUT-A) has no return on it: 0, never inf.
             ret=last["equity"] / s.starting_balance - 1 if s.starting_balance > 0 else 0.0,
             pnl=last["equity"] - s.starting_balance,
             bench_ret=last["benchmark"] / s.starting_balance - 1 if s.starting_balance > 0 else 0.0,

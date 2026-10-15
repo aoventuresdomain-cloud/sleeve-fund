@@ -14,7 +14,7 @@ from sqlalchemy import create_engine, select, text
 
 from sleeve_fund import supervisor
 from sleeve_fund.gate_ledger import DbLedger
-from sleeve_fund.store import Store, events_t
+from sleeve_fund.store import Store, events_t, qty_words
 
 T0 = datetime(2026, 10, 14, 9, 0, tzinfo=UTC)
 PX = 60_000.0
@@ -139,5 +139,13 @@ def test_the_flow_event_names_the_dust_that_leaves_with_a_withdrawn_holder(new_s
     _mark(store, "held", t2 + timedelta(seconds=10))
     sup.mark_portfolio(t2 + timedelta(seconds=20))
     (flow,) = _flows(store, "held")
-    assert ", with dust of 1E-9 no order can close, which leaves with it" in flow, flow
+    assert ", with dust of 0.000000001 no order can close, which leaves with it" in flow, flow
     assert "held" in store.withdrawn()
+
+
+@pytest.mark.parametrize("qty, words", [(Decimal("1.000000000E-9"), "0.000000001"), (Decimal("1E-9"), "0.000000001"),
+                                        (Decimal(100), "100"), (Decimal("100.000000000000000000"), "100"),
+                                        (Decimal("0.01500002"), "0.01500002")])
+def test_a_quantity_reads_in_plain_digits_whatever_scale_the_engine_hands_back(qty, words):
+    """TEC-DUST-FMT: Postgres returns a NUMERIC at its column's scale, SQLite without; never an exponent (1E+2)."""
+    assert qty_words(qty) == words
