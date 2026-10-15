@@ -11,7 +11,7 @@ from nautilus_trader.model import Bar
 
 from sleeve_fund.data import bar_minutes
 from sleeve_fund.strategies.base import IdeaSpec, LongFlatConfig, LongFlatStrategy
-from sleeve_fund.strategies.indicators import AtrSma, Rsi, Sma, settle_bars
+from sleeve_fund.strategies.indicators import AtrSma, Rsi, Sma, seeding, settle_bars
 
 DAY_NS = 86_400_000_000_000
 
@@ -88,6 +88,9 @@ class _Ema:
         return self.count >= self.span
 
 
+seeding.register(_Ema, "EMA", seeding.RELATIVE, 1e-4)  # A10: an EMA's tolerance, 1 bp (Advisor, 15 Oct 07:02 UK)
+
+
 class DipBuy(LongFlatStrategy):
     def __init__(self, config: DipBuyConfig) -> None:
         super().__init__(config)
@@ -116,6 +119,12 @@ class DipBuy(LongFlatStrategy):
 
     def resume_leg(self, side: int, held: int) -> None:
         self._side, self._held = side, held  # after a restart: the leg, and its time stop, from the journal's entry
+
+    def seeding_units(self) -> list[tuple[str, object]]:
+        return [(k, u) for k, u in super().seeding_units() if u is not self.day_ema]  # fed on day closes only
+
+    def seeding_timeframes(self) -> dict[int, list[tuple[str, object]]]:
+        return {1440: [(f"EMA({self.c.trend_ema_days}) on daily closes", self.day_ema)]}
 
     def update_indicators(self, bar: Bar) -> None:
         close = bar.close.as_double()

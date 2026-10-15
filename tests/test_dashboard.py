@@ -2817,3 +2817,16 @@ def test_a_reset_after_liquidation_on_a_stopped_strategy_is_applied_and_ends_the
     assert "command_error" not in r.headers["location"]
     page = c.get("/sleeves/btc-test", auth=AUTH).text
     assert 'id="dlg-ral"' not in page and 'data-open="dlg-start"' in page
+
+
+def test_a_strategy_with_an_average_too_long_to_settle_is_refused_where_it_is_made(client):
+    """A10 (Advisor 15 Oct ~07:59 UK): an EMA past 1,442 bars could never settle within the warm-up seed check's
+    1,000 bars, so the form refuses it, naming the longest it can take; nothing is made."""
+    from urllib.parse import parse_qs, urlparse
+
+    c, store = client
+    r = _new(c, strategy="rsi_pullback", p_rsi_pullback__ema_period="1500")
+    assert r.status_code == 303 and "error" in r.headers["location"], r.headers["location"]
+    said = parse_qs(urlparse(r.headers["location"]).query)["error"][0]
+    assert "EMA(1500) is longer than the warm-up seed check can judge" in said and "1,442" in said, said
+    assert "btc-test" not in {s.name for s in store.sleeves()}

@@ -1729,6 +1729,15 @@ RESET_STAYS = {
 STRATEGY_COLUMNS = frozenset({"sleeve", "sleeve_id", "parent", "strategy_id"})
 
 
+
+LEG_IDENTITY = ("assets", "universe_date")  # create_legs: a multi-asset Strategy's identity, kept in every row's params
+
+
+def model_params(params: dict | None) -> dict:
+    """A row's settings as its model takes them: a multi-asset Strategy's asset list and universe_date (create_legs)
+    are its identity, not the model's, and the model's config refuses them (CR A10-M2)."""
+    return {k: v for k, v in (params or {}).items() if k not in LEG_IDENTITY}
+
 class Store:
     def __init__(self, url: str | None = None, engine: Engine | None = None, portfolio_gate: bool = False) -> None:
         """portfolio_gate: the portfolio gate is in force on this journal, and with no state row its entries are
@@ -4831,7 +4840,7 @@ class Store:
             # One settings block for every leg (multi-asset spec §2); the asset list is the Strategy's identity (QT3 b3c).
             if s.parent is not None:
                 raise ValueError(f"{sleeve} is an asset leg of {s.parent}: change the Strategy's settings")
-            for key in ("assets", "universe_date"):
+            for key in LEG_IDENTITY:
                 if params.get(key) != s.params.get(key):
                     raise ValueError(f"a multi-asset Strategy's {key} is fixed when it is made: a new list is a new "
                                      "Strategy")

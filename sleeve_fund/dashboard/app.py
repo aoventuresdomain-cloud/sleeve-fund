@@ -2954,4 +2954,14 @@ def _check_strategy_params(cfg: SleeveConfig, half_spread: float = 0.0) -> None:
     params.pop("max_notional", None)
     config_cls(instrument_id=InstrumentId.from_str(cfg.instrument_id), bar_type=BarType.from_str(cfg.bar_type),
                assumed_taker_fee=float(cfg.fees.taker), assumed_half_spread=half_spread, **params)
+    # A10 (Advisor 15 Oct ~07:59 UK): an average too long to settle within the warm-up seed check is refused here
+    from sleeve_fund.start_check import build_model
+    from sleeve_fund.strategies.indicators import seeding
+
+    try:
+        _, units = build_model(cfg.strategy, cfg.venue, cfg.instrument, cfg.params, cfg.bar_spec)
+    except Exception:  # noqa: BLE001 - a model that can't be built is the start check's FAIL, not a new refusal here
+        units = []
+    if too_long := [why for _, unit in units for why in seeding.too_long(unit)]:
+        raise ValueError("; ".join(too_long))
 
