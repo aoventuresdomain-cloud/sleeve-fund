@@ -980,8 +980,9 @@ window.Console = (() => {
       const pair = ($("instrument").value || "").toUpperCase();
       const quote = pair.split("/")[1] || "";
       const cap = Number($("starting_balance").value || 0);
+      const held = $("starting_balance").type === "hidden";  // the fund holds the capital (CUT-A)
       const items = [
-        `Trade ${pair || "the instrument"} with ${money.format(cap)} ${quote} of simulated money, deciding on ${bar ? bar.parentElement.textContent.trim() : "1h"} candles.`,
+        `Trade ${pair || "the instrument"} ${held ? "sized from the fund's equity" : `with ${money.format(cap)} ${quote} of simulated money`}, deciding on ${bar ? bar.parentElement.textContent.trim() : "1h"} candles.`,
         `Use ${opt.textContent.split(" (")[0]}: ${desc ? desc.textContent : ""}`,
         (() => {
           const mk = form.elements.market ? form.elements.market.value : "spot";
@@ -989,7 +990,8 @@ window.Console = (() => {
           const shorts = form.elements.allow_short && form.elements.allow_short.checked;
           return `Trade the ${form.elements.market.selectedOptions[0].textContent.split(":")[0].toLowerCase()}, ${shorts ? "long and short" : "long only"}, with positions up to ${prof.lev}x its capital.`;
         })(),
-        `Pause for a day after losing ${pct(Number(prof.day))} in a day, and halt for your review at a ${pct(Number(prof.dd))} drawdown.`,
+        held ? "Pause and halt with the fund's own brakes, not on this Strategy's own losses."
+          : `Pause for a day after losing ${pct(Number(prof.day))} in a day, and halt for your review at a ${pct(Number(prof.dd))} drawdown.`,
       ];
       items.push(...exitFields(form)());
       if ($("execution").value === "maker") items.push(`Rest each signal order as a post-only limit for the maker fee, and send whatever hasn't filled after ${$("maker_wait_minutes").value || 15} minutes at market. Protective exits go at market.`);

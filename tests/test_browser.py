@@ -960,3 +960,28 @@ def test_a19_the_button_says_create_stopped_for_the_timed_test_and_goes_back_on_
     assert set(labels()) == {"Start strategy in paper mode"}
     assert errors == []
     page.context.close()
+
+
+def test_a19_fund_held_the_pm_makes_the_timed_test_from_the_form_with_no_capital_to_type(a19, browser):
+    """HoE MUST: with the fund holding the cash the store refuses a Strategy with capital of its own, so the form asks
+    none, sends 0, and its summary names no halt of the Strategy's own."""
+    from datetime import UTC, datetime, timedelta
+
+    base, store = a19
+    at = datetime.now(UTC) - timedelta(minutes=5)
+    store.settle_flow(store.fund_flow("deposit", 100_000, actor="pm", reason="the PM's reset", rebase=True, now=at), at)
+    page, errors = _open(browser, f"{base}/sleeves/new?instrument=BTC/USD&name=timed-test")
+    assert page.locator("input[name=starting_balance][type=number]").count() == 0
+    _step(page, "Model")
+    page.select_option("#strategy", "candle_step")
+    _step(page, "Capital and risk")
+    assert "The fund holds the capital. This Strategy sizes from fund equity." in page.inner_text("main")
+    assert "halt at" not in page.inner_text("#risk_profile")
+    summary = page.inner_text("#summary")
+    assert "sized from the fund's equity" in summary and "drawdown" not in summary and "simulated money" not in summary
+    _submit(page)
+    assert page.url.endswith("/sleeves/timed-test"), page.url
+    s = store.sleeve("timed-test")
+    assert s.desired_state == "stopped" and s.starting_balance == 0
+    assert errors == []
+    page.context.close()

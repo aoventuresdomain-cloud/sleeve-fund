@@ -6,6 +6,7 @@ words with the form sent back filled in. Creating it never starts it, and it is 
 created row is read back from the journal, on Postgres too (TEST_DATABASE_URL)."""
 
 import re
+from datetime import UTC, datetime, timedelta
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -136,3 +137,60 @@ def test_the_button_says_a_test_model_is_created_stopped(c):
     other = c.get("/sleeves/new?strategy=trend_filter", auth=AUTH).text
     assert re.search(r'data-test-label="Create \(stopped\)">Create \(stopped\)</button>', test)
     assert re.search(r'data-test-label="Create \(stopped\)">Start strategy in paper mode</button>', other)
+
+
+
+# HoE MUST (15 Oct, 18:53 UK): on the server the fund holds the cash (the re-base deposit applied at the 04:59 reset),
+# so a Strategy is made with 0 (CUT-A (a)) and its own drawdown halt doesn't act (CUT-A (d)). The form must send 0 and
+# say so, or every create there is refused.
+HELD_WORDS = "The fund holds the capital. This Strategy sizes from fund equity."
+
+
+def _hold(store):  # noqa: F811
+    at = datetime.now(UTC) - timedelta(minutes=5)
+    store.settle_flow(store.fund_flow("deposit", 100_000, actor="pm", reason="the PM's reset", rebase=True, now=at), at)
+
+
+def _capital_value(html: str) -> str | None:
+    m = re.search(r'<input[^>]*name="starting_balance"[^>]*>', html)
+    return re.search(r'value="([^"]*)"', m.group(0)).group(1) if m else None
+
+
+def test_fund_held_the_timed_test_from_the_form_is_made_stopped_with_0(c, store):  # noqa: F811
+    _hold(store)
+    html = c.get("/sleeves/new?strategy=candle_step", auth=AUTH).text
+    assert _capital_value(html) == "0"
+    r = _post(c, starting_balance=_capital_value(html))
+    assert r.status_code == 303 and r.headers["location"] == "/sleeves/timed-test", r.headers.get("location")
+    s = store.sleeve("timed-test")
+    assert s.desired_state == "stopped" and s.starting_balance == 0
+
+
+def test_fund_held_an_ordinary_strategy_from_the_form_is_made_too(c, store):  # noqa: F811
+    _hold(store)
+    html = c.get("/sleeves/new?strategy=trend_filter", auth=AUTH).text
+    form = {"name": "btc-trend", "strategy": "trend_filter", "instrument": "BTC/USD", "bar_spec": "1-HOUR-LAST-INTERNAL",
+            "starting_balance": _capital_value(html), "risk_profile": "balanced", "warmup_bars": "0",
+            "p_trend_filter__fast": "10", "p_trend_filter__slow": "30", "reason": "a Strategy in the fund"}
+    r = c.post("/sleeves/new", data=form, auth=AUTH, headers=SAME, follow_redirects=False)
+    assert r.status_code == 303 and r.headers["location"] == "/sleeves/btc-trend", r.headers.get("location")
+    assert store.sleeve("btc-trend").starting_balance == 0
+
+
+def test_fund_held_the_form_asks_no_capital_and_names_no_own_drawdown_halt(c, store):  # noqa: F811
+    _hold(store)
+    html = c.get("/sleeves/new", auth=AUTH).text
+    assert re.search(r'<input type="hidden" id="starting_balance" name="starting_balance" value="0">', html)
+    assert 'type="number" min="100"' not in html and HELD_WORDS in html
+    labels = re.findall(r'<option value="(?:conservative|balanced|aggressive)"[^>]*>([^<]+)</option>', html)
+    assert labels and not any("halt at" in w for w in labels)
+    assert "Balanced: leverage up to 2x" in labels
+
+
+def test_not_held_the_form_is_as_it_was(c):
+    html = c.get("/sleeves/new", auth=AUTH).text
+    assert re.search(r'id="starting_balance" name="starting_balance" type="number" min="100" step="100" value="10000"'
+                     r" required", html)
+    assert HELD_WORDS not in html
+    labels = re.findall(r'<option value="(?:conservative|balanced|aggressive)"[^>]*>([^<]+)</option>', html)
+    assert labels and all("halt at" in w for w in labels)

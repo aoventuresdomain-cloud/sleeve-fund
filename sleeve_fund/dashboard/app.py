@@ -54,7 +54,16 @@ from sleeve_fund.research.ledger import IdeaLedger, opened_words
 from sleeve_fund.research.holdout import HoldoutLocks
 from sleeve_fund.research.trials import TrialsRegister
 from sleeve_fund.risk import PROFILES, leverage_cap
-from sleeve_fund.store import BACKTEST_PREFIX, HALT_FLATTEN, LIQUIDATION_RESET, RAL, Store, is_backtest, utcnow
+from sleeve_fund.store import (
+    BACKTEST_PREFIX,
+    HALT_FLATTEN,
+    LIQUIDATION_RESET,
+    RAL,
+    Store,
+    _fund_held,
+    is_backtest,
+    utcnow,
+)
 from sleeve_fund.paper.runtime import (EXITS_ONLY, RESUMABLE, clearing_action, entry_blocked, liquidation_event,
                                       pair_ral_figures)
 from sleeve_fund.strategies import REGISTRY, check_perp_sizing, check_perp_stop
@@ -477,7 +486,7 @@ def create_app(store: Store | None = None) -> FastAPI:
             pre = {**TEST_PREFILL[chosen], **pre}
         return page(request, "new_sleeve.html", strategies=choices, instruments=hints,
                     bar_specs=sorted(ALLOWED_BAR_SPECS, key=spec_minutes), profiles=PROFILES, error=error, g1=g1, chosen=chosen,
-                    pre=pre, accounts=st().accounts(), costs=exit_costs())
+                    pre=pre, accounts=st().accounts(), costs=exit_costs(), fund_held=_fund_held(st()))
 
     @app.post("/sleeves/new")
     async def new_sleeve(request: Request, actor: str = Depends(require_pm), _o: None = Depends(same_origin)):

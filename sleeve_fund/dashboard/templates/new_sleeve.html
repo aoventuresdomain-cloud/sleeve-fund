@@ -28,9 +28,13 @@
     <fieldset class="panel step">
       <legend>3. Capital and risk</legend>
       <div class="grid2">
+        {% if fund_held %}{# CUT-A (a): once the fund holds the cash a Strategy is made with 0, and sized from the fund's equity #}
+        <div class="field"><span class="label">Capital</span><input type="hidden" id="starting_balance" name="starting_balance" value="0"><p class="hint" id="fund-held-capital">The fund holds the capital. This Strategy sizes from fund equity.</p></div>
+        {% else %}
         <div class="field"><label for="starting_balance">Capital, in the instrument's quote currency</label><input id="starting_balance" name="starting_balance" type="number" min="100" step="100" value="{{ pre.get('starting_balance', 10000) }}" required></div>
+        {% endif %}
         <div class="field"><label for="account">Account</label><select id="account" name="account">{% for a in accounts %}<option value="{{ a.name }}" {{ 'disabled' if a.kind == 'live' or a.retired_at }} {{ 'selected' if a.name == pre.get('account', 'paper') }}>{{ a.name }} ({{ 'retired' if a.retired_at else 'live, locked until G2' if a.kind == 'live' else 'paper' }})</option>{% endfor %}</select></div>
-        <div class="field"><label for="risk_profile">Risk profile</label><select id="risk_profile" name="risk_profile">{% for p in profiles.values() %}<option value="{{ p.name }}" {{ 'selected' if p.name == pre.get('risk_profile', 'balanced') }} data-dd="{{ p.max_drawdown }}" data-day="{{ p.daily_loss }}" data-lev="{{ p.max_leverage|round(2) }}">{{ p.name|capitalize }}: halt at {{ p.max_drawdown|pct0 }} drawdown</option>{% endfor %}</select></div>
+        <div class="field"><label for="risk_profile">Risk profile</label><select id="risk_profile" name="risk_profile">{% for p in profiles.values() %}<option value="{{ p.name }}" {{ 'selected' if p.name == pre.get('risk_profile', 'balanced') }} data-dd="{{ p.max_drawdown }}" data-day="{{ p.daily_loss }}" data-lev="{{ p.max_leverage|round(2) }}">{{ p.name|capitalize }}: {% if fund_held %}leverage up to {{ '%g'|format(p.max_leverage) }}x{% else %}halt at {{ p.max_drawdown|pct0 }} drawdown{% endif %}</option>{% endfor %}</select></div>
         <div class="field"><label for="max_notional">Largest single order (optional)</label><input id="max_notional" name="max_notional" type="number" min="10" step="10" placeholder="No cap" value="{{ pre.get('max_notional', '') }}"></div>
         <div class="field"><label for="warmup_bars">History to load at start (bars)</label><input id="warmup_bars" name="warmup_bars" type="number" min="0" max="50000" value="{{ pre.get('warmup_bars', '') }}" placeholder="Automatic"></div>
       </div>
