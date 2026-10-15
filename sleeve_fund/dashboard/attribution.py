@@ -85,7 +85,9 @@ def fund(store: Store, sleeves, now: datetime, period: str = "all") -> dict:
     contribution}, total: {pnl, contribution}, fund_start, label}. total is the fund's book at its last mark less
     its book at the period's start; the fund line is what no Strategy's closed trades carry (open positions, costs
     and cash outside a Strategy), so the rows plus the fund line are the total exactly. Contributions are None, and
-    so is everything but the rows' P&L, before the book's first mark."""
+    so is everything but the rows' P&L, before the book's first mark. The total runs to the last mark, not to `now`,
+    because the rows have no upper bound either (every trade closed since the start): a period that ends before the
+    last mark must bound both the rows and the total (HoE 15 Oct)."""
     rows = []
     for s in sleeves:
         a = strategy(store, s.name, trips_of(store, s), now, period)
