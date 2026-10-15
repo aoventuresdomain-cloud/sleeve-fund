@@ -186,7 +186,7 @@ def fetched_rows(store, name: str, pair: str, now: datetime) -> tuple[list[tuple
     """The fetched venue data (FEE-LIVE's last-known-good rows) beside the engine's maintenance tiers and fees, and a
     note for each row that needs words. Reads the journal only."""
     from sleeve_fund import fees
-    from sleeve_fund.store import PUBLISHED_FEES, margin_tiers_of
+    from sleeve_fund.store import PUBLISHED_FEES, margin_tiers_of, venue_fees_of
 
     out: list[tuple[str, object, object, str]] = []
     notes: list[str] = []
@@ -230,7 +230,7 @@ def fetched_rows(store, name: str, pair: str, now: datetime) -> tuple[list[tuple
             out.append((term, "none", engine, "MUST"))
             said(term, "never fetched")
             continue
-        got = Decimal(good["payload"][side])
+        got = getattr(venue_fees_of(good), side)
         verdict, words = _age(good, now)
         if engine < got:  # paper charges less than the venue: its results would look better than they are
             verdict, words = "MUST", f"the engine charges less than the venue; {words}"
