@@ -1826,6 +1826,14 @@ class Store:
             raise ValueError(f"an asset's name is 1-16 letters or digits: {bad}")
         if len(set(unders)) != len(unders):
             raise ValueError(f"an asset is listed twice: {assets}")
+        if bad := [a for a in assets if not re.fullmatch(r"[A-Z0-9]+/[A-Z0-9]+", a)]:  # F-B3C-VENUE
+            from sleeve_fund.venues import DEFAULT_VENUE
+
+            raise ValueError(f"each asset is BASE/QUOTE on the Strategy's one venue ({(venue or DEFAULT_VENUE).upper()})"
+                             f", with no venue of its own: {bad}")
+        if len(quotes := {a.split("/")[1] for a in assets}) > 1:
+            raise ValueError(f"a multi-asset Strategy's assets share one quote currency, its venue's account's: "
+                             f"{', '.join(sorted(quotes))} in {assets}")
         if not universe_date:
             raise ValueError("a multi-asset Strategy names the date its list was chosen (universe_date)")
         params = {**(params or {}), "assets": assets, "universe_date": str(universe_date)}

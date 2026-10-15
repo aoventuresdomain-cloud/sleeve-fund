@@ -154,3 +154,18 @@ def test_a_reset_of_a_multi_asset_strategy_is_refused_and_changes_nothing():
             store.request_reset(name, "Settings changed")
         assert not store.pending_reset(name)
     assert [(s.name, s.status, s.desired_state, s.starting_balance) for s in store.sleeves()] == before
+
+
+@pytest.mark.parametrize("assets, why", [
+    (["BTC/USDT", "ETH/USD@KRAKEN"], "no venue of its own"),
+    (["BTC/USDT", "ETH/USD"], "share one quote currency"),
+    (["BTC/USDT", "ETH"], "BASE/QUOTE"),
+])
+def test_an_asset_on_another_venue_or_quote_is_refused_at_creation(assets, why):
+    """F-B3C-VENUE (HoQA b3c): a multi-asset Strategy trades on one venue, every leg on its account in one quote
+    currency. An asset naming a venue of its own, or another quote, is refused when the Strategy is made, in words,
+    and nothing is made (it was stored as a leg on the Strategy's venue and only refused at start)."""
+    store = _fund(Store.in_memory())
+    with pytest.raises(ValueError, match=why):
+        _make(store, name="two", assets=assets)
+    assert not [s for s in store.sleeves() if s.name.split("~")[0] == "two"]
