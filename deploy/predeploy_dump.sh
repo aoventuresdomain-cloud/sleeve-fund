@@ -11,7 +11,13 @@ DB=${BACKUP_DB:-sleeve_fund}
 CHECK=${PREDEPLOY_CHECK_DB:-predeploy_check}
 export PGHOST=${PGHOST:-db} PGUSER=${PGUSER:-sleeve}  # as backup.sh: the container holds only the password
 f="$DIR/predeploy-$(date -u +%Y%m%d-%H%M%S).pgdump"
+# Until the copy is proved it keeps its .part name, removed on any exit: an unproved copy never stays under a good one.
 trap 'rm -f "$f.part"; dropdb --if-exists "$CHECK" >/dev/null 2>&1 || true' EXIT
+# Twice the newest dump (nightly or pre-deploy) free beside them, or nothing is dumped (HoE).
+last=$(ls -1t "$DIR"/*.dump "$DIR"/predeploy-*.pgdump 2>/dev/null | head -n 1 || true)
+size=$(if [ -n "$last" ]; then stat -c %s "$last"; else echo 0; fi)
+free=$(df -PB1 "$DIR" | awk 'NR == 2 { print $4 }')
+[[ "$free" =~ ^[0-9]+$ ]] && [ "$free" -ge $((2 * size)) ] || { echo "pre-deploy dump: FAIL, not enough disk"; exit 1; }
 # The journal's own rows (backtests excluded: the dashboard may prune those meanwhile), counted before and after the
 # dump: the running code only adds them, so the copy must hold at least the first count and at most the second.
 COUNT="select (select version_num from alembic_version) || ' ' ||
@@ -23,10 +29,9 @@ NAMES="migration orders fills events fund_flows book_moves decisions"
 before=$(psql -d "$DB" -At -c "$COUNT")
 pg_dump -d "$DB" -Fc -f "$f.part"
 after=$(psql -d "$DB" -At -c "$COUNT")
-mv "$f.part" "$f"
 dropdb --if-exists "$CHECK"
 createdb "$CHECK"
-pg_restore --no-owner --no-privileges --exit-on-error -d "$CHECK" "$f" 2>/dev/null \
+pg_restore --no-owner --no-privileges --exit-on-error -d "$CHECK" "$f.part" 2>/dev/null \
   || { echo "pre-deploy dump: FAIL, it didn't restore"; exit 1; }
 copy=$(psql -d "$CHECK" -At -c "$COUNT")
 dropdb "$CHECK"
@@ -36,8 +41,9 @@ read -r -a b <<< "$before"; read -r -a a <<< "$after"; read -r -a c <<< "$copy";
 words="restored at migration ${c[0]}"
 for i in 1 2 3 4 5 6; do
   { [ "${c[$i]}" -ge "${b[$i]}" ] && [ "${c[$i]}" -le "${a[$i]}" ]; } \
-    || { echo "pre-deploy dump: FAIL, ${n[$i]} short in the copy"; exit 1; }
+    || { echo "pre-deploy dump: FAIL, ${n[$i]} doesn't match the journal"; exit 1; }
   words="$words, ${n[$i]} ${c[$i]}"
 done
+mv "$f.part" "$f"
 ls -1t "$DIR"/predeploy-*.pgdump | tail -n +4 | xargs -r rm -f
 echo "pre-deploy dump: PASS, $words"
