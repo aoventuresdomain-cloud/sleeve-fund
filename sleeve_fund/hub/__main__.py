@@ -100,7 +100,7 @@ def _journal_event(sleeve, level, kind, message, ts=None) -> None:
         if _journal is None:
             from sleeve_fund.store import Store
 
-            _journal = Store()
+            _journal = Store(portfolio_gate=True)  # the paper journal runs under the gate; the hub only writes events
         _journal.event(sleeve, level, kind, message, ts=ts)
     except Exception as exc:  # noqa: BLE001 - the log line still says it
         print(f"hub: could not journal {kind}: {exc!r} ({message})")
