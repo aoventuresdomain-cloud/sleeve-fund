@@ -13,6 +13,9 @@ round. One page, pass or fail:
    asset. One failing asset fails, named.
 5. Alerts (A15). Alerts have somewhere to go (ALERT_WEBHOOK_URL) and an outside monitor is pinged (HEALTHCHECK_PING_URL),
    named by host only.
+6. Order client (head 3). Off is a note (the simulated paper client). On, the key type (demo or live) and the host from
+   sleeve_fund.exec_target, the reader the client's guard shares; a production host in demo mode, a demo host in live
+   mode, an unknown host or a missing key fails, named. Key values are never shown.
 
 Strictly read-only. It opens the database read-only (SQLite mode=ro; Postgres default_transaction_read_only), never
 the Store's own engine, and imports nothing that places an order or opens a network connection.
@@ -110,6 +113,25 @@ def check_keys(environ: dict[str, str], engine: Engine) -> Section:
         sec.add(NOTE, f"demo mirror keys set ({', '.join(used)}): demo and testnet hosts only")
     if not sec.failed:
         sec.add(PASS, "no live key in the environment or reported for any account")
+    return sec
+
+
+def check_exec_target(environ: dict[str, str]) -> Section:
+    """Head 3: where the exchange order client would send orders (sleeve_fund.exec_target, the reader its guard shares):
+    off is a note; on, the key type and the host, each mismatch failing, named. Key values are never shown."""
+    from sleeve_fund import exec_target
+
+    sec = Section("Order client")
+    t = exec_target.read(environ)
+    if t is None:
+        sec.add(NOTE, exec_target.OFF)
+        return sec
+    found = exec_target.problems(t)
+    for p in found:
+        sec.add(FAIL, p)
+    if not found:
+        sec.add(PASS, exec_target.describe(t))
+        sec.add(NOTE, exec_target.SCOPE_UNCHECKED)
     return sec
 
 
@@ -423,8 +445,9 @@ def run(url: str, environ: dict[str, str] | None = None) -> tuple[bool, str]:
     env = dict(os.environ if environ is None else environ)
     store = read_only_store(url)
     engine = store.engine
-    sections = [check_store(engine), check_keys(env, engine), check_alerts(env), check_venues(engine),
-                check_maintenance(store), check_books(store), check_assets(store), check_warmups(store),
+    sections = [check_store(engine), check_keys(env, engine), check_exec_target(env), check_alerts(env),
+                check_venues(engine), check_maintenance(store), check_books(store), check_assets(store),
+                check_warmups(store),
                 check_account_sharing(env, engine), check_strength(store)]
     ok = not any(s.failed for s in sections)
     out = [f"Start check: {'PASS' if ok else 'FAIL'}",
