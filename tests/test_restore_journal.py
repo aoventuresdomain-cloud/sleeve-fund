@@ -158,10 +158,29 @@ def test_the_journal_is_renamed_aside_never_dropped(tmp_path):
 
 
 @needs_bash
-def test_a_failed_second_rename_puts_the_journal_back(tmp_path):
+def test_a_failed_set_aside_leaves_the_journal_and_names_the_exit(tmp_path):
     done, calls = _run(tmp_path, rename_ok=False)
-    assert done.returncode == 1 and "restore journal: FAIL" in done.stdout
-    assert not _renames(calls)[1:] or 'RENAME TO "sleeve_fund"' in _renames(calls)[-1]
+    assert done.returncode == 1 and "couldn't set the journal aside (exit 5), it is as it was" in done.stdout
+    assert len(_renames(calls)) == 1
+
+
+@needs_bash
+def test_a_failed_second_rename_puts_the_journal_back_and_names_the_exit(tmp_path):
+    log = tmp_path / "calls.log"
+    _run(tmp_path)
+    psql = tmp_path / "bin" / "psql"  # the set-aside works, the stage's rename into place doesn't
+    psql.write_text(f'''#!/usr/bin/env bash
+echo "psql $*" >> {log}
+case "$*" in *pg_stat_activity*) echo 0;; *'"restore_stage" RENAME'*) exit 6;; *"ALTER DATABASE"*) exit 0;;
+  *) echo "0028 5 4 9 1 2 3";; esac
+''')
+    log.write_text("")
+    env = {k: v for k, v in os.environ.items() if k not in ("PGHOST", "PGUSER")}
+    env |= {"PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}", "BACKUP_DIR": str(tmp_path / "b"), "DUMP": DUMP}
+    done = subprocess.run(["bash", str(INNER)], env=env, capture_output=True, text=True, timeout=30, check=False)
+    assert done.returncode == 1 and "(exit 6), the journal is back as it was" in done.stdout, done.stdout
+    back = _renames(log.read_text().splitlines())[-1]
+    assert '_before_restore_' in back and back.endswith('RENAME TO "sleeve_fund"')
 
 
 @needs_bash
