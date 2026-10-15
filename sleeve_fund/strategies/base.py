@@ -2635,7 +2635,9 @@ class LongFlatStrategy(Strategy):
                 venue["liquidation"] = liq
                 guards["liquidation_cut"] = liq / (1 - d) if side > 0 else liq / (1 + d)
             g_equity, g_cash, g_qty = self._guard_book(equity, cash, qty, self._price())
-            if qty and g_qty and self.runtime.halts:
+            # CUT-A: inside the fund the Strategy's own drawdown halt and daily pause don't act (SleeveRuntime.tick);
+            # its own equity starts at 0, so their levels would sit at about its entry and stop the replay short.
+            if qty and g_qty and self.runtime.halts and not getattr(self.runtime, "fund_held", False):
                 p, day_open = self.runtime.profile, self.runtime._day_open or g_equity
                 guards["risk_halt"] = (max(self.runtime.peak, g_equity) * (1 - p.max_drawdown) - g_cash) / g_qty
                 guards["risk_pause"] = (day_open * (1 - p.daily_loss) - g_cash) / g_qty

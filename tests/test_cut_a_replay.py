@@ -1,14 +1,15 @@
-"""CUT-A on the replay of missed minutes (RESUME-LEG line 1, found by the decision-path scan): inside the fund no
+"""CUT-A-REPLAY (MUST, Drop 3a; found by the CUT-A decision-path scan): inside the fund no
 decision reads a Strategy's own equity, and the replay after a restart or a feed gap is a decision (it closes the
 position as an outage exit). Its drawdown-halt and daily-loss-pause levels are the Strategy's own brakes, which the
 fund's T5 replaces there (Advisor SIZE-FUND Q4), as SleeveRuntime.tick and _guard_breached already skip them. Inside
 the fund the Strategy's own equity starts at 0, so its own "drawdown level" sits at about its entry price."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
-import pytest
-from test_exposure_gate_xfails import _offline  # noqa: F401 - the paper harness's offline venue (autouse)
+from test_exposure_gate_xfails import (
+    _offline,  # noqa: F401 - the paper harness's offline venue (autouse)
+)
 from test_timing import NS, _booked, _late_strategy, _minutes
 
 from sleeve_fund import risk
@@ -16,11 +17,11 @@ from sleeve_fund import risk
 
 def _restarted_long(fund_held: bool, equity: float, cash: float, peak: float, minutes):
     """A 1-unit long from 100 with a 2% stop (98) and a 5% target, restarted over the stored `minutes` (high, low)."""
-    s, bar, events, sold, opened = _late_strategy()
+    s, _, events, sold, _ = _late_strategy()
     _booked(s, sold)
     s._entry_px, s._entry_side, s._stop_frac, s._tp_frac = 100.0, 1, 0.02, 0.05
-    s._last_alive = s._last_seen = datetime.fromtimestamp(NS / 1e9, tz=timezone.utc)
-    s.runtime.store.fills = lambda name, limit: [{"ts": datetime.fromtimestamp((NS - 600e9) / 1e9, tz=timezone.utc)}]
+    s._last_alive = s._last_seen = datetime.fromtimestamp(NS / 1e9, tz=UTC)
+    s.runtime.store.fills = lambda name, limit: [{"ts": datetime.fromtimestamp((NS - 600e9) / 1e9, tz=UTC)}]
     s.runtime.profile, s.runtime.halts, s.runtime.fund_held = risk.profile("balanced"), True, fund_held
     s.runtime.peak, s.runtime._day_open = peak, peak
     s._mark = lambda: (equity, cash, 1.0, 101.0)
@@ -49,7 +50,7 @@ def test_inside_the_fund_the_stop_a_later_missed_minute_passed_is_still_booked()
     the venue filled in minute 2 unbooked, and the minutes marked as seen."""
     s, sold, events, ticks = _restarted_long(True, **FUND, minutes=[(100.5, 99.5), (99.0, 97.0)])
     assert s._check_outage_exits() is True
-    (intent, reason, book), = sold
+    (intent, _, _), = sold
     assert intent == "stop_loss" and "Risk-halt" not in " ".join(e[3] for e in events), events
     assert ticks == []
 
@@ -57,9 +58,9 @@ def test_inside_the_fund_the_stop_a_later_missed_minute_passed_is_still_booked()
 def test_outside_the_fund_the_replay_still_judges_the_strategys_own_drawdown_level():
     # Its own equity, 1,000.92, against a peak of 1,250: the 20% halt is at 1,000 of equity, a price of
     # (1,250 x 0.8 - 899.92) / 1 = 100.08, which the replayed minute's 99.5 passes; the tick then judges it.
-    s, sold, events, ticks = _restarted_long(False, equity=1_000.92, cash=899.92, peak=1_250.0,
+    s, _, events, ticks = _restarted_long(False, equity=1_000.92, cash=899.92, peak=1_250.0,
                                              minutes=[(100.5, 99.5), (101.0, 100.0)])
     assert s._check_outage_exits() is True
     assert len(ticks) == 1 and ticks[0] is not None
-    (_, _, kind, said), = [e for e in events if e[2] == "outage_exit"]
+    (_, _, _, said), = [e for e in events if e[2] == "outage_exit"]
     assert said.startswith("Risk-halt reached") and "drawdown halt's level" in said, said
