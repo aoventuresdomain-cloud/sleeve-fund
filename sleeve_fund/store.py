@@ -2599,12 +2599,15 @@ class Store:
                                                  "made at once")
 
     def account_holders(self, account: str) -> list[str]:
-        """A7: the Strategies (a two-leg's legs as one) whose rows are on `account` and not yet released: put away and
-        out of the book (withdrawn) releases it (Advisor (b)); a saved backtest never holds one."""
+        """A7: the Strategies (a two-leg's legs as one) whose rows are on `account` and not yet released. Advisor (b):
+        released only once put away and out of the book (its balance back to the fund by its journaled withdrawal),
+        flat, and with no order open; a saved backtest never holds one."""
         out = set()
         gone = self.withdrawn()
         for r in self.accounts_links(account):
-            if is_backtest(r) or r in gone:
+            if is_backtest(r):
+                continue
+            if r in gone and self.lifecycle_flat(r)[1] and not self.orders(r, statuses=OPEN_ORDER_STATUSES, limit=1):
                 continue
             out.add(self.sleeve(r).parent or r)
         return sorted(out)

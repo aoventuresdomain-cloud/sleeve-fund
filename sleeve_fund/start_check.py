@@ -130,8 +130,10 @@ def check_account_sharing(environ: dict[str, str], engine: Engine) -> Section:
     Strategy's; each shared one FAILs, named with its Strategies. Off, it says so and passes."""
     from sleeve_fund.accounts import per_strategy
     from sleeve_fund.store import (
+        OPEN_ORDER_STATUSES,
         accounts_t,
         is_backtest,
+        orders_t,
         sleeve_accounts_t,
         sleeve_archive_t,
         sleeves_t,
@@ -145,8 +147,11 @@ def check_account_sharing(environ: dict[str, str], engine: Engine) -> Section:
     with engine.connect() as c:
         rows = c.execute(select(link.account, link.sleeve, s.parent).join(sleeves_t, s.name == link.sleeve)
                          .join(accounts_t, a.name == link.account).where(a.kind == "live")).all()
+        # put away, out of the book and no order open (Advisor (b)); a withdrawal is only ever made flat (F-C3B-A)
         released = set(c.execute(select(sleeve_archive_t.c.sleeve)
                                  .where(sleeve_archive_t.c.withdrawn.is_not(None))).scalars())
+        released -= set(c.execute(select(orders_t.c.sleeve).where(orders_t.c.status.in_(OPEN_ORDER_STATUSES)))
+                        .scalars())
     by: dict[str, set[str]] = {}
     for acc, row, parent in rows:
         if not is_backtest(row) and row not in released:  # put away and out of the book: released (A7 (b))

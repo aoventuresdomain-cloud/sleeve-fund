@@ -108,3 +108,15 @@ def test_6_a_put_away_strategy_holds_its_account_until_it_is_released(store, mon
     else:
         with pytest.raises(ValueError, match="s1"):
             store.assign_account("s2", "desk-a")
+
+
+def test_7_a_withdrawn_strategy_with_an_order_still_open_keeps_its_account(store, monkeypatch):
+    """Advisor (b), HoQA: out of the book is not enough; flat and no open order too."""
+    _on(monkeypatch)
+    store.assign_account("s1", "desk-a")
+    monkeypatch.setattr(store, "withdrawn", lambda: {"s1": 0})
+    store.record_order("s1", order_id="late", side="SELL", qty=0.1, intent="exit", reason="r")
+    with pytest.raises(ValueError, match="s1"):
+        store.assign_account("s2", "desk-a")
+    store.update_order("late", status="canceled")
+    store.assign_account("s2", "desk-a")
