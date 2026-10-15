@@ -2,7 +2,7 @@
 check's key and host line and the client's own guard share (head 3; PE3 agreed 15 Oct ~12:30 UK). Off by default: with
 EXEC_MODE unset the client is the simulated paper one and nothing here applies.
 
-    EXEC_MODE   demo or live (unset: off)
+    EXEC_MODE   demo or live (unset, "off" or "none": off; any other value fails closed)
     EXEC_VENUE  the venue (BYBIT when unset)
     EXEC_HOST   the bare API host, e.g. api-demo.bybit.com
     and the venue's key and secret for that mode (KEYS), e.g. BYBIT_DEMO_API_KEY and BYBIT_DEMO_API_SECRET in demo mode
@@ -22,6 +22,7 @@ from dataclasses import dataclass
 MODE_ENV, VENUE_ENV, HOST_ENV = "EXEC_MODE", "EXEC_VENUE", "EXEC_HOST"
 DEFAULT_VENUE = "BYBIT"
 MODES = ("demo", "live")
+OFF_WORDS = ("off", "none")  # N-KH1 (HoE 15 Oct): exact after trimming, so "Off" fails closed like any unknown mode
 # The closed list of hosts: (venue, mode) -> the hosts allowed in that mode.
 HOSTS = {
     ("BYBIT", "demo"): ("api-demo.bybit.com",),
@@ -57,10 +58,11 @@ def _set(environ: dict, name: str | None) -> bool:
 
 
 def read(environ: dict) -> Target | None:
-    """The order client's target from the environment, or None when it is off (EXEC_MODE unset)."""
-    mode = (environ.get(MODE_ENV) or "").strip().lower()
-    if not mode:
+    """The order client's target from the environment, or None when it is off (EXEC_MODE unset, "off" or "none")."""
+    raw = (environ.get(MODE_ENV) or "").strip()
+    if not raw or raw in OFF_WORDS:
         return None
+    mode = raw.lower()
     venue = ((environ.get(VENUE_ENV) or "").strip() or DEFAULT_VENUE).upper()
     host = (environ.get(HOST_ENV) or "").strip().lower()
     key_var, secret_var = KEYS.get((venue, mode), (None, None))

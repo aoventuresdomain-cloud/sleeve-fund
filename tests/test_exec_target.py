@@ -205,3 +205,24 @@ def test_an_unreadable_target_fails_closed_in_choke(monkeypatch):
     monkeypatch.setattr(et, "read", boom)
     why = runtime.exec_target_block({"EXEC_MODE": "demo"})
     assert why is not None and why.code == "exec_target" and "couldn't be read" in why
+
+
+# ---- N-KH1 (HoE approved 15 Oct): "off" and "none" read as off, exact after trimming; anything else fails closed ---------
+@pytest.mark.parametrize("mode, off", [(None, True), ("off", True), ("none", True), ("  off ", True), ("Off", False),
+                                       ("OFF", False), ("paper", False), ("demo ", None)])
+def test_off_words_are_off_exactly_and_every_other_value_fails_closed(mode, off):
+    from sleeve_fund.paper import runtime
+    from sleeve_fund.start_check import NOTE, PASS, check_exec_target
+
+    env = {k: v for k, v in DEMO.items() if k != "EXEC_MODE"}
+    if mode is not None:
+        env["EXEC_MODE"] = mode
+    sec = check_exec_target(env)
+    if off:
+        assert et.read(env) is None and sec.lines == [(NOTE, et.OFF)] and runtime.exec_target_block(env) is None
+    elif off is None:  # a sound mode with stray spaces is that mode
+        assert et.read(env).mode == "demo" and sec.lines[0] == (PASS, "demo key, host api-demo.bybit.com")
+        assert runtime.exec_target_block(env) is None
+    else:
+        assert sec.failed and any("unknown mode" in w for _, w in sec.lines)
+        assert runtime.exec_target_block(env).code == "exec_target"
