@@ -37,6 +37,13 @@ orders go to the Nautilus sandbox matching engine (fed by the same live prices),
 pays Kraken's UK entry fee (0.40% maker, 0.80% taker). A sleeve is a TOML file in
 `configs/sleeves/` (seeded into the database on start; `configs/examples/` holds ones that are not): strategy, instrument, bar size, paper balance, per-order cap.
 
+Nightly recon (NIGHTLY-RECON): once a night after 01:00 UTC the supervisor compares every Strategy's
+dashboard figures with its journal, to under a cent, and writes `recon-YYYY-MM-DD.txt` (first line PASS or
+FAIL) to `RECON_DIR`; a FAIL is an alert. Deploy note: compose mounts the `recon` volume at `/data/recon`
+(created on the first `docker compose up`, made writable for the app's user by `volume-init`); read a night's
+record with `docker compose exec supervisor cat /data/recon/recon-YYYY-MM-DD.txt`. Unset `RECON_DIR`, it
+doesn't run.
+
 ## Research loop
 
 ```bash

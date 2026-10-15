@@ -116,7 +116,7 @@ main { padding: 26px 28px 56px; min-width: 0; max-width: 1680px; }
 .page-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 16px; margin-bottom: 20px; }
 .page-head h1 { font-size: 24px; font-weight: 600; letter-spacing: -0.03em; margin: 0; line-height: 1.2; }
 .page-head .lede { color: var(--muted); margin: 0; flex-basis: 100%; order: 3; }
-.page-head .actions { margin-left: auto; display: flex; gap: 8px; }
+.page-head .actions { margin-left: auto; display: flex; flex-wrap: wrap; gap: 8px; }
 h2 { font-size: 13.5px; font-weight: 600; letter-spacing: -0.01em; margin: 0; }
 /* Older templates use bare h1/.sub; keep them aligned with the new head. */
 main > h1 { font-size: 24px; font-weight: 600; letter-spacing: -0.03em; margin: 0 0 4px; }
@@ -165,6 +165,10 @@ th[aria-sort] { color: var(--text); }
 th[aria-sort="ascending"]::after { content: " ↑"; } th[aria-sort="descending"]::after { content: " ↓"; }
 .cell-name a { font-weight: 550; color: var(--text); }
 .cell-name .sub2 { display: block; color: var(--faint); font-size: 12px; }
+.cell-name .legs, .pair-legs { list-style: none; margin: 4px 0 0; padding: 0 0 0 10px; border-left: 2px solid var(--line); font-size: 12px; color: var(--muted); }
+.cell-name .legs li, .pair-legs li { white-space: nowrap; }
+tr.leg-row td { font-size: 12px; color: var(--muted); }
+tr.leg-row td.cell-name { padding-left: 22px; }
 
 /* --- status: a dot and a word, like a desk's order states ------------------- */
 .chip { display: inline-flex; align-items: center; gap: 6px; padding: 1px 8px 1px 7px; border-radius: 6px; font-size: 12px; font-weight: 500;
@@ -1010,9 +1014,9 @@ a.rh-pill:hover { border-color: var(--line-strong); text-decoration: none; }
 .sig-lamp.on { background: var(--gain); box-shadow: 0 0 7px var(--gain); }
 .sig-lamp.off, .sig-lamp.hit { background: var(--loss); box-shadow: 0 0 7px var(--loss); }
 .sig-lamp.idle { background: var(--muted); }
-nav.tabs .sig-tab-lights { display: inline-flex; gap: 4px; margin-left: 6px; vertical-align: 1px; }
-nav.tabs .sig-tab-lights:empty { display: none; }
-nav.tabs .sig-tab-lights .sig-lamp { width: 7px; height: 7px; box-shadow: none; }
+nav.tabs .sig-tab-lights, .sub-tabs .sig-tab-lights { display: inline-flex; gap: 4px; margin-left: 6px; vertical-align: 1px; }
+nav.tabs .sig-tab-lights:empty, .sub-tabs .sig-tab-lights:empty { display: none; }
+nav.tabs .sig-tab-lights .sig-lamp, .sub-tabs .sig-tab-lights .sig-lamp { width: 7px; height: 7px; box-shadow: none; }
 .sig-board { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
 .sig-card { padding: 14px 16px; }
 .sig-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 4px; }
@@ -1060,6 +1064,18 @@ nav.tabs .sig-tab-lights .sig-lamp { width: 7px; height: 7px; box-shadow: none; 
 .ov-signals .sig-timing { margin: 8px 2px 0; font-size: 12px; }
 /* Under the chart: Position, Trades, Open orders and Order history in one panel. */
 .ov-lower { margin-bottom: 14px; }
+/* C8: the side panel beside the chart (Signals | Settings), the read-only settings, and the wide dialogs. */
+.ov-side { min-width: 0; max-height: 640px; overflow-y: auto; margin: 0; }
+.ov-side .ov-signals { max-height: none; overflow: visible; padding: 10px 12px; }
+.side-kv { margin: 0; padding: 10px 16px 4px; display: grid; gap: 8px; font-size: 13px; }
+.side-kv > div { display: grid; gap: 2px; }
+.side-kv dt { color: var(--muted); font-size: 12px; }
+.side-kv dd { margin: 0; }
+.side-acts { padding: 4px 16px 14px; margin: 0; }
+.pos-more { padding: 0 18px 12px; }
+.tp-dropped { padding: 0 18px 10px; margin: 0; font-size: 12.5px; color: var(--muted); }
+.path-btn .faint { margin-left: 4px; }
+dialog.wide { width: min(960px, calc(100vw - 32px)); max-height: calc(100vh - 48px); overflow-y: auto; }
 .ov-lower .panel { border: 0; background: none; margin: 0; box-shadow: none; }
 .sub-tabs { display: flex; gap: 4px; padding: 6px 12px 0; border-bottom: 1px solid var(--line); overflow-x: auto; }
 .sub-tabs button { background: none; border: 0; border-bottom: 2px solid transparent; border-radius: 0; color: var(--muted); padding: 8px 10px; font-size: 13px; font-weight: 500; box-shadow: none; white-space: nowrap; }
@@ -1275,3 +1291,7 @@ table.movers tbody tr.tot th, table.movers tbody tr.tot td { border-top: 1px sol
 @media (max-width: 1100px) { .ps-two { grid-template-columns: 1fr; } }
 .ps-two .tbl-wrap, .panel > .tbl-wrap { overflow-x: auto; }
 .ps-groups td { white-space: normal; }
+/* C7: the fund's state, one banner at the top of Portfolio, a Strategy and Portfolio Settings. */
+.fund-banner { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+.fund-banner form { margin: 0 0 0 auto; }
+.fund-banner > button { margin-left: auto; }

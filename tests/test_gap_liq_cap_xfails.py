@@ -895,8 +895,19 @@ def test_gap_liq_cap_the_excess_is_not_in_the_random_entry_benchmark():
     r_long = 200.0 / 100.0 - 1 - 2 * cost
     r_short = -(1 / 3.0) - cost - cost * (4 / 3.0)
     want = (1 + r_long) * (1 + r_short) - 1
-    assert q > 0 and abs(re_.strategy_return - want) <= 2e-3, {"strategy_return": round(re_.strategy_return, 4),
-                                                                "want": round(want, 4)}
+    # ABSORB-GAP (Advisor 15 Oct ~02:55 UK, option A): the strategy's liquidated trip is charged the gap the venue
+    # absorbed past bankruptcy, over its notional; the draws never. Uncharged, as above, for information only.
+    free = result.random_entry_uncharged
+    assert q > 0 and free is not None and abs(free.strategy_return - want) <= 2e-3, {
+        "uncharged": round(getattr(free, "strategy_return", float("nan")), 4), "want": round(want, 4)}
+    gap = sum(a["amount"] for f in result.folds for a in f.absorbed)
+    notional = sum(f["qty"] * f["price"] for f in short_in)
+    # Pinned (QT3's hand check, HoE OK 15 Oct ~05:14 UK): the short gapped to 320 past its 266.5467 bankruptcy price
+    # on a 200 notional, so the charge is (320 - 266.5467) / 200 of it.
+    assert abs(gap / notional - 0.267267) <= 5e-6, {"gap/notional": round(gap / notional, 7)}
+    charged = (1 + r_long) * (1 + r_short - gap / notional) - 1
+    assert gap > 0 and abs(re_.strategy_return - charged) <= 2e-3, {
+        "strategy_return": round(re_.strategy_return, 4), "want": round(charged, 4)}
 
 
 def _draws_capped(closes, trades, windows, cost, lev):

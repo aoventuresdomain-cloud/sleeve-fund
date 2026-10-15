@@ -151,6 +151,36 @@ def _fund_leaving(store: Store, pocket: str) -> bool:
     return pocket.startswith("the fund's cash and P&L") and any(f["kind"] == "withdraw" for f in store.pending_flows())
 
 
+def _withdrawal_line(store: Store, names: list[str], closing: list, old: dict[str, Decimal]) -> str | None:
+    """F-RN-4 (HoE): what leaves the book, so the dry run reconciles to it before the real pass. Before the fund holds
+    the book, each Strategy's withdrawal as it is put away, at today's marks, less any close-out debited to it; once
+    it does, the fund's book as the one withdrawal written ahead of the deposit."""
+    if supervisor.bridge_start(store) is not None:
+        book = supervisor.fund_book(store).total
+        return (f"would withdraw the fund's book, {book:,.2f} at the last mark, as one flow ahead of the deposit"
+                if book > 0 else None)
+    if not names:
+        return None
+    runs, by_name = store.reset_runs(), {s.name: s for s in store.sleeves()}
+    debit: dict[str, Decimal] = {}
+    for _, into, loss in closing:
+        debit[into] = debit.get(into, Decimal(0)) + loss
+    each = {n: supervisor.strategy_equity(store, by_name[n], runs) - debit.get(n, Decimal(0)) for n in names}
+    total = sum(each.values(), Decimal(0))
+    line = ("would withdraw as each is put away, after any close-out: "
+            + ", ".join(f"{n} {eq:,.2f}" for n, eq in each.items()) + f"; {total:,.2f} in all")
+    if old:
+        line += f", {total + sum(old.values(), Decimal(0)):,.2f} with what leaves the old book's runs"
+    return line
+
+
+def _outside_put_away(store: Store, names: list[str]) -> list[str]:
+    """F-RN-7: the clean slate puts away every Strategy not yet put away (supervisor.clear_entries), one outside the
+    fund's book too (a test account): none of its cash is the book's, so it isn't in `names`, but it is put away."""
+    gone, listed = set(store.archived()) | set(store.withdrawn()), set(names)
+    return [s.name for s in store.sleeves(include_legs=False) if s.name not in gone and s.name not in listed]
+
+
 def plan(store: Store, slate: str, deposit: Decimal) -> list[str]:
     """The dry run's lines for the public log: what is in the book, what each step would do, and what would hold it.
     Writes nothing."""
@@ -171,6 +201,10 @@ def plan(store: Store, slate: str, deposit: Decimal) -> list[str]:
     if old := {n: eq for n, eq in _old_pockets(store).items() if eq > 0}:
         lines.append("would take out of the old book at the next mark: "
                      + ", ".join(f"{n} {eq:,.2f}" for n, eq in old.items()))
+    if line := _withdrawal_line(store, names, closing, old):
+        lines.append(line)
+    if outside := _outside_put_away(store, names):
+        lines.append(f"would also put away, outside the book (none of its cash is the book's): {', '.join(outside)}")
     if stuck := _stuck(store, closing):
         lines.append(f"would refuse, nothing written: the book can't be emptied while {'; '.join(stuck)}")
     lines.append(f"then deposit {deposit:,.2f} into the fund's cash, once the book is empty, as its fresh start")

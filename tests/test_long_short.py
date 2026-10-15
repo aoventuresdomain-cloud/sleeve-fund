@@ -1393,3 +1393,54 @@ def test_a_liquidation_fill_not_yet_journaled_still_counts_in_x():
     assert not journaled
     # No mark before the short opened: Y's base is the cash the journal had then, the 10,000 it started with.
     assert text.startswith("Position margin lost (liquidated): 9,023.24, 90% of strategy equity at entry"), text
+
+
+@pytest.mark.no_open_risk_limit  # guards off: liquidation mechanics only
+def test_f_fc_3_the_wiped_out_halts_shortfall_is_the_account_below_zero_at_that_price(tmp_path, full_margin,
+                                                                                      monkeypatch):
+    """F-FC-3 (CR, display): a position taken past its bankruptcy price halts while still open with the shortfall
+    the venue's insurance fund will cover, an estimate at that price: the simulated account (equity with the fund's
+    virtual funding back in, CUT-A; none outside the fund) below zero, never more or less, written to the cent."""
+    from sleeve_fund.research.replay import replay
+    from sleeve_fund.store import Store
+    from sleeve_fund.strategies.base import LongFlatStrategy
+
+    seen, real = [], LongFlatStrategy._wiped_out_why
+
+    def spy(self, shortfall=0.0):
+        why = real(self, shortfall)
+        seen.append((shortfall, self._mark()[0] + LongFlatStrategy._funded(self), why))
+        return why
+
+    monkeypatch.setattr(LongFlatStrategy, "_wiped_out_why", spy)
+    store, name, params = Store.in_memory(), "ping-pong-test", {"rise": 0.01, "dip": 0.005, **PERP}
+    gap = tmp_path / "gap.jsonl.gz"
+    _record(gap, _meta(10_000, params), [(5, 0.0), (20, 0.015), (0, 0.6), (5, 0.0)])  # short, then +60%
+    replay(gap, store=store)
+    estimates = [(short, account, why) for short, account, why in seen if short > 0]
+    assert estimates, seen  # the halt while open (mF-1)
+    short, account, why = estimates[0]
+    assert account < 0 and short == pytest.approx(-account, abs=1e-6), estimates[0]
+    assert f"covers the shortfall, about {short:,.2f} at this price" in why
+
+
+def test_absorb_gap_a_backtest_records_the_gap_past_bankruptcy_the_alert_names_and_books_none(prices, instrument):
+    """ABSORB-GAP (INSURE-RULE point 5, Advisor 14 Oct 23:22 UK): a liquidation gapped past its bankruptcy price is
+    booked there (GAP-LIQ-CAP), and the venue absorbs the rest. The run records that gap, |market fill - bankruptcy|
+    x qty, the figure the alert names, per liquidation (ts, amount); nothing is booked, so equity is unchanged."""
+    closes = [100.0, 100.5, 100.8, 101.5, 101.5, 400.0, 400.0, 400.0]
+    res = run_backtest("ping_pong", _gapped(prices, closes), instrument, PERP, half_spread=0, risk_profile="aggressive")
+    (alert,) = [e for e in res.journal.events_ if e["kind"] == "insurance_fund"]
+    named = float(re.search(r"the ([\d,]+\.\d\d) beyond it", alert["message"]).group(1).replace(",", ""))
+    (gap,) = res.absorbed
+    assert gap["amount"] == pytest.approx(named, abs=0.005) and gap["amount"] > 0, (gap, alert)
+    liq = [o for o in res.decisions.values() if o.get("intent") == "liquidation"]
+    assert liq and pd.Timestamp(gap["ts"]) >= res.fills["ts_last"].min()
+    assert not res.insurance  # recorded, never booked
+
+
+def test_absorb_gap_a_run_with_no_liquidation_records_none(prices, instrument):
+    closes = [100.0, 100.5, 100.8, 101.5, 101.0, 100.0, 99.0, 98.0, 98.0]
+    res = run_backtest("ping_pong", _path(prices, closes), instrument, {**PERP, "take_profit": 0.02, "dip": 0.05},
+                       half_spread=0)
+    assert res.absorbed == []

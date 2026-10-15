@@ -304,3 +304,136 @@ def test_h5_the_guard_keys_on_the_stored_state_never_the_runs_name(store):
     _stale_mark(store, name, T0 + timedelta(seconds=30))
     assert name not in store.previous_book()
     assert [b.split(":")[0] for b in supervisor.positions_breaks(store)] == [name]
+
+
+# --- Drop B riders on RESET-NEG and HOLD-STALE-1 ----------------------------------------------------------------------
+
+def test_f_rn_4_the_dry_run_says_what_each_strategy_withdraws_after_its_close_out(store):
+    """F-RN-4 (HoE): the dry run names each Strategy's withdrawal as it will leave, after its close-out, and the sum,
+    with what leaves from the old book's runs, comes to the book now: the figure HoQA reconciles before the real pass."""
+    _old_book(store)
+    lines = reset_book.plan(store, SLATE, D(100_000))
+    assert ("would withdraw as each is put away, after any close-out: rsi-bands 9,970.30, ping-pong 9,917.49, "
+            f"carry 5,000.00; 24,887.79 in all, {BOOK:,.2f} with what leaves the old book's runs") in lines, lines
+    _until_done(store, [])
+    withdrawn = store.withdrawn()
+    assert [withdrawn[n] for n in ("rsi-bands", "ping-pong", "carry")] == [D("9970.30"), D("9917.49"), D(5000)]
+
+
+def test_f_rn_4_with_no_old_runs_the_withdrawal_line_is_the_book(store):
+    _make(store, "solo", 10_000)
+    _mark(store, T0)
+    _trade(store, "solo", 12.5, T0)
+    _mark(store, T0 + timedelta(minutes=1))
+    assert "would withdraw as each is put away, after any close-out: solo 10,012.50; 10,012.50 in all" in \
+        reset_book.plan(store, SLATE, D(100_000))
+
+
+def test_f_rn_4_once_the_fund_holds_the_book_the_dry_run_says_the_fund_s_withdrawal(store):
+    _fund_held(store)
+    lines = reset_book.plan(store, "2026-10-16-reset", D(100_000))
+    assert "would withdraw the fund's book, 100,000.00 at the last mark, as one flow ahead of the deposit" in lines, lines
+
+
+def test_f_rn_7_the_dry_run_lists_a_strategy_outside_the_book_that_the_slate_also_puts_away(store):
+    """F-RN-7 (15 Oct, deniz-yolo-test): the slate puts away every Strategy, the one on a test account too (outside the
+    book, so none of its cash is the book's); the dry run said nothing of it."""
+    _old_book(store)
+    _make(store, "deniz-yolo-test", 10_000, instrument="BTC/USD", venue="KRAKEN")
+    lines = reset_book.plan(store, SLATE, D(100_000))
+    assert "would also put away, outside the book (none of its cash is the book's): deniz-yolo-test" in lines, lines
+    assert "deniz-yolo-test" not in next(line for line in lines if line.startswith("would put away"))
+    _until_done(store, [])
+    assert "deniz-yolo-test" in store.archived()
+
+
+def test_f_rn_6_a_cover_from_before_0013_naming_no_order_still_shows_in_the_trades_rows(store):
+    """CR F-RN-6: Store.insurance leaves out close-outs only; a cover with no order named (order_id NULL) is a real one.
+    A plain `order_id != CLOSE_OUT` drops it (NULL compares to nothing)."""
+    from sqlalchemy import insert
+
+    from sleeve_fund.store import insurance_t
+
+    _make(store, "x", 1_000)
+    with store.engine.begin() as c:
+        c.execute(insert(insurance_t).values(sleeve="x", ts=T0, price=0, amount=D(5)))
+    assert [D(str(r["amount"])) for r in store.insurance("x", limit=None)] == [D(5)]
+
+
+def test_f_hs_1_a_strategy_archived_but_not_yet_withdrawn_and_no_earlier_books_still_breaks(store):
+    """CR F-HS-1: the guard skips only a Strategy withdrawn or an earlier book's. One archived but still waiting for its
+    withdrawal is in the book: a stale mark that doesn't tie is still a break (widening to every archive survives H1-H5)."""
+    _make(store, "leaving", 10_000)
+    _mark(store, T0)
+    _trade(store, "leaving", -29.70, T0)
+    _stale_mark(store, "leaving", T0 + timedelta(seconds=30))
+    store.archive("leaving")
+    assert "leaving" in store.archived() and "leaving" not in store.withdrawn()
+    assert "leaving" not in store.previous_book()
+    assert [b.split(":")[0] for b in supervisor.positions_breaks(store)] == ["leaving"]
+
+
+def test_f_hs_2_a_last_mark_at_the_put_away_instant_is_stale_one_after_it_breaks(store):
+    """CR F-HS-2: the boundary is inclusive. A mark at the very instant the run was put away is from before it left; one
+    a microsecond later is a mark since (`<` in place of `<=` survives H1-H5)."""
+    run = _stale_run(store)
+    at = store.previous_book()[run]
+    _stale_mark(store, run, at)
+    assert supervisor.positions_breaks(store) == []
+    _stale_mark(store, run, at + timedelta(microseconds=1))
+    assert [b.split(":")[0] for b in supervisor.positions_breaks(store)] == [run]
+
+
+def test_f_rr3_1_close_out_cash_counts_only_after_since_as_strategy_cash_pnl_does(store):
+    """CR F-RR3-1: Store.close_out_cash's window is strategy_cash_pnl's (a row at `since` doesn't count, one after it
+    does), so b7 takes back out exactly the close-outs the cash it compares counted."""
+    r1, r2, _ = _old_book(store)
+    at = T0 + timedelta(minutes=2)
+    assert store.close_out_run(r1, "rsi-bands", D("29.70"), reset_book.CLOSE_OUT, at, "operator",
+                               reset_book.RESET_ACTION, "c1")
+    assert store.close_out_run(r2, "rsi-bands", D("82.51"), reset_book.CLOSE_OUT, at + timedelta(microseconds=1),
+                               "operator", reset_book.RESET_ACTION, "c2")
+    assert store.close_out_cash("rsi-bands") == D("-112.21")
+    assert store.close_out_cash("rsi-bands", since=at - timedelta(microseconds=1)) == D("-112.21")
+    assert store.close_out_cash("rsi-bands", since=at) == D("-82.51")  # the row at `since` is not counted
+    assert store.close_out_cash("rsi-bands", since=at + timedelta(microseconds=1)) == 0
+    for since in (at - timedelta(microseconds=1), at, at + timedelta(microseconds=1)):
+        assert store.close_out_cash("rsi-bands", since=since) == \
+            store.strategy_cash_pnl("rsi-bands", since=since)  # only close-outs moved its cash after T0
+
+
+def test_f_sc_1_once_the_fund_holds_the_book_its_figures_count_the_fund_s_cash(store):
+    """HoQA F-SC-1 (15 Oct, after the reset): `supervisor book` printed "from 0.00, equity 0.00" on a fund holding
+    100,000, as it summed the Strategies' own balances only. Once the fund holds the book, its figures are the fund's:
+    from the cash put in since the re-base, equity the fund's book (fund_book, the identity's own reader)."""
+    _fund_held(store)
+    assert supervisor.book_figures(store) == \
+        "from 100,000.00, equity 100,000.00, fees 0.00, positions none, first mark none"
+    _make(store, "fresh", 0)
+    _mark(store, T0 + timedelta(minutes=21))
+    _trade(store, "fresh", 12.5, T0 + timedelta(minutes=22))
+    _mark(store, T0 + timedelta(minutes=23))
+    assert supervisor.book_figures(store).startswith("from 100,000.00, equity 100,012.50, ")
+    assert supervisor.fund_book(store).total == D("100012.50")
+
+
+def test_f_sc1_1_a_held_position_with_no_mark_shows_no_mark_and_the_fund_s_equity_reader_still_refuses(store):
+    """CR F-SC1-1: under the bridge `supervisor book` read the fund's book, which raises while a held position has no
+    mark, so the deploy log's line crashed where it used to print. It shows the position as not marked, with its
+    quantity; the fund's own reader (fund_book, which the mark and sizing read) still refuses to mark it."""
+    import pytest
+
+    _fund_held(store)
+    _make(store, "held", 0)
+    _mark(store, T0 + timedelta(minutes=21))
+    store.record_fill("held", side="BUY", qty=0.5, price=1_000.0, fee=0.0, order_id="h1", trade_id="h1",
+                      ts=T0 + timedelta(minutes=22))
+    with store.engine.begin() as c:  # its marks gone: a position the supervisor hasn't marked
+        from sqlalchemy import delete
+
+        from sleeve_fund.store import equity_t
+        c.execute(delete(equity_t).where(equity_t.c.sleeve == "held"))
+    with pytest.raises(RuntimeError, match="no mark"):
+        supervisor.fund_book(store)
+    assert supervisor.book_figures(store) == ("from 100,000.00, equity not marked (held holds 0.5 with no mark), "
+                                              "fees 0.00, positions held, first mark none")

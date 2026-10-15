@@ -41,6 +41,9 @@ class VenueProfile:
     data_client: Callable[[], tuple] | None = None
     # (api_key, api_secret) -> FeeSchedule the venue charges that account. Query-only; supervisor only.
     fetch_fees: Callable[[str, str], FeeSchedule] | None = None
+    # (pair, start ms, end ms) -> the venue's trades in [start, end) as (ns, price), oldest first: a replayed stop's
+    # trigger minute (GAP-DOWN); None where the venue serves no trade history
+    trade_history: Callable[[str, int, int], list] | None = None
     # (pair, cursor) -> (1-minute bars by open time, next cursor, caught_up), for the history store
     minute_loader: Callable[[str, str], tuple] | None = None
     merge_minutes: bool = False  # the loader's pages split minutes (bars built from trades)
@@ -462,6 +465,35 @@ def binance_minutes(pair: str, cursor: str, get_json=None) -> tuple[pd.DataFrame
     return bars, nxt, len(bars) < 1500
 
 
+TRADES_TIMEOUT = 5  # seconds a request for a replayed stop's minute of trades may take (GAP-DOWN)
+TRADES_MAX_PAGES = 10  # pages of 1,000 read for one minute before the replay books its extreme instead
+
+
+def binance_trades(pair: str, start_ms: int, end_ms: int, get_json=None) -> list[tuple[int, float]]:
+    """The perpetual's trades in [start_ms, end_ms) as (ns, price), in the venue's order, from its aggregated trades
+    (one row per taker order and price): a replayed stop's trigger minute (GAP-DOWN). One request serves up to 1,000;
+    a busier minute is read on from the last row's id."""
+    import json
+    import urllib.parse
+    import urllib.request
+
+    def fetch(url: str):  # public market data, no key; short, as the replay waits on it
+        with urllib.request.urlopen(url, timeout=TRADES_TIMEOUT) as r:
+            return json.load(r)
+
+    out: list[tuple[int, float]] = []
+    q: dict = {"symbol": binance_symbol(pair), "startTime": int(start_ms), "endTime": int(end_ms) - 1, "limit": 1000}
+    for _ in range(TRADES_MAX_PAGES):
+        rows = (get_json or fetch)(f"{BINANCE_FAPI}/aggTrades?" + urllib.parse.urlencode(q))
+        if isinstance(rows, dict):  # an error body: {"code": ..., "msg": ...}
+            raise ValueError(f"Binance: {rows.get('msg', rows)}")
+        out += [(int(r["T"]) * 1_000_000, float(r["p"])) for r in rows if int(r["T"]) < end_ms]
+        if len(rows) < 1000 or int(rows[-1]["T"]) >= end_ms:
+            return out
+        q = {"symbol": q["symbol"], "fromId": int(rows[-1]["a"]) + 1, "limit": 1000}
+    raise ValueError(f"Binance: more than {TRADES_MAX_PAGES * 1000} trades in the minute; read no further")
+
+
 def binance_funding(pair: str, start_ms: int, get_json=None) -> list[tuple[int, float]]:
     """Up to 1,000 settled funding rates from `start_ms`, [(settlement time in ms, rate)], oldest first. A
     positive rate is paid by longs to shorts, on the position's value at the settlement."""
@@ -548,6 +580,7 @@ BINANCE = register(VenueProfile(
     fee_basis="VIP 0, published schedule, 5 Oct 2026",
     daily_history=binance_daily,
     ohlc_history=binance_ohlc,
+    trade_history=binance_trades,
     list_instruments=binance_instruments,
     data_client=_binance_data_client,
     minute_loader=binance_minutes,

@@ -127,6 +127,13 @@ class Fold:
     unscored: bool = False  # no setting scored on training, so nothing was chosen and the test window sat flat
     # Every liquidation in the test window (_liquidations): a G1 finding whatever the P&L (GAP-LIQ-CAP).
     liquidations: list = field(default_factory=list)
+    # ABSORB-GAP: the gaps past bankruptcy the venue absorbed in the test window, as {"ts", "amount"}; the window's
+    # `test` is charged them (_charge_absorbed), and these are its days uncharged, for information only.
+    absorbed: list = field(default_factory=list)
+    uncharged_returns: pd.Series | None = field(default=None, repr=False)
+    # Each counted trip's share of those gaps, as (opened, gap over its entry notional): what random entry charges
+    # the strategy's own trip (Advisor ~02:55 UK, option A).
+    trip_charges: list = field(default_factory=list)
 
     @property
     def closed_in_window(self) -> int:
@@ -207,6 +214,9 @@ class StudyResult:
     oos_compare_returns: pd.Series | None = None
     spot_hold_returns: pd.Series | None = None  # "holding spot instead", out-of-sample, shown beside a perp hold
     funding_stress: dict | None = None  # a simulated perp's research period at FUNDING_STRESS_RATE
+    # D13-INTRAMINUTE-JUMP (3), GAP-DOWN: out-of-sample again with STOP_STRESS more on each stop exit. charge: the
+    # daily returns that costs, by day; stops: the stop exits; median_stop: the entries' median stop distance.
+    stop_stress: dict = field(default_factory=dict)
     # The probability of backtest overfitting (research.pbo, R4) over the sensitivity grid and every other counted
     # setting of the idea family, with its variant count.
     pbo: object = None
@@ -220,6 +230,13 @@ class StudyResult:
     # Every liquidation in out-of-sample (the folds' test windows) or the opened holdout, as _liquidations gives
     # them: each a G1 finding whatever the P&L (Independent Quant Advisor 6 Oct 23:42, 7 Oct 00:19 (5)).
     holdout_liquidations: list = field(default_factory=list)
+    # ABSORB-GAP: out-of-sample's days and the holdout's summary with the absorbed gaps left uncharged, for information
+    # only (every test reads the charged ones), and the holdout's absorbed gaps; None when nothing was absorbed.
+    oos_uncharged_returns: pd.Series | None = None
+    holdout_absorbed: list = field(default_factory=list)
+    holdout_uncharged: dict | None = None
+    random_entry_uncharged: RandomEntryResult | None = None
+    random_side_uncharged: RandomSideResult | None = None
 
     @property
     def liquidations(self) -> list[dict]:
@@ -630,11 +647,12 @@ def run_study(
         fine = None
         if source is not None and len(source) and not benchmark:  # nothing rests, nothing to guard
             fine = source[(source.index > df.index[0] - bar) & (source.index <= df.index[-1])]
-        res = run_backtest(name, df, instrument, params, starting_capital=starting_capital, bar_minutes=minutes,
-                           risk_profile=risk_profile if guarded else None, exec_prices=fine,
-                           exec_minutes=bar_minutes_of(source) if fine is not None else 1, fees=fees,
-                           half_spread=series.plus(slippage) if series is not None else half_spread + slippage,
-                           first_touch_flip=flip, first_touch_count_from=count_from)
+        res = _charge_absorbed(run_backtest(
+            name, df, instrument, params, starting_capital=starting_capital, bar_minutes=minutes,
+            risk_profile=risk_profile if guarded else None, exec_prices=fine,
+            exec_minutes=bar_minutes_of(source) if fine is not None else 1, fees=fees,
+            half_spread=series.plus(slippage) if series is not None else half_spread + slippage,
+            first_touch_flip=flip, first_touch_count_from=count_from))
         if family:
             return res
         if not benchmark:
@@ -761,6 +779,8 @@ def run_study(
         # The test window's days, not the train's, its first measured from the flat capital it started with (P1-D13).
         test_ret = whole_days(daily_returns(_flat_until(run, test_idx[0] - bar)), test_idx[0], bar)
         b_ret, parts = fold_benchmark(test_ret, test_idx[0], test_idx[-1])
+        absorbed = _absorbed_in(run, test_idx[0] - bar, test_idx[-1])
+        window_trips = trades(fills_to_rows(run.fills), run.shorts, open_trip=True)
         return (
             Fold(
                 train_start=train.index[0],
@@ -770,7 +790,7 @@ def run_study(
                 train_sharpe=best_sharpe,
                 test=summary(test_ret),
                 benchmark_test=_summary_or_none(b_ret),
-                **_window_trips(trades(fills_to_rows(run.fills), run.shorts, open_trip=True), test_idx[0] - bar),
+                **_window_trips(window_trips, test_idx[0] - bar),
                 window_bars=len(test_idx),
                 in_market_bars=_in_market_bars(run.exposure, test_idx[0], test_idx[-1]),
                 halted=_halt_words(run.risk_events, test_idx[0], test_idx[-1]),
@@ -778,6 +798,9 @@ def run_study(
                 grid=pd.DataFrame(surface),
                 **_window_funding(run.funding_marks, train.index[-1], test_idx[-1]),
                 liquidations=_liquidations(run, test_idx[0], test_idx[-1], f"out-of-sample test window {k + 1}"),
+                absorbed=absorbed,
+                uncharged_returns=_uncharged(run, test_idx[0], bar) if absorbed else None,
+                trip_charges=_trip_charges(window_trips, test_idx[0] - bar, absorbed),
             ),
             test_ret, b_ret, parts, run,
         )
@@ -786,6 +809,7 @@ def run_study(
     fold_runs: list = []
     windows = []  # (index in folds, inputs, run) of each window that chose a setting
     oos_parts, bench_parts, compare_by = [], [], []  # compare_by: fold_benchmark's parts, per window
+    stress_parts = []  # _stop_stress, per window that chose a setting
     start = 0
     while start + train_bars + test_bars <= len(research):
         train = research.iloc[start : start + train_bars]
@@ -821,6 +845,7 @@ def run_study(
         run = bt(spec.name, through_test, best, oos=True, trade_from=test_idx[0] - bar, count_from=test_idx[0])
         fold_runs.append((through_test, test_idx, best, run))
         fold, test_ret, b_ret, parts, run = scored(len(folds), *window, run)
+        stress_parts.append(_stop_stress(run, test_idx, bar, test_ret))
         windows.append((len(folds), window, run))
         folds.append(fold)
         compare_by.append(parts)
@@ -870,7 +895,13 @@ def run_study(
                           "random entry still judges")
     else:
         hold_note = ""
+    dists = [x for _, _, d in stress_parts for x in d]
+    stop_stress = {"charge": pd.concat([c for c, _, _ in stress_parts]) if stress_parts else pd.Series(dtype=float),
+                   "stops": sum(n for _, n, _ in stress_parts), "bp": STOP_STRESS * 1e4,
+                   "median_stop": float(pd.Series(dists).median()) if dists else None,
+                   "required_below": STOP_STRESS_REQUIRED_BELOW}
     result = StudyResult(
+        stop_stress=stop_stress,
         idea_hash=idea_hash,
         spec=spec,
         dataset=dataset,
@@ -911,6 +942,9 @@ def run_study(
         fee_note=(f"{float(run_fees.maker):.2%} maker on post-only orders, {float(run_fees.taker):.2%} taker "
                   f"on every other order, plus {spread_words} on orders that take liquidity; break-even: {breakeven}"),
         fee_basis=run_fees,
+        oos_uncharged_returns=pd.concat(
+            [part if f.uncharged_returns is None else f.uncharged_returns for f, part in zip(folds, oos_parts)])
+        if any(f.absorbed for f in folds) else None,
     )
     # Every trip pays the taker fee and half the spread each way, as the study's own runs do on market orders.
     # A perpetual's trades and draws are liquidated as the engine books one, at the risk profile's leverage cap.
@@ -921,6 +955,10 @@ def run_study(
     result.random_entry, result.random_side = _benchmarks(
         research, folds, test_bars, float(run_fees.taker), series if series is not None else spread_used,
         full_default.shorts, leverage, market.get("market"))
+    if any(f.trip_charges for f in folds):  # the strategy's trips uncharged, for information only (ABSORB-GAP)
+        result.random_entry_uncharged, result.random_side_uncharged = _benchmarks(
+            research, folds, test_bars, float(run_fees.taker), series if series is not None else spread_used,
+            full_default.shorts, leverage, market.get("market"), charged=False)
     for rung in ladder:  # the benchmark at each rung's own cost, as the rung's runs pay it (RE-COST)
         at_rung, _ = _benchmarks(research, folds, test_bars, rung.fee + slip,
                                  series if series is not None else spread_used, False, leverage, market.get("market"))
@@ -1055,6 +1093,9 @@ def run_study(
             result.holdout_funding = _window_funding(run.funding_marks, prices.index[-holdout_bars - 1],
                                                      prices.index[-1])
             result.holdout_liquidations = _liquidations(run, h_start, prices.index[-1], "holdout")
+            result.holdout_absorbed = _absorbed_in(run, h_start - bar, prices.index[-1])
+            if result.holdout_absorbed:
+                result.holdout_uncharged = summary(_uncharged(run, h_start, bar))
         except Exception:
             if locks is not None:
                 # The lock was claimed before the look, so the holdout is spent: recorded as a crash, not a result.
@@ -1066,6 +1107,70 @@ def run_study(
         if locks is not None:
             locks.settle(idea, underlying, trial)
     return result
+
+
+STOP_STRESS = 0.002  # D13-INTRAMINUTE-JUMP (3): 20 bp more on each stop exit, a jump through the stop paper may see
+STOP_STRESS_REQUIRED_BELOW = 0.005  # GAP-DOWN (Advisor 15 Oct): the line is required under this median stop distance
+
+
+def _stop_stress(run: BacktestResult, test_idx, bar: pd.Timedelta, test_ret: pd.Series) -> tuple[pd.Series, int, list]:
+    """A test window's stop stress: the daily returns lost if each stop exit filled in it cost STOP_STRESS more of its
+    notional, charged on the equity curve from its fill on, with no re-sizing after it; how many stop exits; and
+    the stop distance of each entry filled in it."""
+    fills = run.fills
+    lo, hi = test_idx[0] - bar, test_idx[-1]
+    cost = pd.Series(0.0, index=run.equity.index)
+    stops, dist = 0, []
+    for o, f in (fills.iterrows() if fills is not None and len(fills) else ()):
+        ts = pd.to_datetime(f["ts_last"], utc=True)
+        if not lo < ts <= hi:
+            continue
+        d = run.decisions.get(o) or {}
+        if d.get("intent") == "stop_loss":  # a resting stop's exit; a liquidation books at bankruptcy
+            stops += 1
+            cost[cost.index >= ts] += STOP_STRESS * float(f["filled_qty"]) * float(f["avg_px"])
+        elif d.get("intent") == "entry" and (d.get("signal") or {}).get("stop_frac"):
+            dist.append(float(d["signal"]["stop_frac"]))
+    if not stops:
+        return pd.Series(0.0, index=test_ret.index), 0, dist
+    from types import SimpleNamespace
+
+    stressed = SimpleNamespace(equity=run.equity - cost, starting_capital=run.starting_capital)
+    s_ret = whole_days(daily_returns(_flat_until(stressed, lo)), test_idx[0], bar)
+    return (test_ret - s_ret.reindex(test_ret.index)).fillna(0.0), stops, dist
+
+
+def _charge_absorbed(run: BacktestResult) -> BacktestResult:
+    """ABSORB-GAP (INSURE-RULE point 5; Advisor 15 Oct ~02:05 UK): a liquidation is booked at its bankruptcy price
+    (GAP-LIQ-CAP), so a run that gapped past it never pays the gap the venue absorbed, and looks better than the trade
+    was. Research charges it: the run's equity less the absorbed gaps to date, stepped down on the first bar closing
+    at or after each liquidation, nothing re-sized ("gap charged, no re-sizing"). Every test that reads returns then
+    reads the charged curve; the engine's own is kept as uncharged_equity, for information only. A run that absorbed
+    nothing is left as it was."""
+    if not run.absorbed or not len(run.equity):
+        return run
+    index = run.equity.index
+    steps = pd.Series(0.0, index=index)
+    for a in run.absorbed:
+        at = int(index.searchsorted(_utc(a["ts"]), side="left"))
+        if at < len(index):
+            steps.iloc[at] += float(a["amount"])
+    run.uncharged_equity = run.equity
+    run.equity = (run.equity - steps.cumsum()).rename(run.equity.name)
+    return run
+
+
+def _absorbed_in(run: BacktestResult, after, end) -> list[dict]:
+    """The run's absorbed gaps (ABSORB-GAP) in the bars closing after `after` up to `end`: a window's own."""
+    lo, hi = _utc(after), _utc(end)
+    return [{"ts": _utc(a["ts"]), "amount": float(a["amount"])} for a in run.absorbed if lo < _utc(a["ts"]) <= hi]
+
+
+def _uncharged(run: BacktestResult, first, bar: pd.Timedelta) -> pd.Series:
+    """A window's days from its first bar `first` on the engine's own curve, the absorbed gaps uncharged."""
+    flat = run.uncharged_equity.copy()
+    flat[flat.index <= first - bar] = run.starting_capital
+    return whole_days(daily_returns(flat), first, bar)
 
 
 def _flat_until(run: BacktestResult, start) -> pd.Series:
@@ -1121,8 +1226,18 @@ def _liquidations(run: BacktestResult, start, end, window: str) -> list[dict]:
             rest = abs(held) if side * held > 0 else 0.0
             held, avg, fee_unit = side * rest, px, (fee / qty if rest else 0.0)
             opened, entry, entry_px = (_utc(f["ts"]), o, px) if rest else (None, None, None)
+    # ABSORB-GAP: the gap past bankruptcy the venue absorbed on each liquidation, recorded when the engine booked it:
+    # the liquidation's own, the last one filled at or before it.
+    liquidated = sorted((_utc(f["ts"]), f["order_id"]) for f in fills
+                        if orders.get(f["order_id"], {}).get("intent") == "liquidation")
+    gaps: dict[str, float] = {}
+    for a in getattr(run, "absorbed", []):
+        owner = [oid for ts, oid in liquidated if ts <= _utc(a["ts"])]
+        if owner:
+            gaps[owner[-1]] = gaps.get(owner[-1], 0.0) + float(a["amount"])
     for liq in found.values():
         liq["x"] = round(liq["x"], 2)
+        liq["absorbed"] = round(gaps.get(liq["order_id"], 0.0), 2)
     return [_judged(liq, orders) for liq in found.values()]
 
 
@@ -1256,6 +1371,21 @@ def _window_trips(trips: list[dict], test_start) -> dict:
             "trips": [(_utc(t["opened"]), _utc(t["closed"]), int(t["side"])) for t in counted]}
 
 
+def _trip_charges(trips: list[dict], test_start, absorbed: list[dict]) -> list[tuple]:
+    """ABSORB-GAP: each absorbed gap on the counted trip it closed, the last opened before it, over that trip's entry
+    notional (the base random entry's trip returns are on), as (opened, charge); a gap on a trip carried in or still
+    open is in no counted trip, as that trip is in no comparison."""
+    start = _utc(test_start)
+    counted = [t for t in trips if t["opened"] is not None and t["closed"] is not None and _utc(t["opened"]) >= start]
+    out: dict = {}
+    for a in absorbed:
+        owner = [t for t in counted if _utc(t["opened"]) < a["ts"]]
+        if owner and owner[-1]["cost"]:
+            key = _utc(owner[-1]["opened"])
+            out[key] = out.get(key, 0.0) + a["amount"] / owner[-1]["cost"]
+    return sorted(out.items())
+
+
 def _in_market_bars(exposure: pd.Series, first, last) -> int:
     """The bars from first to last, inclusive, that closed holding a position of any size or side."""
     if exposure is None or exposure.empty:
@@ -1266,14 +1396,15 @@ def _in_market_bars(exposure: pd.Series, first, last) -> int:
 
 
 def _benchmarks(prices: pd.DataFrame, folds: list[Fold], test_bars: int, taker: float, spread, shorts: bool,
-                leverage: float | None = None, market: str | None = None):
+                leverage: float | None = None, market: str | None = None, charged: bool = True):
     """The random-entry benchmark, and the random-side test when the strategy can go short, on the folds'
     counted trips. Each trip is placed on the bars it was opened and closed in, and both sides of the comparison
     are priced on those bars' closes, so the benchmark compares timing, not fills. spread: a half spread, or a
     SpreadSeries whose value in force at each bar's close is charged there, for the strategy's trips and the draws
     alike (SPREAD-PIT). leverage: the risk profile's cap, for a fold that traded the perpetual (its chosen market,
     else `market`): its trips and their draws are liquidated as the engine books one, losing the margin and fees,
-    never the move past it (Independent Quant Advisor 7 Oct 00:19 (4))."""
+    never the move past it (Independent Quant Advisor 7 Oct 00:19 (4)); and, charged, a liquidated trip of the
+    strategy's pays the gap the venue absorbed past it, its draws never (ABSORB-GAP, Advisor ~02:55 UK, option A)."""
     index = prices.index.tz_localize("UTC") if prices.index.tz is None else prices.index
     cost_per_side = taker + (spread.at_many(index.as_unit("ns").asi8) if isinstance(spread, SpreadSeries) else spread)
 
@@ -1286,13 +1417,14 @@ def _benchmarks(prices: pd.DataFrame, folds: list[Fold], test_bars: int, taker: 
         start = end - test_bars + 1
         windows.append((start, end))
         last = start
+        charges = dict(getattr(f, "trip_charges", []) or []) if charged else {}
         for opened, closed, side in sorted(f.trips):
             entry = max(bar(opened), last)  # one position at a time on the bar grid too
             out = min(max(bar(closed), entry + 1), end)
             if out <= entry:
                 continue
             perp = f.chosen.get("market", market) == PERP
-            placed.append(Trade(entry, out, side, leverage=leverage if perp else None))
+            placed.append(Trade(entry, out, side, leverage=leverage if perp else None, charge=charges.get(opened, 0.0)))
             last = out
     closes = prices["close"].to_numpy(dtype=float)
     bars = sum(f.window_bars for f in folds)

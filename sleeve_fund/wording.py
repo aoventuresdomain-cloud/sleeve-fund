@@ -31,6 +31,10 @@ _VENUE_WORDS = [
     (re.compile(rf"(?:(?:https?|wss?)://)?[\w.-]*\b(?:{_NAMES})[a-z]*\.(?:com|io|exchange)\b(?::\d+)?"
                 rf"(?:/[^\s,;)\]<>'\"]*[^\s,;)\]<>'\".:])?", _I),
      _as()),
+    # A venue's clone (a two-leg Strategy's second leg trades on "BINANCE_P2", P2-8) is the venue: an instrument id's
+    # clone suffix goes as the venue's does, and the clone on its own reads as its venue.
+    (re.compile(rf"(?<=\S)\.(?:{_NAMES})_P\d+\b", _I), ""),
+    (re.compile(rf"\b(?:{_NAMES})_P\d+\b", _I), _as()),
     # An instrument id's venue suffix goes, the id stays: "BTCUSDT-PERP.BINANCE" reads "BTCUSDT-PERP".
     # Inside a file name the venue becomes "venue", so the name stays a name: "keys.binance.json" reads
     # "keys.venue.json", not "keys.json".
@@ -66,3 +70,13 @@ def no_venues(text):
     for pattern, words in _VENUE_WORDS:
         out = pattern.sub(words, out)
     return out
+
+
+def leg_name(name: str | None) -> str:
+    """A strategy row's name as the PM reads it: a two-leg Strategy's second leg "<name>~2" as "<name>, leg 2"."""
+    # Imported here, so the wording stays importable without the journal.
+    from sleeve_fund.store import LEG
+
+    if name and name.endswith(LEG):
+        return f"{name.removesuffix(LEG)}, leg 2"
+    return name or ""

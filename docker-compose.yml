@@ -44,7 +44,9 @@ services:
       HEALTHCHECK_PING_URL: ${HEALTHCHECK_PING_URL:-}
       BACKUP_DIR: /data/backups  # read only: a late or failed backup raises an alert
       CLOCK_SERVER: time.aws.com  # the server clock is checked against it; drift past 250 ms raises an alert
-    volumes: [history:/data/history:ro, backups:/data/backups:ro]
+      RECON_DIR: /data/recon  # the nightly dashboard-against-journal records; a FAIL raises an alert
+      NIGHTLY_ALERT: ${NIGHTLY_ALERT:-off}  # on: a FAIL alerts the PM; off: journaled only (deploy.yml)
+    volumes: [history:/data/history:ro, backups:/data/backups:ro, recon:/data/recon]
     env_file:
       - path: kraken.env
         required: false
@@ -69,8 +71,8 @@ services:
     build: .
     user: "0"
     restart: "no"
-    volumes: [history:/data/history, research:/data/research]
-    command: [find, /data/history, /data/research, "!", -uid, "1000", -exec, chown, "1000:1000", "{}", +]
+    volumes: [history:/data/history, research:/data/research, recon:/data/recon]
+    command: [find, /data/history, /data/research, /data/recon, "!", -uid, "1000", -exec, chown, "1000:1000", "{}", +]
 
   # Keeps every instrument's minute history current from its venue, into the shared store that
   # research and the backtest page read. Public market data only, no keys.
@@ -152,5 +154,6 @@ volumes:
   backups:
   history:
   research:
+  recon:
   pgdata:
   caddy_data:

@@ -6,7 +6,7 @@
     <thead><tr><th>Strategy</th><th>Wanted</th><th>Heartbeat</th><th>Last price mark</th><th>Balance check</th><th>Last start</th><th class="num">Waiting commands</th><th class="num">Errors</th></tr></thead>
     <tbody>{% for p in ops.procs %}{% set x = p.x %}{% set s = x.sleeve %}
     <tr>
-      <td class="cell-name"><a href="/sleeves/{{ s.name }}">{{ s.name }}</a> {{ chip(s.status) }}</td>
+      <td class="cell-name"><a href="/sleeves/{{ s.name }}">{{ s.name|leg_label }}</a> {{ chip(s.status) }}</td>
       <td data-m="hide">{{ s.desired_state|capitalize }}</td>
       <td data-m="right">{% if x.healthy %}<span class="dot ok"></span>{% elif s.desired_state == 'running' %}<span class="dot stale"></span>{% else %}<span class="dot"></span>{% endif %}{{ s.heartbeat_at|ago }}</td>
       <td data-m="hide">{% if p.mark_age is not none %}{{ p.mark_age|held }} ago{% else %}<span class="muted">none yet</span>{% endif %}</td>

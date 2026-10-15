@@ -41,10 +41,21 @@ def leaving(store: Store) -> dict[str, str | None]:
     return {n: said[n]["message"] if n in said and said[n]["kind"] == WITHDRAWAL_WAITS else None for n in names}
 
 
+def _put_away_after_bridge(store: Store, name: str) -> bool:
+    """Whether `name` was put away once the fund held the cash (supervisor.bridge_start): only then does a withdrawal
+    of 0 mean nothing of its own was in the book, rather than its own capital lost before the bridge (F-WN2-2)."""
+    from sleeve_fund.supervisor import bridge_start
+
+    start, at = bridge_start(store), store.archived().get(name)
+    return start is not None and at is not None and at >= start
+
+
 def state_words(store: Store, name: str) -> str:
     """What became of a put-away Strategy's equity, as the PM reads it after "Archived, " or "Retired, "; "" for one
     archived before F-C3B-A (still counted until supervisor withdraw-archived) or a reset's earlier run."""
-    if name in store.withdrawn():
+    if (out := store.withdrawn().get(name)) is not None:
+        if out == 0 and _put_away_after_bridge(store, name):  # F-WN-2 (PE2's F-WN-1); F-WN2-2: not a pre-bridge wipe-out
+            return "it left with nothing to move: its P&L stays in the fund's cash, which isn't a loss"
         return "its equity left the fund's book, which isn't a loss"
     if name in store.withdrawal_pending():
         if (why := store.withdrawal_blocker(name)) is not None:
