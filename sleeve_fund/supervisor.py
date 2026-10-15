@@ -192,11 +192,20 @@ def positions_breaks(store: Store) -> list[str]:
     from sleeve_fund.store import fills_t
 
     out = []
+    # HOLD-STALE-1 (15 Oct 03:59 UK): a Strategy put away (withdrawn, or an earlier book's: a reset run, a clean slate's)
+    # keeps the last mark its runtime wrote, which can be a moment behind its closing fill for good. Skipped only when
+    # that is all it is: by its stored state, never its name, its journal flat and its last mark from before it was put
+    # away. A put-away Strategy still holding, or marked since, is a real fault and still breaks.
+    archived, earlier = store.archived(), store.previous_book()
+    out_at = {n: archived.get(n, earlier.get(n)) for n in set(store.withdrawn()) | set(earlier)}
     for s in store.sleeves():
         if not _in_book(store, s):
             continue
         last = store.last_equity(s.name)
         if last is None:
+            continue
+        at = out_at.get(s.name)
+        if at is not None and last["ts"] <= at and abs(store.journal_book(s.name, 0)["qty"]) <= 1e-12:
             continue
         signed = case((fills_t.c.side == "BUY", fills_t.c.qty), else_=-fills_t.c.qty)
         q = select(func.coalesce(func.sum(signed), 0)).where(fills_t.c.sleeve == s.name, fills_t.c.ts <= last["ts"])
@@ -218,13 +227,16 @@ def insurance_breaks(store: Store, since: datetime | None = None) -> list[str]:
     or the PM's last Resume) on, per Strategy in the book, whatever fill it names. Returns each in words, [] for none."""
     from sqlalchemy import select
 
-    from sleeve_fund.store import insurance_t
+    from sleeve_fund.store import CLOSE_OUT, insurance_t
 
     names = [s.name for s in store.sleeves() if _in_book(store, s)]
     if not names or since is None:
         return []
     i = insurance_t.c
-    q = select(i.sleeve, i.amount).where(i.sleeve.in_(names), i.ts >= since).order_by(i.id)
+    # An old book close-out (RESET-NEG) is a transfer inside the book, not a credit from outside it (DA, cell 10); a
+    # credit naming no fill (before 0013) still counts
+    q = (select(i.sleeve, i.amount).where(i.sleeve.in_(names), i.ts >= since, i.order_id.is_distinct_from(CLOSE_OUT))
+         .order_by(i.id))
     with store.engine.connect() as c:
         rows = list(c.execute(q))
     return [f"{r.sleeve}: an insurance credit of {to_decimal(r.amount, 'amount'):,.2f} booked inside the fund, which "
