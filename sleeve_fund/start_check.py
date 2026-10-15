@@ -111,6 +111,18 @@ def check_keys(environ: dict[str, str], engine: Engine) -> Section:
     return sec
 
 
+def check_alerts(environ: dict[str, str]) -> Section:
+    """A15 (G2): where alerts go and the uptime ping an outside monitor watches, so a dead server says so. Hosts only:
+    a webhook's path or a ping's id is its token, and the page is public."""
+    from sleeve_fund.alerts import where
+
+    sec = Section("Alerts")
+    for var, what in (("ALERT_WEBHOOK_URL", "alerts go to"), ("HEALTHCHECK_PING_URL", "uptime pings go to")):
+        url = (environ.get(var) or "").strip()
+        sec.add(PASS, f"{what} {where(url)}") if url else sec.add(FAIL, f"not set: {var}")
+    return sec
+
+
 def check_venues(engine: Engine) -> Section:
     from sleeve_fund.accounts import PAPER
     from sleeve_fund.store import accounts_t, sleeve_accounts_t

@@ -197,10 +197,15 @@ def test_3e_a_stopped_strategy_still_holding_is_watched(tmp_path):
 
 def _two_strategies():
     store = Store.in_memory()
-    for name, eq in (("s1", 10_250.0), ("s2", 9_900.0)):
+    for name, out in (("s1", 62_500.0), ("s2", 59_000.0)):  # +250 and -100 on a round trip of 0.1, no fees
         store.create_sleeve(name=name, strategy="ping_pong", instrument="BTC/USDT", bar_spec="1-MINUTE-LAST-INTERNAL",
                             starting_balance=10_000, venue="BINANCE", params={"market": "perp"})
-        store.record_equity(name, equity=eq, cash=eq, qty=0.0, price=60_000.0, benchmark=10_000.0,
+        store.record_fill(name, side="BUY", qty=0.1, price=60_000.0, fee=0.0, order_id=f"{name}e", trade_id=f"{name}a",
+                          ts=T0 - timedelta(hours=2))
+        store.record_fill(name, side="SELL", qty=0.1, price=out, fee=0.0, order_id=f"{name}x", trade_id=f"{name}b",
+                          ts=T0 - timedelta(hours=1))
+        eq = 10_000.0 + 0.1 * (out - 60_000.0)
+        store.record_equity(name, equity=eq, cash=eq, qty=0.0, price=out, benchmark=10_000.0,
                             ts=T0 - timedelta(hours=1))
     store.event("s1", "warning", "stale_price", "No trade or quote for 5 minutes", ts=T0 - timedelta(hours=3))
     store.event(None, "error", "supervisor_error", "boom", ts=T0 - timedelta(hours=2))
@@ -215,7 +220,7 @@ def test_4a_the_digest_shows_equity_each_strategy_open_positions_alert_counts_an
     text = digest(_two_strategies(), T0 + timedelta(hours=1))
     assert text.startswith("Multi-Strategy Fund daily digest")
     assert "20,150.00" in text  # fund equity
-    assert "s1" in text and "s2" in text
+    assert "s1: 10,250.00, 250.00" in text and "s2: 9,900.00, -100.00" in text
     assert "1 warning" in text and "1 error" in text  # the last 24 hours only
     assert "Open positions: none" in text
     for word in ("Backup", "Recon", "Clock"):
