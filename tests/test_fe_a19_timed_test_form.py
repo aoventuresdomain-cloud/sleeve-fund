@@ -90,6 +90,7 @@ def test_a_run_window_is_kept_in_hours(c, store):  # noqa: F811
     ("p_candle_step__run_for_hours", "-2", "run for hours: more than 0, or leave it empty to run until stopped"),
     # F-A19-2: float() takes these, and none is a size or a number of hours
     ("p_candle_step__size_share", "nan", "size share: a % of fund equity above 0 and at most 100"),
+    ("p_candle_step__size_share", "1e-9", "size share: a % of fund equity above 0 and at most 100"),  # stores as 0
     ("p_candle_step__run_for_hours", "inf", "run for hours: more than 0, or leave it empty to run until stopped"),
     ("p_candle_step__run_for_hours", "Infinity", "run for hours: more than 0, or leave it empty to run until stopped"),
     ("p_candle_step__run_for_hours", "nan", "run for hours: more than 0, or leave it empty to run until stopped"),

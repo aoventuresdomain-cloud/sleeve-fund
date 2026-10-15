@@ -2607,6 +2607,8 @@ def _form_params(form, strategy: str) -> dict:
             if not (math.isfinite(share) and 0 < share <= 100):
                 raise ValueError(f"{key.replace('_', ' ')}: a % of fund equity above 0 and at most 100")
             params[key] = round(share / 100, 6)
+            if params[key] <= 0:  # too small to store: refuse it here, not when the PM starts it
+                raise ValueError(f"{key.replace('_', ' ')}: a % of fund equity above 0 and at most 100")
     hours = float(params["run_for_hours"]) if "run_for_hours" in params else None
     if hours is not None and not (math.isfinite(hours) and hours > 0):  # F-A19-2: "inf" is no number of hours
         raise ValueError("run for hours: more than 0, or leave it empty to run until stopped")
