@@ -227,6 +227,7 @@ def g1_checks(r: StudyResult, ledger: IdeaLedger, register=None,
         *([(CANDIDATE_CHECK, NOT_JUDGED, "a benchmark: buy and hold is never a G1 candidate")]
           if getattr(getattr(r, "spec", None), "family", None) == "benchmark" else []),
         ("Break-even fee (shown, not a test)", "INFO", _breakeven_words(r)),
+        _stop_stress_row(r, counts, register, insufficient),
         *([] if not getattr(r, "first_touch", None) else [(FIRST_TOUCH_CHECK, "INFO", first_touch_words(r))]),
         *_funding_rows(r),
         (
@@ -276,6 +277,38 @@ def _funding_rows(r: StudyResult) -> list[tuple[str, str, str]]:
                      funding.baseline_check(full.funding_at_baseline, full.funding_held,
                                             full.funding_baseline_longest, "full-period")[1]))
     return rows
+
+
+STOP_STRESS_CHECK = "Stop slippage stress (shown, not a test)"
+
+
+def _stop_stress_row(r: StudyResult, counts: dict, register, insufficient: bool) -> tuple[str, str, str]:
+    """D13-INTRAMINUTE-JUMP (3): out-of-sample with 20 bp more on each stop exit, a jump through the stop paper may
+    see and a backtest's minutes can't; a Sharpe test that would fail under it is flagged to the PM. Required on the
+    sheet when the entries' median stop sits under 0.5% of the price (GAP-DOWN, Advisor 15 Oct)."""
+    st = getattr(r, "stop_stress", None) or {}
+    median, stops = st.get("median_stop"), st.get("stops", 0)
+    need = median is not None and median < st.get("required_below", 0.005)
+    head = (f"required, median stop {median:.2%} is under {st.get('required_below', 0.005):.1%}: " if need else
+            f"median stop {median:.2%}: " if median is not None else "")
+    if not stops:
+        return STOP_STRESS_CHECK, "INFO", head + "no stop exits out of sample, so nothing to stress"
+    charge = st["charge"]
+    base = r.compare_returns
+    stressed = base - charge.reindex(base.index).fillna(0.0)
+    s0, s1 = _bench(base)["sharpe"], _bench(stressed)["sharpe"]
+    words = f"{stops} stop exits out of sample at +{st.get('bp', 20):.0f} bp each: Sharpe {_num(s0)} to {_num(s1)}"
+    if not insufficient:
+        bench = _bench(r.oos_benchmark_returns)["sharpe"]
+        spread = _trial_spread(r, register)
+        b0, _ = sharpe_beats_probability(base, r.oos_benchmark_returns, counts["variants"], trial_spread=spread)
+        b1, _ = sharpe_beats_probability(stressed, r.oos_benchmark_returns, counts["variants"], trial_spread=spread)
+        passes = lambda s, b: not math.isnan(b) and s > bench and b >= G1_CONFIDENCE  # noqa: E731
+        if passes(s0, b0) and not passes(s1, b1):
+            words += "; the Sharpe test would FAIL under it: flagged to the PM"
+        elif passes(s0, b0):
+            words += "; the Sharpe test still passes under it"
+    return STOP_STRESS_CHECK, "INFO", head + words
 
 
 def _liquidation_check(r: StudyResult, ack: str | dict | None) -> tuple[str, str, str]:
