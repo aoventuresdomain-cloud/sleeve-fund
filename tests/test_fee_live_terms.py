@@ -192,3 +192,14 @@ def _rows(store):
 
     with store.engine.connect() as c:
         return [dict(r._mapping) for r in c.execute(select(venue_terms_fetch_t).order_by(venue_terms_fetch_t.c.id))]
+
+
+def test_a_pulled_table_that_differs_from_the_engines_refuses_entries_until_it_is_checked_in(store):
+    """Advisor question (b), PE1's default: liquidation is priced with the profile's table; a pulled one that differs
+    is never used silently: it is kept, and entries on the instrument are refused until the table is re-pasted."""
+    changed = _recorded("risk-limit-BTCUSDT-2026-10-15.json")
+    changed["result"]["list"] = changed["result"]["list"][:-1]  # the venue withdrew its top tier
+    venue_terms.fetch_tiers(store, PAPER, PAIR, get=lambda url: changed, now=T)
+    t = venue_terms.term(store, PAPER, "tiers", PAIR, T + timedelta(hours=1))
+    assert t.state == "refused" and "differs from the table" in t.words and "re-paste" in t.words
+    assert "differs" in venue_terms.entry_refusal(store, PAPER, PAIR, T + timedelta(hours=1))
