@@ -399,10 +399,15 @@ def test_guarantee_3_never_refuses_a_stopless_entry_the_1x_cap_governs_it():
 
 
 def test_guarantee_3_exactly_half_way_is_allowed_and_past_it_refused():
-    # 2x long, no maintenance margin: liquidation is exactly 50% away, so a 25% stop is exactly half way.
+    # 2x long, no maintenance margin: liquidation is 50% away less the entry fee taken off the margin (LIQ-FEE, HoE
+    # TEC: 49.90% at the 0.1% leg cost), so a stop at half that is exactly half way.
+    from sleeve_fund.margin import entry_liquidation
+
     kw = dict(perp=True, leverage=2.0, position_cap_pct=1.0, maintenance_margin=0.0, risk_per_trade=0.9)
-    assert size_entry(_in(**kw, stop_frac=0.25)).ok
-    assert "liquidation" in size_entry(_in(**kw, stop_frac=0.2501)).skipped
+    _, distance = entry_liquidation(10_000.0, 10_000.0 / 2 / 100.0, 100.0, 1, 0.001, 0.0, 2.0)  # as sizing measures it
+    assert distance == pytest.approx(0.499)
+    assert size_entry(_in(**kw, stop_frac=distance / 2)).ok
+    assert "liquidation" in size_entry(_in(**kw, stop_frac=distance / 2 + 0.0001)).skipped
     with pytest.raises(ValueError, match="at most 50% of the way"):
         size_entry(_in(perp=True, leverage=3.0, stop_to_liquidation=0.6))
 
