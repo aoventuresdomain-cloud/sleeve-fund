@@ -1259,6 +1259,30 @@ class Supervisor:
             except Exception as exc:  # noqa: BLE001 - keep the last good schedule; show why on the dashboard
                 msg = str(exc).replace(creds[0], "***").replace(creds[1], "***")
                 self.store.event(None, "warning", "fee_fetch_failed", f"{a['name']}: {msg}")
+        self.check_venue_terms(environ)
+
+    def check_venue_terms(self, environ=None, now=None, get=None) -> None:
+        """FEE-LIVE: each running perp Strategy's instrument's fee rates from its account and margin tiers from the
+        venue's public table (venue_terms.fetch_due), every attempt kept. Paper's account is the demo account (its
+        read-only fee-rate call, on the demo host only); a live account has no fee client here yet, so its attempts
+        fail and its entries stay refused. A pass that can't run is one warning, and the next hour tries again."""
+        from sleeve_fund import venue_terms
+
+        env = os.environ if environ is None else environ
+
+        def client_for(account: str, live: bool):
+            if live:
+                return None
+            from sleeve_fund import mirror
+
+            key, secret = env.get(mirror.BYBIT_KEY_ENV, "").strip(), env.get(mirror.BYBIT_SECRET_ENV, "").strip()
+            return mirror.BybitDemo(mirror.Settings(key, secret)) if key and secret else None
+
+        try:
+            venue_terms.fetch_due(self.store, now or utcnow(), client_for,
+                                  **({"get": get} if get is not None else {}))
+        except Exception as exc:  # noqa: BLE001 - said; the last good rows stay and age by the 24/72 h rules
+            self.store.event(None, "warning", "venue_terms_fetch_failed", f"fees and tiers: {type(exc).__name__}: {exc}")
 
     def _send_alerts(self, alerts: Forwarder) -> None:
         try:

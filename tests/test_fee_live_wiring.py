@@ -20,6 +20,7 @@ pytestmark = [pytest.mark.no_maintenance_tables, pytest.mark.venue_terms_live]
 PAPER = venue("BINANCE")
 PAIR = "BTC/USDT"
 T = datetime(2026, 10, 15, 12, tzinfo=UTC)
+D1 = T + timedelta(days=1)  # the pasted table (15 Oct 00:00) is 36 h old: the daily pull is due
 FEE = {"symbol": "BTCUSDT", "maker": "0.0002", "taker": "0.0004"}
 
 
@@ -130,3 +131,47 @@ def test_the_entry_path_stops_at_the_refusal_before_any_order(prices, instrument
                        risk_profile="aggressive")
     assert res.fills.empty
     assert "entry_refused_venue_terms" in {e["kind"] for e in res.journal.events_}
+
+
+def test_the_supervisors_hourly_pass_fetches_fees_per_instrument_and_tiers_daily(monkeypatch):
+    """Recorded answers only: the demo account's signed fee-rate call (on the demo host) and the public tier table."""
+    import json
+    from pathlib import Path
+
+    from sleeve_fund import mirror, supervisor
+
+    data = Path(__file__).parent / "data" / "fee_live"
+    calls = []
+
+    def call(self, method, path, params=None):
+        calls.append((self.url, method, path, params))
+        return json.loads((data / "fee-rate-BTCUSDT.json").read_text())["result"]
+
+    monkeypatch.setattr(mirror.BybitDemo, "call", call)
+    store = _store()
+    urls = []
+
+    def get(url):
+        urls.append(url)
+        return json.loads((data / "risk-limit-BTCUSDT-2026-10-15.json").read_text())
+
+    sup = supervisor.Supervisor(store)
+    env = {mirror.BYBIT_KEY_ENV: "k", mirror.BYBIT_SECRET_ENV: "s"}
+    sup.check_venue_terms(env, now=D1, get=get)
+    sup.check_venue_terms(env, now=D1 + timedelta(hours=1), get=get)  # tiers aren't pulled again inside 20 h
+    assert [c[0] for c in calls] == ["https://api-demo.bybit.com"] * 2 and len(urls) == 1
+    fee = venue_terms.term(store, PAPER, "fee", PAIR, D1 + timedelta(hours=1))
+    tiers = venue_terms.term(store, PAPER, "tiers", PAIR, D1 + timedelta(hours=1))
+    assert (fee.state, fee.source, tiers.state, tiers.source) == ("fresh", "fee-rate", "fresh", "risk-limit")
+
+
+def test_with_no_demo_key_on_the_server_paper_is_charged_the_published_vip0_and_says_so():
+    from sleeve_fund import supervisor
+
+    store = _store()
+    supervisor.Supervisor(store).check_venue_terms({}, now=D1, get=lambda url: {"retCode": 10006, "retMsg": "busy"})
+    fee = venue_terms.term(store, PAPER, "fee", PAIR, D1)
+    assert fee.source == PUBLISHED_FEES and "published, not account" in fee.words
+    tiers = venue_terms.term(store, PAPER, "tiers", PAIR, D1)
+    assert tiers.source == "hand-checked-pasted"  # the pull failed; the pasted table is still the last good one
+    assert not store.latest_venue_fetch("BINANCE", "tiers", PAIR)["ok"]
