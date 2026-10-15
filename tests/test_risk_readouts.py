@@ -27,6 +27,12 @@ def _strategy_accounts(monkeypatch):
 
 
 PERP = {"market": "perp", "allow_short": True}
+# FEE-LIVE (5): the loss at the stop counts the taker fee on the stop's notional, |qty| x stop x 0.055%, and a stopless
+# perpetual the fee on its stopless exit (the mark less 10%).
+STOPPED = 220 + 0.1 * 58_800 * 0.00055  # 223.234
+NOSTOP = 600 + 0.1 * 54_000 * 0.00055  # 602.97
+THROUGH = 580 + 0.1 * 52_200 * 0.00055  # 582.871: marked at 58,000, exits at 52,200
+SHORT = 220 + 0.1 * 61_200 * 0.00055  # 223.366
 AUTH = ("pm", "test-pw")
 
 
@@ -56,10 +62,10 @@ def test_the_helper_gives_each_open_perp_its_basis_and_the_limits_figure(store):
     _hold(store, "flat", 0.0)
     rows = {r["sleeve"]: r for r in open_risk.book_open_risk(store, lambda s: 0.02)}
     assert set(rows) == {"stopped", "nostop", "through", "short"}
-    assert rows["stopped"] == {"sleeve": "stopped", "risk": pytest.approx(220.0), "basis": "stop", "atr_pct": None}
-    assert rows["nostop"]["basis"] == "stopless" and rows["nostop"]["risk"] == pytest.approx(600.0)
-    assert rows["through"]["basis"] == "gapped" and rows["through"]["risk"] == pytest.approx(580.0)
-    assert rows["short"]["basis"] == "stop" and rows["short"]["risk"] == pytest.approx(220.0)
+    assert rows["stopped"] == {"sleeve": "stopped", "risk": pytest.approx(STOPPED), "basis": "stop", "atr_pct": None}
+    assert rows["nostop"]["basis"] == "stopless" and rows["nostop"]["risk"] == pytest.approx(NOSTOP)
+    assert rows["through"]["basis"] == "gapped" and rows["through"]["risk"] == pytest.approx(THROUGH)
+    assert rows["short"]["basis"] == "stop" and rows["short"]["risk"] == pytest.approx(SHORT)
 
 
 def test_the_helper_never_raises_and_asks_the_atr_only_where_it_needs_it(store):
@@ -73,7 +79,7 @@ def test_the_helper_never_raises_and_asks_the_atr_only_where_it_needs_it(store):
     rows = {r["sleeve"]: r for r in open_risk.book_open_risk(store, atr)}
     assert asked == ["nostop"]
     assert rows["nostop"]["risk"] is None and rows["nostop"]["atr_pct"] is None
-    assert rows["stopped"]["risk"] == pytest.approx(220.0)
+    assert rows["stopped"]["risk"] == pytest.approx(STOPPED)
 
     def broken(s):
         raise OSError("history store unreadable")
@@ -104,9 +110,9 @@ def test_a_trailing_model_takes_the_engines_basis(store, stop_frac):
           stop_frac=stop_frac)
     (row,) = open_risk.book_open_risk(store, lambda s: 0.02)
     if stop_frac is None:
-        assert row["basis"] == "stopless" and row["risk"] == pytest.approx(610.0)
+        assert row["basis"] == "stopless" and row["risk"] == pytest.approx(610 + 0.1 * 54_900 * 0.00055)  # exits at 61,000 less 10%
     else:
-        assert row["basis"] == "stop" and row["risk"] == pytest.approx(220.0)
+        assert row["basis"] == "stop" and row["risk"] == pytest.approx(STOPPED)
 
 
 def test_the_helper_adds_up_to_what_the_gate_counts(store):
@@ -170,13 +176,13 @@ def test_the_tile_counts_a_stopless_perp_at_the_limits_estimate(client):
     _hold(store, "stopped", 0.1, price=61_000, stop_frac=0.02)
     _hold(store, "nostop", 0.1)
     gate = sum(r["risk"] for r in open_risk.book_open_risk(store, lambda s: 0.02))
-    assert gate == pytest.approx(820.0)
+    assert gate == pytest.approx(STOPPED + NOSTOP)  # 826.204
     for url, got in _tiles(c).items():
         assert got is not None, url
-        assert "warn" in got[0] and got[1] == "820.00 · 1 estimated", (url, got)
+        assert "warn" in got[0] and got[1] == "826.20 · 1 estimated", (url, got)
     risk = c.get("/risk", auth=AUTH).text
     assert "nostop: no stop, counted at the larger of 10% and 3 daily ATRs" in risk
-    assert "600.00 est." in risk
+    assert "602.97 est." in risk
 
 
 def test_a_perp_past_its_stop_never_reads_0(client):
@@ -184,9 +190,9 @@ def test_a_perp_past_its_stop_never_reads_0(client):
     c, store = client
     _hold(store, "through", 0.1, price=58_000, stop_frac=0.02)
     for url, got in _tiles(c).items():
-        assert got[1] == "580.00 · 1 estimated" and "warn" in got[0], (url, got)
+        assert got[1] == "582.87 · 1 estimated" and "warn" in got[0], (url, got)
     risk = c.get("/risk", auth=AUTH).text
-    assert "580.00 est. · past stop" in risk
+    assert "582.87 est. · past stop" in risk
     assert "through: the price has gone through its stop and the position is still open" in risk
 
 
@@ -220,13 +226,13 @@ def test_the_tile_is_the_limits_figure_and_spot_has_its_own_line(client):
     """QA R200-1: the tile is the 5% limit's figure, perpetuals only, so it equals the gate; spot risk to stop is
     its own line, outside the limit."""
     c, store = client
-    _hold(store, "perp", 0.1, price=61_000, stop_frac=0.02)  # 220.00, the gate's figure
+    _hold(store, "perp", 0.1, price=61_000, stop_frac=0.02)  # 223.23, the gate's figure
     _hold(store, "spot", 0.1, price=61_000, params={"stop_loss": 0.02}, stop_frac=0.02)
     for url, got in _tiles(c).items():
-        assert got[1] == "220.00" and "warn" not in got[0], (url, got)
+        assert got[1] == "223.23" and "warn" not in got[0], (url, got)
     # The headroom against 5% of the book: the book here is the two strategies' 20,000.
     for url in ("/", "/risk", "/trades"):  # on the Portfolio, in the KPI's hover
-        assert "780.00 headroom to the 5% limit · 1.1% of book" in c.get(url, auth=AUTH).text, url
+        assert "776.77 headroom to the 5% limit · 1.1% of book" in c.get(url, auth=AUTH).text, url
     for url in ("/risk", "/trades"):
         assert re.search(r'<div class="s">spot, outside the limit: [\d,.]+ to stop</div>', c.get(url, auth=AUTH).text), url
     assert "Spot (spot) is outside the 5% limit" in c.get("/", auth=AUTH).text
@@ -234,10 +240,10 @@ def test_the_tile_is_the_limits_figure_and_spot_has_its_own_line(client):
 
 def test_a_book_over_the_limit_reads_red(client):
     c, store = client
-    _hold(store, "big", 1.0)  # no stop: 6,000 counted against 5% of a 10,000 book
+    _hold(store, "big", 1.0)  # no stop: 6,000 and the 29.70 exit fee (54,000 x 0.055%) against 5% of a 10,000 book
     for url in ("/risk", "/trades"):
-        assert '<span class="loss">over the 5% limit by 5,500.00</span> · 60.0% of book' in c.get(url, auth=AUTH).text, url
-    assert "over the 5% limit by 5,500.00 · 60.0% of book" in c.get("/", auth=AUTH).text  # the KPI's hover
+        assert '<span class="loss">over the 5% limit by 5,529.70</span> · 60.3% of book' in c.get(url, auth=AUTH).text, url
+    assert "over the 5% limit by 5,529.70 · 60.3% of book" in c.get("/", auth=AUTH).text  # the KPI's hover
 
 
 def test_trades_filtered_to_one_strategy_shows_no_headroom(client):
@@ -254,8 +260,8 @@ def test_with_two_accounts_each_has_its_own_headroom_as_the_gate_measures_it(cli
     headroom is per account, and each equals what the gate works out for it."""
     c, store = client
     store.create_account("second", "paper")
-    _hold(store, "a", 0.1, price=61_000, stop_frac=0.02)  # 220.00 on the default account
-    _hold(store, "b", 0.1)  # no stop: 600.00
+    _hold(store, "a", 0.1, price=61_000, stop_frac=0.02)  # 223.23 on the default account
+    _hold(store, "b", 0.1)  # no stop: 602.97
     store.assign_account("b", "second")
     for name, sleeve in (("paper", "a"), ("second", "b")):
         own = {r["sleeve"]: r for r in open_risk.book_open_risk(store, lambda s: 0.02, name)}[sleeve]
@@ -267,7 +273,7 @@ def test_with_two_accounts_each_has_its_own_headroom_as_the_gate_measures_it(cli
         for url in ("/risk", "/trades"):
             assert line in c.get(url, auth=AUTH).text, (url, line)
         assert line.replace('<span class="loss">', "").replace("</span>", "") in c.get("/", auth=AUTH).text
-    assert "second: over the 5% limit by 100.00" in c.get("/", auth=AUTH).text  # 600 against 500
+    assert "second: over the 5% limit by 102.97" in c.get("/", auth=AUTH).text  # 602.97 against 500
 
 
 def test_a_spot_only_account_gets_no_headroom_line(client):
@@ -275,18 +281,18 @@ def test_a_spot_only_account_gets_no_headroom_line(client):
     one perp account beside it, that account still reads against its own book, named, as the gate measures it."""
     c, store = client
     store.create_account("spot-only", "paper")
-    _hold(store, "a", 0.1)  # no stop: 600.00 on the default account
+    _hold(store, "a", 0.1)  # no stop: 602.97 on the default account
     _hold(store, "s", 0.1, params={"market": "spot"}, stop_frac=0.02)
     store.assign_account("s", "spot-only")
     book, others, _ = open_risk.account_book(store, "a", store.last_equity("a")["equity"], lambda s: 0.02)
     assert open_risk.account_equity(store, "paper") == pytest.approx(book) == pytest.approx(10_000)
-    assert open_risk.LIMIT * book - others - 600 == pytest.approx(-100)  # 600 against 500
+    assert open_risk.LIMIT * book - others - NOSTOP == pytest.approx(-102.97)  # 602.97 against 500
     for url in ("/risk", "/trades"):
         page = c.get(url, auth=AUTH).text
         assert "spot-only:" not in page, url
-        assert 'paper: <span class="loss">over the 5% limit by 100.00</span>' in page, url
+        assert 'paper: <span class="loss">over the 5% limit by 102.97</span>' in page, url
     page = c.get("/", auth=AUTH).text
-    assert "spot-only:" not in page and "paper: over the 5% limit by 100.00" in page
+    assert "spot-only:" not in page and "paper: over the 5% limit by 102.97" in page
 
 
 def _put_away(store, name, cash_pnl=0.0):
@@ -305,7 +311,7 @@ def test_the_headroom_names_the_part_of_the_book_no_strategy_holds(client):
     """F-C3B-UI (Advisor C3b, option B): the limit's book counts cash a clean slate put away, which no Strategy now
     trades, so the headroom line says how much of the book that is; with none, it reads as before."""
     c, store = client
-    _hold(store, "a", 0.1, price=61_000, stop_frac=0.02)  # 220.00
+    _hold(store, "a", 0.1, price=61_000, stop_frac=0.02)  # 223.23
     _put_away(store, "old", cash_pnl=500.0)
     assert open_risk.account_unallocated(store, "paper") == 0  # archived in the current book: still allocated
     for url in ("/", "/risk", "/trades"):
@@ -314,7 +320,7 @@ def test_the_headroom_names_the_part_of_the_book_no_strategy_holds(client):
     assert "old" in store.previous_book()
     assert open_risk.account_unallocated(store, "paper") == pytest.approx(10_500)
     assert open_risk.account_equity(store, "paper") == pytest.approx(20_500)
-    room = 0.05 * 20_500 - 220
+    room = 0.05 * 20_500 - STOPPED  # 801.77
     for url in ("/", "/risk", "/trades"):
         assert (f"{room:,.2f} headroom to the 5% limit · 1.1% of book, of which 10,500.00 unallocated"
                 in c.get(url, auth=AUTH).text), url
@@ -325,8 +331,8 @@ def test_with_two_accounts_each_line_names_its_own_unallocated_part(client):
     """F-C3B-UI with RR-1: each account's line is against its own book, so each names its own put-away cash."""
     c, store = client
     store.create_account("second", "paper")
-    _hold(store, "a", 0.1, price=61_000, stop_frac=0.02)  # 220.00 on the default account
-    _hold(store, "b", 0.1)  # no stop: 600.00
+    _hold(store, "a", 0.1, price=61_000, stop_frac=0.02)  # 223.23 on the default account
+    _hold(store, "b", 0.1)  # no stop: 602.97
     store.assign_account("b", "second")
     _put_away(store, "old")
     store.decide("PM", "clear", "Clean slate")
@@ -334,5 +340,5 @@ def test_with_two_accounts_each_line_names_its_own_unallocated_part(client):
     assert open_risk.account_unallocated(store, "second") == 0
     for url in ("/risk", "/trades"):
         page = c.get(url, auth=AUTH).text
-        assert "paper: 780.00 headroom to the 5% limit · 1.1% of book, of which 10,000.00 unallocated" in page, url
+        assert "paper: 776.77 headroom to the 5% limit · 1.1% of book, of which 10,000.00 unallocated" in page, url
         assert re.search(r"second: [^·]+· 6\.0% of book(?!, of which)", page), url

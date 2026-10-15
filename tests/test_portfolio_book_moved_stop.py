@@ -36,7 +36,8 @@ def _book_hours(monkeypatch, exits: dict) -> list[dict]:
             entry_stop = opened.setdefault((self._entry_px, self._entry_side), level)
             seen.append({"close": close, "atr": atr_pct, "qty": self._mark(close)[2], "side": side, "level": level,
                          "entry_stop": entry_stop, "risk": held.risk, "base": self._base_code(),
-                         "through": (close - level) * side <= 0, "entry": (self._entry_px, self._entry_side)})
+                         "through": (close - level) * side <= 0, "entry": (self._entry_px, self._entry_side),
+                         "taker": self._cfg.assumed_taker_fee})
         return equity, held
 
     monkeypatch.setattr(Rules, "portfolio_book", spy)
@@ -45,7 +46,8 @@ def _book_hours(monkeypatch, exits: dict) -> list[dict]:
 
 
 def _risk(h: dict, stop: float) -> D:
-    pos = Position("r", underlying(h["base"]), D(repr(float(h["qty"]))), D(repr(float(stop))), taker=D(0))
+    pos = Position("r", underlying(h["base"]), D(repr(float(h["qty"]))), D(repr(float(stop))),
+                   taker=D(repr(float(h["taker"]))))  # the stop's fee at the rate the run pays (FEE-LIVE 5)
     return holding_for(pos, D(repr(float(h["close"]))), h["atr"]).risk
 
 
