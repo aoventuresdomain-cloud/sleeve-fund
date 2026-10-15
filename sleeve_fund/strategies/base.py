@@ -6699,7 +6699,8 @@ class LongFlatStrategy(Strategy):
             self.log.warning(f"no final mark on stop: {e}")
 
     def on_stop(self) -> None:
-        self._gate_done.set()
+        if (done := getattr(self, "_gate_done", None)) is not None:  # A3: stop the gate listener thread
+            done.set()
         self._drop_kept()
         for coid in list(self._maker):
             self._cancel_alert(coid)
