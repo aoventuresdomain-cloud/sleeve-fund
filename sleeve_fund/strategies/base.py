@@ -1786,10 +1786,11 @@ class LongFlatStrategy(Strategy):
         store, name = self.runtime.store, self.runtime.name
         row = store.sleeve(name)
         profile = venue_profile(getattr(self.runtime, "venue", None) or row.venue)
-        if not profile.fee_bounds:
+        if not profile.fee_bounds or not profile.perpetual:  # a simulated perp on a spot venue charges LOW_FEE_PERP
             return None
-        live = store.account_kind(store.account_of(name)) == "live"
-        return venue_terms.entry_refusal(store, profile, row.instrument, self.runtime.now(), live)
+        account = store.account_of(name)
+        live = store.account_kind(account) == "live"
+        return venue_terms.entry_refusal(store, profile, row.instrument, self.runtime.now(), live, account)
 
     def _open_risk_refusal(self, side: int, qty: float, close: float, equity: float, ts_ns: int,
                            held_qty: float = 0.0, held_stop: float | None = None) -> str | None:
@@ -4168,6 +4169,9 @@ class LongFlatStrategy(Strategy):
         if liq is None:
             return frac, None
         side = self._entry_side or 1
+        pulled = self._pulled_liq(cash, qty)
+        if pulled is not None and (pulled - liq) * side > 0:
+            liq = pulled  # Advisor TIER-DIFF 2: a pulled tier table that differs puts it nearer; the nearer one holds
         ref = self._entry_px if (self._entry_px - liq) * side > 0 else self._last_close
         if not ref or (ref - liq) * side <= 0:
             return frac, None  # the price is through it: the liquidation guard closes the position
@@ -4176,6 +4180,27 @@ class LongFlatStrategy(Strategy):
         if frac <= cap or math.isclose(frac, cap, rel_tol=1e-12, abs_tol=1e-15):
             return frac, None
         return cap, liq
+
+    def _pulled_liq(self, cash: float, qty: float) -> float | None:
+        """Paper only (Advisor TIER-DIFF 2): the liquidation price under the venue's newest pulled tier table when it
+        differs in value from the one liquidation is priced with (venue_terms.differing_tiers), else None. The readers
+        keep the priced table; only the stop's half-way cap takes the nearer of the two."""
+        if self._backtest or self.runtime is None or self._cfg.perp is None or not qty:
+            return None
+        from sleeve_fund import venue_terms
+        from sleeve_fund.venues import venue as venue_profile
+
+        store = self.runtime.store
+        row = store.sleeve(self.runtime.name)
+        profile = venue_profile(getattr(self.runtime, "venue", None) or row.venue)
+        if not profile.perpetual:
+            return None
+        table = venue_terms.differing_tiers(store, profile, row.instrument)
+        if table is None:
+            return None
+        entry = self._entry_px if self._entry_px else self._net_position()[1]
+        return markets.isolated_liquidation(cash + LongFlatStrategy._funded(self), qty, entry,
+                                            LongFlatStrategy._max_leverage(self), table)
 
     def _hold_stop_capped(self, asked: float) -> bool:
         """Set the stop for `asked`, held inside the half-liquidation cap (_capped_stop). Journals a clamp only when

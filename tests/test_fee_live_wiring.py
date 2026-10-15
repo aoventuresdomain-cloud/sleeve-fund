@@ -33,7 +33,7 @@ def _store():
 
 def _fee(store, at, source="fee-rate", payload=FEE):
     store.record_venue_fetch("BINANCE", "fee", PAIR, source=source, ok=True, payload=payload, at=at,
-                             bounds=PAPER.fee_bounds)
+                             bounds=PAPER.fee_bounds, account=store.account_of("p1"))
 
 
 def _tiers(store, at):

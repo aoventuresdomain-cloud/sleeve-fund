@@ -343,6 +343,10 @@ KRAKEN = register(VenueProfile(
     # 3 Oct 2026. Tier 2 (0.30% maker, 0.60% taker) starts at $2,501.
     fees=FeeSchedule(maker=Decimal("0.0040"), taker=Decimal("0.0080")),
     fee_basis="Tier 1, 3 Oct 2026",
+    # FEE-LIVE (HoE): no venue falls back silently. No fee endpoint is read here, so the published Tier 1 is written
+    # as a labelled row at each hourly attempt (venue_terms.fetch_due), checked against zero up to Tier 1.
+    fee_bounds={"maker": (Decimal("0"), Decimal("0.0040")), "taker": (Decimal("0"), Decimal("0.0080"))},
+    fee_bounds_basis="spot maker and taker, zero up to the published Tier 1, 3 Oct 2026",
     daily_history=_kraken_daily,
     sub_8dp_test_accounts={"paper": "the hub-fed USD test Strategies and the full-stack check"},
     ohlc_history=_kraken_ohlc,

@@ -224,7 +224,12 @@ class Forwarder:
                 continue
             self._terms_said.add(key)
             level = "error" if t.state == venue_terms.REFUSED else "warning"
-            self.store.event(None, level, f"venue_terms_{t.state if t.state != 'fresh' else 'published'}", t.words)
+            words = t.words
+            if t.kind == "tiers" and "tier table changed" in words:  # Advisor TIER-DIFF 2: name who it touches
+                held = venue_terms.holders(self.store, t.instrument)
+                words += ("; open positions on it, their stops held inside half the way to the nearer liquidation of "
+                          f"the two tables: {', '.join(held)}" if held else "; no open position on it")
+            self.store.event(None, level, f"venue_terms_{t.state if t.state != 'fresh' else 'published'}", words)
 
     def _ops_check(self, what: str, check) -> None:
         """One A15 check; a failure is one error until it works again (then one info line), and never stops the

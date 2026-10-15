@@ -25,9 +25,10 @@ import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
-from sleeve_fund.instruments import FeeSchedule
-from sleeve_fund.store import PUBLISHED_FEES, margin_tiers_of
+from sleeve_fund.instruments import FeeSchedule, pct
+from sleeve_fund.store import PUBLISHED_FEES, margin_tiers_of, venue_fees_of
 
 ALERT_AFTER = timedelta(hours=24)
 REFUSE_AFTER = timedelta(hours=72)
@@ -36,8 +37,9 @@ FEE_RATE, RISK_LIMIT, PASTED = "fee-rate", "risk-limit", "hand-checked-pasted"
 FEE_RATE_PATH = "/v5/account/fee-rate"
 # The paper venue's public V5 risk-limit page: public market data, read-only, no key.
 RISK_LIMIT_URL = "https://api.bybit.com/v5/market/risk-limit?category=linear&symbol={symbol}"
+UK = ZoneInfo("Europe/London")  # times the PM reads are UK times, labelled UK
 KIND_WORDS = {"fee": "fee rates", "tiers": "margin tiers"}
-SOURCE_WORDS = {FEE_RATE: "the account", PUBLISHED_FEES: "the published VIP 0 schedule (published, not account)",
+SOURCE_WORDS = {FEE_RATE: "the account", PUBLISHED_FEES: "the published schedule (published, not account)",
                 RISK_LIMIT: "the public risk-limit table", PASTED: "the table pasted on 15 Oct, hand-checked"}
 
 
@@ -76,10 +78,6 @@ def _failed(e: Exception) -> str:
     return f"{type(e).__name__}: {e}"[:500] or "failed"
 
 
-def _strings(fees: FeeSchedule, symbol: str) -> dict:
-    return {"symbol": symbol, "maker": str(fees.maker), "taker": str(fees.taker)}
-
-
 def fetch_fees(store, profile, instrument: str, *, client, account: str, live: bool, now: datetime | None = None) -> None:
     """One attempt at the account's fee rates for `instrument` (client: a signed V5 client's call(method, path,
     params)). The answer is kept, checked against the profile's published bounds; a refusal or a bad answer is kept as
@@ -92,9 +90,7 @@ def fetch_fees(store, profile, instrument: str, *, client, account: str, live: b
         store.record_venue_fetch(profile.name, "fee", instrument, source=FEE_RATE, ok=False, reason=_failed(e),
                                  account=account, at=at)
         if not live:
-            store.record_venue_fetch(profile.name, "fee", instrument, source=PUBLISHED_FEES, ok=True,
-                                     payload=_strings(profile.fees, symbol), account=account, at=at,
-                                     bounds=profile.fee_bounds)
+            store.record_published_fees(profile.name, instrument, account=account, bounds=profile.fee_bounds, at=at)
         return
     store.record_venue_fetch(profile.name, "fee", instrument, source=FEE_RATE, ok=True, payload=payload,
                              account=account, at=at, bounds=profile.fee_bounds)
@@ -141,6 +137,32 @@ def seed_pasted_tiers(store, profile) -> None:
                                  payload={"symbol": symbol_of(pair), "tiers": rows})
 
 
+def _values(table) -> list[tuple[Decimal, Decimal, Decimal]]:
+    """A maintenance table as Decimal values tier by tier, by rising ceiling (the last one open): what liquidation is
+    priced with, so a difference in formatting or order is no difference (Advisor TIER-DIFF 1)."""
+    return sorted((Decimal("Infinity") if math.isinf(t.ceiling) else Decimal(repr(float(t.ceiling))),
+                   Decimal(repr(float(t.rate))), Decimal(repr(float(t.amount)))) for t in table)
+
+
+def same_tiers(a, b) -> bool:
+    return _values(a) == _values(b)
+
+
+def differing_tiers(store, profile, instrument: str):
+    """The newest good pulled table for `instrument` when it differs from the one liquidation is priced with, else
+    None: open positions are held to the nearer liquidation of the two (Advisor TIER-DIFF 2)."""
+    priced = profile.maintenance_tiers.get(instrument)
+    row = store.latest_good_venue_fetch(profile.name, "tiers", instrument) if priced is not None else None
+    if row is None:
+        return None
+    pulled = margin_tiers_of(row)
+    return None if same_tiers(priced, pulled) else pulled
+
+
+def uk(t: datetime) -> str:
+    return f"{t.astimezone(UK):%-d %b %H:%M} UK"
+
+
 @dataclass(frozen=True)
 class Term:
     """One instrument's fee rates or margin tiers as the engine holds them now."""
@@ -165,13 +187,19 @@ def _utc(t: datetime) -> datetime:
     return t if t.tzinfo is not None else t.replace(tzinfo=timezone.utc)
 
 
-def term(store, profile, kind: str, instrument: str, now: datetime, live: bool = False) -> Term:
-    """The last-known-good fee rates or tiers for `instrument` and how old they are (FRESH, STALE, REFUSED)."""
+def term(store, profile, kind: str, instrument: str, now: datetime, live: bool = False,
+         account: str | None = None) -> Term:
+    """The last-known-good fee rates (the account's own, with `account`) or tiers for `instrument` and how old they
+    are (FRESH, STALE, REFUSED)."""
     what = f"{instrument} {KIND_WORDS[kind]}"
     if kind == "fee" and not profile.fee_bounds:
         return Term(kind, instrument, REFUSED, None, None, None, None,
                     f"{what}: no published range to check a fetched rate against, so none is used")
-    row = store.latest_good_venue_fetch(profile.name, kind, instrument)
+    row = store.latest_good_venue_fetch(profile.name, kind, instrument, account=account if kind == "fee" else None)
+    if row is None and not profile.perpetual:
+        return Term(kind, instrument, STALE, None, None, None, None,
+                    f"{what}: the published schedule ({profile.fee_basis}) is charged (published, not account); not "
+                    "recorded yet by the hourly pass")
     if row is None:
         return Term(kind, instrument, REFUSED, None, None, None, None,
                     f"{what}: never fetched, so entries are refused; exits and stops still run")
@@ -182,17 +210,16 @@ def term(store, profile, kind: str, instrument: str, now: datetime, live: bool =
     at = _utc(row["fetched_at"])
     age = _utc(now) - at
     hours = max(int(age.total_seconds() // 3600), 0)
-    value = ((Decimal(row["payload"]["maker"]), Decimal(row["payload"]["taker"])) if kind == "fee"
-             else margin_tiers_of(row))
+    value = (venue_fees_of(row).maker, venue_fees_of(row).taker) if kind == "fee" else margin_tiers_of(row)
     src = SOURCE_WORDS.get(row["source"], row["source"])
-    when = f"fetched {at.day} {at:%b %H:%M} UTC from {src}"
+    when = f"fetched {uk(at)} from {src}"
     priced = profile.maintenance_tiers.get(instrument) if kind == "tiers" else None
-    if kind == "tiers" and priced is not None and tuple(priced) != tuple(value):
-        # Liquidation is priced with the profile's table (Advisor question (b), PE1's default): a pulled table that
-        # differs is never used silently; entries wait until it is re-pasted and checked in.
-        state, words = REFUSED, (f"{what}: the table {when} differs from the table liquidation is priced with, so "
-                                 "entries are refused until it is re-pasted and checked (DA-11); exits and stops "
-                                 "still run")
+    if kind == "tiers" and priced is not None and not same_tiers(priced, value):
+        # Liquidation is priced with the profile's table (Advisor TIER-DIFF (b)): a pulled table that differs in value
+        # is never used silently. New entries on the instrument wait until it is re-checked; open positions are held
+        # to the nearer liquidation of the two (differing_tiers).
+        state, words = REFUSED, (f"{what}: tier table changed ({when}); new entries refused on {instrument} until "
+                                 "re-checked (DA-11); exits, stops and the liquidation cut still run")
     elif age > REFUSE_AFTER:
         state, words = REFUSED, (f"{what}: last {when}, {hours} hours ago, over 72 hours, so entries are refused "
                                  "until they are fetched again; exits and stops still run")
@@ -205,11 +232,12 @@ def term(store, profile, kind: str, instrument: str, now: datetime, live: bool =
     return t
 
 
-def entry_refusal(store, profile, instrument: str, now: datetime, live: bool = False) -> str | None:
+def entry_refusal(store, profile, instrument: str, now: datetime, live: bool = False,
+                  account: str | None = None) -> str | None:
     """Why an entry on `instrument` is refused for its fee rates or tiers (over 72 h old, or never fetched), or None.
     Only entries read this: exits, stops, the liquidation cut and Stop never do."""
     for kind in ("fee", "tiers"):
-        t = term(store, profile, kind, instrument, now, live)
+        t = term(store, profile, kind, instrument, now, live, account)
         if t.state == REFUSED:
             return f"Entry refused: {t.words}"
     return None
@@ -228,25 +256,36 @@ class _NoClient:
 TIER_EVERY = timedelta(hours=20)  # a tier table younger than this isn't pulled again: daily, with room before 24 h
 
 
-def fetch_due(store, now: datetime, client_for, get=_get_json) -> None:
-    """The supervisor's hourly pass (Supervisor.check_fees): for every running perp Strategy's instrument on a FEE-LIVE
-    venue, the pasted tables seeded once, the account's fee rates fetched (client_for(account, live) gives its signed
-    client, or None when this server has none for it), and the public tiers pulled when the last good table is 20 h
-    old or more. Each attempt is one row, so the 24 h and 72 h rules read the last good one."""
+def _followed(store):
+    """(profile, Strategy, account, live, perp) for every running Strategy on a FEE-LIVE venue: a perp on the paper
+    venue, or spot on a venue with a published range (no fee endpoint here, so its published row stands in, labelled)."""
     from sleeve_fund.venues import venue as venue_profile
 
-    seen = set()
     for s in store.sleeves():
-        if s.lifecycle == "retired" or (s.params or {}).get("market") != "perp":
+        if s.lifecycle == "retired":
             continue
         profile = venue_profile(s.venue)
-        if not profile.fee_bounds:
+        perp = (s.params or {}).get("market") == "perp"
+        if not profile.fee_bounds or perp != bool(profile.perpetual):
             continue
         account = store.account_of(s.name)
-        live = store.account_kind(account) == "live"
+        yield profile, s, account, store.account_kind(account) == "live", perp
+
+
+def fetch_due(store, now: datetime, client_for, get=_get_json) -> None:
+    """The supervisor's hourly pass (Supervisor.check_fees): for every followed Strategy's instrument (_followed), the
+    pasted tables seeded once, the account's fee rates fetched (client_for(account, live) gives its signed client, or
+    None when this server has none for it), and on a perp the public tiers pulled when the last good table is 20 h old
+    or more. A spot venue with no fee endpoint writes its published row at each attempt (HoE: never silently). Each
+    attempt is one row, so the 24 h and 72 h rules read the last good one."""
+    seen = set()
+    for profile, s, account, live, perp in _followed(store):
         if (profile.name, s.instrument, account) in seen:
             continue
         seen.add((profile.name, s.instrument, account))
+        if not perp:
+            store.record_published_fees(profile.name, s.instrument, account=account, bounds=profile.fee_bounds, at=now)
+            continue
         seed_pasted_tiers(store, profile)
         client = client_for(account, live)
         fetch_fees(store, profile, s.instrument, account=account, live=live, now=now,
@@ -257,22 +296,28 @@ def fetch_due(store, now: datetime, client_for, get=_get_json) -> None:
 
 
 def live_terms(store, now: datetime) -> list[Term]:
-    """Every running perp Strategy's instrument on a FEE-LIVE venue, its fee rates then its tiers, once per instrument
-    and account kind: what the start check, the alerts and the dashboard read (FE's reader: live_terms(store, now))."""
-    from sleeve_fund.venues import venue as venue_profile
-
+    """Every followed Strategy's instrument (_followed), its fee rates (its account's own) then, on a perp, its tiers,
+    once per instrument and account: what the start check, the alerts and the dashboard read (FE's reader)."""
     out, seen = [], set()
+    for profile, s, account, live, perp in _followed(store):
+        if (profile.name, s.instrument, account) in seen:
+            continue
+        seen.add((profile.name, s.instrument, account))
+        out.append(term(store, profile, "fee", s.instrument, now, live, account))
+        if perp and not any(t.kind == "tiers" and t.instrument == s.instrument for t in out):
+            out.append(term(store, profile, "tiers", s.instrument, now, live))
+    return out
+
+
+def holders(store, instrument: str) -> list[str]:
+    """The running perp Strategies holding a position on `instrument`: who a changed tier table touches."""
+    out = []
     for s in store.sleeves():
-        if s.lifecycle == "retired" or (s.params or {}).get("market") != "perp":
+        if s.lifecycle == "retired" or s.instrument != instrument or (s.params or {}).get("market") != "perp":
             continue
-        profile = venue_profile(s.venue)
-        if not profile.fee_bounds:
-            continue
-        live = store.account_kind(store.account_of(s.name)) == "live"
-        if (profile.name, s.instrument, live) in seen:
-            continue
-        seen.add((profile.name, s.instrument, live))
-        out += [term(store, profile, kind, s.instrument, now, live) for kind in ("fee", "tiers")]
+        last = store.last_equity(s.name)
+        if last and last.get("qty"):
+            out.append(s.name)
     return out
 
 
@@ -287,10 +332,9 @@ def research_fees(store, profile, instrument: str | None = None) -> ResearchFees
     account's own rate beside it when one has been fetched, so a result shows both."""
     vip0 = profile.fees
     row = store.latest_good_venue_fetch(profile.name, "fee", instrument) if store is not None and instrument else None
-    own = (Decimal(row["payload"]["maker"]), Decimal(row["payload"]["taker"])) if row else None
+    own = (venue_fees_of(row).maker, venue_fees_of(row).taker) if row else None
     fees = FeeSchedule(max(vip0.maker, own[0]) if own else vip0.maker, max(vip0.taker, own[1]) if own else vip0.taker)
-    text = (f"Research fees: {float(fees.maker):.3%} maker, {float(fees.taker):.3%} taker (published VIP 0, never "
-            "below it)")
+    text = f"Research fees: {pct(fees.maker)} maker, {pct(fees.taker)} taker (published VIP 0, never below it)"
     if own:
-        text += f"; the account's own: {float(own[0]):.3%} maker, {float(own[1]):.3%} taker"
+        text += f"; the account's own: {pct(own[0])} maker, {pct(own[1])} taker"
     return ResearchFees(fees, text)

@@ -374,7 +374,7 @@ def check_venue_terms(store, now=None) -> Section:
         elif t.state == venue_terms.STALE or t.source == venue_terms.PUBLISHED_FEES:
             sec.add(NOTE, t.words)
     if not sec.failed:
-        sec.add(PASS, "every perp Strategy's instrument has fee rates and tiers fetched within 72 hours")
+        sec.add(PASS, "every followed Strategy's instrument has its fee rates (and on a perp its tiers) within 72 hours")
     return sec
 
 
