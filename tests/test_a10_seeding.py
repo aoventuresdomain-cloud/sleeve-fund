@@ -269,3 +269,68 @@ def test_a_rules_strategy_checks_its_decision_blocks_chained_as_they_are_fed():
     assert sorted(seeding.name(x) for x in seeding.leaves(unit)) == ["ATR(10)", "EMA(20)", "RSI(14)"]
     assert seeding.check(unit, _walk(1_000), label).settled
     assert all(seeding.read(x) is None for x in seeding.leaves(unit))  # the strategy's own blocks are untouched
+
+
+# --- slower candles ----------------------------------------------------------------------------------------------------
+
+def _rules_on_hourly_rsi(tmp_path, hours):
+    """A rule-builder Strategy deciding on 15-minute candles with an RSI(14) on 1-hour ones, its store holding
+    `hours` of minutes."""
+    from sleeve_fund.history import HistoryStore
+    from sleeve_fund.paper.node import history_loader
+    from sleeve_fund.strategies.definitions import to_params
+    from sleeve_fund.strategies.rules import Rules, RulesConfig
+    from sleeve_fund.venues import venue
+
+    n = hours * 60
+    now = pd.Timestamp.now(tz="UTC").floor("4h")
+    idx = pd.date_range(end=now, periods=n, freq="1min", tz="UTC")
+    c = 60_000 * np.exp(np.cumsum(np.random.default_rng(3).normal(0, 0.0005, n)))
+    store = HistoryStore(tmp_path)
+    store.append("KRAKEN", "BTC/USD", pd.DataFrame({"open": c, "high": c, "low": c, "close": c, "volume": 1.0},
+                                                   index=idx), cursor="c")
+    instrument = venue("kraken").instrument("BTC", "USD")
+    defn = {"version": 1, "reason": "A10 cell.", "blocks": {"r": {"kind": "rsi", "timeframe": "1h"}},
+            "long": {"entry": {"left": "r", "op": "<", "right": 30}}}
+    s = Rules(RulesConfig(instrument_id=instrument.id,
+                          bar_type=BarType.from_str("BTC/USD.KRAKEN-15-MINUTE-LAST-INTERNAL"),
+                          assumed_taker_fee=0.001, warmup_bars=40, **to_params(defn)))
+    s.attach_history(history_loader("KRAKEN", "BTC/USD", store))
+    s.instrument = instrument
+    events = []
+    s.runtime = type("R", (), {"name": "s1", "backtest": True, "now": lambda self: None,
+                               "store": type("S", (), {"event": lambda self, *a, **k: events.append(a)})()})()
+    return s, events
+
+
+def test_a_slower_candles_rsi_is_seeded_twice_and_a_store_between_n_and_2n_holds(tmp_path):
+    s, events = _rules_on_hourly_rsi(tmp_path, 200)  # 200 hourly candles: past its 140, short of 280
+    s._warm_slower()
+    assert s._short_history is None  # its own warm-up is met, as before
+    (_, level, _, msg), = [e for e in events if e[2] == "seed_unsettled"]
+    assert msg.startswith("No new entries: its 1-hour candles' indicators: the history store holds 199 bars")
+    bar = type("B", (), {"ts_event": 0})()
+    assert s._entry_held(bar, "long entry")
+
+
+def test_a_slower_candles_rsi_the_store_covers_twice_over_settles(tmp_path):
+    s, events = _rules_on_hourly_rsi(tmp_path, 400)
+    s._warm_slower()
+    assert s._seed_hold is None and not [e for e in events if e[2] == "seed_unsettled"]
+    assert s._slow[60].count >= 140
+
+
+def test_a_slower_pair_is_fed_only_on_its_own_closed_candles():
+    from sleeve_fund.strategies.timeframes import SlowerCandles
+
+    s, bar, events, sold, opened = __import__("test_timing")._late_strategy(side_now=0, wants=1)
+    slow = SlowerCandles(60, 15)
+    r = seeding.check(Rsi(14), _walk(100), "rsi")
+    s._seed_pairs, s._seed_hold = {"rsi": (r.pair, slow, 100 * MIN)}, "rsi: short"
+    fed = r.pair.fed
+    s._feed_seeds(None, (1, 1, 1, 1, 1, 101 * MIN))  # a decision candle: not this pair's
+    assert r.pair.fed == fed
+    s._feed_seeds(slow, (1, 1, 1, 1, 1, 50 * MIN))  # one loaded already
+    assert r.pair.fed == fed
+    s._feed_seeds(slow, (1, 1, 1, 1, 1, 160 * MIN))
+    assert r.pair.fed == fed + 1
