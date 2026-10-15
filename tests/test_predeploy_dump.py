@@ -127,7 +127,7 @@ def _run(tmp_path: Path, **kw) -> tuple[subprocess.CompletedProcess, list[str]]:
 @needs_bash
 def test_a_copy_that_doesnt_restore_fails_and_drops_the_scratch_database(tmp_path):
     done, calls = _run(tmp_path, restore_ok=False)
-    assert done.returncode == 1 and "pre-deploy dump: FAIL, it didn't restore" in done.stdout
+    assert done.returncode == 1 and "pre-deploy dump: FAIL, it didn't restore (exit 1)" in done.stdout
     assert "secret-host" not in done.stdout + done.stderr
     assert calls[-1].startswith("dropdb") and "predeploy_check" in calls[-1]
     assert not list((tmp_path / "b").iterdir())  # CR F-PDD-1: an unproved copy never stays under a good name
@@ -181,8 +181,8 @@ echo "/dev/x 99999999999 1 {free} 1% /"
         assert [p.name for p in (tmp_path / "b").iterdir()] == ["sleeve_fund-20261015-0012.dump"]
 
 
-@pytest.mark.parametrize("kw, words", [({"dump_ok": False}, "the dump didn't complete"),
-                                       ({"read_ok": False}, "couldn't read the journal")])
+@pytest.mark.parametrize("kw, words", [({"dump_ok": False}, "the dump didn't complete (exit 1)"),
+                                       ({"read_ok": False}, "couldn't read the journal (exit 2)")])  # HoE: the code
 @needs_bash
 def test_a_tool_that_fails_says_so_and_leaves_nothing(tmp_path, kw, words):
     """QT3 N2: a failed pg_dump (or psql) once exited through set -e with no line in the deploy log."""
