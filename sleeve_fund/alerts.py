@@ -104,6 +104,7 @@ class Forwarder:
         self.url, self.ping_url = env.get("ALERT_WEBHOOK_URL") or None, env.get("HEALTHCHECK_PING_URL") or None
         self.backup_dir = Path(env["BACKUP_DIR"]) if env.get("BACKUP_DIR") else None
         self.recon_dir = Path(env["RECON_DIR"]) if env.get("RECON_DIR") else None
+        self.recon_alert = env.get("NIGHTLY_ALERT") == "on"  # off (the default): a FAIL is journaled, not sent
         self._recon_tried = None  # the night last tried: a record that can't be written isn't retried every minute
         self.cursor = self._resume()
         self._failing = False
@@ -139,7 +140,8 @@ class Forwarder:
 
     def check_recon(self) -> None:
         """Nightly (sleeve_fund.nightly_recon): every Strategy's dashboard against its journal, read-only, into a dated
-        record. A FAIL is a warning, the level stale data alerts at; a PASS is journaled as info."""
+        record. A FAIL is a warning, the level stale data alerts at, once NIGHTLY_ALERT is on; until then (the default)
+        it is journaled as info and reaches no one. A PASS is journaled as info."""
         now = self.now()
         if self.recon_dir is None or self.store.url is None or self._recon_tried == now.date():
             return
@@ -149,16 +151,17 @@ class Forwarder:
         try:
             ok, path, fails = nightly_recon.run(self.recon_dir, self.store.url, now)
         except OSError as exc:  # the record couldn't be written: the night isn't proven, so it's a fail
-            self.store.event(None, "warning", "recon_failed", f"nightly recon couldn't write its record in "
-                             f"{self.recon_dir}: {type(exc).__name__}")
+            self.store.event(None, "warning" if self.recon_alert else "info", "recon_failed",
+                             f"nightly recon couldn't write its record in {self.recon_dir}: {type(exc).__name__}")
             return
         if ok:
             self.store.event(None, "info", "recon_passed", f"nightly recon passed: every Strategy's dashboard "
                              f"matches its journal ({path.name})")
             return
         more = f"; and {len(fails) - 3} more" if len(fails) > 3 else ""
-        self.store.event(None, "warning", "recon_failed", f"nightly recon FAILED ({path.name}): "
-                         + "; ".join(fails[:3]) + more)
+        quiet = "" if self.recon_alert else " (not sent: NIGHTLY_ALERT is off)"
+        self.store.event(None, "warning" if self.recon_alert else "info", "recon_failed",
+                         f"nightly recon FAILED ({path.name}): " + "; ".join(fails[:3]) + more + quiet)
 
     def check_clock(self) -> None:
         """Every CLOCK_CHECK: the server clock's offset from a time server. The first reading is journaled so

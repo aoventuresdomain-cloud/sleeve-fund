@@ -97,7 +97,8 @@ def test_it_is_strictly_read_only_no_writes_and_no_network(tmp_path, monkeypatch
 
 
 def _forwarder(url, folder, now, sent):
-    return Forwarder(Store(url), environ={"RECON_DIR": str(folder), "ALERT_WEBHOOK_URL": "https://hooks.example/x"},
+    return Forwarder(Store(url), environ={"RECON_DIR": str(folder), "ALERT_WEBHOOK_URL": "https://hooks.example/x",
+                                          "NIGHTLY_ALERT": "on"},
                      send=lambda u, text: sent.append(text), now=lambda: now[0])
 
 
@@ -142,7 +143,8 @@ def test_a_record_that_cannot_be_written_warns_once_a_night(tmp_path):
     url, _ = _journal(tmp_path)
     (tmp_path / "recon").write_text("not a folder")
     now = [NIGHT]
-    fwd = Forwarder(Store(url), environ={"RECON_DIR": str(tmp_path / "recon")}, now=lambda: now[0])
+    fwd = Forwarder(Store(url), environ={"RECON_DIR": str(tmp_path / "recon"), "NIGHTLY_ALERT": "on"},
+                    now=lambda: now[0])
     fwd.check_recon()
     now[0] = NIGHT + timedelta(minutes=1)
     fwd.check_recon()
