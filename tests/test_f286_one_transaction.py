@@ -14,7 +14,7 @@ from sqlalchemy import create_engine, select, text
 
 from sleeve_fund import supervisor
 from sleeve_fund.gate_ledger import DbLedger
-from sleeve_fund.store import Store, events_t
+from sleeve_fund.store import Store, events_t, qty_words
 
 T0 = datetime(2026, 10, 14, 9, 0, tzinfo=UTC)
 PX = 60_000.0
@@ -128,3 +128,24 @@ def test_a_failure_midway_leaves_none_of_the_three_writes(new_store, monkeypatch
     assert "held" not in store.withdrawn() and store.withdrawal_pending() == ["held"]
     assert (st.equity, st.hwm, st.reference()) == (before.equity, before.hwm, before.reference())
     assert _flows(store, "held") == []
+
+
+def test_the_flow_event_names_the_dust_that_leaves_with_a_withdrawn_holder(new_store):
+    """F-T-3: T-FIX5 reads the dust before the move writes; its words carry it (and none when there is none)."""
+    store = new_store
+    sup, t2 = _c3c(store)
+    store.record_order("held", order_id="d-held", side="BUY", qty=1e-9, intent="entry", reason="t", ts=t2)
+    store.book_fill("held", side="BUY", qty=1e-9, price=PX, fee=0.0, order_id="d-held", trade_id="d-held", ts=t2)
+    _mark(store, "held", t2 + timedelta(seconds=10))
+    sup.mark_portfolio(t2 + timedelta(seconds=20))
+    (flow,) = _flows(store, "held")
+    assert ", with dust of 0.000000001 no order can close, which leaves with it" in flow, flow
+    assert "held" in store.withdrawn()
+
+
+@pytest.mark.parametrize("qty, words", [(Decimal("1.000000000E-9"), "0.000000001"), (Decimal("1E-9"), "0.000000001"),
+                                        (Decimal(100), "100"), (Decimal("100.000000000000000000"), "100"),
+                                        (Decimal("0.01500002"), "0.01500002")])
+def test_a_quantity_reads_in_plain_digits_whatever_scale_the_engine_hands_back(qty, words):
+    """TEC-DUST-FMT: Postgres returns a NUMERIC at its column's scale, SQLite without; never an exponent (1E+2)."""
+    assert qty_words(qty) == words

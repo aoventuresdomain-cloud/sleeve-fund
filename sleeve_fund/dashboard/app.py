@@ -19,6 +19,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlencode, urlparse
+from zoneinfo import ZoneInfo
 
 import markdown
 from fastapi import Depends, FastAPI, Form, HTTPException, Request, status
@@ -27,10 +28,10 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from sleeve_fund import lifecycle, liquidation, markets, open_risk
+from sleeve_fund import compliance_rules, lifecycle, liquidation, markets, open_risk
 from sleeve_fund.dashboard import book as bookm
 from sleeve_fund.dashboard import development as dev
-from sleeve_fund.dashboard import gates, reasons, reports, riskops, trading, withdrawal
+from sleeve_fund.dashboard import attribution, compliance, gates, reasons, reports, riskops, trading, withdrawal
 from sleeve_fund.dashboard.jobs import Jobs
 from sleeve_fund.dashboard.metrics import STALE, sleeve_summary
 from sleeve_fund.data import spec_minutes
@@ -96,6 +97,7 @@ def same_origin(request: Request) -> None:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "cross-site request blocked")
 
 
+UK = ZoneInfo("Europe/London")
 _SLEEVE_POST = re.compile(r"^/sleeves/(?P<name>[^/]+)/(?P<action>[^/]+)$")
 # What isn't built to act on both legs of a two-leg Strategy yet (P2-8): refused on its first leg's row rather than
 # applied to one leg only. Its pause, resume, flatten, start and stop reach both legs (Store.command).
@@ -180,6 +182,9 @@ def create_app(store: Store | None = None) -> FastAPI:
     # The year only when it isn't this one, as a backtest's or an old journal's dates need it.
     templates.env.filters["ts"] = lambda t: (t.strftime("%d %b %H:%M UTC" if t.year == utcnow().year
                                                         else "%d %b %Y %H:%M UTC") if t else "never")
+    # UK time, labelled UK (PM's rule; Portfolio Settings first, the rest of the site still reads UTC).
+    templates.env.filters["uk"] = lambda t: t.astimezone(UK).strftime(
+        "%d %b %H:%M UK" if t.year == utcnow().year else "%d %b %Y %H:%M UK") if t else "never"
     app.mount("/static", StaticFiles(directory=HERE / "static"), name="static")
 
     def st() -> Store:
@@ -582,7 +587,12 @@ def create_app(store: Store | None = None) -> FastAPI:
         positions = trading.book_positions(st(), [x])
         working = [trading.order_view(o) for o in st().orders(name, trading.STATUS_TABS["open"][1], limit=200)]
         fees_funding = x.get("costs", x["fees"] - (perp_x["funding_total"] if perp_x else 0.0))  # funding is + received
-        return page(request, "sleeve.html", x=x, fills=fills[:200], trips=trips, feed=feed, orders=recent,
+        # F-T-2: the fill-handler hold is its own flag, journaled (paper.runtime FILL_HOLD / FILL_HOLD_CLEARED).
+        hold = None if bt_id else st().last_event(name, ("fill_hold", "fill_hold_cleared"))
+        fill_hold = hold if hold is not None and hold["kind"] == "fill_hold" else None
+        attr = None if bt_id else attribution.strategy(st(), name, trips, utcnow(), q.get("attr") if q.get("attr")
+                                                       in attribution.PERIODS else "all")
+        return page(request, "sleeve.html", x=x, fills=fills[:200], trips=trips, feed=feed, orders=recent, attr=attr, fill_hold=fill_hold,
                     order_total=order_total, liquidated=liquidated, ral=ral, clearing=clearing,
                     reset_dropped=reset_dropped,
                     positions=positions, working=working, fees_funding=fees_funding,
@@ -738,7 +748,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         peak, dd = s.starting_balance, []  # from the starting balance too, as the book's (M12-F1)
         for v in eq:
             peak = max(peak, v)
-            dd.append(round(1 - v / peak, 5) if peak else 0.0)
+            dd.append(round(1 - v / peak, 5) if peak > 0 else 0.0)
         fills = [{"t": f["ts"].isoformat(), "side": f["side"], "qty": f["qty"], "price": f["price"]}
                  for f in st().fills(name, limit=2000)]
         return JSONResponse({
@@ -1644,6 +1654,61 @@ def create_app(store: Store | None = None) -> FastAPI:
     def settings_page(request: Request, _: str = Depends(require_pm)):
         return _moved(request, "/setup", "#settings")
 
+    @app.get("/portfolio-settings", response_class=HTMLResponse)
+    def portfolio_settings(request: Request, _: str = Depends(require_pm), edit: str = "", saved: str = ""):
+        """Portfolio Settings (Bridge Drop A): the five compliance tests, their use now, the asset groups and the
+        history of versions; ?edit=1 opens the form."""
+        return page(request, "portfolio_settings.html", v=compliance.page(st()), mode="edit" if edit else "view",
+                    saved=saved, errors=[], form=None)
+
+    def _compliance_form(request_form) -> tuple[dict, dict, list[str], int]:
+        tests, groups, errors = compliance.from_form(request_form)
+        errors += compliance_rules.validate(tests) if not errors else []
+        try:
+            expected = int(request_form.get("expected_version", ""))
+        except ValueError:
+            errors.append("The page is out of date; open Portfolio Settings again.")
+            expected = 0
+        return tests, groups, errors, expected
+
+    @app.post("/portfolio-settings/review", response_class=HTMLResponse)
+    async def portfolio_settings_review(request: Request, _: str = Depends(require_pm),
+                                        _o: None = Depends(same_origin)):
+        """The confirm step: what the new version changes, old -> new, and any warning, before anything is written."""
+        form = await request.form()
+        tests, groups, errors, expected = _compliance_form(form)
+        v = compliance.page(st())
+        if errors:
+            return page(request, "portfolio_settings.html", v=v, mode="edit", saved="", errors=errors, form=form)
+        cur = v["current"]
+        lines = compliance_rules.changes(cur["tests"], tests, cur["groups"], groups)
+        warned = compliance_rules.warnings(tests)
+        no_group = [g["asset"] for g in v["groups"] if not groups.get(g["asset"])]
+        if cur["tests"].get("type_stop_loss", {}).get("enabled") and not tests["type_stop_loss"]["enabled"] and no_group:
+            warned.append(f"Assets with no group ({', '.join(no_group)}) will no longer be refused. They still count "
+                          "under per asset, whole fund and size limits.")
+        return page(request, "portfolio_settings.html", v=v, mode="review", saved="", errors=[], form=form,
+                    changes=lines, warnings=warned, expected=expected,
+                    carry=compliance.to_form(tests, groups))
+
+    @app.post("/portfolio-settings/apply")
+    async def portfolio_settings_apply(request: Request, actor: str = Depends(require_pm),
+                                       _o: None = Depends(same_origin)):
+        """Writes the reviewed set as one new version (Store.add_compliance_version), applied from the next idea."""
+        form = await request.form()
+        tests, groups, errors, expected = _compliance_form(form)
+        try:
+            reason = _reason("compliance", form.get("reason", ""), form.get("reason_pick"), form.get("reason_note", ""))
+            if not reason:
+                errors.append("a reason is required")
+            if errors:
+                raise ValueError("; ".join(errors))
+            version = st().add_compliance_version(compliance.rows(tests), groups, created_by="pm", note=reason,
+                                                  expected_version=expected)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from None
+        return RedirectResponse(f"/portfolio-settings?saved={version}", status_code=303)
+
     @app.get("/setup", response_class=HTMLResponse)
     def setup_page(request: Request, _: str = Depends(require_pm), error: str = ""):
         """Path to live, one card per setting area, and today's Accounts and Settings content as its detail."""
@@ -2210,19 +2275,13 @@ def _risk_view(x: dict, position: dict | None = None) -> dict:
     p = x["profile"]
     stop_px = position["stop_px"] if position else None
     margin = position.get("margin", 0.0) if position else 0.0
-    margin_cap = p.max_position_pct * max(x.get("equity", 0.0), 0.0)
     return {
         "stop_px": stop_px,
         "target_px": position["target_px"] if position else None,
         # The move from here to the stop (round 9, N3): a drop for a long, a rise for a short.
         "to_stop": abs(1 - stop_px / x["price"]) if stop_px and x["price"] else None,
-        # Not capped at 100%: drift past the entry cap shows its true share, in amber (P1-U13).
-        "cap_used": abs(x["exposure"]) / cap if (cap := x.get("cap", p.max_position_pct)) else 0.0,
         "day_used": min(max(-x["day_ret"], 0.0) / p.daily_loss, 1.0) if p.daily_loss else 0.0,
-        # The limit bars (UI v2, item 6): the position's margin against the most the profile lets it put up.
         "margin": margin,
-        "margin_cap": margin_cap,
-        "margin_used": margin / margin_cap if margin_cap > 0 else 0.0,
     }
 
 

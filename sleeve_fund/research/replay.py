@@ -108,6 +108,7 @@ def replay(path: Path | str, with_fills: bool = False, store=None,
     store.create_sleeve(name=s["name"], strategy=s["strategy"], instrument=s["instrument"], bar_spec=s["bar_spec"],
                         starting_balance=s["starting_balance"], risk_profile=s["risk_profile"], params=s["params"])
     runtime = SleeveRuntime(store, s["name"], tick_seconds=s["tick_seconds"])
+    runtime.funded = _funded(store, runtime, h["balances"], instrument, markets.is_perp(s["params"]))
     engine = BacktestEngine(BacktestEngineConfig(trader_id=TraderId.from_str("REPLAY-001"),
                                                  logging=LoggerConfig(stdout_level=LogLevel.ERROR)))
     fee_model = ScheduleFeeModel(fees)
@@ -139,6 +140,20 @@ def replay(path: Path | str, with_fills: bool = False, store=None,
     finally:
         runtime.now = utcnow  # break the runtime <-> strategy cycle on this thread
         engine.dispose()
+
+
+def _funded(store, runtime, balances: list[str], instrument, perp: bool) -> float:
+    """CUT-A: once the fund holds the cash, the recorded account opened with the fund's virtual funding on top of the
+    journal's own cash (paper.node._balances); the engine nets it out as the paper runtime does. 0 before the bridge."""
+    from sleeve_fund import supervisor
+
+    if supervisor.bridge_start(store) is None:
+        return 0.0
+    quote = instrument.quote_currency.code
+    held = sum(float(b.split()[0]) for b in balances if b.split()[-1] == quote)
+    book = runtime.book
+    own = book["cash"] + (book["qty"] * (book["entry_px"] or 0.0) if perp else 0.0)
+    return max(held - own, 0.0)
 
 
 def comparable(orders: list[dict]) -> list[tuple]:

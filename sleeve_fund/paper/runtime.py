@@ -43,6 +43,11 @@ LIQ_STUCK_HEAD = "A liquidation order is still working"
 WIPED_OUT = "Position margin lost (liquidated)"  # how a liquidation's halt begins (LongFlatStrategy._margin_lost)
 RESET_AFTER_LIQUIDATION = LIQUIDATION_RESET  # what a reset after liquidation journals (#164)
 EXITS_ONLY = "exits only"  # how the status of a strategy run for its exits only begins (P1-U35)
+# The fill-handler hold (T-FIX8, F-T-2): a fill the Strategy failed to handle leaves its book in doubt, so it opens
+# nothing more until the PM's Resume. Its own flag, journaled as FILL_HOLD and FILL_HOLD_CLEARED; the status shows it
+# only when nothing stricter is in force.
+FILL_HANDLER_PAUSE = "paused: a fill handler failed, so its book is in doubt; resume once it is checked"
+FILL_HOLD, FILL_HOLD_CLEARED = "fill_hold", "fill_hold_cleared"
 
 
 def liquidation_reason(head: str, covered: float) -> str:
@@ -62,13 +67,13 @@ LIQUIDATED_WORDS = (fold(WIPED_OUT), "wiped out", "position margin lost")  # a l
 # one, and says what alone clears it; no venue names.
 CODES = ("liquidated", "drawdown_halt", "halted", "portfolio_halt", "daily_pause", "portfolio_pause", "retired",
          "winding_down", "stopped", "paused", "exits_only", "stale_data", "degraded_candle", "funding_missing",
-         "portfolio_stale")
+         "portfolio_stale", "book_moving")
 LABELS = {"liquidated": "Liquidated", "drawdown_halt": "Drawdown halt", "halted": "Halted",
           "portfolio_halt": "Portfolio halted", "daily_pause": "Daily loss pause", "portfolio_pause": "Portfolio paused",
           "retired": "Retired", "winding_down": "Winding down", "stopped": "Stopped",
           "paused": "Paused", "exits_only": "Exits only", "stale_data": "Stale data",
           "degraded_candle": "Degraded candle", "funding_missing": "No funding rate",
-          "portfolio_stale": "Portfolio unchecked"}
+          "portfolio_stale": "Portfolio unchecked", "book_moving": "Entry refused"}
 # The portfolio gate's entry blocks (portfolio.gate.entry_block's kinds) as CHOKE codes, with the words their own
 # reason starts with, which the label already says.
 PORTFOLIO_CODES = {"halt": ("portfolio_halt", "Portfolio halted: "),
@@ -184,13 +189,16 @@ def block_codes(why: str | None) -> tuple[str, ...]:
 
 def blocked_state(sleeve, now: datetime | None = None, *, liquidated: str | None = None, archived: bool = False,
                   holds: dict[str, str] | None = None, starting: bool = False,
-                  since: datetime | None = None, portfolio: Why | None = None) -> tuple[bool, Why | None]:
+                  since: datetime | None = None, portfolio: Why | None = None,
+                  moving: str | None = None) -> tuple[bool, Why | None]:
     """CHOKE (HoE 6 Oct 20:52, Advisor): the one "nothing opens" gate, as (blocked, why). Blocked: liquidated until a
     reset after liquidation (`liquidated`, from the journal: liquidation_head), a halt, the daily-loss pause, retired,
     then (not when `starting`: the supervisor's Stop and the dashboard's Start and Resume, which act on these
     themselves) stopped, a pause with no end time, or a hold the engine has raised (`holds`: stale data, a degraded
     candle, no funding rate). `portfolio`: the whole fund's block (portfolio_block), which no Start or Resume of one
-    strategy clears. The why lists every cause that applies (Advisor 00:20). The engine checks every order
+    strategy clears. `moving`: the account a create or move of this Strategy waits to land on at the supervisor's
+    next mark (F-ASSIGN-STALE, Advisor ADV-ASSIGN), which no Start or Resume clears either. The why lists every cause
+    that applies (Advisor 00:20). The engine checks every order
     that would make the position bigger, at submit and at fill; the supervisor and the dashboard's Start and Resume
     read the same answer. Stops, reduce-only orders, the PM's close and a liquidation are never gated."""
     causes = []
@@ -208,6 +216,8 @@ def blocked_state(sleeve, now: datetime | None = None, *, liquidated: str | None
         causes.append(WINDING_DOWN)
     if portfolio is not None:
         causes.append(portfolio)
+    if moving is not None:
+        causes.append(_cause("book_moving", f"this Strategy is moving to {moving} at the next mark."))
     if not starting:  # Start and Resume act on a stopped or paused strategy: what they can't clear is above
         if "stopped" in (sleeve.status, getattr(sleeve, "desired_state", "running")):
             causes.append(STOPPED)
@@ -356,7 +366,17 @@ def entry_blocked(store, name: str, now: datetime | None = None, *, starting: bo
     sleeve = store.sleeve(name)
     return blocked_state(sleeve, now, liquidated=liquidation_head(store, name), archived=name in store.archived(),
                          holds=held or None, starting=starting, since=_halted_since(store, name, sleeve),
-                         portfolio=portfolio_block(store, now))
+                         portfolio=portfolio_block(store, now), moving=moving_to(store, name))
+
+
+def moving_to(store, name: str) -> str | None:
+    """The account `name`'s waiting create or move lands on at the supervisor's next mark (Store.book_moves_pending),
+    or None; read failing, it fails closed as a move to an unknown account."""
+    try:
+        move = store.book_moves_pending().get(name)
+    except Exception:  # noqa: BLE001 - fail closed: an unread move refuses entries, never errors out of CHOKE
+        return "an account the journal couldn't read"
+    return None if move is None else move["account"]
 
 
 def portfolio_block(store, now: datetime | None = None) -> Why | None:
@@ -471,6 +491,9 @@ class SleeveRuntime:
         # The paper engine keeps fills in memory, so a restart rebuilds the book from the journal.
         self.book = self.store.journal_book(sleeve_name, sleeve.starting_balance)
         self.last_reconciled = None
+        # CUT-A (Advisor Q3-MARGIN): what the simulated account was funded with beyond the journal's own cash, a view
+        # of the fund's equity so isolated margin can be posted; never journaled, never in the book, netted out here.
+        self.funded = 0.0
         self._day = None
         self._day_open = None
         self._last_equity = None
@@ -515,8 +538,14 @@ class SleeveRuntime:
         # Why a fill that raced a halt, a liquidation or the daily pause is owed a flatten (the strategy sets it on
         # such a fill; Advisor 23:05, SG7): the block's own flatten covers what filled after it, through the exit path.
         self.raced: str | None = None
+        # F-T-2 (Advisor BGL-PLAN 5): the fill-handler hold, its own flag with no end time (only the PM's Resume
+        # clears it, never the 00:00 roll), kept across a restart by the journal. It never overwrites a stricter state:
+        # halt > stopped > exits-only > daily-loss pause > fill-handler hold > active.
+        last = self.store.last_event(sleeve_name, (FILL_HOLD, FILL_HOLD_CLEARED))
+        self.fill_hold = last is not None and last["kind"] == FILL_HOLD
         self.liq_working_since: datetime | None = None  # when the liquidation order now working was first seen
         self._refused = 0
+        self._fund_held: bool | None = None  # fund_held, read once
 
     def last_fill_this_run(self) -> dict | None:
         """The newest fill a strategy may pick its cycle up from after a restart, else None: none once a reset after
@@ -530,6 +559,20 @@ class SleeveRuntime:
         # A two-leg Strategy's other leg re-based with it (PAIR_REBASED) starts a fresh run too (Advisor F283-O3 (d) 3).
         reset = self.store.last_event(self.name, (RESET_AFTER_LIQUIDATION, PAIR_REBASED))
         return None if reset is not None and reset["ts"] >= fills[0]["ts"] else fills[0]
+
+    @property
+    def fund_held(self) -> bool:
+        """Paper inside the fund's book (the portfolio gate on; not a test Strategy outside the book, F229-6): the fund
+        holds the cash, so the Strategy's own equity (its P&L, from a starting balance of 0) never halts or pauses it;
+        the fund's drawdown halt and daily pause (T5) do (Advisor SIZE-FUND Q4, CUT-A (d)). Its liquidation still
+        halts it. A backtest's single Strategy is the whole fund and keeps its own."""
+        if self.backtest or not getattr(self.store, "portfolio_gate", False):
+            return False
+        if self._fund_held is None:
+            from sleeve_fund.supervisor import outside_fund_book
+
+            self._fund_held = not outside_fund_book(self.store, self.store.sleeve(self.name))
+        return self._fund_held
 
     def _last_liquidation(self) -> str | None:
         """The head of its liquidation halt while it is liquidated, else None (liquidation_head)."""
@@ -604,7 +647,7 @@ class SleeveRuntime:
         elif self.status == "paused" and self.paused_until > self.now():
             self.store.event(self.name, "info", "restart", "restarted while paused", ts=self.now())
         else:
-            self._set("running", "")
+            self._running()
         if not self.backtest:
             # Paper's venue is simulated in the process, so orders still working when it stopped went
             # with it; without this they would read "Working" for ever (review round 8, m8-9).
@@ -814,7 +857,8 @@ class SleeveRuntime:
                                      liquidated=(self.liquidated or WIPED_OUT) if self.wiped_out else None,
                                      archived=sleeve is not None and self.name in self.store.archived(),
                                      holds=self.holds, since=_halted_since(self.store, self.name, state),
-                                     portfolio=None if self.backtest else portfolio_block(self.store, self.now()))
+                                     portfolio=None if self.backtest else portfolio_block(self.store, self.now()),
+                                     moving=None if self.backtest else moving_to(self.store, self.name))
         self._episode(why if blocked else None)
         return blocked, why
 
@@ -974,7 +1018,7 @@ class SleeveRuntime:
                                                            since=since)
                  if not fold(e["message"]).startswith(LIQUIDATED_WORDS)]
         if fold(why).startswith(LIQUIDATED_WORDS) and not later:
-            self._set("running", "")
+            self._running()
             return None
         return f"the halt stays for its own reason until a Resume: {why}"
 
@@ -1022,9 +1066,11 @@ class SleeveRuntime:
         if not lifecycle.can_open(self.lifecycle):
             return False  # P2-6: winding down or retired; exits never ask
         if self.status == "paused" and self.paused_until and self.paused_until <= self.now():
-            self._set("running", "daily-loss pause expired")
-            self.store.event(self.name, "info", "resume", "daily-loss pause expired; trading again", ts=self.now())
-        return self.status == "running"
+            self._running("daily-loss pause expired")
+            self.store.event(self.name, "info", "resume", "daily-loss pause expired" + (
+                "; the fill-handler hold stays until the PM resumes" if self.fill_hold else "; trading again"),
+                ts=self.now())
+        return self.status == "running" and not self.fill_hold
 
     def position_budget(self, equity: float) -> float:
         return equity * self.cap
@@ -1119,6 +1165,8 @@ class SleeveRuntime:
                              ts=self.now())
             if held:
                 flatten, self.flatten_why = True, ("risk_halt", f"Risk halt: {ruined}")
+        elif self.fund_held:
+            pass  # CUT-A (d): the fund's own brakes (T5) halt and pause; the Strategy's own equity never does
         elif self.status == "running":
             judged = min(equity, guard_equity) if guard_equity is not None else equity
             breach = risk.check(self.profile, judged, self.peak, self._day_open, self.halts)
@@ -1145,6 +1193,13 @@ class SleeveRuntime:
                 self.store.event(self.name, "error", "risk_halt", breach.reason + "; flattened, PM must resume",
                                  ts=self.now())
                 flatten, self.flatten_why = True, ("risk_halt", f"Risk halt: {breach.reason}")
+            elif breach and breach.action == "pause_day" and self.paused_until is None and self._held_only():
+                # F-T-2: the hold is weaker than a daily-loss pause, which takes the status with its own 00:00 roll.
+                until = datetime.combine(now.date() + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc)
+                self._set("paused", breach.reason, until)
+                self.store.event(self.name, "warning", "risk_pause", breach.reason + "; flattened until the next 00:00 "
+                                 "UTC, and the fill-handler hold stays", ts=self.now())
+                flatten, self.flatten_why = True, ("risk_pause", f"Daily-loss pause: {breach.reason}")
             elif breach and breach.action == "pause_day" and self.paused_until is None:
                 self.store.event(self.name, "warning", "risk_pause",
                                  f"{breach.reason}; flattened while paused, and it stays paused", ts=self.now())
@@ -1171,7 +1226,19 @@ class SleeveRuntime:
                 if not self.wiped_out and (self.status == "halted" or (self.status == "paused" and self.paused_until)):
                     self.peak = self._day_open = equity
                     self._pair_rebase(equity, hwm=True)
+                    self._running()
+                self.store.mark_applied(cmd["id"])
+                continue
+            elif cmd["command"] == "resume" and self.fill_hold:
+                # F-T-2: a Resume while held clears the hold and nothing else; a stricter state under it keeps its own
+                # way out. Journaled as the hold's, not as pm_resume, so the halt's owed flatten and baselines stand.
+                self.fill_hold = False
+                if self.status == "paused" and self.paused_until is None and self._status_reason() == FILL_HANDLER_PAUSE:
                     self._set("running", "")
+                self.store.event(self.name, "info", FILL_HOLD_CLEARED,
+                                 f"fill-handler hold cleared by the PM: {cmd['reason']}"
+                                 + ("" if self.status == "running" else f"; the {self.status} state stays"),
+                                 ts=self.now())
                 self.store.mark_applied(cmd["id"])
                 continue
             elif cmd["command"] == "resume" and self.status == "running":
@@ -1215,7 +1282,7 @@ class SleeveRuntime:
                 if self.paired and self.pair_parent is not None:
                     self.store.set_pair_day(self.pair_parent, risk.trading_day(self.now()), equity, self.now(),
                                             rebase=True)
-                self._set("running", "")
+                self._running()
             self.store.event(self.name, "info", f"pm_{cmd['command']}", cmd["reason"], ts=self.now())
             self.store.mark_applied(cmd["id"])
         # A flatten is owed until the position is closed: one cut short by a restart (sanity S-3), or whose
@@ -1248,6 +1315,8 @@ class SleeveRuntime:
                 flatten, self.flatten_why = True, why
         if not flatten and self.raced is not None:
             held = abs(qty) >= max(self.close_floor, 1e-12)
+            # The halt's and the live daily-loss pause's own rule (SG7); the fill-handler hold only blocks entries and
+            # never sets paused_until, so it never sells a raced fill (F-T-2).
             flattening = self.status == "halted" or (self.status == "paused" and self.paused_until is not None)
             if held and flattening and not busy:
                 kind = "risk_halt" if self.status == "halted" else "risk_pause"
@@ -1275,7 +1344,7 @@ class SleeveRuntime:
         book = self.store.journal_book(self.name, self.starting_balance)
         # Each fill can round the cash by up to a cent (notional and fee), so allow for that.
         cash_tol = 0.01 * (1 + 2 * book["fills"])
-        d_cash = cash - book["cash"]
+        d_cash = cash - book["cash"]  # cash: the engine's net of its virtual funding (LongFlatStrategy._equity)
         # Compared in Decimal, each side as written, so float noise can't tip a one-lot gap into a halt.
         d_qty = float(Decimal(repr(float(qty))) - Decimal(repr(float(book["qty"]))))
         # Neither side holds more figures than a float does: at 1.6e8 units one float step is 3e-8, wider than two
@@ -1376,6 +1445,31 @@ class SleeveRuntime:
         throttles these). Display only, and paper only: a backtest's runtime never writes them."""
         if not self.backtest:
             self.store.set_signal_state(self.name, state, ts=self.now())
+
+    def hold_entries(self) -> None:
+        """The fill-handler hold (F-T-2): set its flag, journaled once; the status shows it only over running, so a
+        halt, a stop, an exits-only start, the PM's pause and a daily-loss pause all stay as they are."""
+        if self.backtest:
+            return
+        if not self.fill_hold:
+            self.fill_hold = True
+            self.store.event(self.name, "error", FILL_HOLD, "new entries held: a fill handler failed, so the book is "
+                             "in doubt; exits still go, and only the PM's Resume clears it", ts=self.now())
+        if self.status == "running":
+            self._set("paused", FILL_HANDLER_PAUSE)
+
+    def _held_only(self) -> bool:
+        """The status is the fill-handler hold's own, nothing stricter."""
+        return (self.fill_hold and self.status == "paused" and self.paused_until is None
+                and self._status_reason() == FILL_HANDLER_PAUSE)
+
+    def _running(self, reason: str = "") -> None:
+        """Back to running, or to the fill-handler hold while it is set: every way out of a stricter state lands on
+        the hold, never past it (F-T-2)."""
+        if self.fill_hold:
+            self._set("paused", FILL_HANDLER_PAUSE)
+        else:
+            self._set("running", reason)
 
     def _set(self, status: str, reason: str, paused_until: datetime | None = None) -> None:
         self.status, self.paused_until = status, paused_until

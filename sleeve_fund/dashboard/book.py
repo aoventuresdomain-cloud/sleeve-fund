@@ -171,7 +171,7 @@ def book_curve(summaries: list[dict], frames: dict[str, pd.DataFrame]) -> pd.Dat
     # book whose first close was already a loss read 0% drawdown (round 12, M12-F1).
     start = sum(x["sleeve"].starting_balance for x in summaries)
     peak = out["equity"].cummax().clip(lower=start)
-    out["drawdown"] = 1 - out["equity"] / peak
+    out["drawdown"] = (1 - out["equity"] / peak).where(peak > 0, 0.0)  # no capital, no drawdown: 0, never inf (CUT-A)
     return out
 
 
@@ -203,7 +203,7 @@ def recent_curve(store: Store, sleeves: list, days: int, prior_peak: float | Non
     peak = out["equity"].cummax()
     if prior_peak:
         peak = peak.clip(lower=prior_peak)
-    out["drawdown"] = 1 - out["equity"] / peak
+    out["drawdown"] = (1 - out["equity"] / peak).where(peak > 0, 0.0)
     return out
 
 

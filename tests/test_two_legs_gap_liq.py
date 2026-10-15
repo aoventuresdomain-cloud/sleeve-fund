@@ -76,11 +76,13 @@ def test_i_on_paper_the_gap_books_the_perp_legs_liquidation_unwinds_the_spot_leg
                                                                                                liquidation_first):
     """The real two-leg node on a local hub: a long pair (spot, and a perp at 2x) entered at 60,000, then the price
     prints 29,000. The perp leg's liquidation is booked as one (loss X, the insurance line, the incident, a reset after
-    liquidation needed); the spot leg is unwound with it; the summed drawdown halt is raised too.
+    liquidation needed); the spot leg is unwound with it. Inside the fund no per-Strategy drawdown halt fires (CUT-A,
+    TEC-QD-CUTA): the fund's brakes act, and the liquidation halts the Strategy.
 
-    T-FIX7 (QT2 F-P1-REBOOK, the _qa_p1_loud set-up): with Pair.liquidation_first off, the summed halt's flatten closes
-    the perp leg first, past its liquidation price, so its close is relabelled and re-booked in the journal: the same
-    liquidation, incident, insurance line and reset needed, and no handler_failed on either leg."""
+    T-FIX7 (QT2 F-P1-REBOOK, the _qa_p1_loud set-up): with Pair.liquidation_first off, the same liquidation, incident,
+    insurance line and reset needed, and no handler_failed on either leg. (Its relabel came from the summed halt's
+    flatten, which no longer fires inside the fund; the relabel and re-book stay pinned in the unit cells below:
+    test_any_close_filled_past_the_liquidation_price_* and test_t_fix7_*.)"""
     import threading
     import time
     from datetime import datetime, timezone
@@ -172,14 +174,12 @@ def test_i_on_paper_the_gap_books_the_perp_legs_liquidation_unwinds_the_spot_leg
         failed = [e["message"] for n in ("carry", "carry~2") for e in store.events(n, limit=500)
                   if e["kind"] == "handler_failed"]
         assert failed == [], failed
-        if not liquidation_first:  # relabelled from the close that reached it, re-booked by the journal
-            assert closes[0]["signal"].get("relabelled_from") not in (None, "stop_loss"), closes[0]["signal"]
-            assert any(e["kind"] == "order_rebooked" for e in store.events("carry~2", limit=500))
         spot = [o["intent"] for o in store.orders("carry") if o["intent"] != "entry"]
         assert spot, "the spot leg was not unwound"
         halts = [e["message"] for n in ("carry", "carry~2") for e in store.events(n, limit=500)
                  if e["kind"] == "risk_halt"]
-        assert any("drawdown" in m for m in halts), halts  # the summed halt raised beside the liquidation
+        # TEC-QD-CUTA (SIZE-FUND Q4): inside the fund no per-Strategy drawdown halt fires; the liquidation's is the one
+        assert not any("drawdown" in m for m in halts), halts
     finally:
         node.dispose()
 

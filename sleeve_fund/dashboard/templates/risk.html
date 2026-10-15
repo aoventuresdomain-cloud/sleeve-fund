@@ -106,15 +106,14 @@
 
 <section class="panel flush" style="margin:14px 0" aria-labelledby="lim-h">
   <div class="panel-head"><h2 id="lim-h">Limits by strategy</h2></div>
-  {# Nine columns fit the 1,142 px panel at 1440 (QA U3): the profile is on the name's hover, the stop in short. #}
-  <table class="responsive tight" data-hide-md="4 6">
-    <thead><tr><th>Strategy</th><th>Drawdown</th><th>Today's loss</th><th title="Position value at the current price ÷ the strategy's equity, against the cap that applies when a position is opened">Exposure</th><th class="num" title="Further loss before the drawdown limit halts the strategy">Room to halt</th><th>Stop</th><th class="num" title="Isolated margin the open position has put up">Margin</th><th class="num">Liq. price</th><th class="num" title="Money lost if the stop is hit">Risk to stop</th></tr></thead>
+  {# Eight columns fit the 1,142 px panel at 1440 (QA U3): the profile is on the name's hover, the stop in short. #}
+  <table class="responsive tight" data-hide-md="5">
+    <thead><tr><th>Strategy</th><th>Drawdown</th><th>Today's loss</th><th class="num" title="Further loss before the drawdown limit halts the strategy">Room to halt</th><th>Stop</th><th class="num" title="Isolated margin the open position has put up">Margin</th><th class="num">Liq. price</th><th class="num" title="Money lost if the stop is hit">Risk to stop</th></tr></thead>
     <tbody>{% for r in risk.rows %}{% set x = r.x %}{% set s = x.sleeve %}
     <tr>
       <td class="cell-name" title="{{ x.profile.name|capitalize }} risk profile"><a href="/sleeves/{{ s.name }}">{{ s.name }}</a> {{ chip(s.status) }}{% if x.test_account %} {{ test_chip() }}{% endif %}</td>
       <td data-label="Drawdown">{{ usage(r.dd_used) }} <span class="muted">{{ x.drawdown|pct1 }} of {{ x.profile.max_drawdown|pct0 }}</span></td>
       <td data-m="hide">{{ usage(r.day_used) }} <span class="muted">{{ [0 - x.day_ret, 0]|max|pct1 }} of {{ x.profile.daily_loss|pct0 }}</span></td>
-      <td data-m="hide">{{ usage(r.cap_used, drift=True) }} <span class="muted">{{ '%.2f'|format(x.exposure|abs) }}× of {{ '%.2f'|format(x.cap) }}×</span></td>
       <td class="num" data-m="right" data-label="Room">{{ r.headroom|money }}</td>
       <td data-m="hide">{% if r.has_stop %}<span title="{{ live_stop_title(r) }}">{% if r.stop_dist is not none %}{{ r.stop_dist|pct1 }}{% else %}{{ stop_short(s.params) }}{% endif %}</span>{% elif trail_words(s)|trim %}<span title="{{ trail_words(s) }}; trail level not shown">Trailing</span>{% else %}<span class="warn">None</span>{% endif %}</td>
       {% set pos = r.position %}

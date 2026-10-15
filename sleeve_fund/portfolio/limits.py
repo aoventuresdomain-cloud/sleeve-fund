@@ -21,8 +21,12 @@ from sleeve_fund.risk import PortfolioProfile
 
 # The order limits are checked in, so a tie names the same limit every time (QA's limit_hit names).
 LIMITS = ("gross", "net_instrument", "margin", "open_risk")
+# Bridge Drop A (Advisor COMPLIANCE-5): loss if every stop is hit per asset (T1) and per asset group (T2), checked
+# after the four above when the profile sets them, so a tie still names the older limit first.
+STOP_TESTS = ("asset_open_risk", "group_open_risk")
 WORDS = {"gross": "gross exposure", "net_instrument": "net exposure in {u}", "margin": "margin used",
-         "open_risk": "open risk"}
+         "open_risk": "open risk", "asset_open_risk": "loss at the stops in {u}",
+         "group_open_risk": "loss at the stops in the {g} group"}
 ZERO = Decimal(0)
 
 
@@ -133,6 +137,30 @@ def _net_room(net: Decimal, cap: Decimal, signed_per_unit: Decimal) -> Decimal |
     return max(bound - abs(net), ZERO) / abs(signed_per_unit)
 
 
+class Unmapped(Exception):
+    """An entry on an asset the PM's group map leaves out, while T2 is on (Advisor BRIDGE-A-FE-2)."""
+
+
+def _stop_tests(book: Book, underlying: str, profile: PortfolioProfile) -> tuple[dict, dict, str]:
+    """T1 and T2 for an order in `underlying`, as ({test: used}, {test: cap}, its group): the loss at the stops already
+    in the asset, and in its group. With no group map at all T2 has nothing to judge. Raises Unmapped for an asset the
+    map leaves out (it never borrows another group's room), and whatever a map that can't be read raises: the caller
+    refuses both (BRIDGE-3, fail closed)."""
+    e = book.equity
+    used, caps, group = {}, {}, ""
+    if profile.asset_open_risk is not None:
+        used["asset_open_risk"] = sum((h.risk for h in book.holdings if h.underlying == underlying), ZERO)
+        caps["asset_open_risk"] = scale(e, profile.asset_open_risk)
+    groups = profile.groups
+    if profile.group_open_risk is not None and groups is not None and len(groups):
+        group = groups.get(underlying)
+        if group is None:
+            raise Unmapped(underlying)
+        used["group_open_risk"] = sum((h.risk for h in book.holdings if groups.get(h.underlying) == group), ZERO)
+        caps["group_open_risk"] = scale(e, profile.group_open_risk)
+    return used, caps, group
+
+
 def decide(book: Book, intent: Intent, profile: PortfolioProfile) -> Decision:
     """The largest quantity of `intent`, at most what it asks and rounded down to the step, that keeps gross, net in
     its underlying, margin and open risk within the profile; rejected if that is below the venue minimum. A figure
@@ -143,22 +171,33 @@ def decide(book: Book, intent: Intent, profile: PortfolioProfile) -> Decision:
         return rejected(intent.qty, None, "Entry rejected: the book or the order had a figure that can't be used "
                                           f"(book {book.equity}, order {intent!r}), so nothing is sent")
     e, u = book.equity, intent.underlying
+    try:
+        stop_used, stop_caps, group = _stop_tests(book, u, profile)
+    except Unmapped:
+        return rejected(intent.qty, "group_open_risk", f"Entry rejected: {u} is in no asset group, so the per-group "
+                                                       "loss-at-stops test can't judge it; the PM maps it to a group "
+                                                       "in Portfolio Settings")
+    except Exception as exc:  # noqa: BLE001 - a test that can't be evaluated refuses (BRIDGE-3, fail closed)
+        return rejected(intent.qty, "group_open_risk", f"Entry rejected: the loss-at-stops tests couldn't be checked "
+                                                       f"({type(exc).__name__}), so nothing is sent")
+    tests = LIMITS + tuple(k for k in STOP_TESTS if k in stop_used)
     used = {"gross": book.gross(), "net_instrument": book.net(u), "margin": book.margin(),
-            "open_risk": book.open_risk()}
+            "open_risk": book.open_risk(), **stop_used}
     caps = {"gross": scale(e, profile.gross), "net_instrument": scale(e, profile.net_instrument),
-            "margin": scale(e, profile.margin), "open_risk": scale(e, profile.open_risk)}
+            "margin": scale(e, profile.margin), "open_risk": scale(e, profile.open_risk), **stop_caps}
     per_unit = {"gross": intent.price, "net_instrument": intent.side * intent.price,
-                "margin": intent.margin_per_unit, "open_risk": intent.risk_per_unit}
+                "margin": intent.margin_per_unit, "open_risk": intent.risk_per_unit,
+                **{k: intent.risk_per_unit for k in stop_used}}
     room = {k: (_net_room(used[k], caps[k], per_unit[k]) if k == "net_instrument"
-                else _room(used[k], caps[k], per_unit[k])) for k in LIMITS}
-    bound = [k for k in LIMITS if room[k] is not None and room[k] < intent.qty]
+                else _room(used[k], caps[k], per_unit[k])) for k in tests}
+    bound = [k for k in tests if room[k] is not None and room[k] < intent.qty]
     limit = min(bound, key=lambda k: room[k]) if bound else None  # min() keeps the first of LIMITS on a tie
     qty = floor_to(intent.qty if limit is None else room[limit], intent.step)  # both paths on the step (QA F211)
 
     def figures(at: Decimal) -> dict:
-        after = {k: used[k] + at * per_unit[k] for k in LIMITS}
+        after = {k: used[k] + at * per_unit[k] for k in tests}
         return {k: {"before": float(used[k] / e), "after": float(after[k] / e), "cap": float(caps[k] / e)}
-                for k in LIMITS}
+                for k in tests}
 
     if limit is None and (qty <= 0 or qty < intent.min_qty):  # nothing binds, but the request is under the minimum
         return rejected(intent.qty, "below_min", f"Entry rejected: {qty.normalize():f} is below the venue minimum "
@@ -167,7 +206,7 @@ def decide(book: Book, intent: Intent, profile: PortfolioProfile) -> Decision:
         return Decision("approved", qty, intent.qty, None, "Entry within every portfolio limit", figures(qty))
     whole, now, cap = abs(used[limit] + intent.qty * per_unit[limit]) / e, abs(used[limit]) / e, caps[limit] / e
     show = (lambda x: f"{x:.2f}x") if limit in ("gross", "net_instrument") else (lambda x: f"{x:.1%}")
-    what = (f"{WORDS[limit].format(u=u)} would be {show(whole)} of the book with the whole order, above the "
+    what = (f"{WORDS[limit].format(u=u, g=group)} would be {show(whole)} of the book with the whole order, above the "
             f"{show(cap)} limit (now {show(now)})")
     if qty <= 0 or qty < intent.min_qty:
         return rejected(intent.qty, limit, f"Entry rejected: {what}; the room left, {qty.normalize():f}, is below "
@@ -196,6 +235,22 @@ def decide_pair(book: Book, first: Intent, second: Intent, profile: PortfolioPro
             **{f"net:{u}": book.net(u) for u in unders}}
     caps = {"gross": scale(e, profile.gross), "margin": scale(e, profile.margin),
             "open_risk": scale(e, profile.open_risk), **{f"net:{u}": scale(e, profile.net_instrument) for u in unders}}
+    group_of: dict[str, str] = {}  # T1 per asset and T2 per group, both legs' risk counted (no hedge credit)
+    try:
+        for u in unders:
+            stop_used, stop_caps, g = _stop_tests(book, u, profile)
+            if "asset_open_risk" in stop_used:
+                used[f"asset:{u}"], caps[f"asset:{u}"] = stop_used["asset_open_risk"], stop_caps["asset_open_risk"]
+            if "group_open_risk" in stop_used:
+                group_of[u] = g
+                used[f"group:{g}"], caps[f"group:{g}"] = stop_used["group_open_risk"], stop_caps["group_open_risk"]
+    except Unmapped as exc:
+        why = (f"Entry rejected: {exc.args[0]} is in no asset group, so the per-group loss-at-stops test can't judge "
+               "it; neither leg is sent")
+        return rejected(first.qty, "group_open_risk", why), rejected(second.qty, "group_open_risk", why)
+    except Exception as exc:  # noqa: BLE001 - fail closed (BRIDGE-3)
+        why = f"Entry rejected: the loss-at-stops tests couldn't be checked ({type(exc).__name__}); neither leg is sent"
+        return rejected(first.qty, "group_open_risk", why), rejected(second.qty, "group_open_risk", why)
 
     def added(q1: Decimal, q2: Decimal) -> dict:
         out = {"gross": q1 * first.price + q2 * second.price,
@@ -204,6 +259,11 @@ def decide_pair(book: Book, first: Intent, second: Intent, profile: PortfolioPro
         for u in unders:
             out[f"net:{u}"] = sum((q * i.side * i.price for q, i in ((q1, first), (q2, second)) if i.underlying == u),
                                   ZERO)
+            risk = sum((q * i.risk_per_unit for q, i in ((q1, first), (q2, second)) if i.underlying == u), ZERO)
+            if f"asset:{u}" in used:
+                out[f"asset:{u}"] = risk
+            if u in group_of:
+                out[f"group:{group_of[u]}"] = out.get(f"group:{group_of[u]}", ZERO) + risk
         return out
 
     whole = added(first.qty, second.qty)  # per unit of share: the share f adds f x whole to each figure
@@ -216,7 +276,11 @@ def decide_pair(book: Book, first: Intent, second: Intent, profile: PortfolioPro
     q2 = floor_to(q1 * ratio, second.step)
 
     def name(k: str) -> str:
-        return "net_instrument" if k.startswith("net:") else k
+        return {"net": "net_instrument", "asset": "asset_open_risk", "group": "group_open_risk"}.get(k.split(":")[0], k)
+
+    def word(k: str) -> str:
+        kind, _, what = k.partition(":")
+        return WORDS[name(k)].format(u=what, g=what) if what else WORDS[k]
 
     def figures(a1: Decimal, a2: Decimal) -> dict:
         at = added(a1, a2)
@@ -238,11 +302,10 @@ def decide_pair(book: Book, first: Intent, second: Intent, profile: PortfolioPro
         what = (f"the {' and '.join(small)} leg would be below its venue minimum" if small
                 else f"{name(over[0])} would pass its limit after rounding")
         if limit is not None:
-            what = f"{WORDS[name(limit)].format(u=limit[4:]) if limit.startswith('net:') else WORDS[limit]} binds, " + what
+            what = f"{word(limit)} binds, " + what
         return both("rejected", ZERO, ZERO, hit, f"Entry rejected: {what}, so neither leg is sent",
                     figures(ZERO, ZERO))
-    word = WORDS["net_instrument"].format(u=limit[4:]) if limit.startswith("net:") else WORDS[limit]
-    return both("trimmed", q1, q2, hit, f"Both legs trimmed to {share:.1%} of the request: {word} would pass its "
+    return both("trimmed", q1, q2, hit, f"Both legs trimmed to {share:.1%} of the request: {word(limit)} would pass its "
                                         f"limit with the whole pair", figures(q1, q2))
 
 
@@ -273,3 +336,10 @@ def book_breach(profile: PortfolioProfile, equity: Decimal, reference: Decimal, 
         return BookBreach("pause", f"the book has lost {1 - equity / day_start:.1%} since 00:00 UTC, at the "
                                    f"{profile.daily_loss:.0%} daily limit")
     return None
+
+
+def validate_tests(profile: PortfolioProfile) -> None:
+    """A PM's edited test set, checked before it is saved (portfolio.compliance.validate_tests)."""
+    from sleeve_fund.portfolio.compliance import validate_tests as check
+
+    check(profile)

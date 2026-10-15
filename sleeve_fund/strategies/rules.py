@@ -435,6 +435,10 @@ class Rules(LongFlatStrategy):
     def _has_exits(self) -> bool:
         return bool(self.rules.levels) or super()._has_exits
 
+    @property
+    def _stop_designed(self) -> bool:
+        return bool({"stop", "trail"} & set(self.rules.levels)) or super()._stop_designed
+
     def _stop_cfg(self) -> dict:
         if not self.rules.levels:
             return super()._stop_cfg()

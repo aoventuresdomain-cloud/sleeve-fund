@@ -57,7 +57,7 @@ def _sleeve(**over):
     "over",
     [{"strategy": "nope"}, {"bar_spec": "1-TICK-LAST-INTERNAL"}, {"instrument": "BTCUSD"}, {"instrument": "SUI/"},
      {"instrument": "SUI/USD; rm"},
-     {"starting_balance": 0}, {"max_notional": -1}, {"warmup_bars": -1}],
+     {"starting_balance": -1}, {"max_notional": -1}, {"warmup_bars": -1}],
 )
 def test_bad_sleeve_config_rejected(over):
     with pytest.raises(ValueError):
