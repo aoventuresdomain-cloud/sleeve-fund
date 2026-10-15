@@ -129,9 +129,10 @@ def _run(tmp_path: Path, **kw) -> tuple[subprocess.CompletedProcess, list[str]]:
 def test_a_copy_that_doesnt_restore_fails_and_drops_the_scratch_database(tmp_path):
     done, calls = _run(tmp_path, restore_ok=False)
     assert done.returncode == 1 and "pre-deploy dump: FAIL, it didn't restore (exit 1)" in done.stdout
+    assert "secret-host" in (tmp_path / "b" / "predeploy-last.err").read_text()
     assert "secret-host" not in done.stdout + done.stderr
     assert calls[-1].startswith("dropdb") and "predeploy_check" in calls[-1]
-    assert not list((tmp_path / "b").iterdir())  # CR F-PDD-1: an unproved copy never stays under a good name
+    assert not list((tmp_path / "b").glob("*.pgdump*"))  # CR F-PDD-1: an unproved copy never stays under a good name
 
 
 @pytest.mark.parametrize("copy, words", [("0028 5 3 9 1 2 3", "fills doesn't match the journal"),
@@ -142,7 +143,7 @@ def test_a_copy_that_doesnt_restore_fails_and_drops_the_scratch_database(tmp_pat
 def test_a_copy_unlike_the_journal_fails_and_leaves_no_copy(tmp_path, copy, words):
     done, _ = _run(tmp_path, copy=copy)
     assert done.returncode == 1 and done.stdout.startswith("pre-deploy dump: FAIL") and words in done.stdout, done.stdout
-    assert not list((tmp_path / "b").iterdir())
+    assert not list((tmp_path / "b").glob("*.pgdump*"))
 
 
 @pytest.mark.parametrize("check, journal", [("postgres", "sleeve_fund"), ("sleeve_fund", "sleeve_fund"),
@@ -192,9 +193,13 @@ echo "/dev/x 99999999999 1 {free} 1% /"
 def test_a_tool_that_fails_says_so_and_leaves_nothing(tmp_path, kw, words):
     """QT3 N2: a failed pg_dump (or psql) once exited through set -e with no line in the deploy log."""
     done, _ = _run(tmp_path, **kw)
-    assert done.returncode == 1 and done.stdout.strip() == f"pre-deploy dump: FAIL, {words}"
+    assert done.returncode == 1 and done.stdout.strip() == f"pre-deploy dump: FAIL, {words}, details beside the dumps"
     assert "secret-host" not in done.stdout + done.stderr
-    assert not list((tmp_path / "b").iterdir())
+    assert [p.name for p in (tmp_path / "b").iterdir()] == ["predeploy-last.err"]
+    # CR F-PDD-3: the tool's own words are kept for the operator, beside the dumps and private, never in the log
+    err = tmp_path / "b" / "predeploy-last.err"
+    assert err.stat().st_mode & 0o077 == 0
+    assert ("secret-host" in err.read_text()) == (kw != {"copy_ok": False})  # that stand-in fails silently
 
 
 @needs_bash
@@ -203,7 +208,7 @@ def test_a_whole_copy_passes_and_is_never_named_like_a_nightly_dump(tmp_path):
     assert done.returncode == 0, done.stdout + done.stderr
     assert done.stdout.strip() == ("pre-deploy dump: PASS, restored at migration 0028, orders 5, fills 4, events 9, "
                                    "fund_flows 1, book_moves 2, decisions 3")
-    (dump,) = (tmp_path / "b").glob("predeploy-*")
+    (dump,) = (tmp_path / "b").glob("predeploy-*.pgdump")
     assert re.fullmatch(r"predeploy-\d{8}-\d{6}\.pgdump", dump.name)
     assert dump.stat().st_mode & 0o077 == 0  # QT3 N1: docker exec runs with umask 0000; the copy is the owner's only
     assert any(c.startswith("pg_restore") and "--exit-on-error" in c for c in calls)
