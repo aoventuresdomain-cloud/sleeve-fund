@@ -60,6 +60,7 @@ class VenueStub:
     def __init__(self) -> None:
         self.seen: list[tuple[str, str, str]] = []
         self.ws_seen: list[str] = []
+        self.headers: list[dict] = []  # each REST request's headers, for the signing cells
         self.orders: dict[str, dict] = {}  # orderLinkId -> the venue's view of it
         self._ids = itertools.count(1321003749386327552)
         self._lock = threading.Lock()
@@ -111,8 +112,11 @@ class VenueStub:
                     o["orderStatus"] = "Cancelled"
                 return _ok({"orderId": o["orderId"], "orderLinkId": o["orderLinkId"]})
             if path.startswith(("/v5/order/realtime", "/v5/order/history")):
-                return _ok({"category": "linear", "list": [self.lookup_row(o) for o in self.orders.values()],
-                            "nextPageCursor": ""})
+                from urllib.parse import parse_qs, urlparse
+
+                link = parse_qs(urlparse(path).query).get("orderLinkId", [None])[0]
+                rows = [self.lookup_row(o) for o in self.orders.values() if link in (None, o["orderLinkId"])]
+                return _ok({"category": "linear", "list": rows, "nextPageCursor": ""})
         return _ok({"category": "linear", "list": [], "nextPageCursor": ""})
 
     @staticmethod
@@ -141,6 +145,7 @@ class VenueStub:
                 n = int(self.headers.get("content-length") or 0)
                 body = self.rfile.read(n).decode() if n else ""
                 stub.seen.append((self.command, self.path, body))
+                stub.headers.append(dict(self.headers))
                 out = json.dumps(stub.route(self.command, self.path, body)).encode()
                 self.send_response(200)
                 self.send_header("content-type", "application/json")

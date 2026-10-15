@@ -149,9 +149,12 @@ class StopMover:
 
     # a restart ------------------------------------------------------------------------------------------------------
     @staticmethod
-    def reconcile(venue_resting: list[str], journal_current: str | None) -> list[tuple]:
-        """Every resting stop at the venue IN THE FUND'S NAMESPACE that the journal doesn't own as its current stop is
-        cancelled (STOP-EXEC, narrowed by STOP-CLAIM); one outside it is never touched and raises a CRITICAL alert."""
+    def reconcile(venue_resting: list[str], journal_current: str | None, *, holding=None, side: str | None = None,
+                  safety_level=None) -> list[tuple]:
+        """A restart, both ways (STOP-EXEC, STOP-CLAIM, OWN-STOP-SPEC MUST 3). Every resting stop at the venue IN THE
+        FUND'S NAMESPACE that the journal doesn't own as its current stop is cancelled; one outside it is never touched
+        and raises a CRITICAL alert. A position held (`holding` > 0) with its current stop not resting gets one placed
+        at once at the safety level, with an alert."""
         out = []
         for oid in venue_resting:
             if not ours(oid):
@@ -159,4 +162,9 @@ class StopMover:
                                                   "held until the account reconciles")))
             elif oid != journal_current:
                 out.append(("cancel", oid))
+        if holding is not None and _d(holding) > 0 and (journal_current is None or journal_current not in venue_resting):
+            oid = new_order_id()
+            out.append(("place", oid, str(safety_level), str(holding)))
+            out.append(("alert", "critical", (f"No stop was resting at the venue for the {side} stop of {holding} "
+                                              f"held: placed one at {safety_level}")))
         return out

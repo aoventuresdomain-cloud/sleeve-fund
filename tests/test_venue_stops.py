@@ -13,11 +13,16 @@ import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
-
 from exec_stub import VenueStub
+
 from sleeve_fund.paper.exec_client import Limiter
 from sleeve_fund.paper.stop_mover import StopMover, new_order_id
-from sleeve_fund.paper.venue_stops import ForeignWatch, OwnershipGate, VenueStops, classify
+from sleeve_fund.paper.venue_stops import (
+    ForeignWatch,
+    OwnershipGate,
+    VenueStops,
+    classify,
+)
 
 T0 = datetime(2026, 10, 15, 13, tzinfo=UTC)
 
@@ -60,12 +65,12 @@ def test_a_a_stop_is_reduce_only_for_its_own_quantity_with_the_last_price_trigge
 def test_b_every_call_is_signed_with_the_venue_s_scheme_and_never_carries_the_secret(venue, stops):
     oid = new_order_id()
     stops.place(oid, side="SELL", qty="0.010", level="60000.0")
-    method, path, body = venue.seen[-1]
-    h = venue.headers[-1]
-    assert h["X-BAPI-API-KEY"] == "stub-key" and h["X-BAPI-TIMESTAMP"] == "1792066007495"
-    want = hmac.new(b"stub-secret", f"1792066007495stub-key{h['X-BAPI-RECV-WINDOW']}{body}".encode(),
+    body = venue.seen[-1][2]
+    h = {k.lower(): v for k, v in venue.headers[-1].items()}  # header names are case-insensitive
+    assert h["x-bapi-api-key"] == "stub-key" and h["x-bapi-timestamp"] == "1792066007495"
+    want = hmac.new(b"stub-secret", f"1792066007495stub-key{h['x-bapi-recv-window']}{body}".encode(),
                     hashlib.sha256).hexdigest()
-    assert h["X-BAPI-SIGN"] == want
+    assert h["x-bapi-sign"] == want
     assert "stub-secret" not in body and "stub-secret" not in json.dumps(h)
 
 
