@@ -176,7 +176,7 @@ def test_research_never_charges_below_vip0_and_says_both_rates(store):
                              bounds=PAPER.fee_bounds)
     q = venue_terms.research_fees(store, PAPER, PAIR)
     assert (q.fees.maker, q.fees.taker) == (D("0.0002"), D("0.00055"))
-    assert "0.055%" in q.text and "0.040%" in q.text  # research's rate and the account's, side by side
+    assert "0.055%" in q.text and "0.04% taker" in q.text  # research's rate and the account's, side by side
 
 
 def _tiers(store, at):
@@ -203,5 +203,7 @@ def test_a_pulled_table_that_differs_from_the_engines_refuses_entries_until_it_i
     venue_terms.fetch_fees(store, PAPER, PAIR, client=Recorded(_recorded("fee-rate-BTCUSDT.json")),
                            account="paper-main", live=False, now=T)
     t = venue_terms.term(store, PAPER, "tiers", PAIR, T + timedelta(hours=1))
-    assert t.state == "refused" and "differs from the table" in t.words and "re-paste" in t.words
-    assert "differs" in venue_terms.entry_refusal(store, PAPER, PAIR, T + timedelta(hours=1))
+    assert t.state == "refused" and t.words.startswith("BTC/USDT margin tiers: tier table changed (fetched 15 Oct 13:00 "
+                                                       "UK"), t.words
+    assert "new entries refused on BTC/USDT until re-checked" in t.words
+    assert "tier table changed" in venue_terms.entry_refusal(store, PAPER, PAIR, T + timedelta(hours=1))

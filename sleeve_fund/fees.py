@@ -61,14 +61,14 @@ def taker_of(store, sleeve) -> Decimal:
 
 
 def resolve(venue: str | None = None, store=None, instrument: str | None = None, now: datetime | None = None,
-            live: bool = False) -> FeeQuote:
+            live: bool = False, account: str | None = None) -> FeeQuote:
     """The fee schedule to use for `venue` now: the latest one fetched from a connected account,
     else the venue profile's published schedule. On a FEE-LIVE venue (published fee bounds) with an instrument, the
     instrument's last-known-good rate (venue_terms.term); one never fetched is charged at the published VIP 0, its
     entries refused (venue_terms.entry_refusal) while its exits run."""
     profile = venue_profile(venue)
     if profile.fee_bounds:
-        return _live_quote(profile, store, instrument, now, live)
+        return _live_quote(profile, store, instrument, now, live, account)
     row = None
     if store is not None:
         try:
@@ -81,20 +81,21 @@ def resolve(venue: str | None = None, store=None, instrument: str | None = None,
     return FeeQuote(profile.fees, "published", None, None, profile.label, profile.fee_basis)
 
 
-def _live_quote(profile, store, instrument: str | None, now: datetime | None, live: bool) -> FeeQuote:
+def _live_quote(profile, store, instrument: str | None, now: datetime | None, live: bool,
+                account: str | None) -> FeeQuote:
     from datetime import timezone
 
     from sleeve_fund import venue_terms
 
     if store is None or instrument is None:
         return FeeQuote(profile.fees, "published", None, None, profile.label, profile.fee_basis)
-    t = venue_terms.term(store, profile, "fee", instrument, now or datetime.now(timezone.utc), live)
-    rates = f"{float(profile.fees.maker):.3%} maker, {float(profile.fees.taker):.3%} taker"
+    t = venue_terms.term(store, profile, "fee", instrument, now or datetime.now(timezone.utc), live, account)
+    rates = f"{pct(profile.fees.maker)} maker, {pct(profile.fees.taker)} taker"
     if t.value is None:
         return FeeQuote(profile.fees, "published", None, None, profile.label, profile.fee_basis,
-                        words=f"Venue fees: {rates}, the published VIP 0, until {t.words}")
+                        words=f"Venue fees: {rates}, the published schedule, until {t.words}")
     maker, taker = t.value
     published = t.source == venue_terms.PUBLISHED_FEES
     return FeeQuote(FeeSchedule(maker, taker), "published" if published else "account", t.account, t.fetched_at,
                     profile.label, profile.fee_basis if published else "",
-                    words=f"Venue fees: {float(maker):.3%} maker, {float(taker):.3%} taker; {t.words}")
+                    words=f"Venue fees: {pct(maker)} maker, {pct(taker)} taker; {t.words}")

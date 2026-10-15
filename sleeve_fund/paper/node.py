@@ -580,8 +580,9 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         configs = []
         for r in (row,) + ((second,) if second is not None else tuple(assets)):
-            quote = resolve(getattr(r, "venue", None), store, r.instrument,  # FEE-LIVE: the instrument's own rate
-                            live=store.account_kind(store.account_of(r.name)) == "live")
+            acct = store.account_of(r.name)
+            quote = resolve(getattr(r, "venue", None), store, r.instrument,  # FEE-LIVE: the account's own rate
+                            live=store.account_kind(acct) == "live", account=acct)
             configs.append((from_store(r, fee_schedule=quote.fees), SleeveRuntime(journal, r.name)))
             configs[-1][1].venue = configs[-1][0].venue  # its pin's, or the one its open position is on (venue_start)
             perp = markets.terms(configs[-1][0].params, configs[-1][0].venue)
