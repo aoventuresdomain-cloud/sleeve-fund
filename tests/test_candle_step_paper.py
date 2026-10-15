@@ -34,10 +34,10 @@ def _path(store):
     return out
 
 
-def _step_close(n):
-    """The close of the n-th candle that is step 2 (the flip) after the feed starts."""
+def _step_close(n, step=2):
+    """The close of the n-th candle that is `step` (by default 2, the flip) after the feed starts."""
     t0 = _at(_start_ns(HOUR0))
-    hits = [t0 + timedelta(minutes=m) for m in range(1, 20) if step_at(t0 + timedelta(minutes=m), 1)[1] == 2]
+    hits = [t0 + timedelta(minutes=m) for m in range(1, 20) if step_at(t0 + timedelta(minutes=m), 1)[1] == step]
     return hits[n]
 
 
@@ -63,6 +63,28 @@ def test_a_restart_over_the_flip_never_doubles_and_carries_on():
     # From the next cycle on, B trades as A does: the restart cost it at most the steps it was down for.
     nxt = close + timedelta(minutes=4)  # step 0 of the next cycle
     tail = lambda s: [(o["side"], o["filled_qty"], o["intent"]) for o in _orders(s) if o["ts"] >= nxt]
+    assert tail(b) == tail(a)
+
+
+def test_a_restart_before_sell_half_resumes_the_carried_cycle_and_never_doubles():
+    """drop-b-18 risk (HoE 01:44 UK): a Drop B deploy restarts the engine mid-cycle while the timed test runs. From the
+    second cycle on, step 0 carries the last cycle's long in and sends nothing, so "sell half" (step 1) is the cycle's
+    first order. B is down over that close and back before the flip's ("sell the rest and short"): it resumes the same
+    cycle with the same Q, the flip closes what is held and shorts exactly Q, the position never passes Q on either
+    side, and from the flip on it trades as the straight-through run does. With test_a_restart_over_the_flip_* (down
+    over the flip, after sell half) this brackets a restart between the two."""
+    a, b, close, (restart, _) = _ab("candle_step", PARAMS, FLAT, lambda a: _step_close(1, step=1))
+    qa = D(str(_orders(a)[0]["filled_qty"]))
+    assert max(abs(h) for h in _path(b)) <= qa, ("a position above Q after the restart", _path(b))
+    cycle = step_at(close, 1)[0]
+    mine = lambda s: [o for o in _orders(s) if o["ts"] >= restart and o["signal"].get("cycle") == cycle]
+    flip = [(o["side"], D(str(o["filled_qty"])), o["intent"]) for o in mine(b) if o["signal"]["step"] == 2]
+    assert flip, ("B sat the cycle out after the restart: no flip", [(o["ts"], o["side"]) for o in _orders(b)])
+    assert flip[-1] == ("SELL", qa, "entry") and all(side == "SELL" for side, _, _ in flip), flip
+    assert sum(q for _, q, _ in flip) == 2 * qa  # closes the long Q it held (the missed half included), shorts Q
+    assert all(D(str(o["signal"]["q"])) == qa for o in mine(b))
+    flip_close = close + timedelta(minutes=1)
+    tail = lambda s: [(o["side"], o["filled_qty"], o["intent"]) for o in _orders(s) if o["ts"] > flip_close]
     assert tail(b) == tail(a)
 
 

@@ -203,6 +203,13 @@ class CandleStep(LongFlatStrategy):
         ended = any(o["intent"] in EXIT_LEGS and (o["filled_qty"] or 0) > 0 and _ts(o["ts"]) >= first for o in rows)
         self._resumed, self._last_q = (cycle, q, ended), q
 
+    def _carried_into(self, cycle: int, held: Decimal) -> bool:
+        """After a restart: the journal's newest cycle is the one before this and ended long Q, so this cycle's step 0
+        carried that long in without an order (nothing for the journal to show) and its Q is the same. Without this a
+        restart before the cycle's first order sat out the whole cycle (PE1 restart cell, drop-b-18)."""
+        r = self._resumed
+        return r is not None and r[0] == cycle - 1 and not r[2] and r[1] is not None and held == r[1]
+
     def want_side(self, bar: Bar) -> int | None:
         return None  # never decides by side: every order comes from the step
 
@@ -226,7 +233,7 @@ class CandleStep(LongFlatStrategy):
             q, ended = None, False
             if self._resumed is not None and self._resumed[0] == cycle:
                 _, q, ended = self._resumed  # a restart inside this cycle: carry on with its Q
-            elif step == 0 and held > 0:
+            elif held > 0 and (step == 0 or self._carried_into(cycle, held)):
                 # The last cycle's long, carried into this one's first candle: its Q carries too, topped up to if
                 # short of it. Q is sized afresh only from flat, so a missed step never shrinks every later cycle.
                 q = self._last_q or held
