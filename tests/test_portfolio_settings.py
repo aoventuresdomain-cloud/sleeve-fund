@@ -166,7 +166,9 @@ def test_each_row_carries_the_share_of_its_limit_used_as_a_number():
     store = SimpleNamespace(compliance=lambda version=None: v1, instruments=list, compliance_versions=lambda n: [],
                             refused_ideas=lambda *a, **k: [])
     use = {"source": "gate", "fund_gross": {"used": D("0.75"), "what": ""}}
-    with mock.patch.object(compliance, "use_now", return_value=use):
+    # TEC-FE-C2 (setup only): the engine's reader comes first once PE2's lands; this cell reads the page's own.
+    with mock.patch.object(compliance, "engine_use", return_value=None), \
+            mock.patch.object(compliance, "use_now", return_value=use):
         rows = {r["key"]: r for g in compliance.page(store)["tests"] for r in g["rows"]}
     assert rows["fund_gross"]["fill"] == 50.0 and rows["asset_net"]["fill"] is None
 
