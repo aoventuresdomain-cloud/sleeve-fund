@@ -119,7 +119,10 @@ def units(defn: dict) -> list[str]:
             _leaves(defn[side]["entry"], f"{side}.entry", out)
             if "exit" in defn[side]:
                 out.append(f"{side}.exit")
-    out.extend(f"exits.{k}" for k in EXITS if k in (defn.get("exits") or {}))
+    exits = defn.get("exits") or {}
+    out.extend(f"exits.{k}" for k in EXITS if k in exits)
+    for side in ("long", "short"):  # a side's own exits (G1), each its own unit
+        out.extend(f"exits.{side}.{k}" for k in EXITS if k in (exits.get(side) or {}))
     return out
 
 
@@ -179,7 +182,13 @@ def remove(defn: dict, path: str) -> tuple[str, dict | None, str]:
     steps = _steps(path)
     variant = copy.deepcopy(defn)
     if steps[0] == "exits":
-        del variant["exits"][steps[1]]
+        table = variant["exits"]
+        if len(steps) == 3:  # a side's own exit (G1)
+            del table[steps[1]][steps[2]]
+            if not table[steps[1]]:
+                del table[steps[1]]
+        else:
+            del table[steps[1]]
         if not variant["exits"]:
             del variant["exits"]
     else:
@@ -213,14 +222,15 @@ def remove(defn: dict, path: str) -> tuple[str, dict | None, str]:
 
 def stopless(defn: dict) -> bool:
     """No level exit resting at the venue: the variant relies on its liquidation price alone."""
-    return not any(k in (defn.get("exits") or {}) for k in LEVEL_EXITS)
+    exits = defn.get("exits") or {}
+    return not any(k in exits or k in (exits.get(side) or {}) for k in LEVEL_EXITS for side in ("long", "short"))
 
 
 def describe(defn: dict, path: str) -> str:
     """The removed unit in words, for the report."""
     steps = _steps(path)
     if steps[0] == "exits":
-        return f"{steps[1].replace('_', ' ')} exit"
+        return " ".join(str(s).replace("_", " ") for s in steps[1:]) + " exit"
     if steps[-1] == "exit":
         return f"{steps[0]} signal exit"
     node = defn

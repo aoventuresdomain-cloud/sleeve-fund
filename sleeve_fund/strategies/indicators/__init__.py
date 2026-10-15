@@ -19,6 +19,7 @@ from sleeve_fund.strategies.indicators.averages import DAY_OF_MINUTE_BARS, NS_PE
 from sleeve_fund.strategies.indicators.bands import FLAT_BAND, Bollinger, Donchian, Keltner
 from sleeve_fund.strategies.indicators.classic import AtrSma, Rsi, Sma
 from sleeve_fund.strategies.indicators.filters import EfficiencyRatio, RelativeVolume
+from sleeve_fund.strategies.indicators.levels import PriorPeriod, RollingMax, RollingMin
 from sleeve_fund.strategies.indicators.oscillators import Stochastic
 from sleeve_fund.strategies.indicators.swings import RsiDivergence
 
@@ -37,6 +38,9 @@ BLOCKS: dict[str, type] = {
     "rsi_divergence": RsiDivergence,
     "stochastic": Stochastic,
     "keltner": Keltner,
+    "rolling_max": RollingMax,  # G2: the highest of a series over a window, e.g. another block's output
+    "rolling_min": RollingMin,  # G2: and the lowest
+    "prior_period": PriorPeriod,  # G4: the previous calendar day's or week's high, low and close
 }
 
 
@@ -70,7 +74,7 @@ def warmup_for(specs) -> int:
 
 __all__ = [
     "BLOCKS", "DAY_OF_MINUTE_BARS", "FLAT_BAND", "NS_PER_DAY", "PERIOD_MAX", "SETTLE_LENGTHS", "Atr", "AtrSma", "Bollinger",
-    "Donchian", "EfficiencyRatio", "Ema", "Keltner", "RelativeVolume", "Rsi", "RsiDivergence", "Setting", "Sma", "Stochastic",
+    "Donchian", "EfficiencyRatio", "Ema", "Keltner", "PriorPeriod", "RelativeVolume", "RollingMax", "RollingMin", "Rsi", "RsiDivergence", "Setting", "Sma", "Stochastic",
     "Vwap", "Wma", "make_block", "settle_bars",
     "warmup_for",
 ]
