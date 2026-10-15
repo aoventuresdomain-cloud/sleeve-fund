@@ -118,7 +118,8 @@ class Forwarder:
         self.digest = ops_health.DailyDigest(store, env, send=send)
         self.exit_rejects = ops_health.ExitRejectWatch()  # F-RX-2
         self._ops_failing: set[str] = set()
-        self._tables_said: set[str] = set()  # VS-1-TABLE: old maintenance tables already warned about
+        self._tables_said: set[str] = set()
+        self._terms_said: set[tuple] = set()  # FEE-LIVE: (kind, instrument, state, published, day) already said  # VS-1-TABLE: old maintenance tables already warned about
 
     def _resume(self) -> int:
         last = self.store.last_event(None, ("alerts_sent",)) if self.url else None
@@ -208,6 +209,23 @@ class Forwarder:
                 self._tables_said.add(line.split(":")[0])
                 self.store.event(None, "warning", "maintenance_table_old", line)
 
+    def check_venue_terms(self, now) -> None:
+        """FEE-LIVE (Advisor FEE-LIVE-DW): an instrument's fee rates or tiers over 24 h old, refused (over 72 h or never
+        fetched), or the published rate standing in for the account's, is journaled once a day while it lasts, so it
+        goes out with the other alerts."""
+        from sleeve_fund import venue_terms
+
+        for t in venue_terms.live_terms(self.store, now):
+            published = t.source == venue_terms.PUBLISHED_FEES
+            if t.state == venue_terms.FRESH and not published:
+                continue
+            key = (t.kind, t.instrument, t.state, published, now.date())
+            if key in self._terms_said:
+                continue
+            self._terms_said.add(key)
+            level = "error" if t.state == venue_terms.REFUSED else "warning"
+            self.store.event(None, level, f"venue_terms_{t.state if t.state != 'fresh' else 'published'}", t.words)
+
     def _ops_check(self, what: str, check) -> None:
         """One A15 check; a failure is one error until it works again (then one info line), and never stops the
         alerts or the uptime ping that follow it."""
@@ -232,6 +250,7 @@ class Forwarder:
         self._ops_check("rejected-exit", lambda: self.exit_rejects.check(self.store, now))
         self._ops_check("daily digest", lambda: self.digest.step(now))
         self._ops_check("maintenance table age", lambda: self.check_tables(now))
+        self._ops_check("venue fees and tiers", lambda: self.check_venue_terms(now))
         if self.ping_url:
             try:
                 self.pinger(self.ping_url)

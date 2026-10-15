@@ -1753,6 +1753,23 @@ class LongFlatStrategy(Strategy):
             return str(exc)
         return None
 
+    def _venue_terms_refusal(self) -> str | None:
+        """FEE-LIVE (Advisor FEE-LIVE-DW): why paper refuses an entry for its instrument's fee rates or margin tiers
+        (over 72 h old, or never fetched; venue_terms.entry_refusal), or None. A backtest charges research's rates and
+        never asks; only the entry path reads it, so exits, stops, the liquidation cut and Stop always run."""
+        if self._backtest or self.runtime is None:
+            return None
+        from sleeve_fund import venue_terms
+        from sleeve_fund.venues import venue as venue_profile
+
+        store, name = self.runtime.store, self.runtime.name
+        row = store.sleeve(name)
+        profile = venue_profile(getattr(self.runtime, "venue", None) or row.venue)
+        if not profile.fee_bounds:
+            return None
+        live = store.account_kind(store.account_of(name)) == "live"
+        return venue_terms.entry_refusal(store, profile, row.instrument, self.runtime.now(), live)
+
     def _open_risk_refusal(self, side: int, qty: float, close: float, equity: float, ts_ns: int,
                            held_qty: float = 0.0, held_stop: float | None = None) -> str | None:
         """Why the interim open-risk limit refuses this entry (sleeve_fund.open_risk), or None: it gates entries and
@@ -2437,6 +2454,11 @@ class LongFlatStrategy(Strategy):
                        f"maintenance tier ({self._cfg.perp.max_notional:,.0f}), so its liquidation price is unknown")
             return
         self._noted.discard("entry_refused_top_tier")
+        terms_refusal = self._venue_terms_refusal()
+        if terms_refusal:  # FEE-LIVE: fees or tiers over 72 h old, or never fetched; exits and stops never come here
+            self._note("entry_refused_venue_terms", terms_refusal)
+            return
+        self._noted.discard("entry_refused_venue_terms")
         # CUT-A: the simulated account posts the margin, with the fund's virtual funding back in (_mark nets it out)
         liq, distance = entry_liquidation(cash + self._funded(), float(qty), close, side, self._cfg.assumed_taker_fee,
                                           self._cfg.perp.maintenance_margin, lev)
