@@ -1737,7 +1737,10 @@ def create_app(store: Store | None = None) -> FastAPI:
         mirror = setup_view.mirror_state(st(), sleeves)
         here = setup_view.stage(frame, sleeves, mirror)
         accounts = _accounts_rows()
+        from sleeve_fund.dashboard import fee_terms
+
         return page(request, "setup.html", profiles=PROFILES, venues=VENUES.values(), fee_quotes=fee_quotes,
+                    fee_terms=fee_terms.view(st(), utcnow()),
                     tearsheets=str(TEARSHEETS), counts=st().table_sizes(), accounts=accounts,
                     error=error, pre=dict(request.query_params), shell=frame,
                     steps=setup_view.path(here), stage_n=here, next_words=setup_view.NEXT[here], mirror=mirror,
