@@ -73,12 +73,14 @@ class Basket:
 
 @dataclass(frozen=True)
 class TradeAt:
-    """A round trip on an asset's daily closes: in at bar `entry`'s close, out at bar `exit`'s, `notional` at entry."""
+    """A round trip on an asset's daily closes: in at bar `entry`'s close, out at bar `exit`'s, `notional` at entry.
+    exit_cost: False when `exit` is a window's last day the trade was held past (clip): no exit is paid there."""
 
     entry: int
     exit: int
     side: int
     notional: float
+    exit_cost: bool = True
 
 
 @dataclass
@@ -205,12 +207,16 @@ def _run(basket: Basket, assets: list[BasketAsset], first: date, last: date, fee
     return run_portfolio(specs, profile, fund_sized=True), names, specs
 
 
-def pooled_returns(pnl: pd.DataFrame, capital: float) -> pd.Series:
+def equity_before(book: pd.Series, index: pd.DatetimeIndex, capital: float) -> pd.Series:
+    """The fund's equity at the close of the day before each of `index`'s days, from the fund book's daily closes
+    (the capital before its first): every P&L booked before counts, a day between test windows too (CR B-38)."""
+    return book.shift(1).reindex(index).fillna(capital)
+
+
+def pooled_returns(pnl: pd.DataFrame, book: pd.Series, capital: float) -> pd.Series:
     """The pooled daily net return: the day's net P&L summed across the assets, over the fund's equity at the day
-    before's close (the capital plus every P&L booked before)."""
-    day = pnl.sum(axis=1)
-    before = capital + day.cumsum().shift(1, fill_value=0.0)
-    return day / before
+    before's close (equity_before), the same denominator the random check divides by."""
+    return pnl.sum(axis=1) / equity_before(book, pnl.index, capital)
 
 
 def _daily_pnl(run: PortfolioResult, names: list[str], specs: list[LegSpec], assets: list[str]) -> pd.DataFrame:
@@ -231,7 +237,7 @@ def _oos(index: pd.DatetimeIndex, windows) -> np.ndarray:
 def _measure(run, names, specs, assets, windows, capital) -> Measured:
     pnl = _daily_pnl(run, names, specs, assets)
     pnl = pnl[_oos(pnl.index, windows)]
-    returns = pooled_returns(pnl, capital)
+    returns = pooled_returns(pnl, daily_closes(run.book), capital)
     return Measured(run, assets, pnl, returns, float((1 + returns).prod() - 1) if len(returns) else 0.0)
 
 
@@ -278,7 +284,8 @@ def ladder_breakeven(rungs: list[tuple[float, float]]) -> tuple[float | None, st
 
 def trade_pnl(closes: np.ndarray, trips: list[TradeAt], cost_per_side: float) -> np.ndarray:
     """Each bar's net P&L from these trades on these closes: each holds notional / its entry close in units from its
-    entry's close to its exit's, paying cost_per_side on its entry notional and on its exit notional."""
+    entry's close to its exit's, paying cost_per_side on its entry notional and, when it really exits there
+    (exit_cost), on its exit notional."""
     c = np.asarray(closes, dtype=float)
     n = len(c)
     pos, cost = np.zeros(n + 1), np.zeros(n)
@@ -287,7 +294,8 @@ def trade_pnl(closes: np.ndarray, trips: list[TradeAt], cost_per_side: float) ->
         pos[t.entry + 1] += q * t.side
         pos[t.exit + 1] -= q * t.side
         cost[t.entry] += cost_per_side * t.notional
-        cost[t.exit] += cost_per_side * q * c[t.exit]
+        if t.exit_cost:
+            cost[t.exit] += cost_per_side * q * c[t.exit]
     move = np.r_[0.0, np.diff(c)]
     return np.cumsum(pos)[:n] * move - cost
 
@@ -308,7 +316,7 @@ def draw_trades(rng: np.random.Generator, trips: list[TradeAt], ranges: list[tup
             continue
         holds = np.array([t.exit - t.entry for t in inside])
         order, entries = _random_entries(rng, start, end, holds)
-        out.extend(TradeAt(int(e), int(e + holds[k]), inside[k].side, inside[k].notional)
+        out.extend(TradeAt(int(e), int(e + holds[k]), inside[k].side, inside[k].notional, inside[k].exit_cost)
                    for e, k in zip(entries, order))
     return out
 
@@ -316,31 +324,37 @@ def draw_trades(rng: np.random.Generator, trips: list[TradeAt], ranges: list[tup
 def _trips(run: PortfolioResult, name: str, spec: LegSpec, params: dict) -> list[TradeAt]:
     """A leg's closed round trips on its daily closes, at their intended notional: in at the last close at or before
     the entry fill, out at the last close at or before the exit fill, at least one bar. The intended notional is what
-    the entry asked the compliance tests for, its requested quantity at its expected fill: the leg's entries that
-    were sent (approved above 0), in order, are its trips, in order."""
+    the opening entry asked the compliance tests for, its requested quantity at its expected fill: the leg's last
+    sent opening entry (kind "entry", approved above 0) decided on a bar closing at or before the trip's first fill.
+    Adds and trips still open never shift another trip's (CR B-38 a)."""
     idx = spec.prices.index
-    sent = [float(d["requested"]) * float(d["price"]) for d in run.decisions
-            if d["strategy"] == name and float(d["approved"]) > 0]
+    opens = sorted((pd.Timestamp(d["bar_ts"]), float(d["requested"]) * float(d["price"])) for d in run.decisions
+                   if d["strategy"] == name and d.get("kind", "entry") == "entry" and float(d["approved"]) > 0)
+    bars = pd.DatetimeIndex([b for b, _ in opens])
     out = []
-    for k, t in enumerate(trades(fills_to_rows(run.legs[name].fills), shorts=markets.is_perp(params))):
+    for t in trades(fills_to_rows(run.legs[name].fills), shorts=markets.is_perp(params)):
         if t["closed"] is None:
             continue
-        e = max(int(idx.searchsorted(pd.Timestamp(t["opened"]), side="right")) - 1, 0)
+        opened = pd.Timestamp(t["opened"])
+        e = max(int(idx.searchsorted(opened, side="right")) - 1, 0)
         x = max(int(idx.searchsorted(pd.Timestamp(t["closed"]), side="right")) - 1, e + 1)
+        k = int(bars.searchsorted(opened, side="right")) - 1
         if x < len(idx):
-            out.append(TradeAt(e, x, int(t["side"]), sent[k] if k < len(sent) else float(t["cost"])))
+            out.append(TradeAt(e, x, int(t["side"]), opens[k][1] if k >= 0 else float(t["cost"])))
     return out
 
 
 def clip(trips: list[TradeAt], ranges: list[tuple[int, int]]) -> list[TradeAt]:
-    """Each trade cut to the test window it overlaps (the fold-edge rule: only its marks inside the windows count),
-    the same for the basket's trades and the draws'. A trade outside every window is dropped."""
+    """The trades entered inside a test window, each cut at that window's last day when held past it (the fold-edge
+    rule: only its marks inside the window count, Advisor fork 1), the same for the basket's trades and the draws'.
+    Its entry is paid; its exit only when it exits inside the window: a cut is no exit, as the fund book's daily marks
+    pay none (Advisor, B-38 review 20 Oct). A trade entered outside every window is dropped, as the draws' entries
+    are inside the windows only."""
     out = []
     for t in trips:
         for start, end in ranges:
-            e, x = max(t.entry, start), min(t.exit, end)
-            if x > e:
-                out.append(TradeAt(e, x, t.side, t.notional))
+            if start <= t.entry <= end:
+                out.append(TradeAt(t.entry, min(t.exit, end), t.side, t.notional, t.exit_cost and t.exit <= end))
                 break
     return out
 
@@ -372,6 +386,8 @@ def random_beat(m: Measured, names, specs, params: dict, windows, capital: float
     intended notional, each day's P&L summed across the assets over the fund's equity at the day before's close (the
     basket's own book), on the test days only; the draws' entries inside the test windows. Not judged when the
     compliance tests trimmed or refused GATE_TOUCH_CAP of the intended entry notional or more."""
+    if draws < DRAWS:
+        raise ValueError(f"refused: the random check draws at least {DRAWS:,} times, not {draws:,}")
     cut, asked = touched
     share = cut / asked if asked else 0.0
     if share >= GATE_TOUCH_CAP:
@@ -387,7 +403,7 @@ def random_beat(m: Measured, names, specs, params: dict, windows, capital: float
     if not any(t for _, t, _ in legs):
         return RandomBeat(False, math.nan, False, draws, share, seed=seed)
     book = daily_closes(m.run.book)
-    equity = book.shift(1).reindex(clock).fillna(capital).to_numpy(dtype=float)
+    equity = equity_before(book, clock, capital).to_numpy(dtype=float)
 
     def pooled(trips_by_leg) -> float:
         return _sharpe(pooled_trade_returns([(c, t, cps) for (c, _, cps), t in zip(legs, trips_by_leg)], equity)[keep])
@@ -397,7 +413,12 @@ def random_beat(m: Measured, names, specs, params: dict, windows, capital: float
     drawn = np.array([pooled([draw_trades(rng, t, ranges) for _, t, _ in legs]) for _ in range(draws)])
     bar = float(np.nanpercentile(drawn, BAR))
     pct = float((drawn < actual).mean() * 100)
-    return RandomBeat(True, pct, bool(actual > bar), draws, share, actual, float(np.nanmedian(drawn)), bar, seed)
+    return RandomBeat(True, pct, beats_bar(actual, bar), draws, share, actual, float(np.nanmedian(drawn)), bar, seed)
+
+
+def beats_bar(actual: float, bar: float) -> bool:
+    """Strictly above the draws' 95th percentile: level with it is no beat."""
+    return bool(actual > bar)
 
 
 def random_words(r: RandomBeat) -> str:

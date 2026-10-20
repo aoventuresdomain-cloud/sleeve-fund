@@ -85,11 +85,14 @@ def _day(ts: pd.Timestamp) -> date:
 
 
 def test_b38a_pooled_daily_return_is_the_summed_net_pnl_over_the_funds_equity_by_hand():
-    """Two assets, three days, capital 1,000: day 1 +10, day 2 +10 on 1,010, day 3 +10 on 1,020."""
-    idx = pd.date_range("2024-01-02", periods=3, tz="UTC")
-    pnl = pd.DataFrame({"A": [10.0, -5.0, 20.0], "B": [0.0, 15.0, -10.0]}, index=idx)
-    got = bk.pooled_returns(pnl, 1_000.0)
-    assert list(got) == pytest.approx([10 / 1_000, 10 / 1_010, 10 / 1_020], abs=1e-15)
+    """Two assets, capital 1,000, test days 2, 3 and 5 (day 4 between windows): day 2 +10 on 1,000, day 3 +10 on
+    1,010, day 5 +10 on 1,070, the book's close on day 4 after it made 50 there (CR B-38 b: the gap's P&L counts in
+    the denominator, as the random check's)."""
+    idx = pd.date_range("2024-01-02", periods=4, tz="UTC")
+    book = pd.Series([1_010.0, 1_020.0, 1_070.0, 1_080.0], index=idx)  # the fund book's daily closes, days 2 to 5
+    pnl = pd.DataFrame({"A": [10.0, -5.0, 20.0], "B": [0.0, 15.0, -10.0]}, index=idx[[0, 1, 3]])
+    got = bk.pooled_returns(pnl, book, 1_000.0)
+    assert list(got) == pytest.approx([10 / 1_000, 10 / 1_010, 10 / 1_070], abs=1e-15)
 
 
 def test_b38b_the_pooled_series_is_the_out_of_sample_days_only_from_one_fund_run(ran):
@@ -335,7 +338,7 @@ def gapped(tmp_path_factory):
     mp.setattr(bk, "run_portfolio", spy)
     try:
         r = bk.basket_study(_basket(), GAP, RESEARCH_END, register=_register(tmp_path_factory.mktemp("gap")),
-                            dataset="syn", capital=CAPITAL, profile=LOOSE, warm_days=40, ladder=False, draws=50)
+                            dataset="syn", capital=CAPITAL, profile=LOOSE, warm_days=40, ladder=False)
     finally:
         mp.undo()
     return r, runs
@@ -442,15 +445,53 @@ def test_b38v_exactly_5_percent_trimmed_is_not_judged(ran, cut, judged):
     r, runs, _ = ran
     base = runs[0]
     got = bk.random_beat(r.base, [s.name for s in base["specs"]], base["specs"], PARAMS, WINDOWS, CAPITAL,
-                         (cut, 100.0), draws=20)
+                         (cut, 100.0))
     assert got.judged is judged and got.gate_touched == pytest.approx(cut / 100)
 
 
 def test_b38w_trades_across_a_fold_edge_count_only_inside_the_windows():
-    """A trade from bar 3 to bar 12 across windows (0, 9) and (11, 20) is cut to bars 3-9, the same for the
-    basket's trades and the draws'; one wholly between windows is dropped."""
-    cut = bk.clip([bk.TradeAt(3, 12, 1, 100.0), bk.TradeAt(9, 11, 1, 50.0)], [(0, 9), (11, 20)])
-    assert cut == [bk.TradeAt(3, 9, 1, 100.0)]
+    """Windows (0, 9) and (11, 20): a trade from bar 3 to bar 12 is cut to bars 3-9 with no exit paid at the cut; one
+    entered on bar 9 keeps its entry and no marks; one exiting inside its window is whole; one entered on bar 10,
+    between the windows, is dropped (the draws' entries are inside the windows only)."""
+    cut = bk.clip([bk.TradeAt(3, 12, 1, 100.0), bk.TradeAt(9, 11, 1, 50.0), bk.TradeAt(10, 13, 1, 70.0),
+                   bk.TradeAt(12, 15, -1, 30.0)], [(0, 9), (11, 20)])
+    assert cut == [bk.TradeAt(3, 9, 1, 100.0, exit_cost=False), bk.TradeAt(9, 9, 1, 50.0, exit_cost=False),
+                   bk.TradeAt(12, 15, -1, 30.0)]
+
+
+def test_b38zb_a_refused_entry_counts_in_the_trim_share_so_4_trimmed_and_2_refused_is_not_judged():
+    """Advisor (B-38 review 20 Oct): a refused entry never traded, so it is out of both P&L sides, but its requested
+    notional at the expected fill is in the trim share's numerator and denominator. 4 of 100 trimmed and 2 refused
+    is 6%: not judged (without the refusal it would read 4 / 98 = 4.1%, judged)."""
+    from types import SimpleNamespace
+
+    ts = pd.Timestamp("2018-03-10", tz="UTC")
+    run = SimpleNamespace(decisions=[
+        {"ts": ts, "price": 100.0, "requested": 0.98, "approved": 0.94, "strategy": "a"},  # trimmed 4
+        {"ts": ts, "price": 100.0, "requested": 0.02, "approved": 0.0, "strategy": "b"},  # refused 2
+    ])
+    touched = bk.gate_touched(run, [(date(2018, 3, 2), date(2018, 4, 5))])
+    assert touched == pytest.approx((6.0, 100.0))
+    r = bk.random_beat(None, [], [], PARAMS, WINDOWS, CAPITAL, touched)
+    assert not r.judged and r.gate_touched == pytest.approx(0.06)
+    assert "not judged: the compliance tests trimmed 6.0% of entry notional" in bk.random_words(r)
+
+
+def test_b38zc_a_trade_held_past_a_window_books_its_marks_to_the_last_window_day_with_no_fee_at_the_cut():
+    """Advisor (B-38 review 20 Oct): bought 1,000 at bar 1's close (101) and held to bar 5, the window ending at bar 3.
+    Its marks count to bar 3; its entry pays 0.1% (1.00); the cut pays nothing. The same on the draws' side: a draw
+    of it pays its entry and no exit."""
+    closes = np.array([100.0, 101.0, 102.0, 103.0, 104.0, 105.0])
+    cut = bk.clip([bk.TradeAt(1, 5, 1, 1_000.0)], [(0, 3)])
+    assert cut == [bk.TradeAt(1, 3, 1, 1_000.0, exit_cost=False)]
+    q = 1_000.0 / 101.0
+    assert bk.trade_pnl(closes, cut, 0.001) == pytest.approx([0.0, -1.0, q, q, 0.0, 0.0])
+    drawn = bk.draw_trades(np.random.default_rng(3), cut, [(0, 3)])
+    assert len(drawn) == 1 and drawn[0].exit - drawn[0].entry == 2 and not drawn[0].exit_cost
+    fee = bk.trade_pnl(closes, drawn, 0.0) - bk.trade_pnl(closes, drawn, 0.001)
+    assert fee.sum() == pytest.approx(0.001 * 1_000.0)  # the entry only
+    whole = bk.clip([bk.TradeAt(1, 3, 1, 1_000.0)], [(0, 3)])  # one that exits inside its window pays both sides
+    assert bk.trade_pnl(closes, whole, 0.001)[3] == pytest.approx(q - 0.001 * q * 103.0)
 
 
 def test_b38za_retitling_a_rules_definition_is_the_same_basket_try():
@@ -459,3 +500,55 @@ def test_b38za_retitling_a_rules_definition_is_the_same_basket_try():
     renamed = {"definition": {"title": "Dip buy, BTC and ETH", "rules": [1, 2]}}
     assert bk.basket_key(_basket(params=named)) == bk.basket_key(_basket(params=renamed))
     assert bk.basket_key(_basket(params=named)) != bk.basket_key(_basket(params={"definition": {"rules": [1, 3]}}))
+
+
+def test_b38zd_a_holdout_starting_inside_the_research_period_is_refused_before_any_lock_or_run(ran, tmp_path):
+    """CR MUST (B-38): a holdout period starting on the research end, or before it, is refused in words; no asset's
+    lock is claimed and nothing runs."""
+    r, _, _ = ran
+    locks = HoldoutLocks(Store(f"sqlite:///{tmp_path}/t.db"))
+    seen = []
+    mp = pytest.MonkeyPatch()
+    mp.setattr(bk, "run_portfolio", lambda *a, **k: seen.append(a))
+    try:
+        for first in (r.research_end, r.research_end - timedelta(days=30)):
+            with pytest.raises(ValueError, match=f"the holdout starts {first}, inside the research period"):
+                bk.open_holdout(r, (first, HOLDOUT[1]), locks, capital=CAPITAL, profile=LOOSE, warm_days=40)
+    finally:
+        mp.undo()
+    idea = bk.idea_hash(_basket())
+    assert not seen and all(locks.lock(idea, a) is None for a in ("BTC", "ETH", "SOL"))
+
+
+def test_b38ze_the_random_check_refuses_to_judge_on_fewer_than_1000_draws(ran):
+    r, runs, _ = ran
+    base = runs[0]
+    with pytest.raises(ValueError, match="draws at least 1,000 times, not 999"):
+        bk.random_beat(r.base, [s.name for s in base["specs"]], base["specs"], PARAMS, WINDOWS, CAPITAL, (0.0, 1.0),
+                       draws=999)
+
+
+def test_b38zf_the_edges_level_with_the_95th_is_no_beat_and_a_bottom_rung_at_0_is_below_0():
+    assert not bk.beats_bar(1.25, 1.25) and bk.beats_bar(1.2500001, 1.25)
+    assert bk.ladder_breakeven([(0.001, 0.0), (0.002, -0.05)]) == (None, "<0")
+
+
+def test_b38zg_each_trip_takes_its_own_opening_entrys_request_whatever_adds_or_open_trips_come_before():
+    """CR B-38 (a): leg "x" opens 1 @ 100 (request 1.0, sent), adds 0.5 inside that trip (an add: not an opening),
+    has an entry refused, then opens 2 @ 110 (request 2.5, trimmed to 2). Trip 1 is 1.0 x 100, trip 2 2.5 x 110: the
+    add and the refusal never shift it."""
+    from types import SimpleNamespace
+
+    idx = pd.date_range("2024-01-02", periods=10, tz="UTC")
+    t = lambda k: idx[k] + pd.Timedelta(minutes=1)  # noqa: E731 - filled just after bar k's close
+    fills = pd.DataFrame({"side": ["BUY", "BUY", "SELL", "BUY", "SELL"], "filled_qty": [1.0, 0.5, 1.5, 2.0, 2.0],
+                          "avg_px": [100.0, 101.0, 104.0, 110.0, 115.0], "commissions": [0.0] * 5,
+                          "ts_last": [t(0), t(1), t(3), t(5), t(7)]}, index=[f"o{k}" for k in range(5)])
+    dec = lambda k, kind, req, ok, px: {"strategy": "x", "bar_ts": idx[k].to_pydatetime(), "ts": t(k),  # noqa: E731
+                                        "kind": kind, "requested": req, "approved": ok, "price": px}
+    run = SimpleNamespace(legs={"x": SimpleNamespace(fills=fills)}, decisions=[
+        dec(0, "entry", 1.0, 1.0, 100.0), dec(1, "add", 0.5, 0.5, 101.0), dec(4, "entry", 3.0, 0.0, 108.0),
+        dec(5, "entry", 2.5, 2.0, 110.0)])
+    spec = SimpleNamespace(prices=pd.DataFrame({"close": 100.0}, index=idx))
+    got = bk._trips(run, "x", spec, PARAMS)
+    assert [(g.entry, g.exit, g.notional) for g in got] == [(0, 3, 100.0), (5, 7, 275.0)]
