@@ -154,6 +154,13 @@ def price_tick(venue: str | None, pair: str) -> Decimal | None:
     return Decimal(kept).normalize() if kept else None
 
 
+def liquidation_tick(venue: str | None, pair: str) -> float | None:
+    """The kept price tick (price_tick) as the liquidation functions take it: the dashboard's liquidation price rounds to
+    it toward the entry, as the engine's does to its instrument's (CR MUST, B-15); the start check holds the two equal."""
+    kept = price_tick(venue, pair)
+    return float(kept) if kept else None
+
+
 def stale_maintenance(sleeves, today, days: int = 30) -> list[str]:
     """VS-1-TABLE: one line per instrument a live perp Strategy trades whose venue table was read more than `days`
     ago (the venue changes its tiers from time to time; DA-11 keeps them). No venue names: it can reach the PM."""
