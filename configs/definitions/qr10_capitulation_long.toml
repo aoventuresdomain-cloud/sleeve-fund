@@ -1,6 +1,7 @@
 # QR bench: capitulation-day rebound, long only. Decision candle: 1d.
 version = 1
 name = "qr10-capitulation-long"
+title = "Capitulation Rebound (daily) · Long"
 reason = """After an unusually large down day (close at least 2 ATR(14) below the open) on heavy volume (2 x normal),
 forced sellers are done and buyers who step in are paid over the next 1 to 3 days. Out after 3 days or on a close
 above the prior day's high; stop 1.5 ATR below the entry close."""

@@ -1,6 +1,7 @@
 # QR #1 variant (bench): Donchian channel trend, short leg (half risk). Decision candle: 1d.
 version = 1
 name = "qr01c-trend-donchian-short"
+title = "Channel Breakout Trend (55-day, daily) · Short"
 reason = """Mirror of the long leg: sell a close below the lowest low of the last 55 days, cover on a stop that only
 tightens at the highest high of the last 20 days."""
 

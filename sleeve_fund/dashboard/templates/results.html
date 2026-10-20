@@ -33,6 +33,7 @@
     <p style="font-size:28px;font-weight:550;letter-spacing:-0.03em;margin:0 0 8px" class="{% if s.breakeven is not none and s.fee is not none %}{{ 'loss' if s.breakeven < s.fee else 'gain' }}{% endif %}">{{ breakeven }} <span class="muted">per side</span></p>
     <p>The most the idea can pay in fees and still make money over the research period.{% if s.fee is not none %} This venue charges {{ '%.2f'|format(s.fee * 100) }}%{% if s.breakeven is not none and s.breakeven_kind == 'at' %}, so {{ 'fees eat the edge' if s.breakeven < s.fee else 'the edge survives its fee' }}{% endif %}.{% endif %}</p>
     {% if s.breakeven_words %}<p class="muted">{{ s.breakeven_words }}</p>{% endif %}
+    <p id="double-fees">{% include "_double_fees.html" %}</p>
   </section>
 
   <section class="panel span-6" id="nearby" aria-labelledby="nb-h">

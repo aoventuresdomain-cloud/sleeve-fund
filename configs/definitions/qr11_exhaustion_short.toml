@@ -2,6 +2,7 @@
 # Must be judged against the opposite trade (long after the same setup), because overbought often keeps rising here.
 version = 1
 name = "qr11-exhaustion-short"
+title = "Exhaustion Reversal (15m) · Short"
 reason = """After an extreme run (1h RSI(14) above 85 on 2 x normal 1h volume) late buyers run out; sell when 15m
 RSI(14) falls back below 70 within four hours of the setup. Cover at the 15m Bollinger(20, 2) middle, or after 12
 hours; stop 1.5 ATR(14) above the entry close."""
