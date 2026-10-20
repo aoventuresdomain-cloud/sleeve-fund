@@ -285,6 +285,9 @@ def from_form(form) -> tuple[dict[str, dict], dict[str, str], list[str]]:
         tests[r.key] = {"limit": v / 100 if r.unit == "%" else v,
                         # As asked: every test has its checkbox since B-31 (F-LOCKED-OFF: never quietly put back on).
                         "enabled": form.get(f"{r.key}.enabled") in ("on", "1", "true")}
+    # Advisor cell f: a switch for anything but a compliance test (the order rules have none) is refused, never ignored.
+    unknown = sorted({k.rsplit(".", 1)[0] for k in form if k.endswith((".enabled", ".limit"))} - set(rules.KEYS))
+    errors += [f"{k} isn't a compliance test, and the order rules have no off switch." for k in unknown]
     groups = {}
     for key in form:
         if key.startswith("group.") and form.get(key) in rules.GROUPS:

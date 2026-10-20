@@ -195,3 +195,20 @@ def test_the_server_refuses_a_brake_switch_off_without_the_confirm_tick(client, 
                headers=SAME, follow_redirects=False)
     assert r.status_code == 400 and "a reason is required" in r.text, r.text
     assert _n(store) == 1
+
+
+@pytest.mark.parametrize("key", ["order_rules", "stop_rule", "leverage_cap"])
+def test_an_order_rule_switched_off_through_the_server_is_refused_and_changes_nothing(client, key):
+    """Advisor cell f (HoE ruling): the order rules have no off switch. Made-up keys posted to the switch endpoint, asked
+    off, are refused in words, with the stored settings and the journal unchanged."""
+    c, store = client  # noqa: F811
+    tests, journal = store.compliance().tests, store.decisions(limit=500)
+    data = {**_form(), f"{key}.enabled": "", f"{key}.limit": "0", "confirm_off": "on", "reason_pick": "Other",
+            "reason_note": "testing the fund"}
+    for path in ("/portfolio-settings/review", "/portfolio-settings/apply"):
+        r = c.post(path, data=data, auth=AUTH, headers=SAME, follow_redirects=False)
+        assert r.status_code in (200, 400), (path, r.status_code)
+        words = _text(r.text)
+        assert f"{key} isn't a compliance test, and the order rules have no off switch" in words, (path, words[:400])
+        assert "Apply these changes" not in words
+    assert _n(store) == 1 and store.compliance().tests == tests and store.decisions(limit=500) == journal
