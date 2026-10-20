@@ -19,6 +19,21 @@ the BTC table is read. These are backtest studies only: no fund, Strategy, demo 
   random entries (weak if in the market over 60%); long-only rows must also beat buy-and-hold; still profitable at
   2x fees (0.11%); break-even fee shown. The holdout and paper checks come later.
 
+## Pinned dates
+
+Every row reads these days only, whatever day it runs (B-37; Researcher 20 Oct, Advisor-checked). UTC calendar days;
+the decision candles close on them. Minute data for the 15m and 1h rows and the first_touch loader stays inside them.
+
+- **Data start:** 2020-10-21
+- **Research end:** 2025-10-19
+- **Holdout:** 2025-10-20 to 2026-10-19
+
+| Fold | Train start | Test start | Test end |
+| --- | --- | --- | --- |
+| 1 | 2020-10-21 | 2022-10-21 | 2023-10-20 |
+| 2 | 2021-10-21 | 2023-10-21 | 2024-10-19 |
+| 3 | 2022-10-21 | 2024-10-20 | 2025-10-19 |
+
 ## Studies (definition file in configs/definitions/ on main)
 
 | # | Definition | Idea family | Decision candle |

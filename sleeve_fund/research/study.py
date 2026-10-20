@@ -533,6 +533,7 @@ def run_study(
     register=None,
     locks=None,
     idea_hash: str | None = None,
+    pinned=None,
 ) -> StudyResult:
     """prices: bars of any length that divides a day (daily, hourly, 15-minute, 1-minute...). The holdout,
     train and test windows are in days whatever the bar, and every statistic is on daily returns.
@@ -552,13 +553,22 @@ def run_study(
     progress: called with the share of the study's backtests done, 0 to 1.
     idea_hash: the idea family its trials count under, holdout lock included: an optimiser's proposal's own structural
     idea (candidates.idea_hash), so its runs count towards that idea's budget (CR F236-1). None: a rule-builder study's
-    own definition's (CR F236-3), else the hand-coded model's, by its name."""
+    own definition's (CR F236-3), else the hand-coded model's, by its name.
+    pinned: a study list's pinned dates (research.pinned, B-37): only the days they name are read, whatever the day
+    it runs, the holdout is theirs, and the walk-forward must be their folds; None: the history as given."""
     from sleeve_fund.venues import VENUES
 
     perpetual = getattr(VENUES.get(str(instrument.id.venue)), "perpetual", False)
     for combo in grid(spec.param_grid) or [{}]:  # refused up front, before any data is read or run
         check_perp_sizing(spec.name, {**(default_params or spec.default_params or {}), **combo,
                                       **({"market": PERP} if perpetual else {})})
+    if pinned is not None:
+        from sleeve_fund.research import pinned as pinning
+
+        if holdout_days != pinned.holdout_days:
+            raise ValueError(f"pinned dates: the holdout is {pinned.holdout_days} days, not {holdout_days}")
+        prices = pinning.cut(prices, pinned)
+        exec_prices, oos_exec_prices = pinning.upto(exec_prices, pinned.end), pinning.upto(oos_exec_prices, pinned.end)
     minutes = bar_minutes_of(prices)
     if 1440 % minutes:
         raise ValueError(f"{minutes}-minute bars don't divide a day; use 1, 5, 15, 30, 60, 240 or 1440")
@@ -571,6 +581,8 @@ def run_study(
             f"{train_days} + test {test_days} days"
         )
     research = prices.iloc[:-holdout_bars] if holdout_bars else prices
+    if pinned is not None:
+        pinning.check_folds(pinned, research, train_bars, test_bars, bar)
     combos = grid(spec.param_grid)
     if default_params and combos == [{}]:
         # A model with no grid run on the caller's settings (a rule-builder definition): those settings are the one

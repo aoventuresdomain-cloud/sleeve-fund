@@ -61,6 +61,8 @@ class StudyRequest:
     # and the definition's name for its tear sheet. None: the model's own defaults, as the Research page's form runs.
     params: dict | None = None
     label: str | None = None
+    # B-37: a study list's pinned dates (research.pinned.Pinned): the study reads those days only, whatever day it runs.
+    pinned: object | None = None
 
     def exits(self) -> dict:
         """The exits every run of the study trades with, as the strategy takes them."""
@@ -169,7 +171,7 @@ def run_store_study(req: StudyRequest, store=None, progress=None, ledger_path: P
         exits=req.exits(),
         risk_profile=req.risk_profile, exec_prices=exec_prices, half_spread=spread, progress=progress,
         oos_exec_prices=oos_exec, minute_loader=minutes_between, register=register,
-        locks=HoldoutLocks(store) if store is not None else None)
+        locks=HoldoutLocks(store) if store is not None else None, pinned=req.pinned)
     # The fees the strategy's runs paid: a perpetual market's own when it trades one, not the venue's spot rates (RE-COST).
     paid = result.fee_basis
     fee_words = fees.text if paid is None or paid == fees.fees else \
