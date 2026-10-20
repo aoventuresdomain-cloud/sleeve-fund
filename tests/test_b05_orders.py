@@ -49,12 +49,13 @@ def test_a_close_id_on_is_deterministic_short_and_one_per_close():
 
 
 def test_the_strategys_ids_are_its_factorys_off_and_the_funds_on():
-    from sleeve_fund.strategies.base import LongFlatStrategy
+    from sleeve_fund.strategies.base import _ids
 
-    off = SimpleNamespace(_exec_on=lambda: False)
-    on = SimpleNamespace(_exec_on=lambda: True)
-    assert LongFlatStrategy._ids(off) == {}  # OFF: the factory's own ids, so paper stays byte-identical
-    [(key, cid)] = LongFlatStrategy._ids(on).items()
+    off = SimpleNamespace(_backtest=False, _cfg=SimpleNamespace())  # no exec_on in the config: OFF
+    on = SimpleNamespace(_backtest=False, _cfg=SimpleNamespace(exec_on=True))
+    assert _ids(SimpleNamespace(_backtest=True, _cfg=SimpleNamespace(exec_on=True))) == {}  # never in a backtest
+    assert _ids(off) == {}  # OFF: the factory's own ids, so paper stays byte-identical
+    [(key, cid)] = _ids(on).items()
     assert key == "client_order_id" and ours(str(cid)) and exec_client.link_id_ok(str(cid))
 
 
@@ -64,7 +65,7 @@ def test_no_order_in_the_model_is_made_without_the_id_switch():
 
     src = (pathlib.Path(__file__).resolve().parents[1] / "sleeve_fund/strategies/base.py").read_text()
     made = re.findall(r"self\.order_factory\.(market|limit|stop_market)\(", src)
-    assert len(made) == src.count("**self._ids())") + src.count("client_order_id=ClientOrderId(close_id)")
+    assert len(made) == src.count("**_ids(self))") + src.count("client_order_id=ClientOrderId(close_id)")
     assert src.count("self.order_factory.generate_client_order_id()") == 1  # inside _new_coid, its OFF branch
 
 
@@ -105,7 +106,7 @@ def test_demo_and_live_build_through_one_function_and_never_retry_an_order_on_th
     data, execution = exec_client.node_configs(exec_client.exec_settings(DEMO_ENV), DEMO_ENV)
     assert execution.environment == bybit.BybitEnvironment.DEMO and execution.max_retries == 0
     assert execution.base_url_http == "https://api-demo.bybit.com" and data.base_url_http == execution.base_url_http
-    assert execution.margin_mode == bybit.BybitMarginMode.ISOLATED_MARGIN
+    assert execution.margin_mode is None  # never set by the client: the connect check reads it (MUST 3)
     assert execution.product_types == [bybit.BybitProductType.LINEAR]
     live = {"EXEC_MODE": "live", "EXEC_HOST": "api.bybit.com", "BYBIT_TRADE_API_KEY": "k",
             "BYBIT_TRADE_API_SECRET": "s"}
@@ -253,12 +254,12 @@ def test_the_fill_carries_the_venues_own_fee(one_order):
     assert fills[0].commission.as_double() == pytest.approx(0.33)  # what the strategy books (on_order_filled)
 
 
-def test_finding_the_client_sets_the_accounts_margin_mode_when_it_connects(one_order):
-    """FINDING for MUST 3 (Advisor to rule): with margin_mode set, the framework's client posts the account's margin
-    mode at connect, before any order. MUST 3 says never auto-fix; on a shared account this is an account-wide write.
-    Pinned so a change in the client is seen; the connect check (M4) reads the mode instead of setting it."""
+def test_the_client_writes_nothing_to_the_account_when_it_connects(one_order):
+    """B-05 finding (MUST 3, never auto-fix): with margin_mode set, the framework's client posted the account's margin
+    mode at connect, an account-wide write on a shared account. It is left unset; the connect check reads the mode
+    (exec_client.connect_check). Before the order, the client only reads."""
     venue, _, _ = one_order
-    [body] = venue.bodies("account/set-margin-mode")
-    assert body == {"setMarginMode": "ISOLATED_MARGIN"}
     paths = [p.split("?")[0] for _, p, _ in venue.seen]
-    assert paths.index("/v5/account/set-margin-mode") < paths.index("/v5/order/create")
+    assert "/v5/account/set-margin-mode" not in paths
+    first_write = next(i for i, (m, p, _) in enumerate(venue.seen) if m == "POST")
+    assert venue.seen[first_write][1].startswith("/v5/order/create")

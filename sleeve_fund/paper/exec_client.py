@@ -170,8 +170,9 @@ def node_configs(s: ExecSettings, environ, *, urls: dict | None = None, http_tim
     if urls:
         raise ValueError(f"unknown client addresses: {sorted(urls)}")
     data = bybit.BybitDataClientConfig(**common, base_url_ws_public=ws_public, base_url_ws_private=ws_private)
-    execution = bybit.BybitExecutionClientConfig(**common, base_url_ws_private=ws_private, base_url_ws_trade=ws_trade,
-                                                 margin_mode=getattr(bybit.BybitMarginMode, kw["margin_mode"]))
+    # No margin_mode: with one, the client posts the account's margin mode at connect, an account-wide write on a
+    # shared account (B-05 finding, Advisor MUST 3: never auto-fix). The connect check reads it instead.
+    execution = bybit.BybitExecutionClientConfig(**common, base_url_ws_private=ws_private, base_url_ws_trade=ws_trade)
     return data, execution
 
 
@@ -203,7 +204,9 @@ class Limiter:
         if self._tokens[endpoint] >= 1.0:
             self._tokens[endpoint] -= 1.0
             return "send"
-        if since is not None and self._now() - since > self.queue_max:
+        if since is None:  # HoQA (drill-prep line 14): an entry with no first-asked time would wait for ever
+            raise ValueError(f"an entry over the limit on {endpoint} must carry the time it was first asked for")
+        if self._now() - since > self.queue_max:
             return "refuse"
         return "wait"
 
@@ -262,6 +265,106 @@ def may_resend(row: dict | None) -> bool:
     if row is None:
         return True
     return row.get("orderStatus") == "Rejected" and str(row.get("cumExecQty") or "0") in ("0", "0.0", "")
+
+
+# The connect check (B-05 M4; drill-prep MUST 3, 8, 9 clock, 10, 12, 13). Run by the owner when the client connects,
+# on the venue's own answers; its FAIL is journaled per Strategy and refuses entries at runtime (runtime.
+# exec_target_block), exits and stops still run, until a later check passes. Nothing here writes to the account:
+# a wrong margin mode, position mode or leverage is named, never fixed (MUST 3: never auto-fix open).
+CONNECT_FAIL, CONNECT_PASS = "exec_connect_fail", "exec_connect_pass"
+MAX_SKEW_MS = 1000  # the venue's clock against ours; the signed recv window is 5 s (venue_stops.RECV_WINDOW)
+AUTH_CODES = frozenset({10003, 10004, 10005, 10007, 33004})  # invalid key, sign, permission denied, auth, key expired
+
+
+def key_permissions(answer: dict | None) -> dict | None:
+    """The key's permissions as the venue's key query reports them (user/query-api), as gates() reads them:
+    {"trade", "withdraw", "read_only"}. No answer: None (not yet checked, never shown as verified)."""
+    if not answer or answer.get("retCode") != 0:
+        return None
+    r = answer.get("result") or {}
+    perms = r.get("permissions") or {}
+    return {"trade": "Order" in (perms.get("ContractTrade") or []),
+            "withdraw": any("Withdraw" in (v or []) for v in perms.values()),
+            "read_only": str(r.get("readOnly", "0")) == "1"}
+
+
+def connect_check(s: ExecSettings, *, drill_go: bool, key: dict | None, account: dict | None,
+                  positions: dict[str, dict | None], caps: dict[str, float], server_ms: int | None,
+                  local_ms: int) -> list[tuple[str, str]]:
+    """Every line for the client at connect, as (PASS | FAIL | NOTE, what), on the venue's answers: the key's scope
+    (guard), the account's margin mode (account/info), each instrument's position mode and leverage (position/list)
+    against the engine's cap, and the clock. positions: symbol -> the venue's position row (None: unreadable)."""
+    perms = key_permissions(key)
+    out = [x for x in guard(s, drill_go=drill_go, key_permissions=perms) if x[0] == "FAIL"]
+    if perms is None:
+        out.append(("FAIL", "the key's permissions couldn't be read from the venue: a trade-only key can't be shown"))
+    mode = ((account or {}).get("result") or {}).get("marginMode")
+    if mode != "ISOLATED_MARGIN":
+        out.append(("FAIL", (f"the account's margin mode is {mode or 'unreadable'}, not isolated: set it on the "
+                             "account (the fund never changes it)")))
+    for symbol, row in sorted(positions.items()):
+        if row is None:
+            out.append(("FAIL", f"{symbol}: its position settings couldn't be read"))
+            continue
+        if int(row.get("positionIdx", 0)) != 0:
+            out.append(("FAIL", f"{symbol}: hedge mode; the fund trades one-way positions only"))
+        cap = caps.get(symbol)
+        try:
+            lev = float(row.get("leverage"))
+        except (TypeError, ValueError):
+            lev = None
+        if cap is None or lev is None or abs(lev - cap) > 1e-9:
+            out.append(("FAIL", (f"{symbol}: the venue's leverage is {row.get('leverage') or 'unreadable'}, the "
+                                 f"engine's cap {cap if cap is not None else 'unknown'}: set it to match (never "
+                                 "changed with a position open)")))
+    if server_ms is None:
+        out.append(("FAIL", "the venue's clock couldn't be read"))
+    elif abs(server_ms - local_ms) > MAX_SKEW_MS:
+        out.append(("FAIL", f"this machine's clock is {abs(server_ms - local_ms)} ms off the venue's"))
+    if not out:
+        out.append(("PASS", (f"order client connected, {s.mode} mode: trade-only key, isolated, one-way, leverage "
+                             "at the cap, clock in step")))
+    return out
+
+
+def record_connect(store, name: str, lines: list[tuple[str, str]], now: datetime) -> None:
+    """The check in the journal: a FAIL opens (or restates) the hold as an error, which the alerts send; a PASS after
+    a FAIL clears it. A PASS with nothing held writes nothing."""
+    fails = [t for k, t in lines if k == "FAIL"]
+    last = store.last_event(name, (CONNECT_FAIL, CONNECT_PASS))
+    held = last is not None and last["kind"] == CONNECT_FAIL
+    if fails:
+        store.event(name, "error", CONNECT_FAIL, "Order client check failed: " + "; ".join(fails) + ". No new entries "
+                    "until it passes; exits and stops still go out.", ts=now)
+    elif held:
+        store.event(name, "info", CONNECT_PASS, "Order client check passed: entries are allowed again", ts=now)
+
+
+def lost_permission(code: int | None, *, venue_holds: bool) -> str | None:
+    """MUST 8 (Advisor Q2): the first trade-endpoint auth error mid-session is CRITICAL "cannot protect" while the
+    venue holds a position or order for us (cannot_protect's words), and a FAIL either way."""
+    if code not in AUTH_CODES:
+        return None
+    return cannot_protect({}, venue_holds=venue_holds) or (f"the venue refused the key ({code}) on a trade request: "
+                                                           "a trade-only key is needed")
+
+
+def holds(store, name: str) -> list[str]:
+    """Why the client ON refuses `name` new entries, from the journal: a failed connect check (or a lost key) not
+    since passed, and a restart reconcile that didn't tie (exec_reconcile.hold). Unreadable: held (fail closed)."""
+    from sleeve_fund.paper import exec_reconcile
+
+    out = []
+    try:
+        last = store.last_event(name, (CONNECT_FAIL, CONNECT_PASS))
+    except Exception:  # noqa: BLE001 - fail closed, never an error out of the entry gate
+        return ["the order client's last check couldn't be read from the journal"]
+    if last is not None and last["kind"] == CONNECT_FAIL:
+        out.append(last["message"])
+    held = exec_reconcile.hold(store, name)
+    if held is not None:
+        out.append(held)
+    return out
 
 
 FEE_TOLERANCE = 0.01  # EXEC-SPEC MUST 3: a venue fee more than a cent off FEE-LIVE's on one fill is alerted
