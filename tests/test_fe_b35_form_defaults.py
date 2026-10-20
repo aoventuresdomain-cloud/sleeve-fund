@@ -95,3 +95,13 @@ def test_b35_the_two_1h_chips_suggest_different_names(held_site, browser):  # no
     assert all(n.startswith("trend-filter-btcusdt-1h") for n in names), names
     assert errors == []
     page.context.close()
+
+
+def test_b35_the_backtest_form_holds_a_stopless_perp_to_1x_as_paper_does(held_site, browser):  # noqa: F811
+    """Advisor B35-STOPLESS-DEFAULT's condition: research runs the Strategy at the leverage paper will, 1x."""
+    base, _ = held_site
+    page, errors = _open(browser, f"{base}/backtest?{WHERE['perp']}&strategy=trend_filter")
+    assert PROFILES[page.input_value("#risk_profile")].max_leverage <= STOPLESS_MAX_LEVERAGE
+    assert page.locator("#stopless-note").is_visible()
+    assert errors == []
+    page.context.close()

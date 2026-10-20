@@ -952,6 +952,30 @@ window.Console = (() => {
     ["market", "risk_profile"].forEach((n) => form.elements[n]?.dispatchEvent(new Event("change", {bubbles: true})));
   }
 
+  // B-35: a model that places no stop is held to 1x on a perpetual (strategies.check_perp_stop, "always a stop, or
+  // 1x"). With no stop set the form picks the highest profile within that and says why, so its defaults save; a stop
+  // set under the exits frees the choice. The backtest form does the same, so research runs at paper's leverage
+  // (Advisor B35-STOPLESS-DEFAULT).
+  function stoplessHold(form) {
+    if (!form || !form.elements.strategy || !form.elements.risk_profile) return;
+    const $ = (n) => form.elements[n];
+    const holdStopless = () => {
+      const max = Number($("strategy").selectedOptions[0]?.dataset.stoplessMax);
+      const note = form.querySelector("#stopless-note");
+      const held = max > 0 && $("market") && $("market").value !== "spot" && !(form.querySelector("[data-kind=stop]")?.value);
+      if (note) {
+        note.hidden = !held;
+        note.textContent = held ? `This model places no stop, so on a perpetual it is held to ${max}x leverage. Set a stop under the exits to choose more.` : "";
+      }
+      const prof = $("risk_profile");
+      if (!held || Number(prof.selectedOptions[0].dataset.lev) <= max) return;
+      const fit = [...prof.options].filter((o) => Number(o.dataset.lev) <= max).sort((a, b) => Number(b.dataset.lev) - Number(a.dataset.lev))[0];
+      if (fit) { prof.value = fit.value; prof.dispatchEvent(new Event("change", {bubbles: true})); }
+    };
+    form.addEventListener("change", holdStopless);
+    holdStopless();
+  }
+
   // New-sleeve form: show the chosen strategy's settings, keep a plain-English summary.
   function sleeveForm() {
     const form = document.getElementById("sleeve-form");
@@ -1032,25 +1056,8 @@ window.Console = (() => {
       }
     };
     $("name").addEventListener("input", () => { $("name").dataset.touched = "1"; });
-    // B-35: a model that places no stop is held to 1x on a perpetual (strategies.check_perp_stop, "always a stop, or
-    // 1x"). With no stop set the form picks the highest profile within that and says why, so its defaults save; a
-    // stop set under Orders and exits frees the choice.
-    const holdStopless = () => {
-      const max = Number($("strategy").selectedOptions[0]?.dataset.stoplessMax);
-      const note = document.getElementById("stopless-note");
-      const held = max > 0 && $("market").value !== "spot" && !(form.querySelector("[data-kind=stop]")?.value);
-      if (note) {
-        note.hidden = !held;
-        note.textContent = held ? `This model places no stop, so on a perpetual it is held to ${max}x leverage. Set a stop under Orders and exits to choose more.` : "";
-      }
-      const prof = $("risk_profile");
-      if (!held || Number(prof.selectedOptions[0].dataset.lev) <= max) return;
-      const fit = [...prof.options].filter((o) => Number(o.dataset.lev) <= max).sort((a, b) => Number(b.dataset.lev) - Number(a.dataset.lev))[0];
-      if (fit) { prof.value = fit.value; prof.dispatchEvent(new Event("change", {bubbles: true})); }
-    };
-    form.addEventListener("change", holdStopless);
+    stoplessHold(form);
     form.addEventListener("input", sync); form.addEventListener("change", sync); sync();
-    holdStopless();
     wizard(form);
     orderFields("sleeve-form");
 
@@ -1655,5 +1662,5 @@ window.Console = (() => {
     });
   }
 
-  return {sortable, tabs, subtabs, periods, sortBy, dialogs, whys, fillSummary, lineCharts, strategyPicker, priceChart, sleeveForm, orderFields, reasons, picklist, chips, settingsDiff, bookCharts: (url) => pair(url, "eq", null, ["Book", "Buy-and-hold"], {book: true}), pair};
+  return {sortable, tabs, subtabs, periods, sortBy, dialogs, whys, fillSummary, lineCharts, strategyPicker, stoplessHold: (id) => stoplessHold(document.getElementById(id)), priceChart, sleeveForm, orderFields, reasons, picklist, chips, settingsDiff, bookCharts: (url) => pair(url, "eq", null, ["Book", "Buy-and-hold"], {book: true}), pair};
 })();
