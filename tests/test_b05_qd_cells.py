@@ -1,12 +1,11 @@
 """B-05 cells (HoE, CR's mutants on 544cd42d; tests only, no code change): what fails closed stays closed, the
-funding split adds up to the venue's figure with the rounding on the largest holder, and an OFF start never builds
-the exchange client. On Postgres too (TEST_DATABASE_URL)."""
+funding split adds up to the venue's figure with the rounding on the largest holder.
+The OFF-start cell (K2) is PE4's (TEC v2). On Postgres too (TEST_DATABASE_URL)."""
 
 from __future__ import annotations
 
 from decimal import Decimal
 
-import pytest
 from test_b05_guards import DEMO_ENV, NOW, _check
 from test_b05_restart import INSTR, _settled, store  # noqa: F401
 
@@ -62,36 +61,3 @@ def test_a_settlement_split_three_ways_books_the_venues_figure_exactly(store):  
     assert set(done["booked"]) == {"S-1"} and not done["gaps"]
     assert sum(store.funding_total(t) for t in held) == Decimal("-1.00000000")
     assert store.funding_total("s3") == Decimal("-0.33333334")
-
-
-def test_an_off_start_builds_only_the_simulated_client_and_never_the_exchange_clients_configs(monkeypatch):
-    """CR K2 (mutant B): OFF, build_node never reaches exec_client.node_configs and creates no exchange client config.
-    With key variables set an OFF build is refused before anything is built (assert_keyless)."""
-    from nautilus_trader.adapters import bybit
-
-    from sleeve_fund.paper import node as node_mod
-    from sleeve_fund.paper.config import SleeveConfig
-    from sleeve_fund.paper.safety import PaperSafetyError
-
-    made = []
-
-    def never(*a, **k):
-        raise AssertionError("node_configs reached with the client OFF")
-
-    monkeypatch.setattr(exec_client, "node_configs", never)
-    for name in ("BybitExecutionClientConfig", "BybitDataClientConfig"):
-        monkeypatch.setattr(bybit, name, lambda *a, _n=name, **k: made.append(_n))
-    for k in list(DEMO_ENV):
-        monkeypatch.delenv(k, raising=False)
-    sleeve = SleeveConfig(name="t", strategy="trend_filter", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
-                          starting_balance=1000.0)
-    built = node_mod.build_node(sleeve, log_level="ERROR", asset_fetch=dict)
-    try:
-        assert made == [] and built.environment.name == "SANDBOX"
-    finally:
-        built.dispose()
-    monkeypatch.setenv("BYBIT_DEMO_API_KEY", "stub")
-    monkeypatch.setenv("BYBIT_DEMO_API_SECRET", "stub")
-    with pytest.raises(PaperSafetyError, match="credentials"):
-        node_mod.build_node(sleeve, log_level="ERROR", asset_fetch=dict)
-    assert made == []
