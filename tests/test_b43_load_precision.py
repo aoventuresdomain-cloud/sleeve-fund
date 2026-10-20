@@ -12,6 +12,8 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+from test_multi_asset_replay import offline  # noqa: F401 - the venue offline, for the multi-leg cell
+
 from sleeve_fund.venues import venue
 
 pytestmark = [pytest.mark.no_maintenance_tables]
@@ -122,3 +124,32 @@ def test_the_live_start_check_fails_a_venue_quoting_btc_at_2dp_against_the_kept_
     assert sec.failed
     (line,) = [w for k, w in sec.lines if k == "FAIL"]
     assert "p1" in line and "0.01" in line and "0.1" in line, line
+
+
+def test_a_multi_leg_replay_start_refuses_one_legs_feed_off_its_instruments_precision(tmp_path, monkeypatch, offline):
+    """CR M1: replay_legs checks each leg at load too: the first leg's recorded quotes at 2 places against BTC's 1."""
+    from nautilus_trader.model import Price
+    from test_multi_asset_replay import ASSETS, NAME, _record, _store
+
+    from sleeve_fund.data import FeedPrecisionError
+    from sleeve_fund.research import replay
+
+    real = replay._data
+
+    def btc_at_2dp(instrument, rows):
+        data = real(instrument, rows)
+        if instrument.price_precision != 1:  # the other legs are left as recorded
+            return data
+        return [type(d)(d.instrument_id, Price(d.bid_price.as_double(), 2), Price(d.ask_price.as_double(), 2),
+                        d.bid_size, d.ask_size, d.ts_event, d.ts_init) if hasattr(d, "bid_price") else d for d in data]
+
+    store = _store()
+    rows = [NAME, *store._asset_legs(NAME)]
+    paths = []
+    for row, asset in zip(rows, ASSETS):
+        paths.append(tmp_path / f"{row.replace('~', '-')}.jsonl.gz")
+        _record(paths[-1], row, asset, [(1, 0.0)])
+    monkeypatch.setattr(replay, "_data", btc_at_2dp)
+    with pytest.raises(FeedPrecisionError) as exc:
+        replay.replay_legs(paths, store=store)
+    _refused(exc)
