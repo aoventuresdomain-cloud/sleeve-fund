@@ -41,6 +41,33 @@ class VenueReads:
         rows = (answer.get("result") or {}).get("list") or []
         return next((r for r in rows if r.get("symbol") == symbol), None)
 
+    def _list(self, endpoint: str, query: dict) -> list[dict] | None:
+        """Every row of a paged list (nextPageCursor), or None when any page is unanswered or refused."""
+        rows, cursor = [], ""
+        for _ in range(50):  # a bound: an account with more than 50 pages of these is a gap, never a partial read
+            answer = self._get(endpoint, {**query, **({"cursor": cursor} if cursor else {})})
+            if not answer or answer.get("retCode") != 0:
+                return None
+            result = answer.get("result") or {}
+            rows += result.get("list") or []
+            cursor = result.get("nextPageCursor") or ""
+            if not cursor:
+                return rows
+        return None
+
+    def positions(self, symbol: str) -> list[dict] | None:
+        """The position rows for the restart reconcile (exec_reconcile.venue_net), None unanswered."""
+        return self._list("position/list", {"category": "linear", "symbol": symbol})
+
+    def open_orders(self, symbol: str) -> list[dict] | None:
+        """Every open order on the account on `symbol`, the fund's or not (exec_start.start_reconcile sorts them)."""
+        return self._list("order/realtime", {"category": "linear", "symbol": symbol, "openOnly": 0, "limit": 50})
+
+    def settlements(self, symbol: str, start_ms: int) -> list[dict] | None:
+        """The account's funding settlements on `symbol` since `start_ms` (transaction log, type SETTLEMENT)."""
+        return self._list("account/transaction-log", {"category": "linear", "type": "SETTLEMENT",
+                                                      "symbol": symbol, "startTime": start_ms, "limit": 50})
+
     def server_ms(self) -> int | None:
         answer = self._get("market/time")
         try:

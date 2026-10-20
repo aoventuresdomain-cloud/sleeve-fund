@@ -351,8 +351,9 @@ def lost_permission(code: int | None, *, venue_holds: bool) -> str | None:
 
 def holds(store, name: str) -> list[str]:
     """Why the client ON refuses `name` new entries, from the journal: a failed connect check (or a lost key) not
-    since passed, and a restart reconcile that didn't tie (exec_reconcile.hold). Unreadable: held (fail closed)."""
-    from sleeve_fund.paper import exec_reconcile
+    since passed, a restart reconcile that didn't tie (exec_reconcile.hold), and a foreign order on its instrument
+    (exec_start.foreign_hold, fund-wide). Unreadable: held (fail closed)."""
+    from sleeve_fund.paper import exec_reconcile, exec_start
 
     out = []
     try:
@@ -362,6 +363,13 @@ def holds(store, name: str) -> list[str]:
     if last is not None and last["kind"] == CONNECT_FAIL:
         out.append(last["message"])
     held = exec_reconcile.hold(store, name)
+    if held is not None:
+        out.append(held)
+    try:  # MUST 20: a foreign order on its instrument holds it fund-wide
+        instrument = store.sleeve(name).instrument
+    except Exception:  # noqa: BLE001 - fail closed
+        return [*out, "the Strategy's instrument couldn't be read from the journal"]
+    held = exec_start.foreign_hold(store, instrument)
     if held is not None:
         out.append(held)
     return out

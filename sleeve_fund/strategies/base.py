@@ -2684,6 +2684,7 @@ class LongFlatStrategy(Strategy):
         self.entry_sent(qty, values)
 
     def on_bar(self, bar: Bar) -> None:
+        self._recheck_claims()  # ON only: the orders held by the OwnershipGate past their grace (MUST 21)
         self._deciding = self._deciding_bar = None
         try:
             self._on_bar(bar)
@@ -6343,7 +6344,34 @@ class LongFlatStrategy(Strategy):
                 # og6: the venue ended it, so the cancel journalled for it (if any) is settled, never left blocking
                 order_ended(self.runtime.store, str(event.client_order_id), status, _utc(int(event.ts_event)))
 
+    def _claimed(self, event) -> bool:
+        """MUST 21: ON, an order event for an order this Strategy didn't send in this process goes through its
+        OwnershipGate (exec_start.claim): only its own journal's is booked; a sibling's is ignored, one of ours in no
+        journal is held and re-checked each bar, a foreign one holds the instrument fund-wide. True: not booked."""
+        if not _exec_on(self) or self.runtime is None or str(event.client_order_id) in self.decisions:
+            return False
+        from sleeve_fund.paper import exec_start
+
+        rt = self.runtime
+        if getattr(self, "_ownership", None) is None:
+            self._ownership = exec_start.gate(rt.store, rt.name)
+        return exec_start.claim(self._ownership, rt.store, rt.name, str(event.client_order_id), rt.now()) != "book"
+
+    def _recheck_claims(self) -> None:
+        """Each bar ON: a held order past its grace that is still in no journal is an orphan, cancelled by its id."""
+        if getattr(self, "_ownership", None) is None or not self._ownership.held:
+            return
+        from sleeve_fund.paper import exec_start
+
+        rt = self.runtime
+        for oid in exec_start.recheck(self._ownership, rt.store, rt.name, rt.now()):
+            rt.store.event(rt.name, "warning", "orphan_order", f"Order {oid} is the fund's but in no journal: "
+                           "cancelled", ts=rt.now())
+            self.cancel_order(ClientOrderId(oid))
+
     def on_order_accepted(self, event) -> None:
+        if self._claimed(event):
+            return
         self._order_status(event, "accepted")
         coid = str(event.client_order_id)
         if self.runtime is not None:
@@ -6479,6 +6507,8 @@ class LongFlatStrategy(Strategy):
         self._resume_exit(str(event.client_order_id))
 
     def on_order_filled(self, event) -> None:
+        if self._claimed(event):
+            return
         intrabar = self._intrabar_fill(event)  # a bars-only backtest's resting order filled inside a bar, or None
         held = (self._entry_qty, self._entry_px)  # the position before this fill
         if self._margin:  # a fill just after the hour, with no trade, bar or tick between: held before it
