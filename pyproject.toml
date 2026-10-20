@@ -43,5 +43,6 @@ markers = [
     "no_restart_safety_stop: a liquidation-accounting test that carries a stopless position over a restart; lifts the restart's safety stop",
     "real_daily_atr: the test reads the daily ATR from the history store itself (open_risk.history_atr_pct)",
     "no_maintenance_tables: the perp venue as it is, without the interim one-rate table every other test gets (VS-1)",
+    "price_tick_live: the start check reads the venue's live contract tick as it is, not the kept one (B-36b)",
     "venue_terms_live: FEE-LIVE's fetched fees and tiers as they are: entries refused past 72 h or never fetched",
 ]
