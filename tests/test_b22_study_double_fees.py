@@ -171,3 +171,67 @@ def test_b22i_the_fields_are_stored_beside_the_tear_sheet_for_the_page(ran, tmp_
     assert pd.Timestamp(got["oos_start"]) == d["oos_start"] and pd.Timestamp(got["oos_end"]) == d["oos_end"]
     assert (got["oos_days"], got["round_trips"], got["trades_differ"]) == (d["oos_days"], d["round_trips"],
                                                                           d["trades_differ"])
+
+
+def test_b22k_a_window_that_never_traded_is_the_same_trades_at_any_fee():
+    """A window whose settings never traded has no fills at either fee (an empty frame, no columns): same trades, no
+    round trips, and the study goes on (it raised KeyError: filled_qty)."""
+    from types import SimpleNamespace
+
+    from sleeve_fund.instruments import FeeSchedule
+
+    days = pd.date_range("2024-01-01", periods=2, tz="UTC")
+    flat = SimpleNamespace(fills=pd.DataFrame(), shorts=None)
+    d = study_mod._double_fees(pd.Series([0.0, 0.0], index=days), pd.Series([0.0, 0.0], index=days), [(flat, flat)],
+                               FeeSchedule(Decimal("0.0004"), Decimal("0.0011")))
+    assert d["trades_differ"] is False and d["round_trips"] == d["base_round_trips"] == 0 and d["passed"] is False
+
+
+def test_b22l_the_re_runs_add_nothing_to_g1s_first_touch_count(instrument, monkeypatch, tmp_path):
+    """The first-touch share G1 reads is counted from each window's own run, once: the double-fee re-runs count
+    nothing (they are re-scored, never re-judged)."""
+    counted, real = [], study_mod.run_backtest
+
+    def spy(*a, first_touch_count_from=None, **kw):
+        if first_touch_count_from is not None:
+            counted.append(first_touch_count_from)
+        return real(*a, first_touch_count_from=first_touch_count_from, **kw)
+
+    monkeypatch.setattr(study_mod, "run_backtest", spy)
+    r = run_study(SPEC, synthetic_ohlcv(days=1200, seed=3), instrument, ledger=IdeaLedger(tmp_path / "l.jsonl"),
+                  dataset="syn", synthetic=True, holdout_days=0, train_days=365, test_days=365)
+    assert r.double_fees is not None and len(counted) == len(r.folds) == len(set(counted))
+
+
+def test_b22m_judged_on_the_opposite_resolution_the_double_fee_run_is_flipped_too(instrument, monkeypatch, tmp_path):
+    """Advisor (TEC-B22-FLIPS): when G1 judges the opposite resolution, the 2x run is flipped as well, and each
+    window's flipped pair differs only in its fees, 1x then exactly 2x: same bars, settings, spread and window."""
+    from test_r2_g1 import _stats
+
+    flipped, real = [], study_mod.run_backtest
+
+    def fake(name, df, inst, params, *, first_touch_flip=False, **kw):
+        res = real(name, df, inst, params, first_touch_flip=first_touch_flip, **kw)
+        if name != "buy_and_hold":
+            res.first_touch = _stats(51, flip=first_touch_flip)
+            if first_touch_flip and len(res.equity):
+                res.equity = res.equity * pd.Series(0.9995, index=res.equity.index).cumprod()
+                flipped.append({"df": df, "params": params, "fees": kw.get("fees"),
+                                "half_spread": kw.get("half_spread")})
+        return res
+
+    monkeypatch.setattr(study_mod, "run_backtest", fake)
+    r = run_study(SPEC, synthetic_ohlcv(days=1200, seed=3), instrument, ledger=IdeaLedger(tmp_path / "l.jsonl"),
+                  dataset="syn", synthetic=True, holdout_days=0, train_days=365, test_days=365)
+    assert r.first_touch["judged_on"] == "opposite"
+    windows = [f for f in r.folds if not f.unscored]
+    assert windows and len(flipped) == 2 * len(windows)
+    pairs = {}
+    for c in flipped:
+        pairs.setdefault(c["params"]["trade_from"], []).append(c)
+    assert len(pairs) == len(windows)
+    paid = r.fee_basis
+    for one, two in pairs.values():
+        assert one["fees"] is None and (two["fees"].maker, two["fees"].taker) == (paid.maker * 2, paid.taker * 2)
+        assert one["params"] == two["params"] and one["df"].index.equals(two["df"].index)
+        assert one["half_spread"] == two["half_spread"]

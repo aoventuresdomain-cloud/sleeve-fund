@@ -438,6 +438,8 @@ def _double_fees(base: pd.Series, twice: pd.Series, runs: list, fees: FeeSchedul
         return len(round_trips(run.fills, run.shorts))
 
     def same(a, b) -> bool:
+        if not len(a) or not len(b):  # a window that never traded has no fill columns at all
+            return len(a) == len(b)
         return len(a) == len(b) and bool((a["filled_qty"].to_numpy() == b["filled_qty"].to_numpy()).all()
                                           and (a["avg_px"].to_numpy() == b["avg_px"].to_numpy()).all())
 
@@ -921,10 +923,10 @@ def run_study(
     # B-22 (Advisor B22-DOUBLE-FEES): each window again with the settings it chose, at twice its fees, its spread,
     # slippage and funding as they were, judged on what G1 judged (the opposite resolution when that was worse). A real
     # re-run, never the fees subtracted: paying more leaves less to trade with, so the trades themselves move. A window
-    # that chose nothing sat flat, at any fee. Never the holdout.
+    # that chose nothing sat flat, at any fee. Never the holdout, and never counted again in G1's first-touch share.
     twice_parts, twice_runs = list(oos_parts), []
     for k, window, run in windows:
-        rerun = bt(spec.name, window[1], window[3], oos=True, trade_from=window[2][0] - bar, count_from=window[2][0],
+        rerun = bt(spec.name, window[1], window[3], oos=True, trade_from=window[2][0] - bar,
                    fees=doubled(paid(window[3])), flip=first_touch.get("judged_on") == "opposite")
         twice_parts[k] = scored(k, *window, rerun)[1]
         twice_runs.append((run, rerun))

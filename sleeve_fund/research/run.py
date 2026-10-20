@@ -203,8 +203,11 @@ def write_results(result, sheet: Path) -> Path:
     import json
 
     d = result.double_fees
-    fields = None if d is None else {k: (str(v) if isinstance(v, Decimal) else v.isoformat() if isinstance(v, pd.Timestamp)
-                                         else v) for k, v in d.items()}
+
+    def plain(v):
+        return str(v) if isinstance(v, Decimal) else v.isoformat() if isinstance(v, pd.Timestamp) else v
+
+    fields = None if d is None else {k: plain(v) for k, v in d.items()}
     path = results_path(sheet)
     path.write_text(json.dumps({"double_fees": fields}, indent=1, sort_keys=True), encoding="utf-8")
     return path
