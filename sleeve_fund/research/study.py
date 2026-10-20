@@ -21,7 +21,7 @@ from nautilus_trader.model import CurrencyPair
 
 from sleeve_fund import funding
 from sleeve_fund.instruments import FeeSchedule, pair_of, pct
-from sleeve_fund import markets
+from sleeve_fund import markets, risk
 from sleeve_fund.markets import PERP
 from sleeve_fund.research import regime_split
 from sleeve_fund.research.ledger import GAP_STAGE, IdeaLedger, opened_words
@@ -592,7 +592,7 @@ def run_study(
 
         # On a perpetual, the margin cap times the leverage cap, as paper and the backtest page size it; the
         # benchmark holds that exposure up to all of the capital, as the backtest page's does (review round 13, E13-1).
-        strategy_cap = cap_of(risk_profile_of(risk_profile), market)
+        strategy_cap = cap_of(risk_profile_of(risk_profile), {**default_params, **market})  # its own cap too (B-35 a)
         position_cap = min(strategy_cap, 1.0)
     if position_cap is not None and not 0 < position_cap <= 1:
         raise ValueError(f"position_cap {position_cap} outside (0, 1]")
@@ -960,7 +960,9 @@ def run_study(
     )
     # Every trip pays the taker fee and half the spread each way, as the study's own runs do on market orders.
     # A perpetual's trades and draws are liquidated as the engine books one, at the risk profile's leverage cap.
-    leverage = risk_profile_of(risk_profile).max_leverage if risk_profile is not None else None
+    # B-35 (a): lowered by the Strategy's own leverage cap (max_leverage), as the engine's margin and liquidation are
+    leverage = (risk.capped_leverage(risk_profile_of(risk_profile), default_params)
+                if risk_profile is not None else None)
     result.by_regime = regime_split.split(
         trades(fills_to_rows(full_default.fills), full_default.shorts, full_default.funding),
         research, bench.equity, full_default.equity)

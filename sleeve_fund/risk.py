@@ -6,9 +6,13 @@ out of the strategy process into an independent risk service.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
+
+
+OWN_LEVERAGE = "max_leverage"  # B-35 (a): a Strategy's own leverage cap, under its risk profile's
 
 
 @dataclass(frozen=True)
@@ -99,21 +103,46 @@ def check(profile: RiskProfile, equity: float, peak: float, day_open: float, hal
     return None
 
 
+def own_leverage(params: dict | None) -> float | None:
+    """B-35 (a): a Strategy's own leverage cap (params["max_leverage"]), or None when it has none or it isn't a number
+    of at least 1x (the model's config refuses such a value on save and Start, check_own_leverage)."""
+    v = (params or {}).get(OWN_LEVERAGE)
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v < 1:
+        return None
+    return float(v)
+
+
+def check_own_leverage(v) -> None:
+    """B-35 (a): raises ValueError for a Strategy's own leverage cap that isn't a number of at least 1x."""
+    if v is not None and own_leverage({OWN_LEVERAGE: v}) is None:
+        raise ValueError(f"{OWN_LEVERAGE} {v!r} must be a number of at least 1 (times); it can lower the risk "
+                         "profile's leverage cap, never raise it")
+
+
+def capped_leverage(p: RiskProfile, params: dict | None = None) -> float:
+    """B-35 (a): the profile's leverage cap, lowered by the Strategy's own (own_leverage), never raised by it."""
+    own = own_leverage(params)
+    return p.max_leverage if own is None else min(own, p.max_leverage)
+
+
 def leverage_cap(p: RiskProfile, params: dict | None = None) -> float:
-    """The leverage a position is margined at: the profile's cap, or a two-leg Strategy's perp leg's own setting
-    (params["leg"]["leverage"]) when lower, never above 2x (P2-8, Advisor 05:35 UK: min(leg, 2x, profile)). The one
-    figure for its margin, liquidation price and the gate's book (LongFlatStrategy._max_leverage, fund_holdings)."""
+    """The leverage a position is margined at: the profile's cap lowered by the Strategy's own (capped_leverage, B-35
+    (a)), or a two-leg Strategy's perp leg's own setting (params["leg"]["leverage"]) when lower, never above 2x (P2-8,
+    Advisor 05:35 UK: min(leg, 2x, profile)). The one figure for its margin, liquidation price and the gate's book
+    (LongFlatStrategy._max_leverage, fund_holdings)."""
+    cap = capped_leverage(p, params)
     leg = (params or {}).get("leg") or {}
     if leg.get("leverage") is None:
-        return p.max_leverage
-    return min(float(leg["leverage"]), 2.0, p.max_leverage)
+        return cap
+    return min(float(leg["leverage"]), 2.0, cap)
 
 
 def position_cap(p: RiskProfile, params: dict | None = None) -> float:
     """The largest position's notional as a multiple of equity. On spot, the profile's position cap. On a
     perpetual the same cap applies to the margin, and the notional is that margin times the leverage cap
-    (PM, 5 Oct 2026): balanced puts at most 33% of equity up as margin, at 2x a notional of 66%. The
+    (PM, 5 Oct 2026): balanced puts at most 33% of equity up as margin, at 2x a notional of 66% (at the
+    Strategy's own lower cap, B-35 (a), that cap's). The
     stop-to-liquidation and liquidation-distance guards still bound it."""
     from sleeve_fund import markets
 
-    return p.max_position_pct * p.max_leverage if markets.is_perp(params) else p.max_position_pct
+    return p.max_position_pct * capped_leverage(p, params) if markets.is_perp(params) else p.max_position_pct

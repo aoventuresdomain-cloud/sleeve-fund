@@ -57,22 +57,25 @@ def places_stop(strategy: str, params: dict | None) -> bool:
 
 
 def check_perp_stop(strategy: str, params: dict | None, risk_profile: str) -> None:
-    """Refuse a model on a perpetual that places no stop when its risk profile allows more than 1x (the Advisor's
+    """Refuse a model on a perpetual that places no stop when its risk profile, lowered by its own leverage cap
+    (B-35 (a)), allows more than 1x (the Advisor's
     interim minimum for the hand-coded models, until every model must place one). Such a position relies on the
     liquidation price alone. Spot, and any strategy that places a stop, are unaffected. Called wherever a
     strategy is created, edited or started; backtests and studies still run, so the risk can be measured."""
     from sleeve_fund import markets
-    from sleeve_fund.risk import PROFILES
+    from sleeve_fund.risk import PROFILES, capped_leverage, own_leverage
 
     profile = PROFILES.get(risk_profile)
     if profile is None or not markets.is_perp(params or {}) or places_stop(strategy, params):
         return
-    if profile.max_leverage > STOPLESS_MAX_LEVERAGE:
+    # B-35 (a): the Strategy's own leverage cap (max_leverage) can hold it there under a profile that allows more
+    if (lev := capped_leverage(profile, params)) > STOPLESS_MAX_LEVERAGE:
         within = [p.name for p in PROFILES.values() if p.max_leverage <= STOPLESS_MAX_LEVERAGE]
+        allows = (f"its own leverage cap is {lev:g}x" if own_leverage(params) is not None and lev < profile.max_leverage
+                  else f"the {risk_profile} risk profile allows {lev:g}x")
         raise ValueError(f"{strategy.replace('_', ' ').capitalize()} on a perpetual places no stop, so it is capped at "
-                         f"{STOPLESS_MAX_LEVERAGE:g}x, and the {risk_profile} risk profile allows "
-                         f"{profile.max_leverage:g}x. Choose the {' or '.join(within)} profile, or set a stop-loss, an "
-                         "ATR stop or a swing stop")
+                         f"{STOPLESS_MAX_LEVERAGE:g}x, and {allows}. Choose the {' or '.join(within)} profile, set its "
+                         f"leverage cap to {STOPLESS_MAX_LEVERAGE:g}x, or set a stop-loss, an ATR stop or a swing stop")
 
 
 __all__ = [
