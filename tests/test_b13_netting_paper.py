@@ -255,3 +255,16 @@ def test_b13p_the_night_fails_on_a_residual_over_the_line_and_passes_otherwise(s
     monkeypatch.setattr(nt, "reconcile", lambda s, b, a, e: real(s, b, a + D("60"), e))
     [(st, what)] = nightly_recon.netting_shadow(store).lines
     assert st == FAIL and "trading unaffected" in what
+
+
+def test_b13w_the_portfolio_tabs_reach_the_shadow_page(store, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from sleeve_fund.dashboard import app as dash
+
+    monkeypatch.setenv("DASHBOARD_PASSWORD", "pw")
+    c = TestClient(dash.create_app(store))
+    for path, here in (("/netting-shadow", True), ("/trades", False)):
+        tabs = c.get(path, auth=("pm", "pw")).text.split('class="tabs desk-tabs"')[1].split("</nav>")[0]
+        assert '<a href="/netting-shadow" ' + ("aria-current=page" if here else "") in tabs
+        assert ">Netting (shadow)</a>" in tabs and tabs.count("aria-current=page") == 1
