@@ -375,11 +375,17 @@ def register(app: FastAPI, *, page, st, tearsheets, stored_history, venue_choice
         twin = other_side(entries, e)
         if other == "on" and twin is not None and not twin.archived and not twin.runs_on:
             todo.append(twin)
+        done = []
         for x in todo:
             said = note.strip() if x is e else f"archived with its other side, {e.file_id}" + (
                 f": {note.strip()}" if note.strip() else "")
-            store.archive_definition(x.key, definition_hash=x.hash, status=x.status, reason=reason,
-                                     note=said or None, actor=actor)
+            try:  # one archive row and decision each, in their own transaction: say plainly what did get archived
+                store.archive_definition(x.key, definition_hash=x.hash, status=x.status, reason=reason,
+                                         note=said or None, actor=actor)
+            except ValueError as err:
+                kept = f" {', '.join(done)} was archived." if done else ""
+                raise HTTPException(409, f"{x.file_id} could not be archived: {err}.{kept}") from err
+            done.append(x.file_id)
         return RedirectResponse(f"/strategy/archived?done={'+'.join(x.key for x in todo)}", status_code=303)
 
     @app.post("/strategy/restore")

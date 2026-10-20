@@ -307,3 +307,18 @@ def test_archived_strategy_opens_read_only(client):
     _archive(c, "qr02-dip-long")
     html = c.get("/strategy?s=qr02-dip-long&tab=test", auth=AUTH).text
     assert ">Run test</button>" not in html and "Archived" in html and 'name="assets"' not in html
+
+
+def test_pair_archive_failing_on_the_other_side_says_what_was_archived(client, monkeypatch):
+    c, store = client
+    real = store.archive_definition
+
+    def second_fails(file_id, **kw):
+        if file_id == PAIR[1]:
+            raise ValueError("already archived")
+        return real(file_id, **kw)
+
+    monkeypatch.setattr(store, "archive_definition", second_fails)
+    r = _archive(c, PAIR[0], other="on")
+    assert r.status_code == 409 and PAIR[1] in r.json()["detail"] and f"{PAIR[0]} was archived" in r.json()["detail"]
+    assert _counts(store)["definition_archive"] == 1  # the first stays, and the answer says so
