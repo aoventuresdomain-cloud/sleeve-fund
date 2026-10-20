@@ -338,6 +338,6 @@ def test_display_title_leads_and_file_id_stays_as_label(client, fid):
 
 def test_reads_column_only_when_a_block_reads_something_but_the_price(client):
     c, _ = client
-    table = lambda fid: c.get(f"/strategy?s={fid}", auth=AUTH).text.split("Indicators used")[1].split("Settings to test")[0]  # noqa: E731
+    table = lambda fid: c.get(f"/strategy?s={fid}", auth=AUTH).text.split("Indicators used")[1].split("Settings to test")[0]
     assert "<th>Reads</th>" not in table("qr02-dip-long")  # every block reads the price
     assert "<th>Reads</th>" in table("rsi-pullback")  # one block reads the volume
