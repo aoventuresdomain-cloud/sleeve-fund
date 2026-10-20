@@ -65,6 +65,24 @@ def test_a_winner_can_lose_its_gain_too(store):  # noqa: F811
     assert _down50(view)["loss"] == pytest.approx(QTY * mark * 0.5)
 
 
+def test_a_winners_fall_past_its_liquidation_books_the_cap_not_the_move(store, monkeypatch):  # noqa: F811
+    """(a), the other side of the min (Advisor 16:07 UK): the same +10% winner falling 60% ends at 26,400, past its
+    liquidation, so the row books margin 3,000 + gain 600 + the fee, not the 3,960 move. The page's own shocks stop at
+    50%, so the cell adds a 60% one to the same rows."""
+    from sleeve_fund.dashboard import riskops
+
+    monkeypatch.setattr(riskops, "SHOCKS", (-0.60, *riskops.SHOCKS))
+    _hold(store)
+    mark = ENTRY * 1.10
+    s = _long(store, "win", mark)
+    cap, posted, liq = _expected(store, s, mark)
+    assert mark * 0.4 < liq
+    view, _ = _view(store)
+    down60 = next(sc for sc in view["scenarios"] if sc["shock"] == -0.60)
+    assert down60["loss"] == pytest.approx(cap) and cap < QTY * mark * 0.6
+    assert cap - posted - QTY * (mark - ENTRY) > 0  # the liquidation fee on top
+
+
 def test_a_loser_loses_its_remaining_margin_and_the_fee_never_0(store):  # noqa: F811
     """(b) 2x long at -20%, then a 50% fall past its liquidation: the remaining margin (3,000 - 1,200) and the fee."""
     _hold(store)
