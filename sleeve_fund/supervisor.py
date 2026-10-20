@@ -662,16 +662,21 @@ def check_quote_places(s: Sleeve, account: str) -> str | None:
 
 RESTING_STOPS_OFF = ("its stop would rest at the venue as a reduce-only order, and paper sends no resting stop until "
                      "the test-network drills pass: turn resting stops off to run it")
+RESTING_TARGETS_OFF = ("its target would rest at the venue as a reduce-only limit order, and paper sends no resting "
+                       "target until the PM switches resting targets on: turn resting targets off to run it")
 
 
 def check_resting_entries(s: Sleeve) -> None:
     """RESTING-OFF (HoE, Advisor 13 Oct): raises ValueError for a Strategy whose entries would rest at the venue
     (maker_wait_minutes set), until ORPHAN-GUARD lands. Market entries are unaffected; a backtest never comes here.
-    A1 (BGL-1): resting stops are built but OFF: refused too, until the PM's switch-on after the drills."""
+    A1 (BGL-1): resting stops are built but OFF: refused too, until the PM's switch-on after the drills. B-14: so are
+    resting targets, until the PM switches them on."""
     if (s.params or {}).get("maker_wait_minutes"):
         raise ValueError(RESTING_OFF)
     if (s.params or {}).get("resting_stops"):
         raise ValueError(RESTING_STOPS_OFF)
+    if (s.params or {}).get("resting_targets"):
+        raise ValueError(RESTING_TARGETS_OFF)
 
 
 class Supervisor:
