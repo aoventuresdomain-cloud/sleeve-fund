@@ -3847,6 +3847,14 @@ class Store:
         with self.engine.connect() as c:
             return c.execute(select(func.max(mirror_t.c.fill_id)).where(mirror_t.c.sleeve == sleeve)).scalar()
 
+    def order_state(self, order_id: str) -> dict | None:
+        """An order's status, intent and reason, or None for an id the journal has no row for (B-33: the demo copy
+        sends one demo order per paper order once it is finished, reduce-only when it closes)."""
+        with self.engine.connect() as c:
+            row = c.execute(select(orders_t.c.status, orders_t.c.intent, orders_t.c.reason)
+                            .where(orders_t.c.order_id == order_id)).first()
+        return None if row is None else {"status": row.status, "intent": row.intent, "reason": row.reason or ""}
+
     def order_reason(self, order_id: str) -> str:
         with self.engine.connect() as c:
             return c.execute(select(orders_t.c.reason).where(orders_t.c.order_id == order_id)).scalar() or ""
