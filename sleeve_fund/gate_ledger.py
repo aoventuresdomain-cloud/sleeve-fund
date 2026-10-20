@@ -242,7 +242,8 @@ class DbLedger:
                    "outcome": decision.outcome, "limit_hit": limit_hit,
                    "requested_qty": stored(decision.requested_qty), "approved_qty": stored(decision.approved_qty),
                    "price": stored(intent.price), "decided_at": at, **self._figures(intent.underlying),
-                   **self._idea(intent), **self._leverage(intent, decision)}
+                   **self._idea(intent), **self._leverage(intent, decision),
+                   **{k: None if v is None else stored(v) for k, v in decision.t1.items()}}
             if pending is not None:
                 rid, who, holding, made, qty = pending
                 if who != strategy or decision.approved_qty <= 0:
