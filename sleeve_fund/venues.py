@@ -116,6 +116,10 @@ class VenueProfile:
     # venue's live tick is read for the start check (check_price_ticks)
     price_ticks: dict[str, str] = field(default_factory=dict)
     live_tick: Callable[[str], Decimal] | None = None
+    # B-44: pair -> (quantity step, minimum order quantity), kept from the same listing as the tick, and how the venue's
+    # live lot size is read (paper_venue_lot). Sizing rounds down to the step and refuses below the minimum.
+    lot_sizes: dict[str, tuple[str, str]] = field(default_factory=dict)
+    live_lot: Callable[[str], tuple[Decimal, Decimal]] | None = None
     # FEE-LIVE: the published range a fetched fee rate must fall in ({"maker": (lowest, VIP 0), "taker": ...}) and
     # where it was read; a profile without one has no fetched rates (venue_terms refuses to read them)
     fee_bounds: dict[str, tuple] | None = None
@@ -157,10 +161,36 @@ class VenueProfile:
         tick = self.contract_tick(f"{base}/{quote}")
         if tick is not None:  # B-43: the one tick source, over the contract limits' and the default's
             limits["price_precision"] = max(0, -tick.as_tuple().exponent)
+        lot = self.contract_lot(f"{base}/{quote}")
+        if lot is not None:  # B-44: the step and minimum from the same listing, over the contract limits'
+            step, least = lot
+            limits.update(size_precision=max(0, -step.as_tuple().exponent), min_quantity=float(least))
         return perpetual(base, quote, fees=fees or self.fees, venue=self.venue, symbol=self.symbol_of(f"{base}/{quote}"),
                          price_precision=limits.get("price_precision", price_precision),
                          size_precision=limits.get("size_precision", min(size_precision, 3)),
-                         min_quantity=limits.get("min_quantity"), min_notional=limits.get("min_notional", 5.0))
+                         min_quantity=limits.get("min_quantity"), min_notional=limits.get("min_notional", 5.0),
+                         size_increment=lot[0] if lot is not None else None)
+
+    def contract_lot(self, pair: str) -> tuple[Decimal, Decimal] | None:
+        """B-44: the (quantity step, minimum order quantity) an instrument on `pair` is built with: the venue's live
+        listing, else the kept one, said on stderr either way they part (as contract_tick): a failed read takes the kept
+        lot; a live lot that differs from the kept one wins. None when it can't be read and none is kept: the contract
+        limits then stand, as before B-44."""
+        kept = self.lot_sizes.get(pair)
+        kept = tuple(Decimal(x).normalize() for x in kept) if kept else None
+        if self.live_lot is None:
+            return kept
+        try:
+            live = tuple(Decimal(str(x)).normalize() for x in self.live_lot(pair))
+        except Exception as exc:  # noqa: BLE001 - an unreachable venue: the kept lot, said
+            if kept is not None:
+                print(f"{self.label}: live lot size for {pair} unavailable ({exc!r}); the kept step {kept[0]} and "
+                      f"minimum {kept[1]} are used", file=sys.stderr)
+            return kept
+        if kept is not None and live != kept:
+            print(f"{self.label}: the live lot size (step {live[0]}, minimum {live[1]}) for {pair} differs from the kept "
+                  f"(step {kept[0]}, minimum {kept[1]}); the live one is used", file=sys.stderr)
+        return live
 
     def contract_tick(self, pair: str) -> Decimal | None:
         """B-43: the price tick an instrument on `pair` is built with: the venue's live tick, else the kept one (B-36b),
@@ -476,6 +506,20 @@ def paper_venue_listing(pair: str, get_json=None) -> dict:
     return rows[0]
 
 
+def paper_venue_lot(pair: str, get_json=None) -> tuple[Decimal, Decimal]:
+    """B-44: the paper venue's live (quantity step, minimum order quantity) for `pair`, exactly as its listing's
+    lotSizeFilter gives them. Raises ValueError when either is missing or not above 0, or the minimum isn't a whole
+    number of steps."""
+    f = paper_venue_listing(pair, get_json).get("lotSizeFilter") or {}
+    step, least = f.get("qtyStep"), f.get("minOrderQty")
+    if not step or not least:
+        raise ValueError(f"the venue lists no lot size for {pair}")
+    step, least = Decimal(step).normalize(), Decimal(least).normalize()
+    if step <= 0 or least <= 0 or least % step:
+        raise ValueError(f"the venue's lot size for {pair} can't be used: step {step}, minimum {least}")
+    return step, least
+
+
 def paper_venue_tick(pair: str, get_json=None) -> Decimal:
     """The paper venue's live price tick for `pair`, exactly as its listing's priceFilter gives it (B-43)."""
     tick = (paper_venue_listing(pair, get_json).get("priceFilter") or {}).get("tickSize")
@@ -743,6 +787,9 @@ BINANCE = register(VenueProfile(
     maintenance_limits={"BTC/USDT": 1_200_000_000},  # past it the venue takes no position; nor do we
     price_ticks={"BTC/USDT": "0.1"},  # B-36b: kept with its tiers, read 20 Oct 2026; another pair is checked in with its table
     live_tick=paper_venue_tick,
+    # B-44: kept from the same listing (tests/data/fee_live/instruments-info-BTCUSDT.json, read 20 Oct 2026)
+    lot_sizes={"BTC/USDT": ("0.001", "0.001")},
+    live_lot=paper_venue_lot,
     core_pairs=("BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "SUI/USDT"),
     hub=True,
 ))
