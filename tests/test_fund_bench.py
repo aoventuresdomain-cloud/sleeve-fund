@@ -3,6 +3,7 @@ flows bought and sold at their time, funding on a perpetual's long, returns from
 
 from __future__ import annotations
 
+from functools import partial
 from datetime import UTC, datetime, timedelta
 
 import numpy as np
@@ -74,12 +75,13 @@ def test_no_base_or_a_base_at_0_or_below_has_no_return():
     assert chained_return(v, -5) is None
 
 
-def _hub(tmp_path, n_days=3):
+def _hub(tmp_path, n_days=3, tail=0):
+    """`tail`: minutes past the last whole day, so the latest stored close isn't a day's last."""
     from sleeve_fund.venues import VENUES
 
     venue = next(v for v in VENUES.values() if v.hub)
     hist = HistoryStore(tmp_path)
-    idx = pd.date_range(T0 - timedelta(hours=3), periods=(n_days * 1440) + 180, freq="1min", tz="UTC")
+    idx = pd.date_range(T0 - timedelta(hours=3), periods=(n_days * 1440) + 180 + tail, freq="1min", tz="UTC")
     c = 10_000.0 + np.arange(len(idx), dtype=float) * 0.5
     hist.append(venue.name, BENCH_PAIR, pd.DataFrame({"open": c, "high": c, "low": c, "close": c, "volume": 1.0},
                                                      index=idx), cursor="c")
@@ -183,7 +185,73 @@ def test_a_reports_window_measures_the_hold_bought_at_its_start_on_the_books_equ
     fb = fund_hold(store, curve.index[0] + pd.Timedelta(days=1), e0)
     assert perf["bench"] == pytest.approx(float(fb.values.iloc[-1]) / e0 - 1)
     month = reports.monthly(summaries, frames, {}, base, hold)
-    assert all(r["bench_ret"] is not None and r["bench_ret"] > -0.01 for r in month["rows"])
+    # CR M1: the month's benchmark is the hold bought at the month's start on the book's equity then, to its end
+    [row] = month["rows"]
+    own = fund_hold(store, curve.index[0], base, curve.resample("ME").last().index[-1] + pd.Timedelta(days=1))
+    assert row["bench_ret"] == pytest.approx(float(own.values.iloc[-1]) / base - 1) and row["bench_ret"] > 0.05
+    # CR F3: the window's chart line is the same hold, day by day: its last day's last value, from E0
+    on_last_day = fb.values[fb.values.index.floor("1D") == curve.index[-1]].iloc[-1]
+    assert perf["chart"]["bench"][-1] == pytest.approx((float(on_last_day) / e0 - 1) * 100, abs=1e-4)
+    assert perf["chart"]["bench"][-1] > 1
+
+
+def test_a_later_months_benchmark_is_bought_at_the_end_of_the_month_before():
+    """CR F3: the close of the month before is its last daily label's day end, never that label's start."""
+    from sleeve_fund.dashboard.reports import _close_of
+
+    ends = pd.DatetimeIndex([pd.Timestamp("2026-10-31", tz="UTC"), pd.Timestamp("2026-11-30", tz="UTC")])
+    curve = pd.DataFrame(index=pd.DatetimeIndex([pd.Timestamp("2026-10-10", tz="UTC")]))
+    assert _close_of(ends, ends[1], curve) == pd.Timestamp("2026-11-01", tz="UTC")
+    assert _close_of(ends, ends[0], curve) == curve.index[0]
+
+
+def test_the_latest_point_is_the_latest_stored_close_mid_day(tmp_path):
+    """CR F3: with the hub's last close mid-day, the line ends there, never on the day before's close."""
+    hist, venue = _hub(tmp_path, tail=600)
+    fb = fund_hold(None, T0, 100_000, hist=hist, fee=FEE)
+    closes = hist.read(venue.name, BENCH_PAIR, minutes=1)["close"]
+    assert closes.index[-1].hour == 9  # mid-day, not a day's last close
+    assert fb.as_of == closes.index[-1] == fb.values.index[-1]
+    assert fb.values.index[-2] == closes[closes.index < closes.index[-1].floor("1D")].index[-1]
+
+
+def test_the_recent_curve_draws_the_funds_hold_in_place_of_the_rows(tmp_path, monkeypatch):
+    """CR F3: recent_curve's benchmark is the hold it's given, not the Strategies' rows added up."""
+    from sleeve_fund.dashboard import book as bookm
+
+    store, _, _ = _fund_book(tmp_path, monkeypatch)
+    base = bookm.fund_cash(store)
+    line = bookm.fund_line(store, base)
+    sleeves = [store.sleeve("s1"), store.sleeve("s2")]
+    plain = bookm.recent_curve(store, sleeves, 7, None, base)
+    held = bookm.recent_curve(store, sleeves, 7, None, base, bench=line.values)
+    assert set(plain["benchmark"]) == {base}  # the rows hold 0: their sum is only the fund's cash
+    assert held["benchmark"].iloc[-1] == pytest.approx(float(line.values.iloc[-1]))
+
+
+def test_the_records_page_shows_the_funds_hold_for_the_window_and_each_month(tmp_path, monkeypatch):
+    """CR M2: the Records page passes the fund's hold to Reports: a figure in the month table and the window."""
+    from fastapi.testclient import TestClient
+
+    from sleeve_fund.dashboard import app as app_mod
+    from sleeve_fund.dashboard import book as bookm
+    from sleeve_fund.dashboard import reports
+
+    store, summaries, frames = _fund_book(tmp_path, monkeypatch)
+    monkeypatch.setenv("DASHBOARD_PASSWORD", "test-pw")
+    monkeypatch.setenv("TEARSHEET_DIR", str(tmp_path))
+    monkeypatch.setenv("BACKUP_DIR", str(tmp_path / "backups"))
+    monkeypatch.delenv("DEMO_MIRROR", raising=False)
+    monkeypatch.setattr(app_mod, "TEARSHEETS", tmp_path)
+    monkeypatch.setattr(app_mod, "LEDGER", tmp_path / "idea_ledger.jsonl")
+    page = TestClient(app_mod.create_app(store)).get("/records", auth=("pm", "test-pw"))
+    assert page.status_code == 200, page.text[-2000:]
+    base = bookm.fund_cash(store)
+    [row] = reports.monthly(summaries, frames, {}, base, partial(fund_hold, store))["rows"]
+    assert row["bench_ret"] > 0.05
+    assert f'data-label="Benchmark">{row["bench_ret"]:+.2%}</td>' in page.text
+    perf = reports.performance(summaries, frames, [], None, None, base, partial(fund_hold, store))
+    assert abs(perf["bench"]) > 0.05 and f"buy-and-hold {perf['bench']:+.1%}" in page.text
 
 
 def test_a_month_with_no_base_reads_n_a():
