@@ -4772,7 +4772,6 @@ class Store:
         settings of its own in deploy format). A T5 brake switched back on is re-based to the book first
         (gate.rebase_brakes), before the version that turns it on is written, so no mark between the two can judge it
         against its old reference; journaled with the true drawdown."""
-        import os
 
         from sleeve_fund import compliance_rules as rules
 
@@ -4827,15 +4826,15 @@ class Store:
                 on = {r["test"]: r["enabled"] for r in rows}
                 off_now = [k for k in BRAKE_SWITCHES if was.get(k, True) and not on.get(k, True)]
                 if off_now:
-                    from sleeve_fund.paper.exec_client import exec_settings, published_on
+                    from sleeve_fund.paper.exec_client import client_state
 
                     names = ", ".join(rules.name(k) for k in off_now)
-                    said = None if environ is not None else published_on(self)
-                    if environ is None and said is None:
+                    state = client_state(self, environ)
+                    if state == "unknown":
                         raise ValueError(f"{names} can't be switched off until the supervisor has said the exchange "
                                          "order client is off (it says so when it starts): switching the whole-fund "
                                          "test or a loss brake off is for paper testing only")
-                    if exec_settings(os.environ if environ is None else environ).on or said:
+                    if state == "on":
                         raise ValueError(
                             f"{names} can't be switched off while the exchange order client is on: switching the "
                             "whole-fund test or a loss brake off is for paper testing only")

@@ -270,3 +270,19 @@ def test_a_stale_form_never_rebases_a_brake_another_form_switched_on(store):  # 
         store.add_compliance_version(_edit(stale, fund_drawdown=True), stale.asset_types,
                                      expected_version=stale.version, note="testing the fund", now=NOW, environ={})
     assert _state(store).halt_reference == D(90_000)
+
+
+def test_the_one_client_reader_says_on_off_or_unknown_for_the_store_and_the_page(store, monkeypatch):  # noqa: F811
+    """CR MUST (20 Oct): one reader (exec_client.client_state) that the store's save and FE's page both call."""
+    from sleeve_fund.paper.exec_client import client_state, publish
+
+    for var in ON:
+        monkeypatch.delenv(var, raising=False)
+    assert client_state(store) == "unknown"
+    publish(store, ON)
+    assert client_state(store) == "on"
+    publish(store, {})
+    assert client_state(store) == "off"
+    monkeypatch.setenv("EXEC_MODE", "demo")  # this process's own settings on: on, whatever the supervisor said
+    assert client_state(store) == "on"
+    assert client_state(store, {}) == "off" and client_state(store, ON) == "on"  # a given environ alone decides
