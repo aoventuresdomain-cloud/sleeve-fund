@@ -608,12 +608,13 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         try:  # B-39: a perp on an instrument with no kept tiers is refused in words, never crashed at start
             markets.check_kept_tiers((row,) + ((second,) if second is not None else tuple(assets)))
-        except ValueError as exc:
-            if not store.holds_any(row.name):  # a holder still runs for its exits, as F-ZS-2
-                store.set_desired_state(row.name, "stopped")
-                store.set_status(row.name, "stopped", f"not started: {exc}")
-                store.event(row.name, "error", "start_refused", f"Not started: {exc}")
-                return 1
+        except ValueError as exc:  # even a holder: its node would raise at the strategy's init, so nothing would run
+            held = (". It still holds a position, which a flatten can't close while it can't start: an engineer "
+                    "needs to close it" if store.holds_any(row.name) else "")
+            store.set_desired_state(row.name, "stopped")
+            store.set_status(row.name, "stopped", f"not started: {exc}{held}")
+            store.event(row.name, "error", "start_refused", f"Not started: {exc}{held}")
+            return 1
         configs = []
         for r in (row,) + ((second,) if second is not None else tuple(assets)):
             acct = store.account_of(r.name)

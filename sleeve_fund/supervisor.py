@@ -716,6 +716,9 @@ class Supervisor:
         s = self.store.sleeve(name)
         try:
             check_hub_bar_spec(s.venue, s.bar_spec)
+            # B-39: a perp with no kept tiers (VS-1) can't start at all, even for its exits: its node would raise at
+            # the strategy's init. Refused in words here, as the venue's own candles are (FE's review, 20 Oct).
+            check_kept_tiers(_strategy_rows(self.store, s))
         except ValueError as exc:
             held = (f". It still holds a position ({_held_words(self.store, name)}), which a flatten can't close while "
                     "it can't start: an engineer needs to close it" if self.store.holds_any(name) else "")
@@ -729,7 +732,6 @@ class Supervisor:
             check_perp_sizing(s.strategy, s.params)
             check_perp_stop(s.strategy, s.params, s.risk_profile)
             check_funding_schedule(s)
-            check_kept_tiers(_strategy_rows(self.store, s))  # B-39: a perp with no kept tiers, refused in words
             check_resting_entries(s)
             warn = check_quote_places(s, self.store.account_of(name))
         except ValueError as exc:
