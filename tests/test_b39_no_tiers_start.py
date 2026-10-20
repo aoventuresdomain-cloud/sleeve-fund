@@ -97,3 +97,26 @@ def test_the_supervisor_never_spawns_an_untiered_perp_and_starts_the_tiered_one(
     assert "eth-perp" not in started and "btc-perp" in started, started
     assert s.desired_state == "stopped" and "ETH/USDT has no maintenance table kept" in s.status_reason, s.status_reason
     assert [e for e in store.events("eth-perp", limit=10) if e["kind"] == "start_refused"]
+
+
+@pytest.mark.parametrize("shape", ["two_legs", "assets"])
+def test_a_strategy_whose_other_leg_is_an_untiered_perp_is_refused_by_the_supervisor(url, shape):
+    """CR2 (FOLLOW-UP, HoE): the supervisor checks every row the Strategy's process runs, not its first one only: a
+    two-leg Strategy whose second leg, or a multi-asset one whose asset leg, is a perp on an untiered pair is refused."""
+    from sleeve_fund.supervisor import Supervisor
+
+    store = Store(url)
+    _fund(store)
+    if shape == "two_legs":
+        store.create_two_legs(name="carry", strategy="ping_pong", bar_spec="1-MINUTE-LAST-INTERNAL", starting_balance=0,
+                              first={"instrument": "BTC/USDT", "params": {}, "venue": "BINANCE", "side": 1},
+                              second={"instrument": "ETH/USDT", "params": {"market": "perp"}, "venue": "BINANCE",
+                                      "side": -1}, desired_state="running")
+    else:
+        store.create_legs(name="carry", strategy="ping_pong", bar_spec="1-MINUTE-LAST-INTERNAL", assets=["BTC/USDT", "ETH/USDT"],
+                          params=PERP, starting_balance=0, universe_date="2026-10-15", venue="BINANCE")
+    first = store.sleeve("carry")
+    assert first.instrument == "BTC/USDT"  # its own row is fine: only the other leg has no kept tiers
+    assert Supervisor(store, python="true")._refused("carry")
+    refused = [e["message"] for e in store.events("carry") if e["kind"] == "start_refused"]
+    assert refused and "ETH/USDT has no maintenance table kept" in refused[-1], refused
