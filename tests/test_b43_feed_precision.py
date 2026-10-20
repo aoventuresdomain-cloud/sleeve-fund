@@ -168,3 +168,27 @@ def test_the_hubs_refilled_minutes_are_written_at_its_definitions_precision():
     for m in msgs:
         for k in ("o", "h", "l", "c"):
             assert len(str(m[k]).split(".")[1]) == 1, m
+
+
+@pytest.mark.parametrize("spec", ["1-MINUTE-LAST-EXTERNAL", "5-MINUTE-LAST-EXTERNAL"])
+def test_the_paper_bars_the_decoder_builds_carry_the_hubs_definition(spec):
+    """CR M1: the bars paper Strategies trade on are built by the Decoder (Decoder._bar) from the hub's minutes, at
+    the definition's precision registered at hello (hub_client.py:579). 1-place BTC minutes, one written short as a
+    refill can be ("60000.1"), come out as 1-place bars."""
+    from sleeve_fund.hub import protocol
+    from sleeve_fund.paper.hub_client import Decoder, instrument_from
+
+    sent = venue("BINANCE").instrument("BTC", "USDT")
+    inst = instrument_from(type(sent).to_dict(sent))
+    assert inst.price_precision == 1  # set-up
+    decode = Decoder(spec)
+    decode.precision[str(inst.id)] = (inst.price_precision, inst.size_precision)  # as the client does at hello
+    start, minute = 1_792_540_800_000_000_000, 60_000_000_000  # a 5-minute boundary
+    out = []
+    for i in range(11):
+        o, c = ("60000.1", "60000.1") if i == 3 else (f"{60_000 + i}.3", f"{60_000 + i}.5")
+        got = decode(protocol.bar(str(inst.id), o, "60020.9", "59990.2", c, "1.5", start + (i + 1) * minute,
+                                  start + (i + 1) * minute + 1), start + (i + 1) * minute + 1)
+        out += got if isinstance(got, list) else [got] if got is not None else []
+    assert len(out) >= 2, out  # set-up: bars were built
+    _all_at(inst, out)
