@@ -4969,6 +4969,8 @@ class Store:
             if not u or not g:
                 errors.append(f"asset {u or '?'} needs a group name")
             groups[u] = g
+        if not groups and any(r["test"] == "type_stop_loss" and r["enabled"] for r in rows):
+            errors.append(rules.EMPTY_GROUPS)  # B-42 at the store: every caller, not only the form
         if errors:
             raise ValueError("; ".join(errors))
         now = now or utcnow()
