@@ -1,6 +1,7 @@
 # QR bench: liquidity-level continuation, short leg (half risk). Decision candle: 1h. Same approximation as the long.
 version = 1
 name = "qr13-level-continuation-short"
+title = "Stop-Run Continuation (weekly level, 1h) · Short"
 reason = """Mirror of the long leg: when price breaks last week's low and reaches 1 ATR(14) beyond it before coming back
 to the level, the stops below have fired and the fall tends to continue. Out on a close back above the level, after
 48 hours, or on a stop 1 ATR above the level."""

@@ -1,6 +1,7 @@
 # QR bench: exhaustion reversal, long leg (the crash mirror). Decision candle: 15m, setup on 1h.
 version = 1
 name = "qr11-exhaustion-long"
+title = "Exhaustion Reversal (15m) · Long"
 reason = """After an extreme fall (1h RSI(14) below 15 on 2 x normal 1h volume) sellers run out; buy when 15m RSI(14)
 climbs back above 30 within four hours of the setup. Out at the 15m Bollinger(20, 2) middle, or after 12 hours;
 stop 1.5 ATR(14) below the entry close."""

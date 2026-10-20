@@ -1,6 +1,7 @@
 # QR #1 default form, short leg (half risk). Decision candle: 4h.
 version = 1
 name = "qr01b-trend-multispeed-short"
+title = "Trend Consensus (3 speeds, 4h) · Short"
 reason = """Mirror of the long leg: short when all three EMA pairs (8/32, 16/64, 32/128) point down, cover when two of
 the three turn up; 3 ATR(14) stop."""
 

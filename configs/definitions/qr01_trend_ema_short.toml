@@ -1,6 +1,7 @@
 # QR top 3, #1 trend following, short leg (run at half the long leg's risk). Decision candle: 4h.
 version = 1
 name = "qr01-trend-ema-short"
+title = "Trend Cross (21/55, 4h) · Short"
 reason = """The mirror of the long leg: be short from the candle the 21-period EMA crosses below the 55 on 4h candles
 until it crosses back, with a 3 ATR(14) stop. Short legs add little in this asset class, so half risk."""
 
