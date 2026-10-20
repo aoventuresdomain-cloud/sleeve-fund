@@ -113,7 +113,9 @@ def test_a_strategy_put_away_after_an_error_is_not_halted_and_waiting_on_home(c,
     _hold(store)
     for name in ("candle-step-btcusdt-1m", "timed-test"):
         _make(store, name, 0)
+    store.set_desired_state("candle-step-btcusdt-1m", "running")  # TEC-ERR-STOPPED (HoE): it errored while running
     store.set_status("candle-step-btcusdt-1m", "error", "node exited 1")
     assert "1 strategy halted and waiting for you" in _text(c.get("/", auth=AUTH).text)  # a live one waits for the PM
+    store.set_desired_state("candle-step-btcusdt-1m", "stopped")  # archiving needs a stop
     store.archive("candle-step-btcusdt-1m")
     assert "halted and waiting" not in _text(c.get("/", auth=AUTH).text)

@@ -34,7 +34,7 @@ from sleeve_fund.dashboard import development as dev
 from sleeve_fund.dashboard import assets, attribution, compliance, gates, legs, reasons, reports, riskops, trading, withdrawal
 from sleeve_fund.dashboard.account_view import account_view
 from sleeve_fund.dashboard.jobs import Jobs
-from sleeve_fund.dashboard.metrics import STALE, held_by_fund, sleeve_summary
+from sleeve_fund.dashboard.metrics import STALE, held_by_fund, shown_status, sleeve_summary
 from sleeve_fund.data import spec_minutes
 from sleeve_fund.fees import resolve as resolve_fees
 from sleeve_fund.history import REQUEST_YEARS
@@ -177,6 +177,7 @@ def create_app(store: Store | None = None) -> FastAPI:
     # Biggest contributor first, by size whatever its sign (UP-3): rows keep their sign colour and bar direction.
     templates.env.filters["by_size"] = lambda rows, field: sorted(rows, key=lambda x: -abs(x[field]))
     templates.env.filters["money"] = lambda x: f"{x:,.2f}"
+    templates.env.filters["shown"] = lambda s: shown_status(s, st())  # stopped and flat after an error: stopped
     # NaN-safe versions for stats that don't exist until a trade has closed.
     templates.env.filters["pctn"] = lambda x: "n/a" if x != x else f"{x:+.1%}"
     templates.env.filters["numn"] = lambda x: "n/a" if x != x else ("∞" if x == float("inf") else f"{x:.2f}")
@@ -244,11 +245,11 @@ def create_app(store: Store | None = None) -> FastAPI:
             "total": len(ones),
             "running": sum(1 for x in ones if x.status == "running"),
             # a Strategy put away waits for nobody: its last halt or error is history, not "halted" (B-29 add-on)
-            "attention": sum(1 for x in ones if x.status in ("halted", "error") and x.name not in put_away),
+            "attention": sum(1 for x in ones if shown_status(x, st()) in ("halted", "error") and x.name not in put_away),
             "unhealthy": len({x.parent or x.name for x in wanted
                               if not (x.heartbeat_at and now - x.heartbeat_at < STALE)}),
             # The rail lists every strategy not put away, so each is one click from anywhere.
-            "strategies": [{"name": x.name, "status": x.status, "test": bookm.is_test_account(st(), x)}
+            "strategies": [{"name": x.name, "status": shown_status(x, st()), "test": bookm.is_test_account(st(), x)}
                            for x in ones if x.name not in put_away],
         }
 
@@ -421,7 +422,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         fund_dd = riskops.fund_drawdown_view(st()) if book["fund_cash"] else None  # PAGE-DD
         return page(request, "risk.html", fund_dd=fund_dd, book=book, risk=risk, health=health, chart=chart, size=riskops.gate_size(st(), book),
                     halt_name=halt[0] if halt else None, stress=riskops.stress_bars(risk["scenarios"]),
-                    status=riskops.status_word(riskops.status_items(risk["rows"], health), running),
+                    status=riskops.status_word(riskops.status_items(risk["rows"], health, st()), running),
                     ops=riskops.ops_view(st(), every), shell=shell(sleeves + [x["sleeve"] for x in tests]), kill=kill,
                     kill_error=request.query_params.get("kill_error"), killed=request.query_params.get("killed"),
                     acct=account_view(st(), utcnow()))  # B-23

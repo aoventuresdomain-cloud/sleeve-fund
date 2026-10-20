@@ -8,7 +8,7 @@ from sleeve_fund import markets
 from sleeve_fund.research.metrics import trade_stats, trades
 from sleeve_fund.risk import position_cap
 from sleeve_fund.risk import profile as risk_profile
-from sleeve_fund.store import Sleeve, Store, utcnow
+from sleeve_fund.store import OPEN_ORDER_STATUSES, Sleeve, Store, utcnow
 
 STALE = timedelta(minutes=3)
 
@@ -22,6 +22,17 @@ def held_by_fund(store: Store, s: Sleeve) -> bool:
     from sleeve_fund.supervisor import bridge_start, outside_fund_book
 
     return bridge_start(store) is not None and not is_backtest(s.name) and not outside_fund_book(store, s)
+
+
+def shown_status(s: Sleeve, store: Store) -> str:
+    """The status the pages show, display only (no gate, brake, risk or order path reads it): a Strategy left in error
+    that the PM has stopped (or put away, which stops it first) and that is flat, holding no position and no working
+    order, reads as stopped, since its error was its last run's and nothing retries it (HoQA, Head 4 live check; HoE).
+    One still holding something stays in error. The stored status is left as it is."""
+    if s.status != "error" or s.desired_state == "running":
+        return s.status
+    flat = not store.holds_any(s.name) and not store.orders(s.name, statuses=OPEN_ORDER_STATUSES, limit=1)
+    return "stopped" if flat else s.status
 
 
 def sleeve_summary(store: Store, s: Sleeve) -> dict:

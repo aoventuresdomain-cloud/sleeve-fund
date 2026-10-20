@@ -66,7 +66,7 @@
     <div class="srow h" aria-hidden="true"><span>Strategy</span><span class="r">Exposure</span><span class="r">Today</span><span>{{ "Pause and halt" if book.fund_cash else "Room before halt" }}</span><span class="r">Stop</span></div>
     {% for r in risk.rows %}{% set x = r.x %}{% set s = x.sleeve %}{% set left = [x.profile.max_drawdown - x.drawdown, 0]|max %}
     <div class="srow">
-      <div class="nm"><span class="rh-dot {{ tone_of(s.status) }}" title="{{ s.status|capitalize }}"></span><div><a href="/sleeves/{{ s.name }}">{{ s.name|leg_label }}</a><span>{% if r.legs %}Two legs, {{ x.pair.words|lower }}{% else %}{{ s.instrument }}{% endif %} · {{ s.status|capitalize }}{% if x.test_account %} · {{ test_chip() }}{% endif %}</span></div></div>
+      <div class="nm"><span class="rh-dot {{ tone_of(s|shown) }}" title="{{ (s|shown)|capitalize }}"></span><div><a href="/sleeves/{{ s.name }}">{{ s.name|leg_label }}</a><span>{% if r.legs %}Two legs, {{ x.pair.words|lower }}{% else %}{{ s.instrument }}{% endif %} · {{ (s|shown)|capitalize }}{% if x.test_account %} · {{ test_chip() }}{% endif %}</span></div></div>
       <span class="num r ex" title="{% if r.legs %}Both legs' position value at the current price ÷ the Strategy's equity, a short counted as size too{% else %}Position value at the current price ÷ {{ "the fund's equity" if x.in_fund else "the strategy's equity" }}{% endif %}">{{ '%.2f'|format(x.exposure|abs) }}×{% if x.exposure < -0.0005 %} <span class="faint">short</span>{% endif %}</span>
       <span class="num r td {{ 'gain' if x.day_ret > 0.00005 else ('loss' if x.day_ret < -0.00005 else 'muted') }}">{{ x.day_ret|pct1s }}</span>
       {% if x.in_fund %}<div class="room faint" title="Inside the fund the fund's brakes pause and halt, not this Strategy's own drawdown limit">{% if s.status == 'halted' %}Halted{% else %}The fund's brakes{% endif %}</div>
@@ -119,7 +119,7 @@
       {% if leg %}<td class="cell-name"><a href="/sleeves/{{ s.name }}">Leg {{ leg }}</a> <span class="faint">{{ s.instrument }} {{ 'perp' if r.perp else 'spot' }}</span></td>
       <td data-label="Drawdown"><span class="faint" title="A two-leg Strategy's drawdown is both legs' together, on its row">with the pair</span></td><td data-m="hide"><span class="faint">with the pair</span></td>
       {% else %}
-      <td class="cell-name" title="{{ x.profile.name|capitalize }} risk profile"><a href="/sleeves/{{ s.name }}">{{ s.name|leg_label }}</a> {{ chip(s.status) }}{% if x.test_account %} {{ test_chip() }}{% endif %}{% if r.legs %}<span class="sub2">Two legs, {{ x.pair.words|lower }}: limits on both legs together</span>{% endif %}</td>
+      <td class="cell-name" title="{{ x.profile.name|capitalize }} risk profile"><a href="/sleeves/{{ s.name }}">{{ s.name|leg_label }}</a> {{ chip(s|shown) }}{% if x.test_account %} {{ test_chip() }}{% endif %}{% if r.legs %}<span class="sub2">Two legs, {{ x.pair.words|lower }}: limits on both legs together</span>{% endif %}</td>
       {% if x.in_fund %}{% set brakes = "Inside the fund the fund's brakes pause and halt, not this Strategy's own limits" %}
       <td data-label="Drawdown"><span class="faint" title="{{ brakes }}">The fund's brakes</span></td>
       <td data-m="hide"><span class="faint" title="{{ brakes }}">The fund's brakes</span></td>

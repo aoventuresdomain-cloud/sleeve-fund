@@ -149,7 +149,7 @@
     {% for x in summaries %}{% set s = x.sleeve %}{% set room = x.room %}
     <tr>
       <td class="cell-name" data-v="{{ s.name }}"><a href="/sleeves/{{ s.name }}">{{ s.name }}</a>{% if x.legs %} {{ leg_flag(leg_flags.get(s.name)) }}{% endif %}<span class="sub2">{% if x.legs %}Two legs, {{ x.pair.words|lower }}{% else %}{{ s.instrument }}{% endif %} · {{ s.strategy|replace('_', ' ') }} · {{ bar_short(s.bar_spec) }}</span>{{ legs_list(x) }}</td>
-      <td data-v="{{ s.status }}" data-m="right">{{ chip(s.status) }}{% if x.mode != 'paper' %} <span class="chip {{ x.mode }}">{{ x.mode|capitalize }}</span>{% endif %}</td>
+      <td data-v="{{ s|shown }}" data-m="right">{{ chip(s|shown) }}{% if x.mode != 'paper' %} <span class="chip {{ x.mode }}">{{ x.mode|capitalize }}</span>{% endif %}</td>
       <td data-m="hide">{{ spark(x.spark, x.spark_up) }}</td>
       <td class="num" data-v="{{ x.equity }}" data-label="Equity">{{ x.equity|money }}</td>
       <td class="num" data-v="{{ x.day_pnl }}" data-m="right" data-label="Today">{{ money_signed(x.day_pnl) }}</td>
