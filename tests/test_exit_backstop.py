@@ -12,6 +12,7 @@ import pytest
 from nautilus_trader.model import BarType, OrderSide, OrderType
 from test_long_short import PERP, _meta, _record
 
+from sleeve_fund.data import FeedPrecisionError
 from sleeve_fund.research.replay import replay
 from sleeve_fund.store import Store
 from sleeve_fund.strategies import base
@@ -242,6 +243,12 @@ def test_backtest_exits_that_fill_raise_nothing(watched, legs):
 
 
 def test_c9_c8_a_backtest_stop_left_open_by_a_precision_mismatch_raises_the_alert_and_moves_nothing(monkeypatch):
+    from sleeve_fund.research import runner
+
+    with pytest.raises(FeedPrecisionError):  # (a) refuses this feed at load
+        _backtest(DOWN, monkeypatch, mismatch_after="2026-10-01 00:30")
+    # TEC-C9C8: let it past the load guard, modelling a mismatch that appears after load, which (b) is for
+    monkeypatch.setattr(runner, "check_feed_precision", lambda instrument, data: None)
     res = _backtest(DOWN, monkeypatch, mismatch_after="2026-10-01 00:30")  # the long is in; its stop rests
     [e] = _unfilled(res)
     assert e["level"] == "error" and "stop_loss order" in e["message"]
