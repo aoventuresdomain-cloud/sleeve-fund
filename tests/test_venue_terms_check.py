@@ -214,3 +214,21 @@ def test_an_out_of_bounds_fee_fetch_says_so_in_fixed_words(tmp_path, capfd, stor
     _, _, out = _run(tmp_path, capfd, store)
     assert "latest fetch not used: out of bounds (fee fetch refused, outside the published range)" in out, out
     assert "731" not in out, out
+
+
+@pytest.mark.parametrize("reason, said", [
+    ("ValueError: the venue refused: {'retCode': 10001, 'retMsg': 'symbol invalid', 'host': 'api.example.com'}",
+     "ValueError: the venue refused"),
+    ("URLError: <urlopen error [Errno -2] Name or service not known: api.example.com>", "URLError"),
+    ("HTTPError: HTTP Error 403: Forbidden (https://api.example.com/v5/market/risk-limit)", "HTTPError: HTTP Error 403"),
+    ("connect failed to api.example.com", "connect"),
+])
+def test_a_refused_tier_fetch_prints_only_its_first_clause(tmp_path, capfd, store, reason, said):
+    """CR head 3: the public job log printed a refused tier fetch's whole reason, which can carry the venue's answer or
+    a host. Only the first clause is printed; the stored reason keeps the rest for the private dashboard."""
+    _tiers(store, NOW - timedelta(hours=2))
+    store.record_venue_fetch("BINANCE", "tiers", "BTC/USDT", source="risk-limit", ok=False, reason=reason,
+                             at=NOW - timedelta(hours=1))
+    _, _, out = _run(tmp_path, capfd, store)
+    assert f"latest fetch not used: {said}" in out, out
+    assert "example.com" not in out and "retMsg" not in out, out
