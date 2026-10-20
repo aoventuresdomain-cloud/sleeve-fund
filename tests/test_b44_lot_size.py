@@ -62,6 +62,15 @@ def test_a_listing_with_no_usable_lot_size_is_refused(bad):
         paper_venue_lot("BTC/USDT", get_json=listing(**bad))
 
 
+@pytest.mark.parametrize("step,least", [("0.005", "0.005"), ("0.002", "0.002"), ("0.25", "0.5")])
+def test_qd_a_step_that_isnt_a_power_of_ten_is_refused_so_the_kept_lot_stands(built, step, least):
+    # QD MUST: the engine rounds with quantize, which keeps only the step's exponent: 0.007 stays 0.007 on a 0.005 step
+    with pytest.raises(ValueError, match="power of ten"):
+        paper_venue_lot("BTC/USDT", get_json=listing(step, least))
+    inst = built(lambda pair: paper_venue_lot(pair, get_json=listing(step, least)))
+    assert inst.size_increment.as_decimal() == D("0.001") and inst.min_quantity.as_decimal() == D("0.001")
+
+
 def test_the_instrument_carries_the_listings_step_and_minimum_not_the_data_venues(built):
     inst = built(lambda pair: paper_venue_lot(pair, get_json=listing("0.005", "0.010")))
     assert inst.size_increment.as_decimal() == D("0.005") and inst.min_quantity.as_decimal() == D("0.010")
