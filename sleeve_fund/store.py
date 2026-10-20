@@ -3077,6 +3077,13 @@ class Store:
             raise ValueError(f"archiving {TWO_LEG_FENCE}")
         with self._put_away(sleeve, utcnow(), "archived"):
             pass
+        from sleeve_fund.paper import orphan_guard
+
+        if orphan_guard.down_since(self, sleeve) is not None:
+            # CR FOLLOW-UP (head 3): put away, no process will come back for it, so it is no longer "down": a fund-wide
+            # hold its late fill opened (orphan_guard.unprotected_pass) then lifts once that late fill is flat.
+            self.event(sleeve, "info", orphan_guard.OWNER_UP, "put away: no process runs for it, so none is down",
+                       ts=utcnow())
 
     def unarchive(self, sleeve: str) -> None:
         """Bring a put-away sleeve back: the equity it took out comes back into the book with its flow, at what it is
