@@ -170,7 +170,8 @@ class VenueProfile:
         return perpetual(base, quote, fees=fees or self.fees, venue=self.venue, symbol=self.symbol_of(f"{base}/{quote}"),
                          price_precision=limits.get("price_precision", price_precision),
                          size_precision=limits.get("size_precision", min(size_precision, 3)),
-                         min_quantity=limits.get("min_quantity"), min_notional=limits.get("min_notional", 5.0))
+                         min_quantity=limits.get("min_quantity"), min_notional=limits.get("min_notional", 5.0),
+                         size_increment=lot[0] if lot is not None else None)
 
     def contract_lot(self, pair: str) -> tuple[Decimal, Decimal] | None:
         """B-44: the (quantity step, minimum order quantity) an instrument on `pair` is built with: the venue's live
