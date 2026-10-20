@@ -197,3 +197,11 @@ def test_a_leverage_as_a_decimal_float_or_int_gives_the_same_intent(lev):
     want = gate_intent({**d, "leverage": 3.0})
     got = gate_intent({**d, "leverage": lev})
     assert got == want and got.leverage == D(3) and got.margin_per_unit == D(20000)
+
+
+def test_no_leverage_is_spot_with_no_crash():
+    """HoE 00:16 UK: the `is None` branch: spot, the full price as margin, no leverage on the Intent."""
+    d = {"side": 1, "qty": D("0.1"), "price": D(60000), "stop_frac": 0.02, "step": STEP, "min_qty": STEP,
+         "instrument": "BTC", "atr_pct": None, "taker": D(0), "held": D(0), "leverage": None}
+    got = gate_intent(d)
+    assert got.leverage is None and got.margin_per_unit == D(60000)
