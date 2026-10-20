@@ -357,12 +357,47 @@ def test_b13z_an_order_filled_in_slices_with_fees_rounded_to_the_cent_is_one_rat
     """Paper rounds each slice's fee to the cent, so slices of one 0.05% order read back as 0.04998% and 0.05003%:
     one rate, not two. The candle is priced at what its fills paid in all (fees over notional), and a genuine second
     rate is still refused (b13h)."""
-    _slice(store, "a", "a1", 0, "BUY", "0.1", "60030", "3.00")  # 6,003 x 0.05% = 3.0015, journaled 3.00
-    _slice(store, "a", "a1", 1, "BUY", "0.2", "60030", "6.00")  # 12,006 x 0.05% = 6.003, journaled 6.00
-    _slice(store, "b", "b1", 0, "SELL", "0.05", "59970", "1.50")  # 2,998.50 x 0.05% = 1.49925, journaled 1.50
-    _slice(store, "b", "b1", 1, "SELL", "0.05", "59970", "1.50")
-    [n] = _run(store).values()
+    for name in ("d", "e"):  # a USD account: paper books its fees to the cent (USD's 2 places)
+        store.create_sleeve(name=name, strategy="ping_pong", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
+                            starting_balance=0, params={"market": "perp", "allow_short": True}, venue="binance")
+    _slice(store, "d", "d1", 0, "BUY", "0.1", "60030", "3.00")  # 6,003 x 0.05% = 3.0015, journaled 3.00
+    _slice(store, "d", "d1", 1, "BUY", "0.2", "60030", "6.00")  # 12,006 x 0.05% = 6.003, journaled 6.00
+    _slice(store, "e", "e1", 0, "SELL", "0.05", "59970", "1.50")  # 2,998.50 x 0.05% = 1.49925, journaled 1.50
+    _slice(store, "e", "e1", 1, "SELL", "0.05", "59970", "1.50")
+    [n] = _run(store, members=lambda n: n in ("d", "e")).values()
     # Paid 12.00 on 18,009 + 5,997 = 24,006 of notional: 0.04998750...%, to 1e-7 0.0004999. Net +0.2 at 60,030 is
     # 12,006 of notional, 6.0017994 at that rate (rounded to 1e-8 as the netting core books it); saved 12.00 less that.
     assert n["saving"]["fee"] == D("12.00") - (D("12006") * D("0.0004999"))
     assert n["saving"]["crossed"] == D("6")
+
+
+def test_b13za_in_an_8_place_currency_a_cent_apart_is_a_second_rate(store):
+    """The tolerance is the fee's own places, not a fixed cent: in USDT (8 places) the same slices, rounded to the cent,
+    are two rates and refused; to 8 places they are one."""
+    _slice(store, "a", "a1", 0, "BUY", "0.1", "60030", "3.00")
+    _slice(store, "a", "a1", 1, "BUY", "0.2", "60030", "6.00")
+    _slice(store, "b", "b1", 0, "SELL", "0.1", "59970", "2.9985")  # exact at 0.05%
+    with pytest.raises(ValueError, match="same taker fee"):
+        _run(store)
+
+
+def test_b13zb_an_unknown_fee_currency_is_said_never_guessed():
+    from sleeve_fund.portfolio.netting_paper import fee_places
+
+    assert (fee_places("BTC/USD"), fee_places("BTC/USDT")) == (2, 8)
+    with pytest.raises(ValueError, match="can't tell the places"):
+        fee_places("BTCUSD")
+
+
+def test_b13zc_a_second_rate_a_few_cents_off_is_refused_in_usd(store):
+    """The tolerance is one place of the fee's currency, no wider: a 0.052% slice beside a 0.05% order (its fee 5 cents
+    off the candle's pooled rate's, more than its cent of rounding) is a second rate."""
+    for name in ("d", "e"):
+        store.create_sleeve(name=name, strategy="ping_pong", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
+                            starting_balance=0, params={"market": "perp", "allow_short": True}, venue="binance")
+    _slice(store, "d", "d1", 0, "BUY", "0.1", "60030", "3.00")
+    _slice(store, "d", "d1", 1, "BUY", "0.2", "60030", "6.00")
+    _slice(store, "e", "e1", 0, "SELL", "0.05", "59970", "1.56")  # 2,998.50 x 0.052% = 1.55922, journaled 1.56
+    # pooled 10.56 / 21,007.50 = 0.0502678...%: e's fee is 1.56 - 1.50731 = 0.053 off it, past USD's 0.01
+    with pytest.raises(ValueError, match="same taker fee"):
+        _run(store, members=lambda n: n in ("d", "e"))

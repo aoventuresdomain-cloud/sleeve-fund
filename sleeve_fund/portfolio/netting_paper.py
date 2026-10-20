@@ -35,7 +35,6 @@ from sqlalchemy import select
 from sleeve_fund.portfolio import netting as nt
 
 ZERO = Decimal(0)
-FEE_ROUNDING = Decimal("0.01")  # paper journals each fill's fee to the cent (one place of the account's currency)
 RATE_PLACES = Decimal("1e-7")  # a fee rate read back from a fill: 0.055% is 0.00055 to this, whatever the rounding
 
 
@@ -99,15 +98,27 @@ def _charged(r: dict) -> tuple[Decimal, Decimal] | None:
     return _dec(r["fee"]), notional
 
 
+def fee_places(inst: str) -> int:
+    """The decimal places paper books a fill's fee to in `inst` ("BASE/QUOTE"): its quote currency's, the currency the
+    paper account settles in (instruments: settlement_currency=quote). Refused in words when the currency is unknown."""
+    from nautilus_trader.model import Currency
+
+    try:
+        return Currency.from_str(inst.split("/")[1]).precision
+    except (IndexError, ValueError, KeyError) as e:
+        raise ValueError(f"netting shadow: can't tell the places a fee in {inst} is booked to") from e
+
+
 def _one_rate(inst: str, charged: list[tuple[Decimal, Decimal]]) -> Decimal:
     """The taker rate one candle's market fills paid in all (fees over notional, to RATE_PLACES). Paper rounds each
-    fill's fee to the cent, so slices of one order read back a little apart one by one: a fill counts as the same rate
-    while its fee is within FEE_ROUNDING of that rate's; past that it is a second rate, refused. Shortcut: a genuine
-    second rate whose difference on a fill is under a cent (a fill of tens of dollars) passes as the first; immaterial to
-    a shadow, upgrade (read the rate each fill was charged from the journal) before netting goes live."""
+    fill's fee to its currency's places (fee_places: the cent in USD), so slices of one order read back a little apart
+    one by one: a fill counts as the same rate while its fee is within one of those places of that rate's; past that it
+    is a second rate, refused. Shortcut: a genuine second rate whose difference on a fill is under one place (a fill of
+    tens of dollars in USD) passes as the first; immaterial to a shadow, upgrade (journal the rate each fill was charged)
+    before netting goes live."""
     fees = sum(f for f, _ in charged)
     rate = fees / sum(n for _, n in charged)
-    if any(abs(f - rate * n) > FEE_ROUNDING for f, n in charged):
+    if any(abs(f - rate * n) > Decimal(1).scaleb(-fee_places(inst)) for f, n in charged):
         seen = sorted({(f / n).quantize(RATE_PLACES) for f, n in charged})
         raise ValueError(f"netting shadow: fills of one candle in {inst} were charged different taker rates "
                          f"({', '.join(f'{x:%}' for x in seen)}); the Strategies on one account must pay the same "
