@@ -65,7 +65,8 @@ def risk_view(store: Store, summaries: list[dict], book: dict) -> dict:
     equity = book["equity"] or 1.0
     # Inside the fund only the fund's drawdown brake halts (T5b, B-20): a move that takes the book's drawdown to it
     fund_limit = fund_halt_limit(store) if book.get("fund_cash") else None
-    peak = book["equity"] / (1 - book["drawdown"]) if book.get("drawdown", 0.0) < 1 else 0.0
+    dd = book.get("drawdown", 0.0)
+    peak = book["equity"] / (1 - dd) if dd < 1 else 0.0
     scenarios = []
     for i, shock in enumerate(SHOCKS):
         # The book's loss is every leg's, a pair's row carrying its two legs' signed sum; a test-account Strategy is
