@@ -144,6 +144,16 @@ def maintenance_for(profile, pair: str) -> tuple:
     return tiers(table)
 
 
+def price_tick(venue: str | None, pair: str) -> Decimal | None:
+    """B-36b: the contract price tick kept for `pair` (BASE/QUOTE or the venue's own symbol) beside its VS-1 tiers;
+    None when the venue keeps none for it (a spot venue, or a pair whose tick isn't checked in). The one reader."""
+    from sleeve_fund.venues import venue as venue_profile
+
+    profile = venue_profile(venue)
+    kept = profile.price_ticks.get(_table_key(profile, pair))
+    return Decimal(kept).normalize() if kept else None
+
+
 def stale_maintenance(sleeves, today, days: int = 30) -> list[str]:
     """VS-1-TABLE: one line per instrument a live perp Strategy trades whose venue table was read more than `days`
     ago (the venue changes its tiers from time to time; DA-11 keeps them). No venue names: it can reach the PM."""
