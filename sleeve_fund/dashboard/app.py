@@ -1781,6 +1781,11 @@ def create_app(store: Store | None = None) -> FastAPI:
                 cur = compliance.as_set(st().compliance())
                 if not compliance_rules.changes(cur[0], tests, cur[1], groups):  # F-LOCKED-OFF: no no-op version
                     errors.append(f"Nothing changes from version {st().compliance().version}, so nothing was saved")
+                # TEC-B31-TICK: a switch-off applies only with the review step's confirm tick, checked here too
+                offs = compliance.switched_off(cur[0], tests)
+                if offs and form.get("confirm_off") != "on":
+                    names = ", ".join(o.split(" off:")[0] for o in offs)
+                    errors.append(f"Switching off {names} needs the confirm tick on the review step, so nothing was saved")
             if errors:
                 raise ValueError("; ".join(errors))
             version = st().add_compliance_version(compliance.rows(tests), groups, created_by="pm", note=reason,

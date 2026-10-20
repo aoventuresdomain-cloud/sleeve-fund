@@ -102,3 +102,17 @@ def test_b31_in_the_browser_apply_waits_for_the_confirm_tick(held_site, browser)
     assert page.evaluate(valid) is True
     assert errors == []
     page.context.close()
+
+
+def test_b31_the_server_refuses_a_switch_off_without_the_confirm_tick(ps):  # noqa: F811
+    """TEC-B31-TICK (HoE 20 Oct): a browser-only required box doesn't guard a risk switch-off; the server refuses."""
+    c, store = ps
+    carried = dict(re.findall(r'<input type="hidden" name="([^"]+)" value="([^"]*)">',
+                              _review(c, **{"fund_margin.enabled": None})))
+    r = c.post("/portfolio-settings/apply", data={**carried, "reason_pick": "Tighter while testing"}, auth=AUTH,
+               headers=SAME, follow_redirects=False)
+    assert r.status_code == 400 and "T4 Margin" in r.text and "confirm" in r.text.lower(), r.text
+    assert store.compliance().version == 1  # nothing written
+    on = dict(re.findall(r'<input type="hidden" name="([^"]+)" value="([^"]*)">', _review(c, **{"asset_stop_loss.limit": "3"})))
+    assert c.post("/portfolio-settings/apply", data={**on, "reason_pick": "Tighter while testing"}, auth=AUTH,
+                  headers=SAME, follow_redirects=False).status_code == 303  # nothing off: no tick needed
