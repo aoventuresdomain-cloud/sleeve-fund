@@ -20,6 +20,8 @@ import re
 import sys
 from pathlib import Path
 
+from sleeve_fund.venues import RESEARCH_VENUE
+
 ROOT = Path(__file__).resolve().parents[2]
 DEFINITIONS = ROOT / "configs" / "definitions"
 CANDLES = {"15m": 15, "1h": 60, "4h": 240, "1d": 1440}
@@ -84,7 +86,7 @@ def main(argv: list[str] | None = None, run=None, journal=None) -> int:
     ap = argparse.ArgumentParser(prog="python -m sleeve_fund.research.rescore")
     ap.add_argument("list", help="the study list (markdown with a studies table)")
     ap.add_argument("--rows", default="", help="which rows, e.g. 1-8; all by default")
-    ap.add_argument("--venue", default="binance", help="the venue profile whose stored history is read")
+    ap.add_argument("--venue", default=RESEARCH_VENUE.lower(), help="the venue profile whose stored history is read")
     ap.add_argument("--pair", default="BTC/USDT")
     ap.add_argument("--dry-run", action="store_true", help="check every row's definition and settings, run nothing")
     args = ap.parse_args(argv)

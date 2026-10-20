@@ -126,3 +126,13 @@ def test_the_workflow_is_dispatch_only_never_opens_the_holdout_and_runs_the_list
     assert "use-holdout" not in text and "use_holdout" not in text
     assert "python -u -m sleeve_fund.research.rescore" in text and "--rm" in text
     assert "github.ref == 'refs/heads/main'" in text and "DEPLOY_ENABLED" in text
+
+
+def test_the_default_venue_is_the_research_venue_as_before(monkeypatch):
+    """The --venue default comes from the registry (no venue named in code) and resolves to the venue it always was,
+    so a study run without --venue reads the same stored history as before."""
+    seen, real = [], rescore.request
+    monkeypatch.setattr(rescore, "request", lambda name, minutes, venue, pair, *a: seen.append(venue) or real(
+        name, minutes, venue, pair, *a))
+    rescore.main([str(LIST), "--rows", "1", "--dry-run"], run=lambda *a, **k: None, journal=lambda: None)
+    assert seen == ["binance"]
