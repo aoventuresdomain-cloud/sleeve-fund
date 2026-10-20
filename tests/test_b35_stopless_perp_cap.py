@@ -135,3 +135,35 @@ def test_b35i_paper_sizes_a_perp_entry_on_the_capped_leverage(tmp_path, own, not
         lev = 1.5 if own == 1.5 else 2.0
         want = Decimal(str(entry["avg_px"])) * (1 - 1 / Decimal(str(lev)) + Decimal("0.005"))
         assert abs(Decimal(str(liq)) - want) <= want * Decimal("0.002"), (liq, want)
+
+
+@pytest.mark.parametrize("own, cap, lev", [(None, 0.66, 2.0), (1, 0.33, 1.0)])
+def test_b35j_a_perp_study_caps_and_liquidates_at_the_own_cap(tmp_path, monkeypatch, own, cap, lev):
+    """CR2 MUST 1: the study holds a perp Strategy at its own cap too: balanced's 33% margin at 2x is 66% of capital in
+    notional, at its own 1x 33%; and the benchmarks' trades are liquidated at that same leverage."""
+
+    from sleeve_fund import funding, markets
+    from sleeve_fund.data import synthetic_ohlcv
+    from sleeve_fund.research import study
+    from sleeve_fund.research.ledger import IdeaLedger
+    from sleeve_fund.strategies.buy_and_hold import SPEC as HOLD
+    from sleeve_fund.venues import venue
+    from test_binance import INFO, binance_contract  # the venue's contract limits without the network
+
+    b = venue("binance")
+    monkeypatch.setattr(b, "contract", lambda pair: binance_contract(pair, get_json=lambda url: INFO))
+    monkeypatch.setattr(funding, "DEFAULT_ROOT", tmp_path / "funding")
+    seen = []
+    real = study._benchmarks
+
+    def spy(*a, **k):
+        seen.append(a[6] if len(a) > 6 else k.get("leverage"))
+        return real(*a, **k)
+
+    monkeypatch.setattr(study, "_benchmarks", spy)
+    r = study.run_study(HOLD, synthetic_ohlcv(days=200, seed=4), b.instrument("BTC", "USDT"), dataset="syn",
+                        ledger=IdeaLedger(tmp_path / "l.jsonl"), synthetic=True, holdout_days=0, train_days=60,
+                        test_days=60, risk_profile="balanced",
+                        default_params={"market": markets.PERP, **({} if own is None else {"max_leverage": own})})
+    assert any(f"capped at {cap:.0%} of capital in notional" in n for n in r.notes), r.notes
+    assert seen and set(seen) == {lev}
