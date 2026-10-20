@@ -15,7 +15,7 @@
 {% block content %}
 {# The strategy page (combined build F2): header, seven figures, then the desk in tabs. #}
 <div class="page-head" data-live="head">
-  <h1>{{ s.name|leg_label }}</h1> {% if two and two.legs %}{{ leg_flag(two.flags) }} {% endif %}{% if backtest_id %}<span class="chip">Backtest</span>{% else %}{# Until the supervisor catches up, a strategy the PM stopped reads as stopping, not running (round 10, m5). #}{{ chip('stopping' if s.desired_state != 'running' and s.status in ['running', 'starting'] else s.status) }} <span class="chip {{ x.mode }}">{{ x.mode|capitalize }}</span>{% if fill_hold %} <span class="chip paused fill-hold" title="A fill wasn't handled, so its book may be off: it opens nothing new until you resume it. Its stop and exits still work.">Fill hold</span>{% endif %}{% if resetting %} <span class="chip paused" title="A reset is under way: the supervisor closes it and starts it again">Resetting…</span>{% endif %}{% if x.test_account %} {{ test_chip() }}{% endif %}{% endif %}
+  <h1>{{ s.name|leg_label }}</h1> {% if two and two.legs %}{{ leg_flag(two.flags) }} {% endif %}{% if backtest_id %}<span class="chip">Backtest</span>{% else %}{# Until the supervisor catches up, a strategy the PM stopped reads as stopping, not running (round 10, m5). #}{{ chip('stopping' if s.desired_state != 'running' and s.status in ['running', 'starting'] else s.status) }} <span class="chip {{ x.mode }}">{{ x.mode|capitalize }}</span>{% if fill_hold %} <span class="chip paused fill-hold" title="A fill wasn't handled, so its book may be off: it opens nothing new until you resume it. Its stop and exits still work.">Fill hold</span>{% endif %}{% if resetting %} <span class="chip paused" title="A reset is under way: the supervisor closes it and starts it again">Resetting…</span>{% endif %}{% if x.test_account %} {{ test_chip() }}{% endif %}{% if s.lifecycle == 'winding_down' and s.wind_down_deadline %} <span class="chip paused" title="Opens nothing new; its exits, trims and stops keep running. Anything still held at the deadline is closed at the next candle close, and it retires once flat.">Winding down · deadline {{ s.wind_down_deadline|uk }}</span>{% endif %}{% endif %}
   {# A second leg takes no command of its own: its Strategy's reach both legs (P2-8, Advisor M2). #}
   {% if not (two and two.of) %}<div class="actions">
     {% set flattening = pending|selectattr('command', 'equalto', 'flatten')|list %}
@@ -31,6 +31,12 @@
       {# A stopped strategy still holding a position gets to cash in one click (review round 9, R9-M1). #}
       {% if held or (multi and multi.open) %}<button type="button" class="secondary" data-open="dlg-flatten"{% if flattening %} disabled title="A flatten is already waiting for the strategy to act on it"{% endif %}>Flatten</button>{% endif %}
       {% if archived %}<button type="button" class="secondary" data-open="dlg-restore">Restore</button>{% else %}{% set legs_held = two and two.legs and (two.legs|selectattr('held')|list) %}<button type="button" class="secondary" data-open="dlg-archive" {% if two and two.legs %}disabled title="Archiving isn't built for a two-leg Strategy yet"{% elif x.qty or (multi and multi.open) %}disabled title="Flatten before archiving"{% endif %}>Archive</button>{% endif %}{% endif %}
+    {# B-21: the lifecycle (P2-6). Wind down lets the position run off to a deadline; Close now closes it at the next candle
+       close and retires it once flat. A two-leg Strategy only closes now (its wind-down waits for the put-away design). #}
+    {% if not backtest_id and not archived and s.lifecycle in ['active', 'winding_down'] %}
+      {% if s.lifecycle == 'active' %}<button type="button" class="secondary" data-open="dlg-wind_down"{% if two and two.legs %} disabled title="Winding down isn't built for a two-leg Strategy yet: Close now closes both legs"{% endif %}>Wind down</button>{% endif %}
+      <button type="button" class="secondary" data-open="dlg-close_now">Close now</button>
+    {% endif %}
     {# Path to live sits immediately left of Clone with changes (C8); it opens the steps. Reset is not on this page. #}
     {% if path %}{% set met = path|selectattr('ok')|list|length %}<button type="button" class="secondary path-btn" data-open="dlg-path" title="{{ met }} of {{ path|length }} G2 conditions met">Path to live <span class="faint">{{ (journey|selectattr('state', 'equalto', 'here')|map(attribute='label')|first) or 'Paper' }} · G2 {{ met }}/{{ path|length }}</span></button>{% endif %}
     {% if not backtest_id %}<a class="button secondary" href="/sleeves/new?{{ clone_qs }}" title="Start a new strategy from these settings">Clone with changes</a>{% endif %}
@@ -411,6 +417,8 @@
 {# One confirmation dialog per command: says exactly what will happen before it does. #}
 {# F-T-2 (Advisor Addition A): a Resume while the fill hold is on clears the hold and nothing else. #}
 {% set fill_hold_words = 'A fill wasn\'t handled ' ~ (fill_hold.ts|ts if fill_hold else '') ~ ', so its book may be off and it has opened nothing new since. Check its position and orders first. Resuming clears the fill hold only: anything stricter on it, a halt, a stop or a pause, stays until it is lifted its own way.' %}
+{% set holding = (multi.open if multi else x.qty) %}
+{% set close_words = (('It closes every open leg' if multi else 'It ' ~ ('buys back ' if x.qty < 0 else 'sells ') ~ (x.qty|abs|qty) ~ ' ' ~ base) ~ ' at market at the next candle close, paying the taker fee, and retires once flat. Nothing new opens meanwhile.') if holding else 'It holds nothing, so it retires now.' %}
 {% set dialogs = {
   'close': ('Close the ' ~ s.instrument ~ ' position', 'It ' ~ ('buys back ' if x.qty < 0 else 'sells ') ~ (x.qty|abs|qty) ~ ' ' ~ base ~ ' (about ' ~ (x.position_value|abs|money) ~ ' ' ~ quote ~ ') at market, paying the taker fee. This is the same as Flatten: the strategy pauses once it has sent the order, so it doesn\'t enter again until you resume it.', 'Close and pause', 'danger'),
   'pause': ('Pause ' ~ (s.name|leg_label), 'Stops new entries. Any position is kept and its stop-loss still applies.', 'Pause strategy', ''),
@@ -419,6 +427,8 @@
   'stop': ('Stop ' ~ (s.name|leg_label), 'Shuts the strategy process down. ' ~ ('It keeps its ' ~ ('short of ' if x.qty < 0 else '') ~ (x.qty|abs|qty) ~ ' ' ~ base ~ ' unmanaged until restarted, so flatten first if you want cash.' if x.qty else 'It has no open position.'), 'Stop strategy', 'danger' if x.qty else ''),
   'archive': ('Archive ' ~ (s.name|leg_label), 'Hides it from the strategy list on the home page' ~ (', and its equity of ' ~ ((put_away.taken if put_away and put_away.taken is not none else x.equity)|money) ~ ' leaves the fund\'s book at the supervisor\'s next mark, which isn\'t a loss' if not (put_away and (put_away.taken == 0 or put_away.waiting)) else (', and its equity leaves the fund\'s book once it is flat' if put_away.waiting else '')) ~ '. Nothing is deleted: its trades, orders and decisions stay, and you can restore it any time.', 'Archive strategy', ''),
   'restore': ('Restore ' ~ (s.name|leg_label), 'Puts it back in the strategy list on the home page, and its equity comes back into the fund\'s book. It stays stopped until you start it.', 'Restore strategy', ''),
+  'wind_down': ('Wind down ' ~ (s.name|leg_label), 'Opens nothing new from now; its exits, trims and stops keep running. ' ~ ('If it still holds a position at the deadline, twice its usual hold (3 to 30 days), that is closed at market at the next candle close, and it retires once flat.' if holding else 'It holds nothing: Close now retires it straight away.'), 'Wind down', ''),
+  'close_now': ('Close now: ' ~ (s.name|leg_label), close_words ~ ' A retired Strategy is put away; its trades and records stay.', 'Close now and retire', 'danger'),
   'start': ('Start ' ~ (s.name|leg_label), 'Its position margin was lost (liquidated), so it can\'t start. It trades again only after you use Reset after liquidation, which asks for an incident note.' if liquidated else 'Starts the strategy process. It picks up its journal and reconciles before trading.', 'Start strategy', ''),
 } %}
 {# F-B5-FLATTEN (HoE): a multi-asset Strategy's Close and Flatten close every open leg (Store.command tells each asset's
@@ -429,7 +439,7 @@
 {% if not backtest_id and not (two and two.of) %}<div data-live="dialogs" data-live-forms>
 {% for cmd, (title, effect, label, tone) in dialogs.items() %}
 <dialog id="dlg-{{ cmd }}" aria-labelledby="dlg-{{ cmd }}-h">
-  <form method="post" action="/sleeves/{{ s.name }}/{{ 'archive' if cmd in ['archive', 'restore'] else 'command' }}">
+  <form method="post" action="/sleeves/{{ s.name }}/{{ 'archive' if cmd in ['archive', 'restore'] else ('lifecycle' if cmd in ['wind_down', 'close_now'] else 'command') }}">
     <h2 id="dlg-{{ cmd }}-h">{{ title }}</h2>
     <p>{{ effect }}</p>
     {% if cmd == 'stop' and x.qty %}<div class="warnbox"><b>The position stays open.</b> Once stopped, it runs for its exits only: {% if risk.stop_px %}the stop at {{ risk.stop_px|px }} still closes it{% else %}it has no stop, so a safety stop is set from the current price{% endif %}, nothing new opens, and it stops once it is flat. Usually you want Flatten and stop: it closes the position first, then asks you to stop it once it is flat.</div>{% endif %}
@@ -442,7 +452,7 @@
     {% if not refused %}{{ reason_picker(cmd, 'r-' ~ cmd) }}{% endif %}
     <div class="dlg-actions"><button type="button" class="secondary" data-close>{{ 'Close' if refused else 'Cancel' }}</button>
       {% if cmd == 'stop' and x.qty and s.desired_state == 'running' %}<button name="command" value="flatten-stop" class="danger" data-needs-reason disabled{% if flatten_waits %} data-blocked{% endif %}>Flatten and stop</button>{% endif %}
-      {% if not refused %}<button name="{{ 'action' if cmd in ['archive', 'restore'] else 'command' }}" value="{{ 'flatten' if cmd == 'close' else cmd }}" class="{{ tone }}" data-needs-reason disabled>{{ label }}</button>{% endif %}</div>
+      {% if not refused %}<button name="{{ 'action' if cmd in ['archive', 'restore', 'wind_down', 'close_now'] else 'command' }}" value="{{ 'flatten' if cmd == 'close' else cmd }}" class="{{ tone }}" data-needs-reason disabled>{{ label }}</button>{% endif %}</div>
   </form>
 </dialog>
 {% endfor %}

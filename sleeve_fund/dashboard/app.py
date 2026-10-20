@@ -1119,13 +1119,16 @@ def create_app(store: Store | None = None) -> FastAPI:
 
     @app.post("/sleeves/{name}/lifecycle")
     def sleeve_lifecycle(name: str, action: str = Form(...), reason: str = Form(""),
+                         reason_pick: str | None = Form(None), reason_note: str = Form(""),
                          actor: str = Depends(require_pm), _o: None = Depends(same_origin)):
         """P2-6: the PM's lifecycle move (wind_down, retire, close_now), and the one caller of Store.set_lifecycle.
-        The buttons come with the phase 2 UI; the rules are sleeve_fund.lifecycle's."""
+        The Strategy page's Wind down and Close now dialogs post here with a picked reason (B-21); the rules are
+        sleeve_fund.lifecycle's."""
         why = two_leg_refusal(st(), name, "lifecycle")
         if why is not None and (action != "close_now" or st().sleeve(name).parent is not None):
             return RedirectResponse(f"/sleeves/{name}?{urlencode({'command_error': why})}", status_code=303)
         try:
+            reason = _reason(action, reason, reason_pick, reason_note)
             if not reason.strip():
                 raise ValueError("a reason is required")
             st().set_lifecycle(name, action, lifecycle.PM if actor == "PM" else actor, reason)
