@@ -825,6 +825,59 @@ LIMIT = Numeric(10, 4)
 LIMIT_PLACES = Decimal("0.0001")
 # A BIGINT key that still autoincrements on SQLite (which only does so for INTEGER PRIMARY KEY).
 BIG_ID = BigInteger().with_variant(Integer, "sqlite")
+
+# B-16 (PM 15 Oct 17:22 UK; DA and FE2, 20 Oct): a research Strategy (a rule file in configs/definitions/) put away from
+# the Strategies list. One row per archive; a restore sets restored_* once on it; archiving again after a restore is a
+# new row. The file, its trials and its tries count are never touched, and nothing is deleted. No Strategy column: it
+# names rule files, not the fund's Strategies, so a reset never sees it. Write-once, held by the database (as trials).
+ARCHIVE_REASONS = {"no_edge": "No edge after testing", "superseded": "Superseded by another Strategy",
+                   "duplicate": "Duplicate", "not_wanted": "Not wanted"}
+ARCHIVE_OPEN = "restored_at IS NULL"
+definition_archive_t = Table(
+    "definition_archive",
+    metadata,
+    Column("id", BIG_ID, primary_key=True, autoincrement=True),
+    Column("file_id", String(64), nullable=False),  # the definition's name, e.g. qr02_dip_long, or model:<name>
+    Column("definition_hash", String(64)),  # at archive time; audit only
+    Column("status_at_archive", String(32), nullable=False),
+    Column("reason", String(32), nullable=False),
+    Column("note", Text),
+    Column("actor", String(32), nullable=False),
+    Column("archived_at", TS, nullable=False),
+    Column("restored_at", TS),
+    Column("restored_by", String(32)),
+    Column("restore_reason", Text),
+    CheckConstraint(f"reason IN ({', '.join(repr(k) for k in ARCHIVE_REASONS)})", name="definition_archive_reason"),
+    Index("definition_archive_open", "file_id", unique=True,
+          postgresql_where=text(ARCHIVE_OPEN), sqlite_where=text(ARCHIVE_OPEN)),
+)
+ARCHIVE_FROZEN = ("id", "file_id", "definition_hash", "status_at_archive", "reason", "note", "actor", "archived_at")
+ARCHIVE_RESTORE = ("restored_at", "restored_by", "restore_reason")
+DEFINITION_ARCHIVE_PG = (
+    "CREATE OR REPLACE FUNCTION definition_archive_write_once() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+    "IF TG_OP = 'DELETE' THEN RAISE EXCEPTION USING ERRCODE = 'check_violation', "
+    "MESSAGE = 'definition_archive is write-once: a row cannot be deleted'; END IF; "
+    f"IF ({', '.join('NEW.' + c for c in ARCHIVE_FROZEN)}) IS DISTINCT FROM ({', '.join('OLD.' + c for c in ARCHIVE_FROZEN)}) "
+    f"OR OLD.restored_at IS NOT NULL OR {' OR '.join('NEW.' + c + ' IS NULL' for c in ARCHIVE_RESTORE)} "
+    "THEN RAISE EXCEPTION USING ERRCODE = 'check_violation', "
+    "MESSAGE = 'definition_archive is write-once: only a restore, once, with its time, actor and reason'; END IF; "
+    "RETURN NEW; END $$",
+    "CREATE TRIGGER definition_archive_write_once BEFORE UPDATE OR DELETE ON definition_archive FOR EACH ROW "
+    "EXECUTE FUNCTION definition_archive_write_once()",
+)
+DEFINITION_ARCHIVE_SQLITE = (
+    "CREATE TRIGGER definition_archive_no_delete BEFORE DELETE ON definition_archive BEGIN "
+    "SELECT RAISE(ABORT, 'definition_archive is write-once: a row cannot be deleted'); END",
+    "CREATE TRIGGER definition_archive_no_edit BEFORE UPDATE ON definition_archive WHEN "
+    + " OR ".join(f"NEW.{c} IS NOT OLD.{c}" for c in ARCHIVE_FROZEN)
+    + " OR OLD.restored_at IS NOT NULL OR " + " OR ".join(f"NEW.{c} IS NULL" for c in ARCHIVE_RESTORE)
+    + " BEGIN SELECT RAISE(ABORT, 'definition_archive is write-once: only a restore, once, with its time, actor and "
+    "reason'); END",
+)
+for _sql in DEFINITION_ARCHIVE_PG:
+    event.listen(definition_archive_t, "after_create", DDL(_sql).execute_if(dialect="postgresql"))
+for _sql in DEFINITION_ARCHIVE_SQLITE:
+    event.listen(definition_archive_t, "after_create", DDL(_sql).execute_if(dialect="sqlite"))
 # The PM's limits, one row per version, never updated: a change is a new version, the current one the highest.
 portfolio_profile_t = Table(
     "portfolio_profile",
@@ -5273,6 +5326,64 @@ class Store:
             q = q.where(decisions_t.c.ts < until)
         with self.engine.connect() as c:
             return _rows(c.execute(q.order_by(decisions_t.c.id.desc()).limit(limit)))
+
+    def archive_definition(self, file_id: str, *, definition_hash: str | None, status: str, reason: str,
+                           note: str | None, actor: str) -> dict:
+        """B-16: put a research Strategy away from the Strategies list, with its decision log entry, in one
+        transaction. The rule file, its trials and its tries are not touched. ValueError for an unknown reason, a
+        missing actor, file or status, or one already archived."""
+        file_id, actor, note = (file_id or "").strip(), (actor or "").strip(), (note or "").strip() or None
+        if reason not in ARCHIVE_REASONS:
+            raise ValueError(f"an archive reason is one of {tuple(ARCHIVE_REASONS)}, got {reason!r}")
+        if not file_id or not actor or not (status or "").strip():
+            raise ValueError("an archive needs the file, its status and who archived it")
+        label = ARCHIVE_REASONS[reason]
+        try:
+            with self.engine.begin() as c:
+                if c.execute(select(definition_archive_t.c.id).where(
+                        definition_archive_t.c.file_id == file_id, definition_archive_t.c.restored_at.is_(None))).first():
+                    raise ValueError(f"{file_id} is already archived")
+                now = utcnow()
+                new = c.execute(insert(definition_archive_t).values(
+                    file_id=file_id, definition_hash=definition_hash, status_at_archive=status.strip(), reason=reason,
+                    note=note, actor=actor, archived_at=now).returning(definition_archive_t.c.id)).scalar_one()
+                c.execute(insert(decisions_t).values(ts=now, actor=actor, action="research_archive", sleeve=None,
+                                                     reason=f"{file_id}: {label}" + (f": {note}" if note else "")))
+                return dict(c.execute(select(definition_archive_t).where(definition_archive_t.c.id == new)).one()._mapping)
+        except IntegrityError as e:  # another archive of the same file got in first (definition_archive_open)
+            raise ValueError(f"{file_id} is already archived") from e
+
+    def restore_definition(self, file_id: str, *, reason: str, actor: str) -> dict:
+        """B-16: put an archived research Strategy back on the Strategies list as it was, with its decision log entry,
+        in one transaction. ValueError when it isn't archived, or without a reason or actor."""
+        file_id, reason, actor = (file_id or "").strip(), (reason or "").strip(), (actor or "").strip()
+        if not reason or not actor:
+            raise ValueError("a restore needs a reason and who restored it")
+        with self.engine.begin() as c:
+            t = definition_archive_t
+            open_ = c.execute(select(t.c.id).where(t.c.file_id == file_id, t.c.restored_at.is_(None))).first()
+            if open_ is None:
+                raise ValueError(f"{file_id} is not archived")
+            now = utcnow()
+            c.execute(update(t).where(t.c.id == open_.id, t.c.restored_at.is_(None)).values(
+                restored_at=now, restored_by=actor, restore_reason=reason))
+            c.execute(insert(decisions_t).values(ts=now, actor=actor, action="research_restore", sleeve=None,
+                                                 reason=f"{file_id}: {reason}"))
+            return dict(c.execute(select(t).where(t.c.id == open_.id)).one()._mapping)
+
+    def archived_definitions(self) -> list[dict]:
+        """The research Strategies archived now, newest first."""
+        t = definition_archive_t
+        with self.engine.connect() as c:
+            return _rows(c.execute(select(t).where(t.c.restored_at.is_(None)).order_by(t.c.archived_at.desc(),
+                                                                                       t.c.id.desc())))
+
+    def definition_archive_history(self, file_id: str) -> list[dict]:
+        """Every archive of one research Strategy, restored or not, newest first."""
+        t = definition_archive_t
+        with self.engine.connect() as c:
+            return _rows(c.execute(select(t).where(t.c.file_id == file_id).order_by(t.c.archived_at.desc(),
+                                                                                    t.c.id.desc())))
 
 
 def _exact(**values) -> list[Decimal]:
