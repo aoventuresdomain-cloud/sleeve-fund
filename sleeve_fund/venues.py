@@ -459,9 +459,9 @@ def binance_contract(pair: str, get_json=None) -> dict:
 PAPER_INSTRUMENTS_URL = "https://api.bybit.com/v5/market/instruments-info?category=linear&symbol={symbol}"
 
 
-def paper_venue_tick(pair: str, get_json=None) -> Decimal:
-    """The paper venue's live price tick for the linear perpetual on `pair`, exactly as its listing's priceFilter gives it
-    (B-43). Raises ValueError when the venue refuses the request, doesn't list the pair, or lists it not trading."""
+def paper_venue_listing(pair: str, get_json=None) -> dict:
+    """The paper venue's listing row for the linear perpetual on `pair` (B-43): the one read its price tick and lot size
+    come from. Raises ValueError when the venue refuses the request, doesn't list the pair, or lists it not trading."""
     from sleeve_fund.data import _get_json
 
     sym = binance_symbol(pair)  # BTC/USDT -> BTCUSDT, the same form on both venues
@@ -473,7 +473,12 @@ def paper_venue_tick(pair: str, get_json=None) -> Decimal:
         raise ValueError(f"the venue does not list a {pair} perpetual")
     if rows[0].get("status") != "Trading":
         raise ValueError(f"the venue lists {pair} but it is not trading ({rows[0].get('status')})")
-    tick = (rows[0].get("priceFilter") or {}).get("tickSize")
+    return rows[0]
+
+
+def paper_venue_tick(pair: str, get_json=None) -> Decimal:
+    """The paper venue's live price tick for `pair`, exactly as its listing's priceFilter gives it (B-43)."""
+    tick = (paper_venue_listing(pair, get_json).get("priceFilter") or {}).get("tickSize")
     if not tick:
         raise ValueError(f"the venue lists no price tick for {pair}")
     return Decimal(tick).normalize()
