@@ -44,9 +44,11 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 
 from sleeve_fund import markets, risk
 from sleeve_fund.exact import float_view
+from sleeve_fund.store import CLOSING_INTENTS, OPEN_ORDER_STATUSES, utcnow
 
 FLAG_ENV = "DEMO_MIRROR"
 KEY_ENV = "DERIBIT_TESTNET_API_KEY"
@@ -171,11 +173,14 @@ class Testnet:
             return instrument, 0.0, f"{fill['qty'] * fill['price']:,.2f} USD is under one {size:g} USD contract"
         return instrument, amount, ""
 
-    def market(self, side: str, instrument: str, amount: float, label: str) -> tuple[str, float | None]:
-        """Send a market order; returns (order id, average price)."""
+    def market(self, side: str, instrument: str, amount: float, label: str,
+               reduce_only: bool = False) -> tuple[str, float | None]:
+        """Send a market order; returns (order id, average price). reduce_only: it may only cut the position."""
         method = "private/buy" if side == "BUY" else "private/sell"
-        order = self.call(method, {"instrument_name": instrument, "amount": amount, "type": "market",
-                                   "label": label[:64]}, private=True).get("order", {})
+        params = {"instrument_name": instrument, "amount": amount, "type": "market", "label": label[:64]}
+        if reduce_only:
+            params["reduce_only"] = True
+        order = self.call(method, params, private=True).get("order", {})
         return str(order.get("order_id", "")), order.get("average_price")
 
     def position(self, instrument: str) -> float:
@@ -260,13 +265,16 @@ class BybitDemo:
                                  f"order the demo account takes ({step:g}, {min_notional:g} USDT)")
         return symbol, qty, ""
 
-    def market(self, side: str, instrument: str, amount: float, label: str) -> tuple[str, float | None]:
+    def market(self, side: str, instrument: str, amount: float, label: str,
+               reduce_only: bool = False) -> tuple[str, float | None]:
         # Bybit takes order link ids of up to 36 characters: letters, digits, - and _.
         link = "".join(ch if ch.isalnum() or ch in "-_" else "-" for ch in label)[:36]
-        r = self.call("POST", "/v5/order/create", {
-            "category": "linear", "symbol": instrument, "side": "Buy" if side == "BUY" else "Sell",
-            "orderType": "Market", "qty": f"{amount:.8f}".rstrip("0").rstrip("."), "positionIdx": 0,
-            "orderLinkId": link})
+        body = {"category": "linear", "symbol": instrument, "side": "Buy" if side == "BUY" else "Sell",
+                "orderType": "Market", "qty": f"{amount:.8f}".rstrip("0").rstrip("."), "positionIdx": 0,
+                "orderLinkId": link}
+        if reduce_only:  # B-33: a closing copy may only cut the position, never open the other side
+            body["reduceOnly"] = True
+        r = self.call("POST", "/v5/order/create", body)
         order_id = str(r.get("orderId", ""))
         try:  # the create answer has no price; one look-up for it, and a miss costs only the price
             rows = self.call("GET", "/v5/order/realtime", {"category": "linear", "orderId": order_id}).get("list") or []
@@ -369,11 +377,72 @@ def mirrored(store) -> list:
     return [s for s in store.sleeves() if s.params.get("demo_mirror") and s.name not in archived]
 
 
-def mirror_once(store, targets: dict) -> int:
+# B-33: a paper order's fills wait as "pending" rows until the order is finished, then go as ONE demo order;
+# "grouped" rows mark the pending fills that order carried. Readers count only "filled" rows.
+PENDING, GROUPED = "pending", "grouped"
+REDUCE_ONLY_INTENTS = frozenset((*CLOSING_INTENTS, "liquidation"))
+
+
+def copy_link(name: str, suffix: str) -> str:
+    """The demo order link for a Strategy's copy: its name cut short plus a hash of the whole name, so two long names
+    never share one (Bybit refuses a repeated link id), within Bybit's 36 characters (suffix up to 15). A label that
+    already fits is kept as it was, "<name>:<suffix>"."""
+    whole = f"{name}:{suffix}"
+    return whole if len(whole) <= 36 else f"{name[:13]}-{hashlib.sha1(name.encode()).hexdigest()[:6]}:{suffix}"
+
+
+def pending(store, name: str) -> dict[str, list[dict]]:
+    """A Strategy's fills held for a paper order still filling, by paper order id (the row's order_id), oldest
+    first: each a "pending" row with no "grouped" row for its fill yet."""
+    rows = store.mirror_rows(name, limit=100_000)
+    done = {r["fill_id"] for r in rows if r["status"] == GROUPED}
+    out: dict[str, list[dict]] = {}
+    for r in sorted(rows, key=lambda r: r["id"]):
+        if r["status"] == PENDING and r["fill_id"] not in done:
+            out.setdefault(r["order_id"], []).append(r)
+    return out
+
+
+def _pending_qty(store) -> dict[str, float]:
+    """Per Strategy, the signed paper quantity held for orders still filling: being copied, not a missed copy."""
+    out: dict[str, float] = {}
+    for r in store.mirror_rows(limit=100_000):
+        if r["status"] in (PENDING, GROUPED):
+            out[r["sleeve"]] = out.get(r["sleeve"], 0.0) + (float(r["amount"] or 0.0) if r["status"] == PENDING
+                                                            else -float(r["amount"] or 0.0))
+    return out
+
+
+HOLD_SECONDS = 2 * POLL_SECONDS  # Advisor B33 Q1 (a): a resting order's fills wait two cycles at most, then go
+
+
+def _aware(ts: datetime) -> datetime:
+    return ts if ts.tzinfo is not None else ts.replace(tzinfo=UTC)  # SQLite hands back naive UTC
+
+
+def _signed(f: dict) -> float:
+    return (1 if f["side"] == "BUY" else -1) * float(f["qty"])
+
+
+def _bybit_symbol(s) -> str | None:
+    symbol = s.instrument.replace("/", "").upper()
+    return symbol if target_for(s) == "BYBIT" and symbol in BYBIT_CONTRACTS else None
+
+
+def mirror_once(store, targets: dict, now: datetime | None = None) -> int:
     """Copy every mirrored strategy's new fills to its demo account; returns how many orders were sent.
-    targets: {"BYBIT" | "DERIBIT": the demo account's client}, those set up."""
+    targets: {"BYBIT" | "DERIBIT": the demo account's client}, those set up.
+
+    B-33 (Advisor ruling B33-DEMO-COPY): one demo order per paper ORDER, for the sum of its fills, once the order is
+    finished; a fill of an order still filling waits as a pending row (kept in the journal, so a restart rebuilds it),
+    and an order still open after HOLD_SECONDS sends what has filled so far, the rest grouped the same way. On Bybit,
+    where the Strategies on a symbol share one one-way position, every copy is sized by its effect on the paper NET:
+    the part that takes the demo position towards zero goes reduce-only, the part past zero goes as a plain order, and
+    the demo never goes past where the paper net ends after this order. A fill with no order in the journal is copied
+    on its own, as before."""
     store = float_view(store)  # the mirror's figures are floats (DA-9)
-    sent = 0
+    now = now or utcnow()
+    work: list[tuple] = []  # (strategy, venue, key, fills)
     for s in mirrored(store):
         name = target_for(s)
         venue = targets.get(name)
@@ -386,36 +455,159 @@ def mirror_once(store, targets: dict) -> int:
             store.event(s.name, "info", "mirror_start",
                         f"Demo mirror on: each new fill is copied to {where}, and the paper book stays the record")
             continue
+        groups: dict[str, list[dict]] = {}
+        held = {oid: [dict(r, new=False) for r in rows] for oid, rows in pending(store, s.name).items()}
         for f in store.fills_after(s.name, mark):
             if venue is None:
                 store.record_mirror(s.name, fill_id=f["id"], status="skipped",
                                     message="the demo account isn't set up")
                 continue
-            try:
-                instrument, amount, why = venue.size(s, f)
-            except Exception as e:  # noqa: BLE001 - the demo venue's contract list unreachable: noted, not retried
-                instrument, amount, why = None, 0.0, f"couldn't size it: {str(e)[:200]}"
-            sign = 1 if f["side"] == "BUY" else -1
-            if why:
-                store.record_mirror(s.name, fill_id=f["id"], status="skipped", instrument=instrument or "", message=why)
-                store.event(s.name, "warning", "mirror_skipped",
-                            f"Demo mirror didn't copy the {f['side'].lower()} of {f['qty']:.8g} to the demo account: "
-                            f"{why}. The paper book is unaffected.")
+            oid = f.get("order_id") or ""
+            state = store.order_state(oid) if oid else None
+            if state is not None and state["status"] in OPEN_ORDER_STATUSES:
+                store.record_mirror(s.name, fill_id=f["id"], status=PENDING, amount=_signed(f), price=f["price"],
+                                    order_id=oid, message="waiting for the paper order to finish", ts=now)
+                held.setdefault(oid, []).append({"fill_id": f["id"], "amount": _signed(f), "price": f["price"],
+                                                 "ts": now, "new": True})
                 continue
-            reset = "Reset strategy" in store.order_reason(f.get("order_id") or "")  # a PM reset's closing fill
-            try:
-                order_id, price = venue.market(f["side"], instrument, amount,
-                                               f"{s.name[:20]}:reset:{f['id']}" if reset else f"{s.name}:{f['id']}")
-            except Exception as e:  # noqa: BLE001 - noted, never retried, so it can't trade twice
-                store.record_mirror(s.name, fill_id=f["id"], status="error", instrument=instrument,
-                                    amount=sign * amount, message=str(e)[:500])
-                store.event(s.name, "warning", "mirror_failed",
-                            f"Demo mirror couldn't copy the {f['side'].lower()} of {f['qty']:.8g} at {f['price']:,.2f} "
-                            f"to the demo account: {str(e)[:200]}. The paper book is unaffected.")
+            groups.setdefault(oid if state is not None else f"fill:{f['id']}", []).append(f)
+        for oid, rows in held.items():  # a held order now finished, or open too long, goes as one order
+            state = store.order_state(oid)
+            oldest = min(_aware(r["ts"]) for r in rows)
+            if state is None or state["status"] not in OPEN_ORDER_STATUSES or now - oldest >= timedelta(
+                    seconds=HOLD_SECONDS):
+                fills = [{"id": r["fill_id"], "side": "BUY" if r["amount"] > 0 else "SELL",
+                          "qty": abs(float(r["amount"])), "price": float(r["price"] or 0.0), "order_id": oid,
+                          "held": True} for r in rows]
+                groups[oid] = fills + groups.get(oid, [])
+        work += [(s, venue, key, fills) for key, fills in groups.items()]
+    nets = _Nets(store, targets, work)
+    sent = 0
+    for s, venue, key, fills in sorted(work, key=lambda w: max(f["id"] for f in w[3])):
+        sent += _copy_order(store, s, venue, key, fills, nets)
+    return sent
+
+
+class _Nets:
+    """Per Bybit symbol: the paper net of its mirrored Strategies, what of it is not yet copied, and the demo
+    position (read once, then moved by what is sent), so each copy can be sized by its effect on the net."""
+
+    def __init__(self, store, targets: dict, work: list[tuple]) -> None:
+        self.store, self.venue = store, targets.get("BYBIT")
+        self.paper: dict[str, float] = {}
+        self.uncopied: dict[str, float] = {}
+        self.demo: dict[str, float] = {}
+        copying = _pending_qty(store)
+        for s in mirrored(store):
+            symbol = _bybit_symbol(s)
+            if symbol is None or store.mirror_watermark(s.name) is None:
                 continue
-            store.record_mirror(s.name, fill_id=f["id"], status="filled", instrument=instrument, amount=sign * amount,
-                                price=price, order_id=order_id, message="reset" if reset else "")
-            sent += 1
+            self.paper[symbol] = self.paper.get(symbol, 0.0) + store.journal_book(s.name, s.starting_balance)["qty"]
+            self.uncopied[symbol] = self.uncopied.get(symbol, 0.0) + copying.get(s.name, 0.0)
+        for s, _venue, _key, fills in work:
+            symbol = _bybit_symbol(s)
+            if symbol is not None:
+                self.uncopied[symbol] = self.uncopied.get(symbol, 0.0) + sum(
+                    _signed(f) for f in fills if not f.get("held"))
+
+    def position(self, symbol: str) -> float:
+        if symbol not in self.demo:
+            self.demo[symbol] = self.venue.position(symbol)
+        return self.demo[symbol]
+
+    def after(self, symbol: str, move: float) -> float:
+        """Where the paper net ends once this order's move is copied (the rest not yet copied left out)."""
+        return self.paper.get(symbol, 0.0) - self.uncopied.get(symbol, 0.0) + move
+
+    def done(self, symbol: str, move: float, sent: float = 0.0) -> None:
+        self.uncopied[symbol] = self.uncopied.get(symbol, 0.0) - move
+        if symbol in self.demo:
+            self.demo[symbol] = round(self.demo[symbol] + sent, 8)
+
+
+def _copy_order(store, s, venue, key: str, fills: list[dict], nets: _Nets) -> int:
+    """Send one paper order's fills to the demo account; how many demo orders went in (two when a Bybit copy crosses
+    zero: the reduce-only part, then the plain part)."""
+    net = sum(_signed(f) for f in fills)
+    last = max(fills, key=lambda f: f["id"])
+    held_ids = {f["id"]: _signed(f) for f in fills if f.get("held")}
+    symbol = _bybit_symbol(s)
+
+    def close_held(order_id: str = "") -> None:
+        for fid, amount in held_ids.items():
+            store.record_mirror(s.name, fill_id=fid, status=GROUPED, order_id=order_id, amount=amount)
+
+    def skip(instrument: str, why: str) -> int:
+        store.record_mirror(s.name, fill_id=last["id"], status="skipped", instrument=instrument or "", message=why)
+        close_held()
+        if symbol is not None:
+            nets.done(symbol, net)
+        store.event(s.name, "warning", "mirror_skipped",
+                    f"Demo mirror didn't copy the {side.lower()} of {abs(net):.8g} to the demo account: "
+                    f"{why}. The paper book is unaffected.")
+        return 0
+
+    if abs(net) < 1e-12:  # pieces that cancel out: nothing to send
+        close_held()
+        return 0
+    side, sign = ("BUY", 1) if net > 0 else ("SELL", -1)
+    price = sum(f["price"] * f["qty"] for f in fills) / sum(f["qty"] for f in fills)
+    state = store.order_state(key) if not key.startswith("fill:") else None
+    reset = state is not None and "Reset strategy" in state["reason"]  # a PM reset's closing fill
+    try:
+        instrument, amount, why = venue.size(s, {"qty": abs(net), "side": side, "price": price, "id": last["id"]})
+    except Exception as e:  # noqa: BLE001 - the demo venue's contract list unreachable: noted, not retried
+        instrument, amount, why = None, 0.0, f"couldn't size it: {str(e)[:200]}"
+    if why:
+        return skip(instrument, why)
+    if symbol is not None:  # Bybit: sized by its effect on the shared paper net (Advisor B33 Q2)
+        step, min_notional = BYBIT_CONTRACTS[symbol]
+        try:
+            demo = nets.position(symbol)
+        except Exception as e:  # noqa: BLE001 - noted, never retried, so it can't trade twice
+            return skip(instrument, f"couldn't read the demo position: {str(e)[:200]}")
+        room = max(0.0, sign * (nets.after(symbol, net) - demo))  # never past where the paper net ends
+        amount = round(int(min(amount, room) / step + 1e-9) * step, 8)
+        cut = round(int(min(amount, abs(demo)) / step + 1e-9) * step, 8) if demo * sign < 0 else 0.0
+        parts = [(cut, True), (round(amount - cut, 8), False)]
+        parts = [(q, ro) for q, ro in parts if q >= step and (ro or q * price >= min_notional)]
+        if not parts:
+            return skip(instrument, "the demo account already holds where the paper net ends")
+    else:  # Deribit: no shared-net target (sized in dollars at each fill); a closing order may only cut
+        closing = state is not None and (reset or state["intent"] in REDUCE_ONLY_INTENTS)
+        if closing:
+            try:
+                amount = min(amount, max(0.0, -sign * venue.position(instrument)))
+            except Exception as e:  # noqa: BLE001
+                return skip(instrument, f"couldn't read the demo position: {str(e)[:200]}")
+            if amount <= 0:
+                return skip(instrument, "the demo account holds nothing on the side this close cuts")
+        parts = [(amount, closing)]
+    sent, first_id = 0, ""
+    for n, (qty, reduce_only) in enumerate(parts):
+        suffix = f"reset:{last['id']}" if reset else str(last["id"])
+        label = copy_link(s.name, suffix if n == 0 else f"{suffix}b")
+        try:
+            if reduce_only:
+                order_id, filled = venue.market(side, instrument, qty, label, reduce_only=True)
+            else:
+                order_id, filled = venue.market(side, instrument, qty, label)
+        except Exception as e:  # noqa: BLE001 - noted, never retried, so it can't trade twice
+            store.record_mirror(s.name, fill_id=last["id"], status="error", instrument=instrument,
+                                amount=sign * qty, message=str(e)[:500])
+            store.event(s.name, "warning", "mirror_failed",
+                        f"Demo mirror couldn't copy the {side.lower()} of {qty:.8g} at {price:,.2f} "
+                        f"to the demo account: {str(e)[:200]}. The paper book is unaffected.")
+            break
+        store.record_mirror(s.name, fill_id=last["id"], status="filled", instrument=instrument, amount=sign * qty,
+                            price=filled, order_id=order_id, message="reset" if reset else "")
+        first_id = first_id or order_id
+        sent += 1
+        if symbol is not None:
+            nets.demo[symbol] = round(nets.demo[symbol] + sign * qty, 8)
+    close_held(first_id)
+    if symbol is not None:
+        nets.done(symbol, net)
     return sent
 
 
@@ -439,6 +631,7 @@ def check_drift(store, targets: dict, last: dict[str, float]) -> dict[str, float
 
 
 _CATCH_UP_FAILED: dict[str, str] = {}  # per strategy, the last catch-up failure warned about
+_GAP_ALERTED: dict[str, str] = {}  # per strategy, the gap alert last sent or found in the journal (B-33)
 
 
 def catch_up(store, targets: dict, seen: dict[str, float]) -> dict[str, float]:
@@ -458,16 +651,20 @@ def catch_up(store, targets: dict, seen: dict[str, float]) -> dict[str, float]:
         symbol = s.instrument.replace("/", "").upper()
         if target_for(s) == "BYBIT" and symbol in BYBIT_CONTRACTS and store.mirror_watermark(s.name) is not None:
             by_symbol.setdefault(symbol, []).append(s)
-    put_on = _put_on(store)
+    put_on, copying = _put_on(store), _pending_qty(store)
     for symbol, sleeves in by_symbol.items():
         step, min_notional = BYBIT_CONTRACTS[symbol]
         paper = {s.name: store.journal_book(s.name, s.starting_balance) for s in sleeves}
         gaps = {}
         for s in sleeves:
-            gap = round(round((paper[s.name]["qty"] - put_on.get(s.name, 0.0)) / step) * step, 8)
+            gap = round(round((paper[s.name]["qty"] - put_on.get(s.name, 0.0) - copying.get(s.name, 0.0)) / step)
+                        * step, 8)
             if abs(gap) >= step:
                 gaps[s.name] = gap
         out.update(gaps)
+        for s in sleeves:  # no gap left: an alert sent for it is closed, so the same gap later is alerted again
+            if s.name not in gaps:
+                _close_gap(store, s.name)
         due = {n: g for n, g in gaps.items() if seen.get(n) == g}
         if not due:
             continue
@@ -499,7 +696,37 @@ def catch_up(store, targets: dict, seen: dict[str, float]) -> dict[str, float]:
                         f"{symbol}, a copy it had missed")
             account_gap -= sign * qty
             out.pop(name, None)
+        for name, gap in due.items():  # Advisor B33 Q3 (b): a gap still open after its two checks is an alert
+            sign = 1 if gap > 0 else -1
+            # Only while the account itself is still short that way (CR B-33 MUST 1): a copy that errored but went
+            # in leaves this Strategy's own gap open with the account level with the paper book, which is no gap.
+            if name in out and sign * account_gap >= step - 1e-9:
+                _alert_gap(store, name, f"Demo mirror: the demo account is still {abs(gap):g} {symbol} "
+                           f"{'short of' if gap > 0 else 'over'} the paper position after two checks, and the "
+                           "catch-up couldn't close it. Check the demo account; the paper book is unaffected.")
+            else:
+                _close_gap(store, name)
     return out
+
+
+def _alert_gap(store, name: str, words: str) -> None:
+    """Once per open gap, across restarts too: the journal's last gap event for the Strategy says whether this one
+    was already sent (the alerts thread sends every error event to the PM's channel once)."""
+    if _GAP_ALERTED.get(name) == words:
+        return
+    last = store.last_event(name, ("mirror_gap", "mirror_gap_closed"))
+    _GAP_ALERTED[name] = words
+    if last is not None and last["kind"] == "mirror_gap" and last["message"] == words:
+        return
+    store.event(name, "error", "mirror_gap", words)
+
+
+def _close_gap(store, name: str) -> None:
+    _GAP_ALERTED.pop(name, None)
+    last = store.last_event(name, ("mirror_gap", "mirror_gap_closed"))
+    if last is not None and last["kind"] == "mirror_gap":
+        store.event(name, "info", "mirror_gap_closed", "Demo mirror: the demo account is level with the paper "
+                    "position again.")
 
 
 def bybit_leverage(store) -> dict[str, tuple[float, list]]:

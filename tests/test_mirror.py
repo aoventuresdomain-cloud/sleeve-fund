@@ -333,7 +333,13 @@ def test_a_missed_copy_on_bybit_is_caught_up_once_the_gap_is_seen_twice():
     assert mirror.catch_up(store, targets, seen) == {}  # level now: nothing more
     # The catch-up row doesn't move the watermark: the next real fill is still copied.
     _fill(store, "bn-ls", "SELL", 0.1, 2)
-    assert mirror.mirror_once(store, targets) == 1 and demo.held == pytest.approx(-0.05)
+    # TEC-B33-CATCHUP (HoE, Advisor B33 Q2): the sell of 0.1 through 0.05 held goes as two orders, reduce-only to flat
+    # first, then the plain rest; the same end position as the one order before B-33.
+    sent = len(demo.orders)
+    assert mirror.mirror_once(store, targets) == 2 and demo.held == pytest.approx(-0.05)
+    first, second = demo.orders[sent:]
+    assert (first["side"], float(first["qty"]), first.get("reduceOnly")) == ("Sell", 0.05, True)
+    assert (second["side"], float(second["qty"]), second.get("reduceOnly", False)) == ("Sell", 0.05, False)
     assert store.journal_book("bn-ls", 10_000)["qty"] == pytest.approx(-0.05)  # the paper book is untouched
 
 
