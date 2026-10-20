@@ -32,7 +32,10 @@ def risk_view(store: Store, summaries: list[dict], book: dict) -> dict:
     for x in summaries:
         s, p = x["sleeve"], x["profile"]
         peak = store.peak_equity(s.name) or s.starting_balance
-        shocks, at_stake = [], most_it_can_lose(x)
+        in_fund = bool(x.get("in_fund"))
+        # Inside the fund its own equity is its P&L from 0 and its own halt doesn't act (B-20): what it has at stake
+        # is bounded by the fund's equity, and only the fund's brakes halt.
+        shocks, at_stake = [], most_it_can_lose(x, book["equity"]) if in_fund else most_it_can_lose(x)
         perp_held = bool(x.get("qty")) and markets.is_perp(s.params)
         for shock in SHOCKS:
             # Signed: a long loses in a fall, a short in a rally, at most what it has at stake (most_it_can_lose).
@@ -41,14 +44,15 @@ def risk_view(store: Store, summaries: list[dict], book: dict) -> dict:
             after = x["equity"] - loss
             dd_after = 1 - after / max(peak, x["equity"]) if peak else 0.0
             # A strategy with nothing left (wiped out) can't breach again: it is already halted (m12 fix re-check, mF-3).
-            shocks.append({"loss": loss, "breach": x["equity"] > 0 and dd_after >= p.max_drawdown,
+            shocks.append({"loss": loss, "breach": not in_fund and x["equity"] > 0 and dd_after >= p.max_drawdown,
                            # A perp whose move reaches what it has at stake is liquidated in the gap (its margin
                            # and the liquidation fee lost): a two-leg Strategy's other leg is then left unhedged.
                            "liquidated": perp_held and at_stake > 0 and raw >= at_stake})
         rows.append({
             "x": x,
             "dd_used": x["dd_used"],
-            "day_used": min(max(-x["day_ret"], 0.0) / p.daily_loss, 1.0) if p.daily_loss else 0.0,
+            # Inside the fund its own day pause doesn't act (CUT-A (d)): nothing used (B-20)
+            "day_used": 0.0 if in_fund else min(max(-x["day_ret"], 0.0) / p.daily_loss, 1.0) if p.daily_loss else 0.0,
             "headroom": x["room"],
             # An open position's own stop (an exit-plan edit moves it), else the model's setting (P1-U14).
             "has_stop": bool(pos["stop_px"]) if (pos := positions.get(s.name)) else bool(
@@ -59,22 +63,80 @@ def risk_view(store: Store, summaries: list[dict], book: dict) -> dict:
         })
     rows = _fold_pairs(store, rows)
     equity = book["equity"] or 1.0
+    # Inside the fund only the fund's drawdown brake halts (T5b, B-20): a move that takes the book's drawdown to it
+    fund_limit = fund_halt_limit(store) if book.get("fund_cash") else None
+    # measured as the gate measures it, from PortfolioState.reference() (the high-water mark from every mark, or the
+    # PM's Resume re-base), never from the daily curve's drawdown, which misses an intraday peak (CR MUST 1). None
+    # when it can't be read: the fund's halt is then unknown, never "would not halt".
+    reference = fund_halt_reference(store) if fund_limit is not None else None
     scenarios = []
     for i, shock in enumerate(SHOCKS):
         # The book's loss is every leg's, a pair's row carrying its two legs' signed sum; a test-account Strategy is
         # outside the fund's book (it still halts on its own limit).
         loss = sum(r["shocks"][i]["loss"] for r in rows
                    if r["x"]["sleeve"].desired_state == "running" and not r["x"].get("test_account"))
-        scenarios.append({"shock": shock, "loss": loss, "pnl": -loss, "loss_pct": loss / equity,
+        fund_halt = (False if fund_limit is None else None if reference is None
+                     else 1 - (book["equity"] - loss) / reference >= fund_limit)
+        scenarios.append({"shock": shock, "loss": loss, "pnl": -loss, "loss_pct": loss / equity, "fund_halt": fund_halt,
                           "breaches": [r["x"]["sleeve"].name for r in rows if r["shocks"][i]["breach"]],
                           "unhedged": [r["x"]["sleeve"].name for r in rows if r["shocks"][i].get("unhedged")]})
     largest = largest_asset(book["allocation"], book["equity"])
     return {"rows": rows, "scenarios": scenarios, "largest": largest,
+            "fund_halt_unknown": fund_limit is not None and reference is None,
             **{k: held[k] for k in ("accounts", "book", "unallocated", "margin", "open_risk", "estimated", "through", "left_out", "trailing", "hint", "spot",
                                        "spot_risk", "spot_left_out", "spot_hint")},
             "down20": next(sc for sc in scenarios if sc["shock"] == -0.20),
             "up20": next(sc for sc in scenarios if sc["shock"] == 0.20),
             "history": store.events_of(BREACH_KINDS, limit=50)}
+
+
+def limits_in_force(store: Store):
+    """The compliance tests the entry gate applies now (portfolio.compliance.load, the PM's saved version), or None
+    when they can't be read, which the gate refuses on. Never the module's constant PORTFOLIO, which is only the seeded
+    first version (B-20)."""
+    from sleeve_fund.portfolio import compliance
+
+    try:
+        return compliance.load(store)
+    except Exception as exc:  # noqa: BLE001 - said as not readable, never a stand-in limit
+        print(f"dashboard: can't read the compliance tests in force: {exc!r}")
+        return None
+
+
+def fund_halt_limit(store: Store) -> float | None:
+    """T5b, the fund's drawdown halt, as the gate reads it; None when off or unreadable (B-20)."""
+    p = limits_in_force(store)
+    return float(p.drawdown) if p is not None and p.drawdown else None
+
+
+def fund_halt_reference(store: Store) -> float | None:
+    """What the fund's drawdown halt measures from, as the gate reads it (PortfolioState.reference()); None before the
+    supervisor's first mark or when the gate's state can't be read (printed)."""
+    from sleeve_fund.paper.portfolio_gate import PaperGate
+
+    try:
+        ref = PaperGate(store).ledger.state().reference()
+    except Exception as exc:  # noqa: BLE001 - unknown, said so on the page, never a stand-in peak
+        print(f"risk page: can't read the fund's halt reference: {exc!r}")
+        return None
+    return float(ref) if ref is not None and ref > 0 else None
+
+
+def fund_drawdown(store: Store) -> float | None:
+    """PAGE-DD (Advisor, 20 Oct): the drawdown the fund's halt (T5b) acts on, from the gate's last mark against its
+    reference, as portfolio.limits.book_breach measures it (1 - book / the higher of the two). None before the
+    supervisor's first mark or when the gate's state can't be read (printed): the page then says it is not marked."""
+    from sleeve_fund.paper.portfolio_gate import PaperGate
+
+    try:
+        st = PaperGate(store).ledger.state()
+        ref = st.reference()
+    except Exception as exc:  # noqa: BLE001 - unknown, said so on the page, never the daily curve's figure
+        print(f"dashboard: can't read the fund's drawdown from the gate: {exc!r}")
+        return None
+    if st.equity is None or ref is None or st.equity <= 0 or ref <= 0:
+        return None
+    return float(round(1 - st.equity / max(ref, st.equity), 4))
 
 
 def _fold_pairs(store: Store, rows: list[dict]) -> list[dict]:
@@ -100,14 +162,16 @@ def _fold_pairs(store: Store, rows: list[dict]) -> list[dict]:
 def _pair_row(store: Store, first: dict, second: dict) -> dict:
     x = legs.fold_one(store, first["x"], second["x"])
     p, pair = x["profile"], x["pair"]
-    day_start = float(pair["day_start_equity"]) if pair.get("day_start_equity") else x["equity"] - x["day_pnl"]
-    x["day_ret"] = x["equity"] / day_start - 1 if day_start else 0.0
+    in_fund = bool(x.get("in_fund"))  # its own halt and day pause don't act inside the fund (B-20)
+    if not in_fund:  # inside the fund fold_one's day_ret is already over the fund's equity
+        day_start = float(pair["day_start_equity"]) if pair.get("day_start_equity") else x["equity"] - x["day_pnl"]
+        x["day_ret"] = x["equity"] / day_start - 1 if day_start else 0.0
     shocks = []
     for a, b in zip(first["shocks"], second["shocks"], strict=True):
         loss = a["loss"] + b["loss"]
         after = x["equity"] - loss
         dd_after = 1 - after / x["peak"] if x["peak"] else 0.0
-        shocks.append({"loss": loss, "breach": x["equity"] > 0 and dd_after >= p.max_drawdown,
+        shocks.append({"loss": loss, "breach": not in_fund and x["equity"] > 0 and dd_after >= p.max_drawdown,
                        "liquidated": a["liquidated"] or b["liquidated"],
                        "unhedged": [n for n, leg in ((1, a), (2, b)) if leg["liquidated"]]})
     for leg in (first, second):
@@ -115,7 +179,7 @@ def _pair_row(store: Store, first: dict, second: dict) -> dict:
     return {
         "x": x, "legs": [first, second],
         "dd_used": x["dd_used"],
-        "day_used": min(max(-x["day_ret"], 0.0) / p.daily_loss, 1.0) if p.daily_loss else 0.0,
+        "day_used": 0.0 if in_fund else min(max(-x["day_ret"], 0.0) / p.daily_loss, 1.0) if p.daily_loss else 0.0,
         "headroom": x["room"],
         "has_stop": first["has_stop"] and second["has_stop"], "stop_dist": None, "position": None,
         "shocks": shocks,
@@ -135,9 +199,9 @@ def gate_size(store: Store, book: dict) -> dict:
     read, which is printed). tone: "" under NEAR_LIMIT of the limit, "warn" from it,
     "loss" at the limit, where the gate takes nothing more that raises total size. Display only."""
     from sleeve_fund.paper.portfolio_gate import PaperGate
-    from sleeve_fund.risk import PORTFOLIO
 
-    limit = PORTFOLIO.gross
+    tests = limits_in_force(store)  # the saved T4a, not the seeded constant (B-20); None: off or unreadable
+    limit = float(tests.gross) if tests is not None and tests.gross is not None else None
     total = net = None
     source = "gate"
     try:
@@ -155,25 +219,30 @@ def gate_size(store: Store, book: dict) -> dict:
     if total is None:
         total, net = Decimal(repr(book["exposure_pct"])), Decimal(repr(book["net_pct"]))
         source = "marks" if source == "gate" else source
-    cap = Decimal(repr(limit))  # compared exactly, as the gate compares (limits.decide)
-    tone = "loss" if total >= cap else "warn" if total >= cap * Decimal(repr(NEAR_LIMIT)) else ""
+    tone = ""
+    if limit is not None:
+        cap = Decimal(repr(limit))  # compared exactly, as the gate compares (limits.decide)
+        tone = "loss" if total >= cap else "warn" if total >= cap * Decimal(repr(NEAR_LIMIT)) else ""
     total, net = float(total), float(net)
-    return {"total": total, "net": net, "limit": limit, "tone": tone, "source": source}
+    return {"total": total, "net": net, "limit": limit, "tone": tone, "source": source,
+            "limit_off": limit is None and tests is not None}
 
 
-def most_it_can_lose(x: dict) -> float:
+def most_it_can_lose(x: dict, bound: float | None = None) -> float:
     """The most a strategy's open position can lose from the mark, however far the market moves. A perpetual
     on isolated margin is liquidated before it loses more than its margin (notional at entry over the profile's
     leverage cap, markets.isolated_margin) and what it has made or lost since entry, plus the fee on the
-    liquidation; the rest of its equity is not at risk (m13-U6). Anything else can lose at most its equity."""
-    equity, s, qty = max(x["equity"], 0.0), x["sleeve"], x.get("qty") or 0.0
+    liquidation; the rest of its equity is not at risk (m13-U6). Anything else can lose at most its equity, or, inside
+    the fund, `bound`: the fund's equity, since its own is its P&L from 0 (B-20)."""
+    equity, s, qty = max(x["equity"] if bound is None else bound, 0.0), x["sleeve"], x.get("qty") or 0.0
     t, tiered = markets.held_terms(s.params, s.venue, s.instrument) if qty else (None, False)
     if t is None or not tiered:  # unknown liquidation (no kept table): no more than its equity
         return equity
     entry, lev = x.get("entry_px") or x["price"], risk.leverage_cap(x["profile"], s.params)
-    liq = markets.isolated_liquidation(x["cash"], qty, entry, lev, t.maintenance_margin)
+    cash = trading.margin_cash(x)  # inside the fund, with its funding added back as the engine does (B-20)
+    liq = markets.isolated_liquidation(cash, qty, entry, lev, t.maintenance_margin)
     taker = float(markets.fees_for(s.params, venue_profile(s.venue).fees, s.venue).taker)
-    cap = markets.gap_loss_cap(qty, entry, lev, x["cash"] + qty * entry, taker, liq)  # what the engine books (P1-D3)
+    cap = markets.gap_loss_cap(qty, entry, lev, cash + qty * entry, taker, liq)  # what the engine books (P1-D3)
     return min(max(cap + x.get("unrealised", 0.0), 0.0), equity)
 
 
@@ -349,4 +418,4 @@ def stress_bars(scenarios: list[dict]) -> dict:
     shown = [sc for sc in scenarios if any(abs(sc["shock"] - s) < 1e-9 for s in STRESS_SHOWN)]
     biggest = max((abs(sc["pnl"]) for sc in shown), default=0.0)
     bars = [{**sc, "width": (abs(sc["pnl"]) / biggest * 46 if biggest else 0.0)} for sc in shown]
-    return {"bars": bars, "halts": [sc for sc in shown if sc["breaches"]]}
+    return {"bars": bars, "halts": [sc for sc in shown if sc["breaches"] or sc.get("fund_halt")]}

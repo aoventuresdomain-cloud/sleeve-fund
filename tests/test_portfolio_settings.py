@@ -75,8 +75,9 @@ def test_an_edit_is_reviewed_old_to_new_then_saved_as_a_new_version_in_history(p
     assert "T1 Per asset: 4% → 3%" in t and "T2 Per asset group: on → off" in t and "ADA group: none → small" in t
     assert _n(store) == 1  # the review writes nothing
     carried = dict(re.findall(r'<input type="hidden" name="([^"]+)" value="([^"]*)">', r.text))
-    r = c.post("/portfolio-settings/apply", data={**carried, "reason_pick": "Tighter while testing"}, auth=AUTH,
-               headers=SAME, follow_redirects=False)
+    # TEC-B31-TICK (HoE 20 Oct): T2 goes off, so the review step's confirm tick is sent too
+    r = c.post("/portfolio-settings/apply", data={**carried, "confirm_off": "on", "reason_pick": "Tighter while testing"},
+               auth=AUTH, headers=SAME, follow_redirects=False)
     assert r.status_code == 303 and r.headers["location"] == "/portfolio-settings?saved=2"
     cur = store.compliance()
     new = {t["test"]: t for t in cur.tests}

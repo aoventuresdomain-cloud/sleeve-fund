@@ -889,10 +889,13 @@ class Supervisor:
                     continue
                 run = self.store.split_run(req, dust_ok=dust)
             self.store.set_desired_state(name, "running" if req["restart"] else "stopped")
-            self.store.decide("system", "reset", f"Started afresh at {s.starting_balance:,.0f}; the run before is "
+            # B-20: inside a fund-held book a Strategy has no capital of its own, so "afresh at 0" misstates it
+            again = ("trading the fund's cash, with no capital of its own" if _fund_held(self.store)
+                     else f"at {s.starting_balance:,.0f}")
+            self.store.decide("system", "reset", f"Started afresh {again}; the run before is "
                               f"kept as {run} under Previous book", name)
             self.store.event(name, "info", "reset", f"Reset by the PM ({req['reason']}): the run so far is kept as "
-                             f"{run}; starting again at {s.starting_balance:,.0f}")
+                             f"{run}; starting again {again}")
             if s.params.get("demo_mirror"):
                 self.store.queue_resync(name, f"Reset strategy: {req['reason']}")
 
@@ -1493,20 +1496,28 @@ def clear_entries(store: Store, entries: list[dict]) -> list[str]:
     return cleared
 
 
+def _fund_held(store: Store) -> bool:
+    """The fund holds the cash (the PM's re-base deposit applied, bridge_start): no Strategy has capital of its own."""
+    return bridge_start(store) is not None
+
+
 def book_line(store: Store) -> str:
     """The current book in one line for the deploy log: each strategy with its starting balance and
     whether it has traded or been marked yet, so a fresh book can be checked without the dashboard."""
     archived = store.archived()
+    held = _fund_held(store)  # B-20: the fund holds the cash, so no Strategy has a balance of its own to show
     parts = []
     for s in store.sleeves():
+        own = "" if held else f" {s.starting_balance:,.0f}"
         if s.name in archived:
             qty = store.journal_book(s.name, s.starting_balance)["qty"]
             if abs(qty) > 1e-12:  # still counted in the book until it is flat
-                parts.append(f"{s.name} {s.starting_balance:,.0f} (archived, still holding {qty:.12g}, {s.desired_state})")
+                parts.append(f"{s.name}{own} (archived, still holding {qty:.12g}, {s.desired_state})")
             continue
         history = "has history" if store.fills(s.name, limit=1) or store.last_equity(s.name) else "no history"
-        parts.append(f"{s.name} {s.starting_balance:,.0f} ({s.desired_state}, {history})")
-    return "; ".join(parts) or "empty"
+        parts.append(f"{s.name}{own} ({s.desired_state}, {history})")
+    line = "; ".join(parts) or "empty"
+    return f"the fund holds the cash: {line}" if held else line
 
 
 def book_figures(store: Store) -> str:

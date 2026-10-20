@@ -333,6 +333,7 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 .side { font-weight: 600; } .side.buy { color: var(--gain); } .side.sell { color: var(--loss); }
 td .sub { font-size: 11.5px; color: var(--faint); }
 td .sub.liq { white-space: normal; max-width: 8.5em; margin-left: auto; }  /* the stop-to-liquidation words wrap under the price (R200-5) */
+td .sub.margin { white-space: normal; }  /* "margin" over its amount, so the leverage column stays narrow (B-36, R200-5 at 1440) */
 td.reason { max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
 .why-btn { background: none; border: 1px solid var(--line); color: var(--muted); padding: 1px 8px; font-size: 12px; font-weight: 500; border-radius: 4px; }
 .why-btn:hover { color: var(--text); border-color: var(--line-strong); }
@@ -1216,6 +1217,8 @@ table.movers tbody tr.tot th, table.movers tbody tr.tot td { border-top: 1px sol
 .picklist .pl-menu .opt small.paused { color: var(--warn); }
 .picklist .pl-menu .opt[aria-selected="true"] { background: var(--accent-soft); }
 .picklist .pl-menu .opt.own { color: var(--accent); }
+.picklist .pl-menu .opt.off { cursor: not-allowed; color: var(--faint); flex-wrap: wrap; }
+.picklist .pl-menu .opt.off small { white-space: normal; color: var(--warn); }
 .picklist .pl-menu .none { padding: 8px; font-size: 12.5px; color: var(--muted); }
 .picklist .pl-badge { margin: 4px 0 0; min-height: 1em; }
 .picklist .pl-badge.running { color: var(--gain); }

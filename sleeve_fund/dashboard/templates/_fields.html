@@ -18,7 +18,7 @@
       role="combobox" aria-expanded="false" aria-controls="instrument-list" aria-autocomplete="list" placeholder="Search every instrument">
     <span class="pl-kind" data-pl-kind>{{ 'perpetual' if home.perpetual else 'spot' }}</span>
   </div>
-  <input type="hidden" name="venue" value="{{ home.key }}" data-pl-venue data-perp="{{ '1' if home.perpetual }}">
+  <input type="hidden" name="venue" value="{{ home.key }}" data-pl-venue data-perp="{{ '1' if home.perpetual }}" data-bars="{{ home.bars|join(' ') if home.bars }}">
   <ul class="pl-menu" id="instrument-list" role="listbox" aria-label="Instruments" hidden></ul>
   <p class="hint pl-badge" data-pl-badge aria-live="polite"></p>
   <script type="application/json" data-pl-seed>{{ {'venues': vs, 'default': home.key}|tojson }}</script>
@@ -34,10 +34,11 @@
 
 {% macro strategy_fields(strategies, chosen, g1, pre) %}
 <div class="field"><label for="strategy">Model</label>
-  {% macro opt(st) %}<option value="{{ st.name }}" {{ 'selected' if st.name == chosen }} data-g1="{{ g1.get(st.name) or '' }}"{% if st.prefill %} data-prefill="{{ st.prefill|tojson|forceescape }}"{% endif %}>{{ st.name|replace('_', ' ') }} ({{ st.family }})</option>{% endmacro %}
+  {% macro opt(st) %}<option value="{{ st.name }}" {{ 'selected' if st.name == chosen }} data-g1="{{ g1.get(st.name) or '' }}"{% if st.stopless_max %} data-stopless-max="{{ '%g'|format(st.stopless_max) }}"{% endif %}{% if st.perp_refused %} data-perp-refused="{{ st.perp_refused }}"{% endif %}{% if st.bar %} data-bar="{{ st.bar }}" data-bar-words="{{ st.bar_words }}"{% endif %}{% if st.prefill %} data-prefill="{{ st.prefill|tojson|forceescape }}"{% endif %}>{{ st.name|replace('_', ' ') }} ({{ st.family }})</option>{% endmacro %}
   {% set tests = strategies|selectattr('group', 'equalto', 'Test')|list %}
   <select name="strategy" id="strategy">{% if tests %}<optgroup label="Strategies">{% endif %}{% for st in strategies if st.group != 'Test' %}{{ opt(st) }}{% endfor %}{% if tests %}</optgroup>
-    <optgroup label="Test">{% for st in tests %}{{ opt(st) }}{% endfor %}</optgroup>{% endif %}</select></div>
+    <optgroup label="Test">{% for st in tests %}{{ opt(st) }}{% endfor %}</optgroup>{% endif %}</select>
+  <p class="warnbox" id="model-refused" role="alert" hidden></p></div>
 {% for st in strategies %}
 <div class="params" data-strategy="{{ st.name }}">
   <p class="muted" style="margin:8px 0"><span class="desc" data-tpl="{{ st.tpl }}" data-defaults="{{ st.defaults|tojson|forceescape }}">{{ st.idea }}</span> <a href="/strategies/{{ st.name }}">Details and evidence</a></p>
@@ -48,7 +49,7 @@
 {% endfor %}
 {% endmacro %}
 
-{% macro exit_fields(pre, costs=none, side=none, params=none) %}
+{% macro exit_fields(pre, costs=none, side=none, params=none, fund_held=false) %}
 {# One stop and one target, each set one way: the kind is read back from whichever value is filled in.
    The plan line under them (console.js exitPlan) prices the plan in R with the same costs the backtest
    and paper charge. #}
@@ -78,7 +79,7 @@
     </select></div>
     <div class="field" data-tp="pct"><label for="take_profit_pct" data-exit-tpl="Target, % {tp} entry">Target, % {{ w.tp }} entry</label><input id="take_profit_pct" name="take_profit_pct" type="number" min="0.1" max="1000" step="0.01" placeholder="e.g. 15" value="{{ pre.get('take_profit_pct', '') }}"></div>
     <div class="field" data-tp="r"><label for="take_profit_r">Target in R, after costs</label><input id="take_profit_r" name="take_profit_r" type="number" min="0.1" max="50" step="0.1" placeholder="e.g. 2" value="{{ pre.get('take_profit_r', '') }}"></div>
-    <div class="field"><label for="risk_per_trade_pct">Risk per trade, % of capital</label><input id="risk_per_trade_pct" name="risk_per_trade_pct" type="number" min="0.1" max="20" step="0.1" placeholder="None" value="{{ pre.get('risk_per_trade_pct', '') }}"><p class="hint" data-needs-stop>Needs a stop-loss.</p></div>
+    <div class="field"><label for="risk_per_trade_pct">Risk per trade, % of {{ "fund equity" if fund_held else "capital" }}</label><input id="risk_per_trade_pct" name="risk_per_trade_pct" type="number" min="0.1" max="20" step="0.1" placeholder="None" value="{{ pre.get('risk_per_trade_pct', '') }}"><p class="hint" data-needs-stop>Needs a stop-loss.</p></div>
   </div>
   <p class="exit-plan" aria-live="polite" hidden></p>
 </div>

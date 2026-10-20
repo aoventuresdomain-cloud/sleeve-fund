@@ -10,7 +10,7 @@ PROFILES = {"ALPHA": object(), "BETA": object()}
 
 def test_v1_route_for_a_pinned_strategy():
     r = router.route("trend-a", "alpha", PROFILES, tag="TREND_A_0123456789ABCDEFGH")
-    assert r == router.Route("trend-a", "ALPHA", "ALPHA-PAPER-TREND_A_0123456789AB")
+    assert r == router.Route("trend-a", "ALPHA", "ALPHA-PAPER-TREND_A_01234-681E6A")  # B-29: a long tag is cut plus a hash
 
 
 def test_a_new_profile_needs_no_router_change():

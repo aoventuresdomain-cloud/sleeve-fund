@@ -1551,6 +1551,8 @@ def _not_backtest(col):
 def _insert_sleeve(c, ts: datetime, *, name: str, strategy: str, instrument: str, bar_spec: str, params: dict | None,
                    starting_balance, risk_profile: str, warmup_bars: int, desired_state: str, venue: str | None,
                    parent: str | None = None) -> None:
+    if not is_backtest(name):
+        _no_node_id_clash(c, name)
     c.execute(insert(sleeves_t).values(
         name=name, strategy=strategy, instrument=instrument, bar_spec=bar_spec, params=params or {},
         starting_balance=starting_balance, risk_profile=risk_profile, warmup_bars=warmup_bars,
@@ -1564,6 +1566,32 @@ def _insert_sleeve(c, ts: datetime, *, name: str, strategy: str, instrument: str
         from sleeve_fund.venues import DEFAULT_VENUE
 
         _ensure_instrument(c, (venue or DEFAULT_VENUE).upper(), instrument, _contract(params), underlying(instrument))
+
+
+def _node_ids_of(name: str) -> str | None:
+    """The part of a Strategy's trader and account ids its name gives (router.cut_tag); None for a name with no
+    letter or digit, which its node refuses at start."""
+    tag = router.tag_of(name)
+    return router.cut_tag(tag) if tag else None
+
+
+def _no_node_id_clash(c, name: str, *, back: bool = False) -> None:
+    """B-29 (HoE ruling 3): a new Strategy, or a put-away one brought back (back), whose trader or account id would
+    equal a live Strategy's is refused, as their orders and fills would mix. Only names that differ just in case or
+    punctuation get there (Timed Test and timed-test); a put-away Strategy has no node, so it doesn't count."""
+    ids = _node_ids_of(name)
+    if ids is None:
+        return
+    put_away = select(sleeve_archive_t.c.sleeve)
+    for other in c.execute(select(sleeves_t.c.name).where(_not_backtest(sleeves_t.c.name),
+                                                          sleeves_t.c.name.not_in(put_away))).scalars():
+        if other != name and _node_ids_of(other) == ids:
+            if back:
+                raise ValueError(f"Strategy {name} can't be brought back: its orders would share ids with Strategy "
+                                 f"{other}, as the two names differ only in capitals or punctuation. Put {other} away "
+                                 "first, or leave this one put away.")
+            raise ValueError(f"Strategy {name} can't be made: its orders would share ids with Strategy {other}, as "
+                             "the two names differ only in capitals or punctuation. Choose another name.")
 
 
 def _contract(params: dict | None) -> str:
@@ -3085,6 +3113,8 @@ class Store:
             raise ValueError("this strategy is retired, and a retired strategy can't be brought back")
         if self.two_leg(sleeve):  # TWO_LEG_FENCE
             raise ValueError(f"putting a Strategy away {TWO_LEG_FENCE}")
+        with self.engine.connect() as c:  # B-29: back on the node ids a live Strategy now has, its orders would mix
+            _no_node_id_clash(c, sleeve, back=True)
         back: list[Decimal] = []
 
         def amount() -> Decimal:
@@ -3846,6 +3876,14 @@ class Store:
         """The last fill the mirror has dealt with for a strategy, or None if it has never run for it."""
         with self.engine.connect() as c:
             return c.execute(select(func.max(mirror_t.c.fill_id)).where(mirror_t.c.sleeve == sleeve)).scalar()
+
+    def order_state(self, order_id: str) -> dict | None:
+        """An order's status, intent and reason, or None for an id the journal has no row for (B-33: the demo copy
+        sends one demo order per paper order once it is finished, reduce-only when it closes)."""
+        with self.engine.connect() as c:
+            row = c.execute(select(orders_t.c.status, orders_t.c.intent, orders_t.c.reason)
+                            .where(orders_t.c.order_id == order_id)).first()
+        return None if row is None else {"status": row.status, "intent": row.intent, "reason": row.reason or ""}
 
     def order_reason(self, order_id: str) -> str:
         with self.engine.connect() as c:

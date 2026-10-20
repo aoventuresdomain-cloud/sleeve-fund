@@ -69,7 +69,7 @@ def validate_tests(profile: PortfolioProfile) -> None:
         low, high = BOUNDS[f]
         if not low <= float(value) <= high:
             raise ValueError(f"{LABELS[f]} must be between {low:g} and {high:g}, not {float(value):g}")
-    if profile.daily_loss >= profile.drawdown:
+    if profile.daily_loss is not None and profile.drawdown is not None and profile.daily_loss >= profile.drawdown:
         raise ValueError("the daily loss pause must be below the drawdown halt")
 
 

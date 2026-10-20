@@ -12,6 +12,8 @@ order path call it and keep no rule of their own. Nothing here reads the databas
 
 from __future__ import annotations
 
+import hashlib
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -51,7 +53,29 @@ def route(strategy: str, venue: str, profiles: Mapping[str, object], *, tag: str
         raise RouteError(f"{strategy} is pinned to a venue with no registered profile.")
     if not tag:
         raise ValueError("a route needs the strategy's node tag")
-    return Route(strategy=strategy, venue=name, account_id=f"{name}-PAPER-{tag[:20]}")
+    return Route(strategy=strategy, venue=name, account_id=f"{name}-PAPER-{cut_tag(tag)}")
+
+
+def cut_tag(tag: str) -> str:
+    """A Strategy's node tag as its ids carry it (20 characters at most). B-29 (HoE ruling, 20 Oct): a tag of 20
+    characters or fewer that doesn't end in "-" is kept exactly, so every short name keeps the ids it has. A longer
+    one is cut to 13, any "-" at the end dropped, plus "-" and a hash of the whole tag: the engine refuses an id whose
+    last part is empty ("PAPER-CANDLE-STEP-BTCUSDT-" crashed the form's own suggested name), and a bare cut gave two
+    names sharing their first 20 characters (candle-step-btcusdt-1m and -5m) one trader and one account, so their
+    orders and fills mixed. Two tags that differ give different ids; two names with one tag are refused at create
+    (store.create_sleeve)."""
+    if not tag.strip("-"):  # a name with no letter or digit: it would build "PAPER-", which the engine refuses
+        raise ValueError(f"a Strategy's name needs a letter or digit to make its node ids: {tag!r}")
+    if len(tag) <= 20 and not tag.endswith("-"):
+        return tag
+    cut = tag[:13].rstrip("-")
+    digest = hashlib.sha1(tag.encode()).hexdigest()[:6].upper()
+    return f"{cut}-{digest}" if cut else digest
+
+
+def tag_of(name: str) -> str:
+    """A Strategy's node tag: its name in upper case, each run of other characters one "-", none at either end."""
+    return re.sub(r"[^A-Z0-9]+", "-", name.upper()).strip("-")
 
 
 def venue_for(pinned: str | None) -> str:
