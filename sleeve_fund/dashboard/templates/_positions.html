@@ -6,7 +6,7 @@
 {% macro _lev(p) -%}
 {%- set lev = p.leverage if p.leverage is defined and p.leverage is not none else (p.perp.leverage if p.perp else none) -%}
 {%- if p.perp -%}{% if lev %}<span class="lev">{{ '%g'|format((lev * 10)|round / 10) }}×</span>{% else %}<span class="faint">–</span>{% endif %}
-{%- if p.margin %}<div class="sub" title="The isolated margin set aside for this position">margin {{ p.margin|money }}</div>{% endif %}
+{%- if p.margin %}<div class="sub margin" title="The isolated margin set aside for this position">margin {{ p.margin|money }}</div>{% endif %}
 {%- else %}<span class="lev" title="Spot: no leverage">1×</span>{% endif -%}
 {%- endmacro %}
 
