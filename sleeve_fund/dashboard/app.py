@@ -2101,8 +2101,22 @@ def venue_choices() -> list[dict]:
     """Every venue a strategy can be researched, backtested or paper traded on, for the forms' venue field."""
     from sleeve_fund.venues import VENUES
 
-    return [{"key": v.name.lower(), "label": v.label, "perpetual": v.perpetual, "pairs": _hints(v.name)}
+    return [{"key": v.name.lower(), "label": v.label, "perpetual": v.perpetual, "pairs": _hints(v.name),
+             "bars": venue_bars(v.name)}
             for v in VENUES.values() if v.data_client is not None or v.minute_loader is not None]
+
+
+def venue_bars(venue: str) -> list[str]:
+    """The candle lengths a strategy on `venue` can be saved with: the save's own check (check_hub_bar_spec), so the
+    form offers only what the server keeps (B-35, QT3's sweep: a hub-fed venue refused the venue's own candles)."""
+    allowed = []
+    for spec in sorted(ALLOWED_BAR_SPECS, key=spec_minutes):
+        try:
+            check_hub_bar_spec(venue, spec)
+        except ValueError:
+            continue
+        allowed.append(spec)
+    return allowed
 
 
 def _check_listed(store: Store, venue: str | None, pair: str) -> None:

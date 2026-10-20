@@ -989,6 +989,25 @@ window.Console = (() => {
       if (chip && !chip.checked) { chip.checked = true; chip.dispatchEvent(new Event("change", {bubbles: true})); }
     };
     $("strategy").addEventListener("change", pickBar); pickBar();
+    // B-35: only the candle lengths the venue's strategies can be saved with (app.venue_bars, the save's own check);
+    // the others are greyed with the reason, and a greyed pick moves to 1h built from trades.
+    const venueBars = () => {
+      const v = form.querySelector("[data-pl-venue]");
+      if (!v || v.dataset.bars === undefined || !v.dataset.bars) return;
+      const ok = v.dataset.bars.split(" ");
+      const chips = [...form.querySelectorAll("input[name=bar_spec]")];
+      chips.forEach((c) => {
+        const allowed = ok.includes(c.value);
+        c.disabled = !allowed;
+        c.closest("label").title = allowed ? "" : "Strategies on this market decide on candles built from its minutes, so the venue's own candles aren't available";
+      });
+      const on = chips.find((c) => c.checked);
+      if (on && on.disabled) {
+        const to = chips.find((c) => c.value === "1-HOUR-LAST-INTERNAL" && !c.disabled) || chips.find((c) => !c.disabled);
+        if (to) { to.checked = true; to.dispatchEvent(new Event("change", {bubbles: true})); }
+      }
+    };
+    form.querySelector("[data-pl-venue]")?.addEventListener("change", venueBars); venueBars();
     // and one sized by weight can't trade a perpetual yet (check_perp_sizing): there it is greyed, with the reason.
     const perpModels = () => {
       const perp = $("market").value !== "spot";
@@ -1206,6 +1225,7 @@ window.Console = (() => {
       if (!venues[key]) return;
       const changed = venue.value !== key;
       venue.value = key; venue.dataset.perp = venues[key].perpetual ? "1" : "";
+      venue.dataset.bars = (venues[key].bars || []).join(" ");
       if (kind) kind.textContent = venues[key].perpetual ? "perpetual" : "spot";
       if (changed) venue.dispatchEvent(new Event("change", {bubbles: true}));
     };

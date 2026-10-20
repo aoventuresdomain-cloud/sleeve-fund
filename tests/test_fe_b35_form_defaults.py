@@ -86,13 +86,14 @@ def test_b35_a_stopless_perp_says_why_its_held_to_1x_and_a_stop_frees_the_profil
 
 def test_b35_the_two_1h_chips_suggest_different_names(held_site, browser):  # noqa: F811
     base, _ = held_site
-    page, errors = _open(browser, f"{base}/sleeves/new?instrument=BTC/USDT&venue=binance")
+    # On a spot venue: a hub-fed one offers only the 1h built from trades (no offered chip is refused, below).
+    page, errors = _open(browser, f"{base}/sleeves/new?{WHERE['spot']}")
     names = []
     for spec in ("1-HOUR-LAST-INTERNAL", "1-HOUR-LAST-EXTERNAL"):
         page.check(f"input[name=bar_spec][value='{spec}']", force=True)
         names.append(page.input_value("input[name=name]"))
     assert names[0] != names[1], names
-    assert all(n.startswith("trend-filter-btcusdt-1h") for n in names), names
+    assert all(n.startswith("trend-filter-btcusd-1h") for n in names), names
     assert errors == []
     page.context.close()
 
@@ -105,3 +106,30 @@ def test_b35_the_backtest_form_holds_a_stopless_perp_to_1x_as_paper_does(held_si
     assert page.locator("#stopless-note").is_visible()
     assert errors == []
     page.context.close()
+
+
+@pytest.mark.parametrize("market", ["spot", "perp"])
+def test_b35_no_offered_candle_chip_is_refused(held_site, browser, market):  # noqa: F811
+    """QT3's sweep (HoE 15:32 UK): on a perpetual the form offered "1h venue", 4h and 1d, which the save refused. Every
+    chip the form offers saves, with ping pong's untouched defaults, on that chip."""
+    base, store = held_site
+    page, _ = _open(browser, f"{base}/sleeves/new?{WHERE[market]}")
+    chips = page.eval_on_selector_all("input[name=bar_spec]:not([disabled])", "els => els.map(e => e.value)")
+    page.context.close()
+    assert chips
+    refused = {}
+    for spec in chips:
+        page, errors = _open(browser, f"{base}/sleeves/new?{WHERE[market]}")
+        _choose(page, "ping_pong", market)
+        page.evaluate("""spec => { const r = document.querySelector(`input[name=bar_spec][value='${spec}']`);
+            r.checked = true; r.dispatchEvent(new Event("change", {bubbles: true})); }""", spec)
+        name = page.input_value("input[name=name]")
+        _submit(page)
+        lines = [line for line in page.inner_text("main").splitlines() if "Not saved" in line]
+        if lines:
+            refused[spec] = lines
+        else:
+            assert store.sleeve(name).bar_spec == spec
+        assert errors == [], (spec, errors)
+        page.context.close()
+    assert refused == {}, refused

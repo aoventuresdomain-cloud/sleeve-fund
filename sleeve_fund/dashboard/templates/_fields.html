@@ -18,7 +18,7 @@
       role="combobox" aria-expanded="false" aria-controls="instrument-list" aria-autocomplete="list" placeholder="Search every instrument">
     <span class="pl-kind" data-pl-kind>{{ 'perpetual' if home.perpetual else 'spot' }}</span>
   </div>
-  <input type="hidden" name="venue" value="{{ home.key }}" data-pl-venue data-perp="{{ '1' if home.perpetual }}">
+  <input type="hidden" name="venue" value="{{ home.key }}" data-pl-venue data-perp="{{ '1' if home.perpetual }}" data-bars="{{ home.bars|join(' ') if home.bars }}">
   <ul class="pl-menu" id="instrument-list" role="listbox" aria-label="Instruments" hidden></ul>
   <p class="hint pl-badge" data-pl-badge aria-live="polite"></p>
   <script type="application/json" data-pl-seed>{{ {'venues': vs, 'default': home.key}|tojson }}</script>
