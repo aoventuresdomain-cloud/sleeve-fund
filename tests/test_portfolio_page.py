@@ -226,6 +226,7 @@ def test_an_archived_strategy_gets_one_row_so_the_rows_still_add_up_to_book(clie
         assert len(rows) == 3 and abs(sum(rows) - total) < 0.011, key
         assert 'class="archived-row"' in body and 'title="pp-short"' in body and "/sleeves/pp-short" not in body
     assert 'id="archived"' in c.get("/history", auth=AUTH).text  # TEC-B16-HISTORY: the panel is on History
+    assert 'id="archived"' not in page and 'id="test-accounts"' not in page  # CR F1: and gone from Home
 
 
 def test_a_positions_fees_are_its_own_not_the_strategys_since_it_started(client):  # noqa: F811
