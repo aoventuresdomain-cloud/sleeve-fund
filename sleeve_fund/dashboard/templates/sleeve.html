@@ -142,8 +142,8 @@
   <div data-sub-panel="pos" role="tabpanel" id="tab-positions">
   <div data-live="ov-pos" data-live-forms>
     {# One row per (Strategy, asset) leg, its total matching the journal (multi-asset spec); the demo copy is its own labelled row. #}
-    {# The Portfolio's table and empty message, filtered to this Strategy (B-28). #}
-    {% if positions.rows %}{{ positions_table(positions, close_id='dlg-close', closable=closable) }}
+    {# The Portfolio's table and empty message, filtered to this Strategy, without its Strategy column (B-28). #}
+    {% if positions.rows %}{{ positions_table(positions, show_strategy=False, close_id='dlg-close', closable=closable) }}
     {% else %}{% call positions_empty("4px 18px 14px") %} {% if s.desired_state != 'running' %}The strategy is stopped.{% else %}Waiting for the next signal.{% endif %}{% if idea %} Next entry: {{ idea }}{% endif %}{% endcall %}{% endif %}
     {% if tp_drop %}<p class="tp-dropped" data-tp-dropped>Take-profit <s>{{ '%.2f%%'|format(tp_drop.target * 100) if tp_drop.target is not none else '–' }}</s> dropped: {{ tp_drop.words }}{% if tp_drop.break_even is not none %} (break-even {{ '%.2f%%'|format(tp_drop.break_even * 100) }}){% endif %}</p>{% endif %}
     {# The compliance bars (C8): this Strategy's risk to stop against its risk per trade, and the fund's own figures on

@@ -995,7 +995,7 @@ window.Console = (() => {
       const v = form.querySelector("[data-pl-venue]");
       if (!v || v.dataset.bars === undefined || !v.dataset.bars) return;
       const ok = v.dataset.bars.split(" ");
-      const chips = [...form.querySelectorAll("input[name=bar_spec]")];
+      const chips = [...form.querySelectorAll(".chip-pick input[name=bar_spec]")];  // not a backtest's fixed one
       chips.forEach((c) => {
         const allowed = ok.includes(c.value);
         c.disabled = !allowed;

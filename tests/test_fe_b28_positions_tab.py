@@ -62,17 +62,20 @@ def _table(page):
 
 
 def _thead(page):
+    """The table's headings, the Strategy column left out (only the Portfolio has it, UI v2 item 5)."""
     m = re.search(r"<thead>.*?</thead>", _table(page), re.DOTALL)
     assert m, "no positions table"
-    return m.group(0)
+    return m.group(0).replace("<th>Strategy</th>", "")
 
 
 def _cells(page, name):
     """The row's cells for Strategy `name`, the Close cell left out (it opens each page's own dialog)."""
-    m = re.search(rf'<tr data-pos="{re.escape(name)}">(.*?)</tr>', _table(page), re.DOTALL)
-    assert m, f"no row for {name}"
-    cells = re.findall(r"<td[^>]*>(.*?)</td>", m.group(1), re.DOTALL)
-    return [" ".join(re.sub(r"<[^>]+>", " ", x).split()) for x in cells if "close-btn" not in x]
+    row = next((r for r in re.findall(r"<tr>(.*?)</tr>", _table(page), re.DOTALL)
+                if f'data-pos="{name}"' in r), None)
+    assert row, f"no row for {name}"
+    cells = re.findall(r'<td(?: class="(?:num|close-cell|cell-name)")?(?: data-pos="[^"]*")?>(.*?)</td>', row, re.DOTALL)
+    words = [" ".join(re.sub(r"<[^>]+>", " ", x).split()) for x in cells if "close-btn" not in x]
+    return words[1:] if words and words[0] == name else words  # the Portfolio's Strategy cell
 
 
 def _words(page):
@@ -83,7 +86,7 @@ def test_the_strategy_tab_is_the_portfolios_table(c, store):  # noqa: F811
     _hold(store)
     _long(store, "a")
     home, tab = _html(c, "/"), _html(c, "/sleeves/a")
-    assert _thead(tab) == _thead(home)  # same columns, same order, same headings
+    assert _thead(tab) == _thead(home)  # same columns, same order, same headings (Strategy on the Portfolio only)
 
 
 def test_a_fund_held_perps_row_on_its_tab_is_its_portfolio_row(c, store):  # noqa: F811
@@ -152,8 +155,8 @@ def shared_site(tmp_path, monkeypatch):
 
 
 def _rows(page):
-    return page.evaluate("""() => [...document.querySelectorAll('table.book-pos tbody tr')].map(r => ({
-        name: r.dataset.pos, size: parseFloat(r.querySelectorAll('td')[4].innerText.replace(/,/g, ''))}))""")
+    return page.evaluate("""() => [...document.querySelectorAll('table.book-pos tbody td[data-pos]')].map(td => ({
+        name: td.dataset.pos, size: parseFloat(td.parentElement.children[td.cellIndex + 3].innerText.replace(/,/g, ''))}))""")
 
 
 def test_b28_two_strategies_on_one_asset_each_tab_shows_its_own_rows(shared_site, browser):  # noqa: F811
