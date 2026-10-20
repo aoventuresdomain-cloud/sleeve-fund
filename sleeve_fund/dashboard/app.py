@@ -64,6 +64,7 @@ from sleeve_fund.store import (
     is_backtest,
     utcnow,
 )
+from sleeve_fund.paper.exec_client import exec_settings
 from sleeve_fund.paper.runtime import (EXITS_ONLY, RESUMABLE, clearing_action, entry_blocked, liquidation_event,
                                       pair_ral_figures)
 from sleeve_fund.strategies import (
@@ -254,6 +255,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         ctx.setdefault("shell", shell())
         if name in FUND_BANNER_PAGES:  # C7: one banner at the top, only when it applies
             ctx.setdefault("fund_banner", compliance.fund_banner(st()))
+            ctx.setdefault("brakes_off", compliance.brakes_off(st()))  # B-31: a brake off, until it is back on
         return templates.TemplateResponse(request, name, ctx)
 
     def _saved_backtest_summary(name: str | None) -> dict | None:
@@ -1757,8 +1759,16 @@ def create_app(store: Store | None = None) -> FastAPI:
         if errors:
             return page(request, "portfolio_settings.html", v=v, mode="edit", saved="", errors=errors, form=form)
         cur = v["current"]
+        switches = compliance.brake_switches(cur["tests"], tests)
+        if any(not on for _, on in switches) and exec_settings(os.environ).on:  # the store refuses it too (B-31)
+            names = ", ".join(compliance_rules.name(k) for k, on in switches if not on)
+            errors = [f"{names} can't be switched off while the exchange order client is on. {compliance.PAPER_ONLY}"]
+            return page(request, "portfolio_settings.html", v=v, mode="edit", saved="", errors=errors, form=form)
         lines = compliance_rules.changes(cur["tests"], tests, cur["groups"], groups)
         warned = compliance_rules.warnings(tests)
+        if any(not on for _, on in switches):
+            warned.append(compliance.PAPER_ONLY)
+        warned += compliance.rebase_words(st(), cur["tests"], tests)
         no_group = [g["asset"] for g in v["groups"] if not groups.get(g["asset"])]
         if cur["tests"].get("type_stop_loss", {}).get("enabled") and not tests["type_stop_loss"]["enabled"] and no_group:
             warned.append(f"Assets with no group ({', '.join(no_group)}) will no longer be refused. They still count "
@@ -1793,6 +1803,10 @@ def create_app(store: Store | None = None) -> FastAPI:
                                                   expected_version=expected)
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from None
+        for key, on in compliance.brake_switches(cur[0], tests):  # B-31: every brake switch is an alert
+            st().event(None, "warning", "portfolio_brake_switch",
+                       f"{compliance_rules.name(key)} switched {'back on' if on else 'off'} "
+                       f"(compliance tests v{version}): {reason}")
         return RedirectResponse(f"/portfolio-settings?saved={version}", status_code=303)
 
     @app.get("/setup", response_class=HTMLResponse)

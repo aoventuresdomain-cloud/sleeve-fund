@@ -57,6 +57,7 @@
 {% if fund_banner %}{% set fb = fund_banner %}<div class="banner {{ fb.tone }} fund-banner" role="alert" data-fund-state="{{ fb.state }}"><b>{{ fb.text }}.</b>{% if fb.reason and fb.state != 'book_check' %} {{ fb.reason }}{% endif %}
   {% if fb.restart %}<form method="post" action="{{ fb.restart }}" class="inline"><button class="primary">Restart the fund</button></form>{% endif %}
   {% if fb.resume_off %}<button type="button" class="secondary" disabled title="{{ fb.resume_off }}">Resume</button>{% endif %}</div>{% endif %}
+{% for b in brakes_off or [] %}<div class="banner warn brake-off" role="status" data-brake-off="{{ b.key }}"><b>{{ b.name }} OFF{% if b.since %} since {{ b.since }}{% endif %}</b>, reason: {{ b.reason or 'none given' }}.</div>{% endfor %}
 {% block content %}{% endblock %}
     </main>
   </div>
