@@ -13,9 +13,11 @@ from sleeve_fund.strategies import TrendFilter, TrendFilterConfig
 ROOT = Path(__file__).resolve().parent.parent
 PAPER_SRC = ROOT / "sleeve_fund" / "paper"
 SLEEVES = sorted((ROOT / "configs" / "sleeves").glob("*.toml"))
-# TEC-B05-KEYS (HoE to OK): the exchange order client's own modules (B-05) are the only paper code that passes keys.
-# It ships OFF: the node builds it only with the order client ON, and ON is refused (test_b05_guards).
-ORDER_CLIENT = {"exec_client.py", "venue_reads.py", "venue_stops.py"}
+# TEC-B05-KEYS (HoE and Advisor, 20 Oct): the exchange order client's own modules (B-05), by exact path, are the only
+# paper code that passes keys. It ships OFF and a node start never imports them (test_b05_keys_guard, which also pins
+# this list); adding a path needs the HoE's and the Advisor's sign-off, recorded on the board.
+ORDER_CLIENT = {"sleeve_fund/paper/exec_client.py", "sleeve_fund/paper/venue_reads.py",
+                "sleeve_fund/paper/venue_stops.py"}
 
 
 def test_paper_code_cannot_build_a_real_execution_client():
@@ -24,7 +26,7 @@ def test_paper_code_cannot_build_a_real_execution_client():
         src = path.read_text()
         assert "ExecutionClientFactory" not in src.replace("SandboxExecutionClientFactory", ""), path
         assert not re.search(r"\.add_exec_client\(", src), path
-        if path.name not in ORDER_CLIENT:
+        if str(path.relative_to(ROOT)) not in ORDER_CLIENT:
             assert "api_key=" not in src and "api_secret=" not in src, path
 
 
