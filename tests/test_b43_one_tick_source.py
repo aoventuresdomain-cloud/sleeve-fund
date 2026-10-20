@@ -106,6 +106,7 @@ def test_a_paper_start_says_the_kept_tick_once_from_on_start():
         event=lambda sleeve, level, kind, message, **k: events.append(kind)))
     s.clock = SimpleNamespace(timestamp_ns=lambda: (_ for _ in ()).throw(Stop()))
     s._say_tick = lambda: LongFlatStrategy._say_tick(s)
+    s._say_lot = lambda: None  # B-44's lot read at start has its own cell
     with pytest.raises(Stop):
         LongFlatStrategy.on_start(s)
     assert events == ["price_tick_kept"]
