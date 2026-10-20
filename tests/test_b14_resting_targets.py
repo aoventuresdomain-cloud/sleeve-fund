@@ -584,3 +584,16 @@ def test_b14y_halted_or_paused_nothing_new_rests_and_nothing_resting_is_cancelle
     strat.runtime.status = "running"
     LongFlatStrategy._rest_exits(strat)
     assert calls == ["read", ("place", {"take_profit": 0.01})]
+
+
+def test_b14z_stopping_the_strategy_cancels_its_resting_target_with_every_other_order():
+    """HEAD6 5 (HoE: every closing path, Stop-strategy included): a stopped Strategy leaves no target resting at the
+    venue with nothing watching it; a restart rests one again for what is held (b14n)."""
+    from sleeve_fund.strategies.base import LongFlatStrategy
+
+    calls = []
+    strat = SimpleNamespace(_gate_done=None, _drop_kept=lambda: calls.append("drop"), _maker={},
+                            _cfg=SimpleNamespace(instrument_id="I"), runtime=None, recorder=None,
+                            cancel_all_orders=lambda iid: calls.append(("cancel all", iid)))
+    LongFlatStrategy.on_stop(strat)
+    assert ("cancel all", "I") in calls

@@ -268,3 +268,45 @@ def test_b13w_the_portfolio_tabs_reach_the_shadow_page(store, monkeypatch):
         tabs = c.get(path, auth=("pm", "pw")).text.split('class="tabs desk-tabs"')[1].split("</nav>")[0]
         assert '<a href="/netting-shadow" ' + ("aria-current=page" if here else "") in tabs
         assert ">Netting (shadow)</a>" in tabs and tabs.count("aria-current=page") == 1
+
+
+def test_b13x_the_netting_path_places_changes_and_cancels_no_order_and_writes_nothing(store, monkeypatch):
+    """HoE Done-when (B-13 SHADOW): the shadow, its page and its nightly section place, change and cancel no order
+    (no call reaches an order sender or the order client) and write nothing to the journal (no statement but a read
+    reaches the database)."""
+    from sqlalchemy import event
+
+    import sleeve_fund.supervisor as sup
+    from sleeve_fund import nightly_recon
+    from sleeve_fund.paper import exec_client
+    from sleeve_fund.strategies.base import LongFlatStrategy
+
+    _trade(store, "a", "a1", "BUY", "0.3", "60030", close="60000", bar=T1)
+    _trade(store, "b", "b1", "SELL", "0.1", "59970", close="60000", bar=T1)
+    calls = []
+    for cls in (LongFlatStrategy,):  # every Model's order sender (the framework's own are compiled: shadowed here)
+        for meth in ("submit_order", "submit_order_list", "modify_order", "cancel_order", "cancel_orders",
+                     "cancel_all_orders", "close_position", "close_all_positions"):
+            if hasattr(cls, meth):
+                monkeypatch.setattr(cls, meth, lambda *a, _m=meth, **k: calls.append(_m), raising=False)
+    monkeypatch.setattr(exec_client.Limiter, "take", lambda *a, **k: calls.append("order client"))
+    for meth in ("record_order", "update_order", "record_fill", "merge_order_signal", "event"):
+        monkeypatch.setattr(type(store), meth, lambda *a, _m=meth, **k: calls.append(_m))
+    writes = []
+
+    def seen(conn, cursor, statement, *a):
+        if not statement.lstrip().upper().startswith(("SELECT", "WITH", "PRAGMA", "SHOW", "BEGIN", "COMMIT",
+                                                       "ROLLBACK", "SAVEPOINT", "RELEASE")):
+            writes.append(statement.split()[0:3])
+
+    event.listen(store.engine, "before_cursor_execute", seen)
+    try:
+        _run(store)
+        monkeypatch.setattr(sup, "fund_equity", lambda s: D("100000"))
+        monkeypatch.setattr(sup, "_in_book", lambda s, row: row.name in ("a", "b"))
+        nightly_recon.netting_shadow(store)
+        words = _page(store, monkeypatch)
+    finally:
+        event.remove(store.engine, "before_cursor_execute", seen)
+    assert "Total saved 12.60" in words  # the path ran in full
+    assert calls == [] and writes == [], (calls, writes)
