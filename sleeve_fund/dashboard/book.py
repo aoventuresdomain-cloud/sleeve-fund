@@ -68,7 +68,9 @@ def sleeve_extras(store: Store, x: dict, frame: pd.DataFrame) -> dict:
         mode="paper",
         test_account=is_test_account(store, s),
         day_pnl=x["equity"] - day_open,
-        day_ret=x["equity"] / day_open - 1 if day_open else 0.0,
+        # Inside the fund its equity is its P&L from 0: today's move as a share of the fund's equity (B-20)
+        day_ret=(_fund_share(store, x["equity"] - day_open) if x.get("in_fund")
+                 else x["equity"] / day_open - 1 if day_open else 0.0),
         week_pnl=x["equity"] - week_open,
         mtd_pnl=x["equity"] - month_open,
         qty=qty,
@@ -83,6 +85,14 @@ def sleeve_extras(store: Store, x: dict, frame: pd.DataFrame) -> dict:
         spark_up=len(tail) < 2 or tail[-1] >= tail[0],
     )
     return x
+
+
+def _fund_share(store: Store, money: float) -> float:
+    """`money` as a share of the fund's marked equity; 0 while it can't be marked (B-20)."""
+    from sleeve_fund.dashboard.metrics import fund_equity_or_none
+
+    fund = fund_equity_or_none(store)
+    return money / fund if fund else 0.0
 
 
 def spark_path(values: list[float], w: int = 96, h: int = 24) -> str:
@@ -105,6 +115,19 @@ def fund_cash(store: Store) -> float:
     return float(fund_book(store).capital) if bridge_start(store) is not None else 0.0
 
 
+def book_equity(store: Store, summaries: list[dict]) -> float:
+    """The book's equity as book_view reads it, without the rest of the view: inside the fund the fund's marked equity
+    (its own cash and every Strategy's P&L), else the Strategies' sum (B-20)."""
+    base = fund_cash(store)
+    own = sum(x["equity"] for x in summaries) + base
+    if not base:
+        return own
+    from sleeve_fund.dashboard.metrics import fund_equity_or_none
+
+    marked = fund_equity_or_none(store)
+    return marked if marked is not None else own
+
+
 def book_view(store: Store, summaries: list[dict], frames: dict[str, pd.DataFrame]) -> dict:
     # Every strategy in the current book counts, stopped and archived ones included: their cash is still the
     # fund's, and stopping one must never rewrite the book's past. A clean slate starts a new book; the
@@ -118,9 +141,11 @@ def book_view(store: Store, summaries: list[dict], frames: dict[str, pd.DataFram
     start = sum(x["sleeve"].starting_balance for x in active) + base
     equity = sum(x["equity"] for x in active) + base
     if base:  # the fund's book as the gate and sizing read it: its cash, the journal's P&L, positions at their marks
-        from sleeve_fund.supervisor import fund_equity
+        from sleeve_fund.dashboard.metrics import fund_equity_or_none
 
-        equity = float(fund_equity(store))
+        # fund_equity raises while a position has no mark yet: the page then shows the marks' own sum, never a 500
+        marked = fund_equity_or_none(store)
+        equity = marked if marked is not None else equity
     curve = book_curve(active, frames, base=base)
     rets = curve["equity"].pct_change().dropna() if len(curve) else pd.Series(dtype=float)
     enough = len(rets) >= MIN_DAYS_FOR_RATIOS
@@ -255,7 +280,10 @@ def correlation(summaries: list[dict], frames: dict[str, pd.DataFrame]) -> dict:
     names = [x["sleeve"].name for x in summaries if len(frames[x["sleeve"].name]) > MIN_DAYS_FOR_CORRELATION]
     if len(names) < 2:
         return {"names": names, "matrix": []}
-    rets = pd.DataFrame({n: frames[n]["equity"] for n in names}).pct_change()
+    marks = pd.DataFrame({n: frames[n]["equity"] for n in names})
+    # Inside the fund a Strategy's marks are its P&L from 0, so a percent change is blank or meaningless: its daily
+    # P&L, each day's share of the same fund equity, correlates as its return would (B-20).
+    rets = marks.diff() if any(x.get("in_fund") for x in summaries) else marks.pct_change()
     corr = rets.corr(min_periods=MIN_DAYS_FOR_CORRELATION)
     return {"names": names, "matrix": [[(None if pd.isna(corr.loc[a, b]) else round(float(corr.loc[a, b]), 2))
                                          for b in names] for a in names]}

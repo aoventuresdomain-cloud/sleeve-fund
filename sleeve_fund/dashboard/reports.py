@@ -45,15 +45,22 @@ def monthly(summaries: list[dict], frames: dict[str, pd.DataFrame], fills_by_sle
             "turnover": float(mf["notional"].sum()) if len(mf) else 0.0,
         })
     grid, months = {}, [r["month"] for r in rows]
+    # Inside the fund (B-20) a Strategy's marks are its P&L from 0: each month is its P&L over the fund's book at the
+    # month's start, its contribution to the fund's return, so the column adds up to the book's month.
+    book_prev = {ts.strftime("%b %Y"): float(v) for ts, v in prev_eq.items()} if base else {}
     for x in summaries:
         f = frames[x["sleeve"].name]
         if not len(f):
             continue
         me = f["equity"].resample("ME").last()
         prev = me.shift(1).fillna(x["sleeve"].starting_balance)
+        if base:
+            grid[x["sleeve"].name] = {k: float((v - prev[ts]) / book_prev[k]) for ts, v in me.items()
+                                      if book_prev.get(k := ts.strftime("%b %Y"), 0) > 0}
+            continue
         # A month that began with no capital of the Strategy's own (CUT-A) has no return on it: left blank.
         grid[x["sleeve"].name] = {ts.strftime("%b %Y"): float(v / prev[ts] - 1) for ts, v in me.items() if prev[ts] > 0}
-    return {"rows": rows, "sleeves": list(grid), "grid": grid, "months": months}
+    return {"rows": rows, "sleeves": list(grid), "grid": grid, "months": months, "contribution": bool(base)}
 
 
 def _months(idx):

@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {# Where the header's total size comes from (UP-1). #}
-{% macro size_title(size) %}{% if size.source == 'gate' %}As the entry gate reads the book: every position and resting entry, against the fund's last mark. Amber from {{ '%.1f'|format(size.limit * 0.8) }}x; at {{ '%.1f'|format(size.limit) }}x no entry that adds to it is taken.{% elif size.source == 'unreadable' %}From the strategies' own marks: the entry gate's book couldn't be read just now.{% else %}From the strategies' own marks: the fund has no mark yet, and the entry gate takes no entry until it has one.{% endif %}{% endmacro %}
+{% macro size_title(size) %}{% if size.limit is none %}{{ "Total size is switched off in the compliance tests: nothing caps it." if size.limit_off else "The compliance tests in force couldn't be read just now; the entry gate takes no entry until they can." }}{% elif size.source == 'gate' %}As the entry gate reads the book: every position and resting entry, against the fund's last mark. Amber from {{ '%.1f'|format(size.limit * 0.8) }}x; at {{ '%.1f'|format(size.limit) }}x no entry that adds to it is taken.{% elif size.source == 'unreadable' %}From the strategies' own marks: the entry gate's book couldn't be read just now.{% else %}From the strategies' own marks: the fund has no mark yet, and the entry gate takes no entry until it has one.{% endif %}{% endmacro %}
 {% from "_macros.html" import chip, usage, help, stop_words, trail_words, open_risk_hint, open_risk_text, open_risk_room, spot_risk_text, open_risk_warn, risk_cell, stop_liq, test_chip %}
 {% from "_reasons.html" import reason_picker %}
 {# A stop in a word or two, for the strategy list's chip; the Limits tab spells it out. #}
@@ -62,17 +62,18 @@
 
 <div class="rh-split">
   <section class="panel flush rh-strats" aria-labelledby="strats-h">
-    <div class="panel-head"><h2 id="strats-h">Strategies</h2><span class="right">Net {{ size.net|abs|pct0 }} {{ 'short' if size.net < -0.00005 else 'long' }} · <span class="{{ size.tone }}" title="{{ size_title(size) }}">Total size (long + short) {{ '%.2f'|format(size.total) }}x of book, limit {{ '%.1f'|format(size.limit) }}x</span></span></div>
-    <div class="srow h" aria-hidden="true"><span>Strategy</span><span class="r">Exposure</span><span class="r">Today</span><span>Room before halt</span><span class="r">Stop</span></div>
+    <div class="panel-head"><h2 id="strats-h">Strategies</h2><span class="right">Net {{ size.net|abs|pct0 }} {{ 'short' if size.net < -0.00005 else 'long' }} · <span class="{{ size.tone }}" title="{{ size_title(size) }}">Total size (long + short) {{ '%.2f'|format(size.total) }}x of book, {% if size.limit is none %}{{ "limit off" if size.limit_off else "limit not readable" }}{% else %}limit {{ '%.1f'|format(size.limit) }}x{% endif %}</span></span></div>
+    <div class="srow h" aria-hidden="true"><span>Strategy</span><span class="r">Exposure</span><span class="r">Today</span><span>{{ "Pause and halt" if book.fund_cash else "Room before halt" }}</span><span class="r">Stop</span></div>
     {% for r in risk.rows %}{% set x = r.x %}{% set s = x.sleeve %}{% set left = [x.profile.max_drawdown - x.drawdown, 0]|max %}
     <div class="srow">
       <div class="nm"><span class="rh-dot {{ tone_of(s.status) }}" title="{{ s.status|capitalize }}"></span><div><a href="/sleeves/{{ s.name }}">{{ s.name|leg_label }}</a><span>{% if r.legs %}Two legs, {{ x.pair.words|lower }}{% else %}{{ s.instrument }}{% endif %} · {{ s.status|capitalize }}{% if x.test_account %} · {{ test_chip() }}{% endif %}</span></div></div>
-      <span class="num r ex" title="{% if r.legs %}Both legs' position value at the current price ÷ the Strategy's equity, a short counted as size too{% else %}Position value at the current price ÷ the strategy's equity{% endif %}">{{ '%.2f'|format(x.exposure|abs) }}×{% if x.exposure < -0.0005 %} <span class="faint">short</span>{% endif %}</span>
+      <span class="num r ex" title="{% if r.legs %}Both legs' position value at the current price ÷ the Strategy's equity, a short counted as size too{% else %}Position value at the current price ÷ {{ "the fund's equity" if x.in_fund else "the strategy's equity" }}{% endif %}">{{ '%.2f'|format(x.exposure|abs) }}×{% if x.exposure < -0.0005 %} <span class="faint">short</span>{% endif %}</span>
       <span class="num r td {{ 'gain' if x.day_ret > 0.00005 else ('loss' if x.day_ret < -0.00005 else 'muted') }}">{{ x.day_ret|pct1s }}</span>
-      <div class="room" role="img" aria-label="{{ (r.dd_used * 100)|round(0)|int }}% of the drawdown limit used, {{ left|pct1 }} left before halt">
+      {% if x.in_fund %}<div class="room faint" title="Inside the fund the fund's brakes pause and halt, not this Strategy's own drawdown limit">{% if s.status == 'halted' %}Halted{% else %}The fund's brakes{% endif %}</div>
+      {% else %}<div class="room" role="img" aria-label="{{ (r.dd_used * 100)|round(0)|int }}% of the drawdown limit used, {{ left|pct1 }} left before halt">
         <div class="rh-bar"><i class="{{ 'b' if r.dd_used > 0.8 else ('w' if r.dd_used > 0.5) }}" style="width:{{ (r.dd_used * 100)|round(1) }}%"></i></div>
         <span>{% if s.status == 'halted' %}Halted{% else %}{{ left|pct1 }} left<span class="rh-wide"> before halt</span>{% endif %}</span>
-      </div>
+      </div>{% endif %}
       <span class="r stop">{% if r.has_stop %}<span class="rh-chip ok" title="{{ live_stop_title(r) }}">{% if r.stop_dist is not none %}{{ r.stop_dist|pct1 }}{% else %}{{ stop_short(s.params) }}{% endif %}</span>{% elif trail_words(s)|trim %}<span class="rh-chip" title="{{ trail_words(s) }}; trail level not shown">Trailing</span>{% else %}<span class="rh-chip warn">None</span>{% endif %}</span>
     </div>{% else %}<p class="empty" style="padding:4px 18px 16px">No strategies in the book yet.</p>{% endfor %}
     {% if risk.rows|selectattr('x.test_account')|list %}<p class="faint rh-note">A Strategy on a test account is outside the fund's book: its own limits still apply, but it is left out of the book's size, drawdown and market-move figures.</p>{% endif %}
@@ -86,8 +87,8 @@
         <span class="num {{ 'loss' if b.pnl < -0.005 else ('gain' if b.pnl > 0.005 else 'muted') }}">{{ b.pnl|smoney0 }}</span></div>{% endfor %}
     </div>
     {% for sc in stress.bars if sc.unhedged %}<p class="loss rh-note">{{ '+' if sc.shock > 0 else '−' }}{{ (sc.shock|abs * 100)|round(0)|int }}%: {{ sc.unhedged|join(', ') }} would lose a leg to liquidation, the other leg left unhedged</p>{% endfor %}
-    {% if stress.halts %}<ul class="rh-halts">{% for sc in stress.halts %}<li><span class="num">{{ '+' if sc.shock > 0 else '−' }}{{ (sc.shock|abs * 100)|round(0)|int }}%</span> would halt <span class="loss">{{ sc.breaches|map('leg_label')|join(', ') }}</span></li>{% endfor %}</ul>
-    {% else %}<p class="faint rh-note">No strategy would halt at ±20%.</p>{% endif %}
+    {% if stress.halts %}<ul class="rh-halts">{% for sc in stress.halts %}<li><span class="num">{{ '+' if sc.shock > 0 else '−' }}{{ (sc.shock|abs * 100)|round(0)|int }}%</span> would halt <span class="loss">{{ ((['the fund'] if sc.fund_halt else []) + (sc.breaches|map('leg_label')|list))|join(', ') }}</span></li>{% endfor %}</ul>
+    {% else %}<p class="faint rh-note">{{ "The fund would not halt at ±20%." if book.fund_cash else "No strategy would halt at ±20%." }}</p>{% endif %}
     <p class="faint rh-note">Every position moves at once. Stops fill after the move. The Limits tab has every scenario.</p>
   </section>
 </div>
@@ -109,17 +110,21 @@
   <div class="panel-head"><h2 id="lim-h">Limits by strategy</h2></div>
   {# Eight columns fit the 1,142 px panel at 1440 (QA U3): the profile is on the name's hover, the stop in short. #}
   <table class="responsive tight" data-hide-md="5">
-    <thead><tr><th>Strategy</th><th>Drawdown</th><th>Today's loss</th><th class="num" title="Further loss before the drawdown limit halts the strategy">Room to halt</th><th>Stop</th><th class="num" title="Isolated margin the open position has put up">Margin</th><th class="num">Liq. price</th><th class="num" title="Money lost if the stop is hit">Risk to stop</th></tr></thead>
+    <thead><tr><th>Strategy</th><th>Drawdown</th><th>Today's loss</th>{% if book.fund_cash %}<th class="num" title="Inside the fund the fund's brakes act, not a Strategy's own drawdown limit">Room</th>{% else %}<th class="num" title="Further loss before the drawdown limit halts the strategy">Room to halt</th>{% endif %}<th>Stop</th><th class="num" title="Isolated margin the open position has put up">Margin</th><th class="num">Liq. price</th><th class="num" title="Money lost if the stop is hit">Risk to stop</th></tr></thead>
     <tbody>{% for top in risk.rows %}{% for r in [top] + (top.legs or []) %}{% set x = r.x %}{% set s = x.sleeve %}{% set leg = loop.index0 if top.legs else none %}
     <tr{% if leg %} class="leg-row"{% endif %}>
       {% if leg %}<td class="cell-name"><a href="/sleeves/{{ s.name }}">Leg {{ leg }}</a> <span class="faint">{{ s.instrument }} {{ 'perp' if r.perp else 'spot' }}</span></td>
       <td data-label="Drawdown"><span class="faint" title="A two-leg Strategy's drawdown is both legs' together, on its row">with the pair</span></td><td data-m="hide"><span class="faint">with the pair</span></td>
       {% else %}
       <td class="cell-name" title="{{ x.profile.name|capitalize }} risk profile"><a href="/sleeves/{{ s.name }}">{{ s.name|leg_label }}</a> {{ chip(s.status) }}{% if x.test_account %} {{ test_chip() }}{% endif %}{% if r.legs %}<span class="sub2">Two legs, {{ x.pair.words|lower }}: limits on both legs together</span>{% endif %}</td>
+      {% if x.in_fund %}{% set brakes = "Inside the fund the fund's brakes pause and halt, not this Strategy's own limits" %}
+      <td data-label="Drawdown"><span class="faint" title="{{ brakes }}">The fund's brakes</span></td>
+      <td data-m="hide"><span class="faint" title="{{ brakes }}">The fund's brakes</span></td>
+      {% else %}
       <td data-label="Drawdown">{{ usage(r.dd_used) }} <span class="muted">{{ x.drawdown|pct1 }} of {{ x.profile.max_drawdown|pct0 }}</span></td>
       <td data-m="hide">{{ usage(r.day_used) }} <span class="muted">{{ [0 - x.day_ret, 0]|max|pct1 }} of {{ x.profile.daily_loss|pct0 }}</span></td>
-      {% endif %}
-      <td class="num" data-m="right" data-label="Room">{% if leg %}<span class="faint">with the pair</span>{% else %}{{ r.headroom|money }}{% endif %}</td>
+      {% endif %}{% endif %}
+      <td class="num" data-m="right" data-label="Room">{% if leg %}<span class="faint">with the pair</span>{% elif x.in_fund or r.headroom is none %}<span class="faint">–</span>{% else %}{{ r.headroom|money }}{% endif %}</td>
       <td data-m="hide">{% if r.legs %}<span class="faint">per leg</span>{% elif r.has_stop %}<span title="{{ live_stop_title(r) }}">{% if r.stop_dist is not none %}{{ r.stop_dist|pct1 }}{% else %}{{ stop_short(s.params) }}{% endif %}</span>{% elif trail_words(s)|trim %}<span title="{{ trail_words(s) }}; trail level not shown">Trailing</span>{% else %}<span class="warn">None</span>{% endif %}</td>
       {% set pos = r.position %}
       <td class="num" data-m="hide">{% if pos %}{{ pos.margin|money }}{% else %}<span class="faint">–</span>{% endif %}</td>
@@ -132,10 +137,10 @@
 <section class="panel rh-scroll" aria-labelledby="stress-h">
   <div class="panel-head"><h2 id="stress-h">What a sudden move would do</h2></div>
   <table class="compact rh-wrap">
-    <thead><tr><th>Market move</th><th class="num">Book P&amp;L</th><th class="num">Share of book</th><th>Strategies that would halt</th></tr></thead>
+    <thead><tr><th>Market move</th><th class="num">Book P&amp;L</th><th class="num">Share of book</th><th>{{ "Would halt" if book.fund_cash else "Strategies that would halt" }}</th></tr></thead>
     <tbody>{% for sc in risk.scenarios %}
     <tr><td>{{ '+' if sc.shock > 0 else '−' }}{{ (sc.shock|abs * 100)|round(0)|int }}%</td><td class="num {{ 'loss' if sc.pnl < -0.005 else ('gain' if sc.pnl > 0.005) }}">{{ sc.pnl|smoney }}</td><td class="num">{{ (0 - sc.loss_pct)|pct1s }}</td>
-      <td class="wrap">{% if sc.breaches %}<span class="loss">{{ sc.breaches|map('leg_label')|join(', ') }}</span>{% else %}<span class="muted">None</span>{% endif %}{% for n in sc.unhedged %}<div class="loss">{{ n }}: leg liquidated in this move, the other leg left unhedged</div>{% endfor %}</td></tr>
+      <td class="wrap">{% if sc.breaches or sc.fund_halt %}<span class="loss">{{ ((['The fund'] if sc.fund_halt else []) + (sc.breaches|map('leg_label')|list))|join(', ') }}</span>{% else %}<span class="muted">None</span>{% endif %}{% for n in sc.unhedged %}<div class="loss">{{ n }}: leg liquidated in this move, the other leg left unhedged</div>{% endfor %}</td></tr>
     {% endfor %}</tbody>
   </table>
   <p class="muted" style="margin:8px 0 0;font-size:12px">Every position moves at once: a long loses in a fall, a short in a rally. Gap risk: stops fill after the fact, and at 3x, a gap through liquidation loses the whole position margin.</p>

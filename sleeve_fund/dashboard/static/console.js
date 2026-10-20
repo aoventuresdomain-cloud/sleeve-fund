@@ -80,12 +80,15 @@ window.Console = (() => {
   // comparison). opts.book is the Portfolio's book chart: no buy-and-hold, no strip, and a book under two
   // days old opens on 1D so it never shows as a dot.
   function pair(url, eqId, ddId, labels, opts = {}) {
-    const eqEl = document.getElementById(eqId), ddEl = ddId ? document.getElementById(ddId) : null;
+    const eqEl = document.getElementById(eqId);
+    let ddEl = ddId ? document.getElementById(ddId) : null;
     if (!eqEl || !window.LightweightCharts) return;
     const scope = eqEl.closest("section") || document;
     (typeof url === "string" ? fetch(url).then((r) => r.json()) : Promise.resolve(url)).then((d) => {
       if (!d.t.length) { eqEl.innerHTML = '<p class="empty">No marks yet. The first arrives within a minute of a strategy starting.</p>'; if (ddEl) ddEl.remove(); return; }
       const book = !!opts.book;
+      // Inside the fund a Strategy's marks are its P&L from 0 and the fund's brakes act, so it has no drawdown of its own (B-20).
+      if (d.in_fund && ddEl) { ddEl.remove(); ddEl = null; }
       let pctMode = !!opts.compare;
       const base = (logo) => ({
         autoSize: true,
@@ -155,7 +158,7 @@ window.Console = (() => {
             item(null, isIntra() ? "Since the previous point" : "On the day", `${scash(ch)} (${pct(prev ? (ch / prev) * 100 : NaN)})`, tone(ch));
           }
         }
-        item(null, rest ? "Worst drawdown" : "Drawdown", pct(rest ? view.worst : view.dd[at]), (rest ? view.worst : view.dd[at]) < 0 ? "loss" : "");
+        if (!d.in_fund) item(null, rest ? "Worst drawdown" : "Drawdown", pct(rest ? view.worst : view.dd[at]), (rest ? view.worst : view.dd[at]) < 0 ? "loss" : "");
         legend.append(Object.assign(document.createElement("span"), {textContent: rest ? `${view.full[0]} to ${view.full[view.full.length - 1]}` : view.full[at], className: "faint"}));
       };
       // Hovering either chart moves the crosshair on both.
@@ -986,9 +989,9 @@ window.Console = (() => {
         `Use ${opt.textContent.split(" (")[0]}: ${desc ? desc.textContent : ""}`,
         (() => {
           const mk = form.elements.market ? form.elements.market.value : "spot";
-          if (mk === "spot") return `Hold at most ${pct(Number(prof.cap))} of its capital in ${pair.split("/")[0] || "the instrument"}, long only.`;
+          if (mk === "spot") return `Hold at most ${pct(Number(prof.cap))} of ${held ? "the fund's equity" : "its capital"} in ${pair.split("/")[0] || "the instrument"}, long only.`;
           const shorts = form.elements.allow_short && form.elements.allow_short.checked;
-          return `Trade the ${form.elements.market.selectedOptions[0].textContent.split(":")[0].toLowerCase()}, ${shorts ? "long and short" : "long only"}, with positions up to ${prof.lev}x its capital.`;
+          return `Trade the ${form.elements.market.selectedOptions[0].textContent.split(":")[0].toLowerCase()}, ${shorts ? "long and short" : "long only"}, with ${held ? `leverage up to ${prof.lev}x` : `positions up to ${prof.lev}x its capital`}.`;
         })(),
         held ? "Pause and halt with the fund's own brakes, not on this Strategy's own losses."
           : `Pause for a day after losing ${pct(Number(prof.day))} in a day, and halt for your review at a ${pct(Number(prof.dd))} drawdown.`,
@@ -1116,7 +1119,9 @@ window.Console = (() => {
       if (stop || tp) out.push(`Exit any trade ${[stop, tp].filter(Boolean).join(" or ")}.`);
       if (line && !line.hidden) out.push(line.textContent);
       const rpt = num("risk_per_trade_pct");
-      if (rpt) out.push(stop ? `Size each trade to lose about ${rpt}% of capital if the stop is hit, fees and spread included.` : "Risk per trade needs a stop-loss; add one or clear it.");
+      // Inside the fund the label names the fund's equity, the base the engine sizes from (B-20)
+      const base = /fund equity/.test((box.querySelector("label[for=risk_per_trade_pct]") || {}).textContent || "") ? "the fund's equity" : "capital";
+      if (rpt) out.push(stop ? `Size each trade to lose about ${rpt}% of ${base} if the stop is hit, fees and spread included.` : "Risk per trade needs a stop-loss; add one or clear it.");
       return out;
     };
     return box.exitDescribe;

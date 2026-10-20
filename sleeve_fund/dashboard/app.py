@@ -33,7 +33,7 @@ from sleeve_fund.dashboard import book as bookm
 from sleeve_fund.dashboard import development as dev
 from sleeve_fund.dashboard import assets, attribution, compliance, gates, legs, reasons, reports, riskops, trading, withdrawal
 from sleeve_fund.dashboard.jobs import Jobs
-from sleeve_fund.dashboard.metrics import STALE, sleeve_summary
+from sleeve_fund.dashboard.metrics import STALE, held_by_fund, sleeve_summary
 from sleeve_fund.data import spec_minutes
 from sleeve_fund.fees import resolve as resolve_fees
 from sleeve_fund.history import REQUEST_YEARS
@@ -390,6 +390,9 @@ def create_app(store: Store | None = None) -> FastAPI:
         # The drawdown chart's halt line only when the whole book shares one risk profile's limit.
         profiles = {x["profile"].name: x["profile"].max_drawdown for x in summaries}
         halt = next(iter(profiles.items())) if len(profiles) == 1 else None
+        if book["fund_cash"]:  # B-20: inside the fund only the fund's brake halts the book (T5b), never a profile's
+            limit = riskops.fund_halt_limit(st())
+            halt = ("fund", limit) if limit else None
         chart = riskops.drawdown_chart(bookm.book_curve(summaries, frames, bookm.fund_cash(st())),
                                        halt=halt[1] if halt else None)
         return page(request, "risk.html", book=book, risk=risk, health=health, chart=chart, size=riskops.gate_size(st(), book),
@@ -815,9 +818,11 @@ def create_app(store: Store | None = None) -> FastAPI:
             frame = bookm.daily(st(), name)
             t, eq, bench = list(frame.index), list(frame["equity"]), list(frame["benchmark"])
         peak, dd = s.starting_balance, []  # from the starting balance too, as the book's (M12-F1)
+        # Inside the fund its marks are its P&L from 0 and its own halt doesn't act: no drawdown of its own (B-20)
+        in_fund = held_by_fund(st(), s)
         for v in eq:
             peak = max(peak, v)
-            dd.append(round(1 - v / peak, 5) if peak > 0 else 0.0)
+            dd.append(0.0 if in_fund else round(1 - v / peak, 5) if peak > 0 else 0.0)
         fills = [{"t": f["ts"].isoformat(), "side": f["side"], "qty": f["qty"], "price": f["price"]}
                  for f in st().fills(name, limit=2000)]
         return JSONResponse({
@@ -827,7 +832,8 @@ def create_app(store: Store | None = None) -> FastAPI:
             "equity": [round(v, 2) for v in eq],
             "benchmark": [round(v, 2) for v in bench],
             "drawdown": dd,
-            "worst": round(st().max_drawdown(name, s.starting_balance), 5),  # over every mark: the curve above is thinned or daily
+            "worst": 0.0 if in_fund else round(st().max_drawdown(name, s.starting_balance), 5),  # over every mark: the curve above is thinned or daily
+            "in_fund": in_fund,
             "fills": fills,
         })
 
@@ -1372,7 +1378,11 @@ def create_app(store: Store | None = None) -> FastAPI:
             summaries = [x for x in summaries if x["sleeve"].name == chosen]
         w = reports.window(q.get("period", ""), q.get("month", ""), now)
         fills = {x["sleeve"].name: st().fills(x["sleeve"].name, limit=100_000) for x in summaries}
-        base = 0.0 if chosen else bookm.fund_cash(st())  # A-20: the whole book counts the fund's own cash
+        # A-20: the whole book counts the fund's own cash. B-20: so does one Strategy inside the fund, whose marks are
+        # its P&L from 0: its figures then read as its contribution over the fund's capital; one outside the fund (a
+        # test account) keeps its own capital.
+        held = chosen and summaries and held_by_fund(st(), summaries[0]["sleeve"])
+        base = bookm.fund_cash(st()) if (not chosen or held) else 0.0
         perf = reports.performance(summaries, frames, [f for fs in fills.values() for f in fs], w["start"], w["end"],
                                    base)
         m = reports.monthly(summaries, frames, fills, base)
@@ -1405,6 +1415,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         exports.insert(4, ("Decision log", "/decisions.csv" + ("?" + urlencode(dec_dl) if dec_dl else ""),
                            "decisions.csv", "Every decision, with who made it and why."))
         return page(request, "records.html", perf=perf, m=m, w=w, chosen=chosen, sleeves=names,
+                    contribution=bool(chosen and base),
                     periods=reports.PERIODS, log=log, latest=decisions[:5], total=len(decisions),
                     kind_filters=reports.KIND_FILTERS, kind_counts=kinds, kinds=reports.DECISION_KINDS,
                     qs=qs, exports=exports, action=dq["action"], shell=shell())
@@ -1589,7 +1600,8 @@ def create_app(store: Store | None = None) -> FastAPI:
             sleeve = None
         h = trading.history(st(), summaries, sleeve)
         return page(request, "trades.html", h=h, sleeve=sleeve, sleeves=names, shell=shell(sleeves),
-                    book_equity=sum(x["equity"] for x in summaries), backtest=backtest)
+                    book_equity=(sum(x["equity"] for x in summaries) if backtest
+                                 else bookm.book_equity(st(), summaries)), backtest=backtest)  # B-20: the fund's
 
     @app.get("/orders", response_class=HTMLResponse)
     def orders_page(request: Request, _: str = Depends(require_pm)):
@@ -1761,6 +1773,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         from sleeve_fund.dashboard import fee_terms
 
         return page(request, "setup.html", profiles=PROFILES, venues=VENUES.values(), fee_quotes=fee_quotes,
+                    fund_held=_fund_held(st()),  # B-20: a profile then sets the leverage cap only
                     fee_terms=fee_terms.view(st(), utcnow()),
                     tearsheets=str(TEARSHEETS), counts=st().table_sizes(), accounts=accounts,
                     error=error, pre=dict(request.query_params), shell=frame,
@@ -2313,7 +2326,7 @@ def _risk_view(x: dict, position: dict | None = None) -> dict:
         "target_px": position["target_px"] if position else None,
         # The move from here to the stop (round 9, N3): a drop for a long, a rise for a short.
         "to_stop": abs(1 - stop_px / x["price"]) if stop_px and x["price"] else None,
-        "day_used": min(max(-x["day_ret"], 0.0) / p.daily_loss, 1.0) if p.daily_loss else 0.0,
+        "day_used": 0.0 if x.get("in_fund") else min(max(-x["day_ret"], 0.0) / p.daily_loss, 1.0) if p.daily_loss else 0.0,
         "margin": margin,
     }
 

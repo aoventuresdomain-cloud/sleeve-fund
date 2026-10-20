@@ -44,7 +44,7 @@
   {% if positions.open_risk is defined %}
   <div class="kpi wrap" title="{{ open_risk_hint(positions) }}{% if open_risk_room(positions, book.equity)|trim %} · {{ open_risk_room(positions, book.equity, plain=True) }}{% endif %}"><div class="k">Open risk</div><div class="v {{ open_risk_warn(positions) }}">{{ open_risk_text(positions) }}{% if positions.spot_left_out %} · spot {{ positions.spot_left_out|length }} not counted{% endif %}</div></div>
   {% else %}<div class="kpi pending" title="Waiting on the corrected open-risk figures"><div class="k">Open risk</div><div class="v faint">–</div></div>{% endif %}
-  <div class="kpi" title="Worst {{ book.max_drawdown|pct1 }}{% if closest %} · closest to halt: {{ closest.sleeve.name }}, {{ closest.dd_used|pct0 }} of its limit used{% endif %}"><div class="k">Drawdown</div><div class="v {{ 'loss' if book.drawdown >= 0.05 }}">{{ book.drawdown|pct1 }}</div></div>
+  <div class="kpi" title="Worst {{ book.max_drawdown|pct1 }}{% if closest and not closest.in_fund %} · closest to halt: {{ closest.sleeve.name }}, {{ closest.dd_used|pct0 }} of its limit used{% endif %}"><div class="k">Drawdown</div><div class="v {{ 'loss' if book.drawdown >= 0.05 }}">{{ book.drawdown|pct1 }}</div></div>
   <div class="kpi" title="Fees {{ book.fees|money }} · funding {{ 'paid' if book.funding_paid >= 0 else 'received' }} {{ book.funding_paid|abs|money }}{{ cost_share(book) }}"><div class="k">Fees and funding</div><div class="v">{{ book.fees_funding|money }}</div></div>
 </section>
 
@@ -137,7 +137,8 @@
       <th class="num" data-sort="num">Equity</th><th class="num" data-sort="num">Today</th><th class="num" data-sort="num">Since start</th>
       <th class="num" data-sort="num" title="Strategy return minus buy-and-hold return over the same period, in percentage points">vs buy-and-hold</th>
       <th class="num" data-sort="num">Exposure</th><th class="num" data-sort="num">Closed trades</th>
-      <th data-sort="num">Drawdown of limit</th><th class="num" data-sort="num" title="How much the strategy can still lose before its drawdown limit halts it">Room to halt</th><th>Health</th>
+      {% if book.fund_cash %}<th data-sort="num" title="Inside the fund the fund's brakes pause and halt every Strategy, not its own drawdown limit">Pause and halt</th><th class="num" data-sort="num" title="No room of its own: the fund's brakes act">Room</th>
+      {% else %}<th data-sort="num">Drawdown of limit</th><th class="num" data-sort="num" title="How much the strategy can still lose before its drawdown limit halts it">Room to halt</th>{% endif %}<th>Health</th>
     </tr></thead>
     <tbody>
     {% if not summaries %}<tr><td colspan="12" class="empty">Every strategy is archived. <a href="/sleeves/new">Start a new strategy</a> or restore one below.</td></tr>{% endif %}
@@ -148,12 +149,22 @@
       <td data-m="hide">{{ spark(x.spark, x.spark_up) }}</td>
       <td class="num" data-v="{{ x.equity }}" data-label="Equity">{{ x.equity|money }}</td>
       <td class="num" data-v="{{ x.day_pnl }}" data-m="right" data-label="Today">{{ money_signed(x.day_pnl) }}</td>
+      {% if x.in_fund %}{# B-20: no capital of its own, so no return on it: its P&L, and the fund's brakes, not its own #}
+      <td class="num" data-v="{{ x.pnl }}" data-label="Since start" title="Its P&amp;L since start: the fund holds the capital">{{ money_signed(x.pnl) }}</td>
+      <td class="num faint" data-v="0" data-m="right" data-label="vs buy-and-hold" title="No capital of its own to compare: the fund holds it">–</td>
+      {% else %}
       <td class="num" data-v="{{ x.ret }}" data-label="Since start">{{ signed(x.ret) }}</td>
       <td class="num" data-v="{{ x.ret - x.bench_ret }}" data-m="right" data-label="vs buy-and-hold">{{ pts(x.ret - x.bench_ret) }}</td>
-      <td class="num" data-v="{{ x.exposure }}" data-m="hide" title="Position value at the current price ÷ the strategy's equity">{{ '%.2f'|format(x.exposure|abs) }}×{% if x.exposure < -0.0005 %} <span class="faint">short</span>{% endif %}</td>
+      {% endif %}
+      <td class="num" data-v="{{ x.exposure }}" data-m="hide" title="Position value at the current price ÷ {{ "the fund's equity" if x.in_fund else "the strategy's equity" }}">{{ '%.2f'|format(x.exposure|abs) }}×{% if x.exposure < -0.0005 %} <span class="faint">short</span>{% endif %}</td>
       <td class="num" data-v="{{ x.trades.trades }}" data-m="hide">{{ x.trades.trades }}{% if x.trades.trades %} <span class="muted">· {{ x.trades.win_rate|pct0 }} won</span>{% endif %}</td>
+      {% if x.in_fund %}
+      <td data-v="0" data-m="hide" class="faint" title="Inside the fund the fund's brakes pause and halt, not this Strategy's own drawdown limit">Fund's brakes</td>
+      <td class="num faint" data-v="0" data-label="Room" title="Inside the fund the fund's brakes pause and halt, not this Strategy's own drawdown limit">–</td>
+      {% else %}
       <td data-v="{{ x.dd_used }}" data-m="hide">{{ usage(x.dd_used) }} <span class="muted">{{ x.drawdown|pct1 }} of {{ x.profile.max_drawdown|pct0 }}</span></td>
       <td class="num" data-v="{{ room }}" data-label="Room to halt"><span class="{{ 'loss' if x.dd_used >= 0.8 else ('warn' if x.dd_used >= 0.5) }}">{{ room|money }}</span></td>
+      {% endif %}
       <td data-m="hide" class="health">
         {% if s.desired_state == 'stopped' %}<span class="muted">Stopped</span>
         {% elif x.healthy %}<span title="Last heartbeat {{ s.heartbeat_at|ts }}"><span class="dot ok"></span>{{ s.heartbeat_at|ago }}</span>

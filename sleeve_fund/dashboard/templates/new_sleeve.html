@@ -44,7 +44,7 @@
       {{ market_fields(pre, mirror=True) }}
       {{ order_fields(pre) }}
       <h3 class="field-group">Exits (optional)</h3>
-      {{ exit_fields(pre, costs) }}
+      {{ exit_fields(pre, costs, fund_held=fund_held) }}
     </fieldset>
     <fieldset class="panel step">
       <legend>5. Name and reason</legend>

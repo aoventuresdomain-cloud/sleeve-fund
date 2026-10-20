@@ -48,7 +48,7 @@
 {% endfor %}
 {% endmacro %}
 
-{% macro exit_fields(pre, costs=none, side=none, params=none) %}
+{% macro exit_fields(pre, costs=none, side=none, params=none, fund_held=false) %}
 {# One stop and one target, each set one way: the kind is read back from whichever value is filled in.
    The plan line under them (console.js exitPlan) prices the plan in R with the same costs the backtest
    and paper charge. #}
@@ -78,7 +78,7 @@
     </select></div>
     <div class="field" data-tp="pct"><label for="take_profit_pct" data-exit-tpl="Target, % {tp} entry">Target, % {{ w.tp }} entry</label><input id="take_profit_pct" name="take_profit_pct" type="number" min="0.1" max="1000" step="0.01" placeholder="e.g. 15" value="{{ pre.get('take_profit_pct', '') }}"></div>
     <div class="field" data-tp="r"><label for="take_profit_r">Target in R, after costs</label><input id="take_profit_r" name="take_profit_r" type="number" min="0.1" max="50" step="0.1" placeholder="e.g. 2" value="{{ pre.get('take_profit_r', '') }}"></div>
-    <div class="field"><label for="risk_per_trade_pct">Risk per trade, % of capital</label><input id="risk_per_trade_pct" name="risk_per_trade_pct" type="number" min="0.1" max="20" step="0.1" placeholder="None" value="{{ pre.get('risk_per_trade_pct', '') }}"><p class="hint" data-needs-stop>Needs a stop-loss.</p></div>
+    <div class="field"><label for="risk_per_trade_pct">Risk per trade, % of {{ "fund equity" if fund_held else "capital" }}</label><input id="risk_per_trade_pct" name="risk_per_trade_pct" type="number" min="0.1" max="20" step="0.1" placeholder="None" value="{{ pre.get('risk_per_trade_pct', '') }}"><p class="hint" data-needs-stop>Needs a stop-loss.</p></div>
   </div>
   <p class="exit-plan" aria-live="polite" hidden></p>
 </div>
