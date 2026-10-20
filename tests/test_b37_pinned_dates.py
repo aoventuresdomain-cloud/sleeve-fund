@@ -180,3 +180,63 @@ def test_b37i_the_qr_rescore_list_pins_its_dates_and_the_walk_forward_is_its_fol
     research = pinning.cut(bars, p).iloc[:-p.holdout_days]
     pinning.check_folds(p, research, 730, 365, pd.Timedelta(days=1))  # the study's own walk-forward: these folds
     assert len(research) == 1825
+
+
+class _History:
+    """The history store as the server's study job reads it (run.run_store_study): the daily bars as they stood on
+    `day`. Shorter bars are not served: the study's execution bars are cut by b37k, not here."""
+
+    def __init__(self, day: date):
+        self.bars = _upto(day)
+
+    def read(self, venue, pair, minutes, start=None, end=None):
+        assert minutes == 1440, f"only daily bars are stored here, not {minutes}-minute ones"
+        return self.bars
+
+    def coverage(self, venue, pair):
+        return None
+
+
+def test_b37j_the_servers_study_job_reads_the_lists_pinned_dates_whatever_day_it_runs(tmp_path, monkeypatch):
+    """CR MUST (B-37): through run_store_study, the job the re-score runner starts. The same pinned request on the day
+    the holdout ends and 60 days later, with 60 more days of history, writes the same tear sheet. RED with run.py's
+    pinned=req.pinned dropped: the later day's study then reads its 60 extra days."""
+    from sleeve_fund.research import run as run_mod
+
+    monkeypatch.setattr(run_mod, "exec_step", lambda span, minutes: None)  # daily bars only (see _History)
+    monkeypatch.setattr(run_mod, "OOS_EXEC_BUDGET", 0)
+    p = _pins()
+    req = run_mod.StudyRequest(strategy=SPEC.name, pair="BTC/USD", venue="kraken", minutes=1440, train_days=730,
+                               test_days=365, holdout_days=p.holdout_days, pinned=p)
+    sheets = []
+    for k, day in enumerate((p.holdout_end + timedelta(days=1), p.holdout_end + timedelta(days=61))):
+        out = run_mod.run_store_study(req, ledger_path=tmp_path / f"{k}" / "l.jsonl", out_dir=tmp_path / f"ts{k}",
+                                      history=_History(day))
+        sheets.append(out.read_text())
+    assert sheets[0] == sheets[1] and "Tear sheet" in sheets[0]
+
+
+def test_b37k_no_execution_bar_after_the_pinned_end_reaches_a_run(tmp_path, monkeypatch):
+    """CR follow-up: the shorter bars a study executes on (exec_prices, and oos_exec_prices for the out-of-sample
+    windows and the holdout) run 120 days past the pinned end; no run is handed one after it, with or without the
+    holdout. The bars are 6-hourly stamps of the daily closes; the spy records what each run is handed and runs it on
+    its daily bars alone, so only the cut is under test."""
+    p = _pins()
+    last = pd.Timestamp(p.holdout_end + timedelta(days=1), tz="UTC")
+    history = _upto(p.holdout_end + timedelta(days=120))
+    six = pd.date_range(history.index[0] - pd.Timedelta(hours=18), history.index[-1], freq="6h")
+    fine = history.reindex(six, method="bfill").dropna()
+    seen, real = [], study_mod.run_backtest
+
+    def spy(name, df, inst, params, **k):
+        x = k.get("exec_prices")
+        if x is not None and len(x):
+            seen.append(x.index.max())
+        return real(name, df, inst, params, **{**k, "exec_prices": None, "exec_minutes": 1})
+
+    monkeypatch.setattr(study_mod, "run_backtest", spy)
+    for use_holdout in (False, True):
+        run_study(SPEC, history, INSTRUMENT, ledger=IdeaLedger(tmp_path / f"l{use_holdout}.jsonl"),
+                  holdout_days=p.holdout_days, pinned=p, use_holdout=use_holdout, exec_prices=fine,
+                  oos_exec_prices=fine, **KW)
+    assert seen and max(seen) <= last, (max(seen), last)
