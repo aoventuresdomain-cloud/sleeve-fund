@@ -228,3 +228,27 @@ def test_not_held_a_strategy_with_its_own_capital_reads_as_before(c, store):  # 
     t, _ = markets.held_terms(s.params, s.venue, s.instrument)
     assert row["liq_px"] == pytest.approx(margin.isolated_liquidation(10_000 - QTY * ENTRY - FEE, QTY, ENTRY, lev,
                                                                       t.maintenance_margin))
+
+
+def test_the_withdrawal_preview_and_the_risk_page_read_the_saved_size_limits(c, store, monkeypatch):  # noqa: F811
+    """QD via the HoE: with the PM's T4-at-maxima workaround the gate applies 3x gross and 1x net, while the withdrawal
+    preview (withdrawal.py) and the Risk size line (riskops) read the module's seeded 1.5x and 0.5x."""
+    from dataclasses import replace
+    from decimal import Decimal
+    from types import SimpleNamespace
+
+    from sleeve_fund.dashboard import withdrawal
+    from sleeve_fund.paper import portfolio_gate
+    from sleeve_fund.portfolio import compliance
+
+    _hold(store)
+    _long(store)
+    compliance.save(store, replace(compliance.load(store), gross=3.0, net_instrument=1.0), changed_by="pm",
+                    note="T4 at its maxima")
+    ledger = SimpleNamespace(state=lambda: SimpleNamespace(equity=Decimal(100_000)), positions=lambda: ({}, ()),
+                             reservations=lambda: ())
+    monkeypatch.setattr(portfolio_gate, "PaperGate", lambda st: SimpleNamespace(ledger=ledger))
+    limits = {x["key"]: x["limit"] for x in withdrawal.limits_in_use(store)["limits"]}
+    assert limits["gross"] == pytest.approx(3.0) and limits["net"] == pytest.approx(1.0), limits
+    words, _ = _words(c, "/risk")
+    assert "limit 3.0x" in words and "1.5x" not in words
