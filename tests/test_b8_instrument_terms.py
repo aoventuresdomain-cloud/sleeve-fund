@@ -143,9 +143,15 @@ def test_the_engine_side_is_the_instrument_paper_builds_so_a_contract_that_fails
     assert got["lot step"].endswith("PASS")  # the fallback caps the size at 3 places: 0.001, the venue's own
 
 
-def test_a_finer_lot_than_the_venues_is_a_must(tmp_path, capfd, contract):
+def test_a_finer_lot_than_the_venues_is_a_must(tmp_path, capfd, contract, monkeypatch):
+    from decimal import Decimal
+
+    from sleeve_fund.venues import venue
+
     _sleeve(tmp_path, "a", "BTC/USDT", "binance")
     contract.limits = {"price_precision": 1, "size_precision": 4, "min_quantity": 0.001, "min_notional": 100.0}
+    # B-44: the engine's lot comes from the paper venue's listing, so the finer lot is put there
+    monkeypatch.setattr(venue("BINANCE"), "live_lot", lambda pair: (Decimal("0.0001"), Decimal("0.001")))
     assert b8.main([], get=_venue([_symbol("BTCUSDT")], BTC_FUNDING), pattern=str(tmp_path / "*.toml")) == 1
     assert any(line.startswith("BTC/USDT") and "lot step" in line and line.endswith("MUST")
                for line in capfd.readouterr().out.splitlines())
