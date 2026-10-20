@@ -83,6 +83,11 @@ def name(key: str) -> str:
     return f"{r.test} {SHORT.get(key, TESTS[r.test])}"
 
 
+# B-42: T2 on with no asset in a group would judge nothing; the form and the store refuse it in these words.
+EMPTY_GROUPS = (f"{name('type_stop_loss')} is on but no asset has a group, so it would judge nothing. Give the assets "
+                "their groups, or switch it off.")
+
+
 def _by_key(tests: dict[str, dict] | list[dict]) -> tuple[dict[str, dict], list[str]]:
     """The form's key → {limit, enabled}, or the store's list of rows (each with its test key), as key → row."""
     if isinstance(tests, dict):
