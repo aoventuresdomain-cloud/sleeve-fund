@@ -197,11 +197,14 @@ def test_0032_adds_the_figures_from_0031_with_the_migrations_own_rules_and_refus
     old = _decision(store)  # a row from before 0032
     schema.migrate(mig_engine, log=lambda _: None)
     assert _figures(store, old) == dict.fromkeys(DECISION)
-    with pytest.raises(DatabaseError):  # the migration's own triggers, not create_all's
-        _decision(store, **{**DEC, "gross_after": None})
+    for f in DECISION:  # the migration's own triggers, not create_all's: four of five is refused, whichever is missing
+        with pytest.raises(DatabaseError):
+            _decision(store, **{**DEC, f: None})
     did = _decision(store, **DEC)
     with pytest.raises(DatabaseError), mig_engine.begin() as c:
         c.execute(update(gate_decisions_t).where(gate_decisions_t.c.id == did).values(gross_after=Decimal("9")))
+    with pytest.raises(RuntimeError, match="not dropped"), mig_engine.begin() as c:  # figures kept, no fill mark yet
+        command.downgrade(schema._config(c), "0031")
     store.record_fill_mark(did, "t-1", Decimal("60000"), "fill", **LEV)
     with pytest.raises(DatabaseError), mig_engine.begin() as c:
         c.execute(text("DELETE FROM gate_fill_marks"))
@@ -225,3 +228,18 @@ def test_0032_downgrades_while_nothing_is_kept_and_upgrades_again(mig_engine):
     schema.migrate(mig_engine, log=lambda _: None)
     assert "gate_fill_marks" in inspect(mig_engine).get_table_names()
     assert set(DECISION) <= {c["name"] for c in inspect(mig_engine).get_columns("gate_decisions")}
+
+
+def test_0032_writes_the_same_trigger_rules_as_the_store():
+    """CR2: a database built by 0032 and one built by the store hold the same rules, written out twice (a migration is
+    frozen); the SQL must match, or one of them drifts unseen."""
+    import importlib
+
+    from sleeve_fund import store
+
+    m = importlib.import_module("sleeve_fund.migrations.versions.0032_gate_leverage_figures")
+    assert m.BAD == store.GATE_LEVERAGE_BAD and m.MESSAGE == store.GATE_LEVERAGE_MESSAGE
+    assert m.FROZEN_PG == store.GATE_LEVERAGE_FROZEN["postgresql"]
+    assert m.FROZEN_SQLITE == store.GATE_LEVERAGE_FROZEN["sqlite"]
+    assert m.PG == store.GATE_LEVERAGE_PG and m.SQLITE == store.GATE_LEVERAGE_SQLITE
+    assert m.PG_MARKS == store.GATE_FILL_MARKS_PG and m.SQLITE_MARKS == store.GATE_FILL_MARKS_SQLITE
