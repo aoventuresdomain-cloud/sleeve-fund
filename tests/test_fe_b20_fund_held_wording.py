@@ -20,6 +20,7 @@ from sleeve_fund import margin, markets, risk, supervisor
 AUTH = ("pm", "pw")
 PERP = {"market": "perp", "allow_short": True}
 QTY, ENTRY, MARK, FEE = 0.1, 60_000.0, 59_000.0, 3.3
+TICK = 0.1  # BTC/USDT's kept contract tick (B-36b), which the engine's and the pages' liquidation round to
 # The old rule's words (fe-v3 §4 and the B-20 board line): a Strategy's own halt level, room, capital or drawdown.
 OLD_RULE = (r"Room to halt", r"Room before halt", r"(?<!% \()halts? at \d", r"Starting capital", r"No strategy would halt",
             r"Strategies that would halt", r"of its capital", r"Worst drawdown", r"before halt")
@@ -69,7 +70,8 @@ def _mark(store, equity=100_000, hwm=None):  # noqa: F811
 
 def _engine_liquidation(store, s):  # noqa: F811
     """The engine's liquidation for the position, worked independently of the dashboard: base.py's
-    isolated_liquidation(cash + self._funded()), funded = the fund's book x VIRTUAL_HEADROOM (paper/node.py)."""
+    isolated_liquidation(cash + self._funded()), funded = the fund's book x VIRTUAL_HEADROOM (paper/node.py), with the
+    entry fee off its margin and on the kept 0.1 tick, as base.py's _liq_from_entry since LIQ-FEE (B-15, B-36b)."""
     from sleeve_fund.paper.node import VIRTUAL_HEADROOM
 
     t, tiered = markets.held_terms(s.params, s.venue, s.instrument)
@@ -77,8 +79,7 @@ def _engine_liquidation(store, s):  # noqa: F811
     funded = float(supervisor.fund_book(store).total) * VIRTUAL_HEADROOM
     lev = risk.leverage_cap(risk.profile(s.risk_profile), s.params)
     cash = -QTY * ENTRY - FEE
-    # the entry fee off the margin (LIQ-FEE, B-15); no tick yet (B-36 tick)
-    return (margin.isolated_liquidation(cash + funded, QTY, ENTRY, lev, t.maintenance_margin, fees=FEE),
+    return (margin.isolated_liquidation(cash + funded, QTY, ENTRY, lev, t.maintenance_margin, fees=FEE, tick=TICK),
             QTY * ENTRY / lev)
 
 
@@ -251,7 +252,7 @@ def test_not_held_a_strategy_with_its_own_capital_reads_as_before(c, store):  # 
     lev = risk.leverage_cap(risk.profile(s.risk_profile), s.params)
     t, _ = markets.held_terms(s.params, s.venue, s.instrument)
     assert row["liq_px"] == pytest.approx(margin.isolated_liquidation(10_000 - QTY * ENTRY - FEE, QTY, ENTRY, lev,
-                                                                      t.maintenance_margin, fees=FEE))
+                                                                      t.maintenance_margin, fees=FEE, tick=TICK))
 
 
 def test_the_withdrawal_preview_and_the_risk_page_read_the_saved_size_limits(c, store, monkeypatch):  # noqa: F811
