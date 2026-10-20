@@ -212,3 +212,25 @@ def test_an_order_rule_switched_off_through_the_server_is_refused_and_changes_no
         assert f"{key} isn't a compliance test, and the order rules have no off switch" in words, (path, words[:400])
         assert "Apply these changes" not in words
     assert _n(store) == 1 and store.compliance().tests == tests and store.decisions(limit=500) == journal
+
+
+@pytest.mark.parametrize("path", ("/", "/risk", "/trades"))
+def test_an_unreadable_brake_state_says_so_and_never_breaks_a_fund_page(client, monkeypatch, path):
+    """CR's follow-up: the brake-off banner reads the versions on every fund page; a read error there says it can't be
+    read, and the page (and its halt banner) still shows."""
+    from test_c7_fund_banner import _seed
+
+    c, store = client  # noqa: F811
+    _apply(c, 1, **_off("fund_drawdown"))  # a brake off, so the banner reads the versions
+    _seed(monkeypatch, {"state": "halt", "since": None, "until": None, "reason": "Drawdown 15% from the peak",
+                        "restart_url": "/fund/restart"})
+
+    def boom(*a, **k):
+        raise RuntimeError("journal unreachable")
+
+    monkeypatch.setattr(store, "compliance_versions", boom)
+    r = c.get(path, auth=AUTH)
+    assert r.status_code == 200, path
+    words = _text(r.text)
+    assert "Whether a loss brake or the whole-fund test is switched off can't be read." in words
+    assert 'data-fund-state="halt"' in r.text

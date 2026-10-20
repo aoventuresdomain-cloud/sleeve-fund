@@ -79,6 +79,13 @@ def brakes_off(store: Store) -> list[dict]:
     """B-31 (Advisor MUST 4): T3 and each T5 brake switched off in the version in force, with when it went off (the
     first version of the run that has it off) and that version's reason, for the banner that stays on the fund pages
     until it is back on."""
+    try:
+        return _brakes_off(store)
+    except Exception:  # noqa: BLE001 - every fund page reads this: say it can't be read, never a broken page (CR)
+        return [{"key": "unreadable", "unreadable": True}]
+
+
+def _brakes_off(store: Store) -> list[dict]:
     current = as_set(store.compliance())[0]
     off = [k for k in BRAKES if k in current and not current[k]["enabled"]]
     if not off:
