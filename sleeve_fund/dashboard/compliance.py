@@ -162,8 +162,9 @@ def day_figure(store: Store, now=None) -> dict:
     from sleeve_fund.store import utcnow
 
     now = now or utcnow()
-    e = next((e for e in store.events(limit=200) if e["kind"] == "portfolio_brake_rebased"
-              and str(e["message"]).startswith("T5 daily loss pause")), None)
+    # by kind, so a busy day's other events never push it out; gate.day_figure drops one from before today's open
+    e = next((e for e in store.events_of(("portfolio_brake_rebased",), limit=20)
+              if str(e["message"]).startswith("T5 daily loss pause")), None)
     rebased = e["ts"] if e else None
     if rebased is not None and rebased.tzinfo is None:
         rebased = rebased.replace(tzinfo=UTC)

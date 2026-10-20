@@ -158,3 +158,22 @@ def test_the_pages_today_figure_reads_the_funds_state_and_todays_day_pause_rebas
                 ts=now - timedelta(minutes=30))
     fig = day_figure(store, now)
     assert fig["label"] == "Today (since re-base at 15:30 UK)" and fig["value"] == day_return(D(97_000), D(98_000))
+
+
+def test_a_busy_day_keeps_the_day_pause_rebase_label(tmp_path):
+    """CR DAY-RET follow-up (a): the re-base is found by its kind, not among the last few hundred events."""
+    from sleeve_fund.dashboard.compliance import day_figure
+    from sleeve_fund.gate_ledger import DbLedger
+    from sleeve_fund.portfolio.gate import PortfolioState
+    from sleeve_fund.risk import trading_day
+    from sleeve_fund.store import Store
+
+    store = Store(f"sqlite:///{tmp_path}/d.db", portfolio_gate=True)
+    now = datetime(2026, 10, 20, 15, 0, tzinfo=UTC)
+    DbLedger(store, lambda: ()).set_state(PortfolioState(equity=D(97_000), mark_ts=now, hwm=D(100_000),
+                                                         day=trading_day(now), day_start_equity=D(98_000)))
+    store.event(None, "info", "portfolio_brake_rebased", "T5 daily loss pause switched back on: ...",
+                ts=now - timedelta(minutes=30))
+    for i in range(250):
+        store.event(None, "info", "mark", f"busy {i}", ts=now)
+    assert day_figure(store, now)["label"] == "Today (since re-base at 15:30 UK)"
