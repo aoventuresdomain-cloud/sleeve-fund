@@ -242,7 +242,7 @@ class DbLedger:
                    "outcome": decision.outcome, "limit_hit": limit_hit,
                    "requested_qty": stored(decision.requested_qty), "approved_qty": stored(decision.approved_qty),
                    "price": stored(intent.price), "decided_at": at, **self._figures(intent.underlying),
-                   **self._idea(intent)}
+                   **self._idea(intent), **self._leverage(intent, decision)}
             if pending is not None:
                 rid, who, holding, made, qty = pending
                 if who != strategy or decision.approved_qty <= 0:
@@ -256,6 +256,15 @@ class DbLedger:
                     "open_risk": stored(holding.risk), "created_at": made, "expires_at": made + RESERVATION_TTL}])
                 loc.pending = None
         return seq
+
+    @staticmethod
+    def _leverage(intent: Intent, decision: Decision) -> dict:
+        """B-24 (0032): the decision's four leverage figures and the Strategy's position before it (held_before,
+        signed), all five or none: none when the decision has no figures (the book had no equity, or the inputs
+        couldn't be used)."""
+        if not decision.leverage:
+            return {}
+        return {**{k: stored(v) for k, v in decision.leverage.items()}, "held_before": stored(intent.held)}
 
     @staticmethod
     def _idea(intent: Intent) -> dict:
