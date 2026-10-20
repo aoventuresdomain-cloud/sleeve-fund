@@ -55,3 +55,14 @@ def test_a_later_cap_change_leaves_the_entrys_row_as_recorded(store):
     compliance.save(store, replace(compliance.load(store), asset_open_risk=0.02), "pm", "qa: T1 halved")
     assert compliance.load(store).asset_open_risk == 0.02
     assert {k: _row(store, rid)[k] for k in FOUR} == before and money(before["t1_cap"]) == D(800)
+
+
+def test_every_figure_the_writer_sends_is_a_journal_column():
+    """CR F1: the journal's list insert drops a key it has no column for, silently. So each figure a decision carries
+    for the writer (T1's four, B-24's four and held_before) must be a gate_decisions column, or this fails here."""
+    from sleeve_fund.portfolio.limits import Book, Holding, Intent, decide
+
+    intent = Intent("BTC", 1, D("0.2"), D(50_000), D(50_000), D(500), D("0.001"), D("0.001"), D(0), None)
+    d = decide(Book(D(100_000), (Holding("BTC", D(10_000), D(10_000), D(1_000)),)), intent, compliance.SEEDED)
+    sent = {*d.t1, *d.leverage, "held_before"}
+    assert set(FOUR) <= sent and sent <= set(gate_decisions_t.c.keys())
