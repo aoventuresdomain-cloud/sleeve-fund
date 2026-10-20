@@ -12,13 +12,15 @@ import pandas as pd
 from sleeve_fund.dashboard import book as bookm
 
 
-def monthly(summaries: list[dict], frames: dict[str, pd.DataFrame], fills_by_sleeve: dict[str, list[dict]]) -> dict:
-    """Book and per-sleeve returns by calendar month, plus fees and trading activity."""
-    curve = bookm.book_curve(summaries, frames)
+def monthly(summaries: list[dict], frames: dict[str, pd.DataFrame], fills_by_sleeve: dict[str, list[dict]],
+            base: float = 0.0) -> dict:
+    """Book and per-sleeve returns by calendar month, plus fees and trading activity. `base`: the fund's own cash
+    (book.fund_cash, A-20)."""
+    curve = bookm.book_curve(summaries, frames, base)
     if not len(curve):
         return {"rows": [], "sleeves": [], "grid": {}}
     month_end = curve.resample("ME").last()
-    start = sum(x["sleeve"].starting_balance for x in summaries)
+    start = sum(x["sleeve"].starting_balance for x in summaries) + base
     prev_eq = month_end["equity"].shift(1).fillna(start)
     prev_b = month_end["benchmark"].shift(1).fillna(start)
     fills = pd.DataFrame([f for fs in fills_by_sleeve.values() for f in fs])
@@ -130,12 +132,13 @@ def _within(idx, start, end):
     return keep.values
 
 
-def performance(summaries: list[dict], frames: dict[str, pd.DataFrame], fills: list[dict], start, end) -> dict:
+def performance(summaries: list[dict], frames: dict[str, pd.DataFrame], fills: list[dict], start, end,
+                base: float = 0.0) -> dict:
     """The four figures and the book vs benchmark curve over [start, end): return after fees, the gap to
     buy-and-hold in points, the worst drawdown with its date, and fees and fills. Returns are measured
     from the equity at the window's start (the starting capital when the window opens before the first mark)."""
-    curve = bookm.book_curve(summaries, frames)
-    capital = sum(x["sleeve"].starting_balance for x in summaries)
+    curve = bookm.book_curve(summaries, frames, base)  # with the fund's own cash (book.fund_cash, A-20)
+    capital = sum(x["sleeve"].starting_balance for x in summaries) + base
     f = pd.DataFrame(fills)
     if len(f):
         f["ts"] = pd.to_datetime(f["ts"], utc=True)

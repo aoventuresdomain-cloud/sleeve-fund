@@ -95,6 +95,16 @@ def spark_path(values: list[float], w: int = 96, h: int = 24) -> str:
     return " ".join(f"{i * step:.1f},{h - 1 - (v - lo) / span * (h - 2):.1f}" for i, v in enumerate(values))
 
 
+def fund_cash(store: Store) -> float:
+    """A-20: the cash the fund holds that no Strategy carries. Once the fund holds the cash (the re-base deposit
+    applied, supervisor.bridge_start) every Strategy is made with 0 (CUT-A (a)) and the fund's book is its own cash put
+    in plus what the Strategies made (supervisor.fund_book), so the book's figures and curves add this to the
+    Strategies' own; before the bridge it is 0 and the book is theirs alone."""
+    from sleeve_fund.supervisor import bridge_start, fund_book
+
+    return float(fund_book(store).capital) if bridge_start(store) is not None else 0.0
+
+
 def book_view(store: Store, summaries: list[dict], frames: dict[str, pd.DataFrame]) -> dict:
     # Every strategy in the current book counts, stopped and archived ones included: their cash is still the
     # fund's, and stopping one must never rewrite the book's past. A clean slate starts a new book; the
@@ -104,9 +114,14 @@ def book_view(store: Store, summaries: list[dict], frames: dict[str, pd.DataFram
     out = store.withdrawn()
     active = [x for x in summaries if x["sleeve"].name not in out]
     put_away = sum(x["equity"] for x in summaries if x["sleeve"].name in out)
-    start = sum(x["sleeve"].starting_balance for x in active)
-    equity = sum(x["equity"] for x in active)
-    curve = book_curve(active, frames)
+    base = fund_cash(store)
+    start = sum(x["sleeve"].starting_balance for x in active) + base
+    equity = sum(x["equity"] for x in active) + base
+    if base:  # the fund's book as the gate and sizing read it: its cash, the journal's P&L, positions at their marks
+        from sleeve_fund.supervisor import fund_equity
+
+        equity = float(fund_equity(store))
+    curve = book_curve(active, frames, base=base)
     rets = curve["equity"].pct_change().dropna() if len(curve) else pd.Series(dtype=float)
     enough = len(rets) >= MIN_DAYS_FOR_RATIOS
     vol = float(rets.std() * math.sqrt(DAYS_A_YEAR)) if enough else float("nan")
@@ -128,13 +143,14 @@ def book_view(store: Store, summaries: list[dict], frames: dict[str, pd.DataFram
                           if not x["healthy"] and x["sleeve"].desired_state == "running"}),
         "start": start,
         "equity": equity,
+        "fund_cash": base,  # the fund's own cash no Strategy carries, once the fund holds it (A-20)
         # Put away, not trading (Advisor on T-FIX4): what the withdrawn put-aways hold, apart from the book; the two
         # add up to the capital of every Strategy in the current book.
         "put_away": put_away,
         "capital": equity + put_away,
         "pnl": equity - start,
         "ret": equity / start - 1 if start else 0.0,
-        "bench_ret": (sum(x["benchmark"] for x in active) / start - 1) if start else 0.0,
+        "bench_ret": ((sum(x["benchmark"] for x in active) + base) / start - 1) if start else 0.0,
         "day_pnl": sum(x["day_pnl"] for x in active),
         "week_pnl": sum(x["week_pnl"] for x in active),
         "mtd_pnl": sum(x["mtd_pnl"] for x in active),
@@ -142,7 +158,7 @@ def book_view(store: Store, summaries: list[dict], frames: dict[str, pd.DataFram
         "exposure_pct": exposure / equity if equity else 0.0,
         "net_exposure": net,
         "net_pct": net / equity if equity else 0.0,
-        "cash": sum(x["cash"] for x in active),
+        "cash": sum(x["cash"] for x in active) + base,
         "unrealised": sum(x["unrealised"] for x in active),
         "fees": sum(x["fees"] for x in active),
         "funding": sum(x["funding"] for x in active),
@@ -153,26 +169,27 @@ def book_view(store: Store, summaries: list[dict], frames: dict[str, pd.DataFram
         "sharpe": sharpe,
         "bench_sharpe": bench_sharpe,
         "days": len(curve),
-        "allocation": allocation(active, equity),
+        "allocation": allocation(active, equity, base),
         "correlation": correlation(active, frames),
     }
 
 
-def book_curve(summaries: list[dict], frames: dict[str, pd.DataFrame]) -> pd.DataFrame:
-    """Daily book equity and benchmark. A sleeve counts as idle cash before its first mark."""
+def book_curve(summaries: list[dict], frames: dict[str, pd.DataFrame], base: float = 0.0) -> pd.DataFrame:
+    """Daily book equity and benchmark. A sleeve counts as idle cash before its first mark; `base` is the fund's own
+    cash no Strategy carries (fund_cash)."""
     parts = {x["sleeve"].name: frames[x["sleeve"].name] for x in summaries if len(frames[x["sleeve"].name])}
     if not parts:
         return pd.DataFrame(columns=["equity", "benchmark"])
     idx = sorted(set().union(*(f.index for f in parts.values())))
-    out = pd.DataFrame(index=pd.DatetimeIndex(idx), data={"equity": 0.0, "benchmark": 0.0})
+    out = pd.DataFrame(index=pd.DatetimeIndex(idx), data={"equity": base, "benchmark": base})
     for x in summaries:
         f = parts.get(x["sleeve"].name)
-        base = x["sleeve"].starting_balance
+        own = x["sleeve"].starting_balance  # not `base`: that is the fund's cash, read again for `start` below
         for col in ("equity", "benchmark"):
-            out[col] += f[col].reindex(out.index).ffill().fillna(base) if f is not None else base
+            out[col] += f[col].reindex(out.index).ffill().fillna(own) if f is not None else own
     # Measured from the capital the book started with too: its starting balances are never a daily close, so a
     # book whose first close was already a loss read 0% drawdown (round 12, M12-F1).
-    start = sum(x["sleeve"].starting_balance for x in summaries)
+    start = sum(x["sleeve"].starting_balance for x in summaries) + base
     peak = out["equity"].cummax().clip(lower=start)
     out["drawdown"] = (1 - out["equity"] / peak).where(peak > 0, 0.0)  # no capital, no drawdown: 0, never inf (CUT-A)
     return out
@@ -182,7 +199,8 @@ def book_curve(summaries: list[dict], frames: dict[str, pd.DataFrame]) -> pd.Dat
 RECENT_STEP = {1: "5min", 7: "30min"}
 
 
-def recent_curve(store: Store, sleeves: list, days: int, prior_peak: float | None = None) -> pd.DataFrame:
+def recent_curve(store: Store, sleeves: list, days: int, prior_peak: float | None = None,
+                 base: float = 0.0) -> pd.DataFrame:
     """Equity and benchmark summed over the given strategies at fine resolution for the last `days`.
     A strategy without a mark in a step carries its last value; one with no mark yet counts as its
     starting balance. prior_peak is the highest equity before the window, so drawdown is measured from
@@ -191,7 +209,7 @@ def recent_curve(store: Store, sleeves: list, days: int, prior_peak: float | Non
     step = RECENT_STEP.get(days, "30min")
     since = pd.Timestamp(now - pd.Timedelta(days=days)).floor(step)
     idx = pd.date_range(since, pd.Timestamp(now).floor(step), freq=step)
-    out = pd.DataFrame(index=idx, data={"equity": 0.0, "benchmark": 0.0})
+    out = pd.DataFrame(index=idx, data={"equity": base, "benchmark": base})  # the fund's own cash (fund_cash)
     for s in sleeves:
         before = store.equity_at_or_before(s.name, since.to_pydatetime())
         rows = store.equity_since(s.name, since.to_pydatetime())
@@ -210,7 +228,7 @@ def recent_curve(store: Store, sleeves: list, days: int, prior_peak: float | Non
     return out
 
 
-def allocation(summaries: list[dict], equity: float) -> list[dict]:
+def allocation(summaries: list[dict], equity: float, fund_held: float = 0.0) -> list[dict]:
     """Capital by instrument (open positions) plus cash, as shares of book equity. A short is its own row
     with a negative value (its sale proceeds sit in cash, so cash can exceed equity). `bar` is the row's
     width in the allocation bar: positions by gross value, cash filling what is left."""
@@ -226,7 +244,7 @@ def allocation(summaries: list[dict], equity: float) -> list[dict]:
     for r in rows:
         r["share"] = r["value"] / equity if equity else 0.0
         r["bar"] = abs(r["value"]) / scale if scale else 0.0
-    cash = sum(x["cash"] for x in summaries)
+    cash = sum(x["cash"] for x in summaries) + fund_held  # with the fund's own cash (fund_cash)
     rows.append({"name": "Cash", "value": cash, "share": cash / equity if equity else 0.0,
                  "bar": max(0.0, 1 - sum(r["bar"] for r in rows))})
     return rows

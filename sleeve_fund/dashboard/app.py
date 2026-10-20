@@ -350,8 +350,9 @@ def create_app(store: Store | None = None) -> FastAPI:
         prior = daily["equity"][daily.index < cutoff] if len(daily) else daily
         # The peak before the window counts the starting capital too, as the whole history does (M12-F1): from
         # the daily closes alone a wiped-out strategy's was 0, and 0/0 made the range a 500 (mF2-1, mF2-2).
-        start = sum(s.starting_balance for s in sleeves)
-        curve = bookm.recent_curve(st(), sleeves, days, max(float(prior.max()) if len(prior) else 0.0, start))
+        base = bookm.fund_cash(st())  # A-20: the fund's own cash, once it holds it
+        start = sum(s.starting_balance for s in sleeves) + base
+        curve = bookm.recent_curve(st(), sleeves, days, max(float(prior.max()) if len(prior) else 0.0, start), base)
         return JSONResponse({
             "res": "intraday",
             "t": [t.isoformat() for t in curve.index],
@@ -363,11 +364,12 @@ def create_app(store: Store | None = None) -> FastAPI:
     @app.get("/api/book/equity")
     def book_equity_json(days: int | None = None, _: str = Depends(require_pm)):
         sleeves, frames, summaries, _tests = shown_book()
-        curve = bookm.book_curve(summaries, frames)  # every strategy, as the book figures count it
+        base = bookm.fund_cash(st())
+        curve = bookm.book_curve(summaries, frames, base)  # every strategy, as the book figures count it
         if days:
             return _recent_json(sleeves, days, curve)
         return JSONResponse({
-            "start": sum(x["sleeve"].starting_balance for x in summaries),  # the chart's baseline for Change
+            "start": sum(x["sleeve"].starting_balance for x in summaries) + base,  # the chart's baseline for Change
             "t": [t.isoformat() for t in curve.index],
             "equity": [round(v, 2) for v in curve["equity"]],
             "benchmark": [round(v, 2) for v in curve["benchmark"]],
@@ -388,7 +390,8 @@ def create_app(store: Store | None = None) -> FastAPI:
         # The drawdown chart's halt line only when the whole book shares one risk profile's limit.
         profiles = {x["profile"].name: x["profile"].max_drawdown for x in summaries}
         halt = next(iter(profiles.items())) if len(profiles) == 1 else None
-        chart = riskops.drawdown_chart(bookm.book_curve(summaries, frames), halt=halt[1] if halt else None)
+        chart = riskops.drawdown_chart(bookm.book_curve(summaries, frames, bookm.fund_cash(st())),
+                                       halt=halt[1] if halt else None)
         return page(request, "risk.html", book=book, risk=risk, health=health, chart=chart, size=riskops.gate_size(st(), book),
                     halt_name=halt[0] if halt else None, stress=riskops.stress_bars(risk["scenarios"]),
                     status=riskops.status_word(riskops.status_items(risk["rows"], health), running),
@@ -1369,8 +1372,10 @@ def create_app(store: Store | None = None) -> FastAPI:
             summaries = [x for x in summaries if x["sleeve"].name == chosen]
         w = reports.window(q.get("period", ""), q.get("month", ""), now)
         fills = {x["sleeve"].name: st().fills(x["sleeve"].name, limit=100_000) for x in summaries}
-        perf = reports.performance(summaries, frames, [f for fs in fills.values() for f in fs], w["start"], w["end"])
-        m = reports.monthly(summaries, frames, fills)
+        base = 0.0 if chosen else bookm.fund_cash(st())  # A-20: the whole book counts the fund's own cash
+        perf = reports.performance(summaries, frames, [f for fs in fills.values() for f in fs], w["start"], w["end"],
+                                   base)
+        m = reports.monthly(summaries, frames, fills, base)
         months = [r for r in m["rows"] if reports.in_window(r["key"], w)]
         keys = {r["month"] for r in months}
         m = {**m, "rows": months, "months": [mo for mo in m.get("months", []) if mo in keys]}
