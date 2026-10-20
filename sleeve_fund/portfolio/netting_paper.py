@@ -1,20 +1,25 @@
 """B-13: netting across Strategies in shadow on paper (v2 P2-3; PM 13 Oct "shadow first"; Advisor 13 Oct 19:10 UK,
-quant-review/specs-p2-3-p2-8-p2-5.md §2). What one account per venue would have traded and paid had each decision bar's
-intents in an instrument gone out as one net order, read from the paper journal as it stands: the same pure core the
-backtest shadow uses (portfolio.netting), over the fund's own fills.
+quant-review/specs-p2-3-p2-8-p2-5.md §2, and HEAD6-B13-B14, 20 Oct). What one account would have traded and paid had
+each decision bar's intents in an instrument gone out as one net order, read from the paper journal as it stands: the
+same pure core the backtest shadow uses (portfolio.netting), over the fund's own fills.
 
 Read only. It sends nothing, writes nothing and changes no order, fill, limit or Strategy figure (§2.1, §2.6): every
-Strategy's sub-ledger is its own journal, and the figures here are never Strategy evidence (G1/G2).
+Strategy's sub-ledger is its own journal, and the figures here are never Strategy evidence (G1/G2). Its 5 bp residual
+is reported and alerted, never blocking (HEAD6 4); none over the shadow period is a precondition for netting going live.
 
-- Accounts: one per venue, holding the fund's Strategies on it (a test Strategy outside the fund's book is its own fund
-  and is left out, as the book leaves it out).
-- Grouping: an order decided on a bar is grouped by its venue, instrument and decision bar's close (order_timings),
+Every input is what the journal recorded at the time, never a value read today (HEAD6 1), so the same journal gives the
+same figures on any later read:
+- Accounts: one per venue and account (HEAD6 2), holding the fund's Strategies on it. A test Strategy outside the fund's
+  book is its own fund and is left out, as the book leaves it out.
+- Grouping: an order decided on a bar is grouped by its account, instrument and decision bar's close (order_timings),
   so two Strategies deciding on one close net together. An order with no decision bar (a stop or target watched on a
-  trade, the risk guard's) is its own group: nothing else was decided with it.
-- Crossing prices: the decision mark is the order's signal close; the half spread is what that group's market fills
-  paid against it, as the backtest shadow measures it. The taker fee is the venue's, as its fills were charged.
-- Funding: each settlement charged (settled, or the baseline for a missing rate); a later true-up or reversal is a
-  correction of a rate already charged and is counted, not re-netted (corrections).
+  trade, the risk guard's) is its own group: nothing else was decided with it (this understates the saving).
+- Crossing prices: the decision mark is the order's journaled signal close; the half spread is what that group's
+  market fills paid against it. The taker rate is the one those market fills were charged (fee / notional, to 1e-7),
+  so a fee change mid-period prices each bar at the rate then in force; fills in one group at two rates are refused.
+- Funding: no saving line (netting saves none by construction, Advisor 13 Oct 20:25 UK). Settlement charges are
+  netted on the account's position; a later true-up or reversal is linear in the position, so the account books the
+  sum of the Strategies' corrections, and any difference falls to the residual. The conservative baseline line stays.
 """
 
 from __future__ import annotations
@@ -29,6 +34,7 @@ from sqlalchemy import select
 from sleeve_fund.portfolio import netting as nt
 
 ZERO = Decimal(0)
+RATE_PLACES = Decimal("1e-7")  # a fee rate read back from a fill: 0.055% is 0.00055 to this, whatever the rounding
 
 
 def _dec(x) -> Decimal:
@@ -43,14 +49,14 @@ def _ns(t: datetime) -> int:
 
 
 def journal_rows(store, members: Callable[[str], bool]) -> tuple[list[dict], list[dict]]:
-    """The fills and funding charges of the Strategies `members` keeps (by name), from the paper journal: fills with
-    their order's venue, intent, signal close and decision bar's close; funding rows as booked."""
+    """The fills and funding rows of the Strategies `members` keeps (by name), from the paper journal: fills with their
+    order's venue, type, intent, signal close, decision bar's close and the Strategy's account; funding as booked."""
     from sleeve_fund.store import (FUNDING_CHARGE_KINDS, _not_backtest, _rows, fills_t, funding_t, order_timings_t,
                                    orders_t)
 
     f, o, t = fills_t, orders_t, order_timings_t
     q = (select(f.c.sleeve, f.c.ts, f.c.side, f.c.qty, f.c.price, f.c.fee, f.c.instrument, f.c.order_id,
-                o.c.venue, o.c.intent, o.c.signal, t.c.bar_close)
+                o.c.venue, o.c.order_type, o.c.intent, o.c.signal, t.c.bar_close)
          .join(o, o.c.order_id == f.c.order_id)
          .outerjoin(t, t.c.order_id == f.c.order_id)
          .where(_not_backtest(f.c.sleeve))
@@ -59,32 +65,43 @@ def journal_rows(store, members: Callable[[str], bool]) -> tuple[list[dict], lis
     with store.engine.connect() as c:
         fills = [r for r in _rows(c.execute(q)) if members(r["sleeve"])]
         funding = [r for r in _rows(c.execute(fq)) if members(r["sleeve"])]
+    accounts = {n: store.account_of(n) for n in {r["sleeve"] for r in fills + funding}}
     venue_of = {}
     for r in fills:
+        r["account"] = (r["venue"], accounts[r["sleeve"]])
         venue_of.setdefault((r["sleeve"], r["instrument"]), r["venue"])
     for r in funding:
-        r["venue"] = venue_of.get((r["sleeve"], r["instrument"]))
+        venue = venue_of.get((r["sleeve"], r["instrument"]))
+        r["account"] = (venue, accounts[r["sleeve"]]) if venue else None
         r["charge"] = r["kind"] in FUNDING_CHARGE_KINDS
     return fills, funding
 
 
-def shadow(fills: list[dict], funding: list[dict], taker: Callable[[str], Decimal], equity: Decimal) -> dict:
-    """Step B in shadow per venue account over journal rows (journal_rows). taker(strategy): the taker fee that
-    Strategy's fills are charged (its market's, from the venue's live terms), which must be one per account. equity: the fund's equity, the residual's yardstick (§2.5).
-    Returns {venue: figures}, each as the backtest shadow reports it (research.portfolio_run.netting_shadow)."""
+def shadow(fills: list[dict], funding: list[dict], equity: Decimal) -> dict:
+    """Step B in shadow per account over journal rows (journal_rows). equity: the fund's equity, the residual's
+    yardstick (§2.5). Returns {(venue, account): figures}, each as the backtest shadow reports it
+    (research.portfolio_run.netting_shadow)."""
     out = {}
-    venues = sorted({r["venue"] for r in fills if r["venue"]})
-    for venue in venues:
-        out[venue] = _account([r for r in fills if r["venue"] == venue],
-                              [r for r in funding if r.get("venue") == venue], venue, taker, equity)
+    for key in sorted({r["account"] for r in fills}):
+        out[key] = _account([r for r in fills if r["account"] == key],
+                            [r for r in funding if r["account"] == key], key, equity)
     return out
 
 
-def _account(rows: list[dict], funding_rows: list[dict], venue: str, taker: Callable[[str], Decimal],
-             equity: Decimal) -> dict:
+def _rate(r: dict) -> Decimal | None:
+    """The fee rate a market fill was charged, read back from the journal; None for anything else (a resting order's
+    maker fee is not what a net market order would pay)."""
+    notional = _dec(r["qty"]) * _dec(r["price"])
+    if str(r["order_type"]).upper() != "MARKET" or not notional:
+        return None
+    return (_dec(r["fee"]) / notional).quantize(RATE_PLACES)
+
+
+def _account(rows: list[dict], funding_rows: list[dict], key, equity: Decimal) -> dict:
     fills: list[nt.Fill] = []
     marks: dict[tuple[str, int], Decimal] = {}
     halves: dict[tuple[str, int], Decimal] = {}
+    rates: dict[tuple[str, int], set[Decimal]] = defaultdict(set)
     for r in rows:
         qty = _dec(r["qty"])
         if not qty:
@@ -95,6 +112,8 @@ def _account(rows: list[dict], funding_rows: list[dict], venue: str, taker: Call
         side = 1 if str(r["side"]).upper() == "BUY" else -1
         px = _dec(r["price"])
         fills.append(nt.Fill(r["sleeve"], r["instrument"], ts, side * qty, px, _dec(r["fee"])))
+        if (rate := _rate(r)) is not None:
+            rates[(r["instrument"], ts)].add(rate)
         close = (r["signal"] or {}).get("close") if r["bar_close"] is not None else None
         if close and (r["instrument"], ts) not in marks:
             marks[(r["instrument"], ts)] = _dec(close)
@@ -102,6 +121,11 @@ def _account(rows: list[dict], funding_rows: list[dict], venue: str, taker: Call
     first = {}
     for f in fills:
         first.setdefault((f.instrument, f.ts), f)
+    for (inst, _ts), seen in rates.items():
+        if len(seen) > 1:
+            raise ValueError(f"netting shadow: fills of one candle in {inst} were charged different taker rates "
+                             f"({', '.join(f'{x:%}' for x in sorted(seen))}); the Strategies on one account must pay "
+                             "the same taker fee")
 
     def mark(inst: str, ts: int) -> Decimal:
         return marks.get((inst, ts), first[(inst, ts)].price)
@@ -109,29 +133,40 @@ def _account(rows: list[dict], funding_rows: list[dict], venue: str, taker: Call
     def half(inst: str, ts: int) -> Decimal:
         return halves.get((inst, ts), ZERO)
 
-    rates = {taker(name) for name in {f.strategy for f in fills}}
-    if len(rates) > 1:
-        raise ValueError(f"netting shadow on {venue}: the Strategies on one account must pay the same taker fee")
-    rate = next(iter(rates)) if rates else ZERO
+    def taker(inst: str, ts: int) -> Decimal:
+        seen = rates.get((inst, ts))
+        if not seen:
+            raise ValueError(f"netting shadow: no market fill in {inst} at a crossing candle to read the taker rate from")
+        return next(iter(seen))
+
     charged = [r for r in funding_rows if r["charge"]]
-    funding = [nt.Funding(r["sleeve"], r["instrument"], _ns(r["ts"]), _dec(r["rate"]),
-                          _dec(r["price"]), _dec(r["amount"]), r["kind"] == "baseline") for r in charged]
-    sh = nt.shadow(fills, funding, mark, half, rate)
+    funding = [nt.Funding(r["sleeve"], r["instrument"], _ns(r["ts"]), _dec(r["rate"]), _dec(r["price"]),
+                          _dec(r["amount"]), r["kind"] == "baseline") for r in charged]
+    corrections = [r for r in funding_rows if not r["charge"]]
+    corrected = sum((_dec(r["amount"]) for r in corrections), ZERO)
+    sh = nt.shadow(fills, funding, mark, half, taker)
     saving, sub = sh.saving(), sh.strategy_cash()
+    for r in corrections:  # each Strategy's own correction, booked to it as its journal did
+        sub[r["sleeve"]] = sub.get(r["sleeve"], ZERO) + _dec(r["amount"])
     sub_total = sum(sub.values(), ZERO)
-    residual = nt.reconcile(sub_total, sum(saving.values(), ZERO) + sh.baseline_total(), sh.account, equity)
+    account = sh.account + corrected  # linear in the position: the account's correction is the sum of theirs
+    residual = nt.reconcile(sub_total, sum(saving.values(), ZERO) + sh.baseline_total(), account, equity)
     by_group: dict[tuple[str, int], set[str]] = defaultdict(set)
     for f in fills:
         by_group[(f.instrument, f.ts)].add(f.strategy)
+    sub_funding = sum((r.amount for r in funding), ZERO) + corrected
     return {
+        "venue": key[0], "account": key[1],
         "saving": saving,
         "saving_total": sum(saving.values(), ZERO),
-        "account": sh.account,
+        "account_cash": account,
         "sub_ledger_total": sub_total,
         "sub_ledgers": sub,
         "conservative_funding_baseline": sh.baseline_total(),
-        "funding": {"account": sh.account_funding, "sub_ledgers": sum((r.amount for r in funding), ZERO)},
-        "corrections": sum(1 for r in funding_rows if not r["charge"]),
+        # Reconciled, not saved: the account's funding against the Strategies', the baseline line apart
+        "funding": {"account": sh.account_funding + corrected, "sub_ledgers": sub_funding,
+                    "gap": sh.account_funding + corrected + sh.baseline_total() - sub_funding},
+        "corrections": len(corrections),
         "crossed_notional": sum((o.crossed * mark(o.instrument, o.ts) for o in sh.orders), ZERO),
         "orders_sent": sum(1 for o in sh.orders if o.qty),
         "orders_alone": len({r["order_id"] for r in rows if _dec(r["qty"])}),
@@ -153,3 +188,16 @@ def _last_price(fills: list[nt.Fill]) -> Callable[[str, int], Decimal]:
         return seen[-1] if seen else by[inst][0].price
 
     return at
+
+
+def over_line(store, members: Callable[[str], bool], equity: Decimal) -> list[str]:
+    """The accounts whose residual is over the 5 bp line, in words, for the nightly alert (HEAD6 4: reported and
+    alerted, never blocking). Names no venue: an account is named by its Strategies."""
+    fills, funding = journal_rows(store, members)
+    out = []
+    for s in shadow(fills, funding, equity).values():
+        if s["residual"]["block"]:
+            out.append(f"netting shadow (trading unaffected): the account of {', '.join(sorted(s['sub_ledgers']))} has "
+                       f"an unexplained difference of {s['residual']['amount']:,.2f} ({s['residual']['bp']:.1f} bp), "
+                       f"over the {nt.RESIDUAL_BP} bp line")
+    return out

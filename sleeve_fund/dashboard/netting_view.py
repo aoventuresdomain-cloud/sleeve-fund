@@ -12,24 +12,9 @@ from decimal import Decimal
 from sleeve_fund.portfolio import netting_paper
 
 
-def _taker(store, now: datetime):
-    """taker(strategy): the rate its paper fills are charged, worked out as the paper node does (node.py: FEE-LIVE's
-    rate for its account, then its market's schedule)."""
-    from sleeve_fund.fees import resolve
-    from sleeve_fund.paper.config import from_store
-
-    def taker(name: str) -> Decimal:
-        row = store.sleeve(name)
-        acct = store.account_of(name)
-        quote = resolve(getattr(row, "venue", None), store, row.instrument, now,
-                        live=store.account_kind(acct) == "live", account=acct)
-        return from_store(row, fee_schedule=quote.fees).fees.taker
-
-    return taker
-
-
 def view(store, now: datetime) -> dict:
-    """{"accounts": [...], "error": words or None}. Each account: its Strategies and the shadow's figures as floats
+    """{"accounts": [...], "error": words or None}, from the journal as it stands (every input as journaled at the
+    time, so `now` changes nothing but the page's stamp). Each account: its Strategies and the shadow's figures as floats
     for the page, with the residual's check and opposed exposure per Strategy pair (largest first)."""
     from sleeve_fund.supervisor import _in_book, fund_equity
 
@@ -38,8 +23,8 @@ def view(store, now: datetime) -> dict:
         equity = Decimal(repr(float(fund_equity(store))))
         fills, funding = netting_paper.journal_rows(
             store, lambda name: name in sleeves and _in_book(store, sleeves[name]))
-        shadow = netting_paper.shadow(fills, funding, _taker(store, now), equity)
-    except (ValueError, LookupError) as e:  # an unmarked position, a fee that can't be read: said, never guessed
+        shadow = netting_paper.shadow(fills, funding, equity)
+    except (ValueError, LookupError, RuntimeError) as e:  # an unmarked position, a fee that can't be read: said, never guessed
         return {"accounts": [], "error": str(e)}
     accounts = []
     for n, (_, s) in enumerate(sorted(shadow.items()), start=1):
