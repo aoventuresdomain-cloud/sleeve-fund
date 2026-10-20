@@ -111,8 +111,10 @@
         {% endif %}
         {% if e.indicators %}
         <h3>Indicators used</h3>
-        <table class="tight"><thead><tr><th>Name</th><th>Kind</th><th class="num">Period</th><th>Other settings</th><th>Candle</th><th>Reads</th></tr></thead><tbody>
-        {% for b in e.indicators %}<tr><td>{{ b.name }}</td><td>{{ b.kind }}</td><td class="num">{{ b.period }}</td><td>{{ b.settings }}</td><td>{{ b.candle }}</td><td>{{ b.input }}</td></tr>{% endfor %}
+        {# QD 10: the "Reads" column only when some block reads something other than the price #}
+        {% set reads = e.indicators|selectattr("input", "ne", "price")|list|length > 0 %}
+        <table class="tight"><thead><tr><th>Name</th><th>Kind</th><th class="num">Period</th><th>Other settings</th><th>Candle</th>{% if reads %}<th>Reads</th>{% endif %}</tr></thead><tbody>
+        {% for b in e.indicators %}<tr><td>{{ b.name }}</td><td>{{ b.kind }}</td><td class="num">{{ b.period }}</td><td>{{ b.settings }}</td><td>{{ b.candle }}</td>{% if reads %}<td>{{ b.input }}</td>{% endif %}</tr>{% endfor %}
         </tbody></table>
         {% endif %}
         <h3>Settings to test <span class="muted">· {{ 1 + e.secondaries|length }} of {{ budget }} tries planned</span></h3>
