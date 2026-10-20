@@ -1734,7 +1734,8 @@ def create_app(store: Store | None = None) -> FastAPI:
             warned.append(f"Assets with no group ({', '.join(no_group)}) will no longer be refused. They still count "
                           "under per asset, whole fund and size limits.")
         return page(request, "portfolio_settings.html", v=v, mode="review", saved="", errors=[], form=form,
-                    changes=lines, warnings=warned, expected=expected,
+                    changes=lines, warnings=warned, expected=expected, offs=compliance.switched_off(cur["tests"], tests),
+                    order_rules=compliance.ORDER_RULES,
                     carry=compliance.to_form(tests, groups))
 
     @app.post("/portfolio-settings/apply")
