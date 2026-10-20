@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% from "_macros.html" import chip, test_chip, signed, money_signed, usage, spark, pts, tag, cost_share, open_risk_text, open_risk_hint, open_risk_warn, open_risk_room, limits_after, leg_flag, legs_list %}
 {% from "_reasons.html" import reason_picker %}
-{% from "_positions.html" import positions_table %}
+{% from "_positions.html" import positions_table, positions_empty %}
 {% block title %}Portfolio · Multi-Strategy Fund{% endblock %}
 {% block content %}
 <div class="page-head" data-live="head">
@@ -124,7 +124,7 @@
   <div class="panel-head"><h2 id="positions-h">Open positions</h2></div>
   {% if positions.rows %}
   {{ positions_table(positions) }}
-  {% else %}<p class="empty" style="padding:4px 18px 16px">All in cash. A position appears here as soon as a strategy buys or sells short.</p>{% endif %}
+  {% else %}{{ positions_empty() }}{% endif %}
 </section>
 </div>
 
