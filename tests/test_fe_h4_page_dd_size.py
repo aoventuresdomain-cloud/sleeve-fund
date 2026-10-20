@@ -127,3 +127,24 @@ def test_not_held_the_position_size_reads_as_before(c, store):  # noqa: F811
     s = _long(store, "own-long", balance=10_000)
     side, table = _size_cells(c, s.name)
     assert side.startswith("33% of the fund") and table == "33% of the fund"
+
+
+def test_the_halts_drawdown_is_never_negative_and_unusable_figures_read_as_not_marked(c, store):  # noqa: F811
+    """CR's FOLLOW-UP 2: a book above its halt reference reads 0, as book_breach measures from the higher of the two;
+    a reference or book at or below 0 is no figure, never a page error."""
+    from sleeve_fund.dashboard import riskops
+    from sleeve_fund.paper.portfolio_gate import PaperGate
+
+    _hold(store)
+    _long(store)
+    _mark(store, 100_000)
+    ledger = PaperGate(store).ledger
+    st = ledger.state()
+    ledger.set_state(replace(st, equity=Decimal(101_000), hwm=Decimal(101_000), halt_reference=Decimal(99_000)))
+    assert riskops.fund_drawdown(store) == 0.0
+    for bad in ({"halt_reference": Decimal(0), "hwm": Decimal(0)}, {"equity": Decimal(0)}, {"equity": None, "mark_ts": None, "hwm": None, "halt_reference": None,
+                                                                                    "day": None, "day_start_equity": None}):
+        ledger.set_state(replace(st, **bad))
+        assert riskops.fund_drawdown(store) is None, bad
+        words, _ = _words(c, "/")
+        assert "Drawdown from peak –" in words, bad
