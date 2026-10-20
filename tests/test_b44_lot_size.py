@@ -173,3 +173,13 @@ def test_b44_step_exits_still_run_while_entries_are_refused(prices, instrument, 
     res = run_backtest("ping_pong", feed, instrument, {"market": "perp"}, half_spread=0, risk_profile="aggressive")
     sides = list(res.fills["side"]) if not res.fills.empty else []
     assert len(asked) >= 2 and sides[:2] == ["BUY", "SELL"], sides
+
+
+def test_qd_a_power_of_ten_step_above_1_is_kept_and_sizing_rounds_to_it(built):
+    # QD MUST 2: a 10 step must not fall back to 1 (size_precision 0); quantize honours 1E+1
+    from decimal import ROUND_DOWN
+
+    inst = built(lambda pair: paper_venue_lot(pair, get_json=listing("10", "10")))
+    assert inst.size_increment.as_decimal() == D("10") and inst.min_quantity.as_decimal() == D("10")
+    s = Sizer(inst)
+    assert s._lot() == D("10") and D("23").quantize(s._lot(), ROUND_DOWN) == D("20")
