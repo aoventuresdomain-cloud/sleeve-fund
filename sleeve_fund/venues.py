@@ -168,8 +168,7 @@ class VenueProfile:
         return perpetual(base, quote, fees=fees or self.fees, venue=self.venue, symbol=self.symbol_of(f"{base}/{quote}"),
                          price_precision=limits.get("price_precision", price_precision),
                          size_precision=limits.get("size_precision", min(size_precision, 3)),
-                         min_quantity=limits.get("min_quantity"), min_notional=limits.get("min_notional", 5.0),
-                         size_increment=lot[0] if lot is not None else None)
+                         min_quantity=limits.get("min_quantity"), min_notional=limits.get("min_notional", 5.0))
 
     def contract_lot(self, pair: str) -> tuple[Decimal, Decimal] | None:
         """B-44: the (quantity step, minimum order quantity) an instrument on `pair` is built with: the venue's live
@@ -508,8 +507,9 @@ def paper_venue_listing(pair: str, get_json=None) -> dict:
 
 def paper_venue_lot(pair: str, get_json=None) -> tuple[Decimal, Decimal]:
     """B-44: the paper venue's live (quantity step, minimum order quantity) for `pair`, exactly as its listing's
-    lotSizeFilter gives them. Raises ValueError when either is missing or not above 0, or the minimum isn't a whole
-    number of steps."""
+    lotSizeFilter gives them. Raises ValueError when either is missing or not above 0, the minimum isn't a whole
+    number of steps, or the step isn't a power of ten: the engine rounds a quantity by its step's exponent (quantize),
+    so 0.007 would stay 0.007 on a 0.005 step and the venue would refuse it (QD). The kept lot then stands, said."""
     f = paper_venue_listing(pair, get_json).get("lotSizeFilter") or {}
     step, least = f.get("qtyStep"), f.get("minOrderQty")
     if not step or not least:
@@ -517,6 +517,8 @@ def paper_venue_lot(pair: str, get_json=None) -> tuple[Decimal, Decimal]:
     step, least = Decimal(step).normalize(), Decimal(least).normalize()
     if step <= 0 or least <= 0 or least % step:
         raise ValueError(f"the venue's lot size for {pair} can't be used: step {step}, minimum {least}")
+    if step != Decimal(1).scaleb(step.adjusted()):
+        raise ValueError(f"the venue's lot step for {pair} is {step}, not a power of ten, which the engine can't round to")
     return step, least
 
 

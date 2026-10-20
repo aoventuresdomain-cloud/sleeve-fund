@@ -118,16 +118,13 @@ def perpetual(
     size_precision: int = 3,
     min_quantity: float | None = None,
     min_notional: float = 5.0,
-    size_increment: Decimal | None = None,
 ) -> CryptoPerpetual:
     """Build a linear (quote-settled) perpetual as the venue lists it, under the venue's own symbol, so a
     backtest trades the same instrument paper receives from the venue's data client. Use
     VenueProfile.instrument(), which fills in the venue's symbol, fees and contract limits."""
     base_ccy, quote_ccy = Currency.from_str(base), Currency.from_str(quote)
     size_precision = min(size_precision, base_ccy.precision)
-    # B-44: the venue's own quantity step when it is listed (0.001, or one that isn't a power of ten), else 1 in the
-    # last place
-    step = float(size_increment) if size_increment is not None else 10**-size_precision
+    step = 10**-size_precision
     sym = Symbol(symbol)
     return CryptoPerpetual(
         instrument_id=InstrumentId(symbol=sym, venue=venue),

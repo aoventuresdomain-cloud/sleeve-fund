@@ -53,7 +53,7 @@ def built(monkeypatch):
 
 def test_the_lot_size_comes_from_the_recorded_listing():
     assert paper_venue_lot("BTC/USDT", get_json=listing()) == (D("0.001"), D("0.001"))
-    assert paper_venue_lot("BTC/USDT", get_json=listing("0.005", "0.010")) == (D("0.005"), D("0.01"))
+    assert paper_venue_lot("BTC/USDT", get_json=listing("0.010", "0.020")) == (D("0.01"), D("0.02"))
 
 
 @pytest.mark.parametrize("bad", [dict(drop=True), dict(step="0"), dict(step="0.001", least="0.0015")])
@@ -72,21 +72,21 @@ def test_qd_a_step_that_isnt_a_power_of_ten_is_refused_so_the_kept_lot_stands(bu
 
 
 def test_the_instrument_carries_the_listings_step_and_minimum_not_the_data_venues(built):
-    inst = built(lambda pair: paper_venue_lot(pair, get_json=listing("0.005", "0.010")))
-    assert inst.size_increment.as_decimal() == D("0.005") and inst.min_quantity.as_decimal() == D("0.010")
+    inst = built(lambda pair: paper_venue_lot(pair, get_json=listing("0.01", "0.02")))
+    assert inst.size_increment.as_decimal() == D("0.01") and inst.min_quantity.as_decimal() == D("0.02")
     s = Sizer(inst)
-    assert s._lot() == D("0.005") and s._min_qty() == D("0.010")
+    assert s._lot() == D("0.01") and s._min_qty() == D("0.02")
 
 
 def test_sizing_rounds_down_to_the_step_and_refuses_below_the_minimum(built):
-    s = Sizer(built(lambda pair: paper_venue_lot(pair, get_json=listing("0.005", "0.010"))))
+    s = Sizer(built(lambda pair: paper_venue_lot(pair, get_json=listing("0.01", "0.02"))))
 
     def intent(qty):
         return Intent("BTC", 1, D(qty), D("60000"), D("60000"), D("600"), s._lot(), s._min_qty())
 
-    ok = decide(Book(D("100000")), intent("0.0237"), PORTFOLIO)
-    assert ok.approved_qty == D("0.020")
-    small = decide(Book(D("100000")), intent("0.008"), PORTFOLIO)
+    ok = decide(Book(D("100000")), intent("0.0379"), PORTFOLIO)
+    assert ok.approved_qty == D("0.03")
+    small = decide(Book(D("100000")), intent("0.019"), PORTFOLIO)
     assert small.outcome == "rejected" and small.limit_hit == "below_min" and small.approved_qty == 0
 
 
@@ -100,18 +100,18 @@ def test_an_unreadable_listing_takes_the_kept_lot_and_says_so(built, capfd):
 
 
 def test_a_live_lot_that_differs_from_the_kept_one_wins_and_says_so(built, capfd):
-    inst = built(lambda pair: (D("0.002"), D("0.002")))
-    assert inst.size_increment.as_decimal() == D("0.002") and inst.min_quantity.as_decimal() == D("0.002")
+    inst = built(lambda pair: (D("0.01"), D("0.01")))
+    assert inst.size_increment.as_decimal() == D("0.01") and inst.min_quantity.as_decimal() == D("0.01")
     assert "differs from the kept" in capfd.readouterr().err
 
 
-@pytest.mark.parametrize("qty", ["0.004", "0.0099"])
+@pytest.mark.parametrize("qty", ["0.004", "0.0199"])
 def test_a_size_between_0_and_the_minimum_after_rounding_is_refused_in_words_never_sent_as_0(built, qty):
-    s = Sizer(built(lambda pair: paper_venue_lot(pair, get_json=listing("0.005", "0.010"))))
+    s = Sizer(built(lambda pair: paper_venue_lot(pair, get_json=listing("0.01", "0.02"))))
     d = decide(Book(D("100000")), Intent("BTC", 1, D(qty), D("60000"), D("60000"), D("600"), s._lot(), s._min_qty()),
                PORTFOLIO)
     assert d.outcome == "rejected" and d.approved_qty == 0 and d.limit_hit == "below_min"
-    assert d.reason.startswith("Entry rejected") and "0.01" in d.reason
+    assert d.reason.startswith("Entry rejected") and "0.02" in d.reason
 
 
 @pytest.mark.parametrize("live_lot", ["unreadable", None])
