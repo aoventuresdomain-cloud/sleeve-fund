@@ -58,16 +58,30 @@ def test_a_sound_account_passes_in_one_line():
     ({"key": {"retCode": 10003, "retMsg": "API key is invalid."}}, "permissions couldn't be read"),
     ({"account": {"retCode": 0, "result": {"marginMode": "REGULAR_MARGIN"}}}, "not isolated"),
     ({"account": None}, "unreadable, not isolated"),
-    ({"positions": {"BTCUSDT": {**POSITION_OK, "positionIdx": 1}}}, "hedge mode"),
-    ({"positions": {"BTCUSDT": {**POSITION_OK, "leverage": "10"}}}, "the venue's leverage is 10"),
+    ({"positions": {"BTCUSDT": {**POSITION_OK, "positionIdx": 1}}}, "position mode is hedge"),
+    ({"positions": {"BTCUSDT": {**POSITION_OK, "leverage": "10"}}}, "the leverage is 10"),
     ({"positions": {"BTCUSDT": None}}, "couldn't be read"),
-    ({"caps": {"BTCUSDT": None}}, "cap unknown"),
+    ({"caps": {"BTCUSDT": None}}, "cap, which is unknown"),
     ({"server_ms": None}, "clock couldn't be read"),
     ({"local_ms": 1_002_500}, "2500 ms off"),
 ])
 def test_every_way_the_key_account_or_instrument_is_wrong_is_a_fail_named(change, words):
     fails = _fails(_check(**change))
     assert fails and any(words in f for f in fails), fails
+
+
+@pytest.mark.parametrize("change, words", [
+    ({"account": {"retCode": 0, "result": {"marginMode": "REGULAR_MARGIN"}}},
+     "margin mode is REGULAR_MARGIN, not isolated: it must be Isolated"),
+    ({"positions": {"BTCUSDT": {**POSITION_OK, "positionIdx": 1}}},
+     "BTCUSDT: the position mode is hedge, not one-way: it must be One-way"),
+    ({"positions": {"BTCUSDT": {**POSITION_OK, "leverage": "3"}}}, "BTCUSDT: the leverage is 3: it must be 2x"),
+])
+def test_each_setting_mismatch_fails_alone_naming_the_setting_and_its_required_value(change, words):
+    """Advisor B05-NO-ACCOUNT-WRITES cell 2: whoever sets up the demo account before the drills reads what to change;
+    the fund never changes it."""
+    fails = _fails(_check(**change))
+    assert len(fails) == 1 and words in fails[0] and exec_client.SET_IT in fails[0], fails
 
 
 def test_the_pms_gates_still_apply_at_connect():
@@ -267,3 +281,14 @@ def test_off_or_with_no_limiter_nothing_changes():
     lim = exec_client.Limiter({"order/create": (0, 1.0, "")}, now=lambda: NOW)
     assert _model(lim, on=False)("entry") is None
     assert _model(None)("entry") is None
+
+
+def test_on_is_refused_at_the_node_while_the_venue_has_no_data_hub():
+    """HoE ruling on MUST 9: the venue profile is data only, never registered, and ON is refused naming why."""
+    from sleeve_fund import venues
+    from sleeve_fund.paper.safety import PaperSafetyError
+
+    assert exec_client.EXCHANGE_PROFILE["hub"] is False and exec_client.EXCHANGE_PROFILE["name"] not in venues.VENUES
+    with pytest.raises(PaperSafetyError, match="no data hub for this venue"):
+        exec_client.assert_off(DEMO_ENV)
+    exec_client.assert_off({})  # OFF: nothing changes

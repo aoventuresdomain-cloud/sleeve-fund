@@ -1,10 +1,13 @@
 """B-05 M3 (drill-prep MUST 2, spec section 5): the order client under faults, against the fault-injecting stand-in
-(tests/fault_proxy.py). Never a second send of one order, never a release on silence: a create the venue refused or
-rate-limited is sent once and ends rejected; a create whose answer came too late is sent once and is found at the
-venue by its id before anything else is sent; a cancel whose answer came too late leaves the order working (the A2
+(tests/fault_proxy.py). Never a second send of one order, never a release on silence: a create the venue refused is
+sent once and ends rejected; one rate-limited (HTTP 429) is sent once and ends in silence, like one whose answer came
+too late: either is looked up by its id, in open orders and in history, past the venue's visibility window, before
+anything is sent again (exec_client.resend_check); a cancel whose answer came too late leaves the order working (the A2
 path stays open), as does a dropped WebSocket, after which a fill is still booked once by its trade id."""
 
 from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from fault_proxy import REJECTS, FaultVenue, run
@@ -46,13 +49,25 @@ def test_a_refused_create_is_sent_once_and_ends_rejected_with_the_venues_words(w
     assert str(REJECTS[why][0]) in str(rejected.reason) or REJECTS[why][1] in str(rejected.reason)
 
 
-def test_a_429_is_sent_once_and_never_resent_by_the_client():
-    venue, sent = FaultVenue(), []
+def test_a_429_is_sent_once_ends_in_silence_and_only_the_lookup_lets_it_go_again():
+    """QD review item 3: the end state pinned. The client hears an HTTP 429 as no answer: neither accepted nor
+    rejected, nothing released. The venue took nothing, so after the window both lookups find nothing: resend."""
+    from sleeve_fund.paper.venue_stops import VenueStops
+
+    venue, sent, verdicts = FaultVenue(), [], []
+    t0 = datetime(2026, 10, 20, 20, 0, tzinfo=UTC)
+
+    def check(_):
+        stops = VenueStops(venue.http_url, symbol="BTCUSDT", api_key="k", api_secret="s", limiter=exec_client.Limiter())
+        for after in (timedelta(seconds=1), exec_client.VISIBILITY_WINDOW):
+            verdicts.append(exec_client.resend_check(stops, sent[0], sent_at=t0, now=t0 + after))
+
     venue.inject("order/create", ("http", 429))
-    events = run(venue, {3: lambda s: _limit(s, sent)})
+    events = run(venue, {3: lambda s: _limit(s, sent), 8: check}, until=12)
     [oid] = sent
     assert len(venue.bodies("order/create")) == 1
-    assert "OrderAccepted" not in _kinds(events, oid)
+    assert _kinds(events, oid) == ["OrderInitialized", "OrderSubmitted"]  # silence: no reject, nothing released
+    assert verdicts == ["wait", "resend"]
 
 
 def test_a_create_answered_too_late_is_sent_once_and_found_at_the_venue_by_its_id():
@@ -77,8 +92,10 @@ def test_a_create_answered_too_late_is_sent_once_and_found_at_the_venue_by_its_i
 
 
 @pytest.mark.parametrize("row, ok", [
-    (None, True),
+    (exec_client.NOT_FOUND, True),
+    (None, False),  # no answer: never a resend (QD review item 1: its own sentinel, not "not found")
     ({"orderStatus": "Rejected", "cumExecQty": "0"}, True),
+    ({"orderStatus": "Rejected", "cumExecQty": "0.000"}, True),
     ({"orderStatus": "Rejected", "cumExecQty": "0.004"}, False),
     ({"orderStatus": "New", "cumExecQty": "0"}, False),
     ({"orderStatus": "PartiallyFilled", "cumExecQty": "0.004"}, False),
@@ -132,3 +149,72 @@ def test_a_websocket_dropped_mid_fill_reconnects_and_the_fill_is_booked_once_by_
                               fee=f.commission.as_double(), order_id=oid, trade_id=str(f.trade_id)) for f in fills]
     assert said[0] == "new" and all(x == "same" for x in said[1:])
     assert len({str(f.trade_id) for f in fills}) == 1
+
+
+class _Venue:
+    """The two lookups as the venue may answer them: open orders (realtime) and history, each a row, None (not there)
+    or ConnectionError (no usable answer)."""
+
+    def __init__(self, realtime=None, history=None):
+        self.answers = {"realtime": realtime, "history": history}
+
+    def _read(self, which):
+        a = self.answers[which]
+        if a is ConnectionError:
+            raise ConnectionError("no answer")
+        return a
+
+    def lookup(self, oid):
+        return self._read("realtime")
+
+    def history(self, oid):
+        return self._read("history")
+
+
+T0 = datetime(2026, 10, 20, 20, 0, tzinfo=UTC)
+PAST = T0 + exec_client.VISIBILITY_WINDOW
+
+
+def test_a_filled_order_that_shows_only_in_history_is_never_sent_again():
+    """HoE MUST (a): open orders no longer list a filled order; history does."""
+    filled = {"orderLinkId": "sf-x", "orderStatus": "Filled", "cumExecQty": "0.010"}
+    assert exec_client.resend_check(_Venue(realtime=None, history=filled), "sf-x", sent_at=T0, now=PAST) == "keep"
+
+
+def test_an_order_not_yet_visible_is_waited_for_and_never_sent_again_once_it_shows():
+    """HoE MUST (b): just after the create neither lookup shows it yet; inside the window nothing is decided."""
+    working = {"orderLinkId": "sf-x", "orderStatus": "New", "cumExecQty": "0"}
+    early = exec_client.resend_check(_Venue(), "sf-x", sent_at=T0, now=T0 + timedelta(seconds=2))
+    late = exec_client.resend_check(_Venue(realtime=working), "sf-x", sent_at=T0, now=PAST)
+    assert (early, late) == ("wait", "keep")
+
+
+@pytest.mark.parametrize("realtime, history", [(ConnectionError, None), (None, ConnectionError)])
+def test_either_lookup_unanswered_is_no_answer_never_a_resend(realtime, history):
+    assert exec_client.resend_check(_Venue(realtime, history), "sf-x", sent_at=T0, now=PAST) == "no answer"
+
+
+def test_a_refused_lookup_is_no_answer_not_an_empty_list():
+    """A lookup the venue refused (rate limit) used to read as an empty list, so "not found": now no answer."""
+    from exec_stub import VenueStub
+
+    from sleeve_fund.paper.venue_stops import VenueStops
+
+    class Refuses(VenueStub):
+        def route(self, method, path, body):
+            if path.startswith(("/v5/order/realtime", "/v5/order/history")):
+                return {"retCode": 10006, "retMsg": "Too many visits!", "result": {}}
+            return super().route(method, path, body)
+
+    venue = Refuses().start()
+    try:
+        stops = VenueStops(venue.http_url, symbol="BTCUSDT", api_key="k", api_secret="s", limiter=exec_client.Limiter())
+        assert exec_client.resend_check(stops, "sf-x", sent_at=T0, now=PAST) == "no answer"
+    finally:
+        venue.stop()
+
+
+def test_only_both_lookups_empty_past_the_window_or_a_clean_refusal_lets_it_go():
+    refused = {"orderLinkId": "sf-x", "orderStatus": "Rejected", "cumExecQty": "0"}
+    assert exec_client.resend_check(_Venue(), "sf-x", sent_at=T0, now=PAST) == "resend"
+    assert exec_client.resend_check(_Venue(history=refused), "sf-x", sent_at=T0, now=PAST) == "resend"

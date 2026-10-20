@@ -344,3 +344,30 @@ def test_on_one_whose_row_turns_up_in_the_grace_holds_entries_until_a_start_chec
     clock["now"] = NOW + timedelta(seconds=1)
     LongFlatStrategy._recheck_claims(me)
     assert spy.sent == [] and LEFT in exec_reconcile.hold(store, "s1")
+
+
+ORDER_WRITES = ("/v5/order/create", "/v5/order/cancel", "/v5/order/amend")
+
+
+def test_connect_start_and_an_order_cycle_write_no_account_or_instrument_setting(store):
+    """Advisor B05-NO-ACCOUNT-WRITES cell 1: across the connect check, the start reconcile and a full order cycle
+    (a resting stop placed, read back and cancelled) the fake endpoint records zero settings writes: every POST is an
+    order's own create, amend or cancel."""
+    from sleeve_fund.paper.exec_client import exec_settings
+
+    _long(store, "s1", 0.01, "sf-" + "a" * 32)
+    venue = _Account(size="0.01", side="Buy").start()
+    try:
+        reads, stops = _clients(venue)
+        reads.check(exec_settings({"EXEC_MODE": "demo", "EXEC_HOST": "api-demo.bybit.com", "BYBIT_DEMO_API_KEY": "k",
+                                   "BYBIT_DEMO_API_SECRET": "s"}), drill_go=True, caps={SYMBOL: 2.0},
+                    local_ms=lambda: 0)
+        exec_start.start_reconcile(store, reads, stops, account="demo-1", symbol=SYMBOL, instrument=INSTR,
+                                   tags=("s1",), fund_ids=set(), now=NOW)
+        done = exec_start.protect_late_fill(store, "s1", stops, side="SELL", qty="0.01", level="58000", now=NOW,
+                                            sleep=lambda s: None)
+        stops.cancel(done["id"])
+    finally:
+        venue.stop()
+    posts = [p.split("?")[0] for m, p, _ in venue.seen if m == "POST"]
+    assert posts and all(p in ORDER_WRITES for p in posts), posts

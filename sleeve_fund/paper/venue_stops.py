@@ -55,13 +55,22 @@ class VenueStops:
         return self._post("order/cancel", {"category": "linear", "symbol": self.symbol, "orderLinkId": order_id})
 
     def lookup(self, order_id: str) -> dict | None:
-        """The venue's row for the order (for exec_client.stop_drift), or None when it reports none. Raises
-        ConnectionError when there is no answer: a failed lookup is not evidence of anything (OWN-STOP-SPEC Q2)."""
-        self.limiter.take("order/realtime", opening=False)
+        """The venue's open-orders row for the order (for exec_client.stop_drift), or None when it reports none. Raises
+        ConnectionError when there is no usable answer (none, or a refused query): a failed lookup is not evidence of
+        anything (OWN-STOP-SPEC Q2)."""
+        return self._find("order/realtime", order_id)
+
+    def history(self, order_id: str) -> dict | None:
+        """The venue's order-history row for the order (a filled, cancelled or refused order may show only here), or
+        None when it reports none; ConnectionError as lookup (exec_client.resend_check reads both)."""
+        return self._find("order/history", order_id)
+
+    def _find(self, endpoint: str, order_id: str) -> dict | None:
+        self.limiter.take(endpoint, opening=False)
         query = urlencode({"category": "linear", "symbol": self.symbol, "orderLinkId": order_id})
-        answer = self._send("GET", f"/v5/order/realtime?{query}", query, None)
-        if answer is None:
-            raise ConnectionError(f"no answer looking up {order_id}")
+        answer = self._send("GET", f"/v5/{endpoint}?{query}", query, None)
+        if answer is None or answer.get("retCode") != 0:
+            raise ConnectionError(f"no answer looking up {order_id} ({endpoint})")
         rows = (answer.get("result") or {}).get("list") or []
         return next((r for r in rows if r.get("orderLinkId") == order_id), None)
 

@@ -3908,7 +3908,7 @@ class LongFlatStrategy(Strategy):
 
     def _cancel_all_but_exits(self) -> None:
         """A reconcile halt: every open order but the resting stop-loss and target is cancelled, by its client id (the
-        framework's cancel takes the id: an order passed in raised and left the entry resting, 274ecd88)."""
+        framework's cancel takes the id: an order passed in raised and left the entry resting, B-40)."""
         for order in self.cache.orders_open(strategy_id=self.strategy_id):
             if self.decisions.get(str(order.client_order_id), {}).get("intent") not in EXIT_LEGS:
                 self.cancel_order(order.client_order_id)

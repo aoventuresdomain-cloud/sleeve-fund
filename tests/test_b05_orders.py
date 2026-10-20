@@ -79,7 +79,8 @@ def test_a_late_fill_is_closed_once_under_the_id_scheme_in_force(tmp_path, on):
     _late_fill(store)
     [cid] = orphan_guard.close_orphans(store, _NOW, on=on)
     assert cid.startswith(exec_client.CLOSE_ID_PREFIX if on else orphan_guard.CLOSE_PREFIX)
-    assert exec_client.link_id_ok(cid) is on or not on
+    if on:
+        assert exec_client.link_id_ok(cid)
     assert orphan_guard.close_orphans(store, _NOW, on=on) == []  # journaled once: the next pass finds it sent
     [x] = orphan_guard.late_fills(store, "s1")
     assert [o["order_id"] for o in x["closes"]] == [cid]
@@ -263,3 +264,6 @@ def test_the_client_writes_nothing_to_the_account_when_it_connects(one_order):
     assert "/v5/account/set-margin-mode" not in paths
     first_write = next(i for i, (m, p, _) in enumerate(venue.seen) if m == "POST")
     assert venue.seen[first_write][1].startswith("/v5/order/create")
+    # Advisor B05-NO-ACCOUNT-WRITES: across the node's connect, start, order and fill, no settings write at all
+    posts = [p.split("?")[0] for m, p, _ in venue.seen if m == "POST"]
+    assert all(p in ("/v5/order/create", "/v5/order/cancel", "/v5/order/amend") for p in posts), posts

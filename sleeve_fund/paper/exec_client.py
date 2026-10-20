@@ -13,6 +13,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 
 from sleeve_fund import exec_target
 
@@ -41,6 +42,7 @@ LIMITS = {
     "order/amend": (10, 1.0, _RATE_DOC),
     "order/cancel": (10, 1.0, _RATE_DOC),
     "order/realtime": (50, 1.0, _RATE_DOC),
+    "order/history": (50, 1.0, _RATE_DOC),
     "position/list": (50, 1.0, _RATE_DOC),
 }
 SOURCES = {"rate limits": _RATE_DOC, "orderLinkId": LINK_ID_SOURCE}
@@ -222,17 +224,25 @@ def recorded(engine, action: str) -> bool:
                                                         decisions_t.c.actor == "pm").limit(1)).first() is not None
 
 
+# Drill-prep MUST 9 (HoE ruling, 20 Oct): the exchange's venue profile, as data only. It is not registered
+# (venues.register), so no form, study or history store offers it. A second venue's data hub is B-25 ground, which
+# waits the PM's word: until one exists ON stays refused at the node (assert_off), naming why.
+NO_HUB = "no data hub for this venue"
+EXCHANGE_PROFILE = {"name": "BYBIT", "category": "linear", "perpetual": True, "position_mode": "one-way",
+                    "margin_mode": "isolated", "funding_hours": (0, 8, 16), "link_id_max": 36, "hub": False}
+
+
 def assert_off(environ) -> None:
     """A paper node runs on the simulated client only, until the client's drills (spec section 8): ON is refused at the
-    node, whatever the start check or the drills-passed record says, because the Strategy's instrument and market data
-    on the exchange aren't built yet. OFF changes nothing."""
+    node, whatever the start check or the drills-passed record says, because the Strategy's market data on the
+    exchange has no hub yet (MUST 9). OFF changes nothing."""
     from sleeve_fund.paper.safety import PaperSafetyError
 
     s = exec_settings(environ)
     if s.on:
-        raise PaperSafetyError(f"{MODE_ENV}={s.mode}: the exchange order client can't run a paper node yet (its "
-                               "market data on the exchange is on the drill list); unset it to run on the simulated "
-                               "client")
+        why = NO_HUB if not EXCHANGE_PROFILE["hub"] else "the drills haven't passed"
+        raise PaperSafetyError(f"{MODE_ENV}={s.mode}: the exchange order client can't run a paper node yet: {why} "
+                               "(drill-prep MUST 9); unset it to run on the simulated client")
 
 
 # Order ids ON (drill-prep MUST 6, EXEC-SPEC MUST 5 finding; B-05). Paper's ids (O-date-time-<trader>-<strategy>-n)
@@ -257,14 +267,45 @@ def close_id(entry_id: str, n: int = 0) -> str:
     return CLOSE_ID_PREFIX + hashlib.sha1(f"{entry_id}#{n}".encode()).hexdigest()[:32]
 
 
-def may_resend(row: dict | None) -> bool:
+NOT_FOUND = "not found"  # the venue answered and has no such order (an unanswered lookup is None, never this)
+# How long a just-created order may take to show in the venue's lookups. Unconfirmed (the docs host is unreachable
+# from build boxes): on MUST 17's confirm list, with whether a filled order shows in open orders or only in history.
+VISIBILITY_WINDOW = timedelta(seconds=10)
+
+
+def may_resend(row) -> bool:
     """MUST 2 (spec section 5): after a create whose answer never came, the order is looked up by its own id before
-    anything is sent again. Only the venue's word that it has no such order, or that it refused it with nothing
-    filled, lets a new one go; a working, filled or part-filled order, or no answer at all (the lookup raised and
-    there is no row to pass), never does."""
-    if row is None:
+    anything is sent again. Only the venue's word that it has no such order (NOT_FOUND, in open orders AND history,
+    past the visibility window: resend_check), or that it refused it with nothing filled, lets a new one go; a
+    working, filled or part-filled order, or no answer at all (None), never does."""
+    if row == NOT_FOUND:
         return True
-    return row.get("orderStatus") == "Rejected" and str(row.get("cumExecQty") or "0") in ("0", "0.0", "")
+    if not isinstance(row, dict):
+        return False  # None: no answer is not evidence of anything
+    try:
+        filled = Decimal(str(row.get("cumExecQty") or 0))
+    except (ArithmeticError, ValueError):
+        return False
+    return row.get("orderStatus") == "Rejected" and filled == 0
+
+
+def resend_check(stops, oid: str, *, sent_at: datetime, now: datetime) -> str:
+    """Whether an order whose create went unanswered may be sent again (QD M1-M3 review, HoE MUST): "wait" inside
+    the venue's visibility window; "no answer" when either lookup went unanswered; "keep" when the venue has it
+    (working, filled or part-filled, in open orders or in history); "resend" only when neither lookup finds it, or
+    the venue refused it with nothing filled. stops: venue_stops.VenueStops (lookup = open orders, history)."""
+    if now - sent_at < VISIBILITY_WINDOW:
+        return "wait"
+    rows = []
+    for read in (stops.lookup, stops.history):
+        try:
+            rows.append(read(oid))
+        except ConnectionError:
+            return "no answer"
+    found = [r for r in rows if r is not None]
+    if not found:
+        return "resend" if may_resend(NOT_FOUND) else "keep"
+    return "resend" if all(may_resend(r) for r in found) else "keep"
 
 
 # The connect check (B-05 M4; drill-prep MUST 3, 8, 9 clock, 10, 12, 13). Run by the owner when the client connects,
@@ -273,6 +314,7 @@ def may_resend(row: dict | None) -> bool:
 # a wrong margin mode, position mode or leverage is named, never fixed (MUST 3: never auto-fix open).
 CONNECT_FAIL, CONNECT_PASS = "exec_connect_fail", "exec_connect_pass"
 MAX_SKEW_MS = 1000  # the venue's clock against ours; the signed recv window is 5 s (venue_stops.RECV_WINDOW)
+SET_IT = "Set it on the account; the fund never changes an account or instrument setting"  # Advisor B05-NO-ACCOUNT-WRITES
 AUTH_CODES = frozenset({10003, 10004, 10005, 10007, 33004})  # invalid key, sign, permission denied, auth, key expired
 
 
@@ -300,23 +342,23 @@ def connect_check(s: ExecSettings, *, drill_go: bool, key: dict | None, account:
         out.append(("FAIL", "the key's permissions couldn't be read from the venue: a trade-only key can't be shown"))
     mode = ((account or {}).get("result") or {}).get("marginMode")
     if mode != "ISOLATED_MARGIN":
-        out.append(("FAIL", (f"the account's margin mode is {mode or 'unreadable'}, not isolated: set it on the "
-                             "account (the fund never changes it)")))
+        out.append(("FAIL", (f"the account's margin mode is {mode or 'unreadable'}, not isolated: it must be Isolated. "
+                             f"{SET_IT}")))
     for symbol, row in sorted(positions.items()):
         if row is None:
             out.append(("FAIL", f"{symbol}: its position settings couldn't be read"))
             continue
         if int(row.get("positionIdx", 0)) != 0:
-            out.append(("FAIL", f"{symbol}: hedge mode; the fund trades one-way positions only"))
+            out.append(("FAIL", f"{symbol}: the position mode is hedge, not one-way: it must be One-way. {SET_IT}"))
         cap = caps.get(symbol)
         try:
             lev = float(row.get("leverage"))
         except (TypeError, ValueError):
             lev = None
         if cap is None or lev is None or abs(lev - cap) > 1e-9:
-            out.append(("FAIL", (f"{symbol}: the venue's leverage is {row.get('leverage') or 'unreadable'}, the "
-                                 f"engine's cap {cap if cap is not None else 'unknown'}: set it to match (never "
-                                 "changed with a position open)")))
+            need = f"{cap:g}x, the Strategy's cap" if cap is not None else "the Strategy's cap, which is unknown"
+            out.append(("FAIL", (f"{symbol}: the leverage is {row.get('leverage') or 'unreadable'}: it must be {need}. "
+                                 f"{SET_IT}, and never with a position open")))
     if server_ms is None:
         out.append(("FAIL", "the venue's clock couldn't be read"))
     elif abs(server_ms - local_ms) > MAX_SKEW_MS:
