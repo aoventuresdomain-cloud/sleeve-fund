@@ -53,7 +53,7 @@ from sleeve_fund.research import run as study_run
 from sleeve_fund.research.ledger import IdeaLedger, opened_words
 from sleeve_fund.research.holdout import HoldoutLocks
 from sleeve_fund.research.trials import TrialsRegister
-from sleeve_fund.risk import OWN_LEVERAGE, PROFILES, leverage_cap
+from sleeve_fund.risk import OWN_LEVERAGE, PROFILES, leverage_cap, own_leverage
 from sleeve_fund.store import (
     BACKTEST_PREFIX,
     HALT_FLATTEN,
@@ -2901,7 +2901,8 @@ def _order_rules(s, x: dict) -> dict:
     rpt = s.params.get("risk_per_trade")
     stop = bool(s.params.get("stop_loss") or s.params.get("stop_atr"))
     lev = leverage_cap(x["profile"], s.params) if markets.is_perp(s.params) and stop else 1.0
-    return {"risk_pct": float(rpt) * 100 if rpt else None, "leverage": lev, "stop": stop}
+    return {"risk_pct": float(rpt) * 100 if rpt else None, "leverage": lev, "stop": stop,
+            "own_leverage": own_leverage(s.params)}  # B-35 (a): its own cap, under the profile's
 
 
 def _risk_to_stop(x: dict, position: dict | None, store, sleeve) -> float | None:

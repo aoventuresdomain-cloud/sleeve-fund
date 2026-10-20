@@ -43,3 +43,20 @@ def test_the_form_writes_the_number_1_and_refuses_below_1x():
     with pytest.raises(ValueError, match="minimum 1x"):
         risk.check_own_leverage(_form_params({"market": "perp", "p_buy_and_hold__max_leverage": "0.5"},
                                              "buy_and_hold")[risk.OWN_LEVERAGE])
+
+
+def test_the_strategy_page_says_its_own_cap_holds_it_at_1x(held_site, browser):  # noqa: F811
+    """CR2's FOLLOW-UP via QD3: the Settings row read the profile's "up to 2x leverage" for a Strategy its own cap
+    holds at 1x. It says both."""
+    import re
+
+    base, _ = held_site
+    page, errors = _open(browser, f"{base}/sleeves/new?{WHERE['perp']}")
+    _choose(page, "buy_and_hold", "perp")
+    name = page.input_value("input[name=name]")
+    _submit(page)
+    page.goto(f"{base}/sleeves/{name}")
+    row = page.locator("tr", has=page.locator("th", has_text=re.compile(r"^Risk profile$"))).first
+    assert "up to 2x leverage, capped at 1x (no stop when saved)" in row.inner_text(), row.inner_text()
+    assert errors == []
+    page.context.close()
