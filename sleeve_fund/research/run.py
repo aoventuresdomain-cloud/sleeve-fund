@@ -11,6 +11,7 @@ import importlib
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 
 import pandas as pd
@@ -187,7 +188,26 @@ def run_store_study(req: StudyRequest, store=None, progress=None, ledger_path: P
         n += 1
         out = out.with_name(f"{stem}-{n}.md")
     out.write_text(render(result, ledger, register), encoding="utf-8")
+    write_results(result, out)
     return out
+
+
+def results_path(sheet: Path) -> Path:
+    """B-22: the stored figures beside a tear sheet, for the page to read as fields rather than words."""
+    return sheet.with_suffix(".results.json")
+
+
+def write_results(result, sheet: Path) -> Path:
+    """B-22 (Advisor B22-DOUBLE-FEES): the study's stored results beside its tear sheet (results_path), as JSON:
+    {"double_fees": its fields (study._double_fees) or null}. Fees as decimal strings, times as ISO 8601."""
+    import json
+
+    d = result.double_fees
+    fields = None if d is None else {k: (str(v) if isinstance(v, Decimal) else v.isoformat() if isinstance(v, pd.Timestamp)
+                                         else v) for k, v in d.items()}
+    path = results_path(sheet)
+    path.write_text(json.dumps({"double_fees": fields}, indent=1, sort_keys=True), encoding="utf-8")
+    return path
 
 
 def seed(ledger: Path | None = None, tearsheets: Path | None = None) -> None:

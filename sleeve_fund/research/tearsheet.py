@@ -136,6 +136,19 @@ def _trial_spread(r: StudyResult, register) -> float | None:
     return float(np.std(sharpes, ddof=1)) if len(sharpes) > 1 else None
 
 
+def _double_fees_line(r: StudyResult) -> str:
+    """B-22 (Advisor B22-DOUBLE-FEES), in the line the page reads (development.double_fees): the out-of-sample
+    windows re-run at twice the venue's fees, passed when still above 0 net."""
+    from sleeve_fund.instruments import pct
+
+    d = getattr(r, "double_fees", None)
+    if d is None:
+        return "**Profitable at double fees:** not tested: no out-of-sample window chose settings to re-run"
+    return (f"**Profitable at double fees:** {'PASS' if d['passed'] else 'FAIL'}, net {d['net_return']:+.1%} over the "
+            f"out-of-sample period at 2x the venue's fees ({pct(d['maker'])} maker, {pct(d['taker'])} taker; "
+            f"{d['oos_days']} days, {d['round_trips']} round trips; at the venue's fees {d['base_net_return']:+.1%})")
+
+
 def _breakeven_words(r: StudyResult) -> str:
     from sleeve_fund.research.study import breakeven_fee
 
@@ -630,6 +643,8 @@ def render(r: StudyResult, ledger: IdeaLedger, register=None, liquidation_ack: s
     out.append(f"- Time in the market: {r.full_period.exposure.gt(0.001).mean():.0%} of bars hold a position")
     out.append(f"- Stops clamped: {_n(getattr(r.full_period, 'stops_clamped', 0), 'trade')}, held at half the way to "
                "the liquidation price when the level loosened past it or funding moved it nearer")
+    out.append("")
+    out.append(_double_fees_line(r))
     out.append("")
     if r.cost_ladder:
         chosen = getattr(r, "chosen_params", None) or r.default_params
