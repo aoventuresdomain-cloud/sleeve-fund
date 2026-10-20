@@ -5,6 +5,7 @@ the live row needs the PM's word); one that is meant to run and errored still re
 
 import re
 
+import pytest
 from test_fe_a20_fund_book_value import AUTH, _hold, _make, _text, c  # noqa: F401
 from test_halt_ref import store  # noqa: F401
 
@@ -70,6 +71,16 @@ def test_stopped_after_an_error_with_a_working_order_stays_error(c, store):  # n
     store.record_order(NAME, order_id="work-1", side="BUY", qty=0.1, intent="entry", reason="dipped")
     assert not store.holds_any(NAME)
     assert "1 strategy halted and waiting for you" in _text(c.get("/", auth=AUTH).text)
+
+
+@pytest.mark.parametrize("held", ["halted", "paused"])
+def test_a_halted_or_paused_strategy_stopped_and_flat_keeps_its_status(c, store, held):  # noqa: F811
+    """CR2 on 06835b12: only an error reads as stopped; a halt or pause the PM stopped still shows, flat or not."""
+    _errored(store)
+    store.set_status(NAME, held, "drawdown limit")
+    page = c.get(f"/sleeves/{NAME}", auth=AUTH).text
+    head = re.search(r"<h1>.*?</div>", page, re.DOTALL).group(0)
+    assert f'class="chip {held}">' in head and "chip stopped" not in head, head
 
 
 def test_the_shown_status_is_display_only():
