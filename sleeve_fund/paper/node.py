@@ -54,7 +54,17 @@ def strategy_id(cls_name: str, name: str) -> StrategyId:
     trader id), so that part is a hash of the full name: two strategies whose names end alike (ping-pong-test and
     rsi-bands-test) got the same order ids, and the second to send one in a second lost its journal row."""
     digest = hashlib.sha1(name.encode()).hexdigest()[:8].upper()
-    return StrategyId.from_str(f"{cls_name}-{_tag(name)[:20]}-{digest}")
+    return StrategyId.from_str(f"{cls_name}-{router.cut_tag(_tag(name))}-{digest}")
+
+
+def trader_id(tag: str) -> str:
+    """The paper node's trader id for a Strategy's node tag (B-29: through router.cut_tag, never a raw cut)."""
+    return f"PAPER-{router.cut_tag(tag)}"
+
+
+def account_id(venue: str, name: str) -> str:
+    """A leg's paper account on a venue other than the node's own (a clone), as router.route builds the own one."""
+    return f"{venue}-PAPER-{router.cut_tag(_tag(name))}"
 
 
 # Warm-up bars from a store that stopped updating would leave a hole before the first live bar.
@@ -218,7 +228,7 @@ def build_node(sleeve: SleeveConfig, log_level: str = "INFO", runtime: SleeveRun
     exec_factory = SandboxExecutionClientFactory()
     _in_process(exec_factory, (runtime,))
     node = (
-        LiveNode.builder(f"PAPER-{tag}", TraderId.from_str(f"PAPER-{tag[:20]}"), Environment.SANDBOX)
+        LiveNode.builder(f"PAPER-{tag}", TraderId.from_str(trader_id(tag)), Environment.SANDBOX)
         .with_logging(LoggerConfig(stdout_level=getattr(LogLevel, log_level)))
         .with_reconciliation(reconciliation=False)
         # The hub may take a minute to pick up an instrument it doesn't relay yet.
@@ -300,10 +310,10 @@ def build_two_leg_node(lead: SleeveConfig, follow: SleeveConfig, log_level: str 
         fee_model = ScheduleFeeModel(sleeve.fees)  # the real venue's schedule for the leg's own market
         perp = markets.is_perp(sleeve.params)
         balances = _balances(sleeve, runtime, base_code, quote_code)
-        account = route.account_id if venue == profile.venue else f"{name}-PAPER-{_tag(sleeve.name)[:20]}"
+        account = route.account_id if venue == profile.venue else account_id(name, sleeve.name)
         accounts.append((name, fee_model, _sandbox(venue, balances, account, perp, fee_model, hub)))
     builder = (
-        LiveNode.builder(f"PAPER-{tag}", TraderId.from_str(f"PAPER-{tag[:20]}"), Environment.SANDBOX)
+        LiveNode.builder(f"PAPER-{tag}", TraderId.from_str(trader_id(tag)), Environment.SANDBOX)
         .with_logging(LoggerConfig(stdout_level=getattr(LogLevel, log_level)))
         .with_reconciliation(reconciliation=False)
         .with_timeout_connection(120)
@@ -379,10 +389,10 @@ def build_legs_node(legs: list[SleeveConfig], log_level: str = "INFO",
         fee_model = ScheduleFeeModel(sleeve.fees)
         perp = markets.is_perp(sleeve.params)
         balances = _balances(sleeve, runtime, base_code, quote_code)
-        account = route.account_id if venue == profile.venue else f"{venue}-PAPER-{_tag(sleeve.name)[:20]}"
+        account = route.account_id if venue == profile.venue else account_id(venue, sleeve.name)
         accounts.append((str(venue), fee_model, _sandbox(venue, balances, account, perp, fee_model, hub)))
     builder = (
-        LiveNode.builder(f"PAPER-{tag}", TraderId.from_str(f"PAPER-{tag[:20]}"), Environment.SANDBOX)
+        LiveNode.builder(f"PAPER-{tag}", TraderId.from_str(trader_id(tag)), Environment.SANDBOX)
         .with_logging(LoggerConfig(stdout_level=getattr(LogLevel, log_level)))
         .with_reconciliation(reconciliation=False)
         .with_timeout_connection(120)

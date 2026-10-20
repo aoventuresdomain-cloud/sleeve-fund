@@ -51,7 +51,14 @@ def route(strategy: str, venue: str, profiles: Mapping[str, object], *, tag: str
         raise RouteError(f"{strategy} is pinned to a venue with no registered profile.")
     if not tag:
         raise ValueError("a route needs the strategy's node tag")
-    return Route(strategy=strategy, venue=name, account_id=f"{name}-PAPER-{tag[:20]}")
+    return Route(strategy=strategy, venue=name, account_id=f"{name}-PAPER-{cut_tag(tag)}")
+
+
+def cut_tag(tag: str) -> str:
+    """A node tag cut to the 20 characters ids keep, with no "-" left at the end (B-29): the engine refuses an id
+    whose last part is empty, so "PAPER-CANDLE-STEP-BTCUSDT-" crashed the node of the form's own suggested name. A
+    cut that didn't end in "-" is unchanged, so every name that started before keeps its ids."""
+    return tag[:20].rstrip("-")
 
 
 def venue_for(pinned: str | None) -> str:
