@@ -41,7 +41,7 @@
 <section class="panel" aria-labelledby="safe-h">
   <div class="panel-head"><h2 id="safe-h">Safety nets</h2></div>
   <table class="compact kv">
-    <tr><th scope="row">Risk guard</th><td>On for every strategy: halts at the drawdown limit, pauses at the daily-loss limit.</td></tr>
+    <tr><th scope="row">Risk guard</th><td>{% if book is defined and book.fund_cash %}On for the whole fund: its brakes stop new entries for the day after its daily loss limit and flatten and halt the book once its drawdown reaches its limit (Portfolio settings).{% else %}On for every strategy: halts at the drawdown limit, pauses at the daily-loss limit.{% endif %}</td></tr>
     <tr><th scope="row">Balance reconciliation</th><td>On: at every start and every 24 hours; a mismatch halts the strategy.</td></tr>
     <tr><th scope="row">Price watchdog</th><td>On: a strategy with no trade or quote for 5 minutes warns; after 15 it restarts to reconnect.</td></tr>
     <tr><th scope="row">Outside alerts</th><td>{% if ops.alerts and 'not set up' not in ops.alerts.message %}{{ ops.alerts.message }}{% elif ops.alerts %}<span class="warn">{{ ops.alerts.message }}</span>{% else %}<span class="warn">Not reported yet: the supervisor says at start.</span>{% endif %}</td></tr>

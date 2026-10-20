@@ -33,7 +33,7 @@ from sleeve_fund.dashboard import book as bookm
 from sleeve_fund.dashboard import development as dev
 from sleeve_fund.dashboard import assets, attribution, compliance, gates, legs, reasons, reports, riskops, trading, withdrawal
 from sleeve_fund.dashboard.jobs import Jobs
-from sleeve_fund.dashboard.metrics import STALE, sleeve_summary
+from sleeve_fund.dashboard.metrics import STALE, held_by_fund, sleeve_summary
 from sleeve_fund.data import spec_minutes
 from sleeve_fund.fees import resolve as resolve_fees
 from sleeve_fund.history import REQUEST_YEARS
@@ -66,7 +66,14 @@ from sleeve_fund.store import (
 )
 from sleeve_fund.paper.runtime import (EXITS_ONLY, RESUMABLE, clearing_action, entry_blocked, liquidation_event,
                                       pair_ral_figures)
-from sleeve_fund.strategies import REGISTRY, check_perp_sizing, check_perp_stop
+from sleeve_fund.strategies import (
+    PERP_WEIGHT_REFUSAL,
+    REGISTRY,
+    STOPLESS_MAX_LEVERAGE,
+    check_perp_sizing,
+    check_perp_stop,
+    places_stop,
+)
 from sleeve_fund.strategies.base import exit_warmup, maker_orders_enabled
 from sleeve_fund.wording import no_venues
 
@@ -75,7 +82,7 @@ ROOT = HERE.parent.parent
 TEARSHEETS = study_run.TEARSHEETS
 LEDGER = study_run.LEDGER
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,40}$")
-FUND_BANNER_PAGES = {"home.html", "sleeve.html", "portfolio_settings.html"}  # C7: Portfolio, a Strategy, Portfolio Settings
+FUND_BANNER_PAGES = {"home.html", "sleeve.html", "portfolio_settings.html", "risk.html", "trades.html"}  # C7: every fund page listing positions or limits
 VERSION = os.environ.get("APP_VERSION", "dev")[:12]
 ORDER_HISTORY_ROWS = 15  # the strategy page's Order history; the Blotter has the rest
 
@@ -351,8 +358,9 @@ def create_app(store: Store | None = None) -> FastAPI:
         prior = daily["equity"][daily.index < cutoff] if len(daily) else daily
         # The peak before the window counts the starting capital too, as the whole history does (M12-F1): from
         # the daily closes alone a wiped-out strategy's was 0, and 0/0 made the range a 500 (mF2-1, mF2-2).
-        start = sum(s.starting_balance for s in sleeves)
-        curve = bookm.recent_curve(st(), sleeves, days, max(float(prior.max()) if len(prior) else 0.0, start))
+        base = bookm.fund_cash(st())  # A-20: the fund's own cash, once it holds it
+        start = sum(s.starting_balance for s in sleeves) + base
+        curve = bookm.recent_curve(st(), sleeves, days, max(float(prior.max()) if len(prior) else 0.0, start), base)
         return JSONResponse({
             "res": "intraday",
             "t": [t.isoformat() for t in curve.index],
@@ -364,11 +372,12 @@ def create_app(store: Store | None = None) -> FastAPI:
     @app.get("/api/book/equity")
     def book_equity_json(days: int | None = None, _: str = Depends(require_pm)):
         sleeves, frames, summaries, _tests = shown_book()
-        curve = bookm.book_curve(summaries, frames)  # every strategy, as the book figures count it
+        base = bookm.fund_cash(st())
+        curve = bookm.book_curve(summaries, frames, base)  # every strategy, as the book figures count it
         if days:
             return _recent_json(sleeves, days, curve)
         return JSONResponse({
-            "start": sum(x["sleeve"].starting_balance for x in summaries),  # the chart's baseline for Change
+            "start": sum(x["sleeve"].starting_balance for x in summaries) + base,  # the chart's baseline for Change
             "t": [t.isoformat() for t in curve.index],
             "equity": [round(v, 2) for v in curve["equity"]],
             "benchmark": [round(v, 2) for v in curve["benchmark"]],
@@ -389,7 +398,11 @@ def create_app(store: Store | None = None) -> FastAPI:
         # The drawdown chart's halt line only when the whole book shares one risk profile's limit.
         profiles = {x["profile"].name: x["profile"].max_drawdown for x in summaries}
         halt = next(iter(profiles.items())) if len(profiles) == 1 else None
-        chart = riskops.drawdown_chart(bookm.book_curve(summaries, frames), halt=halt[1] if halt else None)
+        if book["fund_cash"]:  # B-20: inside the fund only the fund's brake halts the book (T5b), never a profile's
+            limit = riskops.fund_halt_limit(st())
+            halt = ("fund", limit) if limit else None
+        chart = riskops.drawdown_chart(bookm.book_curve(summaries, frames, bookm.fund_cash(st())),
+                                       halt=halt[1] if halt else None)
         return page(request, "risk.html", book=book, risk=risk, health=health, chart=chart, size=riskops.gate_size(st(), book),
                     halt_name=halt[0] if halt else None, stress=riskops.stress_bars(risk["scenarios"]),
                     status=riskops.status_word(riskops.status_items(risk["rows"], health), running),
@@ -455,9 +468,35 @@ def create_app(store: Store | None = None) -> FastAPI:
         return RedirectResponse("/risk#system", status_code=303)
 
     @app.get("/alerts", response_class=HTMLResponse)
-    def alerts_page(request: Request, _: str = Depends(require_pm), show: str = "open"):
+    def alerts_page(request: Request, _: str = Depends(require_pm), show: str = "open", cleared: int = 0):
         rows = st().alerts(limit=300, include_acked=(show == "all"))
-        return page(request, "alerts.html", alerts=rows, show=show)
+        return page(request, "alerts.html", alerts=rows, show=show, cleared=max(cleared, 0),
+                    open_count=st().open_alert_count())
+
+    @app.get("/alerts/ack-all", response_class=HTMLResponse)
+    def ack_all_confirm(request: Request, _: str = Depends(require_pm)):
+        """B-17's confirm step: how many open alerts Acknowledge all clears. Their ids are fixed here, so an alert
+        raised after this page was shown stays open."""
+        rows = st().alerts(limit=100_000, include_acked=False)
+        return page(request, "alerts_ack_all.html", alerts=rows)
+
+    @app.post("/alerts/ack-all")
+    async def ack_all(request: Request, actor: str = Depends(require_pm), _o: None = Depends(same_origin)):
+        """Acknowledges the alerts the confirm step listed, each through the existing ack (Store.ack, which keeps the
+        row and is a no-op on one already acknowledged), noted as cleared with Acknowledge all."""
+        form = await request.form()
+        try:
+            ids = [int(i) for i in form.getlist("ids")]
+        except ValueError:
+            raise HTTPException(400, "not an alert id") from None
+        done = 0
+        for event_id in ids:
+            try:
+                st().ack(event_id, actor, ACK_ALL_NOTE)
+                done += 1
+            except KeyError:
+                continue  # not an alert (an info event, a backtest's): nothing to clear
+        return RedirectResponse(f"/alerts?cleared={done}", status_code=303)
 
     @app.post("/alerts/{event_id}/ack")
     def ack_alert(event_id: int, note: str = Form(""), next: str = Form("/alerts"),
@@ -813,9 +852,11 @@ def create_app(store: Store | None = None) -> FastAPI:
             frame = bookm.daily(st(), name)
             t, eq, bench = list(frame.index), list(frame["equity"]), list(frame["benchmark"])
         peak, dd = s.starting_balance, []  # from the starting balance too, as the book's (M12-F1)
+        # Inside the fund its marks are its P&L from 0 and its own halt doesn't act: no drawdown of its own (B-20)
+        in_fund = held_by_fund(st(), s)
         for v in eq:
             peak = max(peak, v)
-            dd.append(round(1 - v / peak, 5) if peak > 0 else 0.0)
+            dd.append(0.0 if in_fund else round(1 - v / peak, 5) if peak > 0 else 0.0)
         fills = [{"t": f["ts"].isoformat(), "side": f["side"], "qty": f["qty"], "price": f["price"]}
                  for f in st().fills(name, limit=2000)]
         return JSONResponse({
@@ -825,7 +866,8 @@ def create_app(store: Store | None = None) -> FastAPI:
             "equity": [round(v, 2) for v in eq],
             "benchmark": [round(v, 2) for v in bench],
             "drawdown": dd,
-            "worst": round(st().max_drawdown(name, s.starting_balance), 5),  # over every mark: the curve above is thinned or daily
+            "worst": 0.0 if in_fund else round(st().max_drawdown(name, s.starting_balance), 5),  # over every mark: the curve above is thinned or daily
+            "in_fund": in_fund,
             "fills": fills,
         })
 
@@ -1104,13 +1146,16 @@ def create_app(store: Store | None = None) -> FastAPI:
 
     @app.post("/sleeves/{name}/lifecycle")
     def sleeve_lifecycle(name: str, action: str = Form(...), reason: str = Form(""),
+                         reason_pick: str | None = Form(None), reason_note: str = Form(""),
                          actor: str = Depends(require_pm), _o: None = Depends(same_origin)):
         """P2-6: the PM's lifecycle move (wind_down, retire, close_now), and the one caller of Store.set_lifecycle.
-        The buttons come with the phase 2 UI; the rules are sleeve_fund.lifecycle's."""
+        The Strategy page's Wind down and Close now dialogs post here with a picked reason (B-21); the rules are
+        sleeve_fund.lifecycle's."""
         why = two_leg_refusal(st(), name, "lifecycle")
         if why is not None and (action != "close_now" or st().sleeve(name).parent is not None):
             return RedirectResponse(f"/sleeves/{name}?{urlencode({'command_error': why})}", status_code=303)
         try:
+            reason = _reason(action, reason, reason_pick, reason_note)
             if not reason.strip():
                 raise ValueError("a reason is required")
             st().set_lifecycle(name, action, lifecycle.PM if actor == "PM" else actor, reason)
@@ -1370,8 +1415,14 @@ def create_app(store: Store | None = None) -> FastAPI:
             summaries = [x for x in summaries if x["sleeve"].name == chosen]
         w = reports.window(q.get("period", ""), q.get("month", ""), now)
         fills = {x["sleeve"].name: st().fills(x["sleeve"].name, limit=100_000) for x in summaries}
-        perf = reports.performance(summaries, frames, [f for fs in fills.values() for f in fs], w["start"], w["end"])
-        m = reports.monthly(summaries, frames, fills)
+        # A-20: the whole book counts the fund's own cash. B-20: so does one Strategy inside the fund, whose marks are
+        # its P&L from 0: its figures then read as its contribution over the fund's capital; one outside the fund (a
+        # test account) keeps its own capital.
+        held = chosen and summaries and held_by_fund(st(), summaries[0]["sleeve"])
+        base = bookm.fund_cash(st()) if (not chosen or held) else 0.0
+        perf = reports.performance(summaries, frames, [f for fs in fills.values() for f in fs], w["start"], w["end"],
+                                   base)
+        m = reports.monthly(summaries, frames, fills, base)
         months = [r for r in m["rows"] if reports.in_window(r["key"], w)]
         keys = {r["month"] for r in months}
         m = {**m, "rows": months, "months": [mo for mo in m.get("months", []) if mo in keys]}
@@ -1401,6 +1452,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         exports.insert(4, ("Decision log", "/decisions.csv" + ("?" + urlencode(dec_dl) if dec_dl else ""),
                            "decisions.csv", "Every decision, with who made it and why."))
         return page(request, "records.html", perf=perf, m=m, w=w, chosen=chosen, sleeves=names,
+                    contribution=bool(chosen and base),
                     periods=reports.PERIODS, log=log, latest=decisions[:5], total=len(decisions),
                     kind_filters=reports.KIND_FILTERS, kind_counts=kinds, kinds=reports.DECISION_KINDS,
                     qs=qs, exports=exports, action=dq["action"], shell=shell())
@@ -1585,7 +1637,8 @@ def create_app(store: Store | None = None) -> FastAPI:
             sleeve = None
         h = trading.history(st(), summaries, sleeve)
         return page(request, "trades.html", h=h, sleeve=sleeve, sleeves=names, shell=shell(sleeves),
-                    book_equity=sum(x["equity"] for x in summaries), backtest=backtest)
+                    book_equity=(sum(x["equity"] for x in summaries) if backtest
+                                 else bookm.book_equity(st(), summaries)), backtest=backtest)  # B-20: the fund's
 
     @app.get("/orders", response_class=HTMLResponse)
     def orders_page(request: Request, _: str = Depends(require_pm)):
@@ -1711,7 +1764,8 @@ def create_app(store: Store | None = None) -> FastAPI:
             warned.append(f"Assets with no group ({', '.join(no_group)}) will no longer be refused. They still count "
                           "under per asset, whole fund and size limits.")
         return page(request, "portfolio_settings.html", v=v, mode="review", saved="", errors=[], form=form,
-                    changes=lines, warnings=warned, expected=expected,
+                    changes=lines, warnings=warned, expected=expected, offs=compliance.switched_off(cur["tests"], tests),
+                    order_rules=compliance.ORDER_RULES,
                     carry=compliance.to_form(tests, groups))
 
     @app.post("/portfolio-settings/apply")
@@ -1728,6 +1782,11 @@ def create_app(store: Store | None = None) -> FastAPI:
                 cur = compliance.as_set(st().compliance())
                 if not compliance_rules.changes(cur[0], tests, cur[1], groups):  # F-LOCKED-OFF: no no-op version
                     errors.append(f"Nothing changes from version {st().compliance().version}, so nothing was saved")
+                # TEC-B31-TICK: a switch-off applies only with the review step's confirm tick, checked here too
+                offs = compliance.switched_off(cur[0], tests)
+                if offs and form.get("confirm_off") != "on":
+                    names = ", ".join(o.split(" off:")[0] for o in offs)
+                    errors.append(f"Switching off {names} needs the confirm tick on the review step, so nothing was saved")
             if errors:
                 raise ValueError("; ".join(errors))
             version = st().add_compliance_version(compliance.rows(tests), groups, created_by="pm", note=reason,
@@ -1757,6 +1816,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         from sleeve_fund.dashboard import fee_terms
 
         return page(request, "setup.html", profiles=PROFILES, venues=VENUES.values(), fee_quotes=fee_quotes,
+                    fund_held=_fund_held(st()),  # B-20: a profile then sets the leverage cap only
                     fee_terms=fee_terms.view(st(), utcnow()),
                     tearsheets=str(TEARSHEETS), counts=st().table_sizes(), accounts=accounts,
                     error=error, pre=dict(request.query_params), shell=frame,
@@ -2042,8 +2102,38 @@ def venue_choices() -> list[dict]:
     """Every venue a strategy can be researched, backtested or paper traded on, for the forms' venue field."""
     from sleeve_fund.venues import VENUES
 
-    return [{"key": v.name.lower(), "label": v.label, "perpetual": v.perpetual, "pairs": _hints(v.name)}
+    return [{"key": v.name.lower(), "label": v.label, "perpetual": v.perpetual,
+             "pairs": [p for p in _hints(v.name) if offered(v.name, p)], "bars": venue_bars(v.name)}
             for v in VENUES.values() if v.data_client is not None or v.minute_loader is not None]
+
+
+def offered(venue: str, pair: str) -> bool:
+    """Whether the forms offer `pair` on `venue`: on a perpetual venue only where its published margin tiers are kept,
+    since a strategy is refused there without them (markets.maintenance_for, VS-1; B-39, QT3's sweep: ETH/USDT
+    perpetual was offered, then refused). With venue_bars, the one source of what the forms offer."""
+    from sleeve_fund.venues import venue as venue_profile
+
+    profile = venue_profile(venue)
+    if not profile.perpetual:
+        return True
+    try:
+        markets.maintenance_for(profile, pair)
+    except markets.NoMaintenanceTable:
+        return False
+    return True
+
+
+def venue_bars(venue: str) -> list[str]:
+    """The candle lengths a strategy on `venue` can be saved with: the save's own check (check_hub_bar_spec), so the
+    form offers only what the server keeps (B-35, QT3's sweep: a hub-fed venue refused the venue's own candles)."""
+    allowed = []
+    for spec in sorted(ALLOWED_BAR_SPECS, key=spec_minutes):
+        try:
+            check_hub_bar_spec(venue, spec)
+        except ValueError:
+            continue
+        allowed.append(spec)
+    return allowed
 
 
 def _check_listed(store: Store, venue: str | None, pair: str) -> None:
@@ -2085,7 +2175,7 @@ def instrument_options(store: Store, listing=None) -> list[dict]:
             logging.getLogger(__name__).info(f"couldn't list {v['label']}'s instruments: {exc!r}")
             listed = []
         kind = "perpetual" if v["perpetual"] else "spot"
-        pairs = list(dict.fromkeys([*stored, *v["pairs"], *sorted(listed)]))
+        pairs = [p for p in dict.fromkeys([*stored, *v["pairs"], *sorted(listed)]) if offered(v["key"], p)]
         out += [{"value": p, "venue": v["key"], "group": "Perpetuals" if v["perpetual"] else "Spot",
                  "label": f"{p} {kind}", "badge": stored[p]["text"] if p in stored else "not stored yet",
                  "tone": stored[p]["tone"] if p in stored else "", "stored": p in stored} for p in pairs]
@@ -2309,7 +2399,7 @@ def _risk_view(x: dict, position: dict | None = None) -> dict:
         "target_px": position["target_px"] if position else None,
         # The move from here to the stop (round 9, N3): a drop for a long, a rise for a short.
         "to_stop": abs(1 - stop_px / x["price"]) if stop_px and x["price"] else None,
-        "day_used": min(max(-x["day_ret"], 0.0) / p.daily_loss, 1.0) if p.daily_loss else 0.0,
+        "day_used": 0.0 if x.get("in_fund") else min(max(-x["day_ret"], 0.0) / p.daily_loss, 1.0) if p.daily_loss else 0.0,
         "margin": margin,
     }
 
@@ -2459,6 +2549,11 @@ TEST_FIELDS = {
                     ("run_for_hours", "Run for, hours", "Until stopped", "Empty runs it until you stop it.")),
 }
 PERCENT_PARAMS = {"candle_step": {"size_share"}}
+ACK_ALL_NOTE = "cleared with Acknowledge all"  # B-17: each alert Acknowledge all clears keeps this note
+# A model that decides on one candle length only: choosing it on the form picks that chip (B-35), as the model
+# refuses any other (donchian.py: "decides on daily candles").
+MODEL_BAR = {"donchian": "1-DAY-LAST-EXTERNAL"}
+MODEL_BAR_WORDS = {"donchian": "The Donchian ensemble decides on daily candles"}  # the model's own refusal
 
 
 def _strategy_choices(tests: bool = False) -> list[dict]:
@@ -2474,7 +2569,12 @@ def _strategy_choices(tests: bool = False) -> list[dict]:
         out.append({"name": name, "idea": _idea(name), "params": {} if test else spec.default_params,
                     "family": spec.family, "tpl": spec.summary, "defaults": _config_defaults(name),
                     "group": "Test" if test else "Strategies", "prefill": TEST_PREFILL.get(name) if test else None,
-                    "fields": TEST_FIELDS.get(name, ()) if test else ()})
+                    "fields": TEST_FIELDS.get(name, ()) if test else (),
+                    # B-35: one that places no stop is held to this leverage on a perpetual (check_perp_stop)
+                    "stopless_max": None if places_stop(name, None) else STOPLESS_MAX_LEVERAGE,
+                    # and one sized by weight is refused on a perpetual (check_perp_sizing): offered there, greyed
+                    "perp_refused": PERP_WEIGHT_REFUSAL if REGISTRY[name][0].weight_sized(spec.default_params or {})
+                    else None, "bar": MODEL_BAR.get(name), "bar_words": MODEL_BAR_WORDS.get(name)})
     return out
 
 
@@ -2673,6 +2773,11 @@ def _coerce_params(raw: dict) -> dict:
     for k, v in raw.items():
         if not re.fullmatch(r"[a-z_]{1,32}", k):
             raise ValueError(f"bad parameter name {k!r}")
+        # A list of whole numbers (Donchian's lookbacks "20,55,100", B-35) stays the list the model reads; the
+        # model's own config checks its values.
+        if isinstance(v, str) and re.fullmatch(r"\s*\d{1,6}(\s*,\s*\d{1,6})+\s*", v):
+            out[k] = ",".join(part.strip() for part in v.split(","))
+            continue
         try:
             out[k] = int(v)
         except ValueError:

@@ -165,7 +165,9 @@ def digest(store, now: datetime, backup_dir=None, since: datetime | None = None)
         lines.append(f"Fund equity: can't be marked ({type(exc).__name__})")
     lines.append(t5_day(store, now))
     strategies = [s for s in store.sleeves() if not is_backtest(s.name) and not supervisor.outside_fund_book(store, s)]
-    lines.append("Strategies (equity at last mark, cash P&L since the last digest):")
+    # B-20: inside the fund a Strategy's mark is its P&L from 0, not equity of its own
+    held = supervisor.bridge_start(store) is not None
+    lines.append(f"Strategies ({'P&L since start' if held else 'equity'} at last mark, cash P&L since the last digest):")
     for s in strategies:
         last = store.last_equity(s.name)
         eq = _money(last["equity"]) if last else "not marked"

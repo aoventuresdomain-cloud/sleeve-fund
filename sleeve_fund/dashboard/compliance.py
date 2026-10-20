@@ -15,6 +15,25 @@ from sleeve_fund.store import Store
 
 UK = ZoneInfo("Europe/London")
 ACTION_WORDS = {"trim": "Refuse or trim", "refuse": "Refuse", "pause_day": "Pause new trades", "halt": "Flatten and halt"}
+# B-31: what a row switched off stops checking, in the review step, before the PM's confirm tick. The locked rows
+# (T3, T5) can't be switched off yet, so they have no words here.
+OFF_WORDS = {
+    "asset_stop_loss": "new trades are no longer trimmed to a loss per asset if every stop is hit.",
+    "type_stop_loss": "new trades are no longer trimmed to a loss per asset group if every stop is hit, and an asset "
+                      "with no group can take a trade.",
+    "fund_gross": "new trades are no longer trimmed to a gross size for the fund.",
+    "asset_net": "new trades are no longer trimmed to a net size on one asset.",
+    "fund_margin": "new trades are no longer trimmed to the margin the fund may post.",
+}
+# The rules every order keeps whatever the compliance tests (PM capital model, 14 Oct).
+ORDER_RULES = ("The order rules still apply to every trade: a stop, or 1x leverage without one; a stop within half the "
+               "distance to liquidation; and the leverage cap.")
+
+
+def switched_off(old: dict[str, dict], new: dict[str, dict]) -> list[str]:
+    """One line per test the new set switches off, 'T4 Gross off: new trades are no longer ...' (B-31)."""
+    return [f"{rules.name(k)} off: {OFF_WORDS.get(k, 'new trades are no longer checked against it.')}"
+            for k in rules.KEYS if k in new and old.get(k, {}).get("enabled") and not new[k].get("enabled")]
 
 
 def as_set(compliance) -> tuple[dict[str, dict], dict[str, str]]:
