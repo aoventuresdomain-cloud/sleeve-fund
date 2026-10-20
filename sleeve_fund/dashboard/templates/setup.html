@@ -49,8 +49,8 @@
       <span class="go">See the compliance tests</span>
     </a>
     <a class="scard" href="#profiles">
-      <div class="top"><b>Risk profiles</b><span class="chip paper">{{ profiles|length }}</span><span class="sum">{% for p in profiles.values() %}{{ p.max_drawdown|pct0 }}{{ ' / ' if not loop.last }}{% endfor %} ›</span></div>
-      <dl>{% for p in profiles.values() %}<dt>{{ p.name|capitalize }}</dt><dd>halt at {{ p.max_drawdown|pct0 }}</dd>{% endfor %}</dl>
+      <div class="top"><b>Risk profiles</b><span class="chip paper">{{ profiles|length }}</span><span class="sum">{% for p in profiles.values() %}{% if fund_held %}{{ '%g'|format(p.max_leverage) }}x{% else %}{{ p.max_drawdown|pct0 }}{% endif %}{{ ' / ' if not loop.last }}{% endfor %} ›</span></div>
+      <dl>{% for p in profiles.values() %}<dt>{{ p.name|capitalize }}</dt><dd>{% if fund_held %}leverage up to {{ '%g'|format(p.max_leverage) }}x{% else %}halt at {{ p.max_drawdown|pct0 }}{% endif %}</dd>{% endfor %}</dl>
       <span class="go">See profiles</span>
     </a>
     <a class="scard {{ '' if alerts_out.on else 'att' }}" href="#outside-alerts">

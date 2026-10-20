@@ -238,7 +238,7 @@ def position_margin(x: dict) -> tuple[float, float | None]:
     the risk profile's leverage cap, as paper and the demo copy hold it: notional at entry over the cap
     (markets.isolated_margin, U13-2), liquidated from that margin, not from the strategy's whole equity. On
     spot, what it cost, with nothing to liquidate. The one place every page takes these from (UI v2, item 7)."""
-    qty, cash = x["qty"], x["cash"]
+    qty, cash = x["qty"], margin_cash(x)
     entry = x.get("entry_px") or x["price"]
     if not qty:
         return 0.0, None
@@ -248,6 +248,19 @@ def position_margin(x: dict) -> tuple[float, float | None]:
     lev = risk.leverage_cap(x["profile"], x["sleeve"].params)
     return (markets.isolated_margin(qty, entry, lev, cash + qty * entry),
             markets.isolated_liquidation(cash, qty, entry, lev, t.maintenance_margin) if tiered else None)
+
+
+def margin_cash(x: dict) -> float:
+    """The cash an isolated position's margin is posted from, as the engine posts it. A Strategy's own: its mark's
+    cash. Inside the fund (B-20) a mark's cash is its P&L from 0 with the fund's virtual funding netted out
+    (base.py _mark), so the engine adds that funding back (base.py `cash + self._funded()`, 10 fund equities,
+    paper/node.py VIRTUAL_HEADROOM), which never binds: margin is notional / leverage. Any funding of at least twice
+    the notional gives the same figure at every leverage from 1x, so that is what is added back here; without it
+    the margin read 0 and the liquidation price sat past the entry."""
+    cash = x["cash"]
+    if x.get("in_fund") and x.get("qty"):
+        cash += 2 * abs(x["qty"]) * (x.get("entry_px") or x["price"])
+    return cash
 
 
 def liq_unknown(x: dict) -> bool:
@@ -517,7 +530,8 @@ def perp_view(x: dict, position: dict | None, funding: list[dict]) -> dict | Non
     held = [f for f in funding if opened is not None and f["ts"] >= opened]
     return {
         "leverage": position["leverage"] if position else None,
-        "exposure": notional / equity if equity > 0 else None,
+        # inside the fund over the fund's equity, as its summary's (B-20): its own equity is its P&L from 0
+        "exposure": abs(x["exposure"]) if x.get("in_fund") else notional / equity if equity > 0 else None,
         "effective_leverage": notional / margin if position and margin else None,
         "margin": margin,
         "maintenance": notional * tier.rate - tier.amount if tier else None,

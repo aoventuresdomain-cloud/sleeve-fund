@@ -11,10 +11,9 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from sleeve_fund.dashboard.riskops import NEAR_LIMIT
+from sleeve_fund.dashboard.riskops import NEAR_LIMIT, limits_in_force
 from sleeve_fund.portfolio.gate import EMPTY
 from sleeve_fund.portfolio.limits import Book
-from sleeve_fund.risk import PORTFOLIO
 from sleeve_fund.store import WITHDRAWAL_DEFERRED, Store
 
 # The supervisor's word when a flat Strategy's equity couldn't leave the book at its mark (Supervisor._withdraw_flat).
@@ -75,10 +74,13 @@ def taken_out(store: Store, names) -> Decimal:
     return sum((store.in_book_equity(n) for n in dict.fromkeys(names) if n not in out and n not in held), Decimal(0))
 
 
-def _limit(key: str, words: str, used: Decimal, limit: float, book: Decimal, what: str = "") -> dict:
+def _limit(key: str, words: str, used: Decimal, limit: float | None, book: Decimal, what: str = "") -> dict:
+    """One limit in use; `limit` None: that test is switched off in the saved version, so nothing is near it."""
     share = used / book
-    cap = Decimal(repr(limit))  # compared exactly, as the gate compares (limits.decide)
-    tone = "loss" if share >= cap else "warn" if share >= cap * Decimal(repr(NEAR_LIMIT)) else ""
+    tone = ""
+    if limit is not None:
+        cap = Decimal(repr(limit))  # compared exactly, as the gate compares (limits.decide)
+        tone = "loss" if share >= cap else "warn" if share >= cap * Decimal(repr(NEAR_LIMIT)) else ""
     return {"key": key, "words": words, "what": what, "used": float(share), "limit": limit, "tone": tone}
 
 
@@ -117,14 +119,17 @@ def limits_in_use(store: Store, put_away=()) -> dict:
     view.update(book=float(book), taken=float(taken), after=float(after))
     if after < EMPTY:  # what apply_flow empties: no book left to measure a share of
         return {**view, "empty": True}
+    tests = limits_in_force(store)  # the saved version the gate applies, not the seeded constant (B-20)
+    if tests is None:
+        return {**view, "source": "unreadable"}
     gate = Book(after, held)
     nets = sorted(((abs(gate.net(u)), u) for u in {h.underlying for h in held}), reverse=True)
     net, top = nets[0] if nets else (Decimal(0), "")
     limits = [
-        _limit("gross", "Total size", gate.gross(), PORTFOLIO.gross, after),
-        _limit("net", "Largest net", net, PORTFOLIO.net_instrument, after, top),
-        _limit("margin", "Margin", gate.margin(), PORTFOLIO.margin, after),
-        _limit("open_risk", "Open risk", gate.open_risk(), PORTFOLIO.open_risk, after),
+        _limit("gross", "Total size", gate.gross(), tests.gross, after),
+        _limit("net", "Largest net", net, tests.net_instrument, after, top),
+        _limit("margin", "Margin", gate.margin(), tests.margin, after),
+        _limit("open_risk", "Open risk", gate.open_risk(), tests.open_risk, after),
     ]
     return {**view, "limits": limits, "over": [x["words"] for x in limits if x["tone"] == "loss"]}
 

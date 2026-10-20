@@ -2210,7 +2210,8 @@ class LongFlatStrategy(Strategy):
         return 0.0
 
     def entry_sent(self, qty: Decimal, values: dict) -> None:
-        """An opening order of `qty` went out from _open with these values (a STEPPED model reads its size here)."""
+        """An opening order of `qty` went out from _open with these values (a STEPPED model reads its size here). `qty`
+        is what was submitted, after the portfolio gate's trim, and this runs only once it is sent (B-30)."""
 
     def _lock_resumed(self, r: dict) -> None:
         if self.REENTER_AFTER_EXIT_LEG:  # its stop or target ended the leg, as before the restart (_lock_exit_leg):
@@ -2678,8 +2679,10 @@ class LongFlatStrategy(Strategy):
             self._note("entry_refused_open_risk", f"Entry refused: {why}")
             return
         self._noted.discard("entry_refused_open_risk")
-        self._send_entry(OrderSide.BUY if side > 0 else OrderSide.SELL, qty, reason, signal)
-        self.entry_sent(qty, values)
+        # B-30: the model learns the size that went out (after the portfolio gate's trim), when it went out, never the
+        # size asked for; a refused or unsent entry tells it nothing.
+        self._send_entry(OrderSide.BUY if side > 0 else OrderSide.SELL, qty, reason, signal,
+                         on_sent=lambda sent_qty: self.entry_sent(sent_qty, values))
 
     def on_bar(self, bar: Bar) -> None:
         self._deciding = self._deciding_bar = None
@@ -3757,14 +3760,17 @@ class LongFlatStrategy(Strategy):
         return self
 
     def _send_entry(self, side, qty: Decimal, reason: str, signal: dict, what: str = "entry", sent=None,
-                    gated=None) -> None:
+                    gated=None, on_sent=None) -> None:
         """Send an opening order (`what`: an entry, or a rebalance that adds), or in a portfolio run post it to the
         run's gate pass at now + 1 ns (research.portfolio.CloseBatch) and send only what that approves, never more
         than was sized here, then call sent(trimmed). Exits and reductions never wait for it. On paper with the
         portfolio gate in force (Store.portfolio_gate) the same check runs at once over the journal (P2-1b W2), and
         the order's journal row holds the reservation, so its fills and end settle it (Store._settle_reservation).
         A two-leg Strategy's entry opens both legs through its Pair (strategies.pair), which sends each leg's own,
-        checked for both legs at once on paper (`gated`: this leg's answer from PaperGate.pair, Advisor M1)."""
+        checked for both legs at once on paper (`gated`: this leg's answer from PaperGate.pair, Advisor M1).
+        on_sent(qty): called with the quantity actually submitted (after any trim), once the order has gone out, on
+        whichever pass sends it; never for an entry refused or not sent (B-30). Not passed on to a two-leg Strategy's
+        Pair (no stepped model has two legs)."""
         if what == "entry" and getattr(self, "_tp_signal", None):
             signal, self._tp_signal = {**signal, **self._tp_signal}, {}
         if self.pair is not None and self.pair.sending is not self:
@@ -3776,7 +3782,8 @@ class LongFlatStrategy(Strategy):
             return
         paper = self._paper_gated()
         if self._portfolio is None and paper is None:
-            self._submit(side, qty, what, reason, signal)
+            if self._submit(side, qty, what, reason, signal) and on_sent is not None:
+                on_sent(qty)
             return
         from sleeve_fund.research.portfolio import Pending
 
@@ -3819,6 +3826,8 @@ class LongFlatStrategy(Strategy):
                 return
             if paper is None:
                 self._hold_reservation(decision, self._last_submitted)
+            if on_sent is not None:
+                on_sent(approved)
             if sent is not None:
                 sent(trimmed)
 
@@ -3907,6 +3916,13 @@ class LongFlatStrategy(Strategy):
                                    bar=timedelta(minutes=bar_minutes(self._cfg.bar_type)),
                                    now=_utc(self.clock.timestamp_ns()), min_lead=lead or timedelta(0))
 
+    def _cancel_all_but_exits(self) -> None:
+        """A reconcile halt: every open order but the resting stop-loss and target is cancelled, by its client id (the
+        framework's cancel takes the id: an order passed in raised and left the entry resting, B-40)."""
+        for order in self.cache.orders_open(strategy_id=self.strategy_id):
+            if self.decisions.get(str(order.client_order_id), {}).get("intent") not in EXIT_LEGS:
+                self.cancel_order(order.client_order_id)
+
     def _reconcile_resting(self) -> None:
         """ORPHAN-GUARD og3 at a paper start: the gated entries the journal still has open from before are settled
         (orphan_guard.restart_reconcile): ended with the process before this one where the venue ran in it, asked to
@@ -3918,7 +3934,7 @@ class LongFlatStrategy(Strategy):
         rt = self.runtime
         venue_open = [str(o.client_order_id) for o in self.cache.orders_open(strategy_id=self.strategy_id)]
         restart_reconcile(rt.store, rt.name, _utc(self.clock.timestamp_ns()), venue_open,
-                          send=lambda oid: self.cancel_order(self.cache.order(ClientOrderId(oid))),
+                          send=lambda oid: self.cancel_order(ClientOrderId(oid)),
                           in_process=getattr(rt, "in_process_venue", None),
                           sole_instance=getattr(rt, "sole_instance", None))
 
@@ -6135,9 +6151,7 @@ class LongFlatStrategy(Strategy):
                     # Halted: nothing new trades and nothing is flattened, but a resting stop-loss and target
                     # stay, so the position isn't left unguarded until the PM acts (review round 10, m10-1).
                     self._drop_kept()
-                    for order in self.cache.orders_open(strategy_id=self.strategy_id):
-                        if self.decisions.get(str(order.client_order_id), {}).get("intent") not in EXIT_LEGS:
-                            self.cancel_order(order)
+                    self._cancel_all_but_exits()
             guard, self._guard_equity = self._guard_equity, None
             worst, self._guard_price = self._guard_price, None
             if self._margin and qty != 0:

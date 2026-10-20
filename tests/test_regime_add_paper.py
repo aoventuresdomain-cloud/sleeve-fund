@@ -19,9 +19,9 @@ def test_on_paper_an_add_is_add_in_the_gate_journal_only_and_its_order_row_stays
     paper, seen = _gated(store), {}
     real = LongFlatStrategy._send_entry
 
-    def send(self, side, qty, reason, signal, what="entry", sent=None):
+    def send(self, side, qty, reason, signal, what="entry", sent=None, **kw):  # B-30 (TEC): on_sent passes through
         seen.setdefault("strategy", self)
-        return real(self, side, qty, reason, signal, what, sent)
+        return real(self, side, qty, reason, signal, what, sent, **kw)
 
     monkeypatch.setattr(LongFlatStrategy, "_send_entry", send)
 

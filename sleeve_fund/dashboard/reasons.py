@@ -56,6 +56,19 @@ ACTION_REASONS: dict[str, list[tuple[str, str]]] = {
         ("Running it again", "Back in the list, ready to start"),
         ("Archived by mistake", "It shouldn't have been put away"),
     ],
+    # The lifecycle (B-21): Wind down lets the position run off; Close now closes it at the next candle close.
+    "wind_down": [
+        ("Rotating capital", "Making room for another Strategy"),
+        ("Edge fading", "Its results are drifting from its backtest"),
+        ("Test finished", "It ran as long as planned; let the position close itself"),
+        ("Replaced by a new version", "A clone with new settings takes over"),
+    ],
+    "close_now": [
+        ("Kill rule hit", "The rule set before the test says stop"),
+        ("Position looks wrong", "A suspected bug, a bad fill or the wrong size"),
+        ("Market event", "Get out before or during an event"),
+        ("Test finished", "Done with it, close and retire now"),
+    ],
     "compliance": [
         ("Advisor's recommendation", "The Independent Quant Advisor proposed these numbers"),
         ("Tighter while testing", "Less room while the first Strategies run"),

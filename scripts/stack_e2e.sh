@@ -35,6 +35,10 @@ trap on_exit EXIT
 # Start from that, so the run proves volume-init hands them to the image's user.
 docker compose run --rm --no-deps --build --entrypoint sh volume-init \
   -c 'mkdir -p /data/history/BINANCE /data/research/tearsheets && chown -R 0:0 /data/history /data/research'
+# CI can't reach the venue for its daily margin tiers, so the hand-checked paste would age past the 72-hour refusal:
+# keep the same tables as a "CI seed" dated now, after proving a seed over 72 hours old still refuses (TEC-E2E-TIERS-SEED).
+docker compose run --rm -T --build migrate
+docker compose run --rm -T --no-deps migrate python - < scripts/e2e_seed_tiers.py
 docker compose up -d --build
 # A fresh database is built by the migrations, and the result matches the code.
 docker compose logs --no-color migrate | grep -q "schema: at migration" || { echo "FAIL: migrate did not run"; exit 1; }

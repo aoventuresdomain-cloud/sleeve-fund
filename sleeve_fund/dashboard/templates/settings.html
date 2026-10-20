@@ -23,10 +23,17 @@
   <section class="panel flush span-7" id="profiles" aria-labelledby="rp-h">
     <div class="panel-head"><h2 id="rp-h">Risk profiles</h2></div>
     <table>
+      {% if fund_held %}{# B-20: inside the fund a profile's own halt and pause don't act (CUT-A (d)); the fund's brakes do #}
+      <thead><tr><th>Profile</th><th class="num">Leverage cap</th></tr></thead>
+      <tbody>{% for p in profiles.values() %}<tr><td><strong>{{ p.name|capitalize }}</strong></td><td class="num">{{ '%g'|format(p.max_leverage) }}x</td></tr>{% endfor %}</tbody>
+    </table>
+    <p class="muted" style="margin:0;padding:8px 14px 12px;font-size:12px">The fund holds the capital, so a profile sets a Strategy's leverage cap only. The fund's brakes pause and halt every Strategy: see <a href="/portfolio-settings">Portfolio settings</a>.</p>
+      {% else %}
       <thead><tr><th>Profile</th><th class="num">Halt at drawdown</th><th class="num">Pause at daily loss</th><th class="num">Leverage cap</th></tr></thead>
       <tbody>{% for p in profiles.values() %}<tr><td><strong>{{ p.name|capitalize }}</strong></td><td class="num">{{ p.max_drawdown|pct0 }}</td><td class="num">{{ p.daily_loss|pct0 }}</td><td class="num">{{ '%g'|format(p.max_leverage) }}x</td></tr>{% endfor %}</tbody>
     </table>
     <p class="muted" style="margin:0;padding:8px 14px 12px;font-size:12px">A halt flattens the strategy and waits for you. A daily-loss pause flattens and resumes after 24 hours.</p>
+      {% endif %}
   </section>
   <section class="panel span-5" id="costs" aria-labelledby="fee-h">
     <div class="panel-head"><h2 id="fee-h">Costs and data</h2></div>

@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}Acknowledge all alerts · Multi-Strategy Fund{% endblock %}
+{% block content %}
+{# B-17: the confirm step. The ids are the open alerts as this page was shown; one raised later stays open. #}
+<div class="page-head"><h1>Acknowledge all alerts</h1></div>
+<section class="panel">
+{% if alerts %}
+  <h2>Acknowledge all {{ alerts|length }} open alert{{ 's' if alerts|length != 1 }}?</h2>
+  <p>Each one keeps its row, with you and the time and the note "cleared with Acknowledge all", and still shows under All, including acknowledged. Nothing about any Strategy changes. An alert that arrives after this page was shown stays open.</p>
+  <ul class="alerts">{% for a in alerts[:5] %}<li class="{{ a.level }}"><div><div class="when">{{ a.ts|ts }} · {{ a.level|capitalize }}{% if a.sleeve %} · {{ a.sleeve|leg_label }}{% endif %}</div><div class="msg">{{ a.message|no_venues }}</div></div><span></span></li>{% endfor %}</ul>
+  {% if alerts|length > 5 %}<p class="faint">and {{ alerts|length - 5 }} more.</p>{% endif %}
+  <form method="post" action="/alerts/ack-all">
+    {% for a in alerts %}<input type="hidden" name="ids" value="{{ a.id }}">{% endfor %}
+    <div class="dlg-actions"><a class="button secondary" href="/alerts">Cancel</a> <button class="primary">Acknowledge all {{ alerts|length }}</button></div>
+  </form>
+{% else %}<p class="empty">No open alerts to acknowledge.</p><p><a class="button secondary" href="/alerts">Back to Alerts</a></p>{% endif %}
+</section>
+{% endblock %}

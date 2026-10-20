@@ -80,12 +80,15 @@ window.Console = (() => {
   // comparison). opts.book is the Portfolio's book chart: no buy-and-hold, no strip, and a book under two
   // days old opens on 1D so it never shows as a dot.
   function pair(url, eqId, ddId, labels, opts = {}) {
-    const eqEl = document.getElementById(eqId), ddEl = ddId ? document.getElementById(ddId) : null;
+    const eqEl = document.getElementById(eqId);
+    let ddEl = ddId ? document.getElementById(ddId) : null;
     if (!eqEl || !window.LightweightCharts) return;
     const scope = eqEl.closest("section") || document;
     (typeof url === "string" ? fetch(url).then((r) => r.json()) : Promise.resolve(url)).then((d) => {
       if (!d.t.length) { eqEl.innerHTML = '<p class="empty">No marks yet. The first arrives within a minute of a strategy starting.</p>'; if (ddEl) ddEl.remove(); return; }
       const book = !!opts.book;
+      // Inside the fund a Strategy's marks are its P&L from 0 and the fund's brakes act, so it has no drawdown of its own (B-20).
+      if (d.in_fund && ddEl) { ddEl.remove(); ddEl = null; }
       let pctMode = !!opts.compare;
       const base = (logo) => ({
         autoSize: true,
@@ -155,7 +158,7 @@ window.Console = (() => {
             item(null, isIntra() ? "Since the previous point" : "On the day", `${scash(ch)} (${pct(prev ? (ch / prev) * 100 : NaN)})`, tone(ch));
           }
         }
-        item(null, rest ? "Worst drawdown" : "Drawdown", pct(rest ? view.worst : view.dd[at]), (rest ? view.worst : view.dd[at]) < 0 ? "loss" : "");
+        if (!d.in_fund) item(null, rest ? "Worst drawdown" : "Drawdown", pct(rest ? view.worst : view.dd[at]), (rest ? view.worst : view.dd[at]) < 0 ? "loss" : "");
         legend.append(Object.assign(document.createElement("span"), {textContent: rest ? `${view.full[0]} to ${view.full[view.full.length - 1]}` : view.full[at], className: "faint"}));
       };
       // Hovering either chart moves the crosshair on both.
@@ -949,12 +952,101 @@ window.Console = (() => {
     ["market", "risk_profile"].forEach((n) => form.elements[n]?.dispatchEvent(new Event("change", {bubbles: true})));
   }
 
+  // B-35: a model that places no stop is held to 1x on a perpetual (strategies.check_perp_stop, "always a stop, or
+  // 1x"). With no stop set the form picks the highest profile within that and says why, so its defaults save; a stop
+  // set under the exits frees the choice. The backtest form does the same, so research runs at paper's leverage
+  // (Advisor B35-STOPLESS-DEFAULT).
+  function stoplessHold(form) {
+    if (!form || !form.elements.strategy || !form.elements.risk_profile) return;
+    const $ = (n) => form.elements[n];
+    const holdStopless = () => {
+      const max = Number($("strategy").selectedOptions[0]?.dataset.stoplessMax);
+      const note = form.querySelector("#stopless-note");
+      const held = max > 0 && $("market") && $("market").value !== "spot" && !(form.querySelector("[data-kind=stop]")?.value);
+      if (note) {
+        note.hidden = !held;
+        note.textContent = held ? `This model places no stop, so on a perpetual it is held to ${max}x leverage. Set a stop under the exits to choose more.` : "";
+      }
+      const prof = $("risk_profile");
+      if (!held || Number(prof.selectedOptions[0].dataset.lev) <= max) return;
+      const fit = [...prof.options].filter((o) => Number(o.dataset.lev) <= max).sort((a, b) => Number(b.dataset.lev) - Number(a.dataset.lev))[0];
+      if (fit) { prof.value = fit.value; prof.dispatchEvent(new Event("change", {bubbles: true})); }
+    };
+    form.addEventListener("change", holdStopless);
+    holdStopless();
+  }
+
   // New-sleeve form: show the chosen strategy's settings, keep a plain-English summary.
   function sleeveForm() {
     const form = document.getElementById("sleeve-form");
     if (!form) return;
     const $ = (n) => form.elements[n];
     $("strategy").addEventListener("change", () => applyPrefill(form, $("strategy").selectedOptions[0]));
+    // B-35 (QT3's s5 sweep, HoQA MUST): the model saved is the model picked, or the form says why it can't be. One
+    // source for the chips: those the venue's strategies can be saved with (app.venue_bars, the save's own check) that
+    // the model can use (app.MODEL_BAR: one that decides on one candle length picks that chip). The others are greyed
+    // with the reason, and a greyed pick moves to one offered. The model is never changed for the PM.
+    const VENUE_WORDS = "Strategies on this market decide on candles built from its minutes, so the venue's own candles aren't available";
+    const chips = () => [...form.querySelectorAll(".chip-pick input[name=bar_spec]")];  // not a backtest's fixed one
+    const offerChips = () => {
+      const v = form.querySelector("[data-pl-venue]");
+      const ok = v && v.dataset.bars ? v.dataset.bars.split(" ") : null;
+      const opt = $("strategy").selectedOptions[0];
+      const want = opt?.dataset.bar;
+      const all = chips();
+      all.forEach((c) => {
+        const byVenue = !ok || ok.includes(c.value);
+        const byModel = !want || c.value === want;
+        c.disabled = !(byVenue && byModel);
+        c.closest("label").title = !byVenue ? VENUE_WORDS : !byModel ? `${opt.dataset.barWords}, so this candle length isn't available` : "";
+      });
+      const on = all.find((c) => c.checked);
+      const to = (want && all.find((c) => c.value === want && !c.disabled))
+        || ((!on || on.disabled) && (all.find((c) => c.value === "1-HOUR-LAST-INTERNAL" && !c.disabled) || all.find((c) => !c.disabled)));
+      if (to && to !== on) { to.checked = true; to.dispatchEvent(new Event("change", {bubbles: true})); }
+    };
+    // Why the picked model can't be saved here, in words, or "": sized by weight on a perpetual (check_perp_sizing),
+    // or no candle length both the venue and the model allow.
+    const refusal = () => {
+      const opt = $("strategy").selectedOptions[0];
+      if (!opt) return "";
+      const label = (opt.dataset.label || opt.textContent).split(" (")[0];
+      const name = label.charAt(0).toUpperCase() + label.slice(1);
+      if ($("market").value !== "spot" && opt.dataset.perpRefused) return `${name} is ${opt.dataset.perpRefused}. Pick a spot market or another model.`;
+      if (opt.dataset.bar && chips().length && chips().every((c) => c.disabled)) return `${opt.dataset.barWords}, which this market doesn't offer. Pick another market or another model.`;
+      return "";
+    };
+    const guard = () => {
+      const why = refusal();
+      const note = document.getElementById("model-refused");
+      if (note) { note.hidden = !why; note.textContent = why; }
+      form.querySelectorAll("button[data-label]").forEach((b) => {
+        if (why && !b.hasAttribute("data-model-refused")) { b.toggleAttribute("data-model-refused", true); b.toggleAttribute("data-blocked", true); b.disabled = true; }
+        if (!why && b.hasAttribute("data-model-refused")) { b.removeAttribute("data-model-refused"); b.removeAttribute("data-blocked"); b.disabled = false; form.dispatchEvent(new Event("change")); }
+      });
+      return why;
+    };
+    // A model sized by weight can't trade a perpetual yet: there it is greyed with the reason, unless it is the pick,
+    // which stays picked with the refusal shown (it was moved to another model without a word).
+    const perpModels = () => {
+      const perp = $("market").value !== "spot";
+      [...$("strategy").options].forEach((o) => {
+        if (!o.dataset.perpRefused) return;
+        o.dataset.label ??= o.textContent;
+        o.disabled = perp && !o.selected;
+        o.textContent = perp ? `${o.dataset.label}, ${o.dataset.perpRefused.split(":")[1].trim()}` : o.dataset.label;
+      });
+    };
+    const recheck = () => { perpModels(); offerChips(); guard(); };
+    $("strategy").addEventListener("change", recheck);
+    $("market").addEventListener("change", recheck);
+    form.querySelector("[data-pl-venue]")?.addEventListener("change", recheck);
+    recheck();
+    form.addEventListener("submit", (e) => {
+      if (!guard()) return;
+      e.preventDefault();
+      document.getElementById("model-refused")?.scrollIntoView({block: "center"});
+    });
     const pct = (x) => `${(x * 100).toFixed(0)}%`;
     const sync = () => {
       const strat = $("strategy").value;
@@ -986,9 +1078,10 @@ window.Console = (() => {
         `Use ${opt.textContent.split(" (")[0]}: ${desc ? desc.textContent : ""}`,
         (() => {
           const mk = form.elements.market ? form.elements.market.value : "spot";
-          if (mk === "spot") return `Hold at most ${pct(Number(prof.cap))} of its capital in ${pair.split("/")[0] || "the instrument"}, long only.`;
+          // No per-Strategy position cap since TEC-FE-CAP: the profile carries none to state (it read "NaN%").
+          if (mk === "spot") return `Trade ${form.elements.market ? `the ${form.elements.market.selectedOptions[0].textContent.split(":")[0].toLowerCase()}` : "spot"}, long only.`;
           const shorts = form.elements.allow_short && form.elements.allow_short.checked;
-          return `Trade the ${form.elements.market.selectedOptions[0].textContent.split(":")[0].toLowerCase()}, ${shorts ? "long and short" : "long only"}, with positions up to ${prof.lev}x its capital.`;
+          return `Trade the ${form.elements.market.selectedOptions[0].textContent.split(":")[0].toLowerCase()}, ${shorts ? "long and short" : "long only"}, with ${held ? `leverage up to ${prof.lev}x` : `positions up to ${prof.lev}x its capital`}.`;
         })(),
         held ? "Pause and halt with the fund's own brakes, not on this Strategy's own losses."
           : `Pause for a day after losing ${pct(Number(prof.day))} in a day, and halt for your review at a ${pct(Number(prof.dd))} drawdown.`,
@@ -1000,11 +1093,13 @@ window.Console = (() => {
       ul.replaceChildren(...items.map((t) => Object.assign(document.createElement("li"), {textContent: t})));
       if (!$("name").dataset.touched) {
         // Model, instrument and candle length: rsi-bands-solusdt-15m (UI v2, item 9).
-        const candle = bar ? bar.parentElement.textContent.trim().split(" ")[0] : "";
+        // "1h venue" stays "1h-venue": the two 1h chips must not suggest the same name (B-35 follow-up).
+        const candle = bar ? bar.parentElement.textContent.trim().split(/\s+/).join("-") : "";
         $("name").value = [strat.replace(/_/g, "-"), pair.replace("/", "").toLowerCase(), candle].filter(Boolean).join("-").replace(/[^a-z0-9-]/g, "").slice(0, 41);
       }
     };
     $("name").addEventListener("input", () => { $("name").dataset.touched = "1"; });
+    stoplessHold(form);
     form.addEventListener("input", sync); form.addEventListener("change", sync); sync();
     wizard(form);
     orderFields("sleeve-form");
@@ -1116,7 +1211,9 @@ window.Console = (() => {
       if (stop || tp) out.push(`Exit any trade ${[stop, tp].filter(Boolean).join(" or ")}.`);
       if (line && !line.hidden) out.push(line.textContent);
       const rpt = num("risk_per_trade_pct");
-      if (rpt) out.push(stop ? `Size each trade to lose about ${rpt}% of capital if the stop is hit, fees and spread included.` : "Risk per trade needs a stop-loss; add one or clear it.");
+      // Inside the fund the label names the fund's equity, the base the engine sizes from (B-20)
+      const base = /fund equity/.test((box.querySelector("label[for=risk_per_trade_pct]") || {}).textContent || "") ? "the fund's equity" : "capital";
+      if (rpt) out.push(stop ? `Size each trade to lose about ${rpt}% of ${base} if the stop is hit, fees and spread included.` : "Risk per trade needs a stop-loss; add one or clear it.");
       return out;
     };
     return box.exitDescribe;
@@ -1152,6 +1249,7 @@ window.Console = (() => {
       if (!venues[key]) return;
       const changed = venue.value !== key;
       venue.value = key; venue.dataset.perp = venues[key].perpetual ? "1" : "";
+      venue.dataset.bars = (venues[key].bars || []).join(" ");
       if (kind) kind.textContent = venues[key].perpetual ? "perpetual" : "spot";
       if (changed) venue.dispatchEvent(new Event("change", {bubbles: true}));
     };
@@ -1608,5 +1706,5 @@ window.Console = (() => {
     });
   }
 
-  return {sortable, tabs, subtabs, periods, sortBy, dialogs, whys, fillSummary, lineCharts, strategyPicker, priceChart, sleeveForm, orderFields, reasons, picklist, chips, settingsDiff, bookCharts: (url) => pair(url, "eq", null, ["Book", "Buy-and-hold"], {book: true}), pair};
+  return {sortable, tabs, subtabs, periods, sortBy, dialogs, whys, fillSummary, lineCharts, strategyPicker, stoplessHold: (id) => stoplessHold(document.getElementById(id)), priceChart, sleeveForm, orderFields, reasons, picklist, chips, settingsDiff, bookCharts: (url) => pair(url, "eq", null, ["Book", "Buy-and-hold"], {book: true}), pair};
 })();

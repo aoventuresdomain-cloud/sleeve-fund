@@ -1,0 +1,81 @@
+name: study
+# STUDY (re-score, HoE 20 Oct): runs a list of research definitions as G1 studies on the paper server's stored
+# history (python -m sleeve_fund.research.rescore), in a one-off container of the dashboard's image, the same place
+# the Research page runs its studies, so the trials register, idea counter and tear sheets are the page's own. The
+# holdout stays locked: nothing here can open it. Writes research records only, never a Strategy, order, fill or
+# fund row. The log is public, so it shows counts and per-row ran/failed only; the results are read on the Research
+# page. Run it by hand from main: first with dry_run (the default), which checks every row and runs nothing.
+on:
+  workflow_dispatch:
+    inputs:
+      list:
+        description: Study list in configs/studies/ (file name, e.g. qr-rescore-list.md)
+        required: true
+        default: qr-rescore-list.md
+      rows:
+        description: Which rows, e.g. 1-8 or 1,4,7; empty for all
+        required: false
+        default: ""
+      venue:
+        description: Venue whose stored history is read (lower-case letters only)
+        required: true
+        default: binance
+      pair:
+        description: Instrument, e.g. BTC/USDT
+        required: true
+        default: BTC/USDT
+      dry_run:
+        description: Check every row only, run nothing
+        type: boolean
+        required: true
+        default: true
+# One study list at a time: a queued run waits for the running one (each study is a full backtest).
+concurrency: { group: study, cancel-in-progress: false }
+jobs:
+  study:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    permissions: { contents: read }
+    if: ${{ vars.DEPLOY_ENABLED == 'true' && github.ref == 'refs/heads/main' }}
+    env:
+      USER_AT: ${{ vars.DEPLOY_USER || 'root' }}
+    steps:
+      - name: Check the inputs
+        env:
+          LIST: ${{ inputs.list }}
+          ROWS: ${{ inputs.rows }}
+          VENUE: ${{ inputs.venue }}
+          PAIR: ${{ inputs.pair }}
+        run: |
+          [[ "$LIST" =~ ^[a-z0-9][a-z0-9_-]{0,63}\.md$ ]] || { echo "list must be a file name in configs/studies/, like qr-rescore-list.md"; exit 1; }
+          [[ -z "$ROWS" || "$ROWS" =~ ^[0-9]+(-[0-9]+)?(,[0-9]+(-[0-9]+)?)*$ ]] || { echo "rows must look like 1-8 or 1,4,7"; exit 1; }
+          [[ "$VENUE" =~ ^[a-z]{1,32}$ ]] || { echo "venue must be lower-case letters only"; exit 1; }
+          [[ "$PAIR" =~ ^[A-Z0-9]{1,16}/[A-Z0-9]{1,16}$ ]] || { echo "pair must be like BTC/USDT"; exit 1; }
+      - name: Configure SSH
+        env:
+          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/id_deploy && chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts
+      - name: Refuse to stack a second study list
+        # A one-off container can outlive its job (an SSH drop, a cancelled run), so a run still going is shown and
+        # this job stops rather than start another beside it.
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          ssh -i ~/.ssh/id_deploy "$USER_AT@$HOST" \
+            'running=$(sudo docker ps --filter name=study- --format "{{.Names}} {{.Status}}"); if [ -n "$running" ]; then echo "a study list is still running:"; echo "$running"; exit 1; fi'
+      - name: Run the list
+        env:
+          RUN_ID: ${{ github.run_id }}
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          LIST: ${{ inputs.list }}
+          ROWS: ${{ inputs.rows && format('--rows {0}', inputs.rows) || '' }}
+          VENUE: ${{ inputs.venue }}
+          PAIR: ${{ inputs.pair }}
+          DRY: ${{ inputs.dry_run && '--dry-run' || '' }}
+        run: |
+          ssh -i ~/.ssh/id_deploy -o ServerAliveInterval=30 -o ServerAliveCountMax=10 "$USER_AT@$HOST" \
+            "cd /opt/sleeve-fund && sudo docker compose run --rm -T --no-deps --name study-$RUN_ID dashboard python -u -m sleeve_fund.research.rescore configs/studies/$LIST $ROWS --venue $VENUE --pair $PAIR $DRY"

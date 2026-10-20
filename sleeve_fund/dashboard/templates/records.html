@@ -40,7 +40,7 @@
   <div class="ledger rec-figs">
     <div><div class="k">{{ label }}</div>
       {% if perf.empty %}<div class="v faint">–</div><div class="s">no marks in this period</div>
-      {% else %}<div class="v {{ 'gain' if perf.ret >= 0 else 'loss' }}">{{ perf.ret|pct1s }}</div><div class="s">after fees · {{ perf.pnl|smoney }}</div>{% endif %}</div>
+      {% else %}<div class="v {{ 'gain' if perf.ret >= 0 else 'loss' }}">{{ perf.ret|pct1s }}</div><div class="s">after fees · {{ perf.pnl|smoney }}{% if contribution %} · over the fund's capital{% endif %}</div>{% endif %}</div>
     <div><div class="k">vs benchmark</div>
       {% if perf.empty %}<div class="v faint">–</div>
       {% else %}<div class="v {{ 'gain' if perf.vs >= 0 else 'loss' }}">{{ '%+.1f'|format(perf.vs * 100) }} pts</div><div class="s">buy-and-hold {{ perf.bench|pct1s }}</div>{% endif %}</div>
@@ -74,7 +74,7 @@
 
   {% if m.grid and m.months %}
   <section class="panel flush" aria-labelledby="g-h">
-    <div class="panel-head"><h2 id="g-h">Strategies by month</h2></div>
+    <div class="panel-head"><h2 id="g-h">Strategies by month</h2>{% if m.contribution %}<span class="right faint" title="The fund holds the capital, so each month is the Strategy's P&amp;L over the fund's book at the month's start">contribution to the fund's return</span>{% endif %}</div>
     <div style="overflow-x:auto"><table class="corr heat">
       <tr><th></th>{% for mo in m.months|reverse %}<th scope="col">{{ mo }}</th>{% endfor %}</tr>
       {% for n in m.sleeves %}<tr><th scope="row" class="row"><a href="/sleeves/{{ n }}">{{ n }}</a></th>

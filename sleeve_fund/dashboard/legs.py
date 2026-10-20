@@ -113,6 +113,15 @@ def fold_one(store: Store, first: dict, second: dict, frames: dict | None = None
         "healthy": first["healthy"] and second["healthy"],
         "legs": [leg_row(first, 1), leg_row(second, 2)], "pair": pair,
     }
+    if first.get("in_fund"):
+        # B-20: inside the fund both legs' marks are P&L from 0 and the pair's own halt doesn't act; its size and
+        # today's move are over the fund's equity, as each leg's (metrics.sleeve_summary, book.sleeve_extras)
+        from sleeve_fund.dashboard.metrics import fund_equity_or_none
+
+        fund = fund_equity_or_none(store)
+        gross = abs(first["position_value"]) + abs(second["position_value"])
+        out.update(drawdown=0.0, dd_used=0.0, room=None, ret=0.0, bench_ret=0.0,
+                   exposure=gross / fund if fund else 0.0, day_ret=day_pnl / fund if fund else 0.0)
     out.update(costs(out["pnl"], out["fees"], out["funding"]))
     if curve:
         tail = curve[-60:]
