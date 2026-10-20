@@ -262,6 +262,21 @@ def test_c9_c8_a_backtest_stop_left_open_by_a_precision_mismatch_raises_the_aler
             == [(x["kind"], x["message"]) for x in off.journal.events_])
 
 
+def test_c9_c8_the_same_mismatch_is_refused_at_load_by_the_paper_replay_too(tmp_path, monkeypatch):
+    """The sibling of c9_c8's FeedPrecisionError assert, on the paper replay engine: the recorded quotes and trades
+    carry one decimal more than the instrument's 0.1 tick, and (a) refuses the run before a bar is traded."""
+    from sleeve_fund.research import replay as engine
+
+    real = engine._data
+    monkeypatch.setattr(engine, "_data", lambda instrument, rows: real(
+        instrument, [{**r, **{k: r[k] + "0" for k in ("b", "a", "p") if k in r}} for r in rows]))
+    _record(tmp_path / "a.jsonl.gz", _meta(10_000, PARAMS), DOWN)
+    store = Store.in_memory()
+    with pytest.raises(FeedPrecisionError, match="2 decimal places but the instrument's tick has 1"):
+        replay(tmp_path / "a.jsonl.gz", with_fills=True, store=store)
+    assert not store.orders("ping-pong-test")
+
+
 def test_a_backstop_that_fails_never_stops_the_bars_trading(monkeypatch):
     """CR2 F1 (HoE MUST): it runs first on each bar, so a failure in it (a store write, an odd bar) becomes an ERROR
     event and the bar's targets, stops and decision go on as without it."""
