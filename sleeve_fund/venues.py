@@ -120,6 +120,8 @@ class VenueProfile:
     # live lot size is read (paper_venue_lot). Sizing rounds down to the step and refuses below the minimum.
     lot_sizes: dict[str, tuple[str, str]] = field(default_factory=dict)
     live_lot: Callable[[str], tuple[Decimal, Decimal]] | None = None
+    # B44-STEP: pair -> why its new entries are refused (a listed step the engine can't round to), set by contract_lot
+    lot_refusals: dict[str, str] = field(default_factory=dict)
     # FEE-LIVE: the published range a fetched fee rate must fall in ({"maker": (lowest, VIP 0), "taker": ...}) and
     # where it was read; a profile without one has no fetched rates (venue_terms refuses to read them)
     fee_bounds: dict[str, tuple] | None = None
@@ -181,11 +183,20 @@ class VenueProfile:
             return kept
         try:
             live = tuple(Decimal(str(x)).normalize() for x in self.live_lot(pair))
+        except LotStepUnusable as exc:  # Advisor B44-STEP: an error at start, entries refused, exits run
+            self.lot_refusals[pair] = (f"{self.symbol_of(pair)} lists a quantity step of {exc.step}, which the engine "
+                                       f"can't round to; it is built on "
+                                       + (f"the kept step {kept[0]}" if kept else "the contract's step")
+                                       + ", and new entries are refused until a step it can round to is in place; "
+                                       "exits and stops still run")
+            print(f"{self.label}: {self.lot_refusals[pair]}", file=sys.stderr)
+            return kept
         except Exception as exc:  # noqa: BLE001 - an unreachable venue: the kept lot, said
             if kept is not None:
                 print(f"{self.label}: live lot size for {pair} unavailable ({exc!r}); the kept step {kept[0]} and "
                       f"minimum {kept[1]} are used", file=sys.stderr)
             return kept
+        self.lot_refusals.pop(pair, None)
         if kept is not None and live != kept:
             print(f"{self.label}: the live lot size (step {live[0]}, minimum {live[1]}) for {pair} differs from the kept "
                   f"(step {kept[0]}, minimum {kept[1]}); the live one is used", file=sys.stderr)
@@ -505,6 +516,14 @@ def paper_venue_listing(pair: str, get_json=None) -> dict:
     return rows[0]
 
 
+class LotStepUnusable(ValueError):
+    """A listed quantity step the engine can't round to (not a power of ten): Advisor B44-STEP."""
+
+    def __init__(self, step: Decimal):
+        self.step = step
+        super().__init__(f"the venue's lot step {step} is not a power of ten, which the engine can't round to")
+
+
 def paper_venue_lot(pair: str, get_json=None) -> tuple[Decimal, Decimal]:
     """B-44: the paper venue's live (quantity step, minimum order quantity) for `pair`, exactly as its listing's
     lotSizeFilter gives them. Raises ValueError when either is missing or not above 0, the minimum isn't a whole
@@ -518,7 +537,7 @@ def paper_venue_lot(pair: str, get_json=None) -> tuple[Decimal, Decimal]:
     if step <= 0 or least <= 0 or least % step:
         raise ValueError(f"the venue's lot size for {pair} can't be used: step {step}, minimum {least}")
     if step != Decimal(1).scaleb(step.adjusted()):
-        raise ValueError(f"the venue's lot step for {pair} is {step}, not a power of ten, which the engine can't round to")
+        raise LotStepUnusable(step)
     return step, least
 
 
