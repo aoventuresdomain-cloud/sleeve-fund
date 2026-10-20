@@ -96,6 +96,8 @@ class VenueStops:
 
     def _send(self, method: str, path: str, signed: str, data: bytes | None) -> dict | None:
         """The venue's signing scheme: HMAC-SHA256 of timestamp + key + recv window + (body or query string)."""
+        if self.read_only and method != "GET":  # the one place a request goes out: no write gets round it
+            raise PermissionError(f"a read-only venue client never writes ({method} {path})")
         ts = str(self._now_ms())
         sign = hmac.new(self._secret.encode(), f"{ts}{self._key}{RECV_WINDOW}{signed}".encode(),
                         hashlib.sha256).hexdigest()
