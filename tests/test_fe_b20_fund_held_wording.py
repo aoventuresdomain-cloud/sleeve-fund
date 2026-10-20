@@ -21,7 +21,7 @@ AUTH = ("pm", "pw")
 PERP = {"market": "perp", "allow_short": True}
 QTY, ENTRY, MARK, FEE = 0.1, 60_000.0, 59_000.0, 3.3
 # The old rule's words (fe-v3 §4 and the B-20 board line): a Strategy's own halt level, room, capital or drawdown.
-OLD_RULE = (r"Room to halt", r"Room before halt", r"halts? at \d", r"Starting capital", r"No strategy would halt",
+OLD_RULE = (r"Room to halt", r"Room before halt", r"(?<!% \()halts? at \d", r"Starting capital", r"No strategy would halt",
             r"Strategies that would halt", r"of its capital", r"Worst drawdown", r"before halt")
 
 
@@ -159,6 +159,14 @@ def test_fund_held_no_page_states_a_strategys_own_halt_room_or_capital(c, store)
     assert "× fund equity" in page
     form, _ = _words(c, "/sleeves/new")
     assert "Risk per trade, % of fund equity" in form
+
+
+def test_the_old_rule_lets_only_the_funds_halt_headline_through():
+    """TEC-H4-DD (HoE, 20 Oct 19:57 UK): PAGE-DD's "Drawdown from peak 1.98% (halt at 15%)" is the fund's halt; a
+    Strategy's own halt level still trips the rule."""
+    assert not any(re.search(w, "Drawdown from peak 1.98% (halt at 15%)") for w in OLD_RULE)
+    for own in ("Strategy A (halt at 20%)", "halts at 20%"):
+        assert any(re.search(w, own) for w in OLD_RULE), own
 
 
 def test_fund_held_exposure_and_today_are_over_the_funds_equity(store):  # noqa: F811

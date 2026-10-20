@@ -122,6 +122,23 @@ def fund_halt_reference(store: Store) -> float | None:
     return float(ref) if ref is not None and ref > 0 else None
 
 
+def fund_drawdown(store: Store) -> float | None:
+    """PAGE-DD (Advisor, 20 Oct): the drawdown the fund's halt (T5b) acts on, from the gate's last mark against its
+    reference, as portfolio.limits.book_breach measures it (1 - book / the higher of the two). None before the
+    supervisor's first mark or when the gate's state can't be read (printed): the page then says it is not marked."""
+    from sleeve_fund.paper.portfolio_gate import PaperGate
+
+    try:
+        st = PaperGate(store).ledger.state()
+        ref = st.reference()
+    except Exception as exc:  # noqa: BLE001 - unknown, said so on the page, never the daily curve's figure
+        print(f"dashboard: can't read the fund's drawdown from the gate: {exc!r}")
+        return None
+    if st.equity is None or ref is None or st.equity <= 0 or ref <= 0:
+        return None
+    return float(round(1 - st.equity / max(ref, st.equity), 4))
+
+
 def _fold_pairs(store: Store, rows: list[dict]) -> list[dict]:
     """A two-leg Strategy's legs as one row (F-P28-UI1; Independent Quant Advisor, 14 Oct 10:05 UK), at its first
     leg's place, the legs nested under it (`legs`). Its limits are the summed guard's (ruling E): drawdown from the

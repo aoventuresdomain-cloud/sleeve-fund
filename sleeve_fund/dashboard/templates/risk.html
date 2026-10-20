@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {# Where the header's total size comes from (UP-1). #}
 {% macro size_title(size) %}{% if size.limit is none %}{{ "Total size is switched off in the compliance tests: nothing caps it." if size.limit_off else "The compliance tests in force couldn't be read just now; the entry gate takes no entry until they can." }}{% elif size.source == 'gate' %}As the entry gate reads the book: every position and resting entry, against the fund's last mark. Amber from {{ '%.1f'|format(size.limit * 0.8) }}x; at {{ '%.1f'|format(size.limit) }}x no entry that adds to it is taken.{% elif size.source == 'unreadable' %}From the strategies' own marks: the entry gate's book couldn't be read just now.{% else %}From the strategies' own marks: the fund has no mark yet, and the entry gate takes no entry until it has one.{% endif %}{% endmacro %}
-{% from "_macros.html" import chip, usage, help, stop_words, trail_words, open_risk_hint, open_risk_text, open_risk_room, spot_risk_text, open_risk_warn, risk_cell, stop_liq, test_chip %}
+{% from "_macros.html" import chip, usage, help, stop_words, trail_words, open_risk_hint, open_risk_text, open_risk_room, spot_risk_text, open_risk_warn, risk_cell, stop_liq, test_chip, fund_dd_text %}
 {% from "_reasons.html" import reason_picker %}
 {# A stop in a word or two, for the strategy list's chip; the Limits tab spells it out. #}
 {% macro stop_short(p) %}{% if p.stop_loss %}{{ (p.stop_loss * 100)|round(1) }}%{% elif p.stop_atr %}{{ '%g'|format(p.stop_atr) }} simple ATR{% elif p.stop_swing_bars %}Swing low{% endif %}{% endmacro %}
@@ -52,10 +52,10 @@
   </section>
 
   <section class="panel rh-chart" aria-labelledby="dd-h">
-    <div class="rh-chart-top"><h2 id="dd-h"><span class="rh-wide">Book drawdown, 30 days</span><span class="rh-phone">Drawdown</span></h2>
+    <div class="rh-chart-top"><h2 id="dd-h">{% if fund_dd %}<span class="rh-wide">Drawdown from daily-close peak, 30 days</span><span class="rh-phone">From daily-close peak</span>{% else %}<span class="rh-wide">Book drawdown, 30 days</span><span class="rh-phone">Drawdown</span>{% endif %}</h2>
       <span><span class="rh-big">{{ chart.current|pct1 }}</span> <span class="faint">worst {{ chart.worst|pct1 }}</span></span></div>
     {% set c = chart %}
-    <div class="lw-line rh-dd" data-kind="drawdown" data-halt-name="{{ halt_name or '' }}" data-chart="{{ c|tojson|forceescape }}" role="img" aria-label="Book drawdown over the last 30 days: now {{ c.current|pct1 }}, worst {{ c.worst|pct1 }}{% if c.halt %}, {{ halt_name }} halt at {{ c.halt|pct0 }}{% endif %}"></div>
+    <div class="lw-line rh-dd" data-kind="drawdown" data-halt-name="{{ halt_name or '' }}" data-chart="{{ c|tojson|forceescape }}" role="img" aria-label="{{ 'Drawdown from the daily-close peak' if fund_dd else 'Book drawdown' }} over the last 30 days: now {{ c.current|pct1 }}, worst {{ c.worst|pct1 }}{% if c.halt %}, {{ halt_name }} halt at {{ c.halt|pct0 }}{% endif %}"></div>
     {% if c.points < 2 %}<p class="faint rh-note">The chart fills in as the book's daily closes come in.</p>{% endif %}
   </section>
 </div>
@@ -99,7 +99,8 @@
 <div class="tab-panel" id="tab-limits" role="tabpanel" data-panel="limits">
 <section class="ledger" aria-label="Book risk">
   <div><div class="k">Largest asset</div><div class="v">{% if risk.largest %}{{ risk.largest.name }} {{ risk.largest.share|pct0 }}{% else %}None{% endif %}</div><div class="s">{% if risk.largest and risk.largest.net != risk.largest.gross %}long + short, of total capital · net {{ risk.largest.net_share|pct0 }}{% if risk.largest.net < -0.005 %} short{% endif %}{% else %}of total capital{% endif %}</div></div>
-  <div><div class="k">Book drawdown</div><div class="v">{{ book.drawdown|pct1 }}</div><div class="s">worst {{ book.max_drawdown|pct1 }}</div></div>
+  {% if fund_dd %}<div title="As the fund's halt measures it: the supervisor's last mark of the fund against its peak"><div class="k">Drawdown from peak</div><div class="v">{{ fund_dd_text(fund_dd) }}</div><div class="s">from daily-close peak {{ book.drawdown|pct1 }} · worst {{ book.max_drawdown|pct1 }}</div></div>
+  {% else %}<div><div class="k">Book drawdown</div><div class="v">{{ book.drawdown|pct1 }}</div><div class="s">worst {{ book.max_drawdown|pct1 }}</div></div>{% endif %}
   <div><div class="k">Volatility</div><div class="v">{{ book.vol|pctn0 }}</div><div class="s">annualised, daily returns</div></div>
   {# The same margin and open risk as the Portfolio's tiles (QA U3): trading.book_positions, added up. #}
   <div title="Isolated margin the open positions have put up"><div class="k">Margin used</div><div class="v">{{ risk.margin|money }}</div></div>

@@ -93,3 +93,10 @@
   <ul class="limits-after-list">{% for x in v.limits %}<li><span>{{ x.words }}{% if x.what %} <span class="faint">{{ x.what }}</span>{% endif %}</span> <b class="{{ x.tone }}">{{ x.used|pct1 }}</b> <span class="faint">{% if x.limit is none %}limit off{% else %}of {{ x.limit|pct0 }}{% endif %}</span></li>{% endfor %}</ul>
   {%- if v.over %}<p><b>At or over the limit: {{ v.over|join(', ') }}.</b> {{ 'The withdrawal still goes through and closes nothing' if preview else 'Nothing open was closed' }}; new entries that add to it are blocked until it is back under.</p>{% endif %}
 {%- endif %}</div>{% endmacro %}
+
+{# PAGE-DD: the fund's drawdown as its halt measures it, "1.98% (halt at 15%)"; not marked yet says so. #}
+{% macro fund_dd_text(d) %}{% if d.drawdown is not none %}{{ '%.2f'|format(d.drawdown * 100) }}%{% if d.limit %} <span class="muted">(halt at {{ d.limit|pct0 }})</span>{% endif %}{% else %}<span class="faint" title="The supervisor hasn't marked the fund yet, or its mark couldn't be read{% if d.limit %}; the fund halts {{ d.limit|pct0 }} below its peak{% endif %}">–</span>{% endif %}{% endmacro %}
+
+{# PAGE-SIZE: a fund-held entry's size as its decision journal records it (trading.entry_sizing). T1's room and the
+   loss at the stop aren't journaled before B-24, so they aren't shown. #}
+{% macro entry_size(p) %}{% if p and p.sizing %}Position value: {{ p.sizing.value_share|pct0 }} of fund equity (share of fund {{ '%.2f'|format(p.sizing.value_share) }}×){% if p.perp_limit and p.leverage %}<div>margin leverage {{ '%.2f'|format(p.leverage) }}×</div>{% endif %}{% elif p %}<span class="faint">The size it was decided at isn't in its entry's record</span>{% else %}<span class="faint">No open position</span>{% endif %}{% endmacro %}

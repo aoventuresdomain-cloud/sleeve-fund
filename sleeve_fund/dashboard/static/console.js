@@ -1037,6 +1037,15 @@ window.Console = (() => {
         o.textContent = perp ? `${o.dataset.label}, ${o.dataset.perpRefused.split(":")[1].trim()}` : o.dataset.label;
       });
     };
+    // B-35 (QT3 on merge 9): the instrument list greys a market the picked model can't be saved on, with the reason,
+    // so the PM never lands on a model with no chip to pick (picklist reads this).
+    form.plRefuse = (v) => {
+      const opt = $("strategy").selectedOptions[0];
+      if (!opt || !v) return "";
+      if (v.perpetual && opt.dataset.perpRefused) return `Not for this model: ${opt.dataset.perpRefused.split(":")[1].trim()}`;
+      if (opt.dataset.bar && !(v.bars || []).includes(opt.dataset.bar)) return `Not for this model: ${opt.dataset.barWords.charAt(0).toLowerCase()}${opt.dataset.barWords.slice(1)}, which this market doesn't offer`;
+      return "";
+    };
     const recheck = () => { perpModels(); offerChips(); guard(); };
     $("strategy").addEventListener("change", recheck);
     $("market").addEventListener("change", recheck);
@@ -1283,7 +1292,17 @@ window.Console = (() => {
         if (!os.length) return;
         const g = li("grp", name); g.setAttribute("role", "presentation"); items.push(g);
         os.forEach((o) => {
-          const el = li("opt", o.label); el.setAttribute("role", "option"); el.id = `${list.id}-${shown.length}`;
+          // B-35: a market the form's picked model can't be saved on is listed greyed with the reason, never picked
+          const why = input.form && input.form.plRefuse ? input.form.plRefuse(venues[o.venue]) : "";
+          const el = li(why ? "opt off" : "opt", o.label); el.setAttribute("role", "option");
+          if (why) {
+            el.setAttribute("aria-disabled", "true");
+            el.append(Object.assign(document.createElement("small"), {className: "warn", textContent: why}));
+            el.addEventListener("mousedown", (e) => e.preventDefault());
+            items.push(el);
+            return;
+          }
+          el.id = `${list.id}-${shown.length}`;
           if (o.badge) el.append(Object.assign(document.createElement("small"), {className: o.tone, textContent: o.badge}));
           el.addEventListener("mousedown", (e) => { e.preventDefault(); pick(o); });
           shown.push(o); items.push(el);
