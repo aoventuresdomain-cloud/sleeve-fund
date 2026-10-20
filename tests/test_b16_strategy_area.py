@@ -322,3 +322,15 @@ def test_pair_archive_failing_on_the_other_side_says_what_was_archived(client, m
     r = _archive(c, PAIR[0], other="on")
     assert r.status_code == 409 and PAIR[1] in r.json()["detail"] and f"{PAIR[0]} was archived" in r.json()["detail"]
     assert _counts(store)["definition_archive"] == 1  # the first stays, and the answer says so
+
+
+@pytest.mark.parametrize("fid", QR_IDS)
+def test_display_title_leads_and_file_id_stays_as_label(client, fid):
+    c, _ = client
+    title = next(load_definition_file(p) for p in DEFS.glob("*.toml")
+                 if load_definition_file(p)["name"] == fid)["title"]
+    list_html = c.get("/strategy", auth=AUTH).text
+    page = c.get(f"/strategy?s={fid}", auth=AUTH).text
+    base = title.split(" · ")[0].replace("&", "&amp;").replace("'", "&#39;")
+    assert base in list_html and base in page
+    assert fid in page  # the file id stays, as the small label
