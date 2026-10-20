@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{# B-16 part 2: the old Strategies from the fund, moved here from Home unchanged: Archived, Test accounts and Previous
+   book. Each keeps its links to its Strategy page and journal; nothing is deleted. Built Strategies put away from
+   research are under Strategy, Archived. #}
+{% from "_macros.html" import chip, test_chip, signed %}
+{% block title %}History · Multi-Strategy Fund{% endblock %}
+{% block content %}
+<div class="page-head">
+  <h1>History</h1>
+  <p class="lede">Old Strategies from the fund, kept with their history. Built Strategies you archived are under <a href="/strategy/archived">Strategy, Archived</a>.</p>
+</div>
+
+{% if not (archived or tests or earlier) %}<section class="panel"><p class="empty">No old Strategies: every Strategy is on the fund.</p></section>{% endif %}
+
+{% if archived %}
+<details class="panel archived" id="archived" open>
+  <summary><strong>Archived strategies ({{ archived|length }})</strong> <span class="muted">stopped and put away; none of the fund's book is theirs any more{% set kept = (still_counted|length) + (waiting_flat|length) + (nothing_out|length) %}{% if kept %}, apart from {{ kept }} still in it{% if waiting_flat %} ({{ waiting_flat|length }} waiting to go flat){% endif %}{% endif %}</span></summary>
+  <ul class="feed" style="margin-top:10px">{% for x in archived %}{% set s = x.sleeve %}
+    <li><span class="when">{{ x.equity|money }}</span><span class="what"><a href="/sleeves/{{ s.name }}">{{ s.name }}</a>{% if s.name in waiting_flat %} <span class="warn">waiting to go flat: {{ waiting_flat[s.name] }}</span>{% elif s.name in leaving %} <span class="{{ 'warn' if leaving[s.name] else 'muted' }}">{{ leaving[s.name] or 'leaving the fund\'s book at the supervisor\'s next mark' }}</span>{% elif s.name in nothing_out %} <span class="muted">nothing to withdraw (equity {{ nothing_out[s.name]|money }})</span>{% endif %} <span class="muted">{{ s.instrument }} · {{ s.strategy|replace('_', ' ') }} · {{ signed(x.ret) }} since start</span></span></li>{% endfor %}
+  </ul>
+</details>
+{% endif %}
+
+{% if tests %}
+<details class="panel archived" id="test-accounts" open>
+  <summary><strong>Test accounts ({{ tests|length }})</strong> <span class="muted">strategies on a test account, outside the fund's book: left out of its equity, P&amp;L and open risk, as the limits leave them out, and never Strategy evidence. Their positions show under Positions, marked as not counted.</span></summary>
+  <ul class="feed" style="margin-top:10px">{% for x in tests %}{% set s = x.sleeve %}
+    <li><span class="when">{{ x.equity|money }}</span><span class="what"><a href="/sleeves/{{ s.name }}">{{ s.name }}</a> {{ chip(s.status) }} {{ test_chip() }} <span class="muted">{{ s.instrument }} · {{ s.strategy|replace('_', ' ') }} · {{ signed(x.ret) }} since start</span></span></li>{% endfor %}
+  </ul>
+</details>
+{% endif %}
+
+{% if earlier %}
+<details class="panel archived" id="previous-book" open>
+  <summary><strong>Previous book ({{ earlier|length }})</strong> <span class="muted">put away {% if book_start %}when a new book began on {{ book_start.strftime('%d %b %Y') }}{% if earlier_resets %} or by a strategy reset{% endif %}{% else %}by a strategy reset{% endif %}; kept with their history, and left out of this book's figures</span></summary>
+  <ul class="feed" style="margin-top:10px">{% for s in earlier %}
+    <li><span class="what"><a href="/sleeves/{{ s.name }}">{{ s.name }}</a> <span class="muted">{{ s.instrument }} · {{ s.strategy|replace('_', ' ') }}</span></span></li>{% endfor %}
+  </ul>
+</details>
+{% endif %}
+{% endblock %}

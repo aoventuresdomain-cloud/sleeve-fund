@@ -1302,6 +1302,19 @@ def create_app(store: Store | None = None) -> FastAPI:
     strategy_area.register(app, page=page, st=st, tearsheets=lambda: TEARSHEETS, stored_history=_stored_history,
                            venue_choices=venue_choices, research_venue=_research_venue)
 
+    @app.get("/history", response_class=HTMLResponse)
+    def history(request: Request, _: str = Depends(require_pm)):
+        """B-16 part 2: the old Strategies put away from the fund (Archived, Test accounts, Previous book), as Home
+        listed them, each linking to its Strategy page and journal. Read only; nothing is deleted or moved."""
+        _, frames, summaries, tests = shown_book()
+        put_away = st().archived()
+        earlier = st().previous_book()
+        return page(request, "history.html",
+                    archived=legs.fold(st(), [x for x in summaries if x["sleeve"].name in put_away], frames),
+                    earlier=[st().sleeve(n) for n in earlier], book_start=st().book_start(),
+                    earlier_resets=bool(set(earlier) & set(st().reset_runs())), tests=tests,
+                    **_archived_now(request, put_away))
+
     @app.get("/research/run")
     @app.get("/research/history")
     def research_form_reloaded(request: Request, venue: str = "", _: str = Depends(require_pm)):

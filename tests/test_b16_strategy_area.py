@@ -154,3 +154,44 @@ def test_pm_only(client):
     c, _ = client
     assert c.get("/strategy").status_code == 401
     assert c.post("/strategy/test", headers=SAME).status_code == 401
+
+
+def _new(c, name):
+    form = {"name": name, "strategy": "trend_filter", "instrument": "BTC/USDT", "venue": "binance", "market": "perp", "bar_spec": "1-HOUR-LAST-INTERNAL",
+            "starting_balance": "5000", "risk_profile": "conservative", "warmup_bars": "0", "p_trend_filter__fast": "10",
+            "p_trend_filter__slow": "30", "reason": "first test"}
+    r = c.post("/sleeves/new", data=form, auth=AUTH, headers=SAME, follow_redirects=False)
+    assert r.status_code == 303 and "error" not in r.headers["location"], r.headers["location"]
+
+
+def test_history_lists_archived_strategies(client):
+    """Part 2: a Strategy archived on the fund (its own route) is listed on History, linking to its page; read only."""
+    c, store = client
+    _new(c, "put-away")
+    store.set_desired_state("put-away", "stopped")
+    r = c.post("/sleeves/put-away/archive", data={"action": "archive", "reason": "done"}, auth=AUTH, headers=SAME,
+               follow_redirects=False)
+    assert r.status_code == 303
+    before = _counts(store)
+    html = c.get("/history", auth=AUTH).text
+    assert "Archived strategies (1)" in html and 'href="/sleeves/put-away"' in html
+    assert '<a href="/history"' in html and "<span>History</span>" in html  # in the main menu
+    assert _counts(store) == before
+    assert c.get("/sleeves/put-away", auth=AUTH).status_code == 200
+
+
+def test_history_lists_the_previous_book(client, tmp_path):
+    from sleeve_fund.supervisor import clear
+
+    c, store = client
+    _new(c, "old-one")
+    path = tmp_path / "clear.toml"
+    path.write_text('[[clear]]\nid = "2026-10-04"\nreason = "new book"\n')
+    clear(store, str(path))
+    html = c.get("/history", auth=AUTH).text
+    assert "Previous book (1)" in html and 'href="/sleeves/old-one"' in html
+
+
+def test_history_page_empty(client):
+    c, _ = client
+    assert "No old Strategies" in c.get("/history", auth=AUTH).text
