@@ -453,7 +453,8 @@ def test_b14s_a_target_the_venue_takes_ends_the_refusals_in_a_row(refusals, targ
     strat = SimpleNamespace(
         _target_refusals=refusals, _target_order=lambda o: target and o is order,
         cache=SimpleNamespace(order=lambda coid: order), _order_status=lambda e, s: None, runtime=None,
-        _cancel_on_accept=set(), _resize_if_due=lambda: None)
+        _cancel_on_accept=set(), _resize_if_due=lambda: None,
+        _claimed=lambda e: False, _backtest=False)  # TEC-B14-STUBS: what the D3 tree's handler reads first
     LongFlatStrategy.on_order_accepted(strat, SimpleNamespace(client_order_id="T", ts_init=0))
     assert strat._target_refusals == left
 
@@ -602,14 +603,16 @@ def test_b14z_stopping_the_strategy_cancels_its_resting_target_with_every_other_
 # ---- QD's independent pass (for QD3): OFF before and after, and the hunks no cell above held -------------------------
 
 def test_b14aa_off_orders_and_fills_are_byte_identical_to_before_b14_on_both_engines():
-    """With resting targets off, a target path and a stop path give the orders and fills 274ecd88 gave, on the paper
-    replay and the backtest engine (tests/data/golden/b14_off_274ecd88.json, made on 274ecd88 by b14_off_golden)."""
+    """With resting targets off, a target path and a stop path give the orders and fills the tree before B-14 gave, on
+    the paper replay and the backtest engine (tests/data/golden/b14_off_662e8a0b.json, made by b14_off_golden on the D3
+    base 662e8a0b, which has no B-14; TEC-B14AA-REBASE: it differs from b14_off_274ecd88.json, kept, only in B-15's
+    liquidation prices, b14am)."""
     import json
     from pathlib import Path
 
     from b14_off_golden import off_runs
 
-    want = json.loads((Path(__file__).parent / "data" / "golden" / "b14_off_274ecd88.json").read_text())
+    want = json.loads((Path(__file__).parent / "data" / "golden" / "b14_off_662e8a0b.json").read_text())
     got = json.loads(off_runs())
     assert set(got) == {"paper_target", "paper_stop", "backtest_target", "backtest_stop"}
     assert {o["order_type"] for o in got["paper_target"]["orders"] if o["intent"] == "take_profit"} == {"MARKET"}
@@ -692,7 +695,8 @@ def test_b14af_each_refused_target_adds_one_to_the_refusals_in_a_row_the_runtime
     told = []
     strat = SimpleNamespace(
         _benign_reject=lambda e: False, _target_refused=lambda e: True, _target_refusals=0, _target_refused_at=None,
-        _entry_px=60_000.0, _restore_id="T", runtime=SimpleNamespace(on_target_refused=lambda c, m, n: told.append(n)))
+        _entry_px=60_000.0, _restore_id="T", runtime=SimpleNamespace(on_target_refused=lambda c, m, n: told.append(n)),
+        _claimed=lambda e: False, _backtest=False, _cfg=SimpleNamespace())  # TEC-B14-STUBS: paper, order client off
     for _ in range(3):
         LongFlatStrategy.on_order_rejected(strat, SimpleNamespace(client_order_id="T", reason="would take liquidity"))
         strat._restore_id = "T"
@@ -794,3 +798,49 @@ def test_b14al_off_survives_a_restart(setting):
         s = store.sleeve(SCENARIO)
         assert not s.params.get("resting_targets")
         check_resting_entries(s)  # the stored settings start as they are: nothing to refuse
+
+
+def test_b14am_the_rebased_off_golden_moves_only_b15s_liquidation_prices_to_the_oracle():
+    """TEC-B14AA-REBASE (HoE/HoQA): against the 274ecd88 golden, the D3 one changes liquidation_px and
+    position_liquidation_px and nothing else (orders, fills, fees and quantities as they were), and each new figure is
+    the B-15 oracle worked here: isolated margin less the entry fee held, the nearer of the maintenance on value and
+    on entry value (VS-1-TABLE), on the instrument's 0.1 tick (the order's nearest, the position's the safer side)."""
+    import json
+    from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_EVEN
+    from pathlib import Path
+
+    golden = Path(__file__).parent / "data" / "golden"
+    old = json.loads((golden / "b14_off_274ecd88.json").read_text())
+    new = json.loads((golden / "b14_off_662e8a0b.json").read_text())
+    LIQ = ("liquidation_px", "position_liquidation_px")
+
+    def without(rows):
+        return [{**r, "signal": {k: v for k, v in (r.get("signal") or {}).items() if k not in LIQ}}
+                if isinstance(r, dict) and "signal" in r else r for r in rows]
+
+    assert set(old) == set(new)
+    for k in old:
+        assert set(old[k]) == set(new[k]), k
+        for part in old[k]:
+            a, b = old[k][part], new[k][part]
+            assert (without(a) == without(b)) if isinstance(a, list) else a == b, (k, part)
+
+    def oracle(q, e, fee, lev=Decimal(2), mm=Decimal("0.005")):  # balanced 2x; test_long_short's 0.5% maintenance
+        q, e, fee = Decimal(str(q)), Decimal(str(e)), Decimal(str(fee))
+        cash = abs(q) * e / lev - fee - q * e
+        on_value, on_entry = cash / (mm * abs(q) - q), (abs(q) * e * mm - cash) / q
+        p = max(on_value, on_entry) if q > 0 else min(on_value, on_entry)
+        tick = Decimal("0.1")
+        return float(p.quantize(tick, ROUND_HALF_EVEN)), float(p.quantize(tick, ROUND_CEILING if q > 0 else ROUND_FLOOR))
+
+    for k in ("paper_target", "paper_stop"):
+        filled = [o for o in new[k]["orders"] if Decimal(str(o["filled_qty"]))]  # the golden keeps them as text
+        entries = [o for o in filled if o["intent"] == "entry"]
+        for entry in entries:
+            q = Decimal(str(entry["filled_qty"])) * (1 if entry["side"] == "BUY" else -1)
+            nearest, safer = oracle(q, entry["avg_px"], entry["fee"])
+            assert (entry["signal"]["liquidation_px"], entry["signal"]["position_liquidation_px"]) == (nearest, safer)
+            exit_ = filled[filled.index(entry) + 1]
+            assert exit_["signal"]["liquidation_px"] == safer
+    assert [o["signal"]["liquidation_px"] for o in new["paper_target"]["orders"] if "liquidation_px" in o["signal"]] == [
+        30330.0, 30330.1, 90460.2, 90460.1]
