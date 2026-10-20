@@ -59,3 +59,16 @@ def test_a_changed_tables_liquidation_takes_the_entry_fee_off_the_margin_and_rou
     without = markets.isolated_liquidation(cash, qty, 60_000.0, 3.0, table)
     assert side * (want - without) > 0  # the fee moves it nearer the entry: the cell can tell the two apart
     assert _held(store, side)(cash, qty) == pytest.approx(want, abs=1e-9)
+
+
+@pytest.mark.parametrize("liq, qty, want", [
+    (30000.00000001, 1.0, 30000.0),   # a long a hair above a tick: float noise, the tick itself, not 30000.1
+    (29999.99999999, -1.0, 30000.0),  # a short a hair below: the tick itself, not 29999.9
+    (30000.02, 1.0, 30000.1),         # a real step off the grid: toward the entry, up for a long
+    (30000.08, -1.0, 30000.0),        # and down for a short
+])
+def test_to_tick_takes_float_noise_as_the_tick_and_rounds_a_real_step_toward_the_entry(liq, qty, want):
+    """CR (HoE ask): the snap in margin.to_tick. Written-out prices on a 0.1 tick."""
+    from sleeve_fund.margin import to_tick
+
+    assert to_tick(liq, qty, 0.1) == want
