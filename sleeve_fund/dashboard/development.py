@@ -273,7 +273,7 @@ _BREAKEVEN = re.compile(r"^\*\*Break-even fee:\*\* (.+?)\.?$", re.M)
 _ABOUT = re.compile(r"about ([\d.]+)% per side")
 # B-22: the stored re-run at exactly 2x the venue's fees ("**Profitable at double fees:** PASS, net +3.1% over ..."),
 # written by the research side; the page shows it and never works it out. Absent on every older sheet.
-_DOUBLE_FEES = re.compile(r"^\*\*Profitable at double fees:\*\* (PASS|FAIL), net ([+-][\d.]+%)", re.M)
+_DOUBLE_FEES = re.compile(r"^\*\*Profitable at double fees:\*\* (?:(PASS|FAIL), net ([+-]\d+\.\d%) over the out-of-sample period at 2x the venue's fees \(|(not tested):)", re.M)
 _OOS = re.compile(r"^\| Walk-forward out-of-sample \((\d+) folds?, (\d+) days\) \| ([^|]+)\| ([^|]+)\| ([^|]+)\| ([^|]+)\|",
                   re.M)
 _TRADES = re.compile(r"^\| Enough out-of-sample trades to judge \| [^|]+ \| (?:not judged: )?(\d+) closed", re.M)
@@ -304,10 +304,12 @@ def verdict_word(g1: str | None) -> tuple[str, str]:
 
 
 def double_fees(text: str) -> dict | None:
-    """The sheet's stored 2x-fee result as {"verdict": "PASS" | "FAIL", "net": "+3.1%"}, or None when it has none
-    ("not run")."""
+    """The sheet's stored 2x-fee result as {"verdict": "PASS" | "FAIL", "net": "+3.1%"}, {"verdict": "NOT TESTED"}
+    when the study had no out-of-sample window to re-run, or None when the sheet has no such line ("not run")."""
     m = _DOUBLE_FEES.search(text)
-    return {"verdict": m.group(1), "net": m.group(2)} if m else None
+    if not m:
+        return None
+    return {"verdict": "NOT TESTED", "net": None} if m.group(3) else {"verdict": m.group(1), "net": m.group(2)}
 
 
 def read_sheet(path: Path) -> dict:

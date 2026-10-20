@@ -13,7 +13,9 @@ from test_development import (  # noqa: F401  (the fixtures' sheet writer and th
 
 from sleeve_fund.dashboard import development as dev
 
-STUB_LINE = "**Profitable at double fees:** {verdict}, net {net} over the out-of-sample period at 2x the venue's fees (0.04% maker, 0.10% taker).\n"
+STUB_LINE = ("**Profitable at double fees:** {verdict}, net {net} over the out-of-sample period at 2x the venue's fees "
+             "(0.04% maker, 0.11% taker; 90 days, 41 round trips; at the venue's fees +4.0%)\n")
+NOT_TESTED = "**Profitable at double fees:** not tested: no out-of-sample window chose settings to re-run\n"
 
 
 def _with(tmp_path, verdict=None, net="+3.1%", name="b22"):
@@ -50,3 +52,11 @@ def test_pages_say_not_run_when_the_sheet_has_no_result(client, tmp_path):  # no
     _with(tmp_path)
     html = c.get("/results/b22", auth=AUTH).text
     assert "2× fees: not run" in html and "Profitable at 2× fees" not in html
+
+
+def test_not_tested_line_is_its_own_state(client, tmp_path):  # noqa: F811
+    c, _, _ = client
+    (tmp_path / "b22.md").write_text(_sheet() + "\n" + NOT_TESTED, encoding="utf-8")
+    assert dev.double_fees(NOT_TESTED) == {"verdict": "NOT TESTED", "net": None}
+    html = c.get("/results/b22", auth=AUTH).text
+    assert "2× fees: not tested" in html and "not run" not in html.split('id="double-fees"')[1].split("</p>")[0]

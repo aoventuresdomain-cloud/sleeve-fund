@@ -1,3 +1,3 @@
 {# B-22: the stored re-run at 2x the venue's fees, beside the break-even fee; "not run" when the sheet has none. #}
 {% set df = s.get('double_fees') %}
-{% if df %}<span class="{{ 'gain' if df.verdict == 'PASS' else 'loss' }}">{{ 'Profitable' if df.verdict == 'PASS' else 'Not profitable' }} at 2× fees</span>, net {{ df.net }}{% else %}<span class="muted">2× fees: not run</span>{% endif %}
+{% if df and df.verdict == 'NOT TESTED' %}<span class="muted">2× fees: not tested</span>{% elif df %}<span class="{{ 'gain' if df.verdict == 'PASS' else 'loss' }}">{{ 'Profitable' if df.verdict == 'PASS' else 'Not profitable' }} at 2× fees</span>, net {{ df.net }}{% else %}<span class="muted">2× fees: not run</span>{% endif %}
