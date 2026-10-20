@@ -259,7 +259,7 @@ def day_open(store: Store, now=None, day_pnl=None) -> dict | None:
     from 00:00 UTC, shown in UK time. A display and check only: the T5 brake keeps day_figure's scaled start.
     day_pnl: Home's day P&L (the Strategies' sum). Z more than 1 USDT from it is unreconciled (a cost or flow booked
     outside the Strategies): shown, and journaled as a warning once a UTC day. None before the first mark.
-    shortcut: read from the minute marks, kept whole today; if they are ever thinned within a day, a column (option 1)."""
+    shortcut: read from the minute marks, kept whole today; if ever thinned within a day, a column (option 1)."""
     from datetime import timedelta
     from zoneinfo import ZoneInfo
 
@@ -272,8 +272,10 @@ def day_open(store: Store, now=None, day_pnl=None) -> dict | None:
     if first is None or last is None:
         return None
     since, upto = _utc(first["ts"]), _utc(last["ts"])
+    # [since, upto): the poll writes its mark first and lands its flows after it at the same ts, so a flow at a mark's
+    # own ts is in the next mark's equity, not that one's. A pending flow (no applied_at) is in neither.
     flows = sum((Decimal(str(f["amount"])) * (-1 if f["kind"] == "withdraw" else 1) for f in store.fund_flows()
-                 if f["applied_at"] is not None and since < _utc(f["applied_at"]) <= upto), Decimal(0))
+                 if f["applied_at"] is not None and since <= _utc(f["applied_at"]) < upto), Decimal(0))
     pnl = Decimal(str(last["equity"])) - Decimal(str(first["equity"])) - flows
     uk = ZoneInfo("Europe/London")
     gap = opened - since > timedelta(minutes=1)
