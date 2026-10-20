@@ -97,3 +97,64 @@ def test_the_page_reads_the_pauses_function_never_its_own_sum(monkeypatch):
     monkeypatch.setattr(page, "_gate_book", lambda store: (Book(equity=st.equity), st))
     monkeypatch.setattr(page, "day_return", lambda equity, day_start: D("-0.0123"))
     assert page.use_now(None, {})["fund_day_loss"]["used"] == D("0.0123")
+
+
+def test_after_a_day_pause_rebase_the_label_says_since_when_and_the_figure_is_the_brakes():
+    """Advisor (B) condition: after a B-31 re-base mid-day the figure measures from the re-base, so its label says so;
+    the figure is still the brake's own ratio."""
+    from dataclasses import replace
+
+    from sleeve_fund.portfolio.gate import day_figure
+
+    led, _ = _day(("mark", 98_000))
+    at = OPEN + timedelta(hours=13)  # 14:05 UK
+    st = replace(led.state(), day_start_equity=D(98_000), equity=D(97_000))  # re-based to the book then, then a loss
+    fig = day_figure(st, at + timedelta(hours=1), rebased_at=at)
+    assert fig["label"] == "Today (since re-base at 14:05 UK)"
+    assert fig["value"] == day_return(D(97_000), D(98_000))
+    breach_words = book_breach(PortfolioProfile(daily_loss=0.01), st.equity, st.reference(), st.day_start_equity)
+    assert f"{-fig['value']:.1%}" in breach_words.reason
+    assert day_figure(st, at, rebased_at=at - timedelta(days=1))["label"] == "Today"  # yesterday's re-base: the open
+
+
+def test_on_a_flow_day_the_page_shows_the_pauses_figure_not_the_curves_change():
+    """Advisor condition 2: after a flow the time-weighted figure and the book's money change differ; the page shows
+    the brake's."""
+    from sleeve_fund.portfolio.gate import day_figure
+
+    led, _ = _day(("flow", 10_000), ("mark", 107_000))
+    st = led.state()
+    fig = day_figure(st, OPEN + timedelta(hours=2))
+    money_change = D(107_000) / D(100_000) - 1  # +7%: the deposit read as a gain
+    assert fig["value"] == day_ret(st) and _pct(fig["value"]) == pytest.approx(-0.027273, abs=1e-6)
+    assert fig["value"] != money_change
+
+
+@pytest.mark.parametrize("now, resets", [(datetime(2026, 10, 20, 12, tzinfo=UTC), "01:00 UK"),
+                                         (datetime(2026, 10, 26, 12, tzinfo=UTC), "00:00 UK")])
+def test_the_day_resets_at_00_00_utc_said_in_uk_time_across_the_clock_change(now, resets):
+    """The reset is 00:00 UTC (risk.trading_day): 01:00 UK in summer, 00:00 UK from Sun 25 Oct, worked out, never
+    written as a fixed hour."""
+    from sleeve_fund.portfolio.gate import PortfolioState, day_figure
+
+    assert day_figure(PortfolioState(), now)["resets"] == resets
+
+
+def test_the_pages_today_figure_reads_the_funds_state_and_todays_day_pause_rebase(tmp_path):
+    from sleeve_fund.dashboard.compliance import day_figure
+    from sleeve_fund.gate_ledger import DbLedger
+    from sleeve_fund.portfolio.gate import PortfolioState
+    from sleeve_fund.risk import trading_day
+    from sleeve_fund.store import Store
+
+    store = Store(f"sqlite:///{tmp_path}/d.db", portfolio_gate=True)
+    now = datetime(2026, 10, 20, 15, 0, tzinfo=UTC)
+    DbLedger(store, lambda: ()).set_state(PortfolioState(equity=D(97_000), mark_ts=now, hwm=D(100_000),
+                                                         day=trading_day(now), day_start_equity=D(98_000)))
+    assert day_figure(store, now)["label"] == "Today"
+    store.event(None, "info", "portfolio_brake_rebased", "T5 drawdown halt switched back on: ...", ts=now)
+    assert day_figure(store, now)["label"] == "Today"  # the drawdown's re-base isn't the day's
+    store.event(None, "info", "portfolio_brake_rebased", "T5 daily loss pause switched back on: ...",
+                ts=now - timedelta(minutes=30))
+    fig = day_figure(store, now)
+    assert fig["label"] == "Today (since re-base at 15:30 UK)" and fig["value"] == day_return(D(97_000), D(98_000))

@@ -464,6 +464,20 @@ def day_ret(state: PortfolioState) -> Decimal | None:
     return None if state.day is None else day_return(state.equity, state.day_start_equity)
 
 
+def day_figure(state: PortfolioState, now: datetime, rebased_at: datetime | None = None) -> dict:
+    """What a page shows for today (DAY-RET): the pause's own figure (day_ret), its label, and when the day resets in
+    UK time, worked out from the reset (00:00 UTC), never written as a fixed hour: 01:00 UK in summer, 00:00 UK from
+    Sun 25 Oct. rebased_at: a T5 day pause switched back on today (B-31 re-base); the figure then measures from that,
+    and the label says so (Advisor DAY-RET (B) condition)."""
+    from zoneinfo import ZoneInfo
+
+    uk = ZoneInfo("Europe/London")
+    today = state.day is not None and rebased_at is not None and trading_day(rebased_at) == state.day
+    return {"value": day_ret(state),
+            "label": f"Today (since re-base at {rebased_at.astimezone(uk):%H:%M} UK)" if today else "Today",
+            "resets": f"{next_utc_midnight(now).astimezone(uk):%H:%M} UK"}
+
+
 def resume_after_halt(ledger: Ledger) -> PortfolioState:
     """The PM's Resume after a portfolio halt: clears it and re-bases the halt's reference to the book now, so it
     doesn't fire again at once; the next halt is the drawdown limit below this. A pause for the day stays until

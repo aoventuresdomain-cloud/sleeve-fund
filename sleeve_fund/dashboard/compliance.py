@@ -154,6 +154,22 @@ def use_now(store: Store, groups: dict[str, str]) -> dict:
     return {"source": "gate", **{k: {"used": share, "what": what} for k, (share, what) in used.items()}}
 
 
+def day_figure(store: Store, now=None) -> dict:
+    """Today's return for the pages (DAY-RET): gate.day_figure on the fund's state, with today's T5 re-base if any
+    (portfolio_brake_rebased). FE shows this; it never works the figure out again."""
+    from sleeve_fund.gate_ledger import DbLedger
+    from sleeve_fund.portfolio.gate import day_figure as figure
+    from sleeve_fund.store import utcnow
+
+    now = now or utcnow()
+    e = next((e for e in store.events(limit=200) if e["kind"] == "portfolio_brake_rebased"
+              and str(e["message"]).startswith("T5 daily loss pause")), None)
+    rebased = e["ts"] if e else None
+    if rebased is not None and rebased.tzinfo is None:
+        rebased = rebased.replace(tzinfo=UTC)
+    return figure(DbLedger(store, lambda: ()).state(), now, rebased)
+
+
 def _tone(used: Decimal, limit: Decimal) -> str:
     return "loss" if used >= limit else "warn" if used >= limit * Decimal(repr(NEAR_LIMIT)) else ""
 
