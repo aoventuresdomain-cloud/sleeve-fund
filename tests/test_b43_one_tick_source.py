@@ -6,6 +6,7 @@ Recorded responses only (tests/data/fee_live)."""
 from __future__ import annotations
 
 import json
+import socket
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,6 +19,34 @@ from sleeve_fund.strategies.base import LongFlatStrategy
 pytestmark = [pytest.mark.no_maintenance_tables, pytest.mark.price_tick_live]
 DATA = Path(__file__).parent / "data" / "fee_live"
 PAPER = venues.venue("BINANCE")
+
+
+KEPT_LOT = (Decimal("0.001"), Decimal("0.001"))
+
+
+@pytest.fixture(autouse=True)
+def no_network(monkeypatch):
+    """HoE (D4 MUST): this file reads ticks as they are (price_tick_live), so nothing stands in for the venue. A test
+    here must never reach it, which CI could: every connection attempt is caught here, swallowed or not, and fails."""
+    tried = []
+
+    def connect(sock, address, *a, **k):
+        tried.append(address)
+        raise OSError(f"no network in tests ({address})")
+
+    monkeypatch.setattr(socket.socket, "connect", connect)
+    monkeypatch.setattr(socket.socket, "connect_ex", connect)
+    yield tried
+    assert not tried, f"a test opened a network connection: {tried}"
+
+
+def test_the_network_guard_catches_a_connection_even_one_the_code_swallows(no_network):
+    try:
+        socket.create_connection(("192.0.2.1", 443), timeout=1)
+    except OSError:
+        pass
+    assert no_network
+    no_network.clear()
 
 
 def _listing(tick="0.10", status="Trading"):
@@ -64,6 +93,7 @@ def test_an_instrument_whose_live_read_fails_takes_the_kept_tick_and_says_so_nev
 
     monkeypatch.setattr(PAPER, "live_tick", down)
     monkeypatch.setattr(PAPER, "contract", None)  # the contract limits unreachable too: nothing else gives a tick
+    monkeypatch.setattr(PAPER, "live_lot", lambda pair: KEPT_LOT)  # B-44's lot read: never the venue
     inst = PAPER.instrument("BTC", "USDT")
     assert inst.price_precision == 1 and float(inst.price_increment) == 0.1
     assert "kept price tick 0.1" in capfd.readouterr().err
@@ -72,6 +102,7 @@ def test_an_instrument_whose_live_read_fails_takes_the_kept_tick_and_says_so_nev
 def test_a_live_tick_that_differs_from_the_kept_one_wins_and_says_so(monkeypatch, capfd):
     monkeypatch.setattr(PAPER, "live_tick", lambda pair: Decimal("0.01"))
     monkeypatch.setattr(PAPER, "contract", lambda pair: {"price_precision": 1, "size_precision": 3})
+    monkeypatch.setattr(PAPER, "live_lot", lambda pair: KEPT_LOT)  # B-44's lot read: never the venue
     inst = PAPER.instrument("BTC", "USDT")
     assert inst.price_precision == 2 and float(inst.price_increment) == 0.01
     assert "live price tick 0.01" in capfd.readouterr().err
