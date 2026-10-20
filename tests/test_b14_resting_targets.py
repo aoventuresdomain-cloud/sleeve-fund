@@ -597,3 +597,175 @@ def test_b14z_stopping_the_strategy_cancels_its_resting_target_with_every_other_
                             cancel_all_orders=lambda iid: calls.append(("cancel all", iid)))
     LongFlatStrategy.on_stop(strat)
     assert ("cancel all", "I") in calls
+
+
+# ---- QD's independent pass (for QD3): OFF before and after, and the hunks no cell above held -------------------------
+
+def test_b14aa_off_orders_and_fills_are_byte_identical_to_before_b14_on_both_engines():
+    """With resting targets off, a target path and a stop path give the orders and fills 274ecd88 gave, on the paper
+    replay and the backtest engine (tests/data/golden/b14_off_274ecd88.json, made on 274ecd88 by b14_off_golden)."""
+    import json
+    from pathlib import Path
+
+    from b14_off_golden import off_runs
+
+    want = json.loads((Path(__file__).parent / "data" / "golden" / "b14_off_274ecd88.json").read_text())
+    got = json.loads(off_runs())
+    assert set(got) == {"paper_target", "paper_stop", "backtest_target", "backtest_stop"}
+    assert {o["order_type"] for o in got["paper_target"]["orders"] if o["intent"] == "take_profit"} == {"MARKET"}
+    assert any(o["intent"] == "stop_loss" and o["order_type"] == "MARKET" for o in got["paper_stop"]["orders"])
+    assert "take_profit" in got["backtest_target"]["intents"] and "stop_loss" in got["backtest_stop"]["intents"]
+    for k in want:
+        assert got[k] == want[k], k
+
+
+@pytest.mark.parametrize("bid, ask, last, through", [(60_599.9, 60_600.0, None, False),  # only the ask at the level
+                                                     (60_600.0, 60_600.1, None, True),  # the bid at it: post-only takes
+                                                     (None, None, 60_600.0, True),  # unquoted: the last trade at it
+                                                     (None, None, 60_599.9, False)])
+def test_b14ab_a_long_targets_level_is_judged_against_the_bid_at_or_through_it(bid, ask, last, through):
+    """A long's target sells: a post-only sell at the level takes liquidity once the best bid is at or above it (the
+    ask alone there leaves it resting). A short's buys against the ask."""
+    from sleeve_fund.strategies.base import LongFlatStrategy
+
+    strat = SimpleNamespace(_bid=bid, _ask=ask, _last_close=last)
+    assert LongFlatStrategy._through_target(strat, 60_600.0, 1) is through
+    short = SimpleNamespace(_bid=59_399.9 if bid else None, _ask=59_400.0 if ask else None,
+                            _last_close=last and 59_400.0)
+    assert LongFlatStrategy._through_target(short, 59_400.0, -1) is (bool(ask) or bool(last))
+
+
+@pytest.mark.parametrize("intent, refused", [("take_profit", True), ("entry", False), ("exit", False)])
+def test_b14ac_only_a_refused_resting_target_counts_as_one_never_a_maker_entry(intent, refused):
+    """A post-only maker entry refused is a refused entry as before, never one of the targets' refusals in a row."""
+    from nautilus_trader.model import OrderType
+
+    from sleeve_fund.strategies.base import LongFlatStrategy
+
+    order = SimpleNamespace(order_type=OrderType.LIMIT)
+    strat = SimpleNamespace(_resting_targets=lambda: True, runtime=object(),
+                            cache=SimpleNamespace(order=lambda c: order),
+                            decisions={"T": {"intent": intent}})
+    assert LongFlatStrategy._target_refused(strat, SimpleNamespace(client_order_id="T")) is refused
+
+
+def _watching(price, since):
+    from sleeve_fund.strategies.base import LongFlatStrategy
+
+    sent = []
+    strat = SimpleNamespace(
+        _safety_pending=None, _stop_frac=None, _tp_frac=0.01, _entry_px=60_000.0, _busy=lambda: False, _backtest=False,
+        _restore=None, _entry_side=1, _backstop_since=None, _target_since=since, _target_waits=lambda p, s: False,
+        log=SimpleNamespace(info=lambda m: None), runtime=None, _margin=False, _lock_exit_leg=lambda s: None,
+        _exit_at_market=lambda *a: sent.append(a[0]))
+    return LongFlatStrategy._check_exits(strat, price), strat, sent
+
+
+@pytest.mark.parametrize("price, closes", [(60_500.0, False), (60_700.0, True)])
+def test_b14ad_an_unanswered_targets_grace_ends_with_the_trade_through_and_with_the_close(price, closes):
+    """Back below the level, the grace counts again from the next trade through; and the watched target's close ends
+    it, so the next position's target gets its own grace, never one already used up."""
+    sent, strat, closed = _watching(price, since=5)
+    assert sent is closes and closed == (["take_profit"] if closes else [])
+    assert strat._target_since is None
+
+
+def test_b14ae_a_maker_entry_on_its_way_still_holds_up_the_watched_exits():
+    """Only the resting target is left out of _busy: a post-only entry (a LIMIT too) sent and unanswered is busy."""
+    from nautilus_trader.model import OrderStatus, OrderType
+
+    from sleeve_fund.strategies.base import LongFlatStrategy
+
+    order = SimpleNamespace(client_order_id="E", status=OrderStatus.SUBMITTED, is_closed=False,
+                            order_type=OrderType.LIMIT)
+    strat = SimpleNamespace(
+        _risk_stop_id=None, strategy_id="S", _cfg=SimpleNamespace(instrument_id="I"), _unsent=lambda: [],
+        cache=SimpleNamespace(orders_inflight=lambda **k: [order], orders_open=lambda **k: []),
+        _resting_targets=lambda: True, decisions={"E": {"intent": "entry"}}, _targets_lost=set())
+    strat._target_order = lambda o: LongFlatStrategy._target_order(strat, o)
+    assert LongFlatStrategy._busy(strat) is True
+
+
+def test_b14af_each_refused_target_adds_one_to_the_refusals_in_a_row_the_runtime_alerts_on():
+    from sleeve_fund.strategies.base import LongFlatStrategy
+
+    told = []
+    strat = SimpleNamespace(
+        _benign_reject=lambda e: False, _target_refused=lambda e: True, _target_refusals=0, _target_refused_at=None,
+        _entry_px=60_000.0, _restore_id="T", runtime=SimpleNamespace(on_target_refused=lambda c, m, n: told.append(n)))
+    for _ in range(3):
+        LongFlatStrategy.on_order_rejected(strat, SimpleNamespace(client_order_id="T", reason="would take liquidity"))
+        strat._restore_id = "T"
+    assert told == [1, 2, 3] and strat._target_refusals == 3 and strat._target_refused_at == 60_000.0
+
+
+def test_b14ag_a_target_still_to_place_beside_a_resting_stop_is_placed_and_the_stop_resized():
+    """With A1's stop resting and no target yet (one through its level when the position opened), the target is
+    placed for the position as it is now; the stop is left to its own resize."""
+    from sleeve_fund.strategies.base import LongFlatStrategy
+
+    calls = []
+    stop = object()
+    strat = SimpleNamespace(
+        _cfg=SimpleNamespace(), _backtest=False, _resting_stops=lambda: True, _resting_targets=lambda: True,
+        _stop_frac=0.01, _tp_frac=0.02, _target_refused_at=None, _entry_px=60_000.0, _exits_only=False,
+        runtime=SimpleNamespace(status="running"), _resting_exits=lambda: {"stop_loss": stop},
+        _place_exits=lambda plan: calls.append(("place", plan)), clock=SimpleNamespace(timestamp_ns=lambda: 7),
+        _resized_ns=None, _resize_exits=lambda resting, plan: calls.append(("resize", resting, plan)))
+    LongFlatStrategy._rest_exits(strat)
+    assert calls == [("place", {"take_profit": 0.02}),
+                     ("resize", {"stop_loss": stop}, {"stop_loss": 0.01, "take_profit": 0.02})]
+
+
+@pytest.mark.parametrize("through", [True, False])
+def test_b14ah_a_price_already_through_the_level_places_no_resting_target(through):
+    from nautilus_trader.model import OrderSide
+
+    from sleeve_fund.strategies.base import LongFlatStrategy
+
+    judged, sent = [], []
+    strat = SimpleNamespace(
+        _cfg=SimpleNamespace(instrument_id="I"), _position_qty=lambda free=False: Decimal("0.1"),
+        _lot=lambda: Decimal("0.00000001"), _min_qty=lambda: Decimal("0.00000001"),
+        instrument=SimpleNamespace(size_precision=8, price_precision=1), _entry_side=1, _entry_px=60_000.0,
+        clock=SimpleNamespace(timestamp_ns=lambda: 7), _through_target=lambda lv, s: judged.append((lv, s)) or through,
+        order_factory=SimpleNamespace(limit=lambda **k: SimpleNamespace(client_order_id="T", **k)), decisions={},
+        runtime=None, _open_target=lambda c: None, _sent=[], submit_order=sent.append)
+    LongFlatStrategy._place_exits(strat, {"take_profit": 0.01})
+    assert judged == [(pytest.approx(60_600.0), 1)]
+    assert [(o.order_side, o.price.as_double()) for o in sent] == ([] if through else [(OrderSide.SELL, 60_600.0)])
+
+
+@pytest.mark.parametrize("intent, journaled", [("take_profit", True), ("stop_loss", True), ("entry", False)])
+def test_b14ai_the_venue_resizing_a_resting_target_journals_its_new_quantity(intent, journaled):
+    from sleeve_fund.strategies.base import LongFlatStrategy
+
+    rows = []
+    store = SimpleNamespace(update_order=lambda c, **k: rows.append((c, k)))
+    strat = SimpleNamespace(_resizing={}, decisions={"T": {"intent": intent}}, _resize_if_due=lambda: None,
+                            runtime=SimpleNamespace(store=store))
+    LongFlatStrategy.on_order_updated(strat, SimpleNamespace(client_order_id="T",
+                                                             quantity=SimpleNamespace(as_double=lambda: 0.08)))
+    assert rows == ([("T", {"qty": 0.08, "message": None})] if journaled else [])
+
+
+@pytest.mark.parametrize("targets, stops, rests", [(True, False, True), (False, True, True), (False, False, False)])
+def test_b14aj_a_resize_left_due_is_done_with_resting_targets_alone(targets, stops, rests):
+    from sleeve_fund.strategies.base import LongFlatStrategy
+
+    calls = []
+    strat = SimpleNamespace(_resize_due=True, _backtest=False, _resting_stops=lambda: stops,
+                            _resting_targets=lambda: targets, _pending_exit=None, _rest_exits=lambda: calls.append(1))
+    LongFlatStrategy._resize_if_due(strat)
+    assert (calls == [1]) is rests and strat._resize_due is not rests
+
+
+def test_b14ak_a_refused_target_is_marked_rejected_and_benign_on_its_row():
+    from sleeve_fund.paper.runtime import BENIGN_REJECT, SleeveRuntime
+
+    rows, signals = [], []
+    store = SimpleNamespace(update_order=lambda oid, **k: rows.append((oid, k["status"])),
+                            merge_order_signal=lambda oid, sig: signals.append((oid, sig)),
+                            event=lambda *a, **k: None)
+    SleeveRuntime.on_target_refused(SimpleNamespace(store=store, name=NAME, now=lambda: None), "T", "post-only", 1)
+    assert rows == [("T", "rejected")] and signals == [("T", {BENIGN_REJECT: True})]
