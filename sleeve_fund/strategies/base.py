@@ -3840,6 +3840,13 @@ class LongFlatStrategy(Strategy):
                                    bar=timedelta(minutes=bar_minutes(self._cfg.bar_type)),
                                    now=_utc(self.clock.timestamp_ns()), min_lead=lead or timedelta(0))
 
+    def _cancel_all_but_exits(self) -> None:
+        """A reconcile halt: every open order but the resting stop-loss and target is cancelled, by its client id (the
+        framework's cancel takes the id: an order passed in raised and left the entry resting, B-40)."""
+        for order in self.cache.orders_open(strategy_id=self.strategy_id):
+            if self.decisions.get(str(order.client_order_id), {}).get("intent") not in EXIT_LEGS:
+                self.cancel_order(order.client_order_id)
+
     def _reconcile_resting(self) -> None:
         """ORPHAN-GUARD og3 at a paper start: the gated entries the journal still has open from before are settled
         (orphan_guard.restart_reconcile): ended with the process before this one where the venue ran in it, asked to
@@ -3851,7 +3858,7 @@ class LongFlatStrategy(Strategy):
         rt = self.runtime
         venue_open = [str(o.client_order_id) for o in self.cache.orders_open(strategy_id=self.strategy_id)]
         restart_reconcile(rt.store, rt.name, _utc(self.clock.timestamp_ns()), venue_open,
-                          send=lambda oid: self.cancel_order(self.cache.order(ClientOrderId(oid))),
+                          send=lambda oid: self.cancel_order(ClientOrderId(oid)),
                           in_process=getattr(rt, "in_process_venue", None),
                           sole_instance=getattr(rt, "sole_instance", None))
 
@@ -6054,9 +6061,7 @@ class LongFlatStrategy(Strategy):
                     # Halted: nothing new trades and nothing is flattened, but a resting stop-loss and target
                     # stay, so the position isn't left unguarded until the PM acts (review round 10, m10-1).
                     self._drop_kept()
-                    for order in self.cache.orders_open(strategy_id=self.strategy_id):
-                        if self.decisions.get(str(order.client_order_id), {}).get("intent") not in EXIT_LEGS:
-                            self.cancel_order(order)
+                    self._cancel_all_but_exits()
             guard, self._guard_equity = self._guard_equity, None
             worst, self._guard_price = self._guard_price, None
             if self._margin and qty != 0:
