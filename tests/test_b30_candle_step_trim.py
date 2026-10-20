@@ -93,3 +93,40 @@ def test_restart_reads_the_sent_q_from_the_journal(tmp_path, monkeypatch):
     m.resume_cycle()
     assert m._resumed is not None and m._resumed[1] == D(str(entry["qty"])), (m._resumed, entry["qty"])
 
+
+
+@pytest.mark.parametrize("how", ["not_submitted", "under_the_venue_minimum"])
+def test_a_step_0_that_is_never_sent_sets_no_q_and_the_cycle_opens_nothing(tmp_path, monkeypatch, how):
+    """CR follow-up on B-30: an entry refused at _submit (CHOKE) or left under the venue minimum after the gate tells
+    the model nothing. Were Q set anyway, step 2 ("sell the rest and short Q") would open a short of Q on a book that
+    never went long. The next cycle sizes afresh from flat."""
+    from sleeve_fund.strategies.base import LongFlatStrategy
+
+    refused: list[int] = []
+    if how == "not_submitted":
+        real = LongFlatStrategy._submit
+
+        def submit(self, side, qty, intent, reason, signal, *a, **k):
+            if intent == "entry" and signal.get("step") == 0 and not refused:
+                refused.append(signal["cycle"])
+                return False  # as a CHOKE refusal: nothing sent
+            return real(self, side, qty, intent, reason, signal, *a, **k)
+
+        monkeypatch.setattr(LongFlatStrategy, "_submit", submit)
+    else:
+        real = LongFlatStrategy._under_min_notional
+
+        def under(self, approved, intent):
+            if not refused:
+                refused.append(self._plan.cycle)
+                return (D(1), D(100))  # as F-TRIM-MIN: what is left is under the venue's smallest order value
+            return real(self, approved, intent)
+
+        monkeypatch.setattr(LongFlatStrategy, "_under_min_notional", under)
+    rows, _ = _run(tmp_path, monkeypatch, minutes=15)
+    assert refused, "set-up: no step 0 was refused"
+    in_cycle = [(o["signal"]["step"], o["intent"], o["side"]) for o in rows if o["signal"]["cycle"] == refused[0]]
+    assert in_cycle == [], in_cycle  # no Q: steps 1-5 of that cycle ask for nothing, so no short on a flat book
+    later = [o for o in rows if o["signal"]["cycle"] > refused[0]]
+    assert later and later[0]["intent"] == "entry" and later[0]["signal"]["step"] == 0, \
+        [(o["signal"]["cycle"], o["signal"]["step"], o["intent"]) for o in rows]
