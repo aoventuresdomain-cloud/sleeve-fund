@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 
 from sleeve_fund import compliance_rules as rules
 from sleeve_fund.dashboard.riskops import NEAR_LIMIT
+from sleeve_fund.portfolio.limits import day_return
 from sleeve_fund.store import Store
 
 UK = ZoneInfo("Europe/London")
@@ -146,10 +147,28 @@ def use_now(store: Store, groups: dict[str, str]) -> dict:
         "fund_gross": (book.gross() / eq, ""),
         "asset_net": (net / eq, net_asset),
         "fund_margin": (book.margin() / eq, ""),
-        "fund_day_loss": (max(Decimal(0), 1 - eq / day_start) if day_start else Decimal(0), ""),
+        # DAY-RET: the daily pause's own figure (limits.day_return), never worked out again here
+        "fund_day_loss": (max(Decimal(0), -(day_return(eq, day_start) or Decimal(0))), ""),
         "fund_drawdown": (max(Decimal(0), 1 - eq / reference) if reference else Decimal(0), ""),
     }
     return {"source": "gate", **{k: {"used": share, "what": what} for k, (share, what) in used.items()}}
+
+
+def day_figure(store: Store, now=None) -> dict:
+    """Today's return for the pages (DAY-RET): gate.day_figure on the fund's state, with today's T5 re-base if any
+    (portfolio_brake_rebased). FE shows this; it never works the figure out again."""
+    from sleeve_fund.gate_ledger import DbLedger
+    from sleeve_fund.portfolio.gate import day_figure as figure
+    from sleeve_fund.store import utcnow
+
+    now = now or utcnow()
+    # by kind, so a busy day's other events never push it out; gate.day_figure drops one from before today's open
+    e = next((e for e in store.events_of(("portfolio_brake_rebased",), limit=20)
+              if str(e["message"]).startswith("T5 daily loss pause")), None)
+    rebased = e["ts"] if e else None
+    if rebased is not None and rebased.tzinfo is None:
+        rebased = rebased.replace(tzinfo=UTC)
+    return figure(DbLedger(store, lambda: ()).state(), now, rebased)
 
 
 def _tone(used: Decimal, limit: Decimal) -> str:
