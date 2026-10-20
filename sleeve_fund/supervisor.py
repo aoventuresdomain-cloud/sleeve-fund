@@ -1347,6 +1347,9 @@ class Supervisor:
         signal.signal(signal.SIGINT, lambda *_: setattr(self, "_stopping", True))
         alerts = Forwarder(self.store)
         self.store.event(None, "info", "supervisor_start", "supervisor started")
+        from sleeve_fund.paper.exec_client import publish
+
+        publish(self.store, os.environ)  # B-31: the brakes' switch reads it, not the dashboard's own environment
         self.store.event(None, "info", "alerts_config", alerts.describe())
         loops, sender = 0, None
         while not self._stopping:

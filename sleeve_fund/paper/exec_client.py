@@ -71,6 +71,40 @@ def exec_settings(environ) -> ExecSettings:
                         secret_var=t.secret_var, problems=tuple(exec_target.problems(t)))
 
 
+# B-31 (CR MUST, 20 Oct): the order client's state as the supervisor runs it, published at its start, since only the
+# supervisor is given the client's settings (docker-compose: the dashboard has neither EXEC_MODE nor the venue's keys).
+PUBLISHED = "exec_client"
+
+
+def publish(store, environ) -> None:
+    """The supervisor at its start: the client ON or OFF, as an event other processes read (published_on)."""
+    s = exec_settings(environ)
+    store.event(None, "info", PUBLISHED, f"ON ({s.mode})" if s.on else "OFF")
+
+
+def published_on(store) -> bool | None:
+    """Whether the supervisor said at its last start that the client is on; None when no supervisor has said (unknown,
+    which a guard treats as on)."""
+    e = store.last_event(None, (PUBLISHED,))
+    return None if e is None else not str(e["message"]).startswith("OFF")
+
+
+def client_state(store, environ=None) -> str:
+    """The one reader of whether the exchange order client is on, for every guard that allows a paper-only change (the
+    store's save and the dashboard's page alike, CR MUST 20 Oct): "on", "off" or "unknown". Given an environ, that
+    alone decides (a caller with the client's own settings, and the cells). Without one: the supervisor's word at its
+    last start (published_on), and this process's own settings too, since either being on is on; "unknown" when no
+    supervisor has said, which every guard refuses as it refuses "on"."""
+    import os
+
+    if environ is not None:
+        return "on" if exec_settings(environ).on else "off"
+    said = published_on(store)
+    if said or exec_settings(os.environ).on:
+        return "on"
+    return "unknown" if said is None else "off"
+
+
 def entry_queue_max(environ) -> timedelta:
     """EXEC-SPEC Q1: how long an entry over the limit may wait before it is refused and journaled. Outside 0-10 s it is
     refused at load, never clamped."""

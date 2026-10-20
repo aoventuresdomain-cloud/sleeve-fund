@@ -41,7 +41,7 @@ _RULE = {k: ((r.default, r.low, r.high) if (r := getattr(rules, "BY_KEY", {}).ge
              else (rules.DEFAULTS[k], *rules.BOUNDS[k])) for k in KEY.values()}
 LABELS = {f: rules.LABELS[k] for f, k in KEY.items()}
 BOUNDS = {f: (float(_RULE[k][1]), float(_RULE[k][2])) for f, k in KEY.items()}
-LOCKED = tuple(f for f, k in KEY.items() if k in rules.LOCKED)  # T3 and T5 can't be switched off (BRIDGE-3)
+LOCKED = tuple(f for f, k in KEY.items() if k in rules.LOCKED)  # none since B-31: every test can be switched off (PM)
 # The seeded version 1's tests (PM DEFAULTS-2: T1 4%, T2 6%, T3 10%; T4 and T5 the accepted portfolio limits). Its
 # asset-group map lives with the version in the journal (compliance_rules.DEFAULT_GROUPS), not here.
 SEEDED = replace(PortfolioProfile(), **{f: float(_RULE[k][0]) for f, k in KEY.items()})
