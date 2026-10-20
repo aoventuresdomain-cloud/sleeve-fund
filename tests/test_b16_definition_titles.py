@@ -59,3 +59,22 @@ def test_a_title_is_a_line_of_text(bad):
     defn = {**load_definition_file(DEFS / "qr02_dip_long.toml"), "title": bad}
     with pytest.raises(ValueError, match="title"):
         check_definition(defn)
+
+
+def test_a_rules_strategys_params_keys_ignore_the_title_too():
+    """CR B-16 follow-up: a rules Strategy's params carry its whole definition (to_params), and the run, study,
+    portfolio-member and failed-run keys hash those params; the title stays out of them as well. Params with no
+    titled definition hash as before."""
+    from sleeve_fund.research.trials import failed_row, legacy_definition_hash
+
+    defn = load_definition_file(DEFS / "qr02_dip_long.toml")
+    titled = to_params(defn)
+    untitled = to_params({k: v for k, v in defn.items() if k != "title"})
+    assert titled != untitled
+    setup = {"risk_profile": "balanced", "windows": None, "fee": 0.0006}
+    for s in (None, setup):
+        assert legacy_definition_hash("rules", titled, s) == legacy_definition_hash("rules", untitled, s)
+    assert (failed_row(strategy="rules", params=titled, source="backtest", error="x")["definition_hash"]
+            == failed_row(strategy="rules", params=untitled, source="backtest", error="x")["definition_hash"])
+    plain = {"fast": 10, "slow": 30}
+    assert legacy_definition_hash("trend_filter", plain) == legacy_definition_hash("trend_filter", dict(plain))
