@@ -366,6 +366,7 @@ class LongFlatConfig(StrategyConfig):
         maker_wait_minutes: int | None = None,
         resting_stops: bool = False,
         backstop_grace_ms: int = 1000,
+        max_leverage: float | None = None,
         raced_fill_window_ms: int | None = None,
         max_participation: float | None = MAX_PARTICIPATION,
         volume_scale: float = 1.0,
@@ -517,6 +518,10 @@ class LongFlatConfig(StrategyConfig):
         # A1 (BGL-1): paper rests the stop at the venue as a reduce-only order, as a backtest does, and keeps watching
         # it in the process as a backstop. Built OFF: the supervisor refuses it until the test-network drills pass.
         self.resting_stops = bool(resting_stops)
+        # B-35 (a): the Strategy's own leverage cap on a perpetual, under its risk profile's (risk.capped_leverage):
+        # a number of at least 1x, refused here otherwise, so a bad value never saves or starts
+        risk.check_own_leverage(max_leverage)
+        self.max_leverage = None if max_leverage is None else float(max_leverage)
         # A1 (Advisor b): with a stop resting, the watched level waits this long for the venue's stop to fill before it
         # closes at market itself (none past half the way to liquidation, or for a stop the venue refused).
         if int(backstop_grace_ms) != backstop_grace_ms or not 0 <= backstop_grace_ms <= 3_000:  # Advisor: 3 s at most
@@ -4116,9 +4121,13 @@ class LongFlatStrategy(Strategy):
         return True
 
     def _max_leverage(self) -> float:
-        """The leverage cap this strategy's sizing, isolated margin and liquidation price use: its risk profile's, or a
+        """The leverage cap this strategy's sizing, isolated margin and liquidation price use: its risk profile's (lowered
+        by its own max_leverage, B-35 (a), as risk.leverage_cap), or a
         two-leg Strategy's perp leg's own, never above 2x or the profile's (P2-8, Advisor B; leg_leverage)."""
         profile = self.runtime.profile.max_leverage if self.runtime is not None else 1.0
+        own = getattr(getattr(self, "_cfg", None), "max_leverage", None)  # B-35 (a): the Strategy's own, lower cap
+        if own is not None:
+            profile = min(own, profile)
         leg = getattr(self, "leg_leverage", None)  # called on a test's stand-in strategy too, which has none
         if leg is not None:  # effective: min(the leg's setting, 2x, the profile's cap) (Advisor 05:35 UK)
             return min(leg, 2.0, profile)
