@@ -141,8 +141,10 @@ def test_the_engine_side_is_the_instrument_paper_builds_so_a_contract_that_fails
     assert b8.main([], get=venue_terms, pattern=str(tmp_path / "*.toml")) == 1
     out, err = capfd.readouterr()
     got = {line[15:37].strip(): line for line in out.splitlines() if line.startswith("BTC/USDT")}
-    # B-43 (Advisor): a failed read builds the kept tick, 0.1, never the 2-place default, and says it is the kept one
-    assert got["tick"].endswith("PASS") and "contract limits for BTC/USDT unavailable" in err
+    # B-43 (Advisor): with both the contract limits and the live tick unreadable, paper builds the kept tick, 0.1,
+    # never the 2-place default, and says it is the kept one (CR F1: the engine column reads 0.1)
+    assert got["tick"].split()[-3:] == ["0.10", "0.1", "PASS"], got["tick"]
+    assert "contract limits for BTC/USDT unavailable" in err
     assert "live price tick for BTC/USDT unavailable" in err and "the kept price tick 0.1 is used" in err
     assert got["min quantity"].endswith("MUST")  # no minimum given: paper's is one lot, 0.001, under the venue's 0.01
     assert got["min notional"].endswith("MUST")  # 5 under the venue's 100
