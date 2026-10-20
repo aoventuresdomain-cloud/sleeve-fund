@@ -11,6 +11,7 @@ from __future__ import annotations
 from decimal import Decimal
 from pathlib import Path
 
+from sleeve_fund.data import check_feed_precision
 from sleeve_fund.paper.recorder import read
 
 
@@ -124,6 +125,7 @@ def replay(path: Path | str, with_fills: bool = False, store=None,
                          fee_model=fee_model, fill_model=fill_model())
         engine.add_instrument(instrument)
         data = _data(instrument, rows)
+        check_feed_precision(instrument, data)  # B43-PRECISION (a): refused at load
         engine.add_data(data)
         strategy_cls, config_cls = REGISTRY[s["strategy"]]
         config = config_cls(instrument_id=instrument.id, bar_type=BarType.from_str(f"{instrument.id}-{s['bar_spec']}"),
@@ -198,6 +200,7 @@ def replay_legs(paths: list[Path | str], with_fills: bool = False, store=None, h
                              fee_model=fee_model, fill_model=fill_model())
             engine.add_instrument(instrument)
             data = _data(instrument, rows)
+            check_feed_precision(instrument, data)
             engine.add_data(data)
             strategy_cls, config_cls = REGISTRY[s["strategy"]]
             config = config_cls(instrument_id=instrument.id,

@@ -191,6 +191,28 @@ def decision_bar_type(instrument, minutes: int, exec_minutes: int | None = None)
     return BarType.from_str(str(bt).replace("-EXTERNAL", "-INTERNAL") + "@" + src)
 
 
+class FeedPrecisionError(ValueError):
+    """A feed whose prices carry another precision than the instrument it is fed to (B43-PRECISION (a)): such a feed
+    never fills, so its run is refused at load, never run on silently."""
+
+
+PRICE_FIELDS = ("open", "high", "low", "close", "bid_price", "ask_price", "price")
+
+
+def check_feed_precision(instrument, data) -> None:
+    """B43-PRECISION (a) (HoE, 20 Oct): raises FeedPrecisionError, naming the instrument and both precisions, when any
+    price in `data` (bars, quotes or trades, as handed to the engine) carries another precision than `instrument`'s.
+    The load-time guard for backtest, study and replay starts; the engine's own backstop is separate (QD, (b))."""
+    want = instrument.price_precision
+    for d in data:
+        for name in PRICE_FIELDS:
+            px = getattr(d, name, None)
+            if px is not None and px.precision != want:
+                raise FeedPrecisionError(
+                    f"{instrument.id}: the feed's prices carry {px.precision} decimal places but the instrument's tick "
+                    f"has {want}: refused at load, as orders at another precision never fill")
+
+
 def to_bars(df: pd.DataFrame, instrument, bar_type: BarType | None = None) -> list[Bar]:
     """Build Nautilus bars; each index value is the bar's close time (ts_event)."""
     bar_type = bar_type or daily_bar_type(instrument)
