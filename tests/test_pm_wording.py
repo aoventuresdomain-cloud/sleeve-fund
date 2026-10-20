@@ -104,7 +104,8 @@ def test_the_test_account_strategy_reads_as_outside_the_funds_figures(book):
     """Done-when (4): wherever tst shows, it reads as outside the fund's book, and the book's figures are the fund's."""
     client, _ = book
     home = visible(client.get("/", auth=AUTH).text)
-    assert "outside the fund's book: left out of its equity, P&L and open risk" in home
+    assert "outside the fund's book: left out of its equity, P&L and open risk" in visible(
+        client.get("/history", auth=AUTH).text)  # TEC-B16-HISTORY: the test-accounts panel is on History
     assert "Book value 19,887.78" in home  # trend-btc's alone, not with tst's 2,950
     page = visible(client.get("/sleeves/tst", auth=AUTH).text)
     assert "On a test account, outside the fund's book: its equity, P&L and risk are not in the fund's figures" in page

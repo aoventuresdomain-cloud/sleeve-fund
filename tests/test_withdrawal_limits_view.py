@@ -100,12 +100,13 @@ def test_the_archive_dialog_previews_the_book_and_the_page_after_shows_it(held, 
     assert "Archived b, its equity leaves the fund's book at the supervisor's next mark, which isn't a loss." in home
     assert ("The fund's book will be about <b>10,000.00</b> once b leaves it at the supervisor's next mark. Limits in "
             "use against it:") in home
-    assert '<span class="muted">leaving the fund\'s book at the supervisor\'s next mark</span>' in home
+    assert '<span class="muted">leaving the fund\'s book at the supervisor\'s next mark</span>' in _get(
+        client, "/history")  # TEC-B16-HISTORY: the Archived panel is on History
     assert "Archived b," not in _get(client, "/")  # only right after
     assert "Archived, its equity leaves the fund's book at the supervisor's next mark" in _get(client, "/sleeves/b")
     _mark(held, T0 + timedelta(seconds=5))
     assert "Archived, its equity left the fund's book, which isn't a loss." in _get(client, "/sleeves/b")
-    assert "none of the fund's book is theirs any more</span>" in _get(client, "/")  # TEC-FE-WN2 (HoE)
+    assert "none of the fund's book is theirs any more</span>" in _get(client, "/history")  # TEC-FE-WN2 (HoE)
     r = client.post("/sleeves/b/archive", data={"action": "restore", "reason": "back"}, auth=AUTH, headers=HDR,
                     follow_redirects=False)
     assert r.headers["location"] == "/sleeves/b?put_away=restored"
@@ -119,7 +120,7 @@ def test_an_archive_from_before_the_withdrawal_is_said_to_still_count(held, clie
 
     held.set_desired_state("b", "stopped")
     _archived_before(held, "b")
-    assert "none of the fund's book is theirs any more, apart from 1 still in it<" in _get(client, "/")  # TEC-FE-WN2
+    assert "none of the fund's book is theirs any more, apart from 1 still in it<" in _get(client, "/history")  # TEC-FE-WN2
 
 
 def test_a_retire_shows_the_book_after_it(held, client):
@@ -169,7 +170,7 @@ def test_a_strategy_not_flat_takes_nothing_out_and_shows_as_waiting_to_go_flat(h
     assert (preview["taken"], preview["after"]) == (0, 20_000) and _used(preview)["gross"] == pytest.approx(0.35)
     held.archive("b")
     assert held.withdrawal_pending() == ["b"] and "b" not in held.withdrawn()
-    home = _get(client, "/")
+    home = _get(client, "/history")  # TEC-B16-HISTORY
     assert "waiting to go flat: it holds" in home and "apart from 1 still in it (1 waiting to go flat)" in home
     page = _get(client, "/sleeves/b")
     assert "Archived, waiting to go flat: it holds" in page and "It stays in the fund's book in full until then." in page
@@ -194,7 +195,7 @@ def test_a_strategy_with_nothing_to_withdraw_says_so_and_stays_in_the_book(store
     _poll(store, T0 + timedelta(minutes=1))
     assert store.nothing_withdrawn() == {"b": D(-4)}
     client = TestClient(dash.create_app(store))
-    home = _get(client, "/")
+    home = _get(client, "/history")  # TEC-B16-HISTORY
     assert "nothing to withdraw (equity -4.00)" in home and "apart from 1 still in it<" in home  # TEC-FE-WN2
     assert "Archived, nothing to withdraw (equity -4.00). It stays in the fund's book at that figure." in _get(
         client, "/sleeves/b")
@@ -210,10 +211,10 @@ def test_every_put_away_reads_as_leaving_until_the_poll_and_says_why_when_it_wai
     why = "b is flat, and its equity couldn't leave the fund's book yet: Not done: the fund is paused for the day."
     held.event("b", "warning", "withdrawal_waits", why)
     assert f"which isn't a loss. {why}</p>" in _get(client, "/sleeves/b")  # one full stop
-    assert f'<span class="warn">{why}</span>' in _get(client, "/")
+    assert f'<span class="warn">{why}</span>' in _get(client, "/history")  # TEC-B16-HISTORY
     _mark(held, T0 + timedelta(minutes=2))
     assert "Retired, its equity left the fund's book, which isn't a loss." in _get(client, "/sleeves/b")
-    assert why not in _get(client, "/").split('id="archived"')[1].split("</details>")[0]
+    assert why not in _get(client, "/history").split('id="archived"')[1].split("</details>")[0]
 
 
 def test_a_carried_drawdown_that_cant_be_restored_shows_on_alerts_with_its_figures(client, held):
@@ -284,7 +285,7 @@ def test_portfolios_archived_summary_reads_true_whatever_was_withdrawn(held, cli
                 follow_redirects=False)
     _mark(held, T0 + timedelta(seconds=5))
     monkeypatch.setattr(type(held), "withdrawn", lambda self: {"b": out})
-    home = _get(client, "/")
+    home = _get(client, "/history")  # TEC-B16-HISTORY
     assert "stopped and put away; none of the fund's book is theirs any more</span>" in home
     assert "their equity is out of the fund's book" not in home
 
@@ -317,3 +318,12 @@ def test_a_strategy_put_away_the_instant_the_fund_began_holding_the_cash_left_wi
     page = _get(client, "/sleeves/b")
     assert "Archived, it left with nothing to move: its P&L stays in the fund's cash, which isn't a loss." in page
     assert "its equity left the fund's book" not in page
+
+
+def test_the_home_archive_notice_links_to_history_where_its_row_now_lives(held, client):
+    """TEC-B16-HISTORY (HoE): after archiving, the PM reaches the row's status in one click from the Home notice."""
+    r = client.post("/sleeves/b/archive", data={"action": "archive", "reason": "done with it"}, auth=AUTH,
+                    headers=HDR, follow_redirects=False)
+    banner = _get(client, r.headers["location"]).split('<div class="banner" role="status">Archived b')[1].split("</div>")[0]
+    assert '<a href="/history#archived">See it on History</a>' in banner
+    assert "See it on History" not in _get(client, "/")  # only right after, with the notice
