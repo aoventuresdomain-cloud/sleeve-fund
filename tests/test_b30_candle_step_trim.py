@@ -175,3 +175,42 @@ def test_a_step_0_that_is_never_sent_sets_no_q_and_the_cycle_opens_nothing(tmp_p
     later = [o for o in rows if o["signal"]["cycle"] > refused[0]]
     assert later and later[0]["intent"] == "entry" and later[0]["signal"]["step"] == 0, \
         [(o["signal"]["cycle"], o["signal"]["step"], o["intent"]) for o in rows]
+
+
+
+def _resumed_at_step_3(journaled_steps):
+    """A CandleStep restarted inside a cycle whose journal shows `journaled_steps` acted on: Q 500, the flip's short
+    trimmed to 499.8875 at the gate (QT3's research-engine case), and the step-3 candle's close."""
+    from datetime import UTC, datetime, timedelta
+    from types import SimpleNamespace as NS
+
+    from nautilus_trader.model import BarType
+
+    from sleeve_fund.strategies.candle_step import step_at
+
+    t = datetime(2025, 1, 1, tzinfo=UTC)
+    while step_at(t, 1)[1] != 3:
+        t += timedelta(minutes=1)
+    cycle = step_at(t, 1)[0]
+    filled = {0: 500.0, 1: 250.0, 2: 499.8875, 3: 249.94375}
+    rows = [{"ts": t - timedelta(minutes=3 - k, seconds=-1), "intent": "entry" if k in (0, 2) else "exit",
+             "qty": filled[k], "filled_qty": filled[k], "signal": {"cycle": cycle, "step": k, "q": 500.0}}
+            for k in sorted(journaled_steps, reverse=True)]
+    s = CandleStep.__new__(CandleStep)
+    s._cfg = NS(bar_type=BarType.from_str("BTCUSDT-PERP.BYBIT-1-MINUTE-LAST-INTERNAL"))
+    s.c = NS(run_for_hours=None, size_share=0.6)
+    s._plan = s._started = s._last_q = s._resumed = None
+    s._resumed_legs = {}
+    s.runtime = NS(backtest=False, name="cs", store=NS(orders=lambda name, limit: rows))
+    s.resume_cycle()
+    return s, NS(ts_event=int(t.timestamp() * 1e9))
+
+
+def test_a_restart_recomputes_the_same_cover_half_target():
+    """B-30 (Advisor B30-HELD-SIZE): step 3's target is the short as its open filled (499.8875, from the journal)
+    less half of it, an absolute target: restarted before step 3 it covers 249.94375; the step-3 candle seen again
+    after the cover sends nothing; never down to -Q/2."""
+    before, bar = _resumed_at_step_3({0, 1, 2})
+    assert before.step_orders(bar, D("-499.8875"))[0] == [("reduce", 1, D("249.94375"))]
+    again, bar = _resumed_at_step_3({0, 1, 2, 3})
+    assert again.step_orders(bar, D("-249.94375"))[0] == []

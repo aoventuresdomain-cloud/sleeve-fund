@@ -10,7 +10,10 @@ Each step is an absolute target in units of Q, fixed at step 0 (Advisor: sized f
 with the cycle, reused for the cycle; each open still gated fresh). From what is held, a step asks for:
 - an open (steps 0, 2, 4) to Q on the step's side, a flip as two orders: the close of everything held (never gated),
   then the open; never one double-size order (Advisor MUST);
-- a reduce (steps 1, 3) of what is held above Q/2, never an add, so after a trim at the gate it halves at most.
+- a reduce (steps 1, 3) to its leg less half of it: the leg is what was held when that leg's open filled (step 0's
+  long, step 2's short), so after a trim at the gate it covers half the size actually held, not down to Q/2 (Advisor
+  B30-HELD-SIZE, 20 Oct; the PM's "cover half"). Still an absolute target, never a delta or an add: a step seen again
+  sends nothing. Step 5 waits, reducing only what is held above Q.
 A stop or target inside a cycle makes the rest of it a no-op; the next cycle starts flat at step 0. A step acts once,
 however often its bar is seen. Started mid-cycle, it waits for step 0: it never sizes from a guess. Once the PM's
 run window (run_for_hours, no default) has passed, it closes what it holds and opens nothing.
@@ -23,7 +26,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 
 from nautilus_trader.model import Bar
 
@@ -70,6 +73,7 @@ class Plan:
     run_for_hours: float | None = None
     done: set[int] = field(default_factory=set)
     exited: bool = False
+    legs: dict[int, Decimal] = field(default_factory=dict)  # open step -> the size held once its open filled (B-30)
 
     def __post_init__(self):
         if self.q is not None and self.q <= 0:
@@ -81,15 +85,25 @@ class Plan:
         """A stop or target closed the position inside this cycle: the rest of it is a no-op."""
         self.exited = True
 
-    def orders(self, step: int, held: Decimal) -> list[tuple[str, int, Decimal]]:
+    def leg_filled(self, step: int, held: Decimal) -> None:
+        """An open of step `step` filled, leaving `held` (signed): the size its half step halves."""
+        if step < CYCLE and STEPS[step].opens and held != 0:
+            self.legs[step] = abs(held)
+
+    def orders(self, step: int, held: Decimal, lot: Decimal | None = None) -> list[tuple[str, int, Decimal]]:
         """What step `step` asks for, given the signed quantity held: (kind, side, qty) in the order they go, kind
-        "close", "reduce" (both never gated) or "open" (gated). Empty when it asks for nothing."""
+        "close", "reduce" (both never gated) or "open" (gated). Empty when it asks for nothing. lot: the order step,
+        which a half step's cover rounds down to (never over-closing)."""
         if not 0 <= step < CYCLE:
             raise ValueError(f"step {step} outside 0-{CYCLE - 1}")
         if self.q is None or self.exited:
             return []
         s = STEPS[step]
         want = s.target * self.q
+        leg = self.legs.get(step - 1) if abs(s.target) == HALF else None
+        if leg is not None:  # B30-HELD-SIZE: the leg less half of it, the half rounded down to the lot
+            cover = leg / 2 if lot is None else (leg / 2).quantize(lot, rounding=ROUND_DOWN)
+            want = _side(s.target) * (leg - cover)
         if not s.opens:
             # A reduce or a wait: only ever towards 0, and only by what is held beyond the target on its own side.
             if _side(held) != _side(want) or abs(held) <= abs(want):
@@ -105,12 +119,12 @@ class Plan:
             out.append(("open", _side(want), abs(want) - abs(held)))
         return out
 
-    def act(self, step: int, held: Decimal) -> list[tuple[str, int, Decimal]]:
+    def act(self, step: int, held: Decimal, lot: Decimal | None = None) -> list[tuple[str, int, Decimal]]:
         """orders(), once per step: a step already acted on asks for nothing (a duplicate bar, a restart)."""
         if step in self.done:
             return []
         self.done.add(step)
-        return self.orders(step, held)
+        return self.orders(step, held, lot)
 
     def expired(self, now: datetime) -> bool:
         """Whether the PM's run window has passed. Never, when the PM set none."""
@@ -180,6 +194,7 @@ class CandleStep(LongFlatStrategy):
         self._started: datetime | None = None
         self._last_q: Decimal | None = None  # the last cycle's Q, carried while its long is held
         self._resumed: tuple[int, Decimal | None, bool] | None = None  # (cycle, Q, ended) from the journal
+        self._resumed_legs: dict[int, Decimal] = {}  # that cycle's legs as their opens filled (Plan.legs)
 
     def resume_cycle(self) -> None:
         """After a restart: the cycle the journal's newest step order was in, its Q, and whether a stop or target has
@@ -202,6 +217,16 @@ class CandleStep(LongFlatStrategy):
         first = min(_ts(o["ts"]) for o in mine)
         ended = any(o["intent"] in EXIT_LEGS and (o["filled_qty"] or 0) > 0 and _ts(o["ts"]) >= first for o in rows)
         self._resumed, self._last_q = (cycle, q, ended), q
+        # Each leg as its open filled (B-30): what its entry orders filled, or a long carried in at step 0 (Q).
+        self._resumed_legs = {}
+        for k in (0, 2):
+            got = sum((D_(o["filled_qty"]) for o in mine
+                       if o["intent"] == "entry" and o["signal"].get("step") == k and (o["filled_qty"] or 0) > 0),
+                      Decimal(0))
+            if got > 0:
+                self._resumed_legs[k] = got
+        if 0 not in self._resumed_legs and q is not None and any(o["signal"].get("step") == 1 for o in mine):
+            self._resumed_legs[0] = q  # step 0 carried the last cycle's long in without an order
 
     def _carried_into(self, cycle: int, held: Decimal) -> bool:
         """After a restart: the journal's newest cycle is the one before this and ended long Q, so this cycle's step 0
@@ -238,6 +263,10 @@ class CandleStep(LongFlatStrategy):
                 # short of it. Q is sized afresh only from flat, so a missed step never shrinks every later cycle.
                 q = self._last_q or held
             plan = self._plan = Plan(cycle, q, self._started, self.c.run_for_hours, exited=ended)
+            if self._resumed is not None and self._resumed[0] == cycle:
+                plan.legs.update(self._resumed_legs)
+            elif q is not None and held > 0:
+                plan.leg_filled(0, held)  # the last cycle's long, carried in: step 0's leg as it stands
             if q is not None:
                 self._last_q = q
         values = {"cycle": cycle, "step": step, "run_started": self._started.isoformat()}
@@ -252,7 +281,16 @@ class CandleStep(LongFlatStrategy):
             plan.done.add(0)
             values["size_share"] = self.c.size_share
             return ([("close", 1, -held)] if held < 0 else []) + [("open", 1, None)], reason, values
-        return plan.act(step, held), reason, values
+        return plan.act(step, held, self._lot() if getattr(self, "instrument", None) is not None else None), reason, values
+
+    def on_order_filled(self, event) -> None:
+        super().on_order_filled(event)
+        # B-30: a step's open filled: record the leg its half step halves, the size held now (all fills so far)
+        info = self.decisions.get(str(event.client_order_id)) or {}
+        sig = info.get("signal") or {}
+        if (self._plan is not None and info.get("intent") == "entry" and sig.get("cycle") == self._plan.cycle
+                and sig.get("step") is not None):
+            self._plan.leg_filled(int(sig["step"]), self._signed_qty())
 
     def entry_sent(self, qty: Decimal, values: dict) -> None:
         """The cycle's first open was sized: its quantity is Q for the rest of the cycle (Advisor CANDLE-STEP)."""

@@ -208,3 +208,19 @@ def test_only_the_test_strategy_keeps_a_target_below_costs_by_default():
     from sleeve_fund.strategies.candle_step import SPEC
 
     assert SPEC.default_params["keep_sub_cost_target"] is True and on in ([], ["candle_step"])
+
+
+def test_b30_cover_half_is_half_the_short_held_after_a_trimmed_flip():
+    """B-30 (HoE 20 Oct, QT3's research-engine cell): the flip's short is trimmed below Q at the gate (0.5 of a book a
+    little under 100,000), and step 3's "cover half" buys back half the short actually held, not the short less Q/2."""
+    from decimal import ROUND_DOWN
+
+    run = _at_the_limit()
+    fills = run.legs["cs"].fills.sort_values("ts_last")
+    sides = [(r["side"], D(str(r["filled_qty"]))) for _, r in fills.iterrows()]
+    short = sides[3][1]
+    assert short < D(500)  # trimmed: the case this pins
+    lot = D(str(run.legs["cs"].fills["filled_qty"].iloc[0])).as_tuple().exponent
+    half = (short / 2).quantize(D(1).scaleb(lot) if lot < 0 else D(1), rounding=ROUND_DOWN)
+    assert sides[4] == ("BUY", half), (short, sides[4])
+    assert sides[4][1] != short - D(250)  # never back to -Q/2
