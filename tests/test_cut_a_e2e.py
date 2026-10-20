@@ -103,7 +103,10 @@ def test_stale_60_a_fund_mark_59_s_old_sizes_the_entry_and_61_s_old_refuses_it(t
     at = decided - pd.Timedelta(seconds=age)
     DbLedger(store, lambda: None).set_state(PortfolioState(mark_ts=at, equity=fund, hwm=fund, day=at.date(),
                                                            day_start_equity=fund))
-    plan = h.Plan(t0=h.STD_T0, minutes=4, windows=[(h.M(h.STD_T0, 2), h.M(h.STD_T0, 4), 1)])
+    from test_portfolio_paper_entry import bridge_at_start
+
+    plan = h.Plan(t0=h.STD_T0, minutes=4, windows=[(h.M(h.STD_T0, 2), h.M(h.STD_T0, 4), 1)],
+                  hooks=[bridge_at_start(store, fund)])  # inside the fund (TEC-B34)
     h.run(tmp_path, store, plan, monkeypatch)
     entries = [o for o in h._orders(store) if o["intent"] == "entry"]
     refused = [e["message"] for e in h._events(store) if e["kind"] == "entry_refused_fund_equity"]

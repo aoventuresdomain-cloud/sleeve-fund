@@ -461,7 +461,7 @@ def test_a_spot_and_perp_pair_judges_its_guards_on_every_spot_trade_and_fill_wit
     from sleeve_fund.strategies import REGISTRY
     from sleeve_fund.strategies.base import LongFlatConfig, LongFlatStrategy
     from sleeve_fund.venues import venue
-    from test_p21b_wiring_qa import portfolio_pass
+    from test_p21b_wiring_qa import bridge, portfolio_pass
 
     sent, started = [], []
 
@@ -520,6 +520,8 @@ def test_a_spot_and_perp_pair_judges_its_guards_on_every_spot_trade_and_fill_wit
                           second={"instrument": "BTC/USDT", "params": {"market": "perp"}, "venue": "KRAKEN",
                                   "side": -1})
     portfolio_pass(store, datetime.now(timezone.utc), D(20_000))
+    if gate:
+        bridge(store, 20_000)  # inside the fund (TEC-B34)
     journal = QueuedStore(store)
     lead, follow = (from_store(store.sleeve(n)) for n in ("carry", "carry~2"))
     node, pair = node_mod.build_two_leg_node(lead, follow, log_level="ERROR", asset_fetch=dict,

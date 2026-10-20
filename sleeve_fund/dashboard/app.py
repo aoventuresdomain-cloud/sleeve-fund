@@ -2796,6 +2796,31 @@ def _shorts(store: Store, name: str) -> bool:
         return False
 
 
+def _fund_halt_room(store: Store) -> tuple[float | None, str] | None:
+    """B-34 row 11: inside the fund (its re-base deposit has landed) a Strategy's own equity is its P&L from 0 and
+    never halts it (Advisor CUT-A (d)); the halt that would close a position is the fund's drawdown halt (T5). Returns
+    (the money left before it on the fund's last mark, as book_breach measures it, and its words), headroom None
+    while that halt is off, or None outside the fund. A book never marked can't be checked, so it refuses (fails
+    closed): loosening a stop is the one edit this guards."""
+    from sleeve_fund.gate_ledger import DbLedger
+    from sleeve_fund.money import scale
+    from sleeve_fund.portfolio import compliance
+    from sleeve_fund.supervisor import bridge_start
+
+    if bridge_start(store) is None:
+        return None
+    st = DbLedger(store, lambda: ()).state()
+    if st.equity is None:
+        raise ValueError("the fund's book hasn't been marked yet, so a looser stop can't be checked against the fund's "
+                         "drawdown halt; try again in a minute")
+    drawdown = compliance.load(store, "dashboard").drawdown
+    words = "before the fund's drawdown halt"
+    if drawdown is None:
+        return None, words
+    top = max(st.reference() or st.equity, st.equity)
+    return float(st.equity - (top - scale(top, drawdown))), f"{words} ({drawdown:.0%}, T5)"
+
+
 def _check_open_stop(store: Store, s, params: dict, profile, leg: float, confirmed: bool) -> None:
     """A stop the PM loosens on an open position is checked against its size before it saves (review
     round 8, M8-1: a 3% to 50% edit saved, about 17R at risk). A stop set from the market only ever
@@ -2826,13 +2851,17 @@ def _check_open_stop(store: Store, s, params: dict, profile, leg: float, confirm
         return
     level = entry_px * (1 - side * new)
     loss = max(side * qty * (price - level), 0.0) + qty * level * leg  # from here to the stop, and the fee to close
-    equity = last["equity"] if last else s.starting_balance
-    peak = max(store.peak_equity(s.name) or s.starting_balance, equity)
-    headroom = equity - peak * (1 - profile.max_drawdown)
-    if loss > headroom:
+    fund = _fund_halt_room(store)
+    if fund is not None:  # the fund holds the cash: its drawdown halt (T5) is the one that would close the position
+        headroom, halt = fund
+    else:
+        equity = last["equity"] if last else s.starting_balance
+        peak = max(store.peak_equity(s.name) or s.starting_balance, equity)
+        headroom = equity - peak * (1 - profile.max_drawdown)
+        halt = f"before the {profile.name} profile's {profile.max_drawdown:.0%} drawdown halt"
+    if headroom is not None and loss > headroom:
         raise ValueError(f"a {new:.1%} stop on the open position would lose {loss:,.2f} from here, more than the "
-                         f"{max(headroom, 0):,.2f} left before the {profile.name} profile's "
-                         f"{profile.max_drawdown:.0%} drawdown halt, which would close it first; choose a tighter stop")
+                         f"{max(headroom, 0):,.2f} left {halt}, which would close it first; choose a tighter stop")
     if not confirmed:
         risk = (plan or {}).get("risk_amount") or ((entry or {}).get("signal") or {}).get("risk_amount")
         in_r = f" ({qty * entry_px * (new + leg + (1 - side * new) * leg) / risk:.1f}R of the entry's risk)" if risk else ""

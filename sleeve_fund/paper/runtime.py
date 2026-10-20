@@ -664,15 +664,21 @@ class SleeveRuntime:
 
     @property
     def fund_held(self) -> bool:
-        """Paper inside the fund's book (the portfolio gate on; not a test Strategy outside the book, F229-6): the fund
+        """Paper inside the fund's book (the portfolio gate on, the PM's re-base deposit landed, supervisor.bridge_start;
+        not a test Strategy outside the book, F229-6): the fund
         holds the cash, so the Strategy's own equity (its P&L, from a starting balance of 0) never halts or pauses it;
         the fund's drawdown halt and daily pause (T5) do (Advisor SIZE-FUND Q4, CUT-A (d)). Its liquidation still
         halts it. A backtest's single Strategy is the whole fund and keeps its own."""
         if self.backtest or not getattr(self.store, "portfolio_gate", False):
             return False
         if self._fund_held is None:
-            from sleeve_fund.supervisor import outside_fund_book
+            from sleeve_fund.supervisor import bridge_start, outside_fund_book
 
+            # B34-CAPITAL-PREDICATE (Advisor, 20 Oct): one predicate, the bridge (the PM's re-base deposit has landed).
+            # Before it the Strategy still carries its own capital, so its own halts and sizing stay on. Kept once
+            # true (the bridge never un-lands); re-read each tick until then.
+            if bridge_start(self.store) is None:
+                return False
             self._fund_held = not outside_fund_book(self.store, self.store.sleeve(self.name))
         return self._fund_held
 

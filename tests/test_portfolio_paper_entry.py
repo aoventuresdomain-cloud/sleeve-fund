@@ -34,9 +34,22 @@ def _decisions(journal) -> list:
                               .outerjoin(r, r.c.decision_id == d.c.id).order_by(d.c.id)))
 
 
+def bridge_at_start(paper, equity=D(20_000)) -> tuple:
+    """A plan hook: the PM's re-base deposit lands on the first tick, once the replay has made the Strategy (with its
+    own 10,000), so the run is inside the fund (B34-CAPITAL-PREDICATE: the bridge decides; TEC-B34). Before it a
+    Strategy still sizes off its own capital."""
+    before = STD_T0.to_pydatetime() - timedelta(hours=1)
+
+    def land(rt, kw):
+        if paper.fund_flows() == []:
+            paper.settle_flow(paper.fund_flow("deposit", float(equity), actor="pm", reason="the fund's capital",
+                                              rebase=True, now=before), before)
+    return STD_T0, land
+
+
 def _one_checked_entry(tmp_path, paper, monkeypatch, params=None) -> tuple:
-    run(tmp_path, paper, Plan(t0=STD_T0, minutes=6, windows=[(M(STD_T0, 2), M(STD_T0, 6), 1)], params=params or {}),
-        monkeypatch)
+    run(tmp_path, paper, Plan(t0=STD_T0, minutes=6, windows=[(M(STD_T0, 2), M(STD_T0, 6), 1)], params=params or {},
+                              hooks=[bridge_at_start(paper)]), monkeypatch)
     entries = [o for o in _orders(paper) if o["intent"] == "entry"]
     assert entries, "no entry sent"
     (row,) = _decisions(paper)  # one check
