@@ -63,6 +63,17 @@ WORST = ("PASS", "FOLLOW-UP", "MUST")
 READERS = {"BINANCE": (f"{BINANCE_FAPI}/exchangeInfo", f"{BINANCE_FAPI}/fundingInfo")}
 
 
+def _first_clause(reason) -> str:
+    """A refused fetch's reason, cut to its first clause for this public log (CR head 3): the stored reason can carry
+    the venue's whole answer or a network error naming its host. "ValueError: the venue refused: {...}" prints as
+    "ValueError: the venue refused"; "URLError: <urlopen error ...>" as "URLError"."""
+    import re
+
+    name, _, rest = str(reason or "failed").partition(": ")
+    clause = re.split(r"[:(<\[{'\"]", rest, maxsplit=1)[0].strip()
+    return (f"{name}: {clause}" if clause else name)[:80]
+
+
 def get_json(url: str):
     with urllib.request.urlopen(url, timeout=TIMEOUT) as r:
         return json.load(r)
@@ -201,7 +212,7 @@ def fetched_rows(store, name: str, pair: str, now: datetime) -> tuple[list[tuple
                 oob = str(last["reason"]).startswith("out of bounds")
                 return ("latest fetch not used: " + ("out of bounds (fee fetch refused, outside the published range)"
                                                      if oob else "fee fetch refused (the venue's answer couldn't be used)"))
-            return f"latest fetch not used: {last['reason']}"
+            return f"latest fetch not used: {_first_clause(last['reason'])}"
         return ""
 
     term = "maint. tiers (fetched)"
