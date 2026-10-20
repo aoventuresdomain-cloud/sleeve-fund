@@ -80,47 +80,35 @@ def chained_return(values: pd.Series, base: float, flows=()) -> float | None:
     return growth - 1
 
 
-def fund_benchmark(store, start: datetime | None = None, end: datetime | None = None, hist=None,
-                   now: datetime | None = None, fee: float | None = None) -> FundBench | None:
-    """The fund's benchmark over (start, end], from the bridge on (supervisor.bridge_start); None before the bridge
-    (each Strategy carries its own capital and its own benchmark then) or with no mark or no stored closes. Points: the
-    daily closes, plus the latest stored close as the last, so the line is never up to a day behind."""
+def fund_hold(store, t0, e0: float, end=None, hist=None, now=None, fee: float | None = None) -> FundBench | None:
+    """The fund's hold from t0, on E0 (the book curve's equity then: the curve states the fund's history at today's
+    capital, A-20, so neither side sees a flow), to `end` or the latest stored close. Points: the last close of each
+    UTC day after t0 and the latest stored close, so the line is never up to a day behind. None with no stored closes
+    reaching t0; with E0 at 0 or below, a FundBench with no values (n/a: nothing to measure from)."""
     from sleeve_fund import funding as fundingm
     from sleeve_fund.fees import resolve
     from sleeve_fund.history import HistoryStore
-    from sleeve_fund.supervisor import bridge_start
     from sleeve_fund.venues import VENUES
 
-    bridge = bridge_start(store)
-    if bridge is None:
-        return None
-    t0 = pd.Timestamp(max(start, bridge) if start is not None else bridge)
-    e0 = store.book_equity_at_or_before(t0.to_pydatetime())
-    if e0 is None:  # the window opens before the first mark: from the first one
-        first = store.first_book_mark()
-        if first is None:
-            return None
-        t0, e0 = pd.Timestamp(first["ts"]), first["equity"]
+    t0 = pd.Timestamp(t0)
     t0 = t0.tz_localize("UTC") if t0.tzinfo is None else t0
     hist = hist or HistoryStore()
     venue = next((v for v in VENUES.values() if v.hub), None)
     if venue is None or hist.coverage(venue.name, BENCH_PAIR) is None:
         return None
-    minutes = hist.read(venue.name, BENCH_PAIR, minutes=1, start=t0 - pd.Timedelta(days=2), end=end)["close"]
-    if not len(minutes) or minutes.index[0] > t0:
+    hi = None if end is None else pd.Timestamp(end)
+    closes = hist.read(venue.name, BENCH_PAIR, minutes=1, start=t0 - pd.Timedelta(days=2), end=hi)["close"]
+    if not len(closes) or closes.index[0] > t0:
         return None
     perp = bool(venue.perpetual)
-    rates = fundingm.rates(venue.name, BENCH_PAIR, hist.root) if perp else None
-    # the account's taker fee for the instrument, where a Strategy's start reads it (paper.node: fees.resolve)
-    fee = float(resolve(venue.name, store, BENCH_PAIR, now=now).fees.taker) if fee is None else fee
-    flows = [(pd.Timestamp(f["applied_at"]), float(-f["amount"] if f["kind"] == "withdraw" else f["amount"]))
-             for f in store.fund_flows() if f["applied_at"] is not None and pd.Timestamp(f["applied_at"]) > t0
-             and (end is None or pd.Timestamp(f["applied_at"]) <= pd.Timestamp(end))]
-    daily = minutes[minutes.index > t0].resample("1D").last().dropna()
-    points = sorted(set(daily.index.map(lambda d: minutes.index[minutes.index <= d + pd.Timedelta(days=1)][-1]))
-                    | {minutes.index[-1]})
-    points = [p for p in points if p > t0]
-    values = hold_values(minutes, float(e0), fee, t0, flows, rates, points)
     source = (f"{BENCH_PAIR} perpetual closes with settled funding on the 1x long" if perp
               else f"{BENCH_PAIR} spot closes")
-    return FundBench(float(e0), values, source, fee, minutes.index[-1])
+    # the account's taker fee for the instrument, where a Strategy's start reads it (paper.node: fees.resolve)
+    fee = float(resolve(venue.name, store, BENCH_PAIR, now=now).fees.taker) if fee is None else fee
+    after = closes[closes.index > t0]
+    if e0 <= 0 or not len(after):
+        return FundBench(float(e0), pd.Series(dtype=float), source, fee, closes.index[-1])
+    points = sorted(set(after.groupby(after.index.floor("1D")).tail(1).index) | {after.index[-1]})
+    rates = fundingm.rates(venue.name, BENCH_PAIR, hist.root) if perp else None
+    return FundBench(float(e0), hold_values(closes, float(e0), fee, t0, (), rates, points), source, fee,
+                     closes.index[-1])

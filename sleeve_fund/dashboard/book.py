@@ -6,6 +6,7 @@ sleeves are measured the same way.
 
 from __future__ import annotations
 
+import logging
 import math
 from datetime import datetime
 
@@ -115,6 +116,31 @@ def fund_cash(store: Store) -> float:
     return float(fund_book(store).capital) if bridge_start(store) is not None else 0.0
 
 
+def fund_line(store: Store, start: float):
+    """B34-BENCHMARK (Advisor, 20 Oct): inside the fund the book's benchmark is one hold of the fund's capital from the
+    bridge, on the curve's own base `start` (its capital, A-20), counted once (fund_bench.fund_hold), never each
+    Strategy's row added up. None before the bridge (each Strategy carries its own capital and benchmark then) or with
+    no stored closes: the line then stays the book's cash, and the page says buy-and-hold isn't available."""
+    from sleeve_fund.dashboard.fund_bench import fund_hold
+    from sleeve_fund.supervisor import bridge_start
+
+    bridge = bridge_start(store)
+    if bridge is None:
+        return None
+    try:
+        return fund_hold(store, bridge, start)
+    except Exception as exc:  # noqa: BLE001 - the book's figures stand without it; said in the log and on the page
+        logging.getLogger(__name__).warning(f"the fund's benchmark couldn't be read: {exc!r}")
+        return None
+
+
+def on_days(values: pd.Series, index: pd.DatetimeIndex, before: float) -> pd.Series:
+    """The hold's last value in each UTC day of `index` (the daily curves' labels), carried forward; `before` until its
+    first point."""
+    days = values.groupby(values.index.floor("1D")).last()
+    return days.reindex(days.index.union(index)).ffill().reindex(index).fillna(before)
+
+
 def book_equity(store: Store, summaries: list[dict]) -> float:
     """The book's equity as book_view reads it, without the rest of the view: inside the fund the fund's marked equity
     (its own cash and every Strategy's P&L), else the Strategies' sum (B-20)."""
@@ -146,7 +172,9 @@ def book_view(store: Store, summaries: list[dict], frames: dict[str, pd.DataFram
         # fund_equity raises while a position has no mark yet: the page then shows the marks' own sum, never a 500
         marked = fund_equity_or_none(store)
         equity = marked if marked is not None else equity
-    curve = book_curve(active, frames, base=base)
+    line = fund_line(store, start) if base else None
+    held = line is not None and len(line.values) > 0
+    curve = book_curve(active, frames, base=base, bench=line.values if held else None)
     rets = curve["equity"].pct_change().dropna() if len(curve) else pd.Series(dtype=float)
     enough = len(rets) >= MIN_DAYS_FOR_RATIOS
     vol = float(rets.std() * math.sqrt(DAYS_A_YEAR)) if enough else float("nan")
@@ -177,7 +205,11 @@ def book_view(store: Store, summaries: list[dict], frames: dict[str, pd.DataFram
         "capital": equity + put_away,
         "pnl": equity - start,
         "ret": equity / start - 1 if start else 0.0,
-        "bench_ret": ((sum(x["benchmark"] for x in active) + base) / start - 1) if start else 0.0,
+        # inside the fund its hold, to the latest stored close (never a day behind); else the Strategies' own rows
+        "bench_ret": (float(line.values.iloc[-1]) / start - 1 if held
+                      else ((sum(x["benchmark"] for x in active) + base) / start - 1) if start else 0.0),
+        "bench_as_of": line.as_of if held else None,
+        "bench_source": line.source if held else None,
         "day_pnl": sum(x["day_pnl"] for x in active),
         "week_pnl": sum(x["week_pnl"] for x in active),
         "mtd_pnl": sum(x["mtd_pnl"] for x in active),
@@ -201,9 +233,11 @@ def book_view(store: Store, summaries: list[dict], frames: dict[str, pd.DataFram
     }
 
 
-def book_curve(summaries: list[dict], frames: dict[str, pd.DataFrame], base: float = 0.0) -> pd.DataFrame:
+def book_curve(summaries: list[dict], frames: dict[str, pd.DataFrame], base: float = 0.0,
+               bench: pd.Series | None = None) -> pd.DataFrame:
     """Daily book equity and benchmark. A sleeve counts as idle cash before its first mark; `base` is the fund's own
-    cash no Strategy carries (fund_cash)."""
+    cash no Strategy carries (fund_cash). `bench`: inside the fund, the fund's hold (fund_line), the benchmark in place
+    of the rows' sum."""
     parts = {x["sleeve"].name: frames[x["sleeve"].name] for x in summaries if len(frames[x["sleeve"].name])}
     if not parts:
         return pd.DataFrame(columns=["equity", "benchmark"])
@@ -217,8 +251,20 @@ def book_curve(summaries: list[dict], frames: dict[str, pd.DataFrame], base: flo
     # Measured from the capital the book started with too: its starting balances are never a daily close, so a
     # book whose first close was already a loss read 0% drawdown (round 12, M12-F1).
     start = sum(x["sleeve"].starting_balance for x in summaries) + base
-    peak = out["equity"].cummax().clip(lower=start)
-    out["drawdown"] = (1 - out["equity"] / peak).where(peak > 0, 0.0)  # no capital, no drawdown: 0, never inf (CUT-A)
+    if bench is not None:
+        out["benchmark"] = on_days(bench, out.index, start)
+    out["equity"] = out["equity"].astype(float)  # the marks are Money: 0/0 there raises before `where` (B-41)
+    peak = out["equity"].cummax().clip(lower=float(start))
+    out["drawdown"] = _drawdown(out["equity"], peak)
+    return out
+
+
+def _drawdown(equity: pd.Series, peak: pd.Series) -> pd.Series:
+    """1 - equity / peak where the peak is above 0; 0 where it isn't (no capital, no drawdown: CUT-A), divided only
+    where it is, in floats (B-41: a fund-held book whose peak is 0 raised on Money 0/0)."""
+    out = pd.Series(0.0, index=equity.index)
+    up = peak > 0
+    out[up] = 1 - equity[up].astype(float) / peak[up].astype(float)
     return out
 
 
@@ -227,7 +273,7 @@ RECENT_STEP = {1: "5min", 7: "30min"}
 
 
 def recent_curve(store: Store, sleeves: list, days: int, prior_peak: float | None = None,
-                 base: float = 0.0) -> pd.DataFrame:
+                 base: float = 0.0, bench: pd.Series | None = None) -> pd.DataFrame:
     """Equity and benchmark summed over the given strategies at fine resolution for the last `days`.
     A strategy without a mark in a step carries its last value; one with no mark yet counts as its
     starting balance. prior_peak is the highest equity before the window, so drawdown is measured from
@@ -248,10 +294,14 @@ def recent_curve(store: Store, sleeves: list, days: int, prior_peak: float | Non
             else:
                 ser = pd.Series(start, index=idx)
             out[col] += ser
+    if bench is not None:  # the fund's hold (fund_line), in place of the rows' sum
+        out["benchmark"] = bench.resample(step).last().reindex(bench.resample(step).last().index.union(idx)).ffill(
+        ).reindex(idx).fillna(base)
+    out["equity"] = out["equity"].astype(float)
     peak = out["equity"].cummax()
     if prior_peak:
-        peak = peak.clip(lower=prior_peak)
-    out["drawdown"] = (1 - out["equity"] / peak).where(peak > 0, 0.0)
+        peak = peak.clip(lower=float(prior_peak))
+    out["drawdown"] = _drawdown(out["equity"], peak)
     return out
 
 

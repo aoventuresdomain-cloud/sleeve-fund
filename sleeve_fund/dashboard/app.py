@@ -360,7 +360,9 @@ def create_app(store: Store | None = None) -> FastAPI:
         # the daily closes alone a wiped-out strategy's was 0, and 0/0 made the range a 500 (mF2-1, mF2-2).
         base = bookm.fund_cash(st())  # A-20: the fund's own cash, once it holds it
         start = sum(s.starting_balance for s in sleeves) + base
-        curve = bookm.recent_curve(st(), sleeves, days, max(float(prior.max()) if len(prior) else 0.0, start), base)
+        line = bookm.fund_line(st(), start) if base else None  # B34-BENCHMARK: the fund's one hold
+        curve = bookm.recent_curve(st(), sleeves, days, max(float(prior.max()) if len(prior) else 0.0, start), base,
+                                   line.values if line is not None and len(line.values) else None)
         return JSONResponse({
             "res": "intraday",
             "t": [t.isoformat() for t in curve.index],
@@ -373,7 +375,9 @@ def create_app(store: Store | None = None) -> FastAPI:
     def book_equity_json(days: int | None = None, _: str = Depends(require_pm)):
         sleeves, frames, summaries, _tests = shown_book()
         base = bookm.fund_cash(st())
-        curve = bookm.book_curve(summaries, frames, base)  # every strategy, as the book figures count it
+        line = bookm.fund_line(st(), sum(x["sleeve"].starting_balance for x in summaries) + base) if base else None
+        curve = bookm.book_curve(summaries, frames, base,  # every strategy, as the book figures count it
+                                 line.values if line is not None and len(line.values) else None)
         if days:
             return _recent_json(sleeves, days, curve)
         return JSONResponse({
@@ -382,6 +386,9 @@ def create_app(store: Store | None = None) -> FastAPI:
             "equity": [round(v, 2) for v in curve["equity"]],
             "benchmark": [round(v, 2) for v in curve["benchmark"]],
             "drawdown": [round(v, 5) for v in curve["drawdown"]] if len(curve) else [],
+            # B34-BENCHMARK: the hold's last point and what it is made of, for the chart's "as of" label and footnote
+            **({"bench_as_of": f"{line.as_of.astimezone(UK):%-d %b %H:%M} UK", "bench_source": line.source}
+               if line is not None and len(line.values) else {"bench_as_of": None, "bench_source": None}),
         })
 
     @app.get("/risk", response_class=HTMLResponse)
@@ -1420,9 +1427,15 @@ def create_app(store: Store | None = None) -> FastAPI:
         # test account) keeps its own capital.
         held = chosen and summaries and held_by_fund(st(), summaries[0]["sleeve"])
         base = bookm.fund_cash(st()) if (not chosen or held) else 0.0
+        # B34-BENCHMARK: inside the fund each window's and month's benchmark is the fund's hold, bought on the book then
+        from functools import partial
+
+        from sleeve_fund.dashboard.fund_bench import fund_hold
+
+        hold = partial(fund_hold, st()) if base and bookm.fund_line(st(), base) is not None else None
         perf = reports.performance(summaries, frames, [f for fs in fills.values() for f in fs], w["start"], w["end"],
-                                   base)
-        m = reports.monthly(summaries, frames, fills, base)
+                                   base, hold)
+        m = reports.monthly(summaries, frames, fills, base, hold)
         months = [r for r in m["rows"] if reports.in_window(r["key"], w)]
         keys = {r["month"] for r in months}
         m = {**m, "rows": months, "months": [mo for mo in m.get("months", []) if mo in keys]}
