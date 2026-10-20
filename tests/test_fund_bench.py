@@ -159,6 +159,7 @@ def test_two_fund_held_strategies_put_one_hold_of_the_funds_capital_on_the_books
     one = fund_hold(store, bridge_start(store), start)
     assert view["bench_ret"] == pytest.approx(float(one.values.iloc[-1]) / start - 1)
     assert view["bench_source"] == one.source and view["bench_as_of"] == one.as_of
+    assert view["history_note"] == bookm.HISTORY_NOTE  # Advisor: never read as an account statement
     curve = bookm.book_curve(summaries, frames, start, one.values)
     assert curve["benchmark"].iloc[-1] == pytest.approx(bookm.on_days(one.values, curve.index, start).iloc[-1])
     assert curve["benchmark"].max() < start * 1.5  # one hold of 100,000 on a market up about 22%; two would be over 2x

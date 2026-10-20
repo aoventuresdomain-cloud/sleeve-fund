@@ -15,6 +15,9 @@ import pandas as pd
 from sleeve_fund.dashboard.metrics import costs
 from sleeve_fund.store import Store, utcnow
 
+# The book's curve and its benchmark inside the fund (A-20, B34-BENCHMARK): its one-line label, so it's never read as an
+# account statement (Advisor, 20 Oct).
+HISTORY_NOTE = "History shown at today's capital; deposits and withdrawals are not shown as gains or losses"
 DAYS_A_YEAR = 365  # the venue trades every day
 MIN_DAYS_FOR_RATIOS = 30
 MIN_DAYS_FOR_CORRELATION = 20
@@ -210,6 +213,8 @@ def book_view(store: Store, summaries: list[dict], frames: dict[str, pd.DataFram
                       else ((sum(x["benchmark"] for x in active) + base) / start - 1) if start else 0.0),
         "bench_as_of": line.as_of if held else None,
         "bench_source": line.source if held else None,
+        # Advisor condition (20 Oct): the curve states the fund's history at today's capital (A-20), never a statement
+        "history_note": HISTORY_NOTE if base else None,
         "day_pnl": sum(x["day_pnl"] for x in active),
         "week_pnl": sum(x["week_pnl"] for x in active),
         "mtd_pnl": sum(x["mtd_pnl"] for x in active),

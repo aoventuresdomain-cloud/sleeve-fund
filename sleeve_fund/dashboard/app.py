@@ -389,6 +389,7 @@ def create_app(store: Store | None = None) -> FastAPI:
             # B34-BENCHMARK: the hold's last point and what it is made of, for the chart's "as of" label and footnote
             **({"bench_as_of": f"{line.as_of.astimezone(UK):%-d %b %H:%M} UK", "bench_source": line.source}
                if line is not None and len(line.values) else {"bench_as_of": None, "bench_source": None}),
+            "history_note": bookm.HISTORY_NOTE if base else None,
         })
 
     @app.get("/risk", response_class=HTMLResponse)
