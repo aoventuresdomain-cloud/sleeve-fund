@@ -1298,6 +1298,9 @@ def create_app(store: Store | None = None) -> FastAPI:
 
     from sleeve_fund.dashboard import results
     results.register(app, page=page, sheet_path=_sheet_path, require_pm=require_pm)
+    from sleeve_fund.dashboard import strategy_area  # B-16: the Strategy area (was Development)
+    strategy_area.register(app, page=page, st=st, tearsheets=lambda: TEARSHEETS, stored_history=_stored_history,
+                           venue_choices=venue_choices, research_venue=_research_venue)
 
     @app.get("/research/run")
     @app.get("/research/history")

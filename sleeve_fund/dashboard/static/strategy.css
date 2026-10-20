@@ -1,0 +1,46 @@
+/* B-16: the Strategy area (strategy_area.html). Built on app.css's tokens and its Development layout (.dev, .plan-*). */
+.sa { grid-template-columns: 320px minmax(0, 1fr); }
+.sa-list { position: sticky; top: calc(var(--strip) + 8px); }
+.sa-rows { max-height: 70vh; overflow-y: auto; border: 1px solid var(--line); border-radius: var(--r); background: var(--panel); }
+.sa-group[hidden], .sa-row[hidden] { display: none; }
+.sa-ghead { padding: 10px 14px 4px; font-size: 11.5px; color: var(--faint); text-transform: uppercase; letter-spacing: .04em; }
+.sa-pair { padding: 8px 14px 2px; font-weight: 600; font-size: 12.5px; }
+.sa-row { display: grid; gap: 2px; padding: 7px 14px; color: var(--text); border-left: 2px solid transparent; }
+.sa-row.in-pair { padding-left: 22px; }
+.sa-row:hover { background: var(--hover); text-decoration: none; }
+.sa-row[aria-current] { background: var(--accent-soft); border-left-color: var(--accent); }
+.sa-top { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.sa-top b { font-weight: 500; font-size: 13px; }
+.sa-meta { font-size: 11.5px; color: var(--faint); }
+.sa-detail h3 { font-size: 13.5px; font-weight: 600; margin: 18px 0 8px; }
+.sa-head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 10px; align-items: flex-start; }
+.sa-head h2 { font-size: 17px; margin: 0; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.sa-sub { font-size: 12px; color: var(--muted); margin-top: 4px; }
+.sa-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; max-width: 420px; }
+.sa-why { font-size: 12px; }
+.sa-tabs { margin-top: 14px; }
+.sa-reason { white-space: pre-line; margin: 0; }
+.sa-rules { margin: 0; display: grid; gap: 6px; }
+.sa-rules > div { display: grid; grid-template-columns: 110px minmax(0, 1fr); gap: 12px; }
+.sa-rules dt { color: var(--muted); font-size: 12.5px; }
+.sa-rules dd { margin: 0; }
+.sa-file summary { cursor: pointer; color: var(--muted); margin-top: 18px; }
+.sa-file pre { white-space: pre-wrap; font-size: 12px; background: var(--raised); padding: 12px; border-radius: var(--r-sm); overflow-x: auto; }
+.sa-confirm { position: relative; }
+.sa-confirm > summary { list-style: none; cursor: pointer; }
+.sa-confirm > summary::-webkit-details-marker { display: none; }
+.sa-confirm-box { position: absolute; right: 0; z-index: 10; width: min(420px, 90vw); display: grid; gap: 10px; box-shadow: var(--shadow); white-space: normal; text-align: left; }
+.sa-confirm-box p { margin: 0; }
+.sa-confirm-box label { display: grid; gap: 4px; font-size: 12.5px; color: var(--muted); }
+.sa-confirm-box label.check { display: flex; align-items: center; gap: 8px; color: var(--text); }
+.sa-btns { display: flex; justify-content: flex-end; gap: 8px; }
+.sa-basket { list-style: none; margin: 8px 0; padding: 0; display: grid; gap: 6px; }
+.sa-basket label { display: flex; align-items: center; gap: 8px; }
+.sa-basket-tools { display: flex; gap: 6px; }
+.sa-run { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding-top: 14px; }
+@media (max-width: 860px) {
+  .sa { grid-template-columns: minmax(0, 1fr); }
+  .sa-list { position: static; }
+  .sa-rows { max-height: 50vh; }
+  .sa-rules > div { grid-template-columns: minmax(0, 1fr); gap: 2px; }
+}
