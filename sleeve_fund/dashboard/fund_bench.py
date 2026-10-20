@@ -1,0 +1,114 @@
+"""The fund's benchmark (Advisor B34-BENCHMARK, 20 Oct): one buy-and-hold of the benchmark asset on the fund's capital,
+counted once on the book's line and never written or summed per Strategy.
+
+Its value is E0 x (1 - fee) x P / P0, E0 the fund's marked equity at the period's start (book_marks), with one taker
+entry fee, so its first point is above 0 whenever E0 is. A deposit buys units at the flow's time, net of the same fee,
+and a withdrawal sells units at that price, so a flow is never a return on either side. On a perpetual the 1x long
+pays or receives each settled funding rate on what it holds; perpetual closes without funding are never used. Worked
+out on read from what the fund already writes (book_marks, fund_flows) and the hub's stored closes: no table of its
+own, so nothing to keep in step.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
+
+import pandas as pd
+
+BENCH_PAIR = "BTC/USDT"
+
+
+@dataclass(frozen=True)
+class FundBench:
+    e0: float  # the fund's marked equity at the period's start: the return base
+    values: pd.Series  # the hold's value at each point, oldest first
+    source: str  # the footnote: which closes, and whether funding is in
+    fee: float
+    as_of: pd.Timestamp  # the last point's time: the latest stored close, not the last daily close
+
+
+def hold_values(prices: pd.Series, e0: float, fee: float, t0, flows=(), funding: pd.Series | None = None,
+                points=None) -> pd.Series:
+    """The hold's value at each of `points` (default: every price after t0). `prices` are closes indexed by UTC time;
+    P0 is the last at or before t0. `flows`: (time, amount) with withdrawals negative. `funding`: settled rates by
+    settlement time, charged to the long as units x price x rate (a positive rate pays)."""
+    prices = prices.sort_index()
+    upto = prices[prices.index <= t0]
+    if not len(upto):
+        raise ValueError(f"no benchmark price at or before {t0}")
+    p0 = float(upto.iloc[-1])
+    units, cash = e0 * (1 - fee) / p0, 0.0
+
+    def price_at(t) -> float:
+        known = prices[prices.index <= t]
+        return float(known.iloc[-1]) if len(known) else p0
+
+    events = [(pd.Timestamp(t), 0, float(a)) for t, a in flows if pd.Timestamp(t) > t0]
+    if funding is not None:
+        events += [(t, 1, float(r)) for t, r in funding.items() if t > t0]
+    events.sort(key=lambda e: (e[0], e[1]))
+    points = prices.index[prices.index > t0] if points is None else pd.DatetimeIndex(points)
+    out, i = [], 0
+    for t in points:
+        while i < len(events) and events[i][0] <= t:
+            at, kind, x = events[i]
+            p = price_at(at)
+            if kind == 0:
+                units += x * (1 - fee) / p if x > 0 else x / p
+            else:
+                cash -= units * p * x
+            i += 1
+        out.append(units * price_at(t) + cash)
+    return pd.Series(out, index=points, dtype=float)
+
+
+def chained_return(values: pd.Series, base: float, flows=()) -> float | None:
+    """The return over `values` from `base`, its value just before the first point, with each flow taken out on the
+    step it lands in (DAY-RET's rule): the product of (V - F) / V_prev. Without flows it is V_last / base - 1. None
+    when the base, or any step's, is 0 or below: nothing to measure from."""
+    if base <= 0:
+        return None
+    prev_t, prev, growth = None, base, 1.0
+    flows = [(pd.Timestamp(t), float(a)) for t, a in flows]
+    for t, v in values.items():
+        f = sum(a for ft, a in flows if (prev_t is None or ft > prev_t) and ft <= t)
+        if prev <= 0:
+            return None
+        growth *= (float(v) - f) / prev
+        prev_t, prev = t, float(v)
+    return growth - 1
+
+
+def fund_hold(store, t0, e0: float, end=None, hist=None, now=None, fee: float | None = None) -> FundBench | None:
+    """The fund's hold from t0, on E0 (the book curve's equity then: the curve states the fund's history at today's
+    capital, A-20, so neither side sees a flow), to `end` or the latest stored close. Points: the last close of each
+    UTC day after t0 and the latest stored close, so the line is never up to a day behind. None with no stored closes
+    reaching t0; with E0 at 0 or below, a FundBench with no values (n/a: nothing to measure from)."""
+    from sleeve_fund import funding as fundingm
+    from sleeve_fund.fees import resolve
+    from sleeve_fund.history import HistoryStore
+    from sleeve_fund.venues import VENUES
+
+    t0 = pd.Timestamp(t0)
+    t0 = t0.tz_localize("UTC") if t0.tzinfo is None else t0
+    hist = hist or HistoryStore()
+    venue = next((v for v in VENUES.values() if v.hub), None)
+    if venue is None or hist.coverage(venue.name, BENCH_PAIR) is None:
+        return None
+    hi = None if end is None else pd.Timestamp(end)
+    closes = hist.read(venue.name, BENCH_PAIR, minutes=1, start=t0 - pd.Timedelta(days=2), end=hi)["close"]
+    if not len(closes) or closes.index[0] > t0:
+        return None
+    perp = bool(venue.perpetual)
+    source = (f"{BENCH_PAIR} perpetual closes with settled funding on the 1x long" if perp
+              else f"{BENCH_PAIR} spot closes")
+    # the account's taker fee for the instrument, where a Strategy's start reads it (paper.node: fees.resolve)
+    fee = float(resolve(venue.name, store, BENCH_PAIR, now=now).fees.taker) if fee is None else fee
+    after = closes[closes.index > t0]
+    if e0 <= 0 or not len(after):
+        return FundBench(float(e0), pd.Series(dtype=float), source, fee, closes.index[-1])
+    points = sorted(set(after.groupby(after.index.floor("1D")).tail(1).index) | {after.index[-1]})
+    rates = fundingm.rates(venue.name, BENCH_PAIR, hist.root) if perp else None
+    return FundBench(float(e0), hold_values(closes, float(e0), fee, t0, (), rates, points), source, fee,
+                     closes.index[-1])

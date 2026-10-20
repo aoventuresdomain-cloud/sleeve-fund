@@ -97,7 +97,7 @@ def test_i_on_paper_the_gap_books_the_perp_legs_liquidation_unwinds_the_spot_leg
     from sleeve_fund.store import Store
     from sleeve_fund.strategies.base import LongFlatConfig, LongFlatStrategy
     from sleeve_fund.venues import venue
-    from tests.test_p21b_wiring_qa import portfolio_pass
+    from tests.test_p21b_wiring_qa import bridge, portfolio_pass
 
     sent, started = [], []
 
@@ -136,6 +136,7 @@ def test_i_on_paper_the_gap_books_the_perp_legs_liquidation_unwinds_the_spot_leg
     # A book big enough that its open-risk limit (5%) takes the whole pair, sized so the gap is a summed drawdown past
     # balanced's 20% as well as the perp leg's liquidation.
     portfolio_pass(store, datetime.now(timezone.utc), D(100_000))
+    bridge(store, 100_000)  # inside the fund (TEC-B34)
     journal = QueuedStore(store)
     lead, follow = (from_store(store.sleeve(n)) for n in ("carry", "carry~2"))
     node, pair = node_mod.build_two_leg_node(lead, follow, log_level="ERROR", asset_fetch=dict,

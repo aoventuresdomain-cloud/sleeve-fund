@@ -13,9 +13,10 @@ from sleeve_fund.dashboard import book as bookm
 
 
 def monthly(summaries: list[dict], frames: dict[str, pd.DataFrame], fills_by_sleeve: dict[str, list[dict]],
-            base: float = 0.0) -> dict:
+            base: float = 0.0, hold=None) -> dict:
     """Book and per-sleeve returns by calendar month, plus fees and trading activity. `base`: the fund's own cash
-    (book.fund_cash, A-20)."""
+    (book.fund_cash, A-20). `hold(t0, e0, end)`: inside the fund, the fund's hold (fund_bench.fund_hold), each month's
+    benchmark bought at the month's start on the book's equity then: None (n/a) when that is 0 or below."""
     curve = bookm.book_curve(summaries, frames, base)
     if not len(curve):
         return {"rows": [], "sleeves": [], "grid": {}}
@@ -38,7 +39,8 @@ def monthly(summaries: list[dict], frames: dict[str, pd.DataFrame], fills_by_sle
             "equity": r["equity"],
             "pnl": r["equity"] - prev_eq[ts],
             "ret": r["equity"] / prev_eq[ts] - 1 if prev_eq[ts] else 0.0,
-            "bench_ret": r["benchmark"] / prev_b[ts] - 1 if prev_b[ts] else 0.0,
+            "bench_ret": (_hold_ret(hold, _close_of(prev_eq.index, ts, curve), float(prev_eq[ts]), ts)
+                          if hold is not None else r["benchmark"] / prev_b[ts] - 1 if prev_b[ts] else 0.0),
             "worst_dd": float(curve.loc[_months(curve.index) == period, "drawdown"].max()),
             "fees": float(mf["fee"].sum()) if len(mf) else 0.0,
             "fills": int(len(mf)),
@@ -61,6 +63,22 @@ def monthly(summaries: list[dict], frames: dict[str, pd.DataFrame], fills_by_sle
         # A month that began with no capital of the Strategy's own (CUT-A) has no return on it: left blank.
         grid[x["sleeve"].name] = {ts.strftime("%b %Y"): float(v / prev[ts] - 1) for ts, v in me.items() if prev[ts] > 0}
     return {"rows": rows, "sleeves": list(grid), "grid": grid, "months": months, "contribution": bool(base)}
+
+
+def _close_of(month_ends, ts, curve):
+    """When a month's benchmark is bought: the close of the month before (its last daily label's day end), or, for the
+    first, the curve's first day's start."""
+    i = list(month_ends).index(ts)
+    return month_ends[i - 1] + pd.Timedelta(days=1) if i else curve.index[0]
+
+
+def _hold_ret(hold, t0, e0: float, end_label):
+    """The fund's hold's return from t0 on e0 to the end of the day labelled end_label; None (n/a) at e0 of 0 or
+    below, or with no hold to read."""
+    if e0 <= 0:
+        return None
+    fb = hold(t0, e0, end_label + pd.Timedelta(days=1))
+    return None if fb is None or not len(fb.values) else float(fb.values.iloc[-1]) / e0 - 1
 
 
 def _months(idx):
@@ -140,7 +158,7 @@ def _within(idx, start, end):
 
 
 def performance(summaries: list[dict], frames: dict[str, pd.DataFrame], fills: list[dict], start, end,
-                base: float = 0.0) -> dict:
+                base: float = 0.0, hold=None) -> dict:
     """The four figures and the book vs benchmark curve over [start, end): return after fees, the gap to
     buy-and-hold in points, the worst drawdown with its date, and fees and fills. Returns are measured
     from the equity at the window's start (the starting capital when the window opens before the first mark)."""
@@ -162,11 +180,20 @@ def performance(summaries: list[dict], frames: dict[str, pd.DataFrame], fills: l
     ret = float(w["equity"].iloc[-1]) / base_eq - 1
     bench = float(w["benchmark"].iloc[-1]) / base_b - 1
     peak = w["equity"].cummax().clip(lower=base_eq)
-    dd = 1 - w["equity"] / peak
+    dd = 1 - w["equity"].astype(float) / peak.astype(float)
     worst = float(dd.max())
     book = [0.0] + [float(v) / base_eq - 1 for v in w["equity"]]
     bmk = [0.0] + [float(v) / base_b - 1 for v in w["benchmark"]]
     first = (w.index[0] - pd.Timedelta(days=1)) if not len(before) else before.index[-1]
+    if hold is not None:
+        # B34-BENCHMARK: inside the fund the benchmark is the fund's hold bought at the window's start on the book's
+        # equity then (E0 = base_eq), its own entry fee paid; its return from E0, to the latest stored close.
+        fb = hold(first + pd.Timedelta(days=1) if len(before) else w.index[0], base_eq, _utc(end) if end else None)
+        if fb is not None and len(fb.values):
+            from sleeve_fund.dashboard.book import on_days
+
+            bench = float(fb.values.iloc[-1]) / base_eq - 1
+            bmk = [0.0] + [float(v) / base_eq - 1 for v in on_days(fb.values, w.index, base_eq)]
     days = [first] + list(w.index)
     return {"empty": False, "ret": ret, "bench": bench, "vs": ret - bench, "worst_dd": worst,
             "worst_on": dd.idxmax() if worst > 0 else None, "fees": fees, "fills": n_fills,

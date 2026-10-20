@@ -250,6 +250,12 @@ def book_open_risk(store, atr_pct, account: str | None = None) -> list[dict]:
 def account_equity(store, account: str) -> float:
     """The book the limit measures an account's open risk against: every strategy on the account inside the fund's
     book, as account_book adds it up (_book_part), so one account's book is supervisor.fund_equity."""
+    from sleeve_fund import supervisor
+
+    if supervisor.bridge_start(store) is not None:
+        # B-34 row 20 (CUT-A (d)): once the fund holds the cash no Strategy has equity of its own, so the book is the
+        # fund's (fund_book), as account_book reads it, never a sum of Strategies' P&L marks.
+        return float(supervisor.fund_book(store).total)
     earlier, runs, out = store.previous_book(), store.reset_runs(), store.withdrawn()
     book = 0.0
     for s in store.sleeves():

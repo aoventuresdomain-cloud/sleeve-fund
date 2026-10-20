@@ -3318,7 +3318,10 @@ class LongFlatStrategy(Strategy):
             self._held_w = 0.0
         elif w > 0 and is_long and self._cfg.rebalance_band is not None:
             if self._held_w is None:  # e.g. after a restart: start from what is actually held
-                equity, _, qty, _ = self._mark()
+                own, _, qty, _ = self._mark()
+                equity = self._weight_equity(own)  # B-34 row 3: the fund's, inside it
+                if equity is None:
+                    return  # the fund's mark is stale: no rebalance off an old figure; exits still run
                 self._held_w = qty * close / equity if equity > 0 else w
             if abs(w - self._held_w) > self._cfg.rebalance_band * self._held_w:
                 if w > self._held_w and (self._entry_blocked(bar, "an addition") or self._entry_held(bar, "addition")):
@@ -3361,7 +3364,13 @@ class LongFlatStrategy(Strategy):
 
     def _rebalance(self, bar: Bar, w: float, reason: str, values: dict) -> bool:
         """Trade part of the position so it is worth `w` of the sleeve's equity at this close."""
-        equity, _, qty, _ = self._mark()
+        own, _, qty, _ = self._mark()
+        equity = self._weight_equity(own)  # B-34 row 2: inside the fund, w of the fund's marked equity
+        if equity is None:
+            self._note("rebalance_skipped_fund_equity", "Rebalance skipped: fund equity stale: the last portfolio mark "
+                       "is older than its interval allows, so nothing is traded off an old figure")
+            return False
+        self._noted.discard("rebalance_skipped_fund_equity")
         price = bar.close.as_decimal()
         diff = Decimal(str(equity * w)) - Decimal(str(qty)) * price
         step = self._lot()
@@ -3637,17 +3646,21 @@ class LongFlatStrategy(Strategy):
         # the other limits are sizes in their own right, and their fee comes out of the spare cash.
         room = Decimal(1) - Decimal(str(self._cfg.cash_buffer)) - Decimal(str(self._cfg.assumed_taker_fee))
         # Never more than the journal's cash either, when an exit booked at a replayed price left it lower.
-        limits = {"free cash": (free.as_decimal() + Decimal(str(min(self._cash_adj, 0.0)))) * room}
-        if weight < 1:
-            limits["target weight"] = Decimal(str((self._mark()[0] or float(free.as_decimal())) * weight))
-        if self._cfg.max_notional is not None:
-            limits["largest order cap"] = Decimal(str(self._cfg.max_notional))
-        base = self._sizing_base(self._mark()[0] or float(free.as_decimal()))
+        own = self._mark()[0] or float(free.as_decimal())
+        base = self._sizing_base(own)
         if base is None:
             self._note("entry_refused_fund_equity", "Buy refused: fund equity stale: the last portfolio mark is older "
                        "than its interval allows, so nothing is sized off an old figure")
             return
         self._noted.discard("entry_refused_fund_equity")
+        limits = {"free cash": (free.as_decimal() + Decimal(str(min(self._cash_adj, 0.0)))) * room}
+        if weight < 1:
+            # B-34 row 1: inside the fund a new entry's weight is of the fund's sizing base (Advisor
+            # B34-CAPITAL-PREDICATE (b)), never the Strategy's own P&L from 0; outside it its own equity, as before.
+            of = base if LongFlatStrategy._fund_held(self) else own
+            limits["target weight"] = Decimal(str(of * weight))
+        if self._cfg.max_notional is not None:
+            limits["largest order cap"] = Decimal(str(self._cfg.max_notional))
         if self.runtime is not None:
             limits[f"{self.runtime.profile.name} risk profile cap"] = Decimal(str(self.runtime.position_budget(base)))
         elif self._cfg.position_cap_pct is not None:
@@ -5934,7 +5947,10 @@ class LongFlatStrategy(Strategy):
         Strategy's own equity (its P&L, from a starting balance of 0) never sizes, halts or pauses it (Advisor CUT-A
         (d)). A test Strategy outside the book (F229-6) is its own fund."""
         rt = self.runtime
-        return rt is not None and not rt.backtest and self._paper_gated() is not None
+        # B34-CAPITAL-PREDICATE (Advisor, 20 Oct): one predicate, the runtime's fund_held (the PM's re-base deposit has
+        # landed, supervisor.bridge_start); before it the Strategy keeps its own sizing and halts.
+        return (rt is not None and not rt.backtest and self._paper_gated() is not None
+                and bool(getattr(rt, "fund_held", False)))
 
     def _paper_fund_equity(self) -> float | None:
         """Paper's fund equity: the supervisor's last portfolio mark, or None when it is stale by the book's own rule
@@ -5953,6 +5969,16 @@ class LongFlatStrategy(Strategy):
                 self.log.warning(f"fund equity unreadable: {type(exc).__name__}: {exc}")
                 return None
             return None if fund is None else float(fund)
+        return self._fund_marked_equity()
+
+    def _fund_marked_equity(self) -> float | None:
+        """B-34 (Advisor B34-CAPITAL-PREDICATE (b)): the fund's equity at the supervisor's last portfolio mark, gains
+        not yet taken included, or None when that mark is stale or can't be read. A weight model's rebalance target
+        and its held weight both read this one figure, so a winner's own gain never reads as overweight."""
+        from sleeve_fund.gate_ledger import DbLedger
+        from sleeve_fund.paper.runtime import _no_positions
+        from sleeve_fund.portfolio import gate
+
         try:
             st = DbLedger(self.runtime.store, _no_positions).state()
         except Exception as exc:  # noqa: BLE001 - fail closed: an unread book sizes nothing
@@ -5963,6 +5989,11 @@ class LongFlatStrategy(Strategy):
         if self.runtime.now() - st.mark_ts > gate.MARK_STALE:
             return None
         return float(st.equity)
+
+    def _weight_equity(self, own: float) -> float | None:
+        """B-34 rows 2 and 3: the equity a target weight is a share of. Inside the fund (_fund_held) the fund's marked
+        equity (None when stale: nothing is traded off an old figure); outside it the Strategy's own, as before."""
+        return self._fund_marked_equity() if LongFlatStrategy._fund_held(self) else own
 
     def _strength_limit(self, limits: dict, values: dict, base: float) -> str | None | bool:
         """G5: with the Model's signal_strength set, the signal strength limit: f(strength) x its configured size, the

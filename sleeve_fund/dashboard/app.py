@@ -363,7 +363,9 @@ def create_app(store: Store | None = None) -> FastAPI:
         # the daily closes alone a wiped-out strategy's was 0, and 0/0 made the range a 500 (mF2-1, mF2-2).
         base = bookm.fund_cash(st())  # A-20: the fund's own cash, once it holds it
         start = sum(s.starting_balance for s in sleeves) + base
-        curve = bookm.recent_curve(st(), sleeves, days, max(float(prior.max()) if len(prior) else 0.0, start), base)
+        line = bookm.fund_line(st(), start) if base else None  # B34-BENCHMARK: the fund's one hold
+        curve = bookm.recent_curve(st(), sleeves, days, max(float(prior.max()) if len(prior) else 0.0, start), base,
+                                   line.values if line is not None and len(line.values) else None)
         return JSONResponse({
             "res": "intraday",
             "t": [t.isoformat() for t in curve.index],
@@ -376,7 +378,9 @@ def create_app(store: Store | None = None) -> FastAPI:
     def book_equity_json(days: int | None = None, _: str = Depends(require_pm)):
         sleeves, frames, summaries, _tests = shown_book()
         base = bookm.fund_cash(st())
-        curve = bookm.book_curve(summaries, frames, base)  # every strategy, as the book figures count it
+        line = bookm.fund_line(st(), sum(x["sleeve"].starting_balance for x in summaries) + base) if base else None
+        curve = bookm.book_curve(summaries, frames, base,  # every strategy, as the book figures count it
+                                 line.values if line is not None and len(line.values) else None)
         if days:
             return _recent_json(sleeves, days, curve)
         return JSONResponse({
@@ -385,6 +389,10 @@ def create_app(store: Store | None = None) -> FastAPI:
             "equity": [round(v, 2) for v in curve["equity"]],
             "benchmark": [round(v, 2) for v in curve["benchmark"]],
             "drawdown": [round(v, 5) for v in curve["drawdown"]] if len(curve) else [],
+            # B34-BENCHMARK: the hold's last point and what it is made of, for the chart's "as of" label and footnote
+            **({"bench_as_of": f"{line.as_of.astimezone(UK):%-d %b %H:%M} UK", "bench_source": line.source}
+               if line is not None and len(line.values) else {"bench_as_of": None, "bench_source": None}),
+            "history_note": bookm.HISTORY_NOTE if base else None,
         })
 
     @app.get("/risk", response_class=HTMLResponse)
@@ -1424,9 +1432,15 @@ def create_app(store: Store | None = None) -> FastAPI:
         # test account) keeps its own capital.
         held = chosen and summaries and held_by_fund(st(), summaries[0]["sleeve"])
         base = bookm.fund_cash(st()) if (not chosen or held) else 0.0
+        # B34-BENCHMARK: inside the fund each window's and month's benchmark is the fund's hold, bought on the book then
+        from functools import partial
+
+        from sleeve_fund.dashboard.fund_bench import fund_hold
+
+        hold = partial(fund_hold, st()) if base and bookm.fund_line(st(), base) is not None else None
         perf = reports.performance(summaries, frames, [f for fs in fills.values() for f in fs], w["start"], w["end"],
-                                   base)
-        m = reports.monthly(summaries, frames, fills, base)
+                                   base, hold)
+        m = reports.monthly(summaries, frames, fills, base, hold)
         months = [r for r in m["rows"] if reports.in_window(r["key"], w)]
         keys = {r["month"] for r in months}
         m = {**m, "rows": months, "months": [mo for mo in m.get("months", []) if mo in keys]}
@@ -2822,6 +2836,31 @@ def _shorts(store: Store, name: str) -> bool:
         return False
 
 
+def _fund_halt_room(store: Store) -> tuple[float | None, str] | None:
+    """B-34 row 11: inside the fund (its re-base deposit has landed) a Strategy's own equity is its P&L from 0 and
+    never halts it (Advisor CUT-A (d)); the halt that would close a position is the fund's drawdown halt (T5). Returns
+    (the money left before it on the fund's last mark, as book_breach measures it, and its words), headroom None
+    while that halt is off, or None outside the fund. A book never marked can't be checked, so it refuses (fails
+    closed): loosening a stop is the one edit this guards."""
+    from sleeve_fund.gate_ledger import DbLedger
+    from sleeve_fund.money import scale
+    from sleeve_fund.portfolio import compliance
+    from sleeve_fund.supervisor import bridge_start
+
+    if bridge_start(store) is None:
+        return None
+    st = DbLedger(store, lambda: ()).state()
+    if st.equity is None:
+        raise ValueError("the fund's book hasn't been marked yet, so a looser stop can't be checked against the fund's "
+                         "drawdown halt; try again in a minute")
+    drawdown = compliance.load(store, "dashboard").drawdown
+    words = "before the fund's drawdown halt"
+    if drawdown is None:
+        return None, words
+    top = max(st.reference() or st.equity, st.equity)
+    return float(st.equity - (top - scale(top, drawdown))), f"{words} ({drawdown:.0%}, T5)"
+
+
 def _check_open_stop(store: Store, s, params: dict, profile, leg: float, confirmed: bool) -> None:
     """A stop the PM loosens on an open position is checked against its size before it saves (review
     round 8, M8-1: a 3% to 50% edit saved, about 17R at risk). A stop set from the market only ever
@@ -2852,13 +2891,17 @@ def _check_open_stop(store: Store, s, params: dict, profile, leg: float, confirm
         return
     level = entry_px * (1 - side * new)
     loss = max(side * qty * (price - level), 0.0) + qty * level * leg  # from here to the stop, and the fee to close
-    equity = last["equity"] if last else s.starting_balance
-    peak = max(store.peak_equity(s.name) or s.starting_balance, equity)
-    headroom = equity - peak * (1 - profile.max_drawdown)
-    if loss > headroom:
+    fund = _fund_halt_room(store)
+    if fund is not None:  # the fund holds the cash: its drawdown halt (T5) is the one that would close the position
+        headroom, halt = fund
+    else:
+        equity = last["equity"] if last else s.starting_balance
+        peak = max(store.peak_equity(s.name) or s.starting_balance, equity)
+        headroom = equity - peak * (1 - profile.max_drawdown)
+        halt = f"before the {profile.name} profile's {profile.max_drawdown:.0%} drawdown halt"
+    if headroom is not None and loss > headroom:
         raise ValueError(f"a {new:.1%} stop on the open position would lose {loss:,.2f} from here, more than the "
-                         f"{max(headroom, 0):,.2f} left before the {profile.name} profile's "
-                         f"{profile.max_drawdown:.0%} drawdown halt, which would close it first; choose a tighter stop")
+                         f"{max(headroom, 0):,.2f} left {halt}, which would close it first; choose a tighter stop")
     if not confirmed:
         risk = (plan or {}).get("risk_amount") or ((entry or {}).get("signal") or {}).get("risk_amount")
         in_r = f" ({qty * entry_px * (new + leg + (1 - side * new) * leg) / risk:.1f}R of the entry's risk)" if risk else ""
