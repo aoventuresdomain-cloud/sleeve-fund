@@ -654,7 +654,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         feed = _feed(events, request.query_params.get("feed", "all"))
         recent = [trading.order_view(o) for o in st().orders(name, limit=ORDER_HISTORY_ROWS)]
         order_total = sum(st().order_counts(name).values())
-        position = trading.open_position(x, fills, orders, plans)
+        position = trading.open_position(x, fills, orders, plans, decision_of=st().entry_decision)
         perp_x = trading.perp_view(x, position, funding) if perp else None
         # Its position's margin was lost (liquidated): no Start, Resume or Reset until the PM resets it after
         # liquidation with an incident note (Advisor 6 Oct 17:57 and 20:41), whatever its status meanwhile.

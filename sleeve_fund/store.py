@@ -5053,6 +5053,13 @@ class Store:
         raise ValueError(f"decision {decision_id} already has a mark for fill {trade_id} at {stored(have.price)}; "
                          "a fill mark is never rewritten")
 
+    def entry_decision(self, order_id: str) -> dict | None:
+        """The gate's decision an order was sent under, its whole row (PAGE-SIZE), or None when it was never gated."""
+        t = gate_decisions_t
+        with self.engine.connect() as c:
+            r = c.execute(select(t).where(t.c.order_id == order_id).order_by(t.c.id.desc()).limit(1)).first()
+        return dict(r._mapping) if r else None
+
     def fill_marks(self, decision_id: int) -> list[dict]:
         """A gate decision's fill marks, oldest first (B-24)."""
         t = gate_fill_marks_t

@@ -466,8 +466,9 @@ def open_risk_hint(estimated: list[str], through: list[str], left_out: dict[str,
 
 
 def open_position(x: dict, fills: list[dict], orders: dict[str, dict],
-                  plans: dict[str, dict] | None = None) -> dict | None:
-    """An open position from a sleeve summary (with book extras), or None when flat."""
+                  plans: dict[str, dict] | None = None, decision_of=None) -> dict | None:
+    """An open position from a sleeve summary (with book extras), or None when flat. decision_of: order id -> its gate
+    decision (Store.entry_decision), for the entry's T1 sizing lines; the Strategy page passes it."""
     if not x["qty"] or not x["entry_px"]:
         return None
     side = 1 if x["qty"] > 0 else -1
@@ -513,21 +514,39 @@ def open_position(x: dict, fills: list[dict], orders: dict[str, dict],
         # inside the fund over the fund's equity, as its summary's (B-20): its own equity is its P&L from 0
         "weight": x["exposure"] if x.get("in_fund") else x["position_value"] / x["equity"] if x["equity"] else 0.0,
         "in_fund": bool(x.get("in_fund")),
-        "sizing": entry_sizing(entry),
+        "sizing": entry_sizing(entry, decision_of(lot["order_id"]) if decision_of and lot else None),
         "fees": sum(float(f["fee"] or 0.0) for f in fills[:own + 1]) if own is not None else None,
     }
 
 
-def entry_sizing(entry: dict | None) -> dict | None:
+def t1_sizing(decision: dict | None) -> dict | None:
+    """PAGE-SIZE lines 1 and 2, read from the entry's gate decision as recorded, never worked from today's T1 (Advisor,
+    20 Oct): the share of T1's room it was sized at (size_share), the loss if its stop is hit (approved quantity x risk
+    per unit over the book's equity then) and T1's cap over that equity. None when any is missing or unusable, never a
+    guess. shortcut: t1_used_before, t1_cap, risk_per_unit (USDT) and size_share are the planned gate_decisions
+    columns (DA, QD2's B-24 part 2 writer); until they land every decision reads as not recorded."""
+    d = decision or {}
+    qty, book, used, cap, per, share = (d.get(k) for k in ("approved_qty", "book_equity", "t1_used_before", "t1_cap",
+                                                            "risk_per_unit", "size_share"))
+    if None in (qty, book, used, cap, per) or book <= 0:
+        return None
+    # size_share alone is NULL when T1 had no room left (QD2's writer): that line only then reads as not recorded
+    return {"room_share": float(share) if share is not None else None, "stop_share": float(round(qty * per / book, 4)),
+            "t1_limit": float(round(cap / book, 4))}
+
+
+def entry_sizing(entry: dict | None, decision: dict | None = None) -> dict | None:
     """PAGE-SIZE (Advisor, 20 Oct): what the entry's decision journal says it was sized to, never worked again: its
     order's quantity at the close it decided at, over the fund equity it was sized off (F-FC-4, journaled inside the
-    fund only). None when the entry doesn't journal them. T1's room and the loss at the stop aren't journaled before
-    B-24, so they aren't shown."""
+    fund only). None when the entry doesn't journal them. decision: its gate decision (Store.entry_decision), for
+    T1's room and the loss at the stop (t1_sizing)."""
     sig = (entry or {}).get("signal") or {}
     fund, close, qty = sig.get("fund_equity"), sig.get("close"), (entry or {}).get("qty")
     if not fund or fund <= 0 or not close or not qty:
         return None
-    return {"value_share": abs(float(qty)) * float(close) / float(fund)}
+    # gated: whether the entry has a decision at all; t1: its two T1 lines, None when that decision lacks them
+    return {"value_share": abs(float(qty)) * float(close) / float(fund), "gated": decision is not None,
+            "t1": t1_sizing(decision)}
 
 
 def perp_view(x: dict, position: dict | None, funding: list[dict]) -> dict | None:
