@@ -4,10 +4,11 @@ capped at 1x. Above that it is refused wherever it is created, edited or started
 row already in the store is refused at start with the reason, never changed. Backtests and studies still run."""
 
 import pytest
-
-from sleeve_fund.strategies import check_perp_stop, places_stop
 from test_dashboard import AUTH, SAME, _new, client  # noqa: F401 - client is a fixture
 from test_supervisor import FakePopen
+
+from sleeve_fund.risk import PROFILES, leverage_cap
+from sleeve_fund.strategies import check_perp_stop, places_stop
 
 PERP = {"market": "perp", "allow_short": True}
 STOPLESS = [("rsi_bands", PERP), ("ping_pong", PERP), ("buy_and_hold", {"market": "perp"}),
@@ -45,17 +46,22 @@ def test_spot_is_unaffected(strategy):
 
 def test_new_strategy_and_a_settings_edit_refuse_it_and_change_nothing(client):  # noqa: F811
     c, store = client
-    r = _new(c, name="rb-perp", strategy="rsi_bands", instrument="BTC/USDT", venue="binance", market="perp",
+    # TEC-B35A (HoE ruling, 20 Oct): through the form it saves under the profile picked, held at 1x by its own cap.
+    r = _new(c, name="rb-held", strategy="rsi_bands", instrument="BTC/USDT", venue="binance", market="perp",
              allow_short="1", risk_profile="balanced")
-    assert r.status_code == 303 and "places+no+stop" in r.headers["location"], r.headers["location"]
-    assert store.sleeves() == []
+    assert r.headers["location"] == "/sleeves/rb-held", r.headers["location"]
+    assert store.sleeve("rb-held").params["max_leverage"] == 1
+    with pytest.raises(ValueError, match="places no stop"):  # without that cap it is still refused
+        check_perp_stop("rsi_bands", {"market": "perp"}, "balanced")
     ok = _new(c, name="rb-perp", strategy="rsi_bands", instrument="BTC/USDT", venue="binance", market="perp",
               allow_short="1", risk_profile="conservative")
     assert ok.headers["location"] == "/sleeves/rb-perp"
     r = c.post("/sleeves/rb-perp/settings", data={"risk_profile": "aggressive", "reason": "more"}, auth=AUTH,
                headers=SAME, follow_redirects=False)
-    assert "settings_error" in r.headers["location"] and "places+no+stop" in r.headers["location"]
-    assert store.sleeve("rb-perp").risk_profile == "conservative"
+    # TEC-B35A: saved through the form it carries its own 1x cap, so a higher profile is taken and it stays at 1x.
+    assert "settings_error" not in r.headers["location"], r.headers["location"]
+    s = store.sleeve("rb-perp")
+    assert s.risk_profile == "aggressive" and leverage_cap(PROFILES[s.risk_profile], s.params) == 1.0
     # With a stop set, the same edit goes through.
     r = c.post("/sleeves/rb-perp/settings", data={"risk_profile": "aggressive", "stop_loss_pct": "2", "reason": "stop"},
                auth=AUTH, headers=SAME, follow_redirects=False)
