@@ -4,6 +4,7 @@ can't write; the list of paper modules that may mention keys is closed, by exact
 
 import json
 import os
+import re
 import subprocess
 import sys
 import urllib.request
@@ -65,10 +66,16 @@ def test_only_the_listed_paper_modules_mention_a_key():
     assert mention == sorted(MAY_HOLD_KEYS)
 
 
-def test_the_key_list_is_the_one_test_paper_exempts():
+def test_test_paper_exempts_only_the_read_path_and_only_its_read_only_client_call():
+    """CR K1: the exemption from test_paper's key check is venue_reads.py alone, and its one key-passing line is the
+    read-only VenueStops it builds."""
     import test_paper
 
-    assert test_paper.ORDER_CLIENT == MAY_HOLD_KEYS
+    assert test_paper.ORDER_CLIENT == {"sleeve_fund/paper/venue_reads.py"}
+    src = (ROOT / "sleeve_fund" / "paper" / "venue_reads.py").read_text()
+    passing = [line.strip() for line in src.splitlines() if "api_key=" in line or "api_secret=" in line]
+    assert len(passing) == 1 and passing[0].startswith("self._client = VenueStops(")
+    assert re.search(r"VenueStops\([^)]*read_only=True\)", src)
 
 
 @pytest.fixture

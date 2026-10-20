@@ -13,11 +13,10 @@ from sleeve_fund.strategies import TrendFilter, TrendFilterConfig
 ROOT = Path(__file__).resolve().parent.parent
 PAPER_SRC = ROOT / "sleeve_fund" / "paper"
 SLEEVES = sorted((ROOT / "configs" / "sleeves").glob("*.toml"))
-# TEC-B05-KEYS (HoE and Advisor, 20 Oct): the exchange order client's own modules (B-05), by exact path, are the only
-# paper code that passes keys. It ships OFF and a node start never imports them (test_b05_keys_guard, which also pins
-# this list); adding a path needs the HoE's and the Advisor's sign-off, recorded on the board.
-ORDER_CLIENT = {"sleeve_fund/paper/exec_client.py", "sleeve_fund/paper/venue_reads.py",
-                "sleeve_fund/paper/venue_stops.py"}
+# TEC-B05-KEYS (HoE and Advisor, 20 Oct; CR K1): the connect check's reads (B-05), by exact path, are the only paper
+# code that passes keys by name, and only into its read-only VenueStops (test_b05_keys_guard pins both). It ships OFF
+# and a node start never imports it. Adding a path needs the HoE's and the Advisor's sign-off, recorded on the board.
+ORDER_CLIENT = {"sleeve_fund/paper/venue_reads.py"}
 
 
 def test_paper_code_cannot_build_a_real_execution_client():
