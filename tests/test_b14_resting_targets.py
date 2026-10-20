@@ -532,3 +532,55 @@ def test_b14v_a_touch_never_starts_an_unanswered_targets_grace():
         now[0] += 2_000_000_000
     assert strat._target_since is None and not strat._targets_lost
     assert LongFlatStrategy._target_waits(strat, 61_200.1, 1) is True and strat._target_since == now[0]
+
+
+def test_b14w_a_reconcile_halt_leaves_the_resting_target_and_stop_and_cancels_the_rest():
+    """HEAD6 5: halted, the target stays resting at the venue, as A1's stop does (only openers are cancelled)."""
+    from sleeve_fund.strategies.base import LongFlatStrategy
+
+    cancelled = []
+    orders = [SimpleNamespace(client_order_id=c) for c in ("E", "T", "S", "X")]
+    strat = SimpleNamespace(
+        strategy_id="S1", cache=SimpleNamespace(orders_open=lambda **k: orders),
+        decisions={"E": {"intent": "entry"}, "T": {"intent": "take_profit"}, "S": {"intent": "stop_loss"},
+                   "X": {"intent": "exit"}},
+        cancel_order=cancelled.append)
+    LongFlatStrategy._cancel_all_but_exits(strat)
+    assert cancelled == ["E", "X"]
+
+
+@pytest.mark.parametrize("status, cancels, on_accept", [("ACCEPTED", ["T"], set()), ("PARTIALLY_FILLED", ["T"], set()),
+                                                        ("SUBMITTED", [], {"T"}), ("PENDING_CANCEL", [], set())])
+def test_b14x_every_close_cancels_the_resting_target_first_and_sells_only_once_it_has_gone(status, cancels, on_accept):
+    """HEAD6 5: a close (a signal's exit, a flatten, a halt's close) cancels the resting target before anything is
+    sold; one not yet at the venue is cancelled as soon as it gets there. Nothing is sent at market meanwhile."""
+    from nautilus_trader.model import OrderStatus, OrderType
+
+    from sleeve_fund.strategies.base import LongFlatStrategy
+
+    cancelled, sent = [], []
+    target = SimpleNamespace(client_order_id="T", status=getattr(OrderStatus, status), order_type=OrderType.LIMIT)
+    strat = SimpleNamespace(_pending_exit=None, pair=None, _drop_kept=lambda earn: None, _working=lambda: [target],
+                            _cancel_on_accept=set(), cancel_order=cancelled.append,
+                            _submit=lambda *a, **k: sent.append(a))
+    LongFlatStrategy._sell_all(strat, "pm_flatten", "Flattened", {})
+    assert cancelled == cancels and strat._cancel_on_accept == on_accept and sent == []
+    assert strat._pending_exit == ("pm_flatten", "Flattened", {})  # sold once every working order has closed
+
+
+@pytest.mark.parametrize("status, exits_only", [("halted", False), ("paused", False), ("flattening", False)])
+def test_b14y_halted_or_paused_nothing_new_rests_and_nothing_resting_is_cancelled(status, exits_only):
+    """HEAD6 5: halt and pause place no new target (and resize none) but cancel none either: the one resting stays."""
+    from sleeve_fund.strategies.base import LongFlatStrategy
+
+    calls = []
+    strat = SimpleNamespace(
+        _cfg=SimpleNamespace(), _backtest=False, _resting_stops=lambda: False, _resting_targets=lambda: True,
+        _tp_frac=0.01, _target_refused_at=None, _entry_px=60_000.0, _exits_only=exits_only,
+        runtime=SimpleNamespace(status=status), _resting_exits=lambda: calls.append("read") or {},
+        _place_exits=lambda plan: calls.append(("place", plan)), cancel_order=lambda c: calls.append(("cancel", c)))
+    LongFlatStrategy._rest_exits(strat)
+    assert calls == []
+    strat.runtime.status = "running"
+    LongFlatStrategy._rest_exits(strat)
+    assert calls == ["read", ("place", {"take_profit": 0.01})]
