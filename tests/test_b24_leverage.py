@@ -186,3 +186,22 @@ def test_j_a_fill_that_slips_the_fund_past_t4_is_alerted_in_words_and_refuses_no
     assert fill_breach({}, t4) is None
     assert fill_breach({"gross_after": D(9), "net_underlying_after": D(9)}, replace(t4, gross=None,
                                                                                     net_instrument=None)) is None
+
+
+@pytest.mark.parametrize("lev", [D("3"), 3.0, 3], ids=["decimal", "float", "int"])
+def test_a_leverage_as_a_decimal_float_or_int_gives_the_same_intent(lev):
+    """HoE 00:03 UK: gate_intent read the leverage with repr(), so a Decimal one (repr "Decimal('3')") crashed and the
+    gate refused the entry. Each form is the same 3x perp order."""
+    d = {"side": 1, "qty": D("0.1"), "price": D(60000), "stop_frac": 0.02, "step": STEP, "min_qty": STEP,
+         "instrument": "BTC", "atr_pct": None, "taker": D(0), "held": D(0)}
+    want = gate_intent({**d, "leverage": 3.0})
+    got = gate_intent({**d, "leverage": lev})
+    assert got == want and got.leverage == D(3) and got.margin_per_unit == D(20000)
+
+
+def test_no_leverage_is_spot_with_no_crash():
+    """HoE 00:16 UK: the `is None` branch: spot, the full price as margin, no leverage on the Intent."""
+    d = {"side": 1, "qty": D("0.1"), "price": D(60000), "stop_frac": 0.02, "step": STEP, "min_qty": STEP,
+         "instrument": "BTC", "atr_pct": None, "taker": D(0), "held": D(0), "leverage": None}
+    got = gate_intent(d)
+    assert got.leverage is None and got.margin_per_unit == D(60000)
