@@ -958,6 +958,28 @@ window.Console = (() => {
     if (!form) return;
     const $ = (n) => form.elements[n];
     $("strategy").addEventListener("change", () => applyPrefill(form, $("strategy").selectedOptions[0]));
+    // B-35: a model that decides on one candle length picks that chip when chosen (the model refuses any other).
+    const pickBar = () => {
+      const want = $("strategy").selectedOptions[0]?.dataset.bar;
+      const chip = want && form.querySelector(`input[name=bar_spec][value="${want}"]`);
+      if (chip && !chip.checked) { chip.checked = true; chip.dispatchEvent(new Event("change", {bubbles: true})); }
+    };
+    $("strategy").addEventListener("change", pickBar); pickBar();
+    // and one sized by weight can't trade a perpetual yet (check_perp_sizing): there it is greyed, with the reason.
+    const perpModels = () => {
+      const perp = $("market").value !== "spot";
+      [...$("strategy").options].forEach((o) => {
+        if (!o.dataset.perpRefused) return;
+        o.dataset.label ??= o.textContent;
+        o.disabled = perp;
+        o.textContent = perp ? `${o.dataset.label}, ${o.dataset.perpRefused.split(":")[1].trim()}` : o.dataset.label;
+      });
+      if ($("strategy").selectedOptions[0]?.disabled) {
+        $("strategy").value = [...$("strategy").options].find((o) => !o.disabled).value;
+        $("strategy").dispatchEvent(new Event("change", {bubbles: true}));
+      }
+    };
+    $("market").addEventListener("change", perpModels); perpModels();
     const pct = (x) => `${(x * 100).toFixed(0)}%`;
     const sync = () => {
       const strat = $("strategy").value;
@@ -1004,12 +1026,31 @@ window.Console = (() => {
       ul.replaceChildren(...items.map((t) => Object.assign(document.createElement("li"), {textContent: t})));
       if (!$("name").dataset.touched) {
         // Model, instrument and candle length: rsi-bands-solusdt-15m (UI v2, item 9).
-        const candle = bar ? bar.parentElement.textContent.trim().split(" ")[0] : "";
+        // "1h venue" stays "1h-venue": the two 1h chips must not suggest the same name (B-35 follow-up).
+        const candle = bar ? bar.parentElement.textContent.trim().split(/\s+/).join("-") : "";
         $("name").value = [strat.replace(/_/g, "-"), pair.replace("/", "").toLowerCase(), candle].filter(Boolean).join("-").replace(/[^a-z0-9-]/g, "").slice(0, 41);
       }
     };
     $("name").addEventListener("input", () => { $("name").dataset.touched = "1"; });
+    // B-35: a model that places no stop is held to 1x on a perpetual (strategies.check_perp_stop, "always a stop, or
+    // 1x"). With no stop set the form picks the highest profile within that and says why, so its defaults save; a
+    // stop set under Orders and exits frees the choice.
+    const holdStopless = () => {
+      const max = Number($("strategy").selectedOptions[0]?.dataset.stoplessMax);
+      const note = document.getElementById("stopless-note");
+      const held = max > 0 && $("market").value !== "spot" && !(form.querySelector("[data-kind=stop]")?.value);
+      if (note) {
+        note.hidden = !held;
+        note.textContent = held ? `This model places no stop, so on a perpetual it is held to ${max}x leverage. Set a stop under Orders and exits to choose more.` : "";
+      }
+      const prof = $("risk_profile");
+      if (!held || Number(prof.selectedOptions[0].dataset.lev) <= max) return;
+      const fit = [...prof.options].filter((o) => Number(o.dataset.lev) <= max).sort((a, b) => Number(b.dataset.lev) - Number(a.dataset.lev))[0];
+      if (fit) { prof.value = fit.value; prof.dispatchEvent(new Event("change", {bubbles: true})); }
+    };
+    form.addEventListener("change", holdStopless);
     form.addEventListener("input", sync); form.addEventListener("change", sync); sync();
+    holdStopless();
     wizard(form);
     orderFields("sleeve-form");
 

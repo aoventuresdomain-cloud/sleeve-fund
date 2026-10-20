@@ -66,7 +66,14 @@ from sleeve_fund.store import (
 )
 from sleeve_fund.paper.runtime import (EXITS_ONLY, RESUMABLE, clearing_action, entry_blocked, liquidation_event,
                                       pair_ral_figures)
-from sleeve_fund.strategies import REGISTRY, check_perp_sizing, check_perp_stop
+from sleeve_fund.strategies import (
+    PERP_WEIGHT_REFUSAL,
+    REGISTRY,
+    STOPLESS_MAX_LEVERAGE,
+    check_perp_sizing,
+    check_perp_stop,
+    places_stop,
+)
 from sleeve_fund.strategies.base import exit_warmup, maker_orders_enabled
 from sleeve_fund.wording import no_venues
 
@@ -2476,6 +2483,9 @@ TEST_FIELDS = {
                     ("run_for_hours", "Run for, hours", "Until stopped", "Empty runs it until you stop it.")),
 }
 PERCENT_PARAMS = {"candle_step": {"size_share"}}
+# A model that decides on one candle length only: choosing it on the form picks that chip (B-35), as the model
+# refuses any other (donchian.py: "decides on daily candles").
+MODEL_BAR = {"donchian": "1-DAY-LAST-EXTERNAL"}
 
 
 def _strategy_choices(tests: bool = False) -> list[dict]:
@@ -2491,7 +2501,12 @@ def _strategy_choices(tests: bool = False) -> list[dict]:
         out.append({"name": name, "idea": _idea(name), "params": {} if test else spec.default_params,
                     "family": spec.family, "tpl": spec.summary, "defaults": _config_defaults(name),
                     "group": "Test" if test else "Strategies", "prefill": TEST_PREFILL.get(name) if test else None,
-                    "fields": TEST_FIELDS.get(name, ()) if test else ()})
+                    "fields": TEST_FIELDS.get(name, ()) if test else (),
+                    # B-35: one that places no stop is held to this leverage on a perpetual (check_perp_stop)
+                    "stopless_max": None if places_stop(name, None) else STOPLESS_MAX_LEVERAGE,
+                    # and one sized by weight is refused on a perpetual (check_perp_sizing): offered there, greyed
+                    "perp_refused": PERP_WEIGHT_REFUSAL if REGISTRY[name][0].weight_sized(spec.default_params or {})
+                    else None, "bar": MODEL_BAR.get(name)})
     return out
 
 
@@ -2690,6 +2705,11 @@ def _coerce_params(raw: dict) -> dict:
     for k, v in raw.items():
         if not re.fullmatch(r"[a-z_]{1,32}", k):
             raise ValueError(f"bad parameter name {k!r}")
+        # A list of whole numbers (Donchian's lookbacks "20,55,100", B-35) stays the list the model reads; the
+        # model's own config checks its values.
+        if isinstance(v, str) and re.fullmatch(r"\s*\d{1,6}(\s*,\s*\d{1,6})+\s*", v):
+            out[k] = ",".join(part.strip() for part in v.split(","))
+            continue
         try:
             out[k] = int(v)
         except ValueError:

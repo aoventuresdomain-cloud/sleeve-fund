@@ -34,7 +34,7 @@
 
 {% macro strategy_fields(strategies, chosen, g1, pre) %}
 <div class="field"><label for="strategy">Model</label>
-  {% macro opt(st) %}<option value="{{ st.name }}" {{ 'selected' if st.name == chosen }} data-g1="{{ g1.get(st.name) or '' }}"{% if st.prefill %} data-prefill="{{ st.prefill|tojson|forceescape }}"{% endif %}>{{ st.name|replace('_', ' ') }} ({{ st.family }})</option>{% endmacro %}
+  {% macro opt(st) %}<option value="{{ st.name }}" {{ 'selected' if st.name == chosen }} data-g1="{{ g1.get(st.name) or '' }}"{% if st.stopless_max %} data-stopless-max="{{ '%g'|format(st.stopless_max) }}"{% endif %}{% if st.perp_refused %} data-perp-refused="{{ st.perp_refused }}"{% endif %}{% if st.bar %} data-bar="{{ st.bar }}"{% endif %}{% if st.prefill %} data-prefill="{{ st.prefill|tojson|forceescape }}"{% endif %}>{{ st.name|replace('_', ' ') }} ({{ st.family }})</option>{% endmacro %}
   {% set tests = strategies|selectattr('group', 'equalto', 'Test')|list %}
   <select name="strategy" id="strategy">{% if tests %}<optgroup label="Strategies">{% endif %}{% for st in strategies if st.group != 'Test' %}{{ opt(st) }}{% endfor %}{% if tests %}</optgroup>
     <optgroup label="Test">{% for st in tests %}{{ opt(st) }}{% endfor %}</optgroup>{% endif %}</select></div>
