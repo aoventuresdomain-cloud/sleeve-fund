@@ -1,6 +1,7 @@
 # QR #1 default form (Advisor 14 Oct): multi-speed trend, long leg. Decision candle: 4h.
 version = 1
 name = "qr01b-trend-multispeed-long"
+title = "Trend Consensus (3 speeds, 4h) · Long"
 reason = """Three EMA pairs (8/32, 16/64, 32/128) each vote on the trend, so no single setting decides. Go long when
 all three agree, leave when two of the three turn down; 3 ATR(14) stop."""
 

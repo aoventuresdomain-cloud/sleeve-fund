@@ -1,6 +1,7 @@
 # QR bench (long shot): 10-day-high breakout held only overnight. Decision candle: 1h.
 version = 1
 name = "qr12-overnight-breakout-long"
+title = "Overnight Breakout (1h) · Long"
 reason = """Breakouts may hold better through the quieter hours. Between 21:00 and 06:00 London time, buy a close above
 the highest high of the last 10 daily candles; out at 08:00 London or on a 2 ATR(14) stop."""
 

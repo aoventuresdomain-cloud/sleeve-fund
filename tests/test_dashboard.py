@@ -557,7 +557,7 @@ def test_every_page_offers_new_sleeve_and_reaches_every_page(client, path):
     c, _ = client
     page = c.get(path, auth=AUTH).text
     assert 'class="button rail-new" href="/sleeves/new"' in page and 'id="more"' in page
-    for href in ("/", "/alerts", "/research", "/backtest", "/risk", "/records", "/setup"):
+    for href in ("/", "/alerts", "/strategy", "/backtest", "/risk", "/records", "/setup"):
         assert f'href="{href}"' in page  # nothing is desktop-only any more; phones reach it through More
     assert 'id="strats"' in page  # every strategy is listed under Portfolio (a sheet on phones)
     if path in ("/", "/trades", "/orders"):  # the book-wide blotters are tabs of the portfolio
@@ -846,7 +846,7 @@ def test_archive_hides_a_stopped_sleeve_and_restore_brings_it_back(client):
     assert c.post("/sleeves/btc-test/archive", data={"action": "archive", "reason": "x"}, auth=AUTH,
                   headers={"Origin": "https://evil.example"}).status_code == 403
     assert post("archive").status_code == 303
-    home = c.get("/", auth=AUTH).text
+    home = c.get("/history", auth=AUTH).text  # B-16 part 2 (TEC): the panel moved from Home to History
     assert "Archived strategies (1)" in home and home.count('href="/sleeves/btc-test"') == 1
     assert "Archived.</div>" in c.get("/sleeves/btc-test", auth=AUTH).text
     assert post("restore", reason="back in use").status_code == 303
@@ -1927,6 +1927,8 @@ def test_the_home_page_opens_after_a_strategy_reset_with_no_clean_slate_ever(cli
     assert store.book_start() is None and store.reset_runs()
     r = c.get("/", auth=AUTH)
     assert r.status_code == 200
+    r = c.get("/history", auth=AUTH)  # B-16 part 2 (TEC): the panel moved from Home to History
+    assert r.status_code == 200
     assert "Previous book (1)" in r.text and "put away by a strategy reset;" in r.text
     assert "new book began" not in r.text
 
@@ -1948,7 +1950,9 @@ def test_a_clean_slate_starts_a_new_book_and_keeps_the_old_one_viewable(client, 
     assert set(store.previous_book()) == {"old-one"}
     home = c.get("/", auth=AUTH).text
     assert "10,000.00" in home and "17,000.00" not in home  # the book starts from the new strategy only
-    assert "Previous book (1)" in home and 'href="/sleeves/old-one"' in home
+    history = c.get("/history", auth=AUTH).text  # B-16 part 2 (TEC): the panel moved from Home to History
+    assert "Previous book (1)" in history and 'href="/sleeves/old-one"' in history
+    assert '1 old Strategy is kept in <a href="/history">History</a>' in home
     assert c.get("/sleeves/old-one", auth=AUTH).status_code == 200
     store.unarchive("old-one")  # brought back: it rejoins the book
     assert store.previous_book() == {}

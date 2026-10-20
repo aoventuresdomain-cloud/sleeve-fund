@@ -3,6 +3,7 @@
 # earlier card's "Bollinger width at its 120-bar low" needs a rolling-minimum block the builder doesn't have.
 version = 1
 name = "qr03-squeeze-long"
+title = "Squeeze Breakout (1h) · Long"
 reason = """Calm periods are followed by big moves (volatility clustering). When the Bollinger(20, 2) bands sit inside
 the Keltner(20, 1.5 ATR) channel the market is coiled; buy a close above the last 20 candles' high, on at least
 1.5 x normal volume, within 10 candles of the squeeze. Out on a 2.5 ATR trailing stop, a close back below the

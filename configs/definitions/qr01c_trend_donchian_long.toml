@@ -1,6 +1,7 @@
 # QR #1 variant (bench): Donchian channel trend, long leg. Decision candle: 1d.
 version = 1
 name = "qr01c-trend-donchian-long"
+title = "Channel Breakout Trend (55-day, daily) · Long"
 reason = """The turtle rule: buy a close above the highest high of the last 55 days, hold with a stop that only
 tightens at the lowest low of the last 20 days, so the trend premium is entered on breakouts."""
 
