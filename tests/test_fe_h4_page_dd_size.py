@@ -172,3 +172,33 @@ def test_the_headline_measures_from_the_halts_reference_not_the_days_start(c, st
     assert book_breach(halt, st.equity, st.reference(), st.day_start_equity).action == "halt"
     assert book_breach(replace(halt, drawdown=float(shown + Decimal("0.0001"))), st.equity, st.reference(),
                        st.day_start_equity) is None
+
+
+def test_after_a_rebase_the_headline_says_since_when_and_the_all_time_peak_shows(c, store):  # noqa: F811
+    """PAGE-DD-REBASE (Advisor, 20 Oct, Head 5): once a brake switched back on (B-31) or a Resume has re-based the
+    halt's reference below the all-time peak, the headline reads "Drawdown since re-base at <time> UK: x% (halt at
+    15%)", the gate's own figure, with a visible "From all-time peak: y%", (peak - book) / peak."""
+    from datetime import UTC, datetime
+
+    from test_fe_b20_fund_held_wording import OLD_RULE
+
+    from sleeve_fund.paper.portfolio_gate import PaperGate
+
+    _hold(store)
+    _long(store)
+    _mark(store, 99_000, hwm=101_000)
+    ledger = PaperGate(store).ledger
+    ledger.set_state(replace(ledger.state(), halt_reference=Decimal(100_000)))  # re-based at 100,000, then 99,000
+    at = datetime(2026, 10, 20, 20, 15, tzinfo=UTC)
+    store.event(None, "info", "portfolio_brake_rebased", "T5b Drawdown halt re-based (compliance tests v2, QA)", ts=at)
+    st = ledger.state()
+    for path in ("/", "/risk"):
+        words, _ = _words(c, path)
+        assert "Drawdown since re-base at 20 Oct 21:15 UK 1.00% (halt at 15%)" in words, (path, words[:700])
+        assert round(1 - st.equity / st.reference(), 4) == Decimal("0.0100")  # the gate's own figure
+        assert f"From all-time peak: {(101_000 - 99_000) / 101_000:.2%}" in words, path  # 1.98%
+        assert "Drawdown from peak" not in words, path
+        assert [w for w in OLD_RULE if re.search(w, words)] == [], path
+    ledger.set_state(replace(st, halt_reference=None))  # no re-base: as before
+    words, _ = _words(c, "/")
+    assert "Drawdown from peak 1.98% (halt at 15%)" in words and "From all-time peak" not in words

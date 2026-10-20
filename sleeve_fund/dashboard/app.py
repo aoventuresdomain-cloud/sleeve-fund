@@ -313,8 +313,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         # Margin used and Open risk, as the position figures compute them (UI v2, item 7), once they exist.
         if "open_risk" in positions:
             book.update(margin_used=positions["margin"], open_risk=positions["open_risk"])
-        fund_dd = ({"drawdown": riskops.fund_drawdown(st()), "limit": riskops.fund_halt_limit(st())}
-                   if book["fund_cash"] else None)  # PAGE-DD: inside the fund, the halt's own figure
+        fund_dd = riskops.fund_drawdown_view(st()) if book["fund_cash"] else None  # PAGE-DD: inside the fund, the halt's own figure
         return page(request, "home.html", fund_dd=fund_dd,
                     summaries=legs.fold(st(), [x for x in summaries if x["sleeve"].name not in put_away], frames),
                     leg_flags=legs.flags(st()),
@@ -405,8 +404,7 @@ def create_app(store: Store | None = None) -> FastAPI:
             halt = ("fund", limit) if limit else None
         chart = riskops.drawdown_chart(bookm.book_curve(summaries, frames, bookm.fund_cash(st())),
                                        halt=halt[1] if halt else None)
-        fund_dd = ({"drawdown": riskops.fund_drawdown(st()), "limit": riskops.fund_halt_limit(st())}
-                   if book["fund_cash"] else None)  # PAGE-DD
+        fund_dd = riskops.fund_drawdown_view(st()) if book["fund_cash"] else None  # PAGE-DD
         return page(request, "risk.html", fund_dd=fund_dd, book=book, risk=risk, health=health, chart=chart, size=riskops.gate_size(st(), book),
                     halt_name=halt[0] if halt else None, stress=riskops.stress_bars(risk["scenarios"]),
                     status=riskops.status_word(riskops.status_items(risk["rows"], health), running),
