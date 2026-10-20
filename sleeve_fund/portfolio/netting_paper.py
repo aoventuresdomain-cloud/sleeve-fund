@@ -35,6 +35,7 @@ from sqlalchemy import select
 from sleeve_fund.portfolio import netting as nt
 
 ZERO = Decimal(0)
+SLACK = Decimal("1e-9")  # beyond one place of the fee's currency (_one_rate)
 RATE_PLACES = Decimal("1e-7")  # a fee rate read back from a fill: 0.055% is 0.00055 to this, whatever the rounding
 
 
@@ -110,27 +111,30 @@ def fee_places(inst: str) -> int:
 
 
 def _one_rate(inst: str, charged: list[tuple[Decimal, Decimal]]) -> Decimal:
-    """The taker rate one candle's market fills paid in all (fees over notional, to RATE_PLACES). Paper rounds each
-    fill's fee to its currency's places (fee_places: the cent in USD), so slices of one order read back a little apart
-    one by one: a fill counts as the same rate while its fee is within one of those places of that rate's; past that it
-    is a second rate, refused. Shortcut: a genuine second rate whose difference on a fill is under one place (a fill of
-    tens of dollars in USD) passes as the first; immaterial to a shadow, upgrade (journal the rate each fill was charged)
-    before netting goes live."""
-    fees = sum(f for f, _ in charged)
-    rate = fees / sum(n for _, n in charged)
-    if any(abs(f - rate * n) > Decimal(1).scaleb(-fee_places(inst)) for f, n in charged):
+    """The taker rate one candle's market fills paid in all (fees over notional, to RATE_PLACES; Advisor: pooled, as
+    journaled). Paper rounds each fill's fee to its currency's places (fee_places: the cent in USD), so slices of one
+    order read back a little apart one by one. They are one rate when a single rate explains every fee to within one
+    place (plus 1e-9): the rates each fee allows overlap. Otherwise it is a second rate, refused. Not half a place (the
+    rounding bound): paper's journaled fees sit up to 0.008 from their fill's price x qty x rate (1.81 for 1.818), so half
+    a place refuses one order's own slices (b13y). Shortcut: on a fill too small for one place to tell two rates apart
+    (under about 30 of notional in USD at maker vs taker), a second rate can pass as the first; immaterial to a shadow.
+    Netting go-live MUST (Advisor): journal each fill's charged rate and use it, never read it back."""
+    place = Decimal(1).scaleb(-fee_places(inst)) + SLACK
+    low = max((f - place) / n for f, n in charged)
+    high = min((f + place) / n for f, n in charged)
+    if low > high:
         seen = sorted({(f / n).quantize(RATE_PLACES) for f, n in charged})
         raise ValueError(f"netting shadow: fills of one candle in {inst} were charged different taker rates "
                          f"({', '.join(f'{x:%}' for x in seen)}); the Strategies on one account must pay the same "
                          "taker fee")
-    return rate.quantize(RATE_PLACES)
+    return (sum(f for f, _ in charged) / sum(n for _, n in charged)).quantize(RATE_PLACES)
 
 
 def _account(rows: list[dict], funding_rows: list[dict], key, equity: Decimal) -> dict:
     fills: list[nt.Fill] = []
     marks: dict[tuple[str, int], Decimal] = {}
     halves: dict[tuple[str, int], Decimal] = {}
-    charged: dict[tuple[str, int], list[tuple[Decimal, Decimal]]] = defaultdict(list)
+    paid_by: dict[tuple[str, int], list[tuple[Decimal, Decimal]]] = defaultdict(list)  # candle: its market fills
     for r in rows:
         qty = _dec(r["qty"])
         if not qty:
@@ -142,7 +146,7 @@ def _account(rows: list[dict], funding_rows: list[dict], key, equity: Decimal) -
         px = _dec(r["price"])
         fills.append(nt.Fill(r["sleeve"], r["instrument"], ts, side * qty, px, _dec(r["fee"])))
         if (paid := _charged(r)) is not None:
-            charged[(r["instrument"], ts)].append(paid)
+            paid_by[(r["instrument"], ts)].append(paid)
         close = (r["signal"] or {}).get("close") if r["bar_close"] is not None else None
         if close and (r["instrument"], ts) not in marks:
             marks[(r["instrument"], ts)] = _dec(close)
@@ -150,7 +154,7 @@ def _account(rows: list[dict], funding_rows: list[dict], key, equity: Decimal) -
     first = {}
     for f in fills:
         first.setdefault((f.instrument, f.ts), f)
-    rates = {(inst, ts): _one_rate(inst, paid) for (inst, ts), paid in charged.items()}
+    rates = {(inst, ts): _one_rate(inst, paid) for (inst, ts), paid in paid_by.items()}
 
     def mark(inst: str, ts: int) -> Decimal:
         return marks.get((inst, ts), first[(inst, ts)].price)
@@ -196,6 +200,9 @@ def _account(rows: list[dict], funding_rows: list[dict], key, equity: Decimal) -
         "orders_alone": len({r["order_id"] for r in rows if _dec(r["qty"])}),
         "bars_shared": sum(1 for names in by_group.values() if len(names) > 1),
         "residual": residual,
+        # Advisor (B-13 fee fix): each crossing candle's taker rate as read (pooled), with the fill slices it came from
+        "taker_rates": [{"instrument": inst, "ts": ts, "rate": rates[(inst, ts)], "slices": len(paid)}
+                        for (inst, ts), paid in sorted(paid_by.items())],
         "opposed_exposure": nt.opposed_exposure(fills, _last_price(fills), sorted({f.ts for f in fills})),
     }
 

@@ -401,3 +401,49 @@ def test_b13zc_a_second_rate_a_few_cents_off_is_refused_in_usd(store):
     # pooled 10.56 / 21,007.50 = 0.0502678...%: e's fee is 1.56 - 1.50731 = 0.053 off it, past USD's 0.01
     with pytest.raises(ValueError, match="same taker fee"):
         _run(store, members=lambda n: n in ("d", "e"))
+
+
+def _usd(store):
+    for name in ("d", "e"):  # a USD account: paper books its fees to the cent
+        store.create_sleeve(name=name, strategy="ping_pong", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
+                            starting_balance=0, params={"market": "perp", "allow_short": True}, venue="binance")
+    return lambda n: n in ("d", "e")
+
+
+def test_b13zd_three_cent_rounded_slices_are_one_rate_and_its_slices_are_reported(store):
+    """Advisor: one 0.05% order filled in 3 slices whose cent-rounded rates differ prices as one rate, not refused; the
+    candle's rate as read and its slice count are in the shadow's figures."""
+    members = _usd(store)
+    _slice(store, "d", "d1", 0, "BUY", "0.1", "60030", "3.00")  # 3.0015: 0.049975%
+    _slice(store, "d", "d1", 1, "BUY", "0.1", "60030", "3.01")  # 3.0015 rounded up: 0.050141%
+    _slice(store, "d", "d1", 2, "BUY", "0.05", "60030", "1.50")  # 1.50075: 0.049975%
+    _slice(store, "e", "e1", 0, "SELL", "0.1", "59970", "3.00")  # 2.9985: 0.050025%
+    [n] = _run(store, members=members).values()
+    # 10.51 paid on 6,003 + 6,003 + 3,001.50 + 5,997 = 21,004.50 of notional: 0.050036897...%, to 1e-7 0.0005004
+    assert n["taker_rates"] == [{"instrument": "BTC/USD", "ts": _ns(T1), "rate": D("0.0005004"), "slices": 4}]
+
+
+def test_b13ze_a_genuine_0_02_and_0_055_candle_on_fills_of_1000_is_refused(store):
+    members = _usd(store)
+    _slice(store, "d", "d1", 0, "BUY", "0.02", "60030", "0.66")  # 1,200.60 x 0.055% = 0.66033
+    _slice(store, "e", "e1", 0, "SELL", "0.02", "59970", "0.24")  # 1,199.40 x 0.02% = 0.23988
+    with pytest.raises(ValueError, match=r"different taker rates \(0\.02001%, 0\.05497%\)"):
+        _run(store, members=members)
+
+
+def test_b13zf_a_fault_in_the_shadow_fails_its_own_section_and_the_night_still_checks_the_books(store, monkeypatch):
+    """CR2 FOLLOW-UP 2: an unexpected error in the shadow fails its section in words (alerted), and the book check and
+    positions sections are still written."""
+    import sleeve_fund.supervisor as sup
+    from sleeve_fund import nightly_recon
+    from sleeve_fund.portfolio import netting_paper
+    from sleeve_fund.start_check import FAIL
+
+    monkeypatch.setattr(sup, "fund_equity", lambda s: D("100000"))
+    monkeypatch.setattr(netting_paper, "over_line", lambda *a: (_ for _ in ()).throw(TypeError("a bug")))
+    [(st, what)] = nightly_recon.netting_shadow(store).lines
+    assert st == FAIL and "TypeError: a bug" in what and "trading unaffected" in what
+    monkeypatch.setattr(nightly_recon, "read_only_store", lambda url: store)
+    monkeypatch.setattr(store.engine, "dispose", lambda: None)
+    titles = [sec.title for sec in nightly_recon.compare("unused")]
+    assert len(titles) == 4 and titles[-1].startswith("Netting shadow")

@@ -100,6 +100,9 @@ def netting_shadow(store) -> Section:
     except (ValueError, LookupError, RuntimeError) as e:
         sec.add(NOTE, f"couldn't work out the netting shadow tonight: {e}")
         return sec
+    except Exception as e:  # noqa: BLE001 - CR2: a fault of its own fails this section only, never the night's others
+        sec.add(FAIL, f"the netting shadow failed tonight (trading unaffected): {type(e).__name__}: {e}")
+        return sec
     for what in over:
         sec.add(FAIL, what)
     if not over:
