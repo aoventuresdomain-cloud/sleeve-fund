@@ -194,7 +194,7 @@ def test_after_a_rebase_the_headline_says_since_when_and_the_all_time_peak_shows
     st = ledger.state()
     for path in ("/", "/risk"):
         words, _ = _words(c, path)
-        assert "Drawdown since re-base at 20 Oct 21:15 UK 1.00% (halt at 15%)" in words, (path, words[:700])
+        assert "Drawdown since re-base at 20 Oct 21:15 UK: 1.00% (halt at 15%)" in words, (path, words[:700])
         assert round(1 - st.equity / st.reference(), 4) == Decimal("0.0100")  # the gate's own figure
         assert f"From all-time peak: {(101_000 - 99_000) / 101_000:.2%}" in words, path  # 1.98%
         assert "Drawdown from peak" not in words, path

@@ -95,7 +95,7 @@
 {%- endif %}</div>{% endmacro %}
 
 {# PAGE-DD-REBASE: after a re-base the headline says it measures from there, and the all-time peak's figure shows. #}
-{% macro fund_dd_label(d) %}{% if d.rebased %}Drawdown since re-base{% if d.rebased_at %} at {{ d.rebased_at|uk }}{% endif %}{% else %}Drawdown from peak{% endif %}{% endmacro %}
+{% macro fund_dd_label(d) %}{% if d.rebased %}Drawdown since re-base{% if d.rebased_at %} at {{ d.rebased_at|uk }}{% endif %}:{% else %}Drawdown from peak{% endif %}{% endmacro %}
 {% macro fund_dd_hover(d) %}{% if d.rebased %}A brake switched back on or a Resume re-based the fund's halt to the book then, so it measures from there; the all-time peak's drawdown is shown under it{% else %}As the fund's halt measures it: the supervisor's last mark of the fund against its peak{% endif %}{% endmacro %}
 {% macro fund_dd_peak(d) %}{% if d.rebased and d.peak_drawdown is not none %}<div class="s">From all-time peak: {{ '%.2f'|format(d.peak_drawdown * 100) }}%</div>{% endif %}{% endmacro %}
 
