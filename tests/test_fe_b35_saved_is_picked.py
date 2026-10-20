@@ -226,3 +226,26 @@ def test_a_submit_held_off_by_a_check_never_saves_even_if_something_re_enables_i
     assert page.url.endswith(f"/sleeves/new?{WHERE['spot'][0]}&strategy=donchian"), page.url
     assert _saved(store) == before and errors == []
     page.context.close()
+
+
+def test_enter_in_a_field_never_saves_while_the_submit_is_held_off(held_site, browser):  # noqa: F811
+    """CR F2: Enter in a field of the last step submits with the form's button as its submitter (earlier steps move on);
+    held off, nothing saves."""
+    base, store = held_site
+    before = _saved(store)
+    page, errors = _open(browser, f"{base}/sleeves/new?{WHERE['spot'][0]}&strategy=donchian")
+    _step(page, "Model")
+    page.evaluate("""spec => { const f = document.getElementById("sleeve-form");
+        f.querySelector(`input[name=bar_spec][value='${spec}']`).checked = true;
+        f.querySelector("input[name=reason_pick]").checked = true; }""", MODEL_BAR["donchian"])
+    page.locator(".wiz-nav button").last.click()
+    field = page.evaluate("""() => { const f = document.getElementById("sleeve-form");
+        const b = f.querySelector("button[data-label]"); b.setAttribute("data-blocked", ""); b.disabled = false;
+        const i = [...f.querySelectorAll("input")].find((e) => e.offsetParent && /^(text|number|)$/.test(e.type));
+        if (i) i.focus(); return i && i.name; }""")
+    assert field, "no text field on the last step"
+    page.keyboard.press("Enter")
+    page.wait_for_timeout(1500)
+    assert "/sleeves/new" in page.url, (field, page.url)
+    assert _saved(store) == before and errors == []
+    page.context.close()
