@@ -88,3 +88,24 @@ def test_a_start_whose_instrument_carries_another_tick_journals_the_kept_one_onc
     LongFlatStrategy._say_tick(same)  # its instrument carries the kept tick: nothing to say
     assert [(e[0], e[1], e[2]) for e in events] == [("p1", "warning", "price_tick_kept")]
     assert "0.1" in events[0][3] and "0.01" in events[0][3]
+
+
+def test_a_paper_start_says_the_kept_tick_once_from_on_start():
+    """CR2 (FOLLOW-UP, HoE): on_start itself says it (the Advisor's "said once per start"), not only the helper. The
+    stand-in stops on_start just after, at its first clock read."""
+    class Stop(Exception):
+        pass
+
+    events = []
+    s = _engine(0.01)
+    inst = s.instrument
+    s.cache = SimpleNamespace(instrument=lambda iid: inst)
+    s._cfg = SimpleNamespace(instrument_id="BTCUSDT-PERP.BINANCE")
+    s._backtest, s.recorder = False, None
+    s.runtime = SimpleNamespace(name="p1", pinned=False, store=SimpleNamespace(
+        event=lambda sleeve, level, kind, message, **k: events.append(kind)))
+    s.clock = SimpleNamespace(timestamp_ns=lambda: (_ for _ in ()).throw(Stop()))
+    s._say_tick = lambda: LongFlatStrategy._say_tick(s)
+    with pytest.raises(Stop):
+        LongFlatStrategy.on_start(s)
+    assert events == ["price_tick_kept"]
