@@ -1742,6 +1742,9 @@ def create_app(store: Store | None = None) -> FastAPI:
     def _compliance_form(request_form) -> tuple[dict, dict, list[str], int]:
         tests, groups, errors = compliance.from_form(request_form)
         errors += compliance_rules.validate(tests) if not errors else []
+        if not errors and tests.get("type_stop_loss", {}).get("enabled") and not groups:  # B-42 (F-V3-EMPTYGROUPS)
+            errors.append(f"{compliance_rules.name('type_stop_loss')} is on but no asset has a group, so it would judge "
+                          "nothing. Give the assets their groups, or switch it off.")
         try:
             expected = int(request_form.get("expected_version", ""))
         except ValueError:
