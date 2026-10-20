@@ -454,7 +454,7 @@ def late_fills(store, name: str | None = None) -> list[dict]:
         orders_t,
     )
 
-    q = select(orders_t).where(orders_t.c.order_id.like(f"{CLOSE_PREFIX}%"))
+    q = select(orders_t).where(_is_close(orders_t.c.order_id))
     if name is not None:
         q = q.where(orders_t.c.sleeve == name)
     closes: dict[str, list[dict]] = {}
@@ -516,7 +516,30 @@ def unflat(store, name: str) -> list[dict]:
     return [x for x in late_fills(store, name) if x["late"] > x["closed"]]
 
 
-def close_orphans(store, now: datetime, submit=None, name: str | None = None) -> list[str]:
+def _close_id(oid: str, n: int, on: bool | None) -> str:
+    """A late fill's close id: orphan-close-<entry>[-n] on the simulated client; exec_client.close_id with the exchange
+    client ON (B-05, MUST 6: the venue takes 36 characters). on=None reads the process's own settings."""
+    from sleeve_fund.paper import exec_client
+
+    if on is None:
+        import os
+
+        on = exec_client.exec_settings(os.environ).on
+    if on:
+        return exec_client.close_id(oid, n)
+    return f"{CLOSE_PREFIX}{oid}" + (f"-{n + 1}" if n else "")
+
+
+def _is_close(col):
+    """The journal's close rows, under either id scheme (_close_id)."""
+    from sqlalchemy import or_
+
+    from sleeve_fund.paper.exec_client import CLOSE_ID_PREFIX
+
+    return or_(col.like(f"{CLOSE_PREFIX}%"), col.like(f"{CLOSE_ID_PREFIX}%"))
+
+
+def close_orphans(store, now: datetime, submit=None, name: str | None = None, on: bool | None = None) -> list[str]:
     """og5 and A2-DW4: a late fill (late_fills) is closed by one reduce-only market order on the opposite side for
     exactly what filled late less what closes already have out, through the exit path (never gated: brakes, halts and
     the entry block never stop an exit), journaled and alerted as a late fill after cancel, closed. Reduce-only, so it
@@ -537,7 +560,7 @@ def close_orphans(store, now: datetime, submit=None, name: str | None = None) ->
         oid, sleeve = x["order_id"], x["sleeve"]
         exit_side = "SELL" if x["side"] == "BUY" else "BUY"
         n = len(x["closes"])
-        cid = f"{CLOSE_PREFIX}{oid}" + (f"-{n + 1}" if n else "")
+        cid = _close_id(oid, n, on)
         what = f"Late fill after cancel, closed: {oid} filled {qty:f} {x['after']}"
         try:
             store.record_order(sleeve, order_id=cid, side=exit_side, qty=float(qty), intent="exit",
@@ -583,7 +606,7 @@ def unsent(store, name: str, sent: set[str]) -> bool:
 
     with store.engine.connect() as c:
         ids = c.execute(select(orders_t.c.order_id).where(orders_t.c.sleeve == name,
-                                                          orders_t.c.order_id.like(f"{CLOSE_PREFIX}%"),
+                                                          _is_close(orders_t.c.order_id),
                                                           orders_t.c.status.in_(OPEN_ORDER_STATUSES))).scalars().all()
     return any(i not in sent for i in ids)
 

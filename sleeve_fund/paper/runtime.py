@@ -387,7 +387,7 @@ def entry_blocked(store, name: str, now: datetime | None = None, *, starting: bo
                          portfolio=portfolio_block(store, now), moving=moving_to(store, name),
                          exit_rejects=exit_reject_block(store, sleeve.instrument, now),
                          account=account_block(store, name), resting=resting_block(store, name, now),
-                         exec_target=exec_target_block())
+                         exec_target=exec_target_block(store=store, name=name))
 
 
 def account_block(store, name: str) -> Why | None:
@@ -411,7 +411,7 @@ def account_block(store, name: str) -> Why | None:
                   "is on. Exits and stops still run; move one Strategy to its own account to trade again.")
 
 
-def exec_target_block(environ=None) -> Why | None:
+def exec_target_block(environ=None, store=None, name: str | None = None) -> Why | None:
     """Head 3 (Advisor KEYHOST MUST): while the order client's key or host is wrong (exec_target.problems, the start
     check's "Order client" FAIL), nothing opens or adds; exits, stops, the liquidation cut and Stop still run. Off
     (EXEC_MODE unset) or sound: None. Unreadable, it fails closed."""
@@ -423,6 +423,15 @@ def exec_target_block(environ=None) -> Why | None:
         found = exec_target.problems(exec_target.read(os.environ if environ is None else environ))
     except Exception:  # noqa: BLE001 - fail closed, never an error out of CHOKE
         found = ["its key and host couldn't be read"]
+    if store is not None and name is not None:  # B-05 M4: ON, the connect check's FAIL and the restart check's hold
+        from sleeve_fund.paper import exec_client
+
+        try:
+            on = exec_client.exec_settings(os.environ if environ is None else environ).on
+        except Exception:  # noqa: BLE001 - fail closed
+            on = True
+        if on:
+            found = [*found, *exec_client.holds(store, name)]
     if not found:
         return None
     return _cause("exec_target", "; ".join(found) + ". Exits and stops still run; fix the key or host to trade again.")
@@ -979,7 +988,8 @@ class SleeveRuntime:
                                      account=None if self.backtest else account_block(self.store, self.name),
                                      resting=None if self.backtest else resting_block(self.store, self.name,
                                                                                        self.now()),
-                                     exec_target=None if self.backtest else exec_target_block())
+                                     exec_target=None if self.backtest else exec_target_block(store=self.store,
+                                                                                              name=self.name))
         self._episode(why if blocked else None)
         return blocked, why
 
