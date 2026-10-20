@@ -252,7 +252,8 @@ def test_the_cover_rounds_down_to_the_lot_and_a_retry_sends_nothing():
     assert plan.orders(1, D("0.002"), lot=D("0.001")) == []
 
 
-@pytest.mark.parametrize("carried", [D("0.826"), D("0.833")], ids=["under_q_top_up_refused", "at_q"])
+@pytest.mark.parametrize("carried", [D("0.826"), D("0.833"), D("0.9")],
+                         ids=["under_q_top_up_refused", "at_q", "over_q_not_ours"])
 def test_a_restart_after_step_0_carries_a_long_under_q_and_halves_it(carried):
     """QT3 c4 (HoE: a fix): T4 trimmed step 4's buy, so cycle 2 carries 0.826 of Q 0.833 in, and the gate refused step
     0's top-up (no order journaled). Restarted after that step 0, the cycle carries on as with no restart: step 1 sells
@@ -283,6 +284,9 @@ def test_a_restart_after_step_0_carries_a_long_under_q_and_halves_it(carried):
     restarted = model()
     restarted.resume_cycle()
     orders, _, values = restarted.step_orders(NS(ts_event=int(t.timestamp() * 1e9)), carried)
+    if carried > D("0.833"):  # CR: more than Q held is not the last cycle's long carried in: never halved as if it were
+        assert orders == [] and "q" not in values and not restarted._carried_into(cycle, carried), (orders, values)
+        return
     assert orders == [("reduce", -1, carried / 2)], orders
     assert values["q"] == 0.833 and values["leg"] == float(carried)
     live = model()  # the same cycle with no restart: its step 0 carried the long in
