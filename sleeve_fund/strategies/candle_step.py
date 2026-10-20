@@ -73,7 +73,7 @@ class Plan:
     run_for_hours: float | None = None
     done: set[int] = field(default_factory=set)
     exited: bool = False
-    legs: dict[int, Decimal] = field(default_factory=dict)  # open step -> the size held once its open filled (B-30)
+    legs: dict[int, Decimal] = field(default_factory=dict)  # open step -> its leg, the size its open filled to (B-30)
 
     def __post_init__(self):
         if self.q is not None and self.q <= 0:
@@ -86,7 +86,9 @@ class Plan:
         self.exited = True
 
     def leg_filled(self, step: int, held: Decimal) -> None:
-        """An open of step `step` filled, leaving `held` (signed): the size its half step halves."""
+        """Step `step`'s open filled to `held` (signed): the size its half step halves. Read when the half step first
+        comes, before it reduces anything (nothing else changes the position in between: an exit ends the cycle, and
+        a step waits while an order works), and journaled with it for a restart."""
         if step < CYCLE and STEPS[step].opens and held != 0:
             self.legs[step] = abs(held)
 
@@ -194,7 +196,7 @@ class CandleStep(LongFlatStrategy):
         self._started: datetime | None = None
         self._last_q: Decimal | None = None  # the last cycle's Q, carried while its long is held
         self._resumed: tuple[int, Decimal | None, bool] | None = None  # (cycle, Q, ended) from the journal
-        self._resumed_legs: dict[int, Decimal] = {}  # that cycle's legs as their opens filled (Plan.legs)
+        self._resumed_legs: dict[int, Decimal] = {}  # that cycle's legs, as its half steps journaled them
 
     def resume_cycle(self) -> None:
         """After a restart: the cycle the journal's newest step order was in, its Q, and whether a stop or target has
@@ -217,16 +219,10 @@ class CandleStep(LongFlatStrategy):
         first = min(_ts(o["ts"]) for o in mine)
         ended = any(o["intent"] in EXIT_LEGS and (o["filled_qty"] or 0) > 0 and _ts(o["ts"]) >= first for o in rows)
         self._resumed, self._last_q = (cycle, q, ended), q
-        # Each leg as its open filled (B-30): what its entry orders filled, or a long carried in at step 0 (Q).
-        self._resumed_legs = {}
-        for k in (0, 2):
-            got = sum((D_(o["filled_qty"]) for o in mine
-                       if o["intent"] == "entry" and o["signal"].get("step") == k and (o["filled_qty"] or 0) > 0),
-                      Decimal(0))
-            if got > 0:
-                self._resumed_legs[k] = got
-        if 0 not in self._resumed_legs and q is not None and any(o["signal"].get("step") == 1 for o in mine):
-            self._resumed_legs[0] = q  # step 0 carried the last cycle's long in without an order
+        # Each leg its half step halved, as that step journaled it (B-30, CR v4): a half step not yet journaled has
+        # reduced nothing, so what is held when it comes is still its leg as the open filled.
+        self._resumed_legs = {int(o["signal"]["step"]) - 1: D_(o["signal"]["leg"]) for o in reversed(mine)
+                              if o["signal"].get("leg") is not None}
 
     def _carried_into(self, cycle: int, held: Decimal) -> bool:
         """After a restart: the journal's newest cycle is the one before this and ended long Q, so this cycle's step 0
@@ -265,8 +261,6 @@ class CandleStep(LongFlatStrategy):
             plan = self._plan = Plan(cycle, q, self._started, self.c.run_for_hours, exited=ended)
             if self._resumed is not None and self._resumed[0] == cycle:
                 plan.legs.update(self._resumed_legs)
-            elif q is not None and held > 0:
-                plan.leg_filled(0, held)  # the last cycle's long, carried in: step 0's leg as it stands
             if q is not None:
                 self._last_q = q
         values = {"cycle": cycle, "step": step, "run_started": self._started.isoformat()}
@@ -281,16 +275,11 @@ class CandleStep(LongFlatStrategy):
             plan.done.add(0)
             values["size_share"] = self.c.size_share
             return ([("close", 1, -held)] if held < 0 else []) + [("open", 1, None)], reason, values
+        if abs(STEPS[step].target) == HALF and _side(held) == _side(STEPS[step].target):
+            if step - 1 not in plan.legs:  # nothing reduced since the leg's open filled: what is held is that leg
+                plan.leg_filled(step - 1, held)
+            values["leg"] = float(plan.legs[step - 1])  # journaled, so a restart halves the same leg (CR v4)
         return plan.act(step, held, self._lot() if getattr(self, "instrument", None) is not None else None), reason, values
-
-    def on_order_filled(self, event) -> None:
-        super().on_order_filled(event)
-        # B-30: a step's open filled: record the leg its half step halves, the size held now (all fills so far)
-        info = self.decisions.get(str(event.client_order_id)) or {}
-        sig = info.get("signal") or {}
-        if (self._plan is not None and info.get("intent") == "entry" and sig.get("cycle") == self._plan.cycle
-                and sig.get("step") is not None):
-            self._plan.leg_filled(int(sig["step"]), self._signed_qty())
 
     def entry_sent(self, qty: Decimal, values: dict) -> None:
         """The cycle's first open was sized: its quantity is Q for the rest of the cycle (Advisor CANDLE-STEP)."""

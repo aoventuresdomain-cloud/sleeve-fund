@@ -178,9 +178,10 @@ def test_a_step_0_that_is_never_sent_sets_no_q_and_the_cycle_opens_nothing(tmp_p
 
 
 
-def _resumed_at_step_3(journaled_steps):
-    """A CandleStep restarted inside a cycle whose journal shows `journaled_steps` acted on: Q 500, the flip's short
-    trimmed to 499.8875 at the gate (QT3's research-engine case), and the step-3 candle's close."""
+
+def _model(at_step, journal=(), last_q=None):
+    """A CandleStep (no engine) at the close of a candle that is step `at_step`, its journal holding `journal`'s
+    orders of that cycle: (step, intent, filled, extra signal). With a journal it is restarted on it (resume_cycle)."""
     from datetime import UTC, datetime, timedelta
     from types import SimpleNamespace as NS
 
@@ -189,28 +190,63 @@ def _resumed_at_step_3(journaled_steps):
     from sleeve_fund.strategies.candle_step import step_at
 
     t = datetime(2025, 1, 1, tzinfo=UTC)
-    while step_at(t, 1)[1] != 3:
+    while step_at(t, 1)[1] != at_step:
         t += timedelta(minutes=1)
     cycle = step_at(t, 1)[0]
-    filled = {0: 500.0, 1: 250.0, 2: 499.8875, 3: 249.94375}
-    rows = [{"ts": t - timedelta(minutes=3 - k, seconds=-1), "intent": "entry" if k in (0, 2) else "exit",
-             "qty": filled[k], "filled_qty": filled[k], "signal": {"cycle": cycle, "step": k, "q": 500.0}}
-            for k in sorted(journaled_steps, reverse=True)]
+    rows = [{"ts": t - timedelta(minutes=at_step - k, seconds=-1), "intent": intent, "qty": filled,
+             "filled_qty": filled, "signal": {"cycle": cycle, "step": k, "q": 1.0, **extra}}
+            for k, intent, filled, extra in reversed(journal)]
     s = CandleStep.__new__(CandleStep)
     s._cfg = NS(bar_type=BarType.from_str("BTCUSDT-PERP.BYBIT-1-MINUTE-LAST-INTERNAL"))
     s.c = NS(run_for_hours=None, size_share=0.6)
-    s._plan = s._started = s._last_q = s._resumed = None
+    s._plan = s._started = s._resumed = None
+    s._last_q = last_q
     s._resumed_legs = {}
     s.runtime = NS(backtest=False, name="cs", store=NS(orders=lambda name, limit: rows))
-    s.resume_cycle()
-    return s, NS(ts_event=int(t.timestamp() * 1e9))
+    if journal:
+        s.resume_cycle()
+    bar = lambda k: NS(ts_event=int((t + timedelta(minutes=k - at_step)).timestamp() * 1e9))
+    return s, bar
 
 
 def test_a_restart_recomputes_the_same_cover_half_target():
-    """B-30 (Advisor B30-HELD-SIZE): step 3's target is the short as its open filled (499.8875, from the journal)
-    less half of it, an absolute target: restarted before step 3 it covers 249.94375; the step-3 candle seen again
-    after the cover sends nothing; never down to -Q/2."""
-    before, bar = _resumed_at_step_3({0, 1, 2})
-    assert before.step_orders(bar, D("-499.8875"))[0] == [("reduce", 1, D("249.94375"))]
-    again, bar = _resumed_at_step_3({0, 1, 2, 3})
-    assert again.step_orders(bar, D("-249.94375"))[0] == []
+    """B-30 (Advisor B30-HELD-SIZE): step 3's target is the short as its open filled (499.8875) less half of it, an
+    absolute target: restarted before step 3 it covers 249.94375; the step-3 candle seen again after the cover (its
+    leg journaled with it) sends nothing; never down to -Q/2."""
+    flip = [(0, "entry", 500.0, {}), (1, "exit", 250.0, {"leg": 500.0}), (2, "exit", 250.0, {}),
+            (2, "entry", 499.8875, {})]
+    before, bar = _model(3, flip)
+    assert before.step_orders(bar(3), D("-499.8875"))[0] == [("reduce", 1, D("249.94375"))]
+    again, bar = _model(3, [*flip, (3, "exit", 249.94375, {"leg": 499.8875})])
+    assert again.step_orders(bar(3), D("-249.94375"))[0] == []
+
+
+@pytest.mark.parametrize("topped_up", [True, False], ids=["top_up_filled", "no_top_up"])
+def test_a_long_carried_in_under_q_halves_what_step_0_left_held_restart_or_not(topped_up):
+    """CR v4 MUST: T4 trims step 4's buy, so the next cycle carries a long under Q (0.8 of Q 1.0); step 0 tops it up
+    (0.2 filled) or doesn't. Step 1 sells half of what step 0 left held, with or without a restart between: 0.5 after
+    the top-up, 0.4 without; a restart after step 1 sends nothing more."""
+    held = D("1.0") if topped_up else D("0.8")
+    live, bar = _model(0, last_q=D("1.0"))
+    live.step_orders(bar(0), D("0.8"))  # carried in: Q 1.0, the top-up asked
+    if topped_up:
+        live._plan.leg_filled(0, held)  # what on_order_filled records as the top-up fills
+    orders, _, values = live.step_orders(bar(1), held)
+    assert orders == [("reduce", -1, held / 2)]
+    assert values["leg"] == float(held)  # journaled with the step, which is what a restart reads back
+    if topped_up:  # a restart between the top-up and step 1: the leg is what is held, as without one
+        restarted, bar = _model(1, [(0, "entry", 0.2, {})])
+        assert restarted.step_orders(bar(1), held)[0] == [("reduce", -1, held / 2)]
+    after, bar = _model(1, [*([(0, "entry", 0.2, {})] if topped_up else []), (1, "exit", float(held / 2),
+                                                                               {"leg": float(held)})])
+    assert after.step_orders(bar(1), held / 2)[0] == []
+
+
+def test_the_cover_rounds_down_to_the_lot_and_a_retry_sends_nothing():
+    """Advisor B30-HELD-SIZE (1): half the leg rounds DOWN to the lot, never over-closing (0.0015 of 0.003 covers
+    0.001), and the target it leaves (0.002) is absolute: the step asked again sends nothing."""
+    from sleeve_fund.strategies.candle_step import Plan
+
+    plan = Plan(0, D("0.003"), legs={0: D("0.003")})
+    assert plan.orders(1, D("0.003"), lot=D("0.001")) == [("reduce", -1, D("0.001"))]
+    assert plan.orders(1, D("0.002"), lot=D("0.001")) == []
