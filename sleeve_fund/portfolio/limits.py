@@ -138,6 +138,14 @@ def _net_room(net: Decimal, cap: Decimal, signed_per_unit: Decimal) -> Decimal |
     return max(bound - abs(net), ZERO) / abs(signed_per_unit)
 
 
+def _caps_on(e: Decimal, profile: PortfolioProfile) -> dict[str, Decimal]:
+    """The caps of the order limits the PM has on, keyed as LIMITS. A test switched off (None) is off: it has no cap,
+    binds nothing and has no figure (B-32, PM 15 Oct), the way _stop_tests already treats T1 and T2. The same holds
+    for T3, which can't be switched off today (compliance_rules.LOCKED refuses the save): B-31's locked half is then
+    only that switch (HoE, 20 Oct)."""
+    return {k: scale(e, getattr(profile, k)) for k in LIMITS if getattr(profile, k) is not None}
+
+
 class Unmapped(Exception):
     """An entry on an asset the PM's group map leaves out, while T2 is on (Advisor BRIDGE-A-FE-2)."""
 
@@ -181,11 +189,10 @@ def decide(book: Book, intent: Intent, profile: PortfolioProfile) -> Decision:
     except Exception as exc:  # noqa: BLE001 - a test that can't be evaluated refuses (BRIDGE-3, fail closed)
         return rejected(intent.qty, "group_open_risk", f"Entry rejected: the loss-at-stops tests couldn't be checked "
                                                        f"({type(exc).__name__}), so nothing is sent")
-    tests = LIMITS + tuple(k for k in STOP_TESTS if k in stop_used)
+    caps = {**_caps_on(e, profile), **stop_caps}
+    tests = tuple(k for k in LIMITS if k in caps) + tuple(k for k in STOP_TESTS if k in stop_used)
     used = {"gross": book.gross(), "net_instrument": book.net(u), "margin": book.margin(),
             "open_risk": book.open_risk(), **stop_used}
-    caps = {"gross": scale(e, profile.gross), "net_instrument": scale(e, profile.net_instrument),
-            "margin": scale(e, profile.margin), "open_risk": scale(e, profile.open_risk), **stop_caps}
     per_unit = {"gross": intent.price, "net_instrument": intent.side * intent.price,
                 "margin": intent.margin_per_unit, "open_risk": intent.risk_per_unit,
                 **{k: intent.risk_per_unit for k in stop_used}}
@@ -232,10 +239,14 @@ def decide_pair(book: Book, first: Intent, second: Intent, profile: PortfolioPro
         return rejected(first.qty, None, why), rejected(second.qty, None, why)
     e, ratio = book.equity, second.qty / first.qty
     unders = list(dict.fromkeys(i.underlying for i in legs))
-    used = {"gross": book.gross(), "margin": book.margin(), "open_risk": book.open_risk(),
-            **{f"net:{u}": book.net(u) for u in unders}}
-    caps = {"gross": scale(e, profile.gross), "margin": scale(e, profile.margin),
-            "open_risk": scale(e, profile.open_risk), **{f"net:{u}": scale(e, profile.net_instrument) for u in unders}}
+    on = _caps_on(e, profile)
+    # Only the tests the PM has on are figures here: everything below loops over `used` (B-32).
+    used = {k: v for k, v in (("gross", book.gross()), ("margin", book.margin()), ("open_risk", book.open_risk()))
+            if k in on}
+    caps = {k: on[k] for k in used}
+    if "net_instrument" in on:
+        used.update({f"net:{u}": book.net(u) for u in unders})
+        caps.update({f"net:{u}": on["net_instrument"] for u in unders})
     group_of: dict[str, str] = {}  # T1 per asset and T2 per group, both legs' risk counted (no hedge credit)
     try:
         for u in unders:
@@ -330,10 +341,11 @@ def book_breach(profile: PortfolioProfile, equity: Decimal, reference: Decimal, 
         return BookBreach("halt", f"the book's figures aren't usable (book {equity}, reference {reference}, "
                                   f"day start {day_start})")
     top = max(reference, equity)
-    if equity <= top - scale(top, profile.drawdown):
+    # A brake switched off (None) never fires (B-32; locked today, B-31's locked half is the switch).
+    if profile.drawdown is not None and equity <= top - scale(top, profile.drawdown):
         return BookBreach("halt", f"the book is {1 - equity / top:.1%} below its reference {top:,.2f}, at the "
                                   f"{profile.drawdown:.0%} portfolio drawdown limit")
-    if equity <= day_start - scale(day_start, profile.daily_loss):
+    if profile.daily_loss is not None and equity <= day_start - scale(day_start, profile.daily_loss):
         return BookBreach("pause", f"the book has lost {1 - equity / day_start:.1%} since 00:00 UTC, at the "
                                    f"{profile.daily_loss:.0%} daily limit")
     return None

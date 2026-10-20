@@ -400,9 +400,9 @@ def _intrabar(book: pd.Series, marks: dict, hours: dict, profile: PortfolioProfi
             px = float(h.at[stamp, "low"] if qty > 0 else h.at[stamp, "high"])
             low += qty * (px - close)
         worst_dd = max(worst_dd, 1 - low / hwm)
-        if low <= hwm * (1 - profile.drawdown):
+        if profile.drawdown is not None and low <= hwm * (1 - profile.drawdown):  # None: switched off (B-32)
             crossed["halt"].add(d)
-        if low <= start_of_day * (1 - profile.daily_loss):
+        if profile.daily_loss is not None and low <= start_of_day * (1 - profile.daily_loss):
             crossed["pause"].add(d)
     return worst_dd, {k: len(crossed[k] - marked[k] - (marked["halt"] if k == "pause" else set())) for k in crossed}
 
