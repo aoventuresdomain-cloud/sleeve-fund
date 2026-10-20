@@ -438,7 +438,7 @@ def late_fills(store, name: str | None = None) -> list[dict]:
     """og5 and A2-DW4: every gated entry with a late fill, as order id, strategy, side, `late` (what filled while its
     strategy's process was down, or after its bar's close: the bar-close cancel raced it), `sent` (closes still out,
     plus what ended ones filled: a close that ended unfilled, with its process or refused, no longer counts) and
-    `closed` (what its closes filled). Exact: fills are unique by venue fill id (fills_sleeve_order_trade), so a
+    `closed` (what its closes filled, or all of it once the Strategy's book is flat: flat_book). Exact: fills are unique by venue fill id (fills_sleeve_order_trade), so a
     duplicate fill event counts once. Only gated entries: a reduce-only exit is never gated, so its late fill is a
     valid exit, booked as any fill. What filled before both is the strategy's to keep. Paper and replay only: a
     backtest has no resting-cancel race and never journals a gated entry, so this finds nothing there."""
@@ -472,7 +472,7 @@ def late_fills(store, name: str | None = None) -> list[dict]:
         q = q.where(orders_t.c.sleeve == name)
     with store.engine.connect() as c:
         rows = c.execute(q).all()
-    out, downs = [], {}
+    out, downs, flat = [], {}, {}
     for oid, sleeve, side, kind, bar_ts in rows:
         if sleeve not in downs:
             downs[sleeve] = _down_at(store, sleeve)
@@ -495,10 +495,19 @@ def late_fills(store, name: str | None = None) -> list[dict]:
         if late <= 0 and not mine:
             continue
         filled = [Decimal(str(o["filled_qty"] or 0)) for o in mine]
-        out.append({"order_id": oid, "sleeve": sleeve, "side": side, "late": late, "after": after,
-                    "sent": sum((f if o["status"] in ENDED else Decimal(str(o["qty"])) for o, f in zip(mine, filled)),
-                                Decimal(0)),
-                    "closed": sum(filled, Decimal(0)), "closes": mine})
+        x = {"order_id": oid, "sleeve": sleeve, "side": side, "late": late, "after": after,
+             "sent": sum((f if o["status"] in ENDED else Decimal(str(o["qty"])) for o, f in zip(mine, filled)),
+                         Decimal(0)),
+             "closed": sum(filled, Decimal(0)), "closes": mine, "flat_book": False}
+        if x["late"] > x["closed"]:
+            if sleeve not in flat:
+                flat[sleeve] = store.lifecycle_flat(sleeve)[1]
+            if flat[sleeve]:
+                # CR FOLLOW-UP (head 3): the Strategy's book is flat (an exit, a stop or a flatten closed it, not the
+                # late close), so nothing of the late fill is held: closed, and no close is owed. Otherwise its block,
+                # and the fund-wide hold while its owner is down, would never lift.
+                x.update(sent=max(x["sent"], late), closed=late, flat_book=True)
+        out.append(x)
     return out
 
 
