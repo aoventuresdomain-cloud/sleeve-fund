@@ -105,3 +105,15 @@ def test_fund_held_the_book_curve_starts_from_the_funds_cash(c, store):  # noqa:
     day = c.get("/api/book/equity?days=1", auth=AUTH).json()
     assert day["equity"][-1] == 100_500 and max(day["drawdown"]) == 0
     assert all(math.isfinite(v) for v in day["equity"] + day["drawdown"])
+
+
+def test_a_strategy_put_away_after_an_error_is_not_halted_and_waiting_on_home(c, store):  # noqa: F811
+    """With B-29's top bar (CR on B-29): Home's own line counted the archived candle-step Strategy left in "error" on
+    15 Oct as "1 strategy halted and waiting for you"."""
+    _hold(store)
+    for name in ("candle-step-btcusdt-1m", "timed-test"):
+        _make(store, name, 0)
+    store.set_status("candle-step-btcusdt-1m", "error", "node exited 1")
+    assert "1 strategy halted and waiting for you" in _text(c.get("/", auth=AUTH).text)  # a live one waits for the PM
+    store.archive("candle-step-btcusdt-1m")
+    assert "halted and waiting" not in _text(c.get("/", auth=AUTH).text)

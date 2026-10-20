@@ -160,10 +160,12 @@ def book_view(store: Store, summaries: list[dict], frames: dict[str, pd.DataFram
     net = sum(x["position_value"] for x in active)
     # Counted as Strategies: a two-leg Strategy's second leg row (P2-8) is part of its first leg's, not one more.
     ones = [x for x in summaries if not getattr(x["sleeve"], "parent", None)]
+    archived = store.archived()
     return {
         "sleeves": len(ones),
         "running": sum(1 for x in ones if x["sleeve"].status == "running"),
-        "attention": sum(1 for x in ones if x["sleeve"].status in ("halted", "error")),
+        # One put away waits for nobody: its last halt or error is history (the top bar's count, B-29 add-on).
+        "attention": sum(1 for x in ones if x["sleeve"].status in ("halted", "error") and x["sleeve"].name not in archived),
         "unhealthy": len({getattr(x["sleeve"], "parent", None) or x["sleeve"].name for x in active
                           if not x["healthy"] and x["sleeve"].desired_state == "running"}),
         "start": start,
