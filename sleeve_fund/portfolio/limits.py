@@ -109,6 +109,7 @@ class Decision:
     reason: str  # one sentence for the journal and the strategy page
     figures: dict = field(default_factory=dict)  # each limit: book before, after (at approved_qty), cap; x book
     leverage: dict = field(default_factory=dict)  # B-24: leverage()'s figures at approved_qty; {} when not judged
+    t1: dict = field(default_factory=dict)  # PAGE-SIZE-T1: t1_figures() from the T1 check's own inputs; {} when T1 is off
 
 
 def floor_to(qty: Decimal, step: Decimal) -> Decimal:
@@ -218,6 +219,16 @@ def fill_breach(marked: dict[str, Decimal], profile: PortfolioProfile) -> str | 
     return "a fill took the fund's " + " and ".join(over) + " (slippage past T4)" if over else None
 
 
+def t1_figures(used: Decimal, cap: Decimal, risk_per_unit: Decimal, qty: Decimal) -> dict:
+    """PAGE-SIZE-T1 (Advisor): what T1 compared, as the check had it: the loss at the stops already in the asset
+    (t1_used_before) and T1's cap, both in fund currency, the order's loss at the stop per unit (risk_per_unit; a
+    stopless 1x entry's stopless measure), and size_share, the share of T1's room the approved `qty` uses (1 = all of
+    it; None when there was no room)."""
+    room = cap - used
+    return {"t1_used_before": used, "t1_cap": cap, "risk_per_unit": risk_per_unit,
+            "size_share": qty * risk_per_unit / room if room > 0 else None}
+
+
 def decide(book: Book, intent: Intent, profile: PortfolioProfile) -> Decision:
     """_decide's answer with B-24's leverage figures for the position it leaves (at the quantity approved; a refusal's
     are the position as it stands)."""
@@ -247,6 +258,13 @@ def _decide(book: Book, intent: Intent, profile: PortfolioProfile) -> Decision:
         return rejected(intent.qty, "group_open_risk", f"Entry rejected: the loss-at-stops tests couldn't be checked "
                                                        f"({type(exc).__name__}), so nothing is sent")
     caps = {**_caps_on(e, profile), **stop_caps}
+
+    def t1(d: Decision) -> Decision:
+        if "asset_open_risk" not in stop_used:
+            return d
+        return replace(d, t1=t1_figures(stop_used["asset_open_risk"], stop_caps["asset_open_risk"],
+                                        intent.risk_per_unit, d.approved_qty))
+
     tests = tuple(k for k in LIMITS if k in caps) + tuple(k for k in STOP_TESTS if k in stop_used)
     used = {"gross": book.gross(), "net_instrument": book.net(u), "margin": book.margin(),
             "open_risk": book.open_risk(), **stop_used}
@@ -265,19 +283,20 @@ def _decide(book: Book, intent: Intent, profile: PortfolioProfile) -> Decision:
                 for k in tests}
 
     if limit is None and (qty <= 0 or qty < intent.min_qty):  # nothing binds, but the request is under the minimum
-        return rejected(intent.qty, "below_min", f"Entry rejected: {qty.normalize():f} is below the venue minimum "
-                                                 f"of {intent.min_qty.normalize():f}", figures(ZERO))
+        return t1(rejected(intent.qty, "below_min", f"Entry rejected: {qty.normalize():f} is below the venue "
+                                                    f"minimum of {intent.min_qty.normalize():f}", figures(ZERO)))
     if limit is None:
-        return Decision("approved", qty, intent.qty, None, "Entry within every portfolio limit", figures(qty))
+        return t1(Decision("approved", qty, intent.qty, None, "Entry within every portfolio limit", figures(qty)))
     whole, now, cap = abs(used[limit] + intent.qty * per_unit[limit]) / e, abs(used[limit]) / e, caps[limit] / e
     show = (lambda x: f"{x:.2f}x") if limit in ("gross", "net_instrument") else (lambda x: f"{x:.1%}")
     what = (f"{WORDS[limit].format(u=u, g=group)} would be {show(whole)} of the book with the whole order, above the "
             f"{show(cap)} limit (now {show(now)})")
     if qty <= 0 or qty < intent.min_qty:
-        return rejected(intent.qty, limit, f"Entry rejected: {what}; the room left, {qty.normalize():f}, is below "
-                                           f"the venue minimum of {intent.min_qty.normalize():f}", figures(ZERO))
-    return Decision("trimmed", qty, intent.qty, limit,
-                    f"Entry trimmed from {intent.qty.normalize():f} to {qty.normalize():f}: {what}", figures(qty))
+        return t1(rejected(intent.qty, limit, f"Entry rejected: {what}; the room left, {qty.normalize():f}, is "
+                                              f"below the venue minimum of {intent.min_qty.normalize():f}",
+                           figures(ZERO)))
+    return t1(Decision("trimmed", qty, intent.qty, limit,
+                       f"Entry trimmed from {intent.qty.normalize():f} to {qty.normalize():f}: {what}", figures(qty)))
 
 
 def decide_pair(book: Book, first: Intent, second: Intent, profile: PortfolioProfile) -> tuple[Decision, Decision]:
@@ -372,8 +391,10 @@ def _decide_pair(book: Book, first: Intent, second: Intent, profile: PortfolioPr
                 for k in used}
 
     def both(outcome, a1, a2, limit_hit, reason, figs):
-        return (Decision(outcome, a1, first.qty, limit_hit, reason, figs),
-                Decision(outcome, a2, second.qty, limit_hit, reason, figs))
+        # PAGE-SIZE-T1: each leg's own T1 figures; two legs in one asset share its room, so their shares add up
+        return tuple(Decision(outcome, a, leg.qty, limit_hit, reason, figs, t1=t1_figures(
+            used[f"asset:{leg.underlying}"], caps[f"asset:{leg.underlying}"], leg.risk_per_unit, a)
+            if f"asset:{leg.underlying}" in used else {}) for a, leg in ((a1, first), (a2, second)))
 
     after = added(q1, q2)
     over = [k for k in used if (abs(used[k] + after[k]) > max(caps[k], abs(used[k])) if k.startswith("net:")
