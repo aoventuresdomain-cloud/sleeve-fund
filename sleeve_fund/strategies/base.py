@@ -1158,6 +1158,8 @@ class LongFlatStrategy(Strategy):
                 raise RuntimeError(f"{why} ({e.reason})") from e
         if self.recorder is not None:
             self.recorder.start(self.instrument)
+        if not self._backtest:
+            self._say_tick()
         if self.runtime is not None and hasattr(self.runtime.store, "set_grid"):
             # DA-9: the journal takes this instrument's quantities to its lot.
             self.runtime.store.set_grid(lot_decimals=self.instrument.size_precision)
@@ -4351,10 +4353,31 @@ class LongFlatStrategy(Strategy):
         return max(self.instrument.size_increment.as_decimal(), Decimal(10) ** -lot_decimals(self.instrument))
 
     def _tick(self) -> float | None:
-        """The instrument's price tick, which a liquidation price rounds to toward the entry (margin.to_tick)."""
+        """The price tick a liquidation price rounds to toward the entry (margin.to_tick): the one kept for the
+        instrument (markets.liquidation_tick, B-43), which the dashboard reads and the start check holds equal to the
+        paper venue's live tick; the instrument's own where none is kept. Paper's instrument is defined by the market
+        data's venue, whose tick may differ (CR, B-36b): the kept one is what the tiers are priced in."""
+        from sleeve_fund import markets
+
         instrument = getattr(self, "instrument", None)  # a test's stub may hold none: no rounding, as before
+        iid = getattr(instrument, "id", None)
+        if iid is not None:
+            kept = markets.liquidation_tick(str(iid.venue), str(iid.symbol))
+            if kept is not None:
+                return kept
         inc = getattr(instrument, "price_increment", None) if instrument is not None else None
         return float(inc) if inc is not None else None
+
+    def _say_tick(self) -> None:
+        """B-43 (Advisor): a start whose instrument carries a price tick other than the kept one says so, once, in the
+        journal: its liquidation rounds to the kept tick (_tick), its orders to the instrument's."""
+        inc = getattr(self.instrument, "price_increment", None)
+        kept = LongFlatStrategy._tick(self)
+        if self.runtime is None or inc is None or kept is None or float(inc) == kept:
+            return
+        self.runtime.store.event(self.runtime.name, "warning", "price_tick_kept",
+                                 f"the instrument's price tick is {float(inc):g}; liquidation prices round to the kept "
+                                 f"tick {kept:g}, as the venue's tiers are priced and the pages show")
 
     def _held_qty(self, qty: float) -> float:
         """A fill's quantity as the account holds it. A venue can print and fill at 8 lot decimals in a

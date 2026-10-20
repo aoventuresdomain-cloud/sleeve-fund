@@ -14,12 +14,6 @@ pytestmark = [pytest.mark.no_maintenance_tables]
 PERP = {"market": "perp", "allow_short": True, "stop_loss": 0.02}
 
 
-def _info(tick: str) -> dict:
-    return {"symbols": [{"symbol": "BTCUSDT", "contractType": "PERPETUAL", "status": "TRADING", "baseAsset": "BTC",
-                         "quoteAsset": "USDT", "pricePrecision": 2, "quantityPrecision": 3,
-                         "filters": [{"filterType": "PRICE_FILTER", "tickSize": tick}]}]}
-
-
 def test_the_kept_tick_is_read_through_one_reader_and_none_where_not_kept():
     from sleeve_fund.markets import price_tick
 
@@ -30,10 +24,12 @@ def test_the_kept_tick_is_read_through_one_reader_and_none_where_not_kept():
 
 
 def test_the_venues_live_tick_comes_from_its_recorded_contract_listing():
-    from sleeve_fund.venues import binance_tick
+    from test_b43_one_tick_source import _listing
 
-    assert binance_tick("BTC/USDT", get_json=lambda url: _info("0.10")) == Decimal("0.1")
-    assert binance_tick("BTC/USDT", get_json=lambda url: _info("0.50")) == Decimal("0.5")
+    from sleeve_fund.venues import paper_venue_tick  # B-43: the paper venue's listing, not another venue's
+
+    assert paper_venue_tick("BTC/USDT", get_json=lambda url: _listing("0.10")) == Decimal("0.1")
+    assert paper_venue_tick("BTC/USDT", get_json=lambda url: _listing("0.50")) == Decimal("0.5")
 
 
 def _store(pair="BTC/USDT", params=PERP):

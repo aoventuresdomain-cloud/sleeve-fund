@@ -106,14 +106,15 @@ def _vs1_interim_tables(monkeypatch, request):
 
 @pytest.fixture(autouse=True)
 def _price_tick_read(monkeypatch, request):
-    """B-36b: the start check reads the venue's live contract tick from its public listing; a build machine can't reach
-    the venue, so every test reads the kept tick back as the live one (the check passes wherever one is kept). A test
-    marked price_tick_live reads it as it is."""
+    """B-36b, B-43: the start check and an instrument read the venue's live contract tick from its public listing; a
+    build machine can't reach the venue, so every test reads the kept tick back as the live one (the check passes
+    wherever one is kept). A test marked price_tick_live reads it as it is."""
     if request.node.get_closest_marker("price_tick_live"):
         return
     from sleeve_fund import markets, start_check
 
     monkeypatch.setattr(start_check, "_live_tick", lambda venue, pair: markets.price_tick(venue, pair))
+    monkeypatch.setattr(venue("BINANCE"), "live_tick", lambda pair: markets.price_tick("BINANCE", pair))
 
 
 @pytest.fixture(autouse=True)
