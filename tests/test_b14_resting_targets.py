@@ -734,7 +734,7 @@ def test_b14ah_a_price_already_through_the_level_places_no_resting_target(throug
         instrument=SimpleNamespace(size_precision=8, price_precision=1), _entry_side=1, _entry_px=60_000.0,
         clock=SimpleNamespace(timestamp_ns=lambda: 7), _through_target=lambda lv, s: judged.append((lv, s)) or through,
         order_factory=SimpleNamespace(limit=lambda **k: SimpleNamespace(client_order_id="T", **k)), decisions={},
-        runtime=None, _open_target=lambda c: None, _sent=[], submit_order=sent.append)
+        runtime=None, _open_target=lambda c: None, _sent=[], submit_order=sent.append, _backtest=False)
     LongFlatStrategy._place_exits(strat, {"take_profit": 0.01})
     assert judged == [(pytest.approx(60_600.0), 1)]
     assert [(o.order_side, o.price.as_double()) for o in sent] == ([] if through else [(OrderSide.SELL, 60_600.0)])

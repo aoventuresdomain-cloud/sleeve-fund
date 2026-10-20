@@ -7100,7 +7100,7 @@ class LongFlatStrategy(Strategy):
             # position opened leaves the close to the watched target (_check_exits), at market, as today.
             orders.append((self.order_factory.limit(
                 instrument_id=cfg.instrument_id, order_side=exit_side, quantity=quantity, price=px,
-                time_in_force=TimeInForce.GTC, post_only=True, reduce_only=True), "take_profit", "LIMIT",
+                time_in_force=TimeInForce.GTC, post_only=True, reduce_only=True, **_ids(self)), "take_profit", "LIMIT",
                 f"Take-profit: resting {exit_word} at {px.as_double():,.6g}, {tp:.2%} "
                 f"{'above' if side > 0 else 'below'} the {self._entry_px:,.6g} entry; fills at that level as a maker "
                 "order when the price trades through it",
