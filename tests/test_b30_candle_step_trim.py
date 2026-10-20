@@ -250,3 +250,41 @@ def test_the_cover_rounds_down_to_the_lot_and_a_retry_sends_nothing():
     plan = Plan(0, D("0.003"), legs={0: D("0.003")})
     assert plan.orders(1, D("0.003"), lot=D("0.001")) == [("reduce", -1, D("0.001"))]
     assert plan.orders(1, D("0.002"), lot=D("0.001")) == []
+
+
+@pytest.mark.parametrize("carried", [D("0.826"), D("0.833")], ids=["under_q_top_up_refused", "at_q"])
+def test_a_restart_after_step_0_carries_a_long_under_q_and_halves_it(carried):
+    """QT3 c4 (HoE: a fix): T4 trimmed step 4's buy, so cycle 2 carries 0.826 of Q 0.833 in, and the gate refused step
+    0's top-up (no order journaled). Restarted after that step 0, the cycle carries on as with no restart: step 1 sells
+    half of what is held (0.413), never sits the cycle out."""
+    from datetime import UTC, datetime, timedelta
+    from types import SimpleNamespace as NS
+
+    from nautilus_trader.model import BarType
+
+    from sleeve_fund.strategies.candle_step import step_at
+
+    t = datetime(2025, 1, 1, tzinfo=UTC)
+    while step_at(t, 1)[1] != 1:
+        t += timedelta(minutes=1)
+    cycle = step_at(t, 1)[0]
+    rows = [{"ts": t - timedelta(minutes=3), "intent": "entry", "qty": float(carried), "filled_qty": float(carried),
+             "signal": {"cycle": cycle - 1, "step": 4, "q": 0.833}}]  # the last cycle's buy, trimmed by T4
+
+    def model():
+        s = CandleStep.__new__(CandleStep)
+        s._cfg = NS(bar_type=BarType.from_str("BTCUSDT-PERP.BYBIT-1-MINUTE-LAST-INTERNAL"))
+        s.c = NS(run_for_hours=None, size_share=0.6)
+        s._plan = s._started = s._resumed = None
+        s._last_q, s._resumed_legs = D("0.833"), {}
+        s.runtime = NS(backtest=False, name="cs", store=NS(orders=lambda name, limit: rows))
+        return s
+
+    restarted = model()
+    restarted.resume_cycle()
+    orders, _, values = restarted.step_orders(NS(ts_event=int(t.timestamp() * 1e9)), carried)
+    assert orders == [("reduce", -1, carried / 2)], orders
+    assert values["q"] == 0.833 and values["leg"] == float(carried)
+    live = model()  # the same cycle with no restart: its step 0 carried the long in
+    live.step_orders(NS(ts_event=int((t - timedelta(minutes=1)).timestamp() * 1e9)), carried)
+    assert live.step_orders(NS(ts_event=int(t.timestamp() * 1e9)), carried)[0] == orders

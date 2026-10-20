@@ -225,11 +225,13 @@ class CandleStep(LongFlatStrategy):
                               if o["signal"].get("leg") is not None}
 
     def _carried_into(self, cycle: int, held: Decimal) -> bool:
-        """After a restart: the journal's newest cycle is the one before this and ended long Q, so this cycle's step 0
-        carried that long in without an order (nothing for the journal to show) and its Q is the same. Without this a
-        restart before the cycle's first order sat out the whole cycle (PE1 restart cell, drop-b-18)."""
+        """After a restart: the journal's newest cycle is the one before this and ended long, at most Q, so this cycle's
+        step 0 carried that long in without an order (nothing for the journal to show) and its Q is the same. Without
+        this a restart before the cycle's first order sat out the whole cycle (PE1 restart cell, drop-b-18). The long
+        may be under Q (T4 trimmed step 4's buy, and step 0's top-up was refused): the half step then acts on what is
+        held, as with no restart (B30-HELD-SIZE; QT3 c4)."""
         r = self._resumed
-        return r is not None and r[0] == cycle - 1 and not r[2] and r[1] is not None and held == r[1]
+        return r is not None and r[0] == cycle - 1 and not r[2] and r[1] is not None and 0 < held <= r[1]
 
     def want_side(self, bar: Bar) -> int | None:
         return None  # never decides by side: every order comes from the step
