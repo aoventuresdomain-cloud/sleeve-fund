@@ -148,3 +148,54 @@ def test_the_database_refuses_a_delete_or_an_edit_and_sets_restored_once(store):
         c.execute(update(t).values(restore_reason="changed"))  # set once: never edited after
     with store.engine.connect() as c:
         assert c.execute(select(t.c.reason, t.c.restore_reason)).one() == ("duplicate", "Back")
+
+
+@pytest.fixture
+def mig_engine(tmp_path):
+    from sleeve_fund.store import make_engine, metadata
+
+    eng = make_engine(PG or f"sqlite:///{tmp_path}/m.db")
+
+    def clean():
+        with eng.begin() as c:
+            c.execute(text("DROP TABLE IF EXISTS alembic_version"))
+        metadata.drop_all(eng)
+
+    clean()
+    yield eng
+    clean()
+    eng.dispose()
+
+
+def test_0031_builds_the_write_once_table_from_0030_and_drops_it_back_only_while_empty(mig_engine):
+    from alembic import command
+
+    from sleeve_fund import schema
+
+    with mig_engine.begin() as c:
+        command.upgrade(schema._config(c), "0030")
+    schema.migrate(mig_engine, log=lambda _: None)
+    store = Store(engine=mig_engine)
+    store.archive_definition(FILE, definition_hash=None, status="tested", reason="duplicate", note=None, actor="pm")
+    with pytest.raises(DatabaseError), mig_engine.begin() as c:
+        c.execute(text("DELETE FROM definition_archive"))  # the migration's own triggers, not create_all's
+    with pytest.raises(DatabaseError), mig_engine.begin() as c:
+        c.execute(text("UPDATE definition_archive SET note = 'x'"))
+    with pytest.raises(RuntimeError, match="not dropped"), mig_engine.begin() as c:
+        command.downgrade(schema._config(c), "0030")
+    with mig_engine.connect() as c:
+        assert c.execute(text("SELECT COUNT(*) FROM definition_archive")).scalar_one() == 1
+
+
+def test_0031_downgrades_an_empty_archive_and_upgrades_it_again(mig_engine):
+    from alembic import command
+    from sqlalchemy import inspect
+
+    from sleeve_fund import schema
+
+    schema.migrate(mig_engine, log=lambda _: None)
+    with mig_engine.begin() as c:
+        command.downgrade(schema._config(c), "0030")
+    assert "definition_archive" not in inspect(mig_engine).get_table_names()
+    schema.migrate(mig_engine, log=lambda _: None)
+    assert "definition_archive" in inspect(mig_engine).get_table_names()
