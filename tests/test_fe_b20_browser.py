@@ -66,3 +66,16 @@ def test_b20_the_new_strategy_summary_names_the_funds_equity_and_leverage(held_s
     assert "of the fund's equity if the stop is hit" in summary, summary
     assert errors == []
     page.context.close()
+
+
+def test_b20_the_spot_summary_states_no_cap_the_profile_no_longer_has(held_site, browser):  # noqa: F811
+    """TEC-FE-CAP took the per-Strategy position cap away; the spot line still read it and said "Hold at most NaN%"."""
+    base, _ = held_site
+    page, errors = _open(browser, f"{base}/sleeves/new?instrument=BTC/USDT&venue=binance")
+    page.evaluate("() => { const f = document.getElementById('sleeve-form'); f.elements.market.value = 'spot';"
+                  " f.elements.market.dispatchEvent(new Event('change')); }")
+    summary = " ".join(page.inner_text("#summary").split())
+    assert "NaN" not in summary and "Hold at most" not in summary, summary
+    assert "long only." in summary, summary
+    assert errors == []
+    page.context.close()

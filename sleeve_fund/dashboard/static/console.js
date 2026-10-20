@@ -989,7 +989,8 @@ window.Console = (() => {
         `Use ${opt.textContent.split(" (")[0]}: ${desc ? desc.textContent : ""}`,
         (() => {
           const mk = form.elements.market ? form.elements.market.value : "spot";
-          if (mk === "spot") return `Hold at most ${pct(Number(prof.cap))} of ${held ? "the fund's equity" : "its capital"} in ${pair.split("/")[0] || "the instrument"}, long only.`;
+          // No per-Strategy position cap since TEC-FE-CAP: the profile carries none to state (it read "NaN%").
+          if (mk === "spot") return `Trade ${form.elements.market ? `the ${form.elements.market.selectedOptions[0].textContent.split(":")[0].toLowerCase()}` : "spot"}, long only.`;
           const shorts = form.elements.allow_short && form.elements.allow_short.checked;
           return `Trade the ${form.elements.market.selectedOptions[0].textContent.split(":")[0].toLowerCase()}, ${shorts ? "long and short" : "long only"}, with ${held ? `leverage up to ${prof.lev}x` : `positions up to ${prof.lev}x its capital`}.`;
         })(),
