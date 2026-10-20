@@ -63,6 +63,7 @@ MINUTE_NS = 60_000_000_000
 # (_exit_backstop): a precision mismatch or a venue that never fills it, never silent. Stops and the other protective
 # exits wait 2 bars; targets and the signal's own exits 3.
 EXIT_UNFILLED = "exit_not_filled"
+EXIT_BACKSTOP_FAILED = "exit_backstop_failed"  # the check itself failed: alerted once, the bar trades on
 EXIT_UNFILLED_BARS = 2
 TARGET_UNFILLED_BARS = 3
 PATIENT_EXITS = ("take_profit", "exit")  # TARGET_UNFILLED_BARS; every other closing intent EXIT_UNFILLED_BARS
@@ -772,6 +773,7 @@ class LongFlatStrategy(Strategy):
         self._cancel_on_accept: set[str] = set()  # orders to cancel as soon as the venue has them
         self._backstop_since: int | None = None  # A1: when the price first went through a resting stop's level
         self._unfilled: dict[str, dict] = {}  # B43-PRECISION: exit order id -> its count since the first print through
+        self._backstop_failed = False  # B43-PRECISION: the check's own failure has been alerted
         self._gate_pushed: threading.Event | None = None  # A3: set by the journal's push (_listen_gate)
         self._gate_done = threading.Event()
         self._exec_type = None  # backtest: the shorter bars the decision bars are built from
@@ -3240,8 +3242,16 @@ class LongFlatStrategy(Strategy):
         self._snap_settlements(bar.ts_event, bar.close.as_double())
         try:
             self._exit_backstop(bar)
-        except Exception:  # noqa: BLE001 - an alert never stands in the way of the bar's targets, stops and decision
+        except Exception as exc:  # noqa: BLE001 - an alert never holds up the bar's stops, targets or decision
             self.log.error(f"exit backstop failed on the bar at {int(bar.ts_event)}\n{traceback.format_exc()}")
+            if not self._backstop_failed:  # one alert, not one a bar; the log keeps each
+                self._backstop_failed = True
+                try:
+                    self.runtime.store.event(self.runtime.name, "error", EXIT_BACKSTOP_FAILED,
+                                             f"the unfilled-exit check failed, so it watches nothing: {exc!r}",
+                                             ts=self.runtime.now())
+                except Exception:  # noqa: BLE001 - the store itself may be what failed: the log above has it
+                    pass
         self._finish_resume()  # warm-up bars asked of the venue that never came: resume without them
         self._resize_if_due()
         if self._exec_type is not None and bar.bar_type == self._exec_type:

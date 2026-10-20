@@ -15,7 +15,7 @@ from test_long_short import PERP, _meta, _record
 from sleeve_fund.research.replay import replay
 from sleeve_fund.store import Store
 from sleeve_fund.strategies import base
-from sleeve_fund.strategies.base import EXIT_UNFILLED, LongFlatStrategy
+from sleeve_fund.strategies.base import EXIT_BACKSTOP_FAILED, EXIT_UNFILLED, LongFlatStrategy
 
 MIN = 60_000_000_000
 ONE = "BTC/USD.KRAKEN-1-MINUTE-LAST-EXTERNAL"
@@ -256,8 +256,8 @@ def test_c9_c8_a_backtest_stop_left_open_by_a_precision_mismatch_raises_the_aler
 
 
 def test_a_backstop_that_fails_never_stops_the_bars_trading(monkeypatch):
-    """CR2 F1: it runs first on each bar, so a failure in it (a store write, an odd bar) is logged and the bar's
-    targets, stops and decision go on as without it."""
+    """CR2 F1 (HoE MUST): it runs first on each bar, so a failure in it (a store write, an odd bar) becomes an ERROR
+    event and the bar's targets, stops and decision go on as without it."""
     def boom(self, bar):
         raise RuntimeError("store down")
 
@@ -267,3 +267,6 @@ def test_a_backstop_that_fails_never_stops_the_bars_trading(monkeypatch):
     cols = ["side", "quantity", "filled_qty", "avg_px", "status", "type"]
     assert len(after.fills) > 1 and after.fills[cols].equals(before.fills[cols]) and after.equity.equals(before.equity)
     assert after.handler_error_count == before.handler_error_count == 0
+    assert any(f["side"] == "SELL" for _, f in after.fills.iterrows())  # the long's stop went out and filled
+    [failed] = [e for e in after.journal.events_ if e["kind"] == EXIT_BACKSTOP_FAILED]  # once, not every bar
+    assert failed["level"] == "error" and "store down" in failed["message"]
