@@ -25,6 +25,9 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 
 from sleeve_fund.dashboard import strategy_words as words
 from sleeve_fund.research.candidates import BUDGET_PER_IDEA, configurations, idea_hash
+from sleeve_fund.store import (
+    ARCHIVE_REASONS,  # the pick-list (mock-up v5, section 5), shared with the table's CHECK
+)
 from sleeve_fund.strategies.definitions import (
     check_definition,
     definition_hash,
@@ -47,9 +50,6 @@ MODELS = ("trend_filter", "rsi_pullback", "rsi_bands", "rsi_cross", "dip_buy", "
 FAMILIES = {"qr01-": "Trend", "qr01b-": "Trend", "qr01c-": "Breakout", "qr02-": "Dip", "qr03-": "Squeeze",
             "qr10-": "Exhaustion", "qr11-": "Exhaustion", "qr12-": "Breakout", "qr13-": "Level continuation",
             "rsi-": "Mean reversion"}
-# Archive reasons: the pick-list (mock-up v5, section 5) and the words the page and the log show.
-ARCHIVE_REASONS = {"no_edge": "No edge after testing", "superseded": "Superseded by another Strategy",
-                   "duplicate": "Duplicate", "not_wanted": "Not wanted"}
 # Status chips: key -> (words, chip tone).
 STATUS = {"untested": ("Built, not tested", ""), "tested": ("Tested", "paused"), "passed": ("Passed G1", "running"),
           "killed": ("Killed", "halted"), "on_paper": ("On paper", "running"), "refused": ("Refused", "halted")}
@@ -379,7 +379,7 @@ def register(app: FastAPI, *, page, st, tearsheets, stored_history, venue_choice
             said = note.strip() if x is e else f"archived with its other side, {e.file_id}" + (
                 f": {note.strip()}" if note.strip() else "")
             store.archive_definition(x.key, definition_hash=x.hash, status=x.status, reason=reason,
-                                     note=said or None, actor="PM" if actor == "PM" else actor)
+                                     note=said or None, actor=actor)
         return RedirectResponse(f"/strategy/archived?done={'+'.join(x.key for x in todo)}", status_code=303)
 
     @app.post("/strategy/restore")
@@ -390,7 +390,7 @@ def register(app: FastAPI, *, page, st, tearsheets, stored_history, venue_choice
             raise HTTPException(400, "a reason is required")
         if not e.archived:
             raise HTTPException(409, "it isn't archived")
-        _store_or_refuse().restore_definition(e.key, reason=reason.strip(), actor="PM" if actor == "PM" else actor)
+        _store_or_refuse().restore_definition(e.key, reason=reason.strip(), actor=actor)
         return RedirectResponse(f"/strategy?s={e.key}&done=restored", status_code=303)
 
     @app.post("/strategy/test")

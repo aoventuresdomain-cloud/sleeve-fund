@@ -2,12 +2,13 @@
 are listed with their status; each opens with its reason and plain-English rules; a file that fails its check shows
 why instead of crashing; Run is refused while research is on hold; and no page writes anything or acts on the fund."""
 
+import re
 import shutil
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 
 from sleeve_fund.dashboard import strategy_area as sa
 from sleeve_fund.research.candidates import idea_hash
@@ -207,3 +208,102 @@ def test_empty_book_home_points_to_history(tmp_path, client):
     path.write_text('[[clear]]\nid = "2026-10-04"\nreason = "new book"\n')
     clear(store, str(path))
     assert 'Old Strategies are in <a href="/history">History</a>' in c.get("/", auth=AUTH).text
+
+
+# --- Archive and Restore (the Data Architect's definition_archive table) ---
+
+PAIR = ("qr02-dip-long", "qr02-dip-short")
+
+
+def _archive(c, key, **kw):
+    data = {"key": key, "reason": "no_edge", **kw}
+    return c.post("/strategy/archive", data=data, auth=AUTH, headers=SAME, follow_redirects=False)
+
+
+def _log(store):
+    with store.engine.connect() as c:
+        return [r for r in c.execute(text("select action, sleeve, reason from decisions order by id"))
+                if r[0].startswith("research_")]
+
+
+def test_archive_hides_it_and_changes_nothing_else(client):
+    c, store = client
+    files = {p.name: p.read_bytes() for p in DEFS.glob("*.toml")}
+    defn = load_definition_file(DEFS / "qr02_dip_long.toml")
+    store.add_trials([trial_row(definition_hash=definition_hash(defn), idea_hash=idea_hash(defn), name="qr02-dip-long",
+                                family="rules", settings={}, dataset="d", stage="in_sample", source="study",
+                                sharpe=0.5, trades=40)])
+    tables = _counts(store)
+    r = _archive(c, "qr02-dip-long", note="superseded by the 4h version")
+    assert r.status_code == 303 and r.headers["location"].startswith("/strategy/archived")
+    after = _counts(store)
+    assert {t: n for t, n in after.items() if n != tables[t]} == {"definition_archive": 1, "decisions": 1}
+    assert {p.name: p.read_bytes() for p in DEFS.glob("*.toml")} == files
+    listed = c.get("/strategy", auth=AUTH).text
+    assert "/strategy?s=qr02-dip-long\"" not in listed and "/strategy?s=qr02-dip-short" in listed
+    assert "qr02-dip-long" in c.get("/strategy/archived", auth=AUTH).text
+    assert _log(store) == [("research_archive", None, "qr02-dip-long: No edge after testing: superseded by the 4h version")]
+    tries = c.get("/strategy?s=qr02-dip-long&tab=history", auth=AUTH).text
+    assert "Tries used 1 of 20" in tries  # archiving does not give a try back
+
+
+def test_archive_needs_a_reason_and_refuses_twice(client):
+    c, store = client
+    assert c.post("/strategy/archive", data={"key": "qr02-dip-long"}, auth=AUTH, headers=SAME).status_code == 400
+    assert _archive(c, "qr02-dip-long", reason="made-up").status_code == 400
+    assert _counts(store)["definition_archive"] == 0
+    assert _archive(c, "qr02-dip-long").status_code == 303
+    assert _archive(c, "qr02-dip-long").status_code == 409
+    assert _counts(store)["definition_archive"] == 1
+
+
+def test_archive_pair_other_side_is_optional(client):
+    c, store = client
+    _archive(c, PAIR[0], other="on", note="paired test")
+    with store.engine.connect() as conn:
+        files = {r[0] for r in conn.execute(text("select file_id from definition_archive"))}
+    assert files == set(PAIR)
+    log = _log(store)
+    assert len(log) == 2 and "archived with its other side, qr02-dip-long" in log[1][2]
+    c2, store2 = client  # the same app; a lone archive leaves the twin
+    _archive(c2, "qr03-squeeze-long")
+    with store2.engine.connect() as conn:
+        assert "qr03-squeeze-short" not in {r[0] for r in conn.execute(text("select file_id from definition_archive"))}
+
+
+def test_archive_is_refused_while_on_the_fund(client):
+    c, store = client
+    defn = load_definition_file(DEFS / "qr02_dip_long.toml")
+    store.create_sleeve(name="dip-on-fund", strategy="rules", instrument="BTC/USDT", bar_spec="4-HOUR-LAST-EXTERNAL",
+                        starting_balance=1000, params={"definition": defn}, desired_state="stopped")
+    before = _counts(store)
+    assert _archive(c, "qr02-dip-long").status_code == 409
+    assert _counts(store) == before
+
+
+def test_restore_puts_it_back_as_it_was(client):
+    c, store = client
+    def body():  # the page without its clock
+        return re.sub(r"\d{4}-\d\d-\d\dT[\d:+.]+|\d\d:\d\d(:\d\d)?", "", c.get("/strategy?s=qr02-dip-long", auth=AUTH).text)
+
+    before = body()
+    _archive(c, "qr02-dip-long")
+    assert c.post("/strategy/restore", data={"key": "qr02-dip-long"}, auth=AUTH, headers=SAME).status_code == 400
+    r = c.post("/strategy/restore", data={"key": "qr02-dip-long", "reason": "wanted after all"}, auth=AUTH,
+               headers=SAME, follow_redirects=False)
+    assert r.status_code == 303
+    assert body() == before
+    assert [a for a, *_ in _log(store)] == ["research_archive", "research_restore"]
+    assert _log(store)[1][2] == "qr02-dip-long: wanted after all"
+    assert c.post("/strategy/restore", data={"key": "qr02-dip-long", "reason": "again"}, auth=AUTH,
+                  headers=SAME).status_code == 409
+    # archived again after a restore is allowed: the table keeps both rows
+    assert _archive(c, "qr02-dip-long").status_code == 303
+    assert _counts(store)["definition_archive"] == 2
+
+
+def test_archived_strategy_opens_read_only(client):
+    c, _ = client
+    _archive(c, "qr02-dip-long")
+    html = c.get("/strategy?s=qr02-dip-long&tab=test", auth=AUTH).text
+    assert ">Run test</button>" not in html and "Archived" in html and 'name="assets"' not in html

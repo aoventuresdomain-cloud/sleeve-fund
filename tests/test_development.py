@@ -113,7 +113,7 @@ def test_the_development_tab_lists_every_model_with_its_status(client):
     assert '<button type="button" data-filter="all" aria-pressed="true">All <span class="n">8</span>' in page
     # No page-level venue switch that reloads; the menu and the tab both say Development.
     assert "data-reload" not in page and 'data-tab="development">Development' in page
-    assert "<span>Development</span>" in page
+    assert "<span>Strategy</span>" in page
 
 
 def test_rsi_cross_comes_with_research_recommended_settings(client):
