@@ -16,7 +16,7 @@
   </p>
 </div>
 
-{% if archived_now %}<div class="banner" role="status">Archived {{ archived_now }}{% if archived_words %}, {{ archived_words }}{% endif %}.{{ limits_after(put_away_now) }}</div>{% endif %}
+{% if archived_now %}<div class="banner" role="status">Archived {{ archived_now }}{% if archived_words %}, {{ archived_words }}{% endif %}. <a href="/history#archived">See it on History</a>{{ limits_after(put_away_now) }}</div>{% endif %}
 
 {% if summaries or archived %}
 {# Shown only when an alert is waiting to be acknowledged: the newest one, and a link to the rest. #}
