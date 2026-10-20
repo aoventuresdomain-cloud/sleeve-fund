@@ -286,3 +286,21 @@ def test_the_one_client_reader_says_on_off_or_unknown_for_the_store_and_the_page
     monkeypatch.setenv("EXEC_MODE", "demo")  # this process's own settings on: on, whatever the supervisor said
     assert client_state(store) == "on"
     assert client_state(store, {}) == "off" and client_state(store, ON) == "on"  # a given environ alone decides
+
+
+@pytest.mark.parametrize("mode, said", [(None, "off"), ("demo", "on")])
+def test_the_supervisors_start_publishes_its_order_client_for_the_switch(store, monkeypatch, mode, said):  # noqa: F811
+    """CR follow-up (20 Oct): the one wire that makes the switch work in deploy format, the supervisor's word at its
+    start, from its own settings."""
+    from sleeve_fund.paper.exec_client import client_state
+    from sleeve_fund.supervisor import Supervisor
+
+    for var in ON:
+        monkeypatch.delenv(var, raising=False)
+    if mode:
+        monkeypatch.setenv("EXEC_MODE", mode)
+    sup = Supervisor(store)
+    sup._stopping = True  # its start, then out: no loop
+    sup.run()
+    monkeypatch.delenv("EXEC_MODE", raising=False)  # the dashboard's own settings: none, as in deploy format
+    assert client_state(store) == said
