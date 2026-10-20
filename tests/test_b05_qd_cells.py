@@ -7,7 +7,7 @@ from __future__ import annotations
 from decimal import Decimal
 
 from test_b05_guards import DEMO_ENV, NOW, _check
-from test_b05_restart import INSTR, _settled, store  # noqa: F401
+from test_b05_restart import INSTR, _Account, _long, _settled, _start, store  # noqa: F401
 
 from sleeve_fund.paper import exec_client, exec_start, runtime
 
@@ -61,3 +61,27 @@ def test_a_settlement_split_three_ways_books_the_venues_figure_exactly(store):  
     assert set(done["booked"]) == {"S-1"} and not done["gaps"]
     assert sum(store.funding_total(t) for t in held) == Decimal("-1.00000000")
     assert store.funding_total("s3") == Decimal("-0.33333334")
+
+
+def test_a_foreign_order_gone_while_the_start_check_is_still_untied_keeps_the_instruments_hold(store, monkeypatch):  # noqa: F811
+    """CR F1: the foreign hold lifts only when the foreign order is gone AND a start check ties; gone alone, every
+    Strategy on the instrument stays held for it, and it lifts at the first start that ties."""
+    monkeypatch.setenv("EXEC_MODE", "demo")
+    _long(store, "s1", 0.03, "sf-" + "a" * 32)
+    venue = _Account(size="0.05", side="Buy").start()  # the account holds 0.05, the journals 0.03: untied
+    try:
+        venue.rest("", key="manual-1")
+        _start(store, venue)
+        venue.orders.pop("manual-1")
+        untied = _start(store, venue)
+        assert not untied["result"].clean and untied["foreign"] == []
+        held = exec_start.foreign_hold(store, INSTR)
+        assert held is not None and "in no journal of the fund" in held
+        for name in ("s1", "s2"):
+            assert held in exec_client.holds(store, name)
+        assert runtime.exec_target_block(store=store, name="s2") is not None
+        _long(store, "s2", 0.02, "sf-" + "b" * 32)  # now the journals hold 0.05 too
+        tied = _start(store, venue)
+    finally:
+        venue.stop()
+    assert tied["result"].clean and exec_start.foreign_hold(store, INSTR) is None
