@@ -195,3 +195,15 @@ def test_history_lists_the_previous_book(client, tmp_path):
 def test_history_page_empty(client):
     c, _ = client
     assert "No old Strategies" in c.get("/history", auth=AUTH).text
+
+
+def test_empty_book_home_points_to_history(tmp_path, client):
+    """With only a previous book, Home shows the get-started panel and still says where the old Strategies are."""
+    from sleeve_fund.supervisor import clear
+
+    c, store = client
+    _new(c, "old-one")
+    path = tmp_path / "clear.toml"
+    path.write_text('[[clear]]\nid = "2026-10-04"\nreason = "new book"\n')
+    clear(store, str(path))
+    assert 'Old Strategies are in <a href="/history">History</a>' in c.get("/", auth=AUTH).text
