@@ -317,7 +317,9 @@ def create_app(store: Store | None = None) -> FastAPI:
         if "open_risk" in positions:
             book.update(margin_used=positions["margin"], open_risk=positions["open_risk"])
         fund_dd = riskops.fund_drawdown_view(st()) if book["fund_cash"] else None  # PAGE-DD: inside the fund, the halt's own figure
-        return page(request, "home.html", fund_dd=fund_dd,
+        # DAY-RET (A): once a render, as it may journal its unreconciled warning; inside the fund, as the book marks are
+        day_line = compliance.day_open(st(), day_pnl=book["day_pnl"]) if book["fund_cash"] else None
+        return page(request, "home.html", fund_dd=fund_dd, day_line=day_line,
                     summaries=legs.fold(st(), [x for x in summaries if x["sleeve"].name not in put_away], frames),
                     leg_flags=legs.flags(st()),
                     # A two-leg Strategy is archived whole: one row, its legs summed (CR F283-2).
