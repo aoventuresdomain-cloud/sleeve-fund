@@ -103,3 +103,15 @@ def test_a_size_between_0_and_the_minimum_after_rounding_is_refused_in_words_nev
                PORTFOLIO)
     assert d.outcome == "rejected" and d.approved_qty == 0 and d.limit_hit == "below_min"
     assert d.reason.startswith("Entry rejected") and "0.01" in d.reason
+
+
+@pytest.mark.parametrize("live_lot", ["unreadable", None])
+def test_cr2_with_no_live_lot_the_kept_lot_wins_over_the_other_venues_contract(monkeypatch, live_lot):
+    # CR2 MUST: the contract differs from the kept lot, so only the kept lot can give 0.001 / 0.001
+    def down(pair):
+        raise ConnectionError("no answer")
+
+    monkeypatch.setattr(PAPER, "contract", lambda pair: {**CONTRACT, "size_precision": 2, "min_quantity": 0.01})
+    monkeypatch.setattr(PAPER, "live_lot", down if live_lot == "unreadable" else None)
+    inst = PAPER.instrument("BTC", "USDT")
+    assert inst.size_increment.as_decimal() == D("0.001") and inst.min_quantity.as_decimal() == D("0.001")
