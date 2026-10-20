@@ -525,8 +525,8 @@ def t1_sizing(decision: dict | None) -> dict | None:
     """PAGE-SIZE lines 1 and 2, read from the entry's gate decision as recorded, never worked from today's T1 (Advisor,
     20 Oct): the share of T1's room it was sized at (size_share), the loss if its stop is hit (approved quantity x risk
     per unit over the book's equity then) and T1's cap over that equity. None when any is missing or unusable, never a
-    guess; t1_used_before is journaled but not read here. shortcut: t1_cap, risk_per_unit (USDT) and size_share are
-    the planned gate_decisions columns (DA, QD2's B-24 part 2 writer); until they land every decision reads as not
+    guess; t1_used_before is journaled but not read here. t1_cap, risk_per_unit (USDT) and size_share are
+    gate_decisions' own (DA, 0034), written by QD2's B-24 part 2 writer; a row from before them reads as not
     recorded."""
     d = decision or {}
     # one type throughout (CR F3): a column read back as a float beside a Decimal one would raise on the page

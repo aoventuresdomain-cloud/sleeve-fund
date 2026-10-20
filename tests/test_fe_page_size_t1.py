@@ -4,9 +4,10 @@ position size adds two figures from the entry's gate decision, never worked agai
 - "Risk if the stop is hit: x% of the fund (T1 limit 4%)": approved quantity x risk per unit over the book's equity
   then, and T1's cap over the same equity.
 Read from the recorded row only, never worked from today's T1 (Advisor via the HoE, 21:20 UK). The four columns
-(t1_used_before, t1_cap and risk_per_unit in USDT, size_share a fraction) are the DA's to add to gate_decisions, written by
-B-24 part 2's writer. Until they land, a decision without them reads "not in this entry's
-record", and an entry with no decision shows neither line. Expected figures are written out here."""
+(t1_used_before, t1_cap and risk_per_unit in USDT, size_share a fraction) are gate_decisions' own (DA, 0034), written
+by B-24 part 2's writer. A decision from before them reads "not in this entry's record"; one with no T1 room left
+(size_share NULL, the other three set) reads n/a for its room; an entry with no decision shows neither line. Expected
+figures are written out here."""
 
 import re
 from decimal import Decimal
@@ -19,7 +20,7 @@ from test_halt_ref import (
 )
 
 from sleeve_fund.dashboard import trading
-from sleeve_fund.store import Store, gate_decisions_t, utcnow
+from sleeve_fund.store import gate_decisions_t, utcnow
 
 # The fund at 100,000; T1 4% = 4,000 of loss at the stops in BTC; 1,000 already used; 150 a unit to the stop, fees in.
 # Room: (4,000 - 1,000) / 150 = 20 units. Approved 12: 60% of the room; 12 x 150 = 1,800 = 1.8% of the fund.
@@ -28,15 +29,15 @@ T1 = {"t1_used_before": Decimal(1000), "t1_cap": Decimal(4000), "risk_per_unit":
 BOOK = Decimal(100000)
 
 
-def _decided(store, s, approved=Decimal(12), seq=1, bar_ts=None):  # noqa: F811
-    """The gate's approved decision for the entry order, as the gate writes it, without the T1 columns (not yet a
-    schema column)."""
+def _decided(store, s, approved=Decimal(12), seq=1, bar_ts=None, **t1):  # noqa: F811
+    """The gate's approved decision for the entry order, as the gate writes it; `t1`: its T1 columns (0034), none for
+    a row from before them."""
     with store.engine.begin() as cx:
         cx.execute(insert(gate_decisions_t), [{
             "seq": seq, "sleeve_id": s.id, "bar_ts": bar_ts or utcnow(), "intent_id": "i1", "intent": "entry", "underlying": "BTC",
             "order_id": f"{s.name}-1", "profile_version": 1, "outcome": "approved", "requested_qty": approved,
             "approved_qty": approved, "price": Decimal(str(ENTRY)), "book_equity": BOOK, "stage": "submit",
-            "decided_at": utcnow()}])
+            "decided_at": utcnow(), **t1}])
 
 
 def _lines(cell):
@@ -58,14 +59,10 @@ def test_a_decision_without_its_t1_figures_has_none_and_never_a_guess():
     assert trading.t1_sizing(None) is None
 
 
-def test_fund_held_the_page_shows_both_lines_from_the_decision(c, store, monkeypatch):  # noqa: F811
-    """shortcut: the T1 columns aren't in the schema yet, so the decision read is given them here; once the DA's
-    columns land this cell writes them on the row instead."""
+def test_fund_held_the_page_shows_both_lines_from_the_decision(c, store):  # noqa: F811
     _hold(store)
     s = _journaled_long(store, fund_equity=100_000.0)
-    _decided(store, s)
-    real = Store.entry_decision
-    monkeypatch.setattr(Store, "entry_decision", lambda self, oid: {**real(self, oid), **T1})
+    _decided(store, s, **T1)
     for cell in _size_cells(c, s.name):
         assert "Sized at 60% of the room T1 allows" in cell, cell
         assert "Risk if the stop is hit: 1.8% of the fund (T1 limit 4%)" in cell, cell
@@ -91,15 +88,13 @@ def test_fund_held_an_entry_with_no_gate_decision_shows_neither_line(c, store): 
         assert _lines(cell) == [] and "T1" not in cell, cell
 
 
-def test_the_lines_are_the_recorded_ones_never_worked_from_today_s_t1(c, store, monkeypatch):  # noqa: F811
+def test_the_lines_are_the_recorded_ones_never_worked_from_today_s_t1(c, store):  # noqa: F811
     """The Advisor's cell: T1's cap changed after the entry (4% to 2%) leaves that entry's lines as recorded."""
     from test_compliance_tests import _edit
 
     _hold(store)
     s = _journaled_long(store, fund_equity=100_000.0)
-    _decided(store, s)
-    real = Store.entry_decision
-    monkeypatch.setattr(Store, "entry_decision", lambda self, oid: {**real(self, oid), **T1})
+    _decided(store, s, **T1)
     before = _size_cells(c, s.name)
     c1 = store.compliance()
     store.add_compliance_version(_edit(c1, asset_stop_loss="0.02"), c1.asset_types, expected_version=c1.version,
@@ -109,17 +104,16 @@ def test_the_lines_are_the_recorded_ones_never_worked_from_today_s_t1(c, store, 
     assert all("T1 limit 4%" in cell and "Sized at 60%" in cell for cell in before), before
 
 
-def test_with_no_t1_room_recorded_only_the_room_line_reads_as_not_recorded(c, store, monkeypatch):  # noqa: F811
+def test_with_no_t1_room_left_the_room_line_reads_n_a_and_the_risk_line_stays(c, store):  # noqa: F811
     """QD2's writer: no room left (cap - used <= 0) records size_share NULL and the other three set."""
     assert trading.t1_sizing({"approved_qty": Decimal(12), "book_equity": BOOK, **T1, "size_share": None}) == {
         "room_share": None, "stop_share": 0.018, "t1_limit": 0.04}
     _hold(store)
     s = _journaled_long(store, fund_equity=100_000.0)
-    _decided(store, s)
-    real = Store.entry_decision
-    monkeypatch.setattr(Store, "entry_decision", lambda self, oid: {**real(self, oid), **T1, "size_share": None})
+    _decided(store, s, **{**T1, "t1_used_before": Decimal(4000), "size_share": None})  # cap - used = 0 (DA, QD2)
     for cell in _size_cells(c, s.name):
-        assert "Room T1 allows: not in this entry's record" in cell and "Sized at" not in cell, cell
+        assert "Room T1 allows: n/a (none left when it was sized)" in cell and "Sized at" not in cell, cell
+        assert "not in this entry's record" not in cell, cell
         assert "Risk if the stop is hit: 1.8% of the fund (T1 limit 4%)" in cell, cell
 
 
