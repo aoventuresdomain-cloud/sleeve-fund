@@ -572,6 +572,10 @@ def run_study(
         )
     research = prices.iloc[:-holdout_bars] if holdout_bars else prices
     combos = grid(spec.param_grid)
+    if default_params and combos == [{}]:
+        # A model with no grid run on the caller's settings (a rule-builder definition): those settings are the one
+        # point, so every run trades them, not the model's empty defaults.
+        combos = [dict(default_params)]
     default_params = default_params or spec.default_params or (combos[0] if combos else {})
     idea_hash = idea_of(default_params, idea_hash)
 

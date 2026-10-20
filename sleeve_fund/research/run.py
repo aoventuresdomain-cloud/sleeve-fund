@@ -57,6 +57,10 @@ class StudyRequest:
     stop_swing_bars: int | None = None
     atr_bars: int | None = None
     take_profit_r: float | None = None
+    # A rule-builder study (the re-score workflow): the `rules` model's params, to_params(definition) plus its market,
+    # and the definition's name for its tear sheet. None: the model's own defaults, as the Research page's form runs.
+    params: dict | None = None
+    label: str | None = None
 
     def exits(self) -> dict:
         """The exits every run of the study trades with, as the strategy takes them."""
@@ -159,7 +163,8 @@ def run_store_study(req: StudyRequest, store=None, progress=None, ledger_path: P
     register = TrialsRegister(store) if store is not None else None
     dataset = dataset_name(profile.name, req.pair, req.minutes)
     result = run_study(
-        spec, prices, instrument, dataset=dataset, ledger=ledger, holdout_days=req.holdout_days,
+        spec, prices, instrument, dataset=dataset, ledger=ledger, default_params=req.params,
+        holdout_days=req.holdout_days,
         train_days=req.train_days, test_days=req.test_days, use_holdout=req.use_holdout,
         exits=req.exits(),
         risk_profile=req.risk_profile, exec_prices=exec_prices, half_spread=spread, progress=progress,
@@ -179,7 +184,7 @@ def run_store_study(req: StudyRequest, store=None, progress=None, ledger_path: P
                             "up on this instrument, so the study ends there.")
     # Every run keeps its own sheet: a re-run with other exits, profile or windows is new evidence, not a
     # replacement for the old (review round 8, R8-M3). The newest sheet per instrument and bars decides G1.
-    stem = f"{spec.name}_{dataset}_{datetime.now(timezone.utc):%Y%m%d-%H%M%S}"
+    stem = f"{req.label or spec.name}_{dataset}_{datetime.now(timezone.utc):%Y%m%d-%H%M%S}"
     out = (out_dir or TEARSHEETS) / f"{stem}.md"
     out.parent.mkdir(parents=True, exist_ok=True)
     n = 1
