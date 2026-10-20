@@ -12,10 +12,11 @@ concurrency:
   group: ${{ github.event_name == 'pull_request' && format('tests-pr-{0}', github.ref) || format('tests-{0}', github.run_id) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
-  # The suite runs as parallel shards, each with its own Postgres. The browser tests run on their own shard, the only
+  # The suite runs as parallel shards, each with its own Postgres. The browser tests (every test using the browser
+  # fixture, marked "browser" by tests/conftest.py) run on their own shard, the only
   # one that installs the browser; pytest-split shares the rest into 5 groups of about equal run time, using the
   # durations stored in .test_durations (a test missing from it counts as the average). Every test runs exactly once.
-  # To refresh the durations after the suite has changed a lot: pytest --store-durations --ignore=tests/test_browser.py
+  # To refresh the durations after the suite has changed a lot: pytest --store-durations -m "not browser"
   shard:
     name: pytest shard ${{ matrix.group }}
     runs-on: ubuntu-24.04
@@ -58,10 +59,10 @@ jobs:
       - if: matrix.group == 'browser'
         run: python -m playwright install --with-deps chromium
       - if: matrix.group == 'browser'
-        run: pytest -q $PYTEST_ARGS tests/test_browser.py
+        run: pytest -q $PYTEST_ARGS -m browser
       - if: matrix.group != 'browser'
         run: >-
-          pytest -q $PYTEST_ARGS --ignore=tests/test_browser.py
+          pytest -q $PYTEST_ARGS -m "not browser"
           --splits 5 --group ${{ matrix.group }} --splitting-algorithm least_duration
   # The check the merge flow reads: green only when every shard is.
   pytest:

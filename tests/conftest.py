@@ -129,3 +129,11 @@ def _backtest_wait(monkeypatch):
     from sleeve_fund.dashboard import app as app_mod
 
     monkeypatch.setattr(app_mod, "BACKTEST_WAIT", TEST_BACKTEST_WAIT)
+
+
+def pytest_collection_modifyitems(items):
+    """Every test that opens the browser carries the browser mark, so CI runs it on the one shard that installs Chromium
+    (and `-m "not browser"` everywhere else): FE's browser cells live in their own files, not only in test_browser.py."""
+    for item in items:
+        if "browser" in getattr(item, "fixturenames", ()) or item.path.name == "test_browser.py":
+            item.add_marker(pytest.mark.browser)
