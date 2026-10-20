@@ -153,7 +153,7 @@ def gate_intent(d: dict) -> Intent:
     unit = holding_for(Position("", name, Decimal(side), stop, d.get("leverage"), d.get("taker")), price, d.get("atr_pct"))
     return Intent(name, side, money(d["qty"], "qty"), price, unit.margin, unit.risk, d["step"], d["min_qty"],
                   money(d.get("held") or Decimal(0), "held"),
-                  None if d.get("leverage") is None else Decimal(repr(d["leverage"])))
+                  None if d.get("leverage") is None else Decimal(str(d["leverage"])))
 
 
 def tagged_intent(d: dict, now: datetime):
