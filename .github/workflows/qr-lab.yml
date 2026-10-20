@@ -1,0 +1,75 @@
+name: qr-lab
+# Quant Researcher re-score (20 Oct 2026): BTC perpetual, development years only (to 2025-10-19; the holdout year is
+# never downloaded), each rule-builder definition through the real engine on the fee ladder. Touches no server.
+on:
+  push:
+    branches: [claude/project-thread-ohkqss]
+    paths: [research/qr-lab/**, .github/workflows/qr-lab.yml]
+  workflow_dispatch:
+permissions: { contents: write }
+concurrency: { group: qr-lab, cancel-in-progress: true }
+jobs:
+  data:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install pandas
+      - run: python research/qr-lab/fetch_btc.py 2020-01 2025-10 btc_1m.csv.gz
+      - uses: actions/upload-artifact@v4
+        with: { name: btc-1m, path: btc_1m.csv.gz, retention-days: 7 }
+  run:
+    needs: data
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        job:
+          - qr01_trend_ema_long:240:15
+          - qr01_trend_ema_short:240:15
+          - qr01b_trend_multispeed_long:240:15
+          - qr01b_trend_multispeed_short:240:15
+          - qr01c_trend_donchian_long:1440:60
+          - qr01c_trend_donchian_short:1440:60
+          - qr02_dip_long:240:15
+          - qr02_dip_short:240:15
+          - qr03_squeeze_long:60:5
+          - qr03_squeeze_short:60:5
+          - qr10_capitulation_long:1440:60
+          - qr11_exhaustion_long:15:5
+          - qr11_exhaustion_short:15:5
+          - qr12_overnight_breakout_long:60:5
+          - qr13_level_continuation_long:60:1
+          - qr13_level_continuation_short:60:1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -e .
+      - uses: actions/download-artifact@v4
+        with: { name: btc-1m }
+      - name: run
+        run: |
+          IFS=: read f b e <<< "${{ matrix.job }}"
+          echo "NAME=$f" >> $GITHUB_ENV
+          python research/qr-lab/rescore.py --minutes-csv btc_1m.csv.gz --definition configs/definitions/$f.toml \
+            --bar $b --exec $e --end 2025-10-19 --out out/$f.json
+      - uses: actions/upload-artifact@v4
+        with: { name: "res-${{ env.NAME }}", path: out/ }
+  publish:
+    needs: run
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { pattern: res-*, merge-multiple: true, path: results }
+      - run: python research/qr-lab/summarise.py results results/ranked.md
+      - name: commit to qr-lab-results
+        run: |
+          git config user.name "qr-lab"; git config user.email "qr-lab@users.noreply.github.com"
+          git checkout --orphan qr-lab-results
+          git rm -rfq --cached . ; find . -mindepth 1 -maxdepth 1 ! -name results ! -name .git -exec rm -rf {} +
+          git add results; git commit -qm "qr-lab results from ${GITHUB_SHA::8} (run ${GITHUB_RUN_ID})"
+          git push -f origin qr-lab-results
