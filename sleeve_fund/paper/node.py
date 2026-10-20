@@ -606,6 +606,14 @@ def main(argv: list[str] | None = None) -> int:
         assets = [] if second is not None else [venue_start(store, store.sleeve(n)) for n in store._asset_legs(row.name)]
         if any(a is None for a in assets):
             return 1
+        try:  # B-39: a perp on an instrument with no kept tiers is refused in words, never crashed at start
+            markets.check_kept_tiers((row,) + ((second,) if second is not None else tuple(assets)))
+        except ValueError as exc:
+            if not store.holds_any(row.name):  # a holder still runs for its exits, as F-ZS-2
+                store.set_desired_state(row.name, "stopped")
+                store.set_status(row.name, "stopped", f"not started: {exc}")
+                store.event(row.name, "error", "start_refused", f"Not started: {exc}")
+                return 1
         configs = []
         for r in (row,) + ((second,) if second is not None else tuple(assets)):
             acct = store.account_of(r.name)

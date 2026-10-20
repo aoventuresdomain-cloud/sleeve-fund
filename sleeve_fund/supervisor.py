@@ -25,6 +25,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from sleeve_fund import accounts, lifecycle, liquidation, router
+from sleeve_fund.markets import check_kept_tiers
 from sleeve_fund.alerts import Forwarder
 from sleeve_fund.exact import float_view
 from sleeve_fund.money import to_decimal
@@ -534,6 +535,16 @@ def check_venue_pin(store: Store, s: Sleeve) -> None:
         raise ValueError(router.VENUE_MOVED[mode])
 
 
+def _strategy_rows(store: Store, s: Sleeve) -> list[Sleeve]:
+    """A Strategy's rows its process runs: its own, then a two-leg Strategy's second leg or a multi-asset one's legs."""
+    from sleeve_fund.store import LEG
+
+    try:
+        return [s, store.sleeve(s.name + LEG)]
+    except KeyError:
+        return [s, *(store.sleeve(n) for n in store._asset_legs(s.name))]
+
+
 def check_funding_schedule(s: Sleeve) -> None:
     """Raises ValueError when a perp's newest stored settlement step is shorter than the schedule funding is charged
     on: the engine would skip settlements (funding.schedule_mismatch; Advisor, 6 Oct 2026), until DA-11."""
@@ -718,6 +729,7 @@ class Supervisor:
             check_perp_sizing(s.strategy, s.params)
             check_perp_stop(s.strategy, s.params, s.risk_profile)
             check_funding_schedule(s)
+            check_kept_tiers(_strategy_rows(self.store, s))  # B-39: a perp with no kept tiers, refused in words
             check_resting_entries(s)
             warn = check_quote_places(s, self.store.account_of(name))
         except ValueError as exc:
