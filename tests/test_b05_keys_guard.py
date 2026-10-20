@@ -101,6 +101,16 @@ def test_the_connect_check_read_path_cannot_write(requests_seen, write):
     assert "POST" not in requests_seen and requests_seen == []
 
 
+@pytest.mark.parametrize("method", ["POST", "PUT", "DELETE", "PATCH"])
+def test_a_read_only_client_refuses_any_write_at_the_send_itself(requests_seen, method):
+    """CR B05-SEND-GUARD: the refusal sits at the one place a request goes out, so a write method added later can't
+    get round it by not going through _post."""
+    reads = VenueReads("https://venue.invalid", api_key="k", api_secret="s", limiter=Limiter({}))
+    with pytest.raises(PermissionError):
+        reads._client._send(method, "/v5/order/create", "{}", b"{}")
+    assert requests_seen == []
+
+
 def test_the_read_path_still_reads(requests_seen):
     reads = VenueReads("https://venue.invalid", api_key="k", api_secret="s", limiter=Limiter({}))
     assert reads.server_ms() is None  # unanswered here, so None: the check fails on it, never a pass
