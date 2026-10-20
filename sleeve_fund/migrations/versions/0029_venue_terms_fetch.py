@@ -6,7 +6,7 @@ Additive only: one new table, its CHECKs, its index and the triggers that refuse
 Store on the same code built it first.
 
 Revision ID: 0029
-Revises: 0028 (0030 orphan_guard_cancel sits on this one: data-architect/migration-register-head2.md)
+Revises: 0028 (re-chained onto 0015 when A2 folds into head 3: data-architect/migration-register-head2.md)
 Create Date: 2026-10-15 12:30:00.000000
 """
 
