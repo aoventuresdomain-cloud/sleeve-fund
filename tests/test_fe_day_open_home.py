@@ -15,7 +15,7 @@ from sleeve_fund.dashboard.compliance import DAY_OPEN_UNRECONCILED, day_open
 from sleeve_fund.portfolio.gate import next_utc_midnight
 
 
-def _day(store, off):  # noqa: F811
+def _day(store, off, opening_age=timedelta(seconds=30), held=True):  # noqa: F811
     """The fund held from before today's open, one Strategy holding a long: 100,000 at the open, and now that plus the
     Strategies' day P&L plus `off` (the book's P&L the Strategies don't have), no flow today. Returns their day P&L."""
     from sleeve_fund.dashboard import book as bookm
@@ -23,9 +23,14 @@ def _day(store, off):  # noqa: F811
     now = datetime.now(UTC)
     opened = next_utc_midnight(now) - timedelta(days=1)
     at = opened - timedelta(hours=2)
-    store.settle_flow(store.fund_flow("deposit", 100_000, actor="pm", reason="the PM's reset", rebase=True, now=at), at)
-    _mark(store, opened - timedelta(seconds=30), "100000")
-    _long(store)
+    if held:
+        store.settle_flow(store.fund_flow("deposit", 100_000, actor="pm", reason="the PM's reset", rebase=True, now=at),
+                          at)
+    _mark(store, opened - opening_age, "100000")
+    if held:
+        _long(store)
+    else:
+        _long(store, "own-long", balance=10_000)
     xs, frames = _summaries(store)
     day = D(str(bookm.book_view(store, xs, frames)["day_pnl"]))
     _mark(store, now - timedelta(seconds=5), str(D(100000) + day + D(off)))
@@ -76,5 +81,24 @@ def test_the_day_opens_at_00_00_utc_shown_in_uk_time_either_side_of_the_clock_ch
 
 
 def test_outside_the_fund_home_shows_no_opening_line(c, store):  # noqa: F811
-    _long(store, "own-long", balance=10_000)
+    """CR M1: with book marks there to read, it is the fund guard that keeps the line out."""
+    _day(store, "250", held=False)
+    assert day_open(store, day_pnl=0) is not None
     assert "Opened today" not in _tile(c)
+
+
+def test_an_opening_from_an_earlier_mark_says_when_it_was(c, store):  # noqa: F811
+    """CR M2: the opening figure is the last mark at or before 00:00 UTC; over a minute before it, the tile says when."""
+    from zoneinfo import ZoneInfo
+
+    opened = next_utc_midnight(datetime.now(UTC)) - timedelta(days=1)
+    _day(store, "0.50", opening_age=timedelta(minutes=7))
+    at = (opened - timedelta(minutes=7)).astimezone(ZoneInfo("Europe/London"))
+    assert f"from the last mark before it at {at:%H:%M} UK" in _tile(c)
+
+
+def test_a_book_short_of_the_strategies_reads_the_gap_unsigned(c, store):  # noqa: F811
+    """CR F1: the book 250 below the Strategies' sum reads "250.00 away", never "−250.00 away"."""
+    _day(store, "-250")
+    tile = _tile(c)
+    assert "is 250.00 away from the Strategies'" in tile and "−250.00 away" not in tile, tile
