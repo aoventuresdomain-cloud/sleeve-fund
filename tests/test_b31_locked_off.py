@@ -37,7 +37,8 @@ def test_a_once_locked_test_asked_off_is_valid_on_the_form_and_the_server(key):
 def test_a_once_locked_test_saved_off_reads_back_off_and_on_again_restores_its_limit(store, key):  # noqa: F811
     c1 = store.compliance()
     limit = next(t["limit"] for t in c1.tests if t["test"] == key)
-    store.add_compliance_version(_edit(c1, **{key: False}), c1.asset_types, expected_version=1, note="testing")
+    store.add_compliance_version(_edit(c1, **{key: False}), c1.asset_types, expected_version=1, note="testing",
+                                 environ={})
     c2 = store.compliance()
     assert not next(t["enabled"] for t in c2.tests if t["test"] == key)
     field = compliance.FIELD[key]
@@ -111,6 +112,7 @@ def _state(store, **kw) -> PortfolioState:
 
 
 def _switch(store, key, on, note="testing the fund", **kw):
+    kw.setdefault("environ", {})  # the order client OFF, as these cells' own; the deploy-format path is cell g2's
     c = store.compliance()
     return store.add_compliance_version(_edit(c, **{key: on}), c.asset_types, expected_version=c.version, note=note,
                                         now=NOW, **kw)
@@ -213,3 +215,58 @@ def test_the_paper_gate_marks_a_book_40_percent_down_with_t5_off_and_neither_hal
     st = led.state()
     assert (st.halted, st.paused, st.hwm) == (None, None, D(100_000))
     assert mark_book(led, D(60_000), NOW + timedelta(minutes=2), SEEDED) == "halt"  # on, not re-based: it fires
+
+
+ON = {"EXEC_MODE": "demo", "EXEC_HOST": "api-demo.bybit.com", "BYBIT_DEMO_API_KEY": "k", "BYBIT_DEMO_API_SECRET": "s"}
+
+
+@pytest.mark.parametrize("key", LOCKED_BEFORE)
+def test_in_deploy_format_the_switch_reads_the_supervisors_client_not_the_dashboards_own(store, key, monkeypatch):  # noqa: F811
+    """CR MUST (20 Oct): the dashboard saves with no client settings of its own (docker-compose gives them to the
+    supervisor only). The save reads what the supervisor published at its start: ON refuses switching off, so does no
+    word from a supervisor at all; OFF lets it through."""
+    from sleeve_fund.paper.exec_client import publish
+
+    for var in ON:
+        monkeypatch.delenv(var, raising=False)
+    with pytest.raises(ValueError, match="until the supervisor has said the exchange order client is off"):
+        _switch(store, key, False, environ=None)  # no supervisor has said: unknown, so refused
+    publish(store, ON)
+    with pytest.raises(ValueError, match="order client is on"):
+        _switch(store, key, False, environ=None)
+    assert store.compliance().version == 1
+    publish(store, {})  # a supervisor restarted with the client OFF
+    _switch(store, key, False, environ=None)
+    assert store.compliance().version == 2
+    publish(store, ON)
+    _switch(store, key, True, environ=None)  # switching back on is never refused
+    assert store.compliance().version == 3
+
+
+@pytest.mark.parametrize("key, held", [("fund_drawdown", {"halted": "the book fell 15%"}),
+                                       ("fund_day_loss", {"paused": "the day lost 3%",
+                                                          "paused_until": NOW + timedelta(hours=11)})])
+def test_switching_a_brake_back_on_while_it_holds_never_lifts_it_and_only_moves_its_reference(store, key, held):  # noqa: F811
+    """CR MUST (20 Oct): a halt or a pause in force stays through off and back on, unlike a Resume
+    (gate.resume_after_halt); only the brake's reference moves to the book."""
+    before = _state(store, equity=D(84_000), **held)
+    _switch(store, key, False)
+    _switch(store, key, True)
+    after = _state(store)
+    assert (after.halted, after.paused, after.paused_until) == (before.halted, before.paused, before.paused_until)
+    moved = after.halt_reference if key == "fund_drawdown" else after.day_start_equity
+    assert moved == D(84_000) and after.hwm == before.hwm
+
+
+def test_a_stale_form_never_rebases_a_brake_another_form_switched_on(store):  # noqa: F811
+    """CR follow-up: the re-base now comes before the version is written, so a form opened before another saved is
+    refused before it, and the reference the other form set stays."""
+    _switch(store, "fund_drawdown", False)
+    stale = store.compliance()
+    _state(store, equity=D(90_000))
+    _switch(store, "fund_drawdown", True)  # re-based to 90,000
+    _state(store, equity=D(85_000), halt_reference=D(90_000))
+    with pytest.raises(ValueError, match="changed since this page was opened"):
+        store.add_compliance_version(_edit(stale, fund_drawdown=True), stale.asset_types,
+                                     expected_version=stale.version, note="testing the fund", now=NOW, environ={})
+    assert _state(store).halt_reference == D(90_000)

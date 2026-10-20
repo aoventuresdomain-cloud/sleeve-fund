@@ -187,7 +187,14 @@ def test_a_once_locked_test_is_switched_off_like_the_others_and_a_set_that_chang
     assert same.status_code == 400 and "Nothing changes from version 1, so nothing was saved" in same.text
     assert _n(store) == 1
     off = _form(**{"fund_drawdown.enabled": None})
-    r = c.post("/portfolio-settings/apply", data={**off, "reason_pick": "Other", "reason_note": "testing the fund"},
+    from sleeve_fund.paper.exec_client import publish
+
+    publish(store, {"EXEC_MODE": "demo"})  # CR MUST: the supervisor says the client is on, so the save is refused
+    on = c.post("/portfolio-settings/apply", data={**off, "reason_pick": "Other", "reason_note": "testing the fund", "confirm_off": "on"},
+                auth=AUTH, headers=SAME, follow_redirects=False)
+    assert on.status_code == 400 and "order client is on" in on.text and _n(store) == 1
+    publish(store, {})  # a supervisor started with the client off, as in deploy format
+    r = c.post("/portfolio-settings/apply", data={**off, "reason_pick": "Other", "reason_note": "testing the fund", "confirm_off": "on"},
                auth=AUTH,
                headers=SAME, follow_redirects=False)
     assert r.status_code in (302, 303), r.text

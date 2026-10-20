@@ -71,6 +71,24 @@ def exec_settings(environ) -> ExecSettings:
                         secret_var=t.secret_var, problems=tuple(exec_target.problems(t)))
 
 
+# B-31 (CR MUST, 20 Oct): the order client's state as the supervisor runs it, published at its start, since only the
+# supervisor is given the client's settings (docker-compose: the dashboard has neither EXEC_MODE nor the venue's keys).
+PUBLISHED = "exec_client"
+
+
+def publish(store, environ) -> None:
+    """The supervisor at its start: the client ON or OFF, as an event other processes read (published_on)."""
+    s = exec_settings(environ)
+    store.event(None, "info", PUBLISHED, f"ON ({s.mode})" if s.on else "OFF")
+
+
+def published_on(store) -> bool | None:
+    """Whether the supervisor said at its last start that the client is on; None when no supervisor has said (unknown,
+    which a guard treats as on)."""
+    e = store.last_event(None, (PUBLISHED,))
+    return None if e is None else not str(e["message"]).startswith("OFF")
+
+
 def entry_queue_max(environ) -> timedelta:
     """EXEC-SPEC Q1: how long an entry over the limit may wait before it is refused and journaled. Outside 0-10 s it is
     refused at load, never clamped."""

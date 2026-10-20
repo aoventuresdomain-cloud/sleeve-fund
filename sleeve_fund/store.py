@@ -4766,8 +4766,12 @@ class Store:
         Journaled with what changed, old and new. It applies from the gate's next evaluation.
 
         B-31 (Advisor B31-BRAKE-SWITCH): T3 and the T5 brakes switch off for paper testing only, so switching one off
-        is refused while the exchange order client is on (environ: the process's, os.environ by default). A T5 brake
-        switched back on is re-based to the book then (gate.rebase_brakes), journaled with the true drawdown."""
+        is refused while the exchange order client is on: as the supervisor published it at its start
+        (exec_client.published_on; refused too when no supervisor has said), or as this process's own settings say
+        (environ, os.environ by default). Given an environ, that alone decides (CR MUST: the dashboard has no client
+        settings of its own in deploy format). A T5 brake switched back on is re-based to the book first
+        (gate.rebase_brakes), before the version that turns it on is written, so no mark between the two can judge it
+        against its old reference; journaled with the true drawdown."""
         import os
 
         from sleeve_fund import compliance_rules as rules
@@ -4794,6 +4798,24 @@ class Store:
         if errors:
             raise ValueError("; ".join(errors))
         now = now or utcnow()
+        # CR follow-up: the re-base goes first. With the brake still off in the version in force, a mark meanwhile can't
+        # judge it, and once the version is written it is judged from the book now. A version that fails to write
+        # (another form saved first) leaves the brake off, which a moved reference doesn't touch.
+        with self.engine.connect() as c:
+            if (c.execute(select(func.max(compliance_versions_t.c.version))).scalar() or 0) != expected_version:
+                # never re-base a brake another form has already switched on: refused as the write below would be
+                raise ValueError("the compliance tests changed since this page was opened: reload and edit again")
+        before = self.compliance(expected_version) if expected_version else None
+        was_on = {t["test"]: bool(t["enabled"]) for t in before.tests} if before else {}
+        turned_on = {k for k in BRAKE_SWITCHES if not was_on.get(k, True) and any(
+            r["test"] == k and r["enabled"] for r in rows)}
+        rebased = []
+        if turned_on & {"fund_drawdown", "fund_day_loss"}:
+            from sleeve_fund.gate_ledger import DbLedger
+            from sleeve_fund.portfolio.gate import rebase_brakes
+
+            _, rebased = rebase_brakes(DbLedger(self, lambda: ()), drawdown="fund_drawdown" in turned_on,
+                                       day="fund_day_loss" in turned_on)
         try:
             with self.engine.begin() as c:
                 latest = c.execute(select(func.max(compliance_versions_t.c.version))).scalar() or 0
@@ -4805,14 +4827,18 @@ class Store:
                 on = {r["test"]: r["enabled"] for r in rows}
                 off_now = [k for k in BRAKE_SWITCHES if was.get(k, True) and not on.get(k, True)]
                 if off_now:
-                    from sleeve_fund.paper.exec_client import exec_settings
+                    from sleeve_fund.paper.exec_client import exec_settings, published_on
 
-                    if exec_settings(os.environ if environ is None else environ).on:
+                    names = ", ".join(rules.name(k) for k in off_now)
+                    said = None if environ is not None else published_on(self)
+                    if environ is None and said is None:
+                        raise ValueError(f"{names} can't be switched off until the supervisor has said the exchange "
+                                         "order client is off (it says so when it starts): switching the whole-fund "
+                                         "test or a loss brake off is for paper testing only")
+                    if exec_settings(os.environ if environ is None else environ).on or said:
                         raise ValueError(
-                            f"{', '.join(rules.name(k) for k in off_now)} can't be switched off while the exchange "
-                            "order client is on: switching the whole-fund test or a loss brake off is for paper "
-                            "testing only")
-                turned_on = {k for k in BRAKE_SWITCHES if not was.get(k, True) and on.get(k, False)}
+                            f"{names} can't be switched off while the exchange order client is on: switching the "
+                            "whole-fund test or a loss brake off is for paper testing only")
                 v = latest + 1
                 c.execute(insert(compliance_versions_t).values(version=v, created_at=now, created_by=created_by,
                                                                note=note.strip()))
@@ -4825,17 +4851,8 @@ class Store:
                     reason=f"compliance tests v{v} ({note.strip()}): {_compliance_changes(old, rows, groups)}"))
         except IntegrityError as exc:  # another write took the same version number first
             raise ValueError("the compliance tests changed since this page was opened: reload and edit again") from exc
-        if turned_on & {"fund_drawdown", "fund_day_loss"}:
-            # After the version's commit, so a re-base never stands for a version that wasn't written; a crash between
-            # the two leaves the brake on against its old reference, which can only halt or pause sooner (safe side).
-            from sleeve_fund.gate_ledger import DbLedger
-            from sleeve_fund.portfolio.gate import rebase_brakes
-
-            _, words = rebase_brakes(DbLedger(self, lambda: ()), drawdown="fund_drawdown" in turned_on,
-                                     day="fund_day_loss" in turned_on)
-            for w in words:
-                self.event(None, "info", "portfolio_brake_rebased", f"{w} (compliance tests v{v}, {note.strip()})",
-                           ts=now)
+        for w in rebased:
+            self.event(None, "info", "portfolio_brake_rebased", f"{w} (compliance tests v{v}, {note.strip()})", ts=now)
         return v
 
     def prune_backtests(self, keep: int = 50) -> int:
