@@ -340,3 +340,14 @@ def test_display_title_leads_and_file_id_stays_as_label(client, fid):
     assert esc(side) in row and row.index(f">{esc(side)}<") < row.index(f">{fid}")  # the row name before its id label
     list_html = c.get("/strategy", auth=AUTH).text
     assert list_html.index(esc(group)) < list_html.index(f"/strategy?s={fid}\"", list_html.index(esc(group)))
+
+
+@pytest.mark.parametrize("fid", QR_IDS + ["rsi-pullback"])
+def test_reads_column_only_when_a_block_reads_something_but_the_price(client, fid):
+    """The Indicators table shows 'Reads' only for a file with a chained block (input = another block)."""
+    c, _ = client
+    chained = any('input = "' in p.read_text() for p in DEFS.glob("*.toml")
+                  if load_definition_file(p)["name"] == fid)
+    page = c.get(f"/strategy?s={fid}", auth=AUTH).text
+    table = page.split("Indicators used")[1].split("Settings to test")[0]
+    assert ("<th>Reads</th>" in table) is chained
