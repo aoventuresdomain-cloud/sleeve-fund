@@ -225,3 +225,27 @@ def test_after_the_gates_own_rebase_the_headline_measures_from_the_book_then(c, 
     assert shown, re.search(r"Drawdown.{0,120}", words).group(0)
     assert shown and Decimal(shown.group(1)) / 100 == round(1 - st.equity / st.reference(), 4) == Decimal("0.0051")
     assert f"From all-time peak: {(101_000 - 98_500) / 101_000:.2%}" in words  # 2.48%
+
+
+def test_back_at_the_peak_after_a_rebase_the_headline_reads_from_peak_again(c, store, monkeypatch):  # noqa: F811
+    """CR MUST M1 on PAGE-DD-REBASE: the label switches back once the fund is back at its all-time peak. Through the
+    ledger (B-31's rebase_brakes, then a mark at the old peak) and, since the ledger then stores no separate
+    reference, on a state whose reference equals the peak, which is no re-base."""
+    from sleeve_fund.dashboard import riskops
+    from sleeve_fund.paper.portfolio_gate import PaperGate
+    from sleeve_fund.portfolio.gate import rebase_brakes
+
+    _hold(store)
+    _long(store)
+    _mark(store, 99_000, hwm=101_000)
+    ledger = PaperGate(store).ledger
+    rebase_brakes(ledger, drawdown=True, day=False)
+    store.event(None, "info", "portfolio_brake_rebased", "T5b Drawdown halt re-based (QA)")
+    _mark(store, 101_000)
+    words, _ = _words(c, "/")
+    assert "Drawdown from peak 0.00% (halt at 15%)" in words, re.search(r"Drawdown.{0,120}", words).group(0)
+    assert "since re-base" not in words and "From all-time peak" not in words
+    at_peak = replace(ledger.state(), equity=Decimal(100_500), hwm=Decimal(101_000), halt_reference=Decimal(101_000))
+    monkeypatch.setattr(type(ledger), "state", lambda self: at_peak)
+    view = riskops.fund_drawdown_view(store)
+    assert view["rebased"] is False and view["peak_drawdown"] is None and view["drawdown"] == round(1 - 100_500 / 101_000, 4)
