@@ -127,3 +127,48 @@ def test_not_held_the_position_size_reads_as_before(c, store):  # noqa: F811
     s = _long(store, "own-long", balance=10_000)
     side, table = _size_cells(c, s.name)
     assert side.startswith("33% of the fund") and table == "33% of the fund"
+
+
+def test_the_halts_drawdown_is_never_negative_and_unusable_figures_read_as_not_marked(c, store):  # noqa: F811
+    """CR's FOLLOW-UP 2: a book above its halt reference reads 0, as book_breach measures from the higher of the two;
+    a reference or book at or below 0 is no figure, never a page error."""
+    from sleeve_fund.dashboard import riskops
+    from sleeve_fund.paper.portfolio_gate import PaperGate
+
+    _hold(store)
+    _long(store)
+    _mark(store, 100_000)
+    ledger = PaperGate(store).ledger
+    st = ledger.state()
+    ledger.set_state(replace(st, equity=Decimal(101_000), hwm=Decimal(101_000), halt_reference=Decimal(99_000)))
+    assert riskops.fund_drawdown(store) == 0.0
+    for bad in ({"halt_reference": Decimal(0), "hwm": Decimal(0)}, {"equity": Decimal(0)}, {"equity": None, "mark_ts": None, "hwm": None, "halt_reference": None,
+                                                                                    "day": None, "day_start_equity": None}):
+        ledger.set_state(replace(st, **bad))
+        assert riskops.fund_drawdown(store) is None, bad
+        words, _ = _words(c, "/")
+        assert "Drawdown from peak –" in words, bad
+
+
+def test_the_headline_measures_from_the_halts_reference_not_the_days_start(c, store):  # noqa: F811
+    """CR MUST M1 on 6b1324fe: a past high-water mark of 101,000 above today's start of 98,000, the book at 99,000 (a
+    small gain today, still under the peak). The headline is 1 - book / reference, 1.98%, the figure book_breach halts
+    at; from the day's start it would read 0."""
+    from sleeve_fund.paper.portfolio_gate import PaperGate
+    from sleeve_fund.portfolio.limits import book_breach
+    from sleeve_fund.risk import PORTFOLIO
+
+    _hold(store)
+    _long(store)
+    _mark(store, 99_000, hwm=101_000)
+    ledger = PaperGate(store).ledger
+    ledger.set_state(replace(ledger.state(), day_start_equity=Decimal(98_000)))
+    st = ledger.state()
+    assert st.reference() > st.day_start_equity and st.equity > st.day_start_equity
+    words, _ = _words(c, "/")
+    shown = Decimal(re.search(r"Drawdown from peak (\d+\.\d\d)%", words).group(1)) / 100
+    assert shown == round(1 - st.equity / st.reference(), 4) == Decimal("0.0198")
+    halt = replace(PORTFOLIO, drawdown=float(shown), daily_loss=None)
+    assert book_breach(halt, st.equity, st.reference(), st.day_start_equity).action == "halt"
+    assert book_breach(replace(halt, drawdown=float(shown + Decimal("0.0001"))), st.equity, st.reference(),
+                       st.day_start_equity) is None

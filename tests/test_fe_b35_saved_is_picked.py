@@ -148,7 +148,7 @@ def test_donchian_never_lands_on_a_perpetual_with_no_chip_to_pick(held_site, bro
     before = _saved(store)
     page, errors = _open(browser, f"{base}/sleeves/new?{WHERE['spot'][0]}&strategy=donchian")
     greyed, text, opt = _perp_entry(page)
-    assert greyed and "Not for this model" in text, text
+    assert greyed and "Not for this model" in text and PERP_WEIGHT_REFUSAL.split(":")[1].strip() in text, text
     opt.click(force=True)
     assert page.input_value("[data-pl-venue]") == "kraken" and page.input_value("#strategy") == "donchian"
     assert any(offered for _, offered in _chips(page))  # its daily chip is still there to pick
@@ -159,4 +159,32 @@ def test_donchian_never_lands_on_a_perpetual_with_no_chip_to_pick(held_site, bro
     opt.click()
     assert page.input_value("[data-pl-venue]") == "binance"
     assert _saved(store) == before and errors == []
+    page.context.close()
+
+
+def _entry(page, typed, kind):
+    page.fill("#instrument", "")
+    page.click("#instrument")
+    page.type("#instrument", typed)
+    opt = page.locator("#instrument-list [role=option]", has_text=typed).filter(has_text=kind).first
+    opt.wait_for(state="visible", timeout=5000)
+    return opt.get_attribute("aria-disabled") == "true", opt.inner_text()
+
+
+def test_the_instrument_list_greys_by_the_markets_own_candles_and_only_perps_by_weight(held_site, browser):  # noqa: F811
+    """CR's FOLLOW-UP 1 on 6b1324fe: each of plRefuse's two reasons pinned. A model that decides on one candle length
+    greys a market whose candles (the venue's own list) don't include it, and not one whose do; a model sized by
+    weight greys only the perpetuals."""
+    base, _ = held_site
+    page, errors = _open(browser, f"{base}/sleeves/new?{WHERE['spot'][0]}&strategy=donchian")
+    greyed, text = _entry(page, "BTC/USD", "spot")
+    assert not greyed, text  # its daily candles are this market's, and spot takes a model sized by weight
+    page.evaluate("""() => { const s = document.getElementById("strategy"); s.value = "buy_and_hold";
+        const o = s.selectedOptions[0]; o.dataset.bar = "1-HOUR-LAST-EXTERNAL"; o.dataset.barWords = "It decides on the venue's hourly candles";
+        s.dispatchEvent(new Event("change", {bubbles: true})); }""")  # a model held to a candle only spot has
+    greyed, text = _entry(page, "BTC/USDT", "perpetual")
+    assert greyed and "hourly candles, which this market doesn't offer" in text, text
+    greyed, text = _entry(page, "BTC/USD", "spot")
+    assert not greyed, text
+    assert errors == []
     page.context.close()
