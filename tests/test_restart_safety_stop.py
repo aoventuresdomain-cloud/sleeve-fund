@@ -65,7 +65,8 @@ def test_a_stop_that_cant_be_restored_gets_a_safety_stop_half_way_from_the_mark_
     book = store.journal_book("s1", 10_000)
     _restart(store, instrument, prices.iloc[25:27], 2.0)  # two bars: too few for the 14-bar ATR
     liq = markets.isolated_liquidation(book["cash"], book["qty"], book["entry_px"], risk.profile("balanced").max_leverage,
-                                       markets.terms(PERP).maintenance_margin)
+                                       markets.terms(PERP).maintenance_margin, fees=float(book["entry_fees"]),
+                                       tick=float(instrument.price_increment))  # LIQ-FEE (HoE TEC)
     mark = float(prices["close"].iloc[25])  # the first price after the restart
     assert liq is not None and liq < mark
     alert = _incident(store)

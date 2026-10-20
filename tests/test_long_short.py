@@ -883,7 +883,8 @@ def test_a_perp_shows_leverage_liquidation_and_funding(client):  # noqa: F811
     store.record_equity("pp-fund", equity=cash - 5_950, cash=cash, qty=-0.1, price=59_500.0, benchmark=10_000)
     html = c.get("/sleeves/pp-fund", auth=AUTH).text
     lev = __import__("sleeve_fund.risk", fromlist=["profile"]).profile(store.sleeve("pp-fund").risk_profile).max_leverage
-    liq = markets.isolated_liquidation(cash, -0.1, 59_000.0, lev, markets.LOW_FEE_PERP.maintenance_margin)
+    liq = markets.isolated_liquidation(cash, -0.1, 59_000.0, lev, markets.LOW_FEE_PERP.maintenance_margin,
+                                       fees=1.0)  # LIQ-FEE (HoE TEC): the open short's entry fee off its margin
     assert f"{0.1 * 59_000 / lev:,.2f}" in html  # isolated margin: the notional at entry over the leverage cap
     # QA U2: leverage is the position's own (notional at entry over its margin); exposure is at the mark over equity.
     # UP-2: in the cap format, and the one from the mark (5,950 over the same margin) labelled effective.

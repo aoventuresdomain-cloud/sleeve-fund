@@ -78,6 +78,7 @@ def sleeve_extras(store: Store, x: dict, frame: pd.DataFrame) -> dict:
         position_value=qty * price,
         cash=last["cash"] if last else s.starting_balance,
         entry_px=book["entry_px"],
+        entry_fees=float(book.get("entry_fees") or 0.0),  # off the isolated margin (LIQ-FEE): the engine's liquidation
         unrealised=unreal,
         last_fill=fill[0] if fill else None,
         reconcile=rec,

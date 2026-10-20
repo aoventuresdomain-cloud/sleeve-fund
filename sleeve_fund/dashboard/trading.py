@@ -247,7 +247,10 @@ def position_margin(x: dict) -> tuple[float, float | None]:
         return abs(qty) * entry, None
     lev = risk.leverage_cap(x["profile"], x["sleeve"].params)
     return (markets.isolated_margin(qty, entry, lev, cash + qty * entry),
-            markets.isolated_liquidation(cash, qty, entry, lev, t.maintenance_margin) if tiered else None)
+            markets.isolated_liquidation(cash, qty, entry, lev, t.maintenance_margin,
+                                         fees=x.get("entry_fees") or 0.0,
+                                         tick=markets.liquidation_tick(getattr(x["sleeve"], "venue", None),
+                                                                       x["sleeve"].instrument)) if tiered else None)
 
 
 def margin_cash(x: dict) -> float:

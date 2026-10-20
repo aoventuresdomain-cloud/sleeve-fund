@@ -63,13 +63,17 @@ def _entry(res) -> float:
     return float(res.fills.loc[entry, "avg_px"])
 
 
-def _liq(entry: float, side: int, lev: float) -> float:
+def _liq(res, entry: float, side: int, lev: float, tick: float) -> float:
     """The isolated liquidation price at this leverage (margin.isolated_liquidation): the margin is the notional over
-    the leverage, whatever the size, so the price is the entry's and the leverage's alone. The nearer of the two
+    the leverage less the entry fill's fee (LIQ-FEE, HoE TEC), on the tick toward the entry. The nearer of the two
     formulas (VS-1-TABLE): a long's is on its entry value, a short's on its value at the price."""
-    if side > 0:
-        return entry * (1 - 1 / lev + MAINTENANCE)
-    return entry * (1 + 1 / lev) / (1 + MAINTENANCE)
+    from sleeve_fund import margin
+
+    fill = next(f for f in sorted(res.journal.fills_, key=lambda f: f["ts"])
+                if res.decisions[f["order_id"]]["intent"] == "entry")
+    qty = side * float(fill["qty"])
+    return margin.isolated_liquidation(1e9 - qty * entry, qty, entry, lev, MAINTENANCE, fees=float(fill["fee"]),
+                                       tick=tick)  # a balance clear of the margin, as the backtest's is
 
 
 def _held(seen: list[dict], entry: float) -> list[float]:
@@ -90,7 +94,7 @@ def test_a_level_loosening_past_half_way_to_liquidation_is_held_at_half_way(side
                        half_spread=0, risk_profile=profile)
     assert not res.handler_errors, res.handler_errors
     entry = _entry(res)
-    liq = _liq(entry, side, LEVERAGE[profile])
+    liq = _liq(res, entry, side, LEVERAGE[profile], float(instrument.price_increment))
     cap = entry - side * 0.5 * abs(entry - liq)  # half the way from the entry to the liquidation price
     assert (LOOSENED[side] - cap) * side < 0, "the path must loosen past the cap, or the pin proves nothing"
     held = _held(seen, entry)
@@ -129,7 +133,7 @@ def test_funding_paid_moves_the_liquidation_price_and_a_fixed_stop_is_pulled_in(
     paid = [f for f in res.funding if f["amount"] < 0]
     assert paid, "no funding was paid while the position was held"
     entry = _entry(res)
-    liq = _liq(entry, 1, 3.0)
+    liq = _liq(res, entry, 1, 3.0, float(instrument.price_increment))
     assert 125.5 > entry - 0.5 * (entry - liq)  # inside half way at entry, so it opened
     held = _held(seen, entry)
     assert held[0] == pytest.approx(125.5)  # before the settlement: the stop as it opened

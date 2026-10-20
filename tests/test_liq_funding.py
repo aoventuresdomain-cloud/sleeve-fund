@@ -20,6 +20,15 @@ from test_hub_146_qa import (  # noqa: F401 - _probe registers the probe
 )
 
 MM = 0.005
+TICK = 0.1  # the harness's BTC/USD at price_precision 1: the engine's liquidation price sits on it (LIQ-FEE)
+
+
+def _taker() -> float:
+    """The harness's perp taker rate (qa.paper's held entry and fills are charged it)."""
+    from sleeve_fund import markets
+    from sleeve_fund.venues import venue
+
+    return float(markets.fees_for({"market": "perp", "allow_short": True}, venue("KRAKEN").fees).taker)
 SETTLED = pd.Timestamp("2025-10-03 08:00", tz="UTC")
 pytestmark = list(LIQUIDATION_MECHANICS)  # a stopless 3x position on purpose: the guard is the subject
 
@@ -97,7 +106,8 @@ def _book(where, prices, side):
         fill = fills[0]
         assert orders[0]["intent"] == "entry", orders
         cash = 10_000 - side * fill["qty"] * fill["price"] - fill["fee"]
-        fixed = markets.isolated_liquidation(cash, side * fill["qty"], fill["price"], 3.0, MM)
+        fixed = markets.isolated_liquidation(cash, side * fill["qty"], fill["price"], 3.0, MM, fees=fill["fee"],
+                                             tick=TICK)  # LIQ-FEE (HoE TEC): the entry fee off the margin
         funded = sum(r["amount"] for r in res.funding if pd.Timestamp(r["ts"]) > pd.Timestamp(fill["ts"]))
     return orders, fixed, side * fill["qty"], funded, float(fill["price"])
 
@@ -156,7 +166,8 @@ def test_a_restart_reads_the_funding_since_the_fill_back_from_the_journal(hourly
     _rate(monkeypatch, 0.0)
     qty, px = 0.25, qa.BASE
     fee = qty * px * 0.0005
-    fixed = markets.isolated_liquidation(10_000 - qty * px - fee, qty, px, 3.0, MM)
+    fixed = markets.isolated_liquidation(10_000 - qty * px - fee, qty, px, 3.0, MM, fees=qty * px * _taker(),
+                                         tick=TICK)  # LIQ-FEE (HoE TEC): the held entry's fee off the margin
     funded = -1500.0
     record_order, create = Store.record_order, Store.create_sleeve
 
@@ -392,7 +403,8 @@ def _add_run(where, prices, side):
     assert [f["intent"] for f in opened] == ["entry", "rebalance"], [(f["intent"], f["qty"]) for f in fills]
     q = sum(f["qty"] for f in opened)
     avg = sum(f["qty"] * f["price"] for f in opened) / q
-    fixed = markets.isolated_liquidation(10_000.0 - side * q * avg, side * q, avg, 3.0, MM)  # balance clear of margin
+    fixed = markets.isolated_liquidation(10_000.0 - side * q * avg, side * q, avg, 3.0, MM,  # balance clear of margin
+                                         fees=sum(f["fee"] for f in opened), tick=TICK)  # LIQ-FEE (HoE TEC)
     return orders, fixed, side * q, funded, fills, cash, avg
 
 
@@ -508,7 +520,9 @@ def test_a_restart_after_an_add_reads_back_the_funding_since_the_first_fill(hour
     _rate(monkeypatch, 0.0)
     qty, px, half = 0.25, qa.BASE, 0.125
     fee = qty * px * 0.0005
-    fixed = markets.isolated_liquidation(10_000 - qty * px - fee, qty, px, 3.0, MM)
+    # LIQ-FEE (HoE TEC): both opening fills' fees off the margin, the first's as recorded below and the held one's
+    fixed = markets.isolated_liquidation(10_000 - qty * px - fee, qty, px, 3.0, MM,
+                                         fees=half * px * 0.0005 + half * px * _taker(), tick=TICK)
     record_order, create = Store.record_order, Store.create_sleeve
 
     def journaled(self, sleeve, **kw):
