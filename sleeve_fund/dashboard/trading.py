@@ -3,6 +3,8 @@ the strategy gave when it acted (journaled in the orders table at decision time)
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 from sleeve_fund import markets, risk
 from sleeve_fund.research.metrics import ZERO, _dec, trade_stats, trades
 from sleeve_fund.paper.runtime import liquidation_head
@@ -523,12 +525,14 @@ def t1_sizing(decision: dict | None) -> dict | None:
     """PAGE-SIZE lines 1 and 2, read from the entry's gate decision as recorded, never worked from today's T1 (Advisor,
     20 Oct): the share of T1's room it was sized at (size_share), the loss if its stop is hit (approved quantity x risk
     per unit over the book's equity then) and T1's cap over that equity. None when any is missing or unusable, never a
-    guess. shortcut: t1_used_before, t1_cap, risk_per_unit (USDT) and size_share are the planned gate_decisions
-    columns (DA, QD2's B-24 part 2 writer); until they land every decision reads as not recorded."""
+    guess; t1_used_before is journaled but not read here. shortcut: t1_cap, risk_per_unit (USDT) and size_share are
+    the planned gate_decisions columns (DA, QD2's B-24 part 2 writer); until they land every decision reads as not
+    recorded."""
     d = decision or {}
-    qty, book, used, cap, per, share = (d.get(k) for k in ("approved_qty", "book_equity", "t1_used_before", "t1_cap",
-                                                            "risk_per_unit", "size_share"))
-    if None in (qty, book, used, cap, per) or book <= 0:
+    # one type throughout (CR F3): a column read back as a float beside a Decimal one would raise on the page
+    qty, book, cap, per, share = (None if d.get(k) is None else Decimal(str(d[k]))
+                                  for k in ("approved_qty", "book_equity", "t1_cap", "risk_per_unit", "size_share"))
+    if None in (qty, book, cap, per) or book <= 0:
         return None
     # size_share alone is NULL when T1 had no room left (QD2's writer): that line only then reads as not recorded
     return {"room_share": float(share) if share is not None else None, "stop_share": float(round(qty * per / book, 4)),

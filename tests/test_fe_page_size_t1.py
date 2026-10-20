@@ -28,12 +28,12 @@ T1 = {"t1_used_before": Decimal(1000), "t1_cap": Decimal(4000), "risk_per_unit":
 BOOK = Decimal(100000)
 
 
-def _decided(store, s, approved=Decimal(12)):  # noqa: F811
+def _decided(store, s, approved=Decimal(12), seq=1, bar_ts=None):  # noqa: F811
     """The gate's approved decision for the entry order, as the gate writes it, without the T1 columns (not yet a
     schema column)."""
     with store.engine.begin() as cx:
         cx.execute(insert(gate_decisions_t), [{
-            "seq": 1, "sleeve_id": s.id, "bar_ts": utcnow(), "intent_id": "i1", "intent": "entry", "underlying": "BTC",
+            "seq": seq, "sleeve_id": s.id, "bar_ts": bar_ts or utcnow(), "intent_id": "i1", "intent": "entry", "underlying": "BTC",
             "order_id": f"{s.name}-1", "profile_version": 1, "outcome": "approved", "requested_qty": approved,
             "approved_qty": approved, "price": Decimal(str(ENTRY)), "book_equity": BOOK, "stage": "submit",
             "decided_at": utcnow()}])
@@ -51,7 +51,7 @@ def test_the_two_lines_are_the_decisions_own_t1_figures():
 
 def test_a_decision_without_its_t1_figures_has_none_and_never_a_guess():
     base = {"approved_qty": Decimal(12), "book_equity": BOOK, **T1}
-    for missing in ("t1_used_before", "t1_cap", "risk_per_unit", "book_equity"):
+    for missing in ("t1_cap", "risk_per_unit", "book_equity"):
         assert trading.t1_sizing({k: v for k, v in base.items() if k != missing}) is None, missing
         assert trading.t1_sizing({**base, missing: None}) is None, missing
     assert trading.t1_sizing({**base, "book_equity": Decimal(0)}) is None
@@ -121,3 +121,22 @@ def test_with_no_t1_room_recorded_only_the_room_line_reads_as_not_recorded(c, st
     for cell in _size_cells(c, s.name):
         assert "Room T1 allows: not in this entry's record" in cell and "Sized at" not in cell, cell
         assert "Risk if the stop is hit: 1.8% of the fund (T1 limit 4%)" in cell, cell
+
+
+def test_the_limit_is_the_recorded_cap_and_one_type_throughout():
+    """CR F1, F3 and F4: a cap recorded at 2% of the book reads 2%, not a fixed 4%; a column read back as a float beside
+    Decimal ones never raises; t1_used_before isn't needed for either line (QD2 still journals it)."""
+    d = {"approved_qty": Decimal(12), "book_equity": BOOK, "t1_cap": Decimal(2000), "risk_per_unit": 150.0,
+         "size_share": 0.9}
+    assert trading.t1_sizing(d) == {"room_share": 0.9, "stop_share": 0.018, "t1_limit": 0.02}
+
+
+def test_the_page_reads_the_orders_latest_decision(c, store):  # noqa: F811
+    """CR F2: an order with two decisions (a check re-run) shows the later one's."""
+    from datetime import timedelta
+
+    _hold(store)
+    s = _journaled_long(store, fund_equity=100_000.0)
+    _decided(store, s, approved=Decimal(5), seq=1, bar_ts=utcnow() - timedelta(minutes=1))
+    _decided(store, s, approved=Decimal(12), seq=2)
+    assert store.entry_decision(f"{s.name}-1")["approved_qty"] == Decimal(12)
