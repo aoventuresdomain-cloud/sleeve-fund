@@ -5,7 +5,7 @@ the Portfolio Settings form and by the store's write alike. Every limit is a sha
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from itertools import pairwise
 
 
@@ -58,11 +58,19 @@ UNMAPPED = "An asset with no group can't take a new trade while the per-group te
 
 
 def show(key: str, limit: Decimal | float) -> str:
-    """A limit in the PM's words: 2.0% or 1.5x."""
+    """A limit in the PM's words: 2% or 1.50x. An "x" value always shows 2 decimal places (B-18): display only, the
+    stored limit and the gate's maths keep every digit."""
     v = Decimal(str(limit))
     if BY_KEY[key].unit == "x":
-        return f"{v.normalize():f}x"
+        return f"{v.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP):f}x"
     return f"{(v * 100).quantize(Decimal('0.01')).normalize():f}%"
+
+
+def edit(key: str, limit: Decimal | float) -> str:
+    """A limit as the edit box carries it: every stored digit, in the page's unit without its sign (0.125x -> 0.125,
+    4% -> 4). Never show()'s rounded value: an untouched save must not change the limit (B-18 edge)."""
+    v = Decimal(str(limit))
+    return f"{(v * 100 if BY_KEY[key].unit == '%' else v).normalize():f}"
 
 
 SHORT = {"fund_gross": "Gross", "asset_net": "Net per asset", "fund_margin": "Margin",

@@ -34,10 +34,15 @@
 
 {% macro strategy_fields(strategies, chosen, g1, pre) %}
 <div class="field"><label for="strategy">Model</label>
-  <select name="strategy" id="strategy">{% for st in strategies %}<option value="{{ st.name }}" {{ 'selected' if st.name == chosen }} data-g1="{{ g1.get(st.name) or '' }}">{{ st.name|replace('_', ' ') }} ({{ st.family }})</option>{% endfor %}</select></div>
+  {% macro opt(st) %}<option value="{{ st.name }}" {{ 'selected' if st.name == chosen }} data-g1="{{ g1.get(st.name) or '' }}"{% if st.prefill %} data-prefill="{{ st.prefill|tojson|forceescape }}"{% endif %}>{{ st.name|replace('_', ' ') }} ({{ st.family }})</option>{% endmacro %}
+  {% set tests = strategies|selectattr('group', 'equalto', 'Test')|list %}
+  <select name="strategy" id="strategy">{% if tests %}<optgroup label="Strategies">{% endif %}{% for st in strategies if st.group != 'Test' %}{{ opt(st) }}{% endfor %}{% if tests %}</optgroup>
+    <optgroup label="Test">{% for st in tests %}{{ opt(st) }}{% endfor %}</optgroup>{% endif %}</select></div>
 {% for st in strategies %}
 <div class="params" data-strategy="{{ st.name }}">
   <p class="muted" style="margin:8px 0"><span class="desc" data-tpl="{{ st.tpl }}" data-defaults="{{ st.defaults|tojson|forceescape }}">{{ st.idea }}</span> <a href="/strategies/{{ st.name }}">Details and evidence</a></p>
+  {% if st.fields %}<div class="grid2">{% for k, label, placeholder, hint in st.fields %}{% set fname = 'p_' ~ st.name ~ '__' ~ k %}<div class="field"><label for="p-{{ st.name }}-{{ k }}">{{ label }}</label><input id="p-{{ st.name }}-{{ k }}" name="{{ fname }}" value="{{ pre.get(fname, '') }}" placeholder="{{ placeholder }}" inputmode="decimal"><p class="hint">{{ hint }}</p></div>{% endfor %}</div>
+  <p class="hint">A test Strategy is created stopped: start it from its own page when you are ready. It trades inside the fund, sized from the fund's equity, with every compliance test.</p>{% endif %}
   {% if st.params %}<div class="grid2">{% for k, v in st.params.items() %}{% set fname = 'p_' ~ st.name ~ '__' ~ k %}<div class="field"><label for="p-{{ st.name }}-{{ k }}">{{ k|replace('_', ' ')|capitalize }}</label><input id="p-{{ st.name }}-{{ k }}" name="{{ fname }}" value="{{ pre.get(fname, v) }}" inputmode="decimal"></div>{% endfor %}</div>{% endif %}
 </div>
 {% endfor %}

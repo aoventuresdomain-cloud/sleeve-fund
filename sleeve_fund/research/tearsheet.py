@@ -87,6 +87,10 @@ def _param(v) -> str:
     0.5% threshold as 0 (round 11 minor)."""
     if isinstance(v, str):
         return v
+    if isinstance(v, dict):  # a setting with parts, e.g. signal_strength: "linear, floor 0.3" (G5)
+        return ", ".join(str(x) if k == "mapping" else f"{k} {_param(x)}" for k, x in v.items())
+    if isinstance(v, (list, tuple)):
+        return "/".join(_param(x) for x in v)
     f = float(v)
     return str(int(f)) if f.is_integer() else f"{f:g}"
 
@@ -488,7 +492,10 @@ def _span(minutes: int) -> str:
         f"{minutes / 60:g} hours" if minutes >= 60 else f"{minutes} minutes")
 
 
-def render(r: StudyResult, ledger: IdeaLedger, register=None, liquidation_ack: str | dict | None = None) -> str:
+def render(r: StudyResult, ledger: IdeaLedger, register=None, liquidation_ack: str | dict | None = None,
+           flat: StudyResult | None = None) -> str:
+    """flat: for a strength-sized variant (G5), its flat version's study on the same windows, shown side by side
+    (strength_report); without it the flat version stays."""
     spec = r.spec
     oos = summary(r.oos_returns)
     oos_b = _bench(r.oos_benchmark_returns)
@@ -700,6 +707,9 @@ def render(r: StudyResult, ledger: IdeaLedger, register=None, liquidation_ack: s
         out.append(f"- Deflated Sharpe: {_share(dsr)} probability the out-of-sample Sharpe "
                    f"is real rather than the best of many tries (higher is better; 95% is a strong bar).{uncertain}")
     out.append("")
+    from sleeve_fund.research.strength_report import section as strength_section
+
+    out += strength_section(r, flat)
     out.append("## Caveats")
     out.append("")
     out.append("- Signal orders go to the venue as the bar that triggered them closes: at market, paying the taker fee "

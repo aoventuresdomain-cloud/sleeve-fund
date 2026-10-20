@@ -32,6 +32,7 @@ from sleeve_fund.gate_ledger import IDENTITY_HOLD_ACTION, IDENTITY_RESUME_ACTION
 from sleeve_fund.portfolio.gate import EMPTY, PortfolioState, apply_flow, mark_book, sweep, unrestorable
 from sleeve_fund.portfolio.limits import Book, Holding
 from sleeve_fund.risk import PORTFOLIO, trading_day
+from sleeve_fund.paper import orphan_guard
 from sleeve_fund.paper.safety import assert_portfolio_gate, credential_var
 from sleeve_fund.paper.single_lock import EXIT_DUPLICATE
 from sleeve_fund.paper.config import check_hub_bar_spec, load_sleeve, to_store_kwargs
@@ -42,6 +43,8 @@ from sleeve_fund.paper.runtime import entry_blocked, liquidation_head, said_sinc
 from sleeve_fund.strategies.base import EXITS_ONLY
 
 VENUE_EXITS = f"{EXITS_ONLY}: {router.VENUE_MOVED[router.EXITS_ONLY]}"  # F-WED1-3: the status reason of that start
+OPEN_CANCEL_REFUSAL = ("a resting entry's cancel is still waiting for the venue to confirm how it ended, so it can't be "
+                       "reset now (the order may still rest, or fill): reset it again once that is settled")
 
 POLL_SECONDS = 5
 KEY_CHECK_EVERY = 12  # polls between key-presence checks: about a minute
@@ -657,11 +660,18 @@ def check_quote_places(s: Sleeve, account: str) -> str | None:
             f"to, which only {why} may do. Its results are not Strategy evidence")
 
 
+RESTING_STOPS_OFF = ("its stop would rest at the venue as a reduce-only order, and paper sends no resting stop until "
+                     "the test-network drills pass: turn resting stops off to run it")
+
+
 def check_resting_entries(s: Sleeve) -> None:
     """RESTING-OFF (HoE, Advisor 13 Oct): raises ValueError for a Strategy whose entries would rest at the venue
-    (maker_wait_minutes set), until ORPHAN-GUARD lands. Market entries are unaffected; a backtest never comes here."""
+    (maker_wait_minutes set), until ORPHAN-GUARD lands. Market entries are unaffected; a backtest never comes here.
+    A1 (BGL-1): resting stops are built but OFF: refused too, until the PM's switch-on after the drills."""
     if (s.params or {}).get("maker_wait_minutes"):
         raise ValueError(RESTING_OFF)
+    if (s.params or {}).get("resting_stops"):
+        raise ValueError(RESTING_STOPS_OFF)
 
 
 class Supervisor:
@@ -803,6 +813,7 @@ class Supervisor:
             self.store.event(name, "info", "settings_applied", "restarted to trade under the changed settings")
 
     def _stop(self, name: str, proc: Proc, why: str) -> None:
+        was = proc.popen is not None
         if proc.alive:
             proc.popen.send_signal(signal.SIGINT)
             try:
@@ -812,6 +823,14 @@ class Supervisor:
                 proc.popen.wait()
         proc.popen, proc.holds, proc.watched = None, None, False
         self.store.event(name, "info", "process_stop", why)
+        if was:
+            self._owner_down(name, "stop")
+
+    def _owner_down(self, name: str, how: str) -> None:
+        """ORPHAN-GUARD og2: a gated strategy's process went down, so its resting entries are the supervisor's to
+        cancel (orphan_guard.supervisor_pass) until its restart reconciles them."""
+        if self.store.portfolio_gate:
+            orphan_guard.owner_down(self.store, name, utcnow(), how)
 
     def reset_pending(self) -> None:
         """Carry each PM reset forward (5 Oct 2026): a strategy still holding is flattened first (a PM flatten,
@@ -826,6 +845,13 @@ class Supervisor:
                 # carried out now, it would put the liquidation away unanswered (U27, QA P1-U33, P1-D24). It is
                 # closed unrun, its flatten and start taken back, and the halt waits for Reset after liquidation.
                 self.store.refuse_reset(req, liquidation.REFUSAL)
+                self._undo_reset_start(req)
+                continue
+            self._settle_ended_sandbox(name)  # CR MUST 2: a stopped paper process's cancels can't be answered
+            if self.store.open_cancels(name):
+                # F241-3: the reset would put the cancel away with the run (split_run) and lift the fresh run's entry
+                # block while its order may still be resting, or fill.
+                self.store.refuse_reset(req, OPEN_CANCEL_REFUSAL)
                 self._undo_reset_start(req)
                 continue
             s = self.store.sleeve(name)
@@ -848,7 +874,20 @@ class Supervisor:
                                  "run put away")
             self._stop(name, self.procs.setdefault(name, Proc()), "reset by PM")
             self.store.drop_pending(name, "lapsed: the strategy was reset")
-            run = self.store.split_run(req, dust_ok=dust)
+            try:
+                run = self.store.split_run(req, dust_ok=dust)
+            except ValueError:
+                if not self.store.open_cancels(name):
+                    raise
+                # F241-4: its process asked for a cancel after the check above and before it was stopped. split_run
+                # changed nothing. Now stopped, a paper process's cancels are settled (CR MUST 2) and the reset runs;
+                # otherwise refused as above, and the process starts again if it was running.
+                self._settle_ended_sandbox(name)
+                if self.store.open_cancels(name):
+                    self.store.refuse_reset(req, OPEN_CANCEL_REFUSAL)
+                    self._undo_reset_start(req)
+                    continue
+                run = self.store.split_run(req, dust_ok=dust)
             self.store.set_desired_state(name, "running" if req["restart"] else "stopped")
             self.store.decide("system", "reset", f"Started afresh at {s.starting_balance:,.0f}; the run before is "
                               f"kept as {run} under Previous book", name)
@@ -856,6 +895,32 @@ class Supervisor:
                              f"{run}; starting again at {s.starting_balance:,.0f}")
             if s.params.get("demo_mirror"):
                 self.store.queue_resync(name, f"Reset strategy: {req['reason']}")
+
+    def _settle_ended_sandbox(self, name: str) -> None:
+        """CR MUST 2 (HoE ruling, CR option 1, 15 Oct): on the simulated paper client the venue lived in the strategy's
+        process, so once that process is proved gone (none of ours alive, its single-instance lock taken, as
+        close_dead_orders proves it) nothing will ever answer its cancels: they are settled as sandbox_ended
+        (orphan_guard.sandbox_gone). With the exchange order client on (any mode exec_target doesn't read as off) a
+        real venue's cancel is the venue's to answer, so nothing settles here. It never starts the strategy."""
+        from sleeve_fund import exec_target
+        from sleeve_fund.paper.single_lock import instance_lock
+
+        if not self.store.portfolio_gate or exec_target.read(os.environ) is not None:
+            return
+        if not (self.store.open_cancels(name) or orphan_guard.gated_open(self.store, name)):
+            return
+        if self.store.account_of(name) != "paper":
+            return
+        runner = name.split("~", 1)[0]  # a leg is traded by its Strategy's own process
+        if self.procs.get(runner, Proc()).alive or self.procs.get(name, Proc()).alive:
+            return
+        lock = instance_lock(runner)
+        if lock is None:  # a live process holds it: not proved gone
+            return
+        try:
+            orphan_guard.sandbox_gone(self.store, name, utcnow())
+        finally:
+            lock.close()
 
     def _undo_reset_start(self, req: dict) -> None:
         """A reset refused after its first pass has already queued its flatten and, for a strategy the PM had
@@ -892,6 +957,7 @@ class Supervisor:
                     # not a crash of it. Its refusal is journalled (duplicate_refused); tried again after the backoff,
                     # and it takes over once that process is gone.
                     continue
+                self._owner_down(sleeve.name, f"crash, exit code {code}")
                 if sleeve.status in ("paused", "halted"):
                     # A crash must not lift a pause or a halt: the status (and a pause's end time) stays, and
                     # the restarted process keeps it (review round 10, B10-3). The crash is in the events.
@@ -1299,6 +1365,11 @@ class Supervisor:
                 self.mark_portfolio()
             except Exception as exc:  # keep supervising; the dashboard shows the error
                 self.store.event(None, "error", "supervisor_error", repr(exc))
+            if self.store.portfolio_gate:
+                try:  # its own try: a failed mark or step never skips the orphan pass, nor the reverse
+                    orphan_guard.supervisor_pass(self.store, utcnow())
+                except Exception as exc:  # noqa: BLE001 - resting_block still fails closed on the strategy's side
+                    self.store.event(None, "error", "orphan_guard_error", repr(exc))
             time.sleep(POLL_SECONDS)
         for name, proc in self.procs.items():
             self._stop(name, proc, "supervisor shutting down")

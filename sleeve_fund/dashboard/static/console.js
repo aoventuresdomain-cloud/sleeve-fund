@@ -924,11 +924,37 @@ window.Console = (() => {
     });
   }
 
+  // A test model (A-19) carries the PM's settings for it on its option (data-prefill): choosing it fills them in, the
+  // market, shorts, candle length, risk profile, stop and target, and its own fields; the demo copy stays unticked.
+  function applyPrefill(form, opt) {
+    if (!opt || !opt.dataset.prefill) return;
+    const set = JSON.parse(opt.dataset.prefill);
+    for (const [name, value] of Object.entries(set)) {
+      const el = form.elements[name];
+      if (!el) continue;
+      if (el instanceof RadioNodeList || (el.length && !el.tagName)) {
+        [...el].forEach((r) => { r.checked = r.value === value; });
+      } else if (el.type === "checkbox") {
+        el.checked = value === "1";
+      } else {
+        el.value = value;
+      }
+    }
+    if (form.elements.demo_mirror) form.elements.demo_mirror.checked = false;
+    const kinds = {stop: "stop_loss_pct", tp: "take_profit_pct"};
+    for (const [k, field] of Object.entries(kinds)) {
+      const pick = form.querySelector(`[data-kind=${k}]`);
+      if (pick && field in set) { pick.value = "pct"; pick.dispatchEvent(new Event("change", {bubbles: true})); }
+    }
+    ["market", "risk_profile"].forEach((n) => form.elements[n]?.dispatchEvent(new Event("change", {bubbles: true})));
+  }
+
   // New-sleeve form: show the chosen strategy's settings, keep a plain-English summary.
   function sleeveForm() {
     const form = document.getElementById("sleeve-form");
     if (!form) return;
     const $ = (n) => form.elements[n];
+    $("strategy").addEventListener("change", () => applyPrefill(form, $("strategy").selectedOptions[0]));
     const pct = (x) => `${(x * 100).toFixed(0)}%`;
     const sync = () => {
       const strat = $("strategy").value;
@@ -940,6 +966,10 @@ window.Console = (() => {
         desc.textContent = fillSummary(desc.dataset.tpl, vals);
       }
       const opt = $("strategy").selectedOptions[0];
+      // A test model is created stopped (A-19): every copy of the submit button (the wizard's too) says so.
+      form.querySelectorAll("button[data-label]").forEach((b) => {
+        b.textContent = opt && opt.dataset.prefill ? b.dataset.testLabel : b.dataset.label;
+      });
       // A G1 pass holds for the instrument and bar length it was tested on, nothing else.
       const minutes = {MINUTE: 1, HOUR: 60, DAY: 1440};
       const bar = form.querySelector("input[name=bar_spec]:checked, input[type=hidden][name=bar_spec], input[name=bar_spec_shown]:checked");
@@ -950,8 +980,9 @@ window.Console = (() => {
       const pair = ($("instrument").value || "").toUpperCase();
       const quote = pair.split("/")[1] || "";
       const cap = Number($("starting_balance").value || 0);
+      const held = $("starting_balance").type === "hidden";  // the fund holds the capital (CUT-A)
       const items = [
-        `Trade ${pair || "the instrument"} with ${money.format(cap)} ${quote} of simulated money, deciding on ${bar ? bar.parentElement.textContent.trim() : "1h"} candles.`,
+        `Trade ${pair || "the instrument"} ${held ? "sized from the fund's equity" : `with ${money.format(cap)} ${quote} of simulated money`}, deciding on ${bar ? bar.parentElement.textContent.trim() : "1h"} candles.`,
         `Use ${opt.textContent.split(" (")[0]}: ${desc ? desc.textContent : ""}`,
         (() => {
           const mk = form.elements.market ? form.elements.market.value : "spot";
@@ -959,7 +990,8 @@ window.Console = (() => {
           const shorts = form.elements.allow_short && form.elements.allow_short.checked;
           return `Trade the ${form.elements.market.selectedOptions[0].textContent.split(":")[0].toLowerCase()}, ${shorts ? "long and short" : "long only"}, with positions up to ${prof.lev}x its capital.`;
         })(),
-        `Pause for a day after losing ${pct(Number(prof.day))} in a day, and halt for your review at a ${pct(Number(prof.dd))} drawdown.`,
+        held ? "Pause and halt with the fund's own brakes, not on this Strategy's own losses."
+          : `Pause for a day after losing ${pct(Number(prof.day))} in a day, and halt for your review at a ${pct(Number(prof.dd))} drawdown.`,
       ];
       items.push(...exitFields(form)());
       if ($("execution").value === "maker") items.push(`Rest each signal order as a post-only limit for the maker fee, and send whatever hasn't filled after ${$("maker_wait_minutes").value || 15} minutes at market. Protective exits go at market.`);

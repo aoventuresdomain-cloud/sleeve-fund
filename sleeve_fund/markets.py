@@ -99,6 +99,16 @@ def terms(params: dict | None, venue: str | None = None, pair: str | None = None
     return LOW_FEE_PERP if m == PERP else VENUE_FEE_PERP
 
 
+def held_terms(params: dict | None, venue: str | None, pair: str | None) -> tuple[PerpTerms | None, bool]:
+    """terms() for a position the journal already holds, which a page reads and must never fail on: (its terms, True),
+    or, on a pair whose venue tiers aren't kept, its terms without the tiers and False: its liquidation is unknown
+    (CR MUST 1). New perps on such a pair are still refused (NoMaintenanceTable)."""
+    try:
+        return terms(params, venue, pair), True
+    except NoMaintenanceTable:
+        return terms(params, venue), False
+
+
 def native_terms(profile, pair: str | None = None) -> PerpTerms:
     """A perpetual venue's own terms: its fee schedule and spread (None: the venue's), the funding it settles,
     and, for `pair`, the venue's own maintenance tiers (VS-1; maintenance_for). None without a pair."""
@@ -128,8 +138,9 @@ def maintenance_for(profile, pair: str) -> tuple:
 
     table = profile.maintenance_tiers.get(_table_key(profile, pair))
     if not table:
-        raise NoMaintenanceTable(f"{pair} on {profile.label} has no maintenance table kept, so its liquidation price "
-                                 "is unknown: a perp on it is refused until the venue's published tiers are kept (VS-1)")
+        # No venue name: these words reach the create page and the start check (CR MUST 2).
+        raise NoMaintenanceTable(f"{pair} has no maintenance table kept, so its liquidation price is unknown: a perp "
+                                 "on it is refused until the venue's published tiers are kept (VS-1)")
     return tiers(table)
 
 

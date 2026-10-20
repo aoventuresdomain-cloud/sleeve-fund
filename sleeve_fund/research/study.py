@@ -134,6 +134,12 @@ class Fold:
     # Each counted trip's share of those gaps, as (opened, gap over its entry notional): what random entry charges
     # the strategy's own trip (Advisor ~02:55 UK, option A).
     trip_charges: list = field(default_factory=list)
+    # G5 research side: a strength-sized variant's counted trips as (opened, size factor f), from their entry orders
+    # (_trip_sizes); random entry sizes them and their draws by these. Empty for a flat version.
+    trip_sizes: list = field(default_factory=list)
+    # The sum over the test window's bars of |position notional / equity| (flat bars 0): its time-weighted gross
+    # exposure is this over window_bars (strength_report, Advisor G5-DW5 Q2).
+    gross_exposure: float = 0.0
 
     @property
     def closed_in_window(self) -> int:
@@ -801,6 +807,8 @@ def run_study(
                 absorbed=absorbed,
                 uncharged_returns=_uncharged(run, test_idx[0], bar) if absorbed else None,
                 trip_charges=_trip_charges(window_trips, test_idx[0] - bar, absorbed),
+                trip_sizes=_trip_sizes(window_trips, test_idx[0] - bar, run.fills, run.decisions),
+                gross_exposure=_gross_exposure(run.exposure, test_idx[0], test_idx[-1]),
             ),
             test_ret, b_ret, parts, run,
         )
@@ -1386,6 +1394,33 @@ def _trip_charges(trips: list[dict], test_start, absorbed: list[dict]) -> list[t
     return sorted(out.items())
 
 
+def _trip_sizes(trips: list[dict], test_start, fills: pd.DataFrame, decisions: dict) -> list[tuple]:
+    """G5: each counted trip's size factor f, from the signal of the order whose fill opened it, as (opened, f); a
+    trip whose entry carried none (a flat version) is left out, so it sizes at 1."""
+    if fills is None or fills.empty:
+        return []
+    start = _utc(test_start)
+    at = {}
+    for ts, oid in zip(fills["ts_last"], fills.index):
+        at.setdefault(_utc(ts), str(oid))
+    out = []
+    for t in trips:
+        if t["opened"] is None or t["closed"] is None or _utc(t["opened"]) < start:
+            continue
+        f = ((decisions.get(at.get(_utc(t["opened"])), {}) or {}).get("signal") or {}).get("size_factor")
+        if f is not None:
+            out.append((_utc(t["opened"]), float(f)))
+    return out
+
+
+def _gross_exposure(exposure: pd.Series, first, last) -> float:
+    """The sum of |exposure| over the bars from first to last, inclusive: flat bars add 0."""
+    if exposure is None or exposure.empty:
+        return 0.0
+    idx = exposure.index
+    return float(exposure[(idx >= first) & (idx <= last)].abs().sum())
+
+
 def _in_market_bars(exposure: pd.Series, first, last) -> int:
     """The bars from first to last, inclusive, that closed holding a position of any size or side."""
     if exposure is None or exposure.empty:
@@ -1418,13 +1453,15 @@ def _benchmarks(prices: pd.DataFrame, folds: list[Fold], test_bars: int, taker: 
         windows.append((start, end))
         last = start
         charges = dict(getattr(f, "trip_charges", []) or []) if charged else {}
+        sizes = dict(getattr(f, "trip_sizes", []) or [])
         for opened, closed, side in sorted(f.trips):
             entry = max(bar(opened), last)  # one position at a time on the bar grid too
             out = min(max(bar(closed), entry + 1), end)
             if out <= entry:
                 continue
             perp = f.chosen.get("market", market) == PERP
-            placed.append(Trade(entry, out, side, leverage=leverage if perp else None, charge=charges.get(opened, 0.0)))
+            placed.append(Trade(entry, out, side, leverage=leverage if perp else None, charge=charges.get(opened, 0.0),
+                                size=sizes.get(opened, 1.0)))
             last = out
     closes = prices["close"].to_numpy(dtype=float)
     bars = sum(f.window_bars for f in folds)

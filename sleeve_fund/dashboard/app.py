@@ -54,7 +54,16 @@ from sleeve_fund.research.ledger import IdeaLedger, opened_words
 from sleeve_fund.research.holdout import HoldoutLocks
 from sleeve_fund.research.trials import TrialsRegister
 from sleeve_fund.risk import PROFILES, leverage_cap
-from sleeve_fund.store import BACKTEST_PREFIX, HALT_FLATTEN, LIQUIDATION_RESET, RAL, Store, is_backtest, utcnow
+from sleeve_fund.store import (
+    BACKTEST_PREFIX,
+    HALT_FLATTEN,
+    LIQUIDATION_RESET,
+    RAL,
+    Store,
+    _fund_held,
+    is_backtest,
+    utcnow,
+)
 from sleeve_fund.paper.runtime import (EXITS_ONLY, RESUMABLE, clearing_action, entry_blocked, liquidation_event,
                                       pair_ral_figures)
 from sleeve_fund.strategies import REGISTRY, check_perp_sizing, check_perp_stop
@@ -464,14 +473,20 @@ def create_app(store: Store | None = None) -> FastAPI:
         from sleeve_fund.dashboard import pipeline
 
         g1 = {r["name"]: "|".join(r["passed_on"]) for r in pipeline.strategies(TEARSHEETS, st().sleeves())}
-        chosen = strategy if strategy in REGISTRY else "trend_filter"
+        choices = _strategy_choices(tests=True)
+        chosen = strategy if strategy in {c["name"] for c in choices} else "trend_filter"
         try:
             hints = _hints(request.query_params.get("venue"))
         except ValueError:
             hints = _hints()
-        return page(request, "new_sleeve.html", strategies=_strategy_choices(), instruments=hints,
+        pre = dict(request.query_params)
+        # A test model picked afresh opens with the PM's settings for it; a clone or a refused form keeps its own
+        # (F-A19-1: a clone with shorts off and no target must not come back with them filled in).
+        if chosen in TEST_PREFILL and not error and pre.get("from") != "clone":
+            pre = {**TEST_PREFILL[chosen], **pre}
+        return page(request, "new_sleeve.html", strategies=choices, instruments=hints,
                     bar_specs=sorted(ALLOWED_BAR_SPECS, key=spec_minutes), profiles=PROFILES, error=error, g1=g1, chosen=chosen,
-                    pre=dict(request.query_params), accounts=st().accounts(), costs=exit_costs())
+                    pre=pre, accounts=st().accounts(), costs=exit_costs(), fund_held=_fund_held(st()))
 
     @app.post("/sleeves/new")
     async def new_sleeve(request: Request, actor: str = Depends(require_pm), _o: None = Depends(same_origin)):
@@ -522,7 +537,7 @@ def create_app(store: Store | None = None) -> FastAPI:
             _saved("strategy", st().create_sleeve, name=name, strategy=strategy, instrument=cfg.instrument,
                    bar_spec=cfg.bar_spec, starting_balance=cfg.starting_balance, params=params,
                    risk_profile=cfg.risk_profile, warmup_bars=cfg.warmup_bars, venue=to_store_kwargs(cfg)["venue"],
-                   trial=trial)
+                   trial=trial, **({"desired_state": "stopped"} if strategy in TEST_PREFILL else {}))
             st().assign_account(name, account)
             st().decide(actor, "create", reason, name)
             _uncounted_event(st(), name, f"strategy {name}", uncounted)
@@ -1738,7 +1753,10 @@ def create_app(store: Store | None = None) -> FastAPI:
         mirror = setup_view.mirror_state(st(), sleeves)
         here = setup_view.stage(frame, sleeves, mirror)
         accounts = _accounts_rows()
+        from sleeve_fund.dashboard import fee_terms
+
         return page(request, "setup.html", profiles=PROFILES, venues=VENUES.values(), fee_quotes=fee_quotes,
+                    fee_terms=fee_terms.view(st(), utcnow()),
                     tearsheets=str(TEARSHEETS), counts=st().table_sizes(), accounts=accounts,
                     error=error, pre=dict(request.query_params), shell=frame,
                     steps=setup_view.path(here), stage_n=here, next_words=setup_view.NEXT[here], mirror=mirror,
@@ -2424,16 +2442,38 @@ def _bar_label(spec: str) -> str:
     return f"{step} {unit} ({how})"
 
 
-def _strategy_choices() -> list[dict]:
+# A-19 (PM's go, 15 Oct): the New Strategy form offers the test models (family "test") in a "Test" group of their own,
+# apart from the Strategies; every other unlisted model stays off the form. Choosing one fills in the PM's settings for
+# it. Each is a normal Strategy in the fund once created: stopped until the PM starts it, every compliance test on.
+TEST_FAMILY = "test"
+TEST_PREFILL = {
+    "candle_step": {"market": "perp", "allow_short": "1", "bar_spec": "1-MINUTE-LAST-INTERNAL",
+                    "risk_profile": "balanced", "stop_loss_pct": "0.1", "take_profit_pct": "0.1",
+                    "p_candle_step__size_share": "60", "p_candle_step__run_for_hours": ""},
+}
+# A test model's own fields: (setting, label, placeholder, hint). A setting in PERCENT_PARAMS is entered as a % and
+# stored as a fraction (60 -> 0.6).
+TEST_FIELDS = {
+    "candle_step": (("size_share", "Size share, % of fund equity", "60", "Each cycle's size, from the fund's equity."),
+                    ("run_for_hours", "Run for, hours", "Until stopped", "Empty runs it until you stop it.")),
+}
+PERCENT_PARAMS = {"candle_step": {"size_share"}}
+
+
+def _strategy_choices(tests: bool = False) -> list[dict]:
+    """The models the form offers: the listed Strategies, and with `tests` the test models (group "Test")."""
     import importlib
 
     out = []
     for name in sorted(REGISTRY):
         spec = importlib.import_module(f"sleeve_fund.strategies.{name}").SPEC
-        if not spec.listed:
+        test = tests and not spec.listed and spec.family == TEST_FAMILY
+        if not spec.listed and not test:
             continue
-        out.append({"name": name, "idea": _idea(name), "params": spec.default_params, "family": spec.family,
-                    "tpl": spec.summary, "defaults": _config_defaults(name)})
+        out.append({"name": name, "idea": _idea(name), "params": {} if test else spec.default_params,
+                    "family": spec.family, "tpl": spec.summary, "defaults": _config_defaults(name),
+                    "group": "Test" if test else "Strategies", "prefill": TEST_PREFILL.get(name) if test else None,
+                    "fields": TEST_FIELDS.get(name, ()) if test else ()})
     return out
 
 
@@ -2523,7 +2563,8 @@ def _clone_qs(s) -> str:
          **_market_form(s.params), **({"venue": s.venue.lower()} if s.venue else {})}
     if "maker_wait_minutes" in params:
         q.update(execution="maker", maker_wait_minutes=params.pop("maker_wait_minutes"))
-    q.update({f"p_{s.strategy}__{k}": v for k, v in params.items()})
+    shown = PERCENT_PARAMS.get(s.strategy, set())  # back as the % the form takes
+    q.update({f"p_{s.strategy}__{k}": f"{float(v) * 100:g}" if k in shown else v for k, v in params.items()})
     return urlencode(q)
 
 
@@ -2569,6 +2610,17 @@ def _form_params(form, strategy: str) -> dict:
     if unknown:
         raise ValueError(f"{', '.join(unknown)}: unknown setting for the {strategy.replace('_', ' ')} model; it "
                          "can't be honoured here, so nothing was run")
+    for key in PERCENT_PARAMS.get(strategy, ()):  # entered as a %, stored as a fraction
+        if key in params:
+            share = float(params[key])
+            if not (math.isfinite(share) and 0 < share <= 100):
+                raise ValueError(f"{key.replace('_', ' ')}: a % of fund equity above 0 and at most 100")
+            params[key] = round(share / 100, 6)
+            if params[key] <= 0:  # too small to store: refuse it here, not when the PM starts it
+                raise ValueError(f"{key.replace('_', ' ')}: a % of fund equity above 0 and at most 100")
+    hours = float(params["run_for_hours"]) if "run_for_hours" in params else None
+    if hours is not None and not (math.isfinite(hours) and hours > 0):  # F-A19-2: "inf" is no number of hours
+        raise ValueError("run for hours: more than 0, or leave it empty to run until stopped")
     market = str(form.get("market", "") or markets.SPOT)
     if market not in markets.MARKETS:
         raise ValueError(f"market: one of {', '.join(markets.MARKETS)}")

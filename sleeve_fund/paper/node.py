@@ -173,10 +173,18 @@ def hub_address(venue: str, environ=None) -> tuple[str, int] | None:
     return host, int(port)
 
 
+def assert_exec_off() -> None:
+    """EXEC-CLIENT ships OFF: every paper node is on the simulated client (exec_client.assert_off)."""
+    from sleeve_fund.paper.exec_client import assert_off
+
+    assert_off(os.environ)
+
+
 def build_node(sleeve: SleeveConfig, log_level: str = "INFO", runtime: SleeveRuntime | None = None,
                asset_fetch=None, recorder=None, history=None, hub: tuple[str, int] | None = None) -> LiveNode:
     """hub: (host, port) of the venue's market data hub; by default HUB_<VENUE> (hub_address)."""
     assert_keyless()
+    assert_exec_off()
     tag = _tag(sleeve.name)
     profile = venue_profile(sleeve.venue)
     # P2-4: the strategy's one venue and its paper account; paper only until G2, so route() refuses any other kind.
@@ -207,6 +215,8 @@ def build_node(sleeve: SleeveConfig, log_level: str = "INFO", runtime: SleeveRun
     fee_model = ScheduleFeeModel(sleeve.fees)
     perp = markets.is_perp(sleeve.params)
     balances = _balances(sleeve, runtime, base_code, quote_code)
+    exec_factory = SandboxExecutionClientFactory()
+    _in_process(exec_factory, (runtime,))
     node = (
         LiveNode.builder(f"PAPER-{tag}", TraderId.from_str(f"PAPER-{tag[:20]}"), Environment.SANDBOX)
         .with_logging(LoggerConfig(stdout_level=getattr(LogLevel, log_level)))
@@ -214,7 +224,7 @@ def build_node(sleeve: SleeveConfig, log_level: str = "INFO", runtime: SleeveRun
         # The hub may take a minute to pick up an instrument it doesn't relay yet.
         .with_timeout_connection(120 if hub is not None else 60)
         .add_data_client("HUB" if hub is not None else None, data_factory, data_config)
-        .add_simulated_exec_client(profile.name, SandboxExecutionClientFactory(),
+        .add_simulated_exec_client(profile.name, exec_factory,
                                    _sandbox(venue, balances, route.account_id, perp, fee_model, hub))
         .build()
     )
@@ -255,6 +265,7 @@ def build_two_leg_node(lead: SleeveConfig, follow: SleeveConfig, log_level: str 
     from sleeve_fund.strategies.pair import LegFollower, Pair
 
     assert_keyless()
+    assert_exec_off()
     profile = venue_profile(lead.venue)
     if venue_profile(follow.venue).name != profile.name:
         raise ValueError(f"a two-leg Strategy's legs trade on one venue, not {lead.venue} and {follow.venue}")
@@ -298,8 +309,10 @@ def build_two_leg_node(lead: SleeveConfig, follow: SleeveConfig, log_level: str 
         .with_timeout_connection(120)
         .add_data_client("HUB", HubDataClientFactory(), data_config)
     )
+    exec_factory = SandboxExecutionClientFactory()
+    _in_process(exec_factory, runtimes)
     for name, _, config in accounts:
-        builder = builder.add_simulated_exec_client(name, SandboxExecutionClientFactory(), config)
+        builder = builder.add_simulated_exec_client(name, exec_factory, config)
     node = builder.build()
     legs = []
     for sleeve, runtime, iid, classes, status, (_, fee_model, _) in (
@@ -329,6 +342,7 @@ def build_legs_node(legs: list[SleeveConfig], log_level: str = "INFO",
     from sleeve_fund.research.portfolio import clone_venue
 
     assert_keyless()
+    assert_exec_off()
     if len(legs) < 2:
         raise ValueError("a multi-asset Strategy has at least two legs")
     runtimes = list(runtimes or [None] * len(legs))
@@ -374,8 +388,10 @@ def build_legs_node(legs: list[SleeveConfig], log_level: str = "INFO",
         .with_timeout_connection(120)
         .add_data_client("HUB", HubDataClientFactory(), data_config)
     )
+    exec_factory = SandboxExecutionClientFactory()
+    _in_process(exec_factory, runtimes)
     for name, _, config in accounts:
-        builder = builder.add_simulated_exec_client(name, SandboxExecutionClientFactory(), config)
+        builder = builder.add_simulated_exec_client(name, exec_factory, config)
     node = builder.build()
     from sleeve_fund.paper.leg_batch import LegBatch
 
@@ -427,6 +443,16 @@ def _balances(sleeve: SleeveConfig, runtime: SleeveRuntime | None, base_code: st
             if book["qty"] > 0:
                 balances.append(Money(book["qty"], Currency.from_str(base_code)))
     return balances
+
+
+def _in_process(exec_factory, runtimes) -> None:
+    """ORPHAN-GUARD: the venue's type, not a setting, says it runs inside this process (orphan_guard.in_process_kind),
+    so a restart may end the orders it left; every journal the node writes is told."""
+    from sleeve_fund.paper.orphan_guard import in_process_kind
+
+    for runtime in runtimes or ():
+        if runtime is not None:
+            runtime.in_process_venue = in_process_kind(exec_factory)
 
 
 def _sandbox(venue, balances: list[Money], account_id: str, perp: bool, fee_model,
@@ -542,7 +568,9 @@ def main(argv: list[str] | None = None) -> int:
         from sleeve_fund.paper.single_lock import INSTANCE_LOCK, duplicate_refused, instance_lock
 
         # One process per strategy (SINGLE-LOCK, Advisor 13 Oct 18:10 UK): a second one would double its orders and
-        # positions, so it stops here, before it connects to market data or the venue. Held for the process's life.
+        # positions, so it stops here, before it connects to market data or the venue. Held for the process's life: a
+        # restart may also release what the process before it left only once that one is gone (17:55), which a free
+        # lock proves.
         lock = instance_lock(args.db_sleeve)
         if lock is None:
             return duplicate_refused(store, args.db_sleeve)
@@ -591,6 +619,8 @@ def main(argv: list[str] | None = None) -> int:
                         "venue's live prices; funding every 8 hours from our own ledger")
         (sleeve, runtime), leg = configs[0], (configs[1] if second is not None else None)
         many = configs if assets else None
+        for _, r in configs:  # this process holds the lock for every leg it runs: the supervisor starts none of them
+            r.instance_lock, r.sole_instance = lock, True
     else:
         sleeve = load_sleeve(args.sleeve)
         check_perp_sizing(sleeve.strategy, sleeve.params)  # a strategy in the store is refused by the supervisor

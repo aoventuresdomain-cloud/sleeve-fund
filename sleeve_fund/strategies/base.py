@@ -14,6 +14,7 @@ import heapq
 import math
 import os
 import re
+import threading
 import time
 import traceback
 from collections import deque
@@ -146,6 +147,10 @@ STALE_AT_START = "no trade or quote yet since this process started. It clears wh
 # does, so a block's cancel goes out within it: a resting entry fills on at most a print inside it, never past 1 s.
 GATE_WATCH_SECONDS = 0.5
 GATE_WATCH = "entry-gate-watch"
+# A3: how often the engine looks whether the journal pushed a decision (Store.decide's NOTIFY, on Postgres): a flag
+# set by the listener thread, read on the engine's own thread, so the cancel goes out within this of the Stop.
+GATE_PUSH_SECONDS = 0.025
+GATE_PUSH = "entry-gate-push"
 STALE_PRICE_RESTART_MINUTES = 15
 # Paper: how often at most the model's conditions on the forming candle are written for the Signals tab
 # (and straight after each bar). Display only: never in a backtest.
@@ -318,6 +323,27 @@ def exit_warmup(params: dict) -> int:
     return int(params.get("stop_swing_bars") or 0)
 
 
+def listen_gate(dsn: str, name: str, pushed: threading.Event, done: threading.Event) -> None:
+    """A3: LISTEN on the journal's GATE_CHANNEL until `done`; set `pushed` for every decision on Strategy `name`. Runs
+    on its own thread and never touches the engine. A dropped connection is retried; the gate read covers the gap."""
+    import psycopg
+
+    from sleeve_fund.store import GATE_ALL, GATE_CHANNEL
+
+    while not done.is_set():
+        try:
+            with psycopg.connect(dsn, autocommit=True) as conn:
+                conn.execute(f"LISTEN {GATE_CHANNEL}")
+                pushed.set()  # anything decided while it wasn't listening is read once
+                while not done.is_set():
+                    for note in conn.notifies(timeout=1.0):
+                        # its own name, its parent's (an asset or second leg's process), or the fund's
+                        if note.payload in (name, name.split("~")[0], GATE_ALL):
+                            pushed.set()
+        except Exception:  # noqa: BLE001 - the gate read every GATE_WATCH_SECONDS still cancels; try again shortly
+            done.wait(5)
+
+
 class LongFlatConfig(StrategyConfig):
     def __init__(
         self,
@@ -339,6 +365,9 @@ class LongFlatConfig(StrategyConfig):
         position_cap_pct: float | None = None,
         rebalance_band: float | None = None,
         maker_wait_minutes: int | None = None,
+        resting_stops: bool = False,
+        backstop_grace_ms: int = 1000,
+        raced_fill_window_ms: int | None = None,
         max_participation: float | None = MAX_PARTICIPATION,
         volume_scale: float = 1.0,
         market: str = markets.SPOT,
@@ -486,6 +515,20 @@ class LongFlatConfig(StrategyConfig):
         # and rebalances first rest as a post-only limit one tick inside the last price (maker fee
         # if filled); whatever is unfilled after this many minutes is cancelled and sent at market.
         self.maker_wait_minutes = maker_wait_minutes
+        # A1 (BGL-1): paper rests the stop at the venue as a reduce-only order, as a backtest does, and keeps watching
+        # it in the process as a backstop. Built OFF: the supervisor refuses it until the test-network drills pass.
+        self.resting_stops = bool(resting_stops)
+        # A1 (Advisor b): with a stop resting, the watched level waits this long for the venue's stop to fill before it
+        # closes at market itself (none past half the way to liquidation, or for a stop the venue refused).
+        if int(backstop_grace_ms) != backstop_grace_ms or not 0 <= backstop_grace_ms <= 3_000:  # Advisor: 3 s at most
+            raise ValueError("backstop_grace_ms must be a whole number of milliseconds from 0 to 3,000")
+        self.backstop_grace_ms = int(backstop_grace_ms)
+        # A3: the longest a resting entry may still fill after a Stop with no push from the journal: the gate read's
+        # period (GATE_WATCH_SECONDS when unset), to be set to the test-network's cancel-latency p99.
+        if raced_fill_window_ms is not None and (int(raced_fill_window_ms) != raced_fill_window_ms
+                                                 or not 10 <= raced_fill_window_ms <= 5_000):
+            raise ValueError("raced_fill_window_ms must be a whole number of milliseconds from 10 to 5,000")
+        self.raced_fill_window_ms = raced_fill_window_ms
         # spot: a cash account, long or flat. perp / perp-venue-fees: a perpetual on margin, with funding,
         # a liquidation price and leverage limits (sleeve_fund.markets); allow_short lets it go short.
         self.market = market
@@ -678,6 +721,9 @@ class LongFlatStrategy(Strategy):
         self._pending_exit = None  # a sell waiting for every working order to close first
         self._sent: list = []  # client order ids of orders sent, until the venue has them (see _unsent)
         self._cancel_on_accept: set[str] = set()  # orders to cancel as soon as the venue has them
+        self._backstop_since: int | None = None  # A1: when the price first went through a resting stop's level
+        self._gate_pushed: threading.Event | None = None  # A3: set by the journal's push (_listen_gate)
+        self._gate_done = threading.Event()
         self._exec_type = None  # backtest: the shorter bars the decision bars are built from
         # Volumes of the last day's decision bars, for the participation cap on buys.
         self._volumes: deque[float] = deque(maxlen=max(1, 1440 // bar_minutes(config.bar_type)))
@@ -747,6 +793,7 @@ class LongFlatStrategy(Strategy):
         # once a UTC day: (day, Gate).
         self._ramp_on = ramp.enabled()
         self._ramp_day = None
+        self._strength_f = None  # G5: the last entry's size factor f, journaled as signal["size_factor"]
         # Paper/live on bars built from live trades: loads warm-up bars from the venue history store
         # (the venue can't serve those bars). Attach with attach_history(); None requests them from
         # the venue's candles instead.
@@ -837,7 +884,10 @@ class LongFlatStrategy(Strategy):
         if self.two_leg and config.market != markets.SPOT:
             self.leg_leverage = float(config.leg["leverage"])
         self._worst_px: float | None = None  # a backtest's worst price in the last bar, for the Pair's clamp
+        self._gtd_refused: str | None = None  # og1: the venue refused a good-till-date entry this run (its reason)
         self._paper_gate = None  # paper's portfolio gate (paper.portfolio_gate.PaperGate), made at its first entry
+        self._late_owed = False  # A2-DW4: a late fill's close may be owed (_send_late_closes)
+        self._late_sent: dict[str, int] = {}  # A2-DW4 MUST 3: each late close this process sent, and when (ns)
         # Exceptions raised in these handlers, oldest first, as (handler, repr). See _reporting.
         self.handler_errors: list[tuple[str, str]] = []
         self.handler_error_count = 0
@@ -1119,6 +1169,8 @@ class LongFlatStrategy(Strategy):
         if self.runtime is not None and not getattr(self.runtime, "backtest", False):  # before this process writes a heartbeat
             self._last_alive = self.runtime.store.sleeve(self.runtime.name).heartbeat_at
             self._last_seen = self.runtime.store.last_feed(self.runtime.name)  # its last market data
+        self._reconcile_resting()  # og3: before anything here can decide, let alone send, a new entry
+        self._late_owed = True  # A2-DW4: checked once the position is back at the venue (_on_tick)
         self.resume_cycle()  # before the warm-up, which decides the candles since on the model's own state
         self._plan_resume()
         if self.preload:
@@ -1733,8 +1785,16 @@ class LongFlatStrategy(Strategy):
         The journal still shows it, as the resting stop_loss order it stands for (P1-U35: a position is never shown
         unwatched): one open row while a position is held with a stop, replaced when the level or size changes, and
         cancelled when the position closes (a stop that fires sends its own market stop-loss, journaled as usual). A
-        backtest's stop is a real resting order (_rest_exits)."""
+        backtest's stop is a real resting order (_rest_exits), and so is paper's with resting stops on (A1): then the
+        venue order is the journal's row, placed, resized and moved here on every tick."""
         if self._backtest or self.runtime is None:
+            return
+        if self._resting_stops():
+            # Not while a market order is working: one part filled leaves a position the next fill may close or turn,
+            # and a reduce-only stop sized to the first part is refused (or rests on nothing) once it does.
+            if (self._restore is None and self._pending_exit is None
+                    and not any(o.order_type == OrderType.MARKET for o in self._working())):
+                self._rest_exits()
             return
         want = None
         if self._entry_px is not None and self._stop_frac is not None and self._entry_qty > 1e-12:
@@ -1762,6 +1822,47 @@ class LongFlatStrategy(Strategy):
                                ts=self.runtime.now())
             store.update_order(oid, status="accepted")
             self._watched = (oid, want)
+
+    def _backstop_waits(self, price: float, side: int) -> bool:
+        """A1 (Advisor b): the price has gone through the stop's level while a stop rests at the venue for it. The
+        watched backstop waits backstop_grace_ms for that stop to fill, so one stop sends one order, then closes what is
+        left at market (a part fill included). No wait for a stop the venue hasn't accepted, refused or lost, nor once
+        the price is more than half the way from the level to the liquidation price."""
+        if not self._resting_stops():
+            return False
+        order = self._resting_exits().get("stop_loss")
+        if order is None or order.status not in (OrderStatus.ACCEPTED, OrderStatus.TRIGGERED,
+                                                 OrderStatus.PARTIALLY_FILLED):
+            return False
+        if self._margin:
+            _, cash, qty, _ = self._mark()
+            liq = self._liq_now(cash, qty) if qty else None
+            level = order.trigger_price.as_double()
+            if liq is not None and side * (level - price) > abs(level - liq) / 2:
+                return False
+        now = self.clock.timestamp_ns()
+        if self._backstop_since is None:
+            self._backstop_since = now
+        return now - self._backstop_since < self._cfg.backstop_grace_ms * 1_000_000
+
+    def _benign_reject(self, event) -> bool:
+        """A1 (Advisor): a closing order refused because there is nothing left to close (a reduce-only order on a
+        position already flat, the backstop and the resting stop crossing). Journaled as benign: never one of F-RX-2's
+        refused closes in a row, never an alert."""
+        if self._backtest or self.runtime is None or self._pos_side() != 0:
+            return False
+        order = self.cache.order(event.client_order_id)
+        intent = self.decisions.get(str(event.client_order_id), {}).get("intent")
+        if order is None or not order.is_reduce_only or intent in (None, *OPENING_INTENTS):
+            return False
+        # Flat at the venue and in the journal both: a journal still holding where the venue has nothing to reduce is
+        # drift, not benign, and counts and alerts as any refused close (HoQA F-RX-1B-WRITER).
+        rt = self.runtime
+        return abs(float(rt.store.journal_book(rt.name, rt.starting_balance)["qty"])) < 1e-12
+
+    def _resting_stops(self) -> bool:
+        """A1: paper with resting stops on (off by default, and refused by the supervisor until the drills pass)."""
+        return not self._backtest and getattr(self._cfg, "resting_stops", False)
 
     def _exits_reason(self) -> str:
         if self._exits_why:
@@ -2474,6 +2575,8 @@ class LongFlatStrategy(Strategy):
                   "budget": round(float(budget), 2), **self._fund_at_entry(base)}
         if strength_words:
             signal["strength"] = strength_words
+            if self._strength_f is not None:  # G5 research side: the size factor, the same field in every engine
+                signal["size_factor"] = self._strength_f
         if ramp_gate is not None and size_by == ramp.LIMIT:  # with the size it would have had, for its track
             signal["ramp"] = ramp_gate.words
             signal[ramp.UNRAMPED] = round(float(min(v for k, v in limits.items() if k != ramp.LIMIT)), 2)
@@ -3306,8 +3409,13 @@ class LongFlatStrategy(Strategy):
         move = price / self._entry_px - 1
         gain = side * move  # what the position made: a short gains as the price falls
         hit = ("stop_loss" if stop is not None and gain <= -stop else "take_profit" if tp and gain >= tp else None)
+        if hit != "stop_loss":
+            self._backstop_since = None
         if hit is None:
             return False
+        if hit == "stop_loss" and self._backstop_waits(price, side):
+            return False
+        self._backstop_since = None
         self.log.info(f"{hit} at {price} ({move:+.2%} from entry {self._entry_px})")
         if self.runtime is not None:
             self.runtime.store.event(self.runtime.name, "info", hit, f"exit at {price:,.4f}, {move:+.2%} from entry",
@@ -3494,6 +3602,8 @@ class LongFlatStrategy(Strategy):
                   "budget": round(float(budget), 2), **self._fund_at_entry(base)}
         if strength_words:
             signal["strength"] = strength_words
+            if self._strength_f is not None:  # G5 research side: the size factor, the same field in every engine
+                signal["size_factor"] = self._strength_f
         if ramp_gate is not None and size_by == ramp.LIMIT:  # with the size it would have had, for its track
             signal["ramp"] = ramp_gate.words
             signal[ramp.UNRAMPED] = round(float(min(v for k, v in limits.items() if k != ramp.LIMIT)), 2)
@@ -3711,6 +3821,14 @@ class LongFlatStrategy(Strategy):
                   "taker": Decimal(repr(float(self._cfg.assumed_taker_fee)))}  # the exit's fee at the stop (FEE-LIVE)
         return signal, intent
 
+    @staticmethod
+    def _gtd_refusal(order, event) -> bool:
+        """og1: whether the venue refused a good-till-date order for its expiry (not for its price or size)."""
+        if order is None or order.time_in_force != TimeInForce.GTD:
+            return False
+        why = str(getattr(event, "reason", "") or "").lower().replace(" ", "").replace("-", "")
+        return any(w in why for w in ("gtd", "goodtilldate", "goodtill", "expire", "expiry"))
+
     def _resting_entry_terms(self):
         """ORPHAN-GUARD og1 for a resting entry on paper: good-till-date to its decision bar's next close, clamped past
         the venue's minimum lead on a short bar, or good-till-cancelled with the backstop note on a venue without it."""
@@ -3721,9 +3839,97 @@ class LongFlatStrategy(Strategy):
             lead = venue(str(self._cfg.instrument_id.venue)).gtd_min_lead
         except ValueError:  # a venue with no profile (a test's): no good-till-date assumed, the backstops cover it
             lead = None
+        if self._gtd_refused is not None:  # it refused one this run: good-till-cancelled from now on, and why
+            from sleeve_fund.paper.orphan_guard import NO_GTD_NOTE
+
+            return TimeInForce.GTC, None, f"{NO_GTD_NOTE}. The venue refused the good-till-date: {self._gtd_refused}"
         return resting_entry_order(gtd_supported=lead is not None, decision_close=_utc(self._deciding[0]),
                                    bar=timedelta(minutes=bar_minutes(self._cfg.bar_type)),
                                    now=_utc(self.clock.timestamp_ns()), min_lead=lead or timedelta(0))
+
+    def _reconcile_resting(self) -> None:
+        """ORPHAN-GUARD og3 at a paper start: the gated entries the journal still has open from before are settled
+        (orphan_guard.restart_reconcile): ended with the process before this one where the venue ran in it, asked to
+        cancel where the venue still has them, else held, blocking new entries, until the venue settles them."""
+        if not self._guarding():
+            return
+        from sleeve_fund.paper.orphan_guard import restart_reconcile
+
+        rt = self.runtime
+        venue_open = [str(o.client_order_id) for o in self.cache.orders_open(strategy_id=self.strategy_id)]
+        restart_reconcile(rt.store, rt.name, _utc(self.clock.timestamp_ns()), venue_open,
+                          send=lambda oid: self.cancel_order(self.cache.order(ClientOrderId(oid))),
+                          in_process=getattr(rt, "in_process_venue", None),
+                          sole_instance=getattr(rt, "sole_instance", None))
+
+    def _send_late_closes(self) -> None:
+        """A2-DW4 (HoE, 15 Oct: exactly one sender): this process sends its late fills' closes, journaled by it or by the
+        supervisor (orphan_guard.send_pending), each once, as reduce-only market exits under their journal id. Paper
+        with the gate only: a backtest has no resting-cancel race, so nothing here runs there."""
+        if not self._guarding() or self._restore is not None:
+            return  # a carried-over position goes back to the venue first, or a reduce-only close finds nothing
+        from sleeve_fund.paper.orphan_guard import send_pending, unflat
+
+        rt = self.runtime
+        sent = {str(o.client_order_id) for o in self.cache.orders(strategy_id=self.strategy_id)}
+        send_pending(rt.store, rt.name, _utc(self.clock.timestamp_ns()), self._submit_late_close, sent)
+        self._late_owed = bool(unflat(rt.store, rt.name))
+
+    def _submit_late_close(self, name: str, side: str, qty: Decimal, close_id: str, reason: str) -> None:
+        """One late fill's close (A2-DW4): a market exit, reduce-only on a perp so it never opens the other side, never
+        gated (_submit's CHOKE check is for orders that open or add). Its journal row is already written."""
+        order = self.order_factory.market(instrument_id=self._cfg.instrument_id,
+                                          order_side=OrderSide.BUY if side == "BUY" else OrderSide.SELL,
+                                          quantity=Quantity.from_decimal_dp(qty, self.instrument.size_precision),
+                                          time_in_force=TimeInForce.GTC, reduce_only=self._margin,
+                                          client_order_id=ClientOrderId(close_id))
+        self.decisions[close_id] = {"intent": "exit", "reason": reason, "signal": {"reduce_only": True}}
+        self._sent.append(order.client_order_id)
+        self._late_sent[close_id] = self.clock.timestamp_ns()
+        self.submit_order(order)
+
+    def _late_safety_due(self, price: float) -> str | None:
+        """A2-DW4 MUST 3 (Advisor's grace correction, 15 Oct): a late fill is never unprotected. Its close is an exit and
+        is never blocked; if it isn't filled within backstop_grace_ms (A1's, no constant of its own), or is refused or
+        unknown here, or the price is past half the way from the position's average entry to its liquidation, both as
+        they stand after the late fill (A2-REF, Advisor 15 Oct: never the pre-fill values), the safety stop goes on at
+        once. Returns why, or None. A filled close is forgotten; a refusal feeds F-RX-2 as any exit's does."""
+        now = self.clock.timestamp_ns()
+        for cid, at in list(self._late_sent.items()):
+            order = self.cache.order(ClientOrderId(cid))
+            if order is not None and order.status == OrderStatus.FILLED:
+                del self._late_sent[cid]
+                continue
+            if order is None or order.status in (OrderStatus.REJECTED, OrderStatus.DENIED):
+                return f"its late fill's close {cid} was refused or is unknown"
+            if self._margin and self._entry_px:
+                _, cash, qty, _ = self._mark()
+                liq = self._liq_now(cash, qty) if qty else None
+                side = self._entry_side or 1
+                if liq is not None and side * (self._entry_px - price) > abs(self._entry_px - liq) / 2:
+                    return f"the price is past half the way from its average entry to liquidation ({liq:,.6g})"
+            if now - at >= self._cfg.backstop_grace_ms * 1_000_000:
+                return f"its late fill's close {cid} wasn't filled within {self._cfg.backstop_grace_ms:,} ms"
+        return None
+
+    def _late_safety(self, price: float) -> None:
+        """MUST 3's action: the restart's safety stop (_place_safety_stop, at the next price in _check_exits) for the
+        late fill's position, with its incident. Entries stay blocked by the late fill anyway (resting_block)."""
+        if self._safety_stop or self._safety_pending is not None or not self._late_sent or price <= 0:
+            return
+        why = self._late_safety_due(price)
+        if why is None:
+            return
+        _, cash, qty, _ = self._mark()
+        if not qty:
+            return
+        self._safety_why = why
+        self._safety_stop, self._safety_pending = True, (cash, qty)
+
+    def _guarding(self) -> bool:
+        """ORPHAN-GUARD runs: paper with the portfolio gate, never a backtest, which has no resting-cancel race and
+        whose journal (MemoryJournal) holds no cancels."""
+        return not self._backtest and self._paper_gated() is not None
 
     def _paper_gated(self):
         """Paper with the portfolio gate in force (Store.portfolio_gate): the paper GateFn, made once; else None (a
@@ -3745,13 +3951,13 @@ class LongFlatStrategy(Strategy):
         before this close is cancelled (Advisor 8 Oct 06:10 UK: an entry never rests past the bar after the one it
         was decided on). The venue's confirmed cancel releases what is left of its reservation as 'cancel'; a
         part-filled one keeps what filled, with its stop. Until then it stays reserved, past the TTL (HoQA w1g)."""
-        if self._paper_gated() is None or not (found := self._resting_openers()):
+        if not self._guarding() or not (found := self._resting_openers()):
             return
-        from sleeve_fund.paper.portfolio_gate import resting_entries
+        from sleeve_fund.paper.orphan_guard import bar_close_cancel
 
         resting, kept = found
         rt = self.runtime
-        due = set(resting_entries(rt.store, rt.name, _utc(close_ns)))
+        due = set(bar_close_cancel(rt.store, rt.name, _utc(close_ns)))  # journalled: the answer settles it
         why = "cancelled at the next bar close: an entry never rests past the bar after it was decided"
         for order in resting:
             if str(order.client_order_id) in due:
@@ -3891,7 +4097,7 @@ class LongFlatStrategy(Strategy):
             self._sent.append(order.client_order_id)
             self.submit_order(order)
             if maker:
-                self._maker[coid] = {"intent": intent, "reason": reason, "signal": signal}
+                self._maker[coid] = {"intent": intent, "reason": reason, "signal": signal, "deciding": self._deciding}
         if self.runtime is not None and coid not in self._kept:
             self.runtime.on_timing(coid, sent=self.clock.timestamp_ns())
         if maker:
@@ -4100,6 +4306,10 @@ class LongFlatStrategy(Strategy):
     def _kept_closed(self, coid: str, kept: dict) -> None:
         if self.runtime is not None and kept["sent"] < kept["order"].quantity.as_decimal():
             self.runtime.on_order_status(coid, "canceled", kept["why"])
+            if self._guarding():
+                from sleeve_fund.paper.orphan_guard import order_ended
+
+                order_ended(self.runtime.store, coid, "canceled", _utc(self.clock.timestamp_ns()))
 
     def _slice_done(self, pid: str, unfilled: float = 0.0) -> None:
         """Paper: a slice closed. What it didn't fill (a denial, say) is the kept order's to send again."""
@@ -5641,6 +5851,7 @@ class LongFlatStrategy(Strategy):
         the Model's indicators have settled (A10), journaled, or a missing, NaN or out-of-range strength (journaled as
         an alert, never full size)."""
         cfg = self._cfg.signal_strength
+        self._strength_f = None
         if cfg is None:
             return None
         if values.get("step_qty") is not None:  # a stepped Model's later open: Q, already scaled at its first (F-G5-6)
@@ -5663,6 +5874,7 @@ class LongFlatStrategy(Strategy):
         own = [v for k, v in limits.items() if k in OWN_SIZE_LIMITS or k.endswith("risk profile cap")]
         configured = min(own) if own else min(limits.values())
         limits[strength.LIMIT] = configured * Decimal(repr(st.f))
+        self._strength_f = st.f
         return strength.words(st, float(configured) / base if base else 0.0)
 
     def _ramp_limit(self, limits: dict, side: int, held, price: Decimal) -> ramp.Gate | None:
@@ -5807,6 +6019,15 @@ class LongFlatStrategy(Strategy):
             # against the journal until it is, but the strategy is alive.
             self.runtime.store.heartbeat(self.runtime.name, self.runtime.now())
             return
+        if self._guarding():
+            from sleeve_fund.paper.orphan_guard import unsent
+
+            rt = self.runtime
+            if self._late_owed or unsent(rt.store, rt.name, {str(o.client_order_id)
+                                                              for o in self.cache.orders(strategy_id=self.strategy_id)}):
+                self._send_late_closes()
+            if self._late_sent:
+                self._late_safety(self._price())
         pair = getattr(self, "pair", None)
         if pair is not None and not pair.recovered:  # a two-leg Strategy's trade left open by a restart (P2-8, M3)
             pair.ready()
@@ -5922,14 +6143,47 @@ class LongFlatStrategy(Strategy):
         venue, so a block accepted between prints (a Stop) has its cancel sent within that time, not on the next print
         or tick: a slow feed can't widen the window in which a resting entry may still fill."""
         if GATE_WATCH not in self.clock.timer_names() and self._resting_openers():
-            self.clock.set_timer(GATE_WATCH, timedelta(seconds=GATE_WATCH_SECONDS), callback=self._on_gate_watch)
+            self.clock.set_timer(GATE_WATCH, timedelta(seconds=self._gate_watch_seconds()),
+                                 callback=self._on_gate_watch)
+            if self._listen_gate():
+                self.clock.set_timer(GATE_PUSH, timedelta(seconds=GATE_PUSH_SECONDS), callback=self._on_gate_push)
+
+    def _gate_watch_seconds(self) -> float:
+        ms = getattr(self._cfg, "raced_fill_window_ms", None)
+        return GATE_WATCH_SECONDS if ms is None else ms / 1000
+
+    def _listen_gate(self) -> bool:
+        """A3: paper on Postgres listens for the journal's pushes (Store.decide) on a thread of its own, which only sets
+        a flag; True while it does. The gate read every _gate_watch_seconds stays, for a push that is lost."""
+        if self._backtest or self.runtime is None:
+            return False
+        if abs(self.clock.timestamp_ns() - time.time_ns()) > 300 * 1_000_000_000:
+            return False  # a replay's simulated clock: no process to push to, and the gate read alone judges it
+        if self._gate_pushed is None:
+            url = getattr(getattr(self.runtime.store, "engine", None), "url", None)
+            if url is None or url.get_backend_name() != "postgresql":
+                return False
+            self._gate_pushed = threading.Event()
+            dsn = url.set(drivername="postgresql").render_as_string(hide_password=False)
+            threading.Thread(target=listen_gate, args=(dsn, self.runtime.name, self._gate_pushed, self._gate_done),
+                             name=f"gate-push-{self.runtime.name}", daemon=True).start()
+        return True
+
+    def _on_gate_push(self, event) -> None:
+        if self._gate_pushed is not None and self._gate_pushed.is_set():
+            self._gate_pushed.clear()
+            self._on_gate_watch(event)
+        elif not self._resting_openers() and GATE_PUSH in self.clock.timer_names():
+            self.clock.cancel_timer(GATE_PUSH)
 
     def _on_gate_watch(self, event) -> None:
         try:
             if self._resting_openers():
                 self._cancel_resting_entries()
-            elif GATE_WATCH in self.clock.timer_names():
-                self.clock.cancel_timer(GATE_WATCH)  # nothing opening rests: nothing to watch until one is accepted
+            else:  # nothing opening rests: nothing to watch until one is accepted
+                for name in (GATE_WATCH, GATE_PUSH):
+                    if name in self.clock.timer_names():
+                        self.clock.cancel_timer(name)
         except Exception as exc:  # never let bookkeeping kill the sleeve silently: counted, kept and journaled
             self._report("_on_gate_watch", exc)
 
@@ -6023,6 +6277,11 @@ class LongFlatStrategy(Strategy):
     def _order_status(self, event, status: str) -> None:
         if self.runtime is not None:
             self.runtime.on_order_status(str(event.client_order_id), status, str(getattr(event, "reason", "") or ""))
+            if status in ("canceled", "expired") and self._guarding():
+                from sleeve_fund.paper.orphan_guard import order_ended
+
+                # og6: the venue ended it, so the cancel journalled for it (if any) is settled, never left blocking
+                order_ended(self.runtime.store, str(event.client_order_id), status, _utc(int(event.ts_event)))
 
     def on_order_accepted(self, event) -> None:
         self._order_status(event, "accepted")
@@ -6052,7 +6311,10 @@ class LongFlatStrategy(Strategy):
             self.pair.order_closed(self, coid)
 
     def on_order_rejected(self, event) -> None:
-        self._order_status(event, "rejected")
+        if self._benign_reject(event):
+            self.runtime.on_benign_reject(str(event.client_order_id), str(getattr(event, "reason", "") or ""))
+        else:
+            self._order_status(event, "rejected")
         if str(event.client_order_id) == self._restore_id:
             self._restore_id = None  # sent again on the next price
             return
@@ -6064,6 +6326,19 @@ class LongFlatStrategy(Strategy):
                 and self._pending_exit is None):
             self._stop_rejected(coid, str(getattr(event, "reason", "") or ""))
         info = self._maker.pop(coid, None)
+        if info is not None and self._gtd_refusal(order, event):
+            # og1 (Advisor 13 Oct): the venue refused even the clamped expiry. The entry goes again through the gate,
+            # good-till-cancelled with the backstop note, never at market and never dropped for its expiry.
+            self._cancel_alert(coid)
+            self._gtd_refused = str(getattr(event, "reason", "") or "refused")
+            was, self._deciding = self._deciding, info.get("deciding")  # still its own decision bar's entry
+            try:
+                self._send_entry(order.side, order.quantity.as_decimal(), info["reason"], info["signal"],
+                                 what=info["intent"])
+            finally:
+                self._deciding = was
+            self._resume_exit(coid)
+            return
         if info is not None:  # e.g. the price moved and a post-only order would have taken liquidity
             self._cancel_alert(coid)
             if self._pending_exit is None:
@@ -6269,8 +6544,10 @@ class LongFlatStrategy(Strategy):
                     self._stop_frac, self._tp_frac, self._stop_basis = plan
             self._gated_fill(coid, qty, px)
         self._sync_watched_stop()  # an add or a partial close resizes the journal's stop in the same step (QA)
-        if self._backtest:
-            if opening and self._pending_exit is None:
+        rested = self._resting_stops() and getattr(self.cache.order(event.client_order_id), "order_type",
+                                                   None) == OrderType.STOP_MARKET  # A1: paper's resting stop filled
+        if self._backtest or rested:
+            if opening and self._pending_exit is None and self._backtest:
                 # On every entry fill, not only the last: a post-only entry can fill in slices through its
                 # maker wait, and paper guards each slice from its first trade (review round 9, M9-4).
                 self._rest_exits()
@@ -6299,6 +6576,8 @@ class LongFlatStrategy(Strategy):
                   if intrabar is not None and intrabar[2] else None)
             self.runtime.on_fill(side="BUY" if event.is_buy else "SELL", qty=qty, price=px, fee=fee,
                                  order_id=journal_id, trade_id=str(event.trade_id), ts=at)
+            if coid in self._reserved and self._guarding():
+                self._send_late_closes()  # A2-DW4: a gated entry filled; if late (its cancel raced it), close it now
             self.runtime.on_timing(journal_id, fill=int(event.ts_init), venue_ts=int(event.ts_event))
             self._flush_rebook(coid, at)
             if self._margin and self._liq_closing is not None:
@@ -6424,7 +6703,8 @@ class LongFlatStrategy(Strategy):
             level = self._entry_px * (1 - side * stop)
             orders.append((StopMarketOrder(
                 self.trader_id, self.strategy_id, cfg.instrument_id, self.order_factory.generate_client_order_id(),
-                exit_side, quantity, Price(level, self.instrument.price_precision), TriggerType.DEFAULT,
+                exit_side, quantity, Price(level, self.instrument.price_precision),
+                TriggerType.LAST_PRICE if self._resting_stops() else TriggerType.DEFAULT,  # A1: as the watched stop
                 TimeInForce.GTC, self._margin, False, UUID4(), now), "stop_loss", "STOP",
                 f"Stop-loss: resting {exit_word} at {level:,.6g}, {_from_entry(stop, side).replace(' the entry', '')} "
                 f"the {self._entry_px:,.6g} entry"
@@ -6634,7 +6914,7 @@ class LongFlatStrategy(Strategy):
 
     def _resize_if_due(self) -> None:
         """Backtests: an entry slice filled while an exit couldn't be resized; size it to the position now."""
-        if self._resize_due and self._backtest and self._pending_exit is None:
+        if self._resize_due and (self._backtest or self._resting_stops()) and self._pending_exit is None:
             self._resize_due = False
             self._rest_exits()
 
@@ -6654,6 +6934,8 @@ class LongFlatStrategy(Strategy):
             self.log.warning(f"no final mark on stop: {e}")
 
     def on_stop(self) -> None:
+        if (done := getattr(self, "_gate_done", None)) is not None:  # A3: stop the gate listener thread
+            done.set()
         self._drop_kept()
         for coid in list(self._maker):
             self._cancel_alert(coid)

@@ -29,8 +29,8 @@ Verdicts (Advisor 03:05 UK):
 
 With the journal (DATABASE_URL, which the hub container has), each traded pair also gets the venue data FEE-LIVE
 fetched (venue_terms_fetch, its last-known-good row) beside the engine's: "maint. tiers (fetched)" against the kept
-maintenance table, and "taker fee (fetched)" / "maker fee (fetched)" against the fees the engine charges
-(fees.resolve); an account's fetched rate is never printed, the log being public, only whether the engine's is
+maintenance table, and "taker fee (fetched)" / "maker fee (fetched)" against the fees paper charges on the pair
+(fees.resolve with the instrument and the fetch's account); an account's fetched rate is never printed, the log being public, only whether the engine's is
 equal, higher or lower (the published stand-in's rates print). A tier that differs, or an engine fee below the fetched one (paper cheaper than the venue), is a MUST;
 an engine fee above it is a FOLLOW-UP. Age as FEE-LIVE judges it: over 24 h FOLLOW-UP, over 72 h or never fetched
 MUST. The published stand-in, and a newer fetch that was refused, are FOLLOW-UPs that say so. It only reads them."""
@@ -197,6 +197,10 @@ def fetched_rows(store, name: str, pair: str, now: datetime) -> tuple[list[tuple
     def refused_since(kind: str, good: dict | None) -> str:
         last = store.latest_venue_fetch(name, kind, pair)
         if last and not last["ok"] and (good is None or last["id"] != good["id"]):
+            if kind == "fee":  # its reason can carry the account's rate, and this log is public (HoE 15:41 UK)
+                oob = str(last["reason"]).startswith("out of bounds")
+                return ("latest fetch not used: " + ("out of bounds (fee fetch refused, outside the published range)"
+                                                     if oob else "fee fetch refused (the venue's answer couldn't be used)"))
             return f"latest fetch not used: {last['reason']}"
         return ""
 
@@ -221,8 +225,9 @@ def fetched_rows(store, name: str, pair: str, now: datetime) -> tuple[list[tuple
         out[-1] = (*out[-1][:3], _worst(out[-1][3], "FOLLOW-UP"))
         said(term, why)
 
-    charged = fees.resolve(name.lower(), store).fees
     good = store.latest_good_venue_fetch(name, "fee", pair)
+    # What paper's fills on the pair are charged (its account's last-known-good rate), never the published VIP 0.
+    charged = fees.resolve(name.lower(), store, pair, now=now, account=good["account"] if good else None).fees
     why = refused_since("fee", good)
     for side in ("taker", "maker"):
         term, engine = f"{side} fee (fetched)", Decimal(str(getattr(charged, side)))
