@@ -13,6 +13,8 @@ from sqlalchemy import create_engine, text
 
 from sleeve_fund.store import Store
 
+# The venue as it is: conftest otherwise gives every pair a stand-in table, which hid this crash (team-learnings A1)
+pytestmark = [pytest.mark.no_maintenance_tables]
 PERP = {"market": "perp", "allow_short": True, "stop_loss": 0.02}
 PG = os.environ.get("TEST_DATABASE_URL")
 
@@ -61,7 +63,7 @@ def test_a_perp_with_no_kept_tiers_is_refused_in_words_and_the_others_still_star
     _fund(store)
     for name, pair in (("eth-perp", "ETH/USDT"), ("btc-perp", "BTC/USDT")):
         store.create_sleeve(name=name, strategy="ping_pong", instrument=pair, bar_spec="1-MINUTE-LAST-INTERNAL",
-                            starting_balance=0, params=PERP)
+                            starting_balance=0, params=PERP, venue="BINANCE")  # the paper venue that lists perps
         store.set_desired_state(name, "running")
 
     assert main(["--db-sleeve", "eth-perp"]) == 1  # refused, not a traceback
