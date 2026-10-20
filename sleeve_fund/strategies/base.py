@@ -3238,7 +3238,10 @@ class LongFlatStrategy(Strategy):
 
     def _on_bar(self, bar: Bar) -> None:
         self._snap_settlements(bar.ts_event, bar.close.as_double())
-        self._exit_backstop(bar)
+        try:
+            self._exit_backstop(bar)
+        except Exception:  # noqa: BLE001 - an alert never stands in the way of the bar's targets, stops and decision
+            self.log.error(f"exit backstop failed on the bar at {int(bar.ts_event)}\n{traceback.format_exc()}")
         self._finish_resume()  # warm-up bars asked of the venue that never came: resume without them
         self._resize_if_due()
         if self._exec_type is not None and bar.bar_type == self._exec_type:

@@ -253,3 +253,17 @@ def test_c9_c8_a_backtest_stop_left_open_by_a_precision_mismatch_raises_the_aler
     assert res.exposure.equals(off.exposure) and res.decisions == off.decisions
     assert ([(x["kind"], x["message"]) for x in res.journal.events_ if x["kind"] != EXIT_UNFILLED]
             == [(x["kind"], x["message"]) for x in off.journal.events_])
+
+
+def test_a_backstop_that_fails_never_stops_the_bars_trading(monkeypatch):
+    """CR2 F1: it runs first on each bar, so a failure in it (a store write, an odd bar) is logged and the bar's
+    targets, stops and decision go on as without it."""
+    def boom(self, bar):
+        raise RuntimeError("store down")
+
+    before = _backtest(DOWN)
+    monkeypatch.setattr(LongFlatStrategy, "_exit_backstop", boom)
+    after = _backtest(DOWN)
+    cols = ["side", "quantity", "filled_qty", "avg_px", "status", "type"]
+    assert len(after.fills) > 1 and after.fills[cols].equals(before.fills[cols]) and after.equity.equals(before.equity)
+    assert after.handler_error_count == before.handler_error_count == 0
