@@ -68,10 +68,9 @@ def journal_rows(store, members: Callable[[str], bool]) -> tuple[list[dict], lis
     return fills, funding
 
 
-def shadow(fills: list[dict], funding: list[dict], taker: Callable[[str, str], Decimal],
-           equity: Decimal) -> dict:
-    """Step B in shadow per venue account over journal rows (journal_rows). taker(venue, instrument): the venue's taker
-    fee, which every Strategy on that account pays. equity: the fund's equity, the residual's yardstick (§2.5).
+def shadow(fills: list[dict], funding: list[dict], taker: Callable[[str], Decimal], equity: Decimal) -> dict:
+    """Step B in shadow per venue account over journal rows (journal_rows). taker(strategy): the taker fee that
+    Strategy's fills are charged (its market's, from the venue's live terms), which must be one per account. equity: the fund's equity, the residual's yardstick (§2.5).
     Returns {venue: figures}, each as the backtest shadow reports it (research.portfolio_run.netting_shadow)."""
     out = {}
     venues = sorted({r["venue"] for r in fills if r["venue"]})
@@ -81,7 +80,7 @@ def shadow(fills: list[dict], funding: list[dict], taker: Callable[[str, str], D
     return out
 
 
-def _account(rows: list[dict], funding_rows: list[dict], venue: str, taker: Callable[[str, str], Decimal],
+def _account(rows: list[dict], funding_rows: list[dict], venue: str, taker: Callable[[str], Decimal],
              equity: Decimal) -> dict:
     fills: list[nt.Fill] = []
     marks: dict[tuple[str, int], Decimal] = {}
@@ -110,7 +109,7 @@ def _account(rows: list[dict], funding_rows: list[dict], venue: str, taker: Call
     def half(inst: str, ts: int) -> Decimal:
         return halves.get((inst, ts), ZERO)
 
-    rates = {taker(venue, i) for i in {f.instrument for f in fills}}
+    rates = {taker(name) for name in {f.strategy for f in fills}}
     if len(rates) > 1:
         raise ValueError(f"netting shadow on {venue}: the Strategies on one account must pay the same taker fee")
     rate = next(iter(rates)) if rates else ZERO

@@ -16,7 +16,7 @@ from sleeve_fund.store import Store
 TAKER = D("0.00055")
 T1 = datetime(2026, 10, 20, 12, 0, tzinfo=timezone.utc)  # a decision bar's close
 T2 = T1 + timedelta(minutes=1)
-INST = "BTC/USDT-PERP"
+INST = "BTC/USDT"
 
 
 def _ns(t):
@@ -41,7 +41,7 @@ def store(request):
         store = Store(engine=engine)
     for name in ("a", "b", "c"):
         store.create_sleeve(name=name, strategy="ping_pong", instrument=INST, bar_spec="1-MINUTE-LAST-INTERNAL",
-                            starting_balance=0, params={"market": "perp", "allow_short": True})
+                            starting_balance=0, params={"market": "perp", "allow_short": True}, venue="binance")
     yield store
     store.engine.dispose()
 
@@ -59,7 +59,7 @@ def _trade(store, sleeve, oid, side, qty, px, close=None, bar=None, at=None, int
 
 def _run(store, members=lambda n: n in ("a", "b"), equity=D("100000")):
     fills, funding = npr.journal_rows(store, members)
-    return npr.shadow(fills, funding, lambda venue, inst: TAKER, equity)
+    return npr.shadow(fills, funding, lambda name: TAKER, equity)
 
 
 def test_b13a_opposite_intents_on_one_bar_net_to_one_order_saving_the_crossed_spread_and_fee(store):
@@ -138,6 +138,64 @@ def test_b13g_it_writes_nothing(store):
 def test_b13h_a_taker_mismatch_on_one_account_is_refused(store):
     _trade(store, "a", "a1", "BUY", "0.3", "60030", close="60000", bar=T1)
     fills, funding = npr.journal_rows(store, lambda n: True)
-    fills.append({**fills[0], "instrument": "ETH/USDT-PERP", "order_id": "x"})
+    fills.append({**fills[0], "sleeve": "b", "order_id": "x"})
     with pytest.raises(ValueError, match="same taker fee"):
-        npr.shadow(fills, funding, lambda v, i: TAKER if i == INST else D("0.0006"), D("100000"))
+        npr.shadow(fills, funding, lambda name: TAKER if name == "a" else D("0.0006"), D("100000"))
+
+
+# ---- the page: its own route and partial, shadow, not evidence ------------------------------------------------------
+
+def _page(store, monkeypatch, equity=D("100000")):
+    import re
+
+    from fastapi.testclient import TestClient
+
+    import sleeve_fund.supervisor as sup
+    from sleeve_fund.dashboard import app as dash
+    from sleeve_fund.dashboard import netting_view
+
+    def fund(_store):
+        if isinstance(equity, Exception):
+            raise equity
+        return equity
+
+    monkeypatch.setattr(sup, "fund_equity", fund)
+    monkeypatch.setattr(netting_view, "_taker", lambda store, now: lambda name: TAKER)
+    monkeypatch.setattr(sup, "_in_book", lambda store, s: s.name in ("a", "b"))
+    monkeypatch.setenv("DASHBOARD_PASSWORD", "pw")
+    r = TestClient(dash.create_app(store)).get("/netting-shadow", auth=("pm", "pw"))
+    assert r.status_code == 200
+    return " ".join(re.sub(r"<[^>]+>", " ", r.text).split())
+
+
+def test_b13i_the_page_shows_the_saving_labelled_shadow_not_evidence(store, monkeypatch):
+    from sleeve_fund.wording import no_venues
+
+    _trade(store, "a", "a1", "BUY", "0.3", "60030", close="60000", bar=T1)
+    _trade(store, "b", "b1", "SELL", "0.1", "59970", close="60000", bar=T1)
+    words = _page(store, monkeypatch)
+    assert "Shadow, not evidence" in words and "Account 1: a, b" in words
+    assert "Saved in fees 6.60" in words and "Saved in spread (opposite orders matched) 6.00" in words
+    assert "Total saved 12.60" in words and "Orders: combined against alone 1 against 2" in words
+    assert "Unexplained difference 0.00 (0.0 bp)" in words and "a / b 50.0%" in words
+    assert no_venues(words) == words  # no venue named on a PM page
+
+
+def test_b13j_a_fund_that_cant_be_marked_is_said_never_guessed(store, monkeypatch):
+    _trade(store, "a", "a1", "BUY", "0.3", "60030", close="60000", bar=T1)
+    words = _page(store, monkeypatch, equity=ValueError("a position has no mark"))
+    assert "Can't work out the shadow right now: a position has no mark" in words and "Total saved" not in words
+
+
+def test_b13k_each_strategys_taker_is_the_rate_its_paper_fills_pay(store):
+    """The page reads each Strategy's rate as the paper node charges it (FEE-LIVE quote, then its market's schedule)."""
+    from datetime import datetime, timezone
+
+    from sleeve_fund.dashboard.netting_view import _taker
+    from sleeve_fund.fees import resolve
+    from sleeve_fund.paper.config import from_store
+
+    now = datetime.now(timezone.utc)
+    row = store.sleeve("a")
+    want = from_store(row, fee_schedule=resolve(getattr(row, "venue", None), store, row.instrument, now).fees).fees
+    assert _taker(store, now)("a") == want.taker

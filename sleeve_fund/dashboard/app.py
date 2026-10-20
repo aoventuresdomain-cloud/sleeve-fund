@@ -1608,6 +1608,14 @@ def create_app(store: Store | None = None) -> FastAPI:
 
         return page(request, "fills.html", r=fills_model.view(st(), utcnow()))
 
+    @app.get("/netting-shadow", response_class=HTMLResponse)
+    def netting_shadow_page(request: Request, _: str = Depends(require_pm)):
+        """B-13: what netting across the fund's Strategies would have saved, in shadow, from the paper journal (exact
+        figures, so the raw store, not st()'s float view). Shadow, not evidence: it changes nothing."""
+        from sleeve_fund.dashboard import netting_view
+
+        return page(request, "netting_shadow.html", n=netting_view.view(app.state.store, utcnow()))
+
     @app.get("/accounts")
     def accounts_page(request: Request, _: str = Depends(require_pm)):
         return _moved(request, "/setup", "#accounts")
