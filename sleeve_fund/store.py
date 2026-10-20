@@ -1066,12 +1066,14 @@ gate_decisions_t = Table(
     Column("would_be", EXACT),
     Column("side", SmallInteger),  # +1 long, -1 short; requested_qty stays unsigned
     # B-24 (DA, 0032; Advisor B24-LEVERAGE): the leverage figures the gate computed for this idea, unrounded, inside its
-    # lock: margin leverage, share of the fund, gross after and net per underlying after (signed). All four or none
-    # (rows before it, error rows); once written they never change (GATE_LEVERAGE triggers below).
+    # lock: margin leverage, share of the fund, gross after and net per underlying after (signed), and the Strategy's own
+    # position before the order (signed), so a fill's share of the fund is worked from this row alone (QD). All five or
+    # none (rows before it, error rows); once written they never change (GATE_LEVERAGE triggers below).
     Column("margin_leverage", EXACT),
     Column("share_of_fund", EXACT),
     Column("gross_after", EXACT),
     Column("net_underlying_after", EXACT),
+    Column("held_before", EXACT),
     CheckConstraint(_in("outcome", GATE_OUTCOMES), name="gate_decisions_outcome"),
     CheckConstraint(_in("limit_hit", GATE_LIMITS), name="gate_decisions_limit_hit"),
     CheckConstraint(_in("stage", GATE_STAGES), name="gate_decisions_stage"),
@@ -1281,22 +1283,24 @@ SHADOW_SQLITE = (
     f"CREATE TRIGGER shadow_outcomes_kind BEFORE INSERT ON shadow_outcomes WHEN {SHADOW_WRONG_KIND} BEGIN "
     "SELECT RAISE(ABORT, 'a shadow outcome is a trim of a trimmed decision or a refusal of a rejected one'); END",
 )
-# B-24 (DA, 0032): the decision's four leverage figures are all there or none, only net may be below 0, and once written
+# B-24 (DA, 0032): the decision's four leverage figures and held_before are all there or none, only net may be below 0, and once written
 # they never change; a row without them may get them once. Triggers, so 0032 adds them without rebuilding gate_decisions
 # on SQLite. A fill mark is write-once.
 GATE_LEVERAGE_BAD = ("NOT ((NEW.margin_leverage IS NULL AND NEW.share_of_fund IS NULL AND NEW.gross_after IS NULL "
-                     "AND NEW.net_underlying_after IS NULL) OR (NEW.margin_leverage IS NOT NULL AND NEW.share_of_fund "
-                     "IS NOT NULL AND NEW.gross_after IS NOT NULL AND NEW.net_underlying_after IS NOT NULL)) "
+                     "AND NEW.net_underlying_after IS NULL AND NEW.held_before IS NULL) OR (NEW.margin_leverage IS NOT NULL "
+                     "AND NEW.share_of_fund IS NOT NULL AND NEW.held_before IS NOT NULL "
+                     "AND NEW.gross_after IS NOT NULL AND NEW.net_underlying_after IS NOT NULL)) "
                      "OR NEW.margin_leverage < 0 OR NEW.share_of_fund < 0 OR NEW.gross_after < 0")
-GATE_LEVERAGE_MESSAGE = ("gate_decisions: the four leverage figures are all set or none, only net may be below 0, "
+GATE_LEVERAGE_MESSAGE = ("gate_decisions: the leverage figures and held_before are all set or none, only net and "
+                         "held_before may be below 0, "
                          "and once set they never change")
 GATE_LEVERAGE_FROZEN = {
     "postgresql": "OLD.margin_leverage IS NOT NULL AND (NEW.margin_leverage, NEW.share_of_fund, NEW.gross_after, "
-                  "NEW.net_underlying_after) IS DISTINCT FROM (OLD.margin_leverage, OLD.share_of_fund, "
-                  "OLD.gross_after, OLD.net_underlying_after)",
+                  "NEW.net_underlying_after, NEW.held_before) IS DISTINCT FROM (OLD.margin_leverage, OLD.share_of_fund, "
+                  "OLD.gross_after, OLD.net_underlying_after, OLD.held_before)",
     "sqlite": "OLD.margin_leverage IS NOT NULL AND (NEW.margin_leverage IS NOT OLD.margin_leverage OR NEW.share_of_fund "
               "IS NOT OLD.share_of_fund OR NEW.gross_after IS NOT OLD.gross_after OR NEW.net_underlying_after IS NOT "
-              "OLD.net_underlying_after)",
+              "OLD.net_underlying_after OR NEW.held_before IS NOT OLD.held_before)",
 }
 GATE_LEVERAGE_PG = (
     "CREATE OR REPLACE FUNCTION gate_leverage_shape() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
