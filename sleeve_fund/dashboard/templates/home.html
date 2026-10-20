@@ -148,7 +148,7 @@
     {% for x in summaries %}{% set s = x.sleeve %}{% set room = x.room %}
     <tr>
       <td class="cell-name" data-v="{{ s.name }}"><a href="/sleeves/{{ s.name }}">{{ s.name }}</a>{% if x.legs %} {{ leg_flag(leg_flags.get(s.name)) }}{% endif %}<span class="sub2">{% if x.legs %}Two legs, {{ x.pair.words|lower }}{% else %}{{ s.instrument }}{% endif %} · {{ s.strategy|replace('_', ' ') }} · {{ bar_short(s.bar_spec) }}</span>{{ legs_list(x) }}</td>
-      <td data-v="{{ s.status }}" data-m="right">{{ chip(s.status) }}{% if x.mode != 'paper' %} <span class="chip {{ x.mode }}">{{ x.mode|capitalize }}</span>{% endif %}</td>
+      <td data-v="{{ s|shown }}" data-m="right">{{ chip(s|shown) }}{% if x.mode != 'paper' %} <span class="chip {{ x.mode }}">{{ x.mode|capitalize }}</span>{% endif %}</td>
       <td data-m="hide">{{ spark(x.spark, x.spark_up) }}</td>
       <td class="num" data-v="{{ x.equity }}" data-label="Equity">{{ x.equity|money }}</td>
       <td class="num" data-v="{{ x.day_pnl }}" data-m="right" data-label="Today">{{ money_signed(x.day_pnl) }}</td>
@@ -215,7 +215,7 @@
 <details class="panel archived" id="test-accounts" open>
   <summary><strong>Test accounts ({{ tests|length }})</strong> <span class="muted">strategies on a test account, outside the fund's book: left out of its equity, P&amp;L and open risk, as the limits leave them out, and never Strategy evidence. Their positions show under Positions, marked as not counted.</span></summary>
   <ul class="feed" style="margin-top:10px">{% for x in tests %}{% set s = x.sleeve %}
-    <li><span class="when">{{ x.equity|money }}</span><span class="what"><a href="/sleeves/{{ s.name }}">{{ s.name }}</a> {{ chip(s.status) }} {{ test_chip() }} <span class="muted">{{ s.instrument }} · {{ s.strategy|replace('_', ' ') }} · {{ signed(x.ret) }} since start</span></span></li>{% endfor %}
+    <li><span class="when">{{ x.equity|money }}</span><span class="what"><a href="/sleeves/{{ s.name }}">{{ s.name }}</a> {{ chip(s|shown) }} {{ test_chip() }} <span class="muted">{{ s.instrument }} · {{ s.strategy|replace('_', ' ') }} · {{ signed(x.ret) }} since start</span></span></li>{% endfor %}
   </ul>
 </details>
 {% endif %}

@@ -11,7 +11,7 @@ from datetime import datetime
 
 import pandas as pd
 
-from sleeve_fund.dashboard.metrics import costs
+from sleeve_fund.dashboard.metrics import costs, shown_status
 from sleeve_fund.store import Store, utcnow
 
 DAYS_A_YEAR = 365  # the venue trades every day
@@ -166,7 +166,8 @@ def book_view(store: Store, summaries: list[dict], frames: dict[str, pd.DataFram
         "sleeves": len(ones),
         "running": sum(1 for x in ones if x["sleeve"].status == "running"),
         # One put away waits for nobody: its last halt or error is history (the top bar's count, B-29 add-on).
-        "attention": sum(1 for x in ones if x["sleeve"].status in ("halted", "error") and x["sleeve"].name not in archived),
+        "attention": sum(1 for x in ones if shown_status(x["sleeve"], store) in ("halted", "error")
+                         and x["sleeve"].name not in archived),
         "unhealthy": len({getattr(x["sleeve"], "parent", None) or x["sleeve"].name for x in active
                           if not x["healthy"] and x["sleeve"].desired_state == "running"}),
         "start": start,

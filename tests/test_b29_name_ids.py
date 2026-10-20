@@ -146,6 +146,7 @@ def test_a_strategy_put_away_after_an_error_no_longer_counts_as_halted(tmp_path,
     for name in ("candle-step-btcusdt-1m", "timed-test"):
         store.create_sleeve(name=name, strategy="candle_step", instrument="BTC/USDT",
                             bar_spec="1-MINUTE-LAST-INTERNAL", starting_balance=0, desired_state="stopped")
+    store.set_desired_state("candle-step-btcusdt-1m", "running")  # TEC-ERR-STOPPED (HoE): it errored while running
     store.set_status("candle-step-btcusdt-1m", "error", "node exited 1")
     client = TestClient(app_mod.create_app(store))
 
@@ -154,6 +155,7 @@ def test_a_strategy_put_away_after_an_error_no_longer_counts_as_halted(tmp_path,
         return page.split('data-live="health"', 1)[1].split("</span></span>", 1)[0]
 
     assert "1 halted" in bar()  # red-first: it waits for the PM while it is still a live Strategy
+    store.set_desired_state("candle-step-btcusdt-1m", "stopped")  # archiving needs a stop
     store.archive("candle-step-btcusdt-1m")
     assert "halted" not in bar()
 
