@@ -2676,7 +2676,8 @@ class Store:
                    ts: datetime | None) -> None:
         """B-24: the decision's four figures at this fill (the order filled so far, at its average price), in the
         fill's own transaction; a fill that lands the fund past T4 by slippage raises an error event (cell j) and is
-        never undone, and so does one whose T4 check couldn't run (the tests unreadable): the fill stays booked. A decision without figures (no book was read, or none could be worked) gets no mark."""
+        never undone. A mark that can't be written, or a T4 check that can't run, is an error event too: the fill stays
+        booked. A decision without figures (no book was read, or none could be worked) gets no mark."""
         from sleeve_fund.portfolio import compliance
         from sleeve_fund.portfolio.limits import fill_breach, fill_mark
 
@@ -2689,14 +2690,26 @@ class Store:
                            to_decimal(row.held_before), int(row.side), filled, avg_px, to_decimal(row.margin_leverage))
         if not marked:
             return
-        self.record_fill_mark(row.id, trade_id, avg_px, "fill", **marked, marked_at=ts, conn=c)
+        # Each in its own savepoint: on PG a failed statement aborts the whole transaction, and the commit would then
+        # drop the fill with it (CR2 MUST). Neither failure undoes the fill; each is an error event.
+        kind, words = "portfolio_fill_past_t4", None
         try:
-            kind, words = "portfolio_fill_past_t4", fill_breach(marked, compliance.load(self, conn=c))
+            with c.begin_nested():
+                self.record_fill_mark(row.id, trade_id, avg_px, "fill", **marked, marked_at=ts, conn=c)
+        except Exception as exc:  # noqa: BLE001 - a mark that can't be written never holds up a fill that happened
+            self._fill_error(c, sleeve, ts, "portfolio_fill_mark_failed", f"{order_id}: fill {trade_id} not marked: "
+                                                                          f"{exc!r}")
+        try:
+            with c.begin_nested():
+                words = fill_breach(marked, compliance.load(self, conn=c))
         except Exception as exc:  # noqa: BLE001 - an unread profile never holds up booking a fill that happened
-            kind, words = "portfolio_t4_check_skipped", f"fill {trade_id} marked, T4 not checked: {exc!r}"
+            kind, words = "portfolio_t4_check_skipped", f"fill {trade_id}: T4 not checked: {exc!r}"
         if words:
-            c.execute(insert(events_t).values(sleeve=sleeve, ts=ts or utcnow(), level="error", kind=kind,
-                                              message=f"{order_id}: {words}"))
+            self._fill_error(c, sleeve, ts, kind, f"{order_id}: {words}")
+
+    @staticmethod
+    def _fill_error(c, sleeve: str, ts: datetime | None, kind: str, message: str) -> None:
+        c.execute(insert(events_t).values(sleeve=sleeve, ts=ts or utcnow(), level="error", kind=kind, message=message))
 
     def rebook_liquidation(self, order_id: str, reason: str, signal: dict, ts: datetime | None = None) -> None:
         """GAP-LIQ (Advisor): a resting stop whose fill was at or past the liquidation price is re-booked as the
