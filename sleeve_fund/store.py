@@ -1575,10 +1575,10 @@ def _node_ids_of(name: str) -> str | None:
     return router.cut_tag(tag) if tag else None
 
 
-def _no_node_id_clash(c, name: str) -> None:
-    """B-29 (HoE ruling 3): a new Strategy whose trader or account id would equal a live Strategy's is refused, as
-    their orders and fills would mix. Only names that differ just in case or punctuation get there (Timed Test and
-    timed-test); a put-away Strategy has no node, so it doesn't count."""
+def _no_node_id_clash(c, name: str, *, back: bool = False) -> None:
+    """B-29 (HoE ruling 3): a new Strategy, or a put-away one brought back (back), whose trader or account id would
+    equal a live Strategy's is refused, as their orders and fills would mix. Only names that differ just in case or
+    punctuation get there (Timed Test and timed-test); a put-away Strategy has no node, so it doesn't count."""
     ids = _node_ids_of(name)
     if ids is None:
         return
@@ -1586,6 +1586,10 @@ def _no_node_id_clash(c, name: str) -> None:
     for other in c.execute(select(sleeves_t.c.name).where(_not_backtest(sleeves_t.c.name),
                                                           sleeves_t.c.name.not_in(put_away))).scalars():
         if other != name and _node_ids_of(other) == ids:
+            if back:
+                raise ValueError(f"Strategy {name} can't be brought back: its orders would share ids with Strategy "
+                                 f"{other}, as the two names differ only in capitals or punctuation. Put {other} away "
+                                 "first, or leave this one put away.")
             raise ValueError(f"Strategy {name} can't be made: its orders would share ids with Strategy {other}, as "
                              "the two names differ only in capitals or punctuation. Choose another name.")
 
@@ -3109,6 +3113,8 @@ class Store:
             raise ValueError("this strategy is retired, and a retired strategy can't be brought back")
         if self.two_leg(sleeve):  # TWO_LEG_FENCE
             raise ValueError(f"putting a Strategy away {TWO_LEG_FENCE}")
+        with self.engine.connect() as c:  # B-29: back on the node ids a live Strategy now has, its orders would mix
+            _no_node_id_clash(c, sleeve, back=True)
         back: list[Decimal] = []
 
         def amount() -> Decimal:

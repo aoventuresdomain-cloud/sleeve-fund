@@ -196,3 +196,35 @@ def test_a_put_away_strategy_doesnt_block_a_name_with_its_ids(journal):
     store.archive("timed-test")
     _make(store, "Timed_Test")
     assert "Timed_Test" in {s.name for s in store.sleeves()}
+
+
+def test_bringing_back_a_strategy_whose_ids_a_live_one_now_has_is_refused_in_words(journal):
+    """CR MUST (B-29 v2): put timed-test away, make Timed Test, bring timed-test back: both would be live on one
+    trader and one account. Bring-back refuses as create does, and moves nothing."""
+    store = journal
+    _make(store, "timed-test")
+    store.archive("timed-test")
+    _make(store, "Timed Test")
+    with pytest.raises(ValueError, match="timed-test can't be brought back: its orders would share ids with "
+                                         "Strategy Timed Test"):
+        store.unarchive("timed-test")
+    assert "timed-test" in store.archived()  # still put away
+    store.archive("Timed Test")
+    store.unarchive("timed-test")  # once the other is put away, it comes back
+
+
+def test_the_dashboards_bring_back_shows_the_refusal(journal, monkeypatch, tmp_path):
+    from fastapi.testclient import TestClient
+
+    from sleeve_fund.dashboard import app as app_mod
+
+    monkeypatch.setenv("DASHBOARD_PASSWORD", "test-pw")
+    monkeypatch.setenv("TEARSHEET_DIR", str(tmp_path))
+    store = journal
+    _make(store, "timed-test")
+    store.archive("timed-test")
+    _make(store, "Timed Test")
+    c = TestClient(app_mod.create_app(store))
+    r = c.post("/sleeves/timed-test/archive", data={"action": "restore", "reason": "back"}, auth=("pm", "test-pw"),
+               headers={"origin": "http://testserver"}, follow_redirects=False)
+    assert r.status_code == 400 and "can't be brought back" in r.text and "Timed Test" in r.text
