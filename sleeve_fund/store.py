@@ -2453,7 +2453,7 @@ class Store:
                     c.execute(insert(fills_t).values(sleeve=sleeve, ts=ts or utcnow(), side=side, qty=qty,
                                                      price=price, fee=fee, order_id=order_id, trade_id=trade_id))
                     if with_order:
-                        self._update_order(c, order_id, fill_qty=qty, fill_px=price, fee=fee)
+                        self._update_order(c, order_id, fill_qty=qty, fill_px=price, fee=fee, trade_id=trade_id, ts=ts)
                     return "new"
             except IntegrityError:
                 continue
@@ -2681,8 +2681,10 @@ class Store:
 
     def _update_order(self, c, order_id: str, *, status: str | None = None, message: str | None = None,
                       fill_qty: float = 0.0, fill_px: float | None = None, fee: float = 0.0,
-                      qty: float | None = None, intent: str | None = None) -> None:
-        """update_order's change, inside the caller's transaction."""
+                      qty: float | None = None, intent: str | None = None, trade_id: str | None = None,
+                      ts: datetime | None = None) -> None:
+        """update_order's change, inside the caller's transaction. trade_id: the fill's, when booked by book_fill; a
+        gated order's fill is then marked against its decision (B-24)."""
         row = c.execute(select(orders_t).where(orders_t.c.order_id == order_id)).first()
         if row is None:
             return
@@ -2705,6 +2707,47 @@ class Store:
         c.execute(update(orders_t).where(orders_t.c.order_id == order_id).values(**values))
         if row.intent in GATED_INTENTS and (fill_qty or values.get("status", row.status) != row.status):
             self._settle_reservation(c, order_id, fill_qty, values.get("status"))
+        if row.intent in GATED_INTENTS and fill_qty and trade_id is not None:
+            self._mark_fill(c, row.sleeve, order_id, trade_id, values["filled_qty"], values["avg_px"], ts)
+
+    def _mark_fill(self, c, sleeve: str, order_id: str, trade_id: str, filled: Decimal, avg_px: Decimal,
+                   ts: datetime | None) -> None:
+        """B-24: the decision's four figures at this fill (the order filled so far, at its average price), in the
+        fill's own transaction; a fill that lands the fund past T4 by slippage raises an error event (cell j) and is
+        never undone. A mark that can't be written, or a T4 check that can't run, is an error event too: the fill stays
+        booked. A decision without figures (no book was read, or none could be worked) gets no mark."""
+        from sleeve_fund.portfolio import compliance
+        from sleeve_fund.portfolio.limits import fill_breach, fill_mark
+
+        d = gate_decisions_t
+        row = c.execute(select(d.c.id, d.c.side, d.c.book_equity, d.c.gross, d.c.net_underlying, d.c.held_before,
+                               d.c.margin_leverage).where(d.c.order_id == order_id)).first()
+        if row is None or row.margin_leverage is None or None in (row.book_equity, row.gross, row.net_underlying):
+            return
+        marked = fill_mark(to_decimal(row.book_equity), to_decimal(row.gross), to_decimal(row.net_underlying),
+                           to_decimal(row.held_before), int(row.side), filled, avg_px, to_decimal(row.margin_leverage))
+        if not marked:
+            return
+        # Each in its own savepoint: on PG a failed statement aborts the whole transaction, and the commit would then
+        # drop the fill with it (CR2 MUST). Neither failure undoes the fill; each is an error event.
+        kind, words = "portfolio_fill_past_t4", None
+        try:
+            with c.begin_nested():
+                self.record_fill_mark(row.id, trade_id, avg_px, "fill", **marked, marked_at=ts, conn=c)
+        except Exception as exc:  # noqa: BLE001 - a mark that can't be written never holds up a fill that happened
+            self._fill_error(c, sleeve, ts, "portfolio_fill_mark_failed", f"{order_id}: fill {trade_id} not marked: "
+                                                                          f"{exc!r}")
+        try:
+            with c.begin_nested():
+                words = fill_breach(marked, compliance.load(self, conn=c))
+        except Exception as exc:  # noqa: BLE001 - an unread profile never holds up booking a fill that happened
+            kind, words = "portfolio_t4_check_skipped", f"fill {trade_id}: T4 not checked: {exc!r}"
+        if words:
+            self._fill_error(c, sleeve, ts, kind, f"{order_id}: {words}")
+
+    @staticmethod
+    def _fill_error(c, sleeve: str, ts: datetime | None, kind: str, message: str) -> None:
+        c.execute(insert(events_t).values(sleeve=sleeve, ts=ts or utcnow(), level="error", kind=kind, message=message))
 
     def rebook_liquidation(self, order_id: str, reason: str, signal: dict, ts: datetime | None = None) -> None:
         """GAP-LIQ (Advisor): a resting stop whose fill was at or past the liquidation price is re-booked as the

@@ -3910,6 +3910,8 @@ class LongFlatStrategy(Strategy):
         intent = {"side": s, "qty": qty, "close": close, "price": fill_price(close, s, self._half_spread()),
                   "stop_frac": self._stop_frac, "tp_frac": self._tp_frac, "what": what, "step": self._lot(), "min_qty": self._min_qty(),
                   "instrument": self._base_code(), "opens": self._position_qty() < self._min_qty(),
+                  # B-24: what is held before it (signed), so the gate journals the resulting position's figures
+                  "held": self._signed_qty() if self._margin else self._position_qty(),
                   "leverage": LongFlatStrategy._max_leverage(self)
                   if self._margin else None,
                   "atr_pct": None if self._stop_frac else self._entry_atr_pct(),

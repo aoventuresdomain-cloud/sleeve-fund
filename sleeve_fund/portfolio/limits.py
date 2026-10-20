@@ -13,7 +13,7 @@ figures in a decision are "x book" ratios and stay float."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import ROUND_DOWN, Decimal
 
 from sleeve_fund.money import money, scale
@@ -93,9 +93,11 @@ class Intent:
     risk_per_unit: Decimal
     step: Decimal
     min_qty: Decimal
+    held: Decimal = ZERO  # B-24: the Strategy's own position before it, signed (long > 0), for the leverage figures
+    leverage: Decimal | None = None  # B-24: its margin leverage on a perp (the Strategy's cap); None: spot or not given
 
     def __post_init__(self):
-        _money_fields(self, "qty", "price", "margin_per_unit", "risk_per_unit", "step", "min_qty")
+        _money_fields(self, "qty", "price", "margin_per_unit", "risk_per_unit", "step", "min_qty", "held")
 
 
 @dataclass(frozen=True)
@@ -106,6 +108,7 @@ class Decision:
     limit_hit: str | None  # what bound it, if any: LIMITS, "below_min", or a portfolio block (gate.entry_block)
     reason: str  # one sentence for the journal and the strategy page
     figures: dict = field(default_factory=dict)  # each limit: book before, after (at approved_qty), cap; x book
+    leverage: dict = field(default_factory=dict)  # B-24: leverage()'s figures at approved_qty; {} when not judged
 
 
 def floor_to(qty: Decimal, step: Decimal) -> Decimal:
@@ -169,7 +172,61 @@ def _stop_tests(book: Book, underlying: str, profile: PortfolioProfile) -> tuple
     return used, caps, group
 
 
+def leverage(book: Book, intent: Intent, qty: Decimal) -> dict[str, Decimal]:
+    """B-24 (Advisor B24-LEVERAGE): the figures every decision journals for the position it leaves, with `qty` of the
+    order sent, at the order's expected fill (the price the check judges); unrounded, only a display rounds.
+      margin_leverage       notional / its isolated margin: the perp's leverage (the 1x/2x/3x cap); spot 1
+      share_of_fund         the Strategy's resulting position's notional / the fund's equity
+      gross_after           the fund's gross after it / equity: T4 gross's own figure, by the same sum
+      net_underlying_after  the fund's signed net in its underlying after it / equity: T4 net's, spot and perp summed
+    No limit of its own: T4 is the fund's limit and the perp cap the Strategy's. Equity at or below 0 has no figures
+    (shown n/a; decide refuses every opening then)."""
+    e = book.equity
+    if e <= 0:
+        return {}
+    order = qty * intent.price
+    lev = intent.leverage if intent.leverage is not None else intent.price / intent.margin_per_unit
+    return {"margin_leverage": lev,
+            "share_of_fund": abs((intent.held + intent.side * qty) * intent.price) / e,
+            "gross_after": (book.gross() + order) / e,
+            "net_underlying_after": (book.net(intent.underlying) + intent.side * order) / e}
+
+
+def fill_mark(equity: Decimal, gross: Decimal, net: Decimal, held: Decimal, side: int, filled: Decimal,
+              avg_px: Decimal, margin_leverage: Decimal) -> dict[str, Decimal]:
+    """B-24 (Advisor B24-LEVERAGE): a fill's figures, the decision's own (leverage) at the fill, from what the decision
+    journaled: the book it was judged on (equity, gross, net in its underlying, reservations included and its own
+    order not), the Strategy's position before it (held, signed), its side, and `filled` of the order so far at its
+    average fill price. The margin leverage is the decision's (the cap it was sent under). {} with no equity."""
+    if equity <= 0:
+        return {}
+    order = filled * avg_px
+    return {"margin_leverage": margin_leverage, "share_of_fund": abs((held + side * filled) * avg_px) / equity,
+            "gross_after": (gross + order) / equity, "net_underlying_after": (net + side * order) / equity}
+
+
+def fill_breach(marked: dict[str, Decimal], profile: PortfolioProfile) -> str | None:
+    """B-24 cell j: a fill that lands the fund over T4 (gross, or net in its underlying) by slippage, in words for the
+    alert; None within. Never refuses anything: the fill has happened, and the next opening is held by the check."""
+    if not marked:
+        return None
+    over = [f"{name} {float(v):.4f}x over its {cap:g}x" for name, v, cap in (
+        ("gross", marked["gross_after"], profile.gross),
+        ("net in its underlying", abs(marked["net_underlying_after"]), profile.net_instrument))
+        if cap is not None and v > Decimal(str(cap))]  # a T4 test switched off has nothing to slip past
+    return "a fill took the fund's " + " and ".join(over) + " (slippage past T4)" if over else None
+
+
 def decide(book: Book, intent: Intent, profile: PortfolioProfile) -> Decision:
+    """_decide's answer with B-24's leverage figures for the position it leaves (at the quantity approved; a refusal's
+    are the position as it stands)."""
+    d = _decide(book, intent, profile)
+    if book.equity <= 0 or intent.price <= 0 or intent.margin_per_unit <= 0:
+        return d  # n/a: _decide refused it, and no figure divides by these
+    return replace(d, leverage=leverage(book, intent, d.approved_qty))
+
+
+def _decide(book: Book, intent: Intent, profile: PortfolioProfile) -> Decision:
     """The largest quantity of `intent`, at most what it asks and rounded down to the step, that keeps gross, net in
     its underlying, margin and open risk within the profile; rejected if that is below the venue minimum. A figure
     already over its limit from marks alone forces nothing down: only what raises it is held back (Advisor 2). A
@@ -223,6 +280,21 @@ def decide(book: Book, intent: Intent, profile: PortfolioProfile) -> Decision:
 
 
 def decide_pair(book: Book, first: Intent, second: Intent, profile: PortfolioProfile) -> tuple[Decision, Decision]:
+    """_decide_pair's answers with B-24's leverage figures for each leg, the fund's figures counting both legs as
+    approved (each leg's own book holds the other leg's approved notional)."""
+    a, b = _decide_pair(book, first, second, profile)
+    out = []
+    for d, leg, other, o in ((a, first, second, b), (b, second, first, a)):
+        if book.equity <= 0 or leg.price <= 0 or leg.margin_per_unit <= 0:
+            out.append(d)
+            continue
+        notional = other.side * o.approved_qty * other.price
+        with_other = Book(book.equity, (*book.holdings, Holding(other.underlying, notional, ZERO, ZERO)))
+        out.append(replace(d, leverage=leverage(with_other, leg, d.approved_qty)))
+    return out[0], out[1]
+
+
+def _decide_pair(book: Book, first: Intent, second: Intent, profile: PortfolioProfile) -> tuple[Decision, Decision]:
     """A two-leg entry (P2-8) as one position: the same share of both legs, or neither (Advisor, 13 Oct 23:55 UK).
     The second leg is held at its ratio to the first (second.qty / first.qty). Gross and margin count both legs; open
     risk is the sum of the legs' own risk, with no hedge credit (ruling A); net exposure is per underlying, so two legs
