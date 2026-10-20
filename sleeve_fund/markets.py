@@ -161,6 +161,16 @@ def liquidation_tick(venue: str | None, pair: str) -> float | None:
     return float(kept) if kept else None
 
 
+def check_kept_tiers(rows) -> None:
+    """B-39 (HoE, 20 Oct): a start check. Raises NoMaintenanceTable, naming the instrument, when any of a Strategy's
+    rows (its own, a second leg's, an asset leg's) is a perp on an instrument whose venue tiers aren't kept, so it is
+    refused in words before a node is built, never crashed at start. Spot rows pass."""
+    from sleeve_fund.venues import DEFAULT_VENUE
+
+    for r in rows:
+        terms(r.params, getattr(r, "venue", None) or DEFAULT_VENUE, r.instrument)
+
+
 def stale_maintenance(sleeves, today, days: int = 30) -> list[str]:
     """VS-1-TABLE: one line per instrument a live perp Strategy trades whose venue table was read more than `days`
     ago (the venue changes its tiers from time to time; DA-11 keeps them). No venue names: it can reach the PM."""

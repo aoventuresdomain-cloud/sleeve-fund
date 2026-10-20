@@ -25,6 +25,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from sleeve_fund import accounts, lifecycle, liquidation, router
+from sleeve_fund.markets import check_kept_tiers
 from sleeve_fund.alerts import Forwarder
 from sleeve_fund.exact import float_view
 from sleeve_fund.money import to_decimal
@@ -534,6 +535,16 @@ def check_venue_pin(store: Store, s: Sleeve) -> None:
         raise ValueError(router.VENUE_MOVED[mode])
 
 
+def _strategy_rows(store: Store, s: Sleeve) -> list[Sleeve]:
+    """A Strategy's rows its process runs: its own, then a two-leg Strategy's second leg or a multi-asset one's legs."""
+    from sleeve_fund.store import LEG
+
+    try:
+        return [s, store.sleeve(s.name + LEG)]
+    except KeyError:
+        return [s, *(store.sleeve(n) for n in store._asset_legs(s.name))]
+
+
 def check_funding_schedule(s: Sleeve) -> None:
     """Raises ValueError when a perp's newest stored settlement step is shorter than the schedule funding is charged
     on: the engine would skip settlements (funding.schedule_mismatch; Advisor, 6 Oct 2026), until DA-11."""
@@ -705,6 +716,9 @@ class Supervisor:
         s = self.store.sleeve(name)
         try:
             check_hub_bar_spec(s.venue, s.bar_spec)
+            # B-39: a perp with no kept tiers (VS-1) can't start at all, even for its exits: its node would raise at
+            # the strategy's init. Refused in words here, as the venue's own candles are (FE's review, 20 Oct).
+            check_kept_tiers(_strategy_rows(self.store, s))
         except ValueError as exc:
             held = (f". It still holds a position ({_held_words(self.store, name)}), which a flatten can't close while "
                     "it can't start: an engineer needs to close it" if self.store.holds_any(name) else "")
