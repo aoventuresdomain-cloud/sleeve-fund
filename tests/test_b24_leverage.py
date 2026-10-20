@@ -155,16 +155,19 @@ def test_a_two_leg_entry_journals_each_legs_figures_with_the_fund_counting_both(
 
 
 def test_k_a_fill_marks_its_own_figures_at_the_fill_price_with_the_decisions_margin_leverage():
-    """Part 2: the fund holds 140,000 of BTC; 0.2 BTC decided at 50,000 (3x) fills 0.15 so far at 50,400 average.
-    At the fill: gross (140,000 + 0.15 x 50,400 = 147,560) / 100,000 = 1.4756; net the same; the Strategy's 0.8 held
-    plus 0.15 at 50,400 = 47,880, 0.4788 of the fund; margin leverage the decision's 3."""
+    """Part 2: the fund holds 140,000 of BTC; 0.2 BTC long decided at 50,000 (3x) with 0.8 held fills 0.15 so far at
+    50,400 average. At the fill: gross (140,000 + 0.15 x 50,400 = 147,560) / 100,000 = 1.4756; net the same; the
+    Strategy's 0.95 at 50,400 = 47,880, 0.4788 of the fund; margin leverage the decision's 3. A short adding to a
+    short: net 140,000 - 7,560 = 132,440, share |-0.8 - 0.15| x 50,400."""
     from sleeve_fund.portfolio.limits import fill_mark
 
-    book = Book(E, (Holding("BTC", D(140_000), D(140_000) / 3, D(1_400)),))
-    got = fill_mark(book, _perp("0.2", held="0.8"), {"margin_leverage": D(3)}, D("0.15"), D(50_400))
+    got = fill_mark(E, D(140_000), D(140_000), D("0.8"), 1, D("0.15"), D(50_400), D(3))
     assert got == {"margin_leverage": D(3), "share_of_fund": D("0.4788"), "gross_after": D("1.4756"),
                    "net_underlying_after": D("1.4756")}
-    assert fill_mark(Book(D(0)), _perp("0.2"), {"margin_leverage": D(3)}, D("0.2"), PX) == {}
+    short = fill_mark(E, D(140_000), D(140_000), D("-0.8"), -1, D("0.15"), D(50_400), D(2))
+    assert short == {"margin_leverage": D(2), "share_of_fund": D("0.4788"), "gross_after": D("1.4756"),
+                     "net_underlying_after": D("1.3244")}
+    assert fill_mark(D(0), D(0), D(0), D(0), 1, D("0.2"), PX, D(3)) == {}
 
 
 @pytest.mark.parametrize("gross, net, words", [
@@ -181,3 +184,5 @@ def test_j_a_fill_that_slips_the_fund_past_t4_is_alerted_in_words_and_refuses_no
     got = fill_breach({"gross_after": D(gross), "net_underlying_after": D(net)}, t4)
     assert (got is None) if words is None else (words in got and "slippage past T4" in got), got
     assert fill_breach({}, t4) is None
+    assert fill_breach({"gross_after": D(9), "net_underlying_after": D(9)}, replace(t4, gross=None,
+                                                                                    net_instrument=None)) is None

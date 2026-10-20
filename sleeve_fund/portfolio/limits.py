@@ -193,15 +193,17 @@ def leverage(book: Book, intent: Intent, qty: Decimal) -> dict[str, Decimal]:
             "net_underlying_after": (book.net(intent.underlying) + intent.side * order) / e}
 
 
-def fill_mark(book: Book, intent: Intent, decided: dict[str, Decimal], filled: Decimal, avg_px: Decimal
-              ) -> dict[str, Decimal]:
-    """B-24 (Advisor B24-LEVERAGE): a fill's figures, the decision's own (leverage) at the fill: `filled` of the order
-    so far at its average fill price, on the book the decision was judged on. The margin leverage is the decision's
-    (the cap it was sent under). {} when the book has no equity, as leverage."""
-    marked = leverage(book, replace(intent, price=avg_px), filled)
-    if marked and "margin_leverage" in decided:
-        marked["margin_leverage"] = decided["margin_leverage"]
-    return marked
+def fill_mark(equity: Decimal, gross: Decimal, net: Decimal, held: Decimal, side: int, filled: Decimal,
+              avg_px: Decimal, margin_leverage: Decimal) -> dict[str, Decimal]:
+    """B-24 (Advisor B24-LEVERAGE): a fill's figures, the decision's own (leverage) at the fill, from what the decision
+    journaled: the book it was judged on (equity, gross, net in its underlying, reservations included and its own
+    order not), the Strategy's position before it (held, signed), its side, and `filled` of the order so far at its
+    average fill price. The margin leverage is the decision's (the cap it was sent under). {} with no equity."""
+    if equity <= 0:
+        return {}
+    order = filled * avg_px
+    return {"margin_leverage": margin_leverage, "share_of_fund": abs((held + side * filled) * avg_px) / equity,
+            "gross_after": (gross + order) / equity, "net_underlying_after": (net + side * order) / equity}
 
 
 def fill_breach(marked: dict[str, Decimal], profile: PortfolioProfile) -> str | None:
@@ -211,7 +213,8 @@ def fill_breach(marked: dict[str, Decimal], profile: PortfolioProfile) -> str | 
         return None
     over = [f"{name} {float(v):.4f}x over its {cap:g}x" for name, v, cap in (
         ("gross", marked["gross_after"], profile.gross),
-        ("net in its underlying", abs(marked["net_underlying_after"]), profile.net_instrument)) if v > Decimal(str(cap))]
+        ("net in its underlying", abs(marked["net_underlying_after"]), profile.net_instrument))
+        if cap is not None and v > Decimal(str(cap))]  # a T4 test switched off has nothing to slip past
     return "a fill took the fund's " + " and ".join(over) + " (slippage past T4)" if over else None
 
 
