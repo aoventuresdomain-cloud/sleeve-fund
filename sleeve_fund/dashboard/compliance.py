@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 
 from sleeve_fund import compliance_rules as rules
 from sleeve_fund.dashboard.riskops import NEAR_LIMIT
+from sleeve_fund.portfolio.limits import day_return
 from sleeve_fund.store import Store
 
 UK = ZoneInfo("Europe/London")
@@ -146,7 +147,8 @@ def use_now(store: Store, groups: dict[str, str]) -> dict:
         "fund_gross": (book.gross() / eq, ""),
         "asset_net": (net / eq, net_asset),
         "fund_margin": (book.margin() / eq, ""),
-        "fund_day_loss": (max(Decimal(0), 1 - eq / day_start) if day_start else Decimal(0), ""),
+        # DAY-RET: the daily pause's own figure (limits.day_return), never worked out again here
+        "fund_day_loss": (max(Decimal(0), -(day_return(eq, day_start) or Decimal(0))), ""),
         "fund_drawdown": (max(Decimal(0), 1 - eq / reference) if reference else Decimal(0), ""),
     }
     return {"source": "gate", **{k: {"used": share, "what": what} for k, (share, what) in used.items()}}

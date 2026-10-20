@@ -327,6 +327,18 @@ class BookBreach:
     reason: str
 
 
+def day_return(equity, day_start) -> Decimal | None:
+    """Today's return (Advisor DAY-RET (B), 20 Oct): equity / day_start - 1, day_start the book at 00:00 UTC scaled by
+    each flow since (gate.apply_flow, Advisor MUST 14 Oct): the time-weighted return, so a deposit or a withdrawal is
+    never a gain or a loss, and a loss counts at its share of the book it was made on. The one reader: the daily pause
+    judges it and the pages show it (FE never works it out again). None when either figure is missing or the day's start
+    is 0 or below: nothing to measure from."""
+    if equity is None or day_start is None:
+        return None
+    equity, day_start = money(equity, "equity"), money(day_start, "day_start")
+    return None if day_start <= 0 else equity / day_start - 1
+
+
 def book_breach(profile: PortfolioProfile, equity: Decimal, reference: Decimal, day_start: Decimal) -> BookBreach | None:
     """The book-wide drawdown halt and daily pause, worst first, or None (Advisor 9). reference: the high-water mark
     since the last book reset, or the book at the PM's last Resume after a portfolio halt (it re-bases there, so the
@@ -346,7 +358,7 @@ def book_breach(profile: PortfolioProfile, equity: Decimal, reference: Decimal, 
         return BookBreach("halt", f"the book is {1 - equity / top:.1%} below its reference {top:,.2f}, at the "
                                   f"{profile.drawdown:.0%} portfolio drawdown limit")
     if profile.daily_loss is not None and equity <= day_start - scale(day_start, profile.daily_loss):
-        return BookBreach("pause", f"the book has lost {1 - equity / day_start:.1%} since 00:00 UTC, at the "
+        return BookBreach("pause", f"the book has lost {-day_return(equity, day_start):.1%} since 00:00 UTC, at the "
                                    f"{profile.daily_loss:.0%} daily limit")
     return None
 

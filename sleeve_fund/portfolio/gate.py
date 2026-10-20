@@ -456,6 +456,14 @@ def carried(st: PortfolioState) -> dict:
                 "carried_day_return": r, "carried_day": st.day if r is not None else None}
 
 
+def day_ret(state: PortfolioState) -> Decimal | None:
+    """Today's return of the fund's book as the daily pause measures it (limits.day_return on the state's day start):
+    the figure the pages show, so page and brake are the same number (DAY-RET)."""
+    from sleeve_fund.portfolio.limits import day_return
+
+    return None if state.day is None else day_return(state.equity, state.day_start_equity)
+
+
 def resume_after_halt(ledger: Ledger) -> PortfolioState:
     """The PM's Resume after a portfolio halt: clears it and re-bases the halt's reference to the book now, so it
     doesn't fire again at once; the next halt is the drawdown limit below this. A pause for the day stays until
