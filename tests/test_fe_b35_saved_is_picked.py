@@ -188,3 +188,21 @@ def test_the_instrument_list_greys_by_the_markets_own_candles_and_only_perps_by_
     assert not greyed, text
     assert errors == []
     page.context.close()
+
+
+def test_clearing_a_model_refusal_keeps_another_checks_block(held_site, browser):  # noqa: F811
+    """CR's follow-up on 3934040: guard() clears only the block it set. A submit another check holds off (data-blocked)
+    stays off when the picked model stops being refused."""
+    base, _ = held_site
+    page, errors = _open(browser, f"{base}/sleeves/new?{WHERE['perp'][0]}&strategy=donchian")
+    _step(page, "Model")
+    assert page.locator("#model-refused").is_visible()
+    page.evaluate("""() => document.querySelectorAll("#sleeve-form button[data-label]").forEach((b) => {
+        b.setAttribute("data-blocked", ""); b.disabled = true; })""")  # another check holds it off too
+    page.select_option("#strategy", "ping_pong")
+    assert not page.locator("#model-refused").is_visible()
+    state = page.eval_on_selector_all("#sleeve-form button[data-label]",
+                                      "bs => bs.map(b => [b.hasAttribute('data-blocked'), b.disabled])")
+    assert state and all(s == [True, True] for s in state), state
+    assert errors == []
+    page.context.close()
