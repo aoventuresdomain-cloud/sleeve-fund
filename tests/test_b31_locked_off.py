@@ -304,3 +304,16 @@ def test_the_supervisors_start_publishes_its_order_client_for_the_switch(store, 
     sup.run()
     monkeypatch.delenv("EXEC_MODE", raising=False)  # the dashboard's own settings: none, as in deploy format
     assert client_state(store) == said
+
+
+@pytest.mark.parametrize("key, labelled", [("fund_day_loss", True), ("fund_drawdown", False)])
+def test_the_pages_today_label_finds_b31s_own_day_pause_rebase(store, key, labelled):  # noqa: F811
+    """CR DAY-RET follow-up (b), B-31 with DAY-RET: the label matches the words rebase_brakes journals, so a daily
+    pause switched back on gives "since re-base" and the drawdown halt's re-base never does."""
+    from sleeve_fund.dashboard.compliance import day_figure
+
+    _switch(store, key, False)
+    _state(store, equity=D(96_000))
+    _switch(store, key, True)
+    label = day_figure(store, NOW + timedelta(minutes=5))["label"]
+    assert label.startswith("Today (since re-base at ") == labelled, label
