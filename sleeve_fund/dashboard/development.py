@@ -271,6 +271,9 @@ _FEES = re.compile(r"^Dataset .*?fees: (.*)$", re.M)
 _TAKER = re.compile(r"([\d.]+)% taker")
 _BREAKEVEN = re.compile(r"^\*\*Break-even fee:\*\* (.+?)\.?$", re.M)
 _ABOUT = re.compile(r"about ([\d.]+)% per side")
+# B-22: the stored re-run at exactly 2x the venue's fees ("**Profitable at double fees:** PASS, net +3.1% over ..."),
+# written by the research side; the page shows it and never works it out. Absent on every older sheet.
+_DOUBLE_FEES = re.compile(r"^\*\*Profitable at double fees:\*\* (PASS|FAIL), net ([+-][\d.]+%)", re.M)
 _OOS = re.compile(r"^\| Walk-forward out-of-sample \((\d+) folds?, (\d+) days\) \| ([^|]+)\| ([^|]+)\| ([^|]+)\| ([^|]+)\|",
                   re.M)
 _TRADES = re.compile(r"^\| Enough out-of-sample trades to judge \| [^|]+ \| (?:not judged: )?(\d+) closed", re.M)
@@ -298,6 +301,13 @@ def _float(s: str) -> float | None:
 def verdict_word(g1: str | None) -> tuple[str, str]:
     """The result's word and its chip tone: Pass, Kill (a G1 FAIL) or Not judged."""
     return {"PASS": ("Pass", "running"), "FAIL": ("Kill", "halted")}.get(g1 or "", ("Not judged", "paused"))
+
+
+def double_fees(text: str) -> dict | None:
+    """The sheet's stored 2x-fee result as {"verdict": "PASS" | "FAIL", "net": "+3.1%"}, or None when it has none
+    ("not run")."""
+    m = _DOUBLE_FEES.search(text)
+    return {"verdict": m.group(1), "net": m.group(2)} if m else None
 
 
 def read_sheet(path: Path) -> dict:
@@ -328,6 +338,7 @@ def read_sheet(path: Path) -> dict:
     out = dict(f, venue=venue.group(1) if venue else None, venue_label=venue_label(venue.group(1) if venue else None),
                fee=float(taker.group(1)) / 100 if taker else None, when=when, word=word, tone=tone,
                breakeven_words=be.group(1) if be else None, breakeven=None, breakeven_kind=None,
+               double_fees=double_fees(text),
                rungs=rungs, slippage=float(slip.group(1)) / 100 if slip else None,
                means=markdown.markdown(means.group(1).strip(), extensions=["tables"]) if means and means.group(1).strip()
                else None, label=label(f["strategy"]) if f["strategy"] else path.stem.replace("_", " "))
