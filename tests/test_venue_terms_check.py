@@ -221,6 +221,7 @@ def test_an_out_of_bounds_fee_fetch_says_so_in_fixed_words(tmp_path, capfd, stor
      "ValueError: the venue refused"),
     ("URLError: <urlopen error [Errno -2] Name or service not known: api.example.com>", "URLError"),
     ("HTTPError: HTTP Error 403: Forbidden (https://api.example.com/v5/market/risk-limit)", "HTTPError: HTTP Error 403"),
+    ("connect failed to api.example.com", "connect"),
 ])
 def test_a_refused_tier_fetch_prints_only_its_first_clause(tmp_path, capfd, store, reason, said):
     """CR head 3: the public job log printed a refused tier fetch's whole reason, which can carry the venue's answer or

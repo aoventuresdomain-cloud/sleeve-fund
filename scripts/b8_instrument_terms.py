@@ -66,10 +66,13 @@ READERS = {"BINANCE": (f"{BINANCE_FAPI}/exchangeInfo", f"{BINANCE_FAPI}/fundingI
 def _first_clause(reason) -> str:
     """A refused fetch's reason, cut to its first clause for this public log (CR head 3): the stored reason can carry
     the venue's whole answer or a network error naming its host. "ValueError: the venue refused: {...}" prints as
-    "ValueError: the venue refused"; "URLError: <urlopen error ...>" as "URLError"."""
+    "ValueError: the venue refused"; "URLError: <urlopen error ...>" as "URLError". A reason with no "Type: text"
+    shape prints its first word only (CR follow-up): "connect failed to api.host" as "connect"."""
     import re
 
-    name, _, rest = str(reason or "failed").partition(": ")
+    name, sep, rest = str(reason or "failed").partition(": ")
+    if not sep:
+        return (re.split(r"[\s:(<\[{'\"]", name.strip(), maxsplit=1)[0] or "failed")[:80]
     clause = re.split(r"[:(<\[{'\"]", rest, maxsplit=1)[0].strip()
     return (f"{name}: {clause}" if clause else name)[:80]
 
