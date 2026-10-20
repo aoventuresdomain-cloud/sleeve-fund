@@ -310,3 +310,59 @@ def test_b13x_the_netting_path_places_changes_and_cancels_no_order_and_writes_no
         event.remove(store.engine, "before_cursor_execute", seen)
     assert "Total saved 12.60" in words  # the path ran in full
     assert calls == [] and writes == [], (calls, writes)
+
+
+@pytest.mark.parametrize("legs", ["UP", "DOWN"])
+def test_b13y_paper_sends_byte_identical_orders_with_the_shadow_read_on_every_tick(tmp_path, monkeypatch, legs):
+    """D4 gate (Advisor HEAD6-B14, HoE): the shadow on or off changes no order. The same recorded session is replayed
+    twice; in the second, the shadow's page view and its nightly section read the journal on every tick, as a PM
+    with the page open and the night's check would. Orders and fills are the same to the byte."""
+    import test_b14_resting_targets as b14
+
+    import sleeve_fund.supervisor as sup
+    from sleeve_fund import nightly_recon
+    from sleeve_fund.dashboard import netting_view
+    from sleeve_fund.paper.runtime import SleeveRuntime
+
+    path = getattr(b14, legs)
+    off = b14._run(tmp_path / "off", legs=path)
+    real, reads = SleeveRuntime.tick, []
+
+    def tick(self, *a, **k):
+        out = real(self, *a, **k)
+        reads.append(netting_view.view(self.store, self.now()))
+        nightly_recon.netting_shadow(self.store)
+        return out
+
+    monkeypatch.setattr(SleeveRuntime, "tick", tick)
+    monkeypatch.setattr(sup, "_in_book", lambda store, s: True)  # the replay's Strategy counts as the fund's
+    monkeypatch.setattr(sup, "fund_equity", lambda store: D("10000"))
+    on = b14._run(tmp_path / "on", legs=path)
+    assert any(r["accounts"] for r in reads) and all(r["error"] is None for r in reads)  # read every tick, worked out
+    assert b14._strip(on[1]) == b14._strip(off[1]) and b14._strip(on[2]) == b14._strip(off[2])
+
+
+def _slice(store, sleeve, oid, n, side, qty, px, fee, close="60000", bar=T1):
+    """One slice of a market order's fills, its fee as paper journals it: rounded to the cent."""
+    at = bar + timedelta(seconds=2 + n)
+    if n == 0:
+        store.record_order(sleeve, order_id=oid, side=side, qty=0.0, intent="entry", reason="test",
+                           signal={"close": float(close)}, ts=at,
+                           timing={"bar_close": _ns(bar), "bar_recv": _ns(bar), "decided": _ns(bar)})
+    store.record_fill(sleeve, side=side, qty=D(qty), price=D(px), fee=D(fee), order_id=oid, trade_id=f"t-{oid}-{n}",
+                      ts=at)
+
+
+def test_b13z_an_order_filled_in_slices_with_fees_rounded_to_the_cent_is_one_rate(store):
+    """Paper rounds each slice's fee to the cent, so slices of one 0.05% order read back as 0.04998% and 0.05003%:
+    one rate, not two. The candle is priced at what its fills paid in all (fees over notional), and a genuine second
+    rate is still refused (b13h)."""
+    _slice(store, "a", "a1", 0, "BUY", "0.1", "60030", "3.00")  # 6,003 x 0.05% = 3.0015, journaled 3.00
+    _slice(store, "a", "a1", 1, "BUY", "0.2", "60030", "6.00")  # 12,006 x 0.05% = 6.003, journaled 6.00
+    _slice(store, "b", "b1", 0, "SELL", "0.05", "59970", "1.50")  # 2,998.50 x 0.05% = 1.49925, journaled 1.50
+    _slice(store, "b", "b1", 1, "SELL", "0.05", "59970", "1.50")
+    [n] = _run(store).values()
+    # Paid 12.00 on 18,009 + 5,997 = 24,006 of notional: 0.04998750...%, to 1e-7 0.0004999. Net +0.2 at 60,030 is
+    # 12,006 of notional, 6.0017994 at that rate (rounded to 1e-8 as the netting core books it); saved 12.00 less that.
+    assert n["saving"]["fee"] == D("12.00") - (D("12006") * D("0.0004999"))
+    assert n["saving"]["crossed"] == D("6")

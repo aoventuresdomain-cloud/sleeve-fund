@@ -15,8 +15,9 @@ same figures on any later read:
   so two Strategies deciding on one close net together. An order with no decision bar (a stop or target watched on a
   trade, the risk guard's) is its own group: nothing else was decided with it (this understates the saving).
 - Crossing prices: the decision mark is the order's journaled signal close; the half spread is what that group's
-  market fills paid against it. The taker rate is the one those market fills were charged (fee / notional, to 1e-7),
-  so a fee change mid-period prices each bar at the rate then in force; fills in one group at two rates are refused.
+  market fills paid against it. The taker rate is the one those market fills were charged (fees / notional, to 1e-7,
+  within their fees' rounding: _one_rate), so a fee change mid-period prices each bar at the rate then in force; fills
+  in one group at two rates are refused.
 - Funding: no saving line (netting saves none by construction, Advisor 13 Oct 20:25 UK). Settlement charges are
   netted on the account's position; a later true-up or reversal is linear in the position, so the account books the
   sum of the Strategies' corrections, and any difference falls to the residual. The conservative baseline line stays.
@@ -34,6 +35,7 @@ from sqlalchemy import select
 from sleeve_fund.portfolio import netting as nt
 
 ZERO = Decimal(0)
+FEE_ROUNDING = Decimal("0.01")  # paper journals each fill's fee to the cent (one place of the account's currency)
 RATE_PLACES = Decimal("1e-7")  # a fee rate read back from a fill: 0.055% is 0.00055 to this, whatever the rounding
 
 
@@ -88,20 +90,36 @@ def shadow(fills: list[dict], funding: list[dict], equity: Decimal) -> dict:
     return out
 
 
-def _rate(r: dict) -> Decimal | None:
-    """The fee rate a market fill was charged, read back from the journal; None for anything else (a resting order's
-    maker fee is not what a net market order would pay)."""
+def _charged(r: dict) -> tuple[Decimal, Decimal] | None:
+    """(fee, notional) of a market fill as journaled, the taker rate it was charged read from the two; None for anything
+    else (a resting order's maker fee is not what a net market order would pay)."""
     notional = _dec(r["qty"]) * _dec(r["price"])
     if str(r["order_type"]).upper() != "MARKET" or not notional:
         return None
-    return (_dec(r["fee"]) / notional).quantize(RATE_PLACES)
+    return _dec(r["fee"]), notional
+
+
+def _one_rate(inst: str, charged: list[tuple[Decimal, Decimal]]) -> Decimal:
+    """The taker rate one candle's market fills paid in all (fees over notional, to RATE_PLACES). Paper rounds each
+    fill's fee to the cent, so slices of one order read back a little apart one by one: a fill counts as the same rate
+    while its fee is within FEE_ROUNDING of that rate's; past that it is a second rate, refused. Shortcut: a genuine
+    second rate whose difference on a fill is under a cent (a fill of tens of dollars) passes as the first; immaterial to
+    a shadow, upgrade (read the rate each fill was charged from the journal) before netting goes live."""
+    fees = sum(f for f, _ in charged)
+    rate = fees / sum(n for _, n in charged)
+    if any(abs(f - rate * n) > FEE_ROUNDING for f, n in charged):
+        seen = sorted({(f / n).quantize(RATE_PLACES) for f, n in charged})
+        raise ValueError(f"netting shadow: fills of one candle in {inst} were charged different taker rates "
+                         f"({', '.join(f'{x:%}' for x in seen)}); the Strategies on one account must pay the same "
+                         "taker fee")
+    return rate.quantize(RATE_PLACES)
 
 
 def _account(rows: list[dict], funding_rows: list[dict], key, equity: Decimal) -> dict:
     fills: list[nt.Fill] = []
     marks: dict[tuple[str, int], Decimal] = {}
     halves: dict[tuple[str, int], Decimal] = {}
-    rates: dict[tuple[str, int], set[Decimal]] = defaultdict(set)
+    charged: dict[tuple[str, int], list[tuple[Decimal, Decimal]]] = defaultdict(list)
     for r in rows:
         qty = _dec(r["qty"])
         if not qty:
@@ -112,8 +130,8 @@ def _account(rows: list[dict], funding_rows: list[dict], key, equity: Decimal) -
         side = 1 if str(r["side"]).upper() == "BUY" else -1
         px = _dec(r["price"])
         fills.append(nt.Fill(r["sleeve"], r["instrument"], ts, side * qty, px, _dec(r["fee"])))
-        if (rate := _rate(r)) is not None:
-            rates[(r["instrument"], ts)].add(rate)
+        if (paid := _charged(r)) is not None:
+            charged[(r["instrument"], ts)].append(paid)
         close = (r["signal"] or {}).get("close") if r["bar_close"] is not None else None
         if close and (r["instrument"], ts) not in marks:
             marks[(r["instrument"], ts)] = _dec(close)
@@ -121,11 +139,7 @@ def _account(rows: list[dict], funding_rows: list[dict], key, equity: Decimal) -
     first = {}
     for f in fills:
         first.setdefault((f.instrument, f.ts), f)
-    for (inst, _ts), seen in rates.items():
-        if len(seen) > 1:
-            raise ValueError(f"netting shadow: fills of one candle in {inst} were charged different taker rates "
-                             f"({', '.join(f'{x:%}' for x in sorted(seen))}); the Strategies on one account must pay "
-                             "the same taker fee")
+    rates = {(inst, ts): _one_rate(inst, paid) for (inst, ts), paid in charged.items()}
 
     def mark(inst: str, ts: int) -> Decimal:
         return marks.get((inst, ts), first[(inst, ts)].price)
@@ -134,10 +148,9 @@ def _account(rows: list[dict], funding_rows: list[dict], key, equity: Decimal) -
         return halves.get((inst, ts), ZERO)
 
     def taker(inst: str, ts: int) -> Decimal:
-        seen = rates.get((inst, ts))
-        if not seen:
+        if (rate := rates.get((inst, ts))) is None:
             raise ValueError(f"netting shadow: no market fill in {inst} at a crossing candle to read the taker rate from")
-        return next(iter(seen))
+        return rate
 
     charged = [r for r in funding_rows if r["charge"]]
     funding = [nt.Funding(r["sleeve"], r["instrument"], _ns(r["ts"]), _dec(r["rate"]), _dec(r["price"]),
