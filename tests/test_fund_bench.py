@@ -231,20 +231,11 @@ def test_the_recent_curve_draws_the_funds_hold_in_place_of_the_rows(tmp_path, mo
 
 def test_the_records_page_shows_the_funds_hold_for_the_window_and_each_month(tmp_path, monkeypatch):
     """CR M2: the Records page passes the fund's hold to Reports: a figure in the month table and the window."""
-    from fastapi.testclient import TestClient
-
-    from sleeve_fund.dashboard import app as app_mod
     from sleeve_fund.dashboard import book as bookm
     from sleeve_fund.dashboard import reports
 
     store, summaries, frames = _fund_book(tmp_path, monkeypatch)
-    monkeypatch.setenv("DASHBOARD_PASSWORD", "test-pw")
-    monkeypatch.setenv("TEARSHEET_DIR", str(tmp_path))
-    monkeypatch.setenv("BACKUP_DIR", str(tmp_path / "backups"))
-    monkeypatch.delenv("DEMO_MIRROR", raising=False)
-    monkeypatch.setattr(app_mod, "TEARSHEETS", tmp_path)
-    monkeypatch.setattr(app_mod, "LEDGER", tmp_path / "idea_ledger.jsonl")
-    page = TestClient(app_mod.create_app(store)).get("/records", auth=("pm", "test-pw"))
+    page = _client(store, tmp_path, monkeypatch).get("/records", auth=("pm", "test-pw"))
     assert page.status_code == 200, page.text[-2000:]
     base = bookm.fund_cash(store)
     [row] = reports.monthly(summaries, frames, {}, base, partial(fund_hold, store))["rows"]
@@ -272,3 +263,30 @@ def test_b41_a_book_whose_peak_is_0_reads_no_drawdown_and_never_raises(tmp_path,
     assert list(curve["drawdown"]) == [0.0] * len(curve)
     recent = bookm.recent_curve(store, [store.sleeve("s1")], 7, None, 0.0)
     assert set(recent["drawdown"]) <= {0.0}
+
+
+def _client(store, tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from sleeve_fund.dashboard import app as app_mod
+
+    monkeypatch.setenv("DASHBOARD_PASSWORD", "test-pw")
+    monkeypatch.setenv("TEARSHEET_DIR", str(tmp_path))
+    monkeypatch.setenv("BACKUP_DIR", str(tmp_path / "backups"))
+    monkeypatch.delenv("DEMO_MIRROR", raising=False)
+    monkeypatch.setattr(app_mod, "TEARSHEETS", tmp_path)
+    monkeypatch.setattr(app_mod, "LEDGER", tmp_path / "idea_ledger.jsonl")
+    return TestClient(app_mod.create_app(store))
+
+
+def test_inside_the_fund_with_no_stored_closes_the_books_benchmark_is_n_a(tmp_path, monkeypatch):
+    """CR F1, TEC-B34-NA (HoE): no hold to read inside the fund is n/a (None), never the book's cash read as 0.00%;
+    the pages that take the book still open."""
+    from sleeve_fund.dashboard import book as bookm
+
+    store, summaries, frames = _fund_book(tmp_path, monkeypatch)
+    monkeypatch.setattr(bookm, "fund_line", lambda *a: None)
+    assert bookm.book_view(store, summaries, frames)["bench_ret"] is None
+    c = _client(store, tmp_path, monkeypatch)
+    for path in ("/", "/risk", "/records"):
+        assert c.get(path, auth=("pm", "test-pw")).status_code == 200, path

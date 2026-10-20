@@ -209,7 +209,8 @@ def book_view(store: Store, summaries: list[dict], frames: dict[str, pd.DataFram
         "pnl": equity - start,
         "ret": equity / start - 1 if start else 0.0,
         # inside the fund its hold, to the latest stored close (never a day behind); else the Strategies' own rows
-        "bench_ret": (float(line.values.iloc[-1]) / start - 1 if held
+        # inside the fund with no hold to read (no stored closes): n/a, never the book's cash read as 0.00% (TEC-B34-NA)
+        "bench_ret": (float(line.values.iloc[-1]) / start - 1 if held else None if base
                       else ((sum(x["benchmark"] for x in active) + base) / start - 1) if start else 0.0),
         "bench_as_of": line.as_of if held else None,
         "bench_source": line.source if held else None,
