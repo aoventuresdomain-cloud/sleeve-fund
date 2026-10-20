@@ -4336,7 +4336,8 @@ class LongFlatStrategy(Strategy):
 
     def _tick(self) -> float | None:
         """The instrument's price tick, which a liquidation price rounds to toward the entry (margin.to_tick)."""
-        inc = getattr(self.instrument, "price_increment", None) if self.instrument is not None else None
+        instrument = getattr(self, "instrument", None)  # a test's stub may hold none: no rounding, as before
+        inc = getattr(instrument, "price_increment", None) if instrument is not None else None
         return float(inc) if inc is not None else None
 
     def _held_qty(self, qty: float) -> float:
@@ -4425,7 +4426,9 @@ class LongFlatStrategy(Strategy):
             return None
         entry = self._entry_px if self._entry_px else self._net_position()[1]
         return markets.isolated_liquidation(cash + LongFlatStrategy._funded(self), qty, entry,
-                                            LongFlatStrategy._max_leverage(self), table)
+                                            LongFlatStrategy._max_leverage(self), table,
+                                            fees=getattr(self, "_entry_fees", 0.0),  # a stub book may hold none
+                                            tick=LongFlatStrategy._tick(self))
 
     def _hold_stop_capped(self, asked: float) -> bool:
         """Set the stop for `asked`, held inside the half-liquidation cap (_capped_stop). Journals a clamp only when
