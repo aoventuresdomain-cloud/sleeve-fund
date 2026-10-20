@@ -77,7 +77,9 @@ def _engine_liquidation(store, s):  # noqa: F811
     funded = float(supervisor.fund_book(store).total) * VIRTUAL_HEADROOM
     lev = risk.leverage_cap(risk.profile(s.risk_profile), s.params)
     cash = -QTY * ENTRY - FEE
-    return margin.isolated_liquidation(cash + funded, QTY, ENTRY, lev, t.maintenance_margin), QTY * ENTRY / lev
+    # the entry fee off the margin (LIQ-FEE, B-15); no tick yet (B-36 tick)
+    return (margin.isolated_liquidation(cash + funded, QTY, ENTRY, lev, t.maintenance_margin, fees=FEE),
+            QTY * ENTRY / lev)
 
 
 def _words(c, path):
@@ -241,7 +243,7 @@ def test_not_held_a_strategy_with_its_own_capital_reads_as_before(c, store):  # 
     lev = risk.leverage_cap(risk.profile(s.risk_profile), s.params)
     t, _ = markets.held_terms(s.params, s.venue, s.instrument)
     assert row["liq_px"] == pytest.approx(margin.isolated_liquidation(10_000 - QTY * ENTRY - FEE, QTY, ENTRY, lev,
-                                                                      t.maintenance_margin))
+                                                                      t.maintenance_margin, fees=FEE))
 
 
 def test_the_withdrawal_preview_and_the_risk_page_read_the_saved_size_limits(c, store, monkeypatch):  # noqa: F811
