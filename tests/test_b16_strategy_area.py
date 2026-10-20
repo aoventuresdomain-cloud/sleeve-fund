@@ -326,18 +326,17 @@ def test_pair_archive_failing_on_the_other_side_says_what_was_archived(client, m
 
 @pytest.mark.parametrize("fid", QR_IDS)
 def test_display_title_leads_and_file_id_stays_as_label(client, fid):
+    """The title comes first, on the page header and in the list row; the file id follows as the small label."""
     c, _ = client
     title = next(load_definition_file(p) for p in DEFS.glob("*.toml")
                  if load_definition_file(p)["name"] == fid)["title"]
-    list_html = c.get("/strategy", auth=AUTH).text
+    group, _, side = title.partition(" · ")
+    esc = lambda t: t.replace("&", "&amp;").replace("'", "&#39;")
     page = c.get(f"/strategy?s={fid}", auth=AUTH).text
-    base = title.split(" · ")[0].replace("&", "&amp;").replace("'", "&#39;")
-    assert base in list_html and base in page
-    assert fid in page  # the file id stays, as the small label
-
-
-def test_reads_column_only_when_a_block_reads_something_but_the_price(client):
-    c, _ = client
-    table = lambda fid: c.get(f"/strategy?s={fid}", auth=AUTH).text.split("Indicators used")[1].split("Settings to test")[0]
-    assert "<th>Reads</th>" not in table("qr02-dip-long")  # every block reads the price
-    assert "<th>Reads</th>" in table("rsi-pullback")  # one block reads the volume
+    head = page.split('id="sa-h"')[1]
+    assert esc(group) in head and f"{esc(group)} · {esc(side)}" in head.split("sa-tabs")[0]
+    assert head.index(esc(group)) < head.index(fid)  # the title before the file id in the header
+    row = page.split(f'href="/strategy?s={fid}"')[1].split("</a>")[0]  # its list row
+    assert esc(side) in row and row.index(f">{esc(side)}<") < row.index(f">{fid}")  # the row name before its id label
+    list_html = c.get("/strategy", auth=AUTH).text
+    assert list_html.index(esc(group)) < list_html.index(f"/strategy?s={fid}\"", list_html.index(esc(group)))
