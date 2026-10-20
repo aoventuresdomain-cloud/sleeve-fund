@@ -1217,6 +1217,8 @@ table.movers tbody tr.tot th, table.movers tbody tr.tot td { border-top: 1px sol
 .picklist .pl-menu .opt small.paused { color: var(--warn); }
 .picklist .pl-menu .opt[aria-selected="true"] { background: var(--accent-soft); }
 .picklist .pl-menu .opt.own { color: var(--accent); }
+.picklist .pl-menu .opt.off { cursor: not-allowed; color: var(--faint); flex-wrap: wrap; }
+.picklist .pl-menu .opt.off small { white-space: normal; color: var(--warn); }
 .picklist .pl-menu .none { padding: 8px; font-size: 12.5px; color: var(--muted); }
 .picklist .pl-badge { margin: 4px 0 0; min-height: 1em; }
 .picklist .pl-badge.running { color: var(--gain); }

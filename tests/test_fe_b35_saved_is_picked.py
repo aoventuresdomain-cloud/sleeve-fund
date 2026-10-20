@@ -126,3 +126,37 @@ def test_every_model_on_its_default_chip_saves_as_itself_or_says_why(held_site, 
         assert errors == [], (c["name"], errors)
         page.context.close()
     assert swapped == {}, swapped
+
+
+
+def _perp_entry(page):
+    """Opens the instrument list, types BTC/USDT and returns its perpetual entry: (greyed, text)."""
+    page.fill("#instrument", "")
+    page.click("#instrument")
+    page.type("#instrument", "BTC/USDT")
+    opt = page.locator("#instrument-list [role=option]", has_text="BTC/USDT").filter(has_text="perpetual").first
+    opt.wait_for(state="visible", timeout=5000)
+    return opt.get_attribute("aria-disabled") == "true", opt.inner_text(), opt
+
+
+def test_donchian_never_lands_on_a_perpetual_with_no_chip_to_pick(held_site, browser):  # noqa: F811
+    """QT3 on merge 9 (s5-donchian.tsv: BTC/USDT perpetual, "FAIL no candle chip offered"): Donchian picked, then the
+    perpetual picked from the instrument list, left the PM on a model with every chip greyed, a dead end. With such a
+    model picked, the list greys that market with the reason in words and a click on it changes nothing; a model that
+    can trade it picks it as before."""
+    base, store = held_site
+    before = _saved(store)
+    page, errors = _open(browser, f"{base}/sleeves/new?{WHERE['spot'][0]}&strategy=donchian")
+    greyed, text, opt = _perp_entry(page)
+    assert greyed and "Not for this model" in text, text
+    opt.click(force=True)
+    assert page.input_value("[data-pl-venue]") == "kraken" and page.input_value("#strategy") == "donchian"
+    assert any(offered for _, offered in _chips(page))  # its daily chip is still there to pick
+    page.evaluate("""() => { const s = document.getElementById("strategy"); s.value = "buy_and_hold";
+        s.dispatchEvent(new Event("change", {bubbles: true})); }""")
+    greyed, text, opt = _perp_entry(page)
+    assert not greyed, text
+    opt.click()
+    assert page.input_value("[data-pl-venue]") == "binance"
+    assert _saved(store) == before and errors == []
+    page.context.close()
