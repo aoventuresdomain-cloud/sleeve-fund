@@ -204,7 +204,8 @@ def test_0029_migrated_table_equals_create_alls_and_refuses_edits(engine, tmp_pa
 def test_0029_downgrade_refuses_while_fetches_are_kept(engine):
     from alembic import command
 
-    schema.migrate(engine, log=lambda _: None)
+    with engine.begin() as conn:  # at 0029 itself: "-1" from a later head would run a later migration's downgrade
+        command.upgrade(schema._config(conn), "0029")
     with engine.begin() as c:
         c.execute(text("INSERT INTO venue_terms_fetch (venue, kind, instrument, source, fetched_at, ok, reason) "
                        "VALUES ('BINANCE', 'fee', 'BTC/USDT', 'fee-rate', :t, 0, 'timeout')"), {"t": T})

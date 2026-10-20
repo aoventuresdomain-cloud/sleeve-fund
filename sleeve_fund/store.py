@@ -561,6 +561,42 @@ for _sql in VENUE_FETCH_PG:
 for _sql in VENUE_FETCH_SQLITE:
     event.listen(venue_terms_fetch_t, "after_create", DDL(_sql).execute_if(dialect="sqlite"))
 
+# B-23 (Advisor B23-ACCOUNT-CAPITAL, 20 Oct): every read of a venue account's marked equity (wallet plus unrealised, in
+# USDT; never the available balance) is one row, kept whether it worked or not, shaped like venue_terms_fetch. The
+# payload keeps the venue's decimal strings and the fund's book at the read, so the gap is judged against the book
+# of the same moment. anchor = 1 marks the paper reading the gap is measured from (a journaled anchor: a fixed
+# starting difference between the demo account and the book is not a gap). Append-only, held by the database.
+account_capital_fetch_t = Table(
+    "account_capital_fetch",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("account", String(41), nullable=False),  # a label, never a key
+    Column("fetched_at", TS, nullable=False),
+    Column("ok", Integer, nullable=False),
+    Column("reason", Text, nullable=False, default=""),
+    Column("payload", JSON, nullable=True),
+    Column("anchor", Integer, nullable=False, default=0),
+    CheckConstraint("ok IN (0, 1)", name="account_capital_fetch_ok"),
+    CheckConstraint("anchor IN (0, 1)", name="account_capital_fetch_anchor"),
+    CheckConstraint("(ok = 1 AND reason = '') OR (ok = 0 AND reason <> '')", name="account_capital_fetch_reason"),
+    CheckConstraint("ok = 0 OR payload IS NOT NULL", name="account_capital_fetch_payload"),
+    CheckConstraint("anchor = 0 OR ok = 1", name="account_capital_fetch_anchor_good"),
+    Index("ix_account_capital_latest", "account", "ok", "fetched_at", "id"),
+)
+ACCOUNT_FETCH_WORM = "account_capital_fetch is append-only: a read is never edited or deleted, a new read is a new row"
+ACCOUNT_FETCH_PG = (
+    "CREATE OR REPLACE FUNCTION account_capital_fetch_append_only() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+    f"RAISE EXCEPTION USING ERRCODE = 'check_violation', MESSAGE = '{ACCOUNT_FETCH_WORM}'; END $$",
+    "CREATE TRIGGER account_capital_fetch_append_only BEFORE UPDATE OR DELETE ON account_capital_fetch FOR EACH ROW "
+    "EXECUTE FUNCTION account_capital_fetch_append_only()",
+)
+ACCOUNT_FETCH_SQLITE = tuple(f"CREATE TRIGGER account_capital_fetch_no_{o.lower()} BEFORE {o} ON account_capital_fetch "
+                             f"BEGIN SELECT RAISE(ABORT, '{ACCOUNT_FETCH_WORM}'); END" for o in ("UPDATE", "DELETE"))
+for _sql in ACCOUNT_FETCH_PG:
+    event.listen(account_capital_fetch_t, "after_create", DDL(_sql).execute_if(dialect="postgresql"))
+for _sql in ACCOUNT_FETCH_SQLITE:
+    event.listen(account_capital_fetch_t, "after_create", DDL(_sql).execute_if(dialect="sqlite"))
+
 
 def _fee_problem(payload, bounds) -> str:
     """Why a fetched fee payload can't be last-known-good, or "" when it can (both rates decimal strings, each inside
@@ -3414,6 +3450,44 @@ class Store:
     def latest_venue_fetch(self, venue: str, kind: str, instrument: str) -> dict | None:
         """The newest fetch, good or failed: what an alert says went wrong last."""
         return self._latest_venue_fetch(venue, kind, instrument, good=False)
+
+    def record_account_read(self, account: str, *, ok: bool, reason: str = "", payload: dict | None = None,
+                            at: datetime | None = None, anchor: bool = False) -> int:
+        """B-23: keep one read of `account`'s marked equity, good or not, and return its id. A good read's payload is
+        the venue's decimal strings (account_capital.wallet_payload) plus the book at the read; a failed one keeps
+        why. anchor: this good read is the one a paper gap is measured from."""
+        if payload is not None:
+            _strings_only(payload)
+        if not ok and not reason:
+            raise ValueError("a failed read keeps its reason")
+        if ok and payload is None:
+            raise ValueError("a good read keeps what it read")
+        if anchor and not ok:
+            raise ValueError("only a good read can be the anchor")
+        with self.engine.begin() as c:
+            return c.execute(insert(account_capital_fetch_t).values(
+                account=account, fetched_at=at or utcnow(), ok=int(bool(ok)), reason="" if ok else reason,
+                payload=payload, anchor=int(bool(anchor)))).inserted_primary_key[0]
+
+    def account_reads(self, account: str, *, good: bool = False, anchor: bool = False, limit: int = 1) -> list[dict]:
+        """`account`'s newest reads, newest first (equal times go to the later row): good ones only, or only anchors."""
+        t = account_capital_fetch_t
+        q = select(t).where(t.c.account == account)
+        if good or anchor:
+            q = q.where(t.c.ok == 1)
+        if anchor:
+            q = q.where(t.c.anchor == 1)
+        with self.engine.connect() as c:
+            rows = _rows(c.execute(q.order_by(t.c.fetched_at.desc(), t.c.id.desc()).limit(limit)))
+        for r in rows:
+            r["fetched_at"] = _aware(r["fetched_at"])
+        return rows
+
+    def ack_of(self, event_id: int) -> dict | None:
+        """The PM's acknowledgement of this alert (who, when, note), or None."""
+        with self.engine.connect() as c:
+            rows = _rows(c.execute(select(acks_t).where(acks_t.c.event_id == event_id)))
+        return rows[0] if rows else None
 
     def set_signal_state(self, sleeve: str, payload: dict, ts: datetime | None = None) -> None:
         """Paper only: the model's conditions on the forming candle, replacing the last ones (Signals tab)."""

@@ -1,0 +1,12 @@
+{# B-23: the account's marked equity (wallet plus unrealised) against the book at the same read, and the gap. Display
+   only: on paper the book sizes every entry. #}
+<section class="ledger" aria-label="Account and book" title="{{ acct.words|no_venues }}">
+  {% if acct.never %}
+  <div><div class="k">Account vs book</div><div class="v faint">Not read yet</div><div class="s">{{ (acct.failure or "waiting for the first read")|no_venues }}</div></div>
+  {% else %}
+  <div><div class="k">Account</div><div class="v">{{ acct.account|money }}</div><div class="s{{ ' warn' if acct.stale }}">marked equity, read {{ acct.read_at|uk_time if acct.read_at else '' }}{% if acct.stale %}, last good read {{ acct.age }}{% endif %}</div></div>
+  <div><div class="k">Book</div><div class="v">{{ acct.book|money }}</div><div class="s">at the same read</div></div>
+  <div><div class="k">Gap</div><div class="v {{ acct.tone }}">{{ acct.gap|smoney }}</div><div class="s">{{ '%.2f'|format(acct.share * 100) }}% of book, {{ acct.basis }}; alert above {{ acct.alert_at|money }}</div></div>
+  {% endif %}
+  <div><div class="k">Sizing</div><div class="v">Book</div><div class="s">{{ acct.setting }}{% if acct.other %} · other assets ignored: {{ acct.other|join(', ') }}{% endif %}{% if acct.failure and not acct.never %} · last read failed: {{ acct.failure|no_venues }}{% endif %}</div></div>
+</section>

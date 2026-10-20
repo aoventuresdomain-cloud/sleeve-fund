@@ -426,6 +426,28 @@ def check_venue_terms(store, now=None) -> Section:
     return sec
 
 
+def check_account_capital(store, environ=None, now=None) -> Section:
+    """B-23 (Advisor B23-ACCOUNT-CAPITAL): the paper account against the book, as the dashboard shows it, and "Size from
+    the account figure", which ships OFF. On paper both are NOTEs: sizing is from the book and a failed or stale read
+    only warns. ON with a live account holding a Strategy is a FAIL: sizing from the account isn't wired into the
+    entry check yet (after G2), so it must not look switched on."""
+    from datetime import UTC, datetime
+
+    from sleeve_fund import account_capital
+
+    sec = Section("Account capital")
+    now = now or datetime.now(UTC)
+    sec.add(NOTE, account_capital.view(store, "paper", now).words)
+    live = sorted({a for a in (store.account_of(s.name) for s in store.sleeves()) if store.account_kind(a) == "live"})
+    takes_effect, words = account_capital.setting_words(environ, bool(live))
+    if takes_effect:
+        sec.add(FAIL, f"{words}, but it isn't wired into the entry check yet (after G2), so it is refused: switch "
+                      f"{account_capital.SETTING_ENV} off ({', '.join(live)})")
+    else:
+        sec.add(NOTE, words)
+    return sec
+
+
 def check_assets(store) -> Section:
     """A multi-asset Strategy asset by asset (multi-asset spec §7): every listed asset has its row, and every journal
     row is keyed to its own row's asset (DA 0028's reconcile, store.asset_mismatches). One failing asset fails, named."""
@@ -493,7 +515,7 @@ def run(url: str, environ: dict[str, str] | None = None) -> tuple[bool, str]:
     sections = [check_store(engine), check_keys(env, engine), check_exec_target(env, exec_gates(env, engine)),
                 check_alerts(env), check_venues(engine), check_maintenance(store), check_venue_terms(store),
                 check_books(store), check_assets(store), check_warmups(store), check_account_sharing(env, engine),
-                check_strength(store)]
+                check_strength(store), check_account_capital(store, env)]
     ok = not any(s.failed for s in sections)
     out = [f"Start check: {'PASS' if ok else 'FAIL'}",
            f"{datetime.now(UTC):%Y-%m-%d %H:%M} UTC, {journal_kind(url)} journal, read-only",

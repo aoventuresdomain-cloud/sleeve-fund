@@ -32,6 +32,7 @@ from sleeve_fund import compliance_rules, lifecycle, liquidation, markets, open_
 from sleeve_fund.dashboard import book as bookm
 from sleeve_fund.dashboard import development as dev
 from sleeve_fund.dashboard import assets, attribution, compliance, gates, legs, reasons, reports, riskops, trading, withdrawal
+from sleeve_fund.dashboard.account_view import account_view
 from sleeve_fund.dashboard.jobs import Jobs
 from sleeve_fund.dashboard.metrics import STALE, held_by_fund, sleeve_summary
 from sleeve_fund.data import spec_minutes
@@ -327,6 +328,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                     test_names={x["sleeve"].name for x in tests},
                     # F-A1-FUNDLINE: every Strategy in the book, archived ones too, so the rows add up to the fund.
                     fund_attr=attribution.fund(st(), [x["sleeve"] for x in summaries], utcnow()),
+                    acct=account_view(st(), utcnow()),  # B-23: account vs book and the gap, display only
                     **_archived_now(request, put_away))
 
     def _archived_now(request: Request, put_away) -> dict:
@@ -407,7 +409,8 @@ def create_app(store: Store | None = None) -> FastAPI:
                     halt_name=halt[0] if halt else None, stress=riskops.stress_bars(risk["scenarios"]),
                     status=riskops.status_word(riskops.status_items(risk["rows"], health), running),
                     ops=riskops.ops_view(st(), every), shell=shell(sleeves + [x["sleeve"] for x in tests]), kill=kill,
-                    kill_error=request.query_params.get("kill_error"), killed=request.query_params.get("killed"))
+                    kill_error=request.query_params.get("kill_error"), killed=request.query_params.get("killed"),
+                    acct=account_view(st(), utcnow()))  # B-23
 
     def _kill_targets(summaries) -> dict:
         """Who the kill switch acts on: every strategy still trading (running and not halted) and every

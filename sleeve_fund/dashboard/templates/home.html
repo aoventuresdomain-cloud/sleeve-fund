@@ -47,6 +47,7 @@
   <div class="kpi" title="Worst {{ book.max_drawdown|pct1 }}{% if closest and not closest.in_fund %} · closest to halt: {{ closest.sleeve.name }}, {{ closest.dd_used|pct0 }} of its limit used{% endif %}"><div class="k">Drawdown</div><div class="v {{ 'loss' if book.drawdown >= 0.05 }}">{{ book.drawdown|pct1 }}</div></div>
   <div class="kpi" title="Fees {{ book.fees|money }} · funding {{ 'paid' if book.funding_paid >= 0 else 'received' }} {{ book.funding_paid|abs|money }}{{ cost_share(book) }}"><div class="k">Fees and funding</div><div class="v">{{ book.fees_funding|money }}</div></div>
 </section>
+{% if acct is defined %}{% include "_account.html" %}{% endif %}
 
 <div class="grid">
   <section class="panel span-8" aria-labelledby="curve-h" data-live="off">
