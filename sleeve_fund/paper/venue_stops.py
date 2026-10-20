@@ -32,8 +32,10 @@ DIRECTION = {"SELL": 2, "BUY": 1}  # a long's sell stop triggers on a fall (2), 
 
 class VenueStops:
     def __init__(self, base_url: str, *, symbol: str, api_key: str, api_secret: str, limiter: Limiter,
-                 now_ms=None, timeout_s: float = 5.0) -> None:
+                 now_ms=None, timeout_s: float = 5.0, read_only: bool = False) -> None:
+        """read_only: the connect check's reads (venue_reads); every write raises before anything is sent."""
         self.base_url, self.symbol, self.limiter, self.timeout_s = base_url.rstrip("/"), symbol, limiter, timeout_s
+        self.read_only = read_only
         self._key, self._secret = api_key, api_secret
         self._now_ms = now_ms or (lambda: int(time.time() * 1000))
 
@@ -81,6 +83,8 @@ class VenueStops:
             raise ValueError(f"{order_id!r} is not a fund order id of at most 36 characters: never sent")
 
     def _post(self, endpoint: str, body: dict) -> tuple:
+        if self.read_only:  # place and cancel both come here: a read-only client never writes (TEC-B05-KEYS)
+            raise PermissionError(f"a read-only venue client never writes ({endpoint})")
         self.limiter.take(endpoint, opening=False)  # protective: never held back
         raw = json.dumps(body, separators=(",", ":"))
         answer = self._send("POST", f"/v5/{endpoint}", raw, raw.encode())

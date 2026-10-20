@@ -15,7 +15,7 @@ class VenueReads:
     def __init__(self, base_url: str, *, api_key: str, api_secret: str, limiter: Limiter, now_ms=None,
                  timeout_s: float = 5.0) -> None:
         self._client = VenueStops(base_url, symbol="", api_key=api_key, api_secret=api_secret, limiter=limiter,
-                                  now_ms=now_ms, timeout_s=timeout_s)
+                                  now_ms=now_ms, timeout_s=timeout_s, read_only=True)
         self.limiter = limiter
 
     def __repr__(self) -> str:  # never the key or the secret
