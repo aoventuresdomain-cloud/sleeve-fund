@@ -18,7 +18,7 @@ class FakeDemo(mirror.BybitDemo):
 
     def __init__(self, held=0.0):
         super().__init__(mirror.Settings("k", "s"), http=self.http)
-        self.orders, self.held = [], held
+        self.orders, self.held, self.fail = [], held, False
 
     def http(self, method, url, headers, body):
         if "/v5/position/list" in url:
@@ -26,6 +26,8 @@ class FakeDemo(mirror.BybitDemo):
             return {"retCode": 0, "result": {"list": [{"symbol": "BTCUSDT", "side": side, "size": str(abs(self.held))}]}}
         if "/v5/order/realtime" in url:
             return {"retCode": 0, "result": {"list": [{"avgPrice": "60000"}]}}
+        if self.fail:
+            return {"retCode": 110007, "retMsg": "ab not enough for new order"}
         o = json.loads(body)
         self.orders.append(o)
         move = (1 if o["side"] == "Buy" else -1) * float(o["qty"])
@@ -53,6 +55,14 @@ def _drop_schemas():
             with admin.begin() as c:
                 c.execute(text(f"DROP SCHEMA IF EXISTS {name} CASCADE"))
         admin.dispose()
+
+
+@pytest.fixture(autouse=True)
+def _fresh_warnings():
+    """The mirror warns once per gap or failure per process; each cell starts as a fresh process."""
+    getattr(mirror, "_GAP_ALERTED", {}).clear()
+    mirror._CATCH_UP_FAILED.clear()
+    yield
 
 
 def _journal():
@@ -216,3 +226,123 @@ def test_two_long_names_never_share_a_reset_link_id():
     mirror.mirror_once(store, targets)
     resets = [o["orderLinkId"] for o in demo.orders if "-reset-" in o["orderLinkId"]]
     assert len(resets) == 2 and len(set(resets)) == 2
+
+
+# --- Advisor ruling B33-DEMO-COPY (20 Oct): copies sized by their effect on the shared paper net ------------------
+
+def test_an_exit_that_moves_the_shared_net_away_from_zero_goes_as_a_plain_order():
+    """A long 1, B short 2: net -1, the demo -1. A's exit of 1 takes the paper net to -2, so the demo sells 1 as a
+    plain order (reduce-only would be refused on a short and fixed late by catch_up)."""
+    store, demo = _store("a", "b"), FakeDemo()
+    targets = _start(store, demo)
+    _order(store, "a", "a1", "BUY", 1.0)
+    _piece(store, "a", "a1", "BUY", 1.0, 1, "filled")
+    _order(store, "b", "b1", "SELL", 2.0)
+    _piece(store, "b", "b1", "SELL", 2.0, 1, "filled")
+    mirror.mirror_once(store, targets)
+    assert demo.held == pytest.approx(-1.0)
+    _order(store, "a", "a2", "SELL", 1.0, intent="exit")
+    _piece(store, "a", "a2", "SELL", 1.0, 1, "filled")
+    mirror.mirror_once(store, targets)
+    last = demo.orders[-1]
+    assert (last["side"], last["qty"], last.get("reduceOnly")) == ("Sell", "1", None)
+    assert demo.held == pytest.approx(-2.0)
+
+
+def test_the_15_oct_exit_is_reduce_only_and_cannot_open_a_short():
+    store, demo = _store(), FakeDemo()
+    targets = _start(store, demo)
+    _order(store, "bn-ls", "o1", "BUY", 1.0)
+    _piece(store, "bn-ls", "o1", "BUY", 1.0, 1, "filled")
+    mirror.mirror_once(store, targets)
+    _order(store, "bn-ls", "o2", "SELL", 1.0, intent="exit")
+    _piece(store, "bn-ls", "o2", "SELL", 1.0, 1, "filled")
+    mirror.mirror_once(store, targets)
+    last = demo.orders[-1]
+    assert (last["side"], last["qty"], last["reduceOnly"]) == ("Sell", "1", True) and demo.held == 0.0
+
+
+def test_a_reversal_is_a_reduce_only_part_to_zero_then_a_plain_part_to_the_paper_net():
+    store, demo = _store(), FakeDemo()
+    targets = _start(store, demo)
+    _order(store, "bn-ls", "o1", "BUY", 0.5)
+    _piece(store, "bn-ls", "o1", "BUY", 0.5, 1, "filled")
+    mirror.mirror_once(store, targets)
+    _order(store, "bn-ls", "o2", "SELL", 0.8, intent="entry")  # close and reverse
+    _piece(store, "bn-ls", "o2", "SELL", 0.8, 1, "filled")
+    mirror.mirror_once(store, targets)
+    assert [(o["qty"], o.get("reduceOnly")) for o in demo.orders[1:]] == [("0.5", True), ("0.3", None)]
+    assert demo.held == pytest.approx(-0.3)
+
+
+def test_an_entry_never_takes_the_demo_past_the_paper_net():
+    store, demo = _store(), FakeDemo(held=0.2)  # bought by hand on the demo account
+    targets = _start(store, demo)
+    _order(store, "bn-ls", "o1", "BUY", 0.3)
+    _piece(store, "bn-ls", "o1", "BUY", 0.3, 1, "filled")
+    mirror.mirror_once(store, targets)
+    assert [o["qty"] for o in demo.orders] == ["0.1"] and demo.held == pytest.approx(0.3)
+
+
+def test_a_restart_between_two_partial_fills_still_gives_exactly_one_order():
+    """Held fills live in the journal (pending rows), not the process: a fresh mirror (a restart) rebuilds them."""
+    store, demo = _store(), FakeDemo()
+    targets = _start(store, demo)
+    _order(store, "bn-ls", "o1", "BUY", 0.2)
+    _piece(store, "bn-ls", "o1", "BUY", 0.1, 1, "partially_filled")
+    mirror.mirror_once(store, targets)
+    getattr(mirror, "_GAP_ALERTED", {}).clear()  # the restart: the process's memory is gone; only the journal is left
+    mirror._CATCH_UP_FAILED.clear()
+    _piece(store, "bn-ls", "o1", "BUY", 0.1, 2, "filled")
+    mirror.mirror_once(store, {"BYBIT": demo})
+    mirror.mirror_once(store, {"BYBIT": demo})
+    assert [o["qty"] for o in demo.orders] == ["0.2"] and demo.held == pytest.approx(0.2)
+
+
+def test_a_resting_order_still_open_after_two_cycles_sends_what_has_filled_then_groups_the_rest():
+    from datetime import timedelta
+
+    from sleeve_fund.store import utcnow
+
+    store, demo = _store(), FakeDemo()
+    targets = _start(store, demo)
+    t0 = utcnow()
+    _order(store, "bn-ls", "o1", "BUY", 0.3)
+    _piece(store, "bn-ls", "o1", "BUY", 0.1, 1, "partially_filled")
+    mirror.mirror_once(store, targets, now=t0)
+    assert mirror.mirror_once(store, targets, now=t0 + timedelta(seconds=mirror.POLL_SECONDS)) == 0
+    assert mirror.mirror_once(store, targets, now=t0 + timedelta(seconds=mirror.HOLD_SECONDS)) == 1
+    assert [o["qty"] for o in demo.orders] == ["0.1"]
+    _piece(store, "bn-ls", "o1", "BUY", 0.1, 2, "partially_filled")
+    _piece(store, "bn-ls", "o1", "BUY", 0.1, 3, "filled")
+    mirror.mirror_once(store, targets, now=t0 + timedelta(seconds=3 * mirror.HOLD_SECONDS))
+    assert [o["qty"] for o in demo.orders] == ["0.1", "0.2"] and demo.held == pytest.approx(0.3)
+
+
+def test_catch_up_never_sends_past_the_paper_net():
+    store, demo = _store(), FakeDemo()
+    targets = _start(store, demo)
+    _order(store, "bn-ls", "o1", "BUY", 0.1)
+    _piece(store, "bn-ls", "o1", "BUY", 0.1, 1, "filled")
+    demo.fail = True  # the copy is refused
+    mirror.mirror_once(store, targets)
+    demo.fail = False
+    demo.held = 0.25  # and the account was bought up by hand meanwhile
+    seen = mirror.catch_up(store, targets, mirror.catch_up(store, targets, {}))
+    assert demo.held == pytest.approx(0.25) and demo.orders == []  # already past the paper net: nothing bought
+    assert seen == {"bn-ls": pytest.approx(0.1)}
+
+
+def test_a_refused_copy_catch_up_cannot_close_raises_an_alert():
+    store, demo = _store(), FakeDemo()
+    targets = _start(store, demo)
+    _order(store, "bn-ls", "o1", "BUY", 0.1)
+    _piece(store, "bn-ls", "o1", "BUY", 0.1, 1, "filled")
+    demo.fail = True
+    mirror.mirror_once(store, targets)
+    seen = mirror.catch_up(store, targets, {})
+    mirror.catch_up(store, targets, seen)  # two checks, still refused: not closed
+    alerts = [e for e in store.events("bn-ls") if e["kind"] == "mirror_gap"]
+    assert len(alerts) == 1 and alerts[0]["level"] == "error"
+    mirror.catch_up(store, targets, seen)
+    assert len([e for e in store.events("bn-ls") if e["kind"] == "mirror_gap"]) == 1  # once per gap, not a flood
