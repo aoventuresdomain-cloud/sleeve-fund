@@ -1,5 +1,4 @@
 import os
-
 from decimal import Decimal
 
 import pytest
@@ -125,6 +124,7 @@ def _price_tick_read(monkeypatch, request):
         return tuple(Decimal(x) for x in kept)
 
     monkeypatch.setattr(venue("BINANCE"), "live_lot", kept_lot)
+    monkeypatch.setattr(start_check, "_hub_lot", lambda v, pair: kept_lot(pair))  # the hub's contract, as kept
 
 
 @pytest.fixture(autouse=True)

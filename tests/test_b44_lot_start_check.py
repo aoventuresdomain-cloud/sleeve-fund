@@ -7,10 +7,12 @@ from __future__ import annotations
 from decimal import Decimal as D
 
 import pytest
+from test_b44_lot_size import listing
 
+# as imported, before conftest stands the kept lot in for it
+from sleeve_fund.start_check import _hub_lot
 from sleeve_fund.store import Store
 from sleeve_fund.venues import paper_venue_lot
-from test_b44_lot_size import listing
 
 pytestmark = [pytest.mark.no_maintenance_tables]
 PERP = {"market": "perp", "allow_short": True, "stop_loss": 0.02}
@@ -86,12 +88,11 @@ def test_the_start_check_runs_it():
 
 
 def test_the_hubs_lot_is_the_data_venues_contract(monkeypatch):
-    from sleeve_fund import start_check
     from sleeve_fund.venues import venue
 
     monkeypatch.setattr(venue("BINANCE"), "contract",
                         lambda pair: {"price_precision": 1, "size_precision": 3, "min_quantity": 0.002})
-    assert start_check._hub_lot("BINANCE", "BTC/USDT") == (D("0.001"), D("0.002"))
+    assert _hub_lot("BINANCE", "BTC/USDT") == (D("0.001"), D("0.002"))
 
 
 def test_cr2_on_start_calls_say_lot():
