@@ -60,16 +60,16 @@ def _record(path, row, asset, minutes_legs):
                            "bar_spec": "1-MINUTE-LAST-INTERNAL", "starting_balance": 0, "risk_profile": "balanced",
                            "params": PARAMS, "maker_fee": "0.0002", "taker_fee": "0.0005", "tick_seconds": 30}}
     rec.start(inst)
-    px, s = PX[base], 0
+    px, s, p = PX[base], 0, inst.price_precision  # the instrument's own tick (B-43: BTC's kept 0.1)
     for minutes, move in minutes_legs:
         step = (1 + move) ** (1 / (minutes * 60)) if minutes else 1 + move
         for _ in range(minutes * 60 or 1):
             px *= step
             t = START + s * 1_000_000_000
             half = px * 0.00001
-            rec.quote(QuoteTick(inst.id, Price(px - half, 2), Price(px + half, 2), Quantity(100, 3), Quantity(100, 3),
+            rec.quote(QuoteTick(inst.id, Price(px - half, p), Price(px + half, p), Quantity(100, 3), Quantity(100, 3),
                                 t, t + 1000))
-            rec.trade(TradeTick(inst.id, Price(px, 2), Quantity(50, 3),
+            rec.trade(TradeTick(inst.id, Price(px, p), Quantity(50, 3),
                                 AggressorSide.BUY if s % 2 else AggressorSide.SELL, TradeId(f"{base}{s}"), t + 2000,
                                 t + 3000))
             s += 1

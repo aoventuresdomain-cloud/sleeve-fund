@@ -137,7 +137,7 @@ def test_the_engine_side_is_the_instrument_paper_builds_so_a_contract_that_fails
     assert b8.main([], get=venue_terms, pattern=str(tmp_path / "*.toml")) == 1
     got = {line[15:37].strip(): line for line in capfd.readouterr().out.splitlines()
            if line.startswith("BTC/USDT")}
-    assert got["tick"].endswith("MUST")  # the fallback's 2-place tick, 0.01, is finer than the venue's 0.1
+    assert got["tick"].endswith("PASS")  # B-43: a failed read builds the kept tick, 0.1, never the 2-place default
     assert got["min quantity"].endswith("MUST")  # no minimum given: paper's is one lot, 0.001, under the venue's 0.01
     assert got["min notional"].endswith("MUST")  # 5 under the venue's 100
     assert got["lot step"].endswith("PASS")  # the fallback caps the size at 3 places: 0.001, the venue's own
