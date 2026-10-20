@@ -165,7 +165,7 @@
     {% elif tab == 'runs' %}
       {% if e.runs_on %}
         <table class="tight"><thead><tr><th>On the fund as</th><th>Instrument</th><th>State</th><th>Since</th></tr></thead><tbody>
-        {% for s in e.runs_on %}<tr><td><a href="/sleeves/{{ s.name }}">{{ s.name }}</a></td><td>{{ s.instrument }}</td><td><span class="chip {{ s.status }}">{{ s.status|capitalize }}</span></td><td>{{ uk(s.created_at) }}</td></tr>{% endfor %}
+        {% for s in e.runs_on %}<tr><td><a href="/sleeves/{{ s.name }}">{{ s.name }}</a></td><td>{{ s.instrument }}</td>{% set seen = s|shown %}<td><span class="chip {{ seen }}">{{ seen|capitalize }}</span></td><td>{{ uk(s.created_at) }}</td></tr>{% endfor %}
         </tbody></table>
         {% if not e.model %}<p class="muted">The same rules file ({% if e.version %}version {{ e.version }} · {% endif %}{{ e.hash[:7] }}). If the file changes, the running copy keeps its version.</p>{% endif %}
       {% else %}

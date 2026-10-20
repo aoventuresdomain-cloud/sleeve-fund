@@ -25,7 +25,7 @@
 <details class="panel archived" id="test-accounts" open>
   <summary><strong>Test accounts ({{ tests|length }})</strong> <span class="muted">strategies on a test account, outside the fund's book: left out of its equity, P&amp;L and open risk, as the limits leave them out, and never Strategy evidence. Their positions show under Positions, marked as not counted.</span></summary>
   <ul class="feed" style="margin-top:10px">{% for x in tests %}{% set s = x.sleeve %}
-    <li><span class="when">{{ x.equity|money }}</span><span class="what"><a href="/sleeves/{{ s.name }}">{{ s.name }}</a> {{ chip(s.status) }} {{ test_chip() }} <span class="muted">{{ s.instrument }} · {{ s.strategy|replace('_', ' ') }} · {{ signed(x.ret) }} since start</span></span></li>{% endfor %}
+    <li><span class="when">{{ x.equity|money }}</span><span class="what"><a href="/sleeves/{{ s.name }}">{{ s.name }}</a> {{ chip(s|shown) }} {{ test_chip() }} <span class="muted">{{ s.instrument }} · {{ s.strategy|replace('_', ' ') }} · {{ signed(x.ret) }} since start</span></span></li>{% endfor %}
   </ul>
 </details>
 {% endif %}
