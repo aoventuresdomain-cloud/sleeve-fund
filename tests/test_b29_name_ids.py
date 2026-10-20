@@ -87,3 +87,37 @@ def test_the_real_paper_node_builds_for_the_names_that_crashed(name, monkeypatch
         assert not str(built.trader_id).endswith("-")
     finally:
         built.dispose()
+
+
+def test_a_name_with_no_letter_or_digit_is_refused_not_built_into_an_empty_id():
+    with pytest.raises(ValueError, match="letter or digit"):
+        router.cut_tag("")
+    with pytest.raises(ValueError, match="letter or digit"):
+        node.trader_id(node._tag("---"))
+    from sleeve_fund.dashboard.app import NAME_RE
+    assert not NAME_RE.match("---") and not NAME_RE.match("-a")  # the form already refuses such a name
+
+
+def test_a_strategy_put_away_after_an_error_no_longer_counts_as_halted(tmp_path, monkeypatch):
+    """The 15 Oct crash left the archived candle-step Strategy in "error", and the top bar kept saying "1 halted"."""
+    from fastapi.testclient import TestClient
+
+    from sleeve_fund.dashboard import app as app_mod
+    from sleeve_fund.store import Store
+
+    monkeypatch.setenv("DASHBOARD_PASSWORD", "test-pw")
+    monkeypatch.setenv("TEARSHEET_DIR", str(tmp_path))
+    store = Store(f"sqlite:///{tmp_path}/t.db")
+    for name in ("candle-step-btcusdt-1m", "timed-test"):
+        store.create_sleeve(name=name, strategy="candle_step", instrument="BTC/USDT",
+                            bar_spec="1-MINUTE-LAST-INTERNAL", starting_balance=0, desired_state="stopped")
+    store.set_status("candle-step-btcusdt-1m", "error", "node exited 1")
+    client = TestClient(app_mod.create_app(store))
+
+    def bar():
+        page = client.get("/", auth=("pm", "test-pw")).text
+        return page.split('data-live="health"', 1)[1].split("</span></span>", 1)[0]
+
+    assert "1 halted" in bar()  # red-first: it waits for the PM while it is still a live Strategy
+    store.archive("candle-step-btcusdt-1m")
+    assert "halted" not in bar()

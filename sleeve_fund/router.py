@@ -58,7 +58,10 @@ def cut_tag(tag: str) -> str:
     """A node tag cut to the 20 characters ids keep, with no "-" left at the end (B-29): the engine refuses an id
     whose last part is empty, so "PAPER-CANDLE-STEP-BTCUSDT-" crashed the node of the form's own suggested name. A
     cut that didn't end in "-" is unchanged, so every name that started before keeps its ids."""
-    return tag[:20].rstrip("-")
+    cut = tag[:20].rstrip("-")
+    if not cut:  # a name with no letter or digit: it would build "PAPER-", which the engine refuses
+        raise ValueError(f"a Strategy's name needs a letter or digit to make its node ids: {tag!r}")
+    return cut
 
 
 def venue_for(pinned: str | None) -> str:

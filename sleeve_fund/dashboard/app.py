@@ -234,7 +234,8 @@ def create_app(store: Store | None = None) -> FastAPI:
             "alerts": st().open_alert_count(),
             "total": len(ones),
             "running": sum(1 for x in ones if x.status == "running"),
-            "attention": sum(1 for x in ones if x.status in ("halted", "error")),
+            # a Strategy put away waits for nobody: its last halt or error is history, not "halted" (B-29 add-on)
+            "attention": sum(1 for x in ones if x.status in ("halted", "error") and x.name not in put_away),
             "unhealthy": len({x.parent or x.name for x in wanted
                               if not (x.heartbeat_at and now - x.heartbeat_at < STALE)}),
             # The rail lists every strategy not put away, so each is one click from anywhere.
