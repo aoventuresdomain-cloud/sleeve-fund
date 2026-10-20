@@ -252,6 +252,9 @@ L22_CASES = [pytest.param(-1, "aggressive", 0.10, 0.40, 0.15, id="3x-short"),
              pytest.param(1, "balanced", 0.20, 0.55, 0.24, id="2x-long")]
 
 
+L22_TICK = 0.1  # the hub-146 harness's BTC/USD at price_precision 1 (as test_liq_funding.TICK)
+
+
 def _l22_harness(monkeypatch):
     try:
         h = importlib.import_module("test_hub_146_qa")
@@ -302,9 +305,13 @@ def _l22_run(monkeypatch, side, profile, back, gap, stop, replayed):
     book = replay_book(held, 10_000)  # the journal as it stood before the restart: the entry only
     from sleeve_fund import risk
 
+    # LIQ-FEE (HoE TEC-LIQ-FEE rows 1-4, HoQA 20 Oct): the journal entry's fees come off the isolated margin and the
+    # price sits on the harness instrument's tick (BTC/USD, price_precision 1) toward the entry: 3x short 79,596.4 ->
+    # 79,563.5, 2x long 30,303.9 -> 30,337.0. Both inputs come from the journal and the instrument, not the engine.
     want = markets.isolated_liquidation(book["cash"], book["qty"], book["entry_px"],
                                         risk.profile(profile).max_leverage,
-                                        markets.terms({"market": "perp"}, "KRAKEN").maintenance_margin)
+                                        markets.terms({"market": "perp"}, "KRAKEN").maintenance_margin,
+                                        fees=book["entry_fees"], tick=L22_TICK)
     return run, want, seen, hook
 
 
