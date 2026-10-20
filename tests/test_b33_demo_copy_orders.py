@@ -346,3 +346,120 @@ def test_a_refused_copy_catch_up_cannot_close_raises_an_alert():
     assert len(alerts) == 1 and alerts[0]["level"] == "error"
     mirror.catch_up(store, targets, seen)
     assert len([e for e in store.events("bn-ls") if e["kind"] == "mirror_gap"]) == 1  # once per gap, not a flood
+
+
+# CR B-33 MUSTs -------------------------------------------------------------------------------------------------------
+class WentInButErrored(FakeDemo):
+    """A copy whose answer was lost: the order went in at the venue, but the mirror saw an error."""
+
+    lose = False
+
+    def http(self, method, url, headers, body):
+        answer = super().http(method, url, headers, body)
+        if self.lose and "/v5/order/create" in url:
+            return {"retCode": 10016, "retMsg": "server timeout"}
+        return answer
+
+
+def _gap_alerts(store, *names):
+    return [e for n in names for e in store.events(n) if e["kind"] == "mirror_gap"]
+
+
+def test_a_copy_that_errored_but_went_in_raises_no_gap_alert_now_or_after_a_restart():
+    """CR MUST 1 (probe b33-false-gap-alert-probe.py): B's sell errored but filled, so the demo is level with the
+    paper net at 0 while B's own gap stays open. That is no gap on the account: nothing to send, nothing to alert."""
+    store, demo = _store("a-long", "b-short"), WentInButErrored()
+    targets = _start(store, demo)
+    _order(store, "a-long", "oa", "BUY", 0.1)
+    _piece(store, "a-long", "oa", "BUY", 0.1, 1, "filled")
+    mirror.mirror_once(store, targets)
+    demo.lose = True
+    _order(store, "b-short", "ob", "SELL", 0.1)
+    _piece(store, "b-short", "ob", "SELL", 0.1, 1, "filled")
+    mirror.mirror_once(store, targets)
+    demo.lose = False
+    sent = len(demo.orders)
+    seen = mirror.catch_up(store, targets, mirror.catch_up(store, targets, {}))
+    mirror._GAP_ALERTED.clear()  # a restart: only the journal is left
+    mirror.catch_up(store, targets, mirror.catch_up(store, targets, seen))
+    assert demo.held == pytest.approx(0.0) and len(demo.orders) == sent  # nothing sent twice
+    assert _gap_alerts(store, "a-long", "b-short") == []
+
+
+def test_an_open_gap_reaches_the_pms_alert_channel_once_not_once_per_poll_or_restart():
+    """Advisor B33-DEMO-COPY 3(b): an alert, not a log line. The alerts thread sends every error event to the PM's
+    channel (ALERT_WEBHOOK_URL, ntfy); the gap's event is written once, so it is sent once."""
+    from sleeve_fund import alerts
+
+    store, demo = _store(), FakeDemo()
+    targets = _start(store, demo)
+    sent = []
+    sender = alerts.Forwarder(store, environ={"ALERT_WEBHOOK_URL": "https://ntfy.sh/pm-topic"},
+                           send=lambda url, text: sent.append(text), pinger=lambda url: None)
+    _order(store, "bn-ls", "o1", "BUY", 0.1)
+    _piece(store, "bn-ls", "o1", "BUY", 0.1, 1, "filled")
+    demo.fail = True
+    mirror.mirror_once(store, targets)
+    seen = {}
+    for _ in range(4):  # four polls with the gap open
+        seen = mirror.catch_up(store, targets, seen)
+        sender.step()
+    mirror._GAP_ALERTED.clear()  # a restart
+    for _ in range(2):
+        seen = mirror.catch_up(store, targets, seen)
+        sender.step()
+    assert len(_gap_alerts(store, "bn-ls")) == 1
+    assert sum("still 0.1 BTCUSDT short of the paper position" in t for t in sent) == 1
+
+
+def test_a_gap_that_closes_and_opens_again_is_alerted_again():
+    store, demo = _store(), FakeDemo()
+    targets = _start(store, demo)
+    _order(store, "bn-ls", "o1", "BUY", 0.1)
+    _piece(store, "bn-ls", "o1", "BUY", 0.1, 1, "filled")
+    demo.fail = True
+    mirror.mirror_once(store, targets)
+    seen = mirror.catch_up(store, targets, mirror.catch_up(store, targets, {}))
+    demo.fail = False
+    seen = mirror.catch_up(store, targets, seen)  # caught up
+    assert demo.held == pytest.approx(0.1)
+    mirror.catch_up(store, targets, seen)  # level: the alert is closed
+    demo.fail = True  # the next order's copy is refused too: a gap of the same size, so the same words
+    _order(store, "bn-ls", "o2", "BUY", 0.1)
+    _piece(store, "bn-ls", "o2", "BUY", 0.1, 1, "filled")
+    mirror.mirror_once(store, targets)
+    mirror.catch_up(store, targets, mirror.catch_up(store, targets, {}))
+    kinds = [e["kind"] for e in reversed(store.events("bn-ls")) if e["kind"].startswith("mirror_gap")]
+    assert kinds == ["mirror_gap", "mirror_gap_closed", "mirror_gap"]
+
+
+class FakeTestnet:
+    """The Deribit testnet's sizing and its reduce-only rule, without the network."""
+
+    label, host, unit = "the Deribit testnet", mirror.TESTNET_HOST, "USD"
+    size, owns = staticmethod(mirror.Testnet.size), staticmethod(mirror.Testnet.owns)
+
+    def __init__(self, held=0.0):
+        self.orders, self.held = [], held
+
+    def market(self, side, instrument, amount, label, reduce_only=False):
+        self.orders.append((side, amount, reduce_only))
+        return f"d{len(self.orders)}", 60_000.0
+
+    def position(self, instrument):
+        return self.held
+
+
+@pytest.mark.parametrize("intent", ["exit", "stop_loss"])
+def test_on_the_second_venue_a_close_goes_reduce_only_and_never_past_the_position(intent):
+    """CR MUST 2: Deribit keeps both (Advisor B33): a closing copy is reduce-only, capped at what the testnet holds.
+    The closing = False mutant fails here."""
+    store = _journal()
+    store.create_sleeve(name="dr-ls", strategy="ping_pong", instrument="BTC/USD", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=10_000, params={"market": "perp", "allow_short": True, "demo_mirror": True})
+    venue = FakeTestnet(held=3000.0)
+    mirror.mirror_once(store, {"DERIBIT": venue})
+    _order(store, "dr-ls", "o1", "SELL", 0.1, intent=intent)
+    _piece(store, "dr-ls", "o1", "SELL", 0.1, 1, "filled")
+    mirror.mirror_once(store, {"DERIBIT": venue})
+    assert venue.orders == [("SELL", 3000.0, True)]  # 0.1 at 60,000 is 6,000 USD; the testnet held 3,000

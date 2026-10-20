@@ -631,7 +631,7 @@ def check_drift(store, targets: dict, last: dict[str, float]) -> dict[str, float
 
 
 _CATCH_UP_FAILED: dict[str, str] = {}  # per strategy, the last catch-up failure warned about
-_GAP_ALERTED: dict[str, float] = {}  # per strategy, the last gap alerted on (B-33)
+_GAP_ALERTED: dict[str, str] = {}  # per strategy, the gap alert last sent or found in the journal (B-33)
 
 
 def catch_up(store, targets: dict, seen: dict[str, float]) -> dict[str, float]:
@@ -662,6 +662,9 @@ def catch_up(store, targets: dict, seen: dict[str, float]) -> dict[str, float]:
             if abs(gap) >= step:
                 gaps[s.name] = gap
         out.update(gaps)
+        for s in sleeves:  # no gap left: an alert sent for it is closed, so the same gap later is alerted again
+            if s.name not in gaps:
+                _close_gap(store, s.name)
         due = {n: g for n, g in gaps.items() if seen.get(n) == g}
         if not due:
             continue
@@ -694,15 +697,36 @@ def catch_up(store, targets: dict, seen: dict[str, float]) -> dict[str, float]:
             account_gap -= sign * qty
             out.pop(name, None)
         for name, gap in due.items():  # Advisor B33 Q3 (b): a gap still open after its two checks is an alert
-            if name in out and _GAP_ALERTED.get(name) != gap:
-                _GAP_ALERTED[name] = gap
-                store.event(name, "error", "mirror_gap",
-                            f"Demo mirror: the demo account is still {abs(gap):g} {symbol} "
-                            f"{'short of' if gap > 0 else 'over'} the paper position after two checks, and the "
-                            "catch-up couldn't close it. Check the demo account; the paper book is unaffected.")
-            elif name not in out:
-                _GAP_ALERTED.pop(name, None)
+            sign = 1 if gap > 0 else -1
+            # Only while the account itself is still short that way (CR B-33 MUST 1): a copy that errored but went
+            # in leaves this Strategy's own gap open with the account level with the paper book, which is no gap.
+            if name in out and sign * account_gap >= step - 1e-9:
+                _alert_gap(store, name, f"Demo mirror: the demo account is still {abs(gap):g} {symbol} "
+                           f"{'short of' if gap > 0 else 'over'} the paper position after two checks, and the "
+                           "catch-up couldn't close it. Check the demo account; the paper book is unaffected.")
+            else:
+                _close_gap(store, name)
     return out
+
+
+def _alert_gap(store, name: str, words: str) -> None:
+    """Once per open gap, across restarts too: the journal's last gap event for the Strategy says whether this one
+    was already sent (the alerts thread sends every error event to the PM's channel once)."""
+    if _GAP_ALERTED.get(name) == words:
+        return
+    last = store.last_event(name, ("mirror_gap", "mirror_gap_closed"))
+    _GAP_ALERTED[name] = words
+    if last is not None and last["kind"] == "mirror_gap" and last["message"] == words:
+        return
+    store.event(name, "error", "mirror_gap", words)
+
+
+def _close_gap(store, name: str) -> None:
+    _GAP_ALERTED.pop(name, None)
+    last = store.last_event(name, ("mirror_gap", "mirror_gap_closed"))
+    if last is not None and last["kind"] == "mirror_gap":
+        store.event(name, "info", "mirror_gap_closed", "Demo mirror: the demo account is level with the paper "
+                    "position again.")
 
 
 def bybit_leverage(store) -> dict[str, tuple[float, list]]:
