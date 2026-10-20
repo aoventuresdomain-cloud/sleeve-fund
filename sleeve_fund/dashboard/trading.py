@@ -507,7 +507,9 @@ def open_position(x: dict, fills: list[dict], orders: dict[str, dict],
         "why": entry["reason"] if entry else None,
         "sig": (signal_items(entry["signal"]) if entry else []) + (plan_items(plan, side) if plan else []),
         "exits_edited": bool(plan and plan["kind"] == "edit"),
-        "weight": x["position_value"] / x["equity"] if x["equity"] else 0.0,
+        # inside the fund over the fund's equity, as its summary's (B-20): its own equity is its P&L from 0
+        "weight": x["exposure"] if x.get("in_fund") else x["position_value"] / x["equity"] if x["equity"] else 0.0,
+        "in_fund": bool(x.get("in_fund")),
         "fees": sum(float(f["fee"] or 0.0) for f in fills[:own + 1]) if own is not None else None,
     }
 
