@@ -2676,7 +2676,7 @@ class Store:
                    ts: datetime | None) -> None:
         """B-24: the decision's four figures at this fill (the order filled so far, at its average price), in the
         fill's own transaction; a fill that lands the fund past T4 by slippage raises an error event (cell j) and is
-        never undone. A decision without figures (no book was read, or none could be worked) gets no mark."""
+        never undone, and so does one whose T4 check couldn't run (the tests unreadable): the fill stays booked. A decision without figures (no book was read, or none could be worked) gets no mark."""
         from sleeve_fund.portfolio import compliance
         from sleeve_fund.portfolio.limits import fill_breach, fill_mark
 
@@ -2691,14 +2691,12 @@ class Store:
             return
         self.record_fill_mark(row.id, trade_id, avg_px, "fill", **marked, marked_at=ts, conn=c)
         try:
-            tests = compliance.load(self, conn=c)
+            kind, words = "portfolio_fill_past_t4", fill_breach(marked, compliance.load(self, conn=c))
         except Exception as exc:  # noqa: BLE001 - an unread profile never holds up booking a fill that happened
-            print(f"store: fill {order_id}/{trade_id} marked, T4 not checked: {exc!r}")
-            return
-        words = fill_breach(marked, tests)
+            kind, words = "portfolio_t4_check_skipped", f"fill {trade_id} marked, T4 not checked: {exc!r}"
         if words:
-            c.execute(insert(events_t).values(sleeve=sleeve, ts=ts or utcnow(), level="error",
-                                              kind="portfolio_fill_past_t4", message=f"{order_id}: {words}"))
+            c.execute(insert(events_t).values(sleeve=sleeve, ts=ts or utcnow(), level="error", kind=kind,
+                                              message=f"{order_id}: {words}"))
 
     def rebook_liquidation(self, order_id: str, reason: str, signal: dict, ts: datetime | None = None) -> None:
         """GAP-LIQ (Advisor): a resting stop whose fill was at or past the liquidation price is re-booked as the

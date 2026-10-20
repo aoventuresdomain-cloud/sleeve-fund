@@ -79,6 +79,23 @@ def test_j_a_fill_slippage_takes_past_t4_is_alerted_and_stays_booked(store):
     assert money(store.held_qty("a")) == D("0.1")
 
 
+def test_a_t4_check_that_cannot_run_is_an_error_event_and_the_fill_stays_booked(store, monkeypatch):
+    """HoE 21:19 UK MUST: unreadable compliance tests never hold up a fill, and never pass silently."""
+    from sleeve_fund.portfolio import compliance
+
+    rid = _approved(store)
+
+    def unreadable(*a, **k):
+        raise RuntimeError("no tests")
+
+    monkeypatch.setattr(compliance, "load", unreadable)
+    _fill(store, 0.1, 60000.0, "t1")
+    assert len(store.fill_marks(rid)) == 1 and money(store.held_qty("a")) == D("0.1")
+    with store.engine.connect() as c:
+        [ev] = list(c.execute(select(events_t).where(events_t.c.kind == "portfolio_t4_check_skipped")))
+    assert ev.level == "error" and ev.sleeve == "a" and "no tests" in ev.message and ev.message.startswith("o-1: ")
+
+
 def test_an_order_no_decision_holds_and_an_exit_are_never_marked(store):
     _hold(store)  # an entry recorded without the gate: no decision, no reservation
     store.record_order("a", order_id="x-1", side="SELL", qty=0.1, intent="exit", reason="qa")
