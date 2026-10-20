@@ -202,3 +202,26 @@ def test_after_a_rebase_the_headline_says_since_when_and_the_all_time_peak_shows
     ledger.set_state(replace(st, halt_reference=None))  # no re-base: as before
     words, _ = _words(c, "/")
     assert "Drawdown from peak 1.98% (halt at 15%)" in words and "From all-time peak" not in words
+
+
+def test_after_the_gates_own_rebase_the_headline_measures_from_the_book_then(c, store):  # noqa: F811
+    """PAGE-DD-REBASE on B-31's own re-base (gate.rebase_brakes, a drawdown brake switched back on): the halt now
+    measures from the book at 99,000, so a later mark of 98,500 reads 0.51% since the re-base and 2.48% from the
+    all-time peak of 101,000."""
+    from sleeve_fund.paper.portfolio_gate import PaperGate
+    from sleeve_fund.portfolio.gate import rebase_brakes
+
+    _hold(store)
+    _long(store)
+    _mark(store, 99_000, hwm=101_000)
+    ledger = PaperGate(store).ledger
+    _, words = rebase_brakes(ledger, drawdown=True, day=False)
+    for w in words:  # as Store.save_compliance journals them
+        store.event(None, "info", "portfolio_brake_rebased", w)
+    _mark(store, 98_500)
+    st = ledger.state()
+    words, _ = _words(c, "/")
+    shown = re.search(r"Drawdown since re-base at .{5,16} UK: (\d+\.\d\d)% \(halt at 15%\)", words)
+    assert shown, re.search(r"Drawdown.{0,120}", words).group(0)
+    assert shown and Decimal(shown.group(1)) / 100 == round(1 - st.equity / st.reference(), 4) == Decimal("0.0051")
+    assert f"From all-time peak: {(101_000 - 98_500) / 101_000:.2%}" in words  # 2.48%
