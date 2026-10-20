@@ -58,6 +58,16 @@ LOCKING_INTENTS = (*EXIT_LEGS, "liquidation", "liquidation_cut")
 # The resting stops a backtest keeps: the model's own, and the risk guard's (_rest_risk_stop).
 STOP_INTENTS = ("stop_loss", "risk_halt", "risk_pause", "liquidation_cut", "liquidation")
 MINUTE_NS = 60_000_000_000
+# B43-PRECISION 3(b) (Advisor 20 Oct): an exit still open this many of the Strategy's bars after the first that traded
+# through its price, and at least EXIT_UNFILLED_FLOOR_NS after that bar opened, raises an ERROR alert once
+# (_exit_backstop): a precision mismatch or a venue that never fills it, never silent. Stops and the other protective
+# exits wait 2 bars; targets and the signal's own exits 3.
+EXIT_UNFILLED = "exit_not_filled"
+EXIT_BACKSTOP_FAILED = "exit_backstop_failed"  # the check itself failed: alerted once, the bar trades on
+EXIT_UNFILLED_BARS = 2
+TARGET_UNFILLED_BARS = 3
+PATIENT_EXITS = ("take_profit", "exit")  # TARGET_UNFILLED_BARS; every other closing intent EXIT_UNFILLED_BARS
+EXIT_UNFILLED_FLOOR_NS = 2 * MINUTE_NS
 # GAP-DOWN (F-GD-DEADLINE): the longest a restart replay waits for a stop's trigger minute of trades, every page of it
 # together. It runs on the first trade after the restart, ahead of every stop and tick behind it, so past this the
 # minute's extreme books the stop instead.
@@ -762,6 +772,8 @@ class LongFlatStrategy(Strategy):
         self._sent: list = []  # client order ids of orders sent, until the venue has them (see _unsent)
         self._cancel_on_accept: set[str] = set()  # orders to cancel as soon as the venue has them
         self._backstop_since: int | None = None  # A1: when the price first went through a resting stop's level
+        self._unfilled: dict[str, dict] = {}  # B43-PRECISION: exit order id -> its count since the first print through
+        self._backstop_failed = False  # B43-PRECISION: the check's own failure has been alerted
         self._gate_pushed: threading.Event | None = None  # A3: set by the journal's push (_listen_gate)
         self._gate_done = threading.Event()
         self._exec_type = None  # backtest: the shorter bars the decision bars are built from
@@ -1344,6 +1356,54 @@ class LongFlatStrategy(Strategy):
             self._on_tick()
         self._bar_target(bar)
         self._rest_risk_stop()
+
+    def _exit_backstop(self, bar: Bar) -> None:
+        """B43-PRECISION 3(b): an exit (any closing intent) still open at the close of its EXIT_UNFILLED_BARS-th bar
+        (TARGET_UNFILLED_BARS for PATIENT_EXITS), counting from the first of the Strategy's bars that traded through
+        its price, and at least EXIT_UNFILLED_FLOOR_NS after that bar opened, raises one ERROR event, which the alerts
+        send (never a reject, so outside F-RX-2). Through: a stop's trigger at or through on the bar's last-trade range
+        (A1's LAST_PRICE trigger), a limit strictly through its price (paper's fill rule), a market order any bar
+        after it was sent. An alert only: no order is changed and nothing is blocked."""
+        if self.runtime is None or str(bar.bar_type) != str(self._cfg.bar_type).split("@")[0]:
+            return
+        ts = int(bar.ts_event)
+        lo, hi = bar.low.as_double(), bar.high.as_double()
+        seen = set()
+        for order in (*self.cache.orders_open(strategy_id=self.strategy_id),
+                      *self.cache.orders_inflight(strategy_id=self.strategy_id)):
+            coid = str(order.client_order_id)
+            intent = self.decisions.get(coid, {}).get("intent")
+            if coid in seen or intent is None or intent in OPENING_INTENTS:
+                continue
+            seen.add(coid)
+            sell = order.side == OrderSide.SELL
+            if order.order_type == OrderType.STOP_MARKET:
+                level = order.trigger_price.as_double()
+                through = lo <= level if sell else hi >= level
+            elif order.order_type == OrderType.LIMIT:
+                level = order.price.as_double()
+                through = hi > level if sell else lo < level
+            else:
+                level, through = None, int(order.ts_init) < ts
+            n = self._unfilled.setdefault(coid, {"bars": 0, "last": None, "since": None, "told": False})
+            if n["last"] == ts or not (through or n["bars"]):
+                continue  # a bar delivered twice counts once; bars before the first through don't count
+            n["bars"], n["last"] = n["bars"] + 1, ts
+            if n["since"] is None:  # the first bar through: the clock starts when it opened
+                n["since"] = ts - int(bar.bar_type.spec.timedelta.total_seconds() * 1_000_000_000)
+            due = TARGET_UNFILLED_BARS if intent in PATIENT_EXITS else EXIT_UNFILLED_BARS
+            if n["told"] or n["bars"] < due or ts - n["since"] < EXIT_UNFILLED_FLOOR_NS:
+                continue
+            from sleeve_fund.venue_terms import uk
+
+            n["told"] = True
+            at = "at market" if level is None else f"at {level:,.6g}"
+            self.runtime.store.event(
+                self.runtime.name, "error", EXIT_UNFILLED,
+                f"{intent} order {coid} ({at}) is still open {n['bars']} bars after the price first traded through it "
+                f"(the bar from {uk(datetime.fromtimestamp(n['since'] / 1e9, tz=timezone.utc))}; last bar "
+                f"{lo:,.6g}-{hi:,.6g}): check the instrument's price precision and the venue", ts=self.runtime.now())
+        self._unfilled = {k: v for k, v in self._unfilled.items() if k in seen}
 
     def _maybe_tick(self) -> None:
         if self.runtime is None:
@@ -3180,6 +3240,18 @@ class LongFlatStrategy(Strategy):
 
     def _on_bar(self, bar: Bar) -> None:
         self._snap_settlements(bar.ts_event, bar.close.as_double())
+        try:
+            self._exit_backstop(bar)
+        except Exception as exc:  # noqa: BLE001 - an alert never holds up the bar's stops, targets or decision
+            self.log.error(f"exit backstop failed on the bar at {int(bar.ts_event)}\n{traceback.format_exc()}")
+            if not self._backstop_failed:  # one alert, not one a bar; the log keeps each
+                self._backstop_failed = True
+                try:
+                    self.runtime.store.event(self.runtime.name, "error", EXIT_BACKSTOP_FAILED,
+                                             f"the unfilled-exit check failed, so it watches nothing: {exc!r}",
+                                             ts=self.runtime.now())
+                except Exception:  # noqa: BLE001 - the store itself may be what failed: the log above has it
+                    pass
         self._finish_resume()  # warm-up bars asked of the venue that never came: resume without them
         self._resize_if_due()
         if self._exec_type is not None and bar.bar_type == self._exec_type:
