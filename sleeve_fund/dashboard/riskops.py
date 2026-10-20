@@ -139,6 +139,27 @@ def fund_drawdown(store: Store) -> float | None:
     return float(round(1 - st.equity / max(ref, st.equity), 4))
 
 
+def fund_drawdown_view(store: Store) -> dict:
+    """PAGE-DD-REBASE (Advisor, 20 Oct): the halt's drawdown (fund_drawdown) with its limit and, once the halt's
+    reference has been re-based below the high-water mark (a B-31 brake switched back on, or a Resume), when, and the
+    drawdown from the all-time peak, (peak - book) / peak, shown beside it."""
+    view = {"drawdown": fund_drawdown(store), "limit": fund_halt_limit(store), "rebased": False, "rebased_at": None,
+            "peak_drawdown": None}
+    from sleeve_fund.paper.portfolio_gate import PaperGate
+
+    try:
+        st = PaperGate(store).ledger.state()
+        ref, peak, book = st.halt_reference, st.hwm, st.equity
+    except Exception:  # noqa: BLE001 - fund_drawdown has printed it; the headline then reads not marked
+        return view
+    if ref is None or not peak or ref >= peak or not book or book <= 0:
+        return view
+    rebased = store.events_of(("portfolio_brake_rebased",), limit=1)  # shortcut: a Resume writes none (no caller yet)
+    view.update(rebased=True, rebased_at=rebased[0]["ts"] if rebased else None,
+                peak_drawdown=float(round(max(1 - book / peak, 0), 4)))
+    return view
+
+
 def _fold_pairs(store: Store, rows: list[dict]) -> list[dict]:
     """A two-leg Strategy's legs as one row (F-P28-UI1; Independent Quant Advisor, 14 Oct 10:05 UK), at its first
     leg's place, the legs nested under it (`legs`). Its limits are the summed guard's (ruling E): drawdown from the
