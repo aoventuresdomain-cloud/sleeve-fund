@@ -249,6 +249,51 @@ def day_figure(store: Store, now=None) -> dict:
     return figure(DbLedger(store, lambda: ()).state(), now, rebased)
 
 
+DAY_OPEN_UNRECONCILED = "day_open_unreconciled"
+UNRECONCILED_OVER = Decimal(1)  # USDT: the day's P&L and the Strategies' sum may differ by rounding, never by more
+
+
+def day_open(store: Store, now=None, day_pnl=None) -> dict | None:
+    """DAY-RET (A), Advisor option 2: "Opened today at X; deposits/withdrawals today Y; P&L today Z", read on demand
+    from the book's minute marks (book_marks) and the fund's flows; no column of its own. The day is the brake's,
+    from 00:00 UTC, shown in UK time. A display and check only: the T5 brake keeps day_figure's scaled start.
+    day_pnl: Home's day P&L (the Strategies' sum). Z more than 1 USDT from it is unreconciled (a cost or flow booked
+    outside the Strategies): shown, and journaled as a warning once a UTC day. None before the first mark.
+    shortcut: read from the minute marks, kept whole today; if ever thinned within a day, a column (option 1)."""
+    from datetime import timedelta
+    from zoneinfo import ZoneInfo
+
+    from sleeve_fund.portfolio.gate import next_utc_midnight
+    from sleeve_fund.store import utcnow
+
+    now = now or utcnow()
+    opened = next_utc_midnight(now) - timedelta(days=1)
+    first, last = store.book_mark_at_or_before(opened), store.book_mark_at_or_before(now)
+    if first is None or last is None:
+        return None
+    since, upto = _utc(first["ts"]), _utc(last["ts"])
+    # [since, upto): the poll writes its mark first and lands its flows after it at the same ts, so a flow at a mark's
+    # own ts is in the next mark's equity, not that one's. A pending flow (no applied_at) is in neither.
+    flows = sum((Decimal(str(f["amount"])) * (-1 if f["kind"] == "withdraw" else 1) for f in store.fund_flows()
+                 if f["applied_at"] is not None and since <= _utc(f["applied_at"]) < upto), Decimal(0))
+    pnl = Decimal(str(last["equity"])) - Decimal(str(first["equity"])) - flows
+    uk = ZoneInfo("Europe/London")
+    gap = opened - since > timedelta(minutes=1)
+    off = None if day_pnl is None else pnl - Decimal(str(day_pnl))
+    off = off if off is not None and abs(off) > UNRECONCILED_OVER else None
+    if off is not None and not any(_utc(e["ts"]) >= opened for e in store.events_of((DAY_OPEN_UNRECONCILED,), limit=1)):
+        store.event(None, "warning", DAY_OPEN_UNRECONCILED,
+                    f"Today's P&L from the book ({pnl:,.2f}) and the Strategies' ({Decimal(str(day_pnl)):,.2f}) differ "
+                    f"by {off:,.2f}: a cost or flow is booked outside the Strategies", ts=now)
+    return {"open": Decimal(str(first["equity"])), "opened": f"{opened.astimezone(uk):%H:%M} UK",
+            "last_mark": f"{since.astimezone(uk):%H:%M} UK" if gap else None, "flows": flows, "pnl": pnl,
+            "unreconciled": off}
+
+
+def _utc(ts):
+    return ts.replace(tzinfo=UTC) if ts.tzinfo is None else ts
+
+
 def _tone(used: Decimal, limit: Decimal) -> str:
     return "loss" if used >= limit else "warn" if used >= limit * Decimal(repr(NEAR_LIMIT)) else ""
 

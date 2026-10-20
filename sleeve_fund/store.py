@@ -3900,6 +3900,14 @@ class Store:
         with self.engine.connect() as c:
             return c.execute(q).scalar()
 
+    def book_mark_at_or_before(self, ts: datetime) -> dict | None:
+        """The fund's last minute mark at or before `ts` (book_marks) as {ts, equity}, or None before the first."""
+        q = (select(book_marks_t.c.ts, book_marks_t.c.equity).where(book_marks_t.c.ts <= ts)
+             .order_by(book_marks_t.c.ts.desc()).limit(1))
+        with self.engine.connect() as c:
+            rows = _rows(c.execute(q))
+        return rows[0] if rows else None
+
     def first_book_mark(self) -> dict | None:
         q = select(book_marks_t.c.ts, book_marks_t.c.equity).order_by(book_marks_t.c.ts).limit(1)
         with self.engine.connect() as c:
