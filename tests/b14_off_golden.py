@@ -1,7 +1,7 @@
 """B-14 OFF golden (QD for QD3, b14aa): with resting targets off, the orders and fills of a target path and a stop path,
 on the paper replay and the backtest engine, as 274ecd88 (before B-14) made them. Rebuild the file only on a change
 that is meant to move OFF orders: run this module from the repo root (PYTHONPATH=.:tests) and write its output to
-tests/data/golden/b14_off_<base>.json (b14_off_662e8a0b.json since TEC-B14AA-REBASE; the 274ecd88 one is kept)."""
+tests/data/b14_off/b14_off_<base>.json (b14_off_662e8a0b.json since TEC-B14AA-REBASE; the 274ecd88 one is kept)."""
 import json
 import tempfile
 from pathlib import Path
