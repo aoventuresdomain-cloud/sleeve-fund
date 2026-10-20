@@ -769,3 +769,28 @@ def test_b14ak_a_refused_target_is_marked_rejected_and_benign_on_its_row():
                             event=lambda *a, **k: None)
     SleeveRuntime.on_target_refused(SimpleNamespace(store=store, name=NAME, now=lambda: None), "T", "post-only", 1)
     assert rows == [("T", "rejected")] and signals == [("T", {BENIGN_REJECT: True})]
+
+
+@pytest.mark.parametrize("setting", [{}, {"resting_targets": False}])
+def test_b14al_off_survives_a_restart(setting):
+    """D4 gate (Advisor HEAD6-B14, HoE): with resting targets off, a restart holding a long rests no target, before or
+    after, and the restarted Strategy keeps the setting off; its target is watched and closes at market, as before."""
+    from datetime import timedelta
+
+    from paper_scenarios import NAME as SCENARIO
+    from test_prop_inv import HOUR0, _at, _start_ns
+    from test_r_i5_1_exit_lock import _ticks
+    from test_r_i5_2_missed_candle import _ab
+
+    from sleeve_fund.supervisor import check_resting_entries
+
+    a, b, _, _ = _ab("ping_pong", {**HELD, "take_profit": 0.05, **setting},
+                     _ticks([(5, 0.0, 0.05), (30, 0.004, 0.05)]),
+                     lambda a: _at(_start_ns(HOUR0)) + timedelta(minutes=20))
+    for store in (a, b):
+        assert store.journal_book(SCENARIO, 10_000)["qty"] > 0  # held through the restart
+        assert not _targets(store.orders(SCENARIO))  # no resting target, ever
+        assert not [o for o in store.orders(SCENARIO) if o["order_type"] == "LIMIT" and o["intent"] == "take_profit"]
+        s = store.sleeve(SCENARIO)
+        assert not s.params.get("resting_targets")
+        check_resting_entries(s)  # the stored settings start as they are: nothing to refuse
