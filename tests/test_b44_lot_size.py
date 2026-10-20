@@ -94,3 +94,12 @@ def test_a_live_lot_that_differs_from_the_kept_one_wins_and_says_so(built, capfd
     inst = built(lambda pair: (D("0.002"), D("0.002")))
     assert inst.size_increment.as_decimal() == D("0.002") and inst.min_quantity.as_decimal() == D("0.002")
     assert "differs from the kept" in capfd.readouterr().err
+
+
+@pytest.mark.parametrize("qty", ["0.004", "0.0099"])
+def test_a_size_between_0_and_the_minimum_after_rounding_is_refused_in_words_never_sent_as_0(built, qty):
+    s = Sizer(built(lambda pair: paper_venue_lot(pair, get_json=listing("0.005", "0.010"))))
+    d = decide(Book(D("100000")), Intent("BTC", 1, D(qty), D("60000"), D("60000"), D("600"), s._lot(), s._min_qty()),
+               PORTFOLIO)
+    assert d.outcome == "rejected" and d.approved_qty == 0 and d.limit_hit == "below_min"
+    assert d.reason.startswith("Entry rejected") and "0.01" in d.reason
