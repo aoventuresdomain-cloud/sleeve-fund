@@ -102,9 +102,7 @@ def test_a_stale_form_is_refused_and_writes_nothing(store):
 
 
 @pytest.mark.parametrize("edit, words", [
-    ({"fund_stop_loss": False}, "can't be switched off"),
-    ({"fund_day_loss": False}, "can't be switched off"),
-    ({"fund_drawdown": False}, "can't be switched off"),
+    # TEC-B31: T3 and T5 asked off are no longer refused (PM 20 Oct); test_b31_locked_off pins that they save off.
     ({"fund_stop_loss": "0.11"}, "between 1% and 10%"),
     ({"fund_day_loss": "0.06"}, "between 1% and 5%"),
     ({"fund_drawdown": "0.04"}, "between 5% and 25%"),

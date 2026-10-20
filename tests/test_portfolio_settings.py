@@ -39,7 +39,7 @@ def _form(**over) -> dict:
          "fund_stop_loss.limit": "10", "asset_stop_loss.enabled": "on", "type_stop_loss.enabled": "on", "fund_gross.limit": "1.5", "asset_net.limit": "0.5", "fund_margin.limit": "50",
          "fund_day_loss.limit": "3", "fund_drawdown.limit": "15", "fund_gross.enabled": "on", "asset_net.enabled": "on",
          "fund_margin.enabled": "on",
-         # The locked tests: the page sends their on as a hidden field (F-LOCKED-OFF).
+         # T3 and T5: a checkbox like the others since B-31 (TEC-B31; were a hidden field, F-LOCKED-OFF).
          "fund_stop_loss.enabled": "on", "fund_day_loss.enabled": "on", "fund_drawdown.enabled": "on", "group.BTC": "large", "group.ETH": "large", "group.SOL": "mid", "group.XRP": "mid"}
     f.update(over)
     return {k: v for k, v in f.items() if v is not None}
@@ -55,12 +55,12 @@ def test_the_page_shows_the_five_tests_their_limits_and_the_fixed_lines(ps):
     assert r.status_code == 200
     t = _text(r.text)
     for words in ("T1 Per asset", "T2 Per asset group", "T3 Whole fund", "T4 Size limits", "T5 Loss brakes",
-                  "Edits apply to new trades only.", "can be changed but not switched off",
+                  "Edits apply to new trades only.",
                   "If the compliance tests can't be read, no new trade goes out.",  # TEC-FE-WORD (HoE)
                   "An asset with no group can't take a new trade while the per-group test is on."):
         assert words in t
     assert "1.50x" in t and "15%" in t and "50%" in t  # B-18 TEC: "x" values show 2 dp
-    assert t.count("Locked on") == 3  # T3 and both loss brakes
+    assert "Locked on" not in t and "not switched off" not in t  # TEC-B31: nothing is locked on (PM 20 Oct)
     assert t.count("No group · ideas refused") == 2  # ADA and DOGE: not in the v1 map
     assert "sleeve" not in t.lower()
 
@@ -95,9 +95,8 @@ def test_locked_tests_and_bounds_are_refused_on_the_form_and_on_the_server(ps):
                auth=AUTH, headers=SAME)
     t = _text(r.text)
     assert "Not saved." in t and "T3 Whole fund must be between 1% and 10%." in t and "T4 Margin must be between 10% and 80%." in t
-    # The form can't switch a locked test off (no checkbox); a hand-made post can't either.
-    assert rules.validate({**rules.defaults(), "fund_drawdown": {"limit": D("0.15"), "enabled": False}}) == [
-        "T5 Drawdown halt can be changed, but it can't be switched off."]
+    # TEC-B31: a loss brake asked off is valid now (PM 20 Oct); its bounds still hold, below.
+    assert rules.validate({**rules.defaults(), "fund_drawdown": {"limit": D("0.15"), "enabled": False}}) == []
     r = c.post("/portfolio-settings/apply", data={**_form(**{"fund_day_loss.limit": "6"}), "reason_pick": "Other",
                                                   "reason_note": "testing the bound"}, auth=AUTH, headers=SAME)
     assert r.status_code == 400 and "T5 Daily loss pause must be between 1% and 5%." in r.text
@@ -174,23 +173,34 @@ def test_each_row_carries_the_share_of_its_limit_used_as_a_number():
     assert rows["fund_gross"]["fill"] == 50.0 and rows["asset_net"]["fill"] is None
 
 
-def test_asking_a_locked_test_off_is_refused_in_words_and_writes_nothing(ps):
-    """F-LOCKED-OFF (Box C): the form quietly put a locked test back on, and Apply then wrote a version that changed
-    nothing. A locked test asked off is refused, by name, and no version is written; nor is a set that changes nothing."""
+def test_a_once_locked_test_is_switched_off_like_the_others_and_a_set_that_changes_nothing_writes_nothing(ps):
+    """TEC-B31 (PM 20 Oct: "they shouldnt be locked"; was F-LOCKED-OFF's refusal). T3 and both loss brakes have a
+    checkbox like the others; one asked off saves a version with it off and its limit kept. F-LOCKED-OFF's other half
+    stands: a set that changes nothing writes nothing."""
     c, store = ps
     edit = c.get("/portfolio-settings?edit=1", auth=AUTH).text
     for key in ("fund_stop_loss", "fund_day_loss", "fund_drawdown"):
-        assert f'<input type="hidden" name="{key}.enabled" value="on">' in edit
-    off = _form(**{"fund_drawdown.enabled": None})
-    r = c.post("/portfolio-settings/review", data=off, auth=AUTH, headers=SAME)
-    assert "T5 Drawdown halt can be changed, but it can&#39;t be switched off." in r.text and "Not saved." in r.text
-    r = c.post("/portfolio-settings/apply", data={**off, "reason_pick": "Tighter while testing"}, auth=AUTH,
-               headers=SAME, follow_redirects=False)
-    assert r.status_code == 400 and "T5 Drawdown halt can be changed, but it can't be switched off." in r.text
+        assert f'<input type="hidden" name="{key}.enabled" value="on">' not in edit
+        assert re.search(rf'<input type="checkbox" class="sw" name="{key}\.enabled" checked>', edit), key
     same = c.post("/portfolio-settings/apply", data={**_form(), "reason_pick": "Tighter while testing"}, auth=AUTH,
                   headers=SAME, follow_redirects=False)
     assert same.status_code == 400 and "Nothing changes from version 1, so nothing was saved" in same.text
     assert _n(store) == 1
+    off = _form(**{"fund_drawdown.enabled": None})
+    from sleeve_fund.paper.exec_client import publish
+
+    publish(store, {"EXEC_MODE": "demo"})  # CR MUST: the supervisor says the client is on, so the save is refused
+    on = c.post("/portfolio-settings/apply", data={**off, "reason_pick": "Other", "reason_note": "testing the fund", "confirm_off": "on"},
+                auth=AUTH, headers=SAME, follow_redirects=False)
+    assert on.status_code == 400 and "order client is on" in on.text and _n(store) == 1
+    publish(store, {})  # a supervisor started with the client off, as in deploy format
+    r = c.post("/portfolio-settings/apply", data={**off, "reason_pick": "Other", "reason_note": "testing the fund", "confirm_off": "on"},
+               auth=AUTH,
+               headers=SAME, follow_redirects=False)
+    assert r.status_code in (302, 303), r.text
+    assert _n(store) == 2
+    [t] = [t for t in store.compliance().tests if t["test"] == "fund_drawdown"]
+    assert not t["enabled"] and t["limit"] == D("0.15")
 
 
 def _edit_form(html: str) -> dict:

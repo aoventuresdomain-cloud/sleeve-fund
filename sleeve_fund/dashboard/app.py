@@ -2436,7 +2436,7 @@ KIND_WORDS = {"handler_failed": "Strategy error", "maker_fill_above_tape": "Make
               "mark_unavailable": "No price to value the book", "price_feed_back": "Price feed back",
               "heartbeat_stale": "Heartbeat late", "process_crash": "Process crashed", "process_start": "Process started",
               "process_stop": "Process stopped", "supervisor_error": "Supervisor error",
-              "supervisor_start": "Supervisor started", "fee_fetch_failed": "Couldn't fetch fees", "fees": "Fees",
+              "supervisor_start": "Supervisor started", "exec_client": "Order client", "fee_fetch_failed": "Couldn't fetch fees", "fees": "Fees",
               "alert_send_failed": "Couldn't send alert", "alerts_sent": "Alerts sent", "alerts_config": "Alerts set up",
               "backup_problem": "Backup problem", "exits_change": "Exits changed", "settings_applied": "Settings applied",
               "stop_rejected": "Stop refused", "stop_reset": "Stop reset", "exits_applied": "Exits applied", "warmup_short": "Short warm-up",

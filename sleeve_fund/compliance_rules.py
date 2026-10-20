@@ -30,7 +30,7 @@ RULES = (
     Rule("type_stop_loss", "T2", "Per asset group: loss if every stop is hit", "asset_type", "open_risk", "trim",
          Decimal("0.06"), Decimal("0.005"), Decimal("0.10")),
     Rule("fund_stop_loss", "T3", "Whole fund: loss if every stop is hit", "fund", "open_risk", "trim",
-         Decimal("0.10"), Decimal("0.01"), Decimal("0.10"), locked=True),
+         Decimal("0.10"), Decimal("0.01"), Decimal("0.10")),
     Rule("fund_gross", "T4", "Gross: every position's size added up", "fund", "gross", "trim",
          Decimal("1.5"), Decimal("0.1"), Decimal(3), unit="x"),
     Rule("asset_net", "T4", "Net per asset: long less short on one asset", "asset", "net", "trim",
@@ -38,9 +38,9 @@ RULES = (
     Rule("fund_margin", "T4", "Margin posted", "fund", "margin", "trim",
          Decimal("0.5"), Decimal("0.10"), Decimal("0.80")),
     Rule("fund_day_loss", "T5", "Today's loss pauses new trades until the next day begins", "fund", "day_loss", "pause_day",
-         Decimal("0.03"), Decimal("0.01"), Decimal("0.05"), locked=True),
+         Decimal("0.03"), Decimal("0.01"), Decimal("0.05")),
     Rule("fund_drawdown", "T5", "Drawdown from the peak closes everything and halts", "fund", "drawdown", "halt",
-         Decimal("0.15"), Decimal("0.05"), Decimal("0.25"), locked=True),
+         Decimal("0.15"), Decimal("0.05"), Decimal("0.25")),
 )
 BY_KEY = {r.key: r for r in RULES}
 KEYS = tuple(BY_KEY)
