@@ -451,3 +451,11 @@ def test_b38w_trades_across_a_fold_edge_count_only_inside_the_windows():
     basket's trades and the draws'; one wholly between windows is dropped."""
     cut = bk.clip([bk.TradeAt(3, 12, 1, 100.0), bk.TradeAt(9, 11, 1, 50.0)], [(0, 9), (11, 20)])
     assert cut == [bk.TradeAt(3, 9, 1, 100.0)]
+
+
+def test_b38za_retitling_a_rules_definition_is_the_same_basket_try():
+    """A rule-builder definition's title renames it on screen only (B-16): the same basket and settings."""
+    named = {"definition": {"title": "Dip buy", "rules": [1, 2]}}
+    renamed = {"definition": {"title": "Dip buy, BTC and ETH", "rules": [1, 2]}}
+    assert bk.basket_key(_basket(params=named)) == bk.basket_key(_basket(params=renamed))
+    assert bk.basket_key(_basket(params=named)) != bk.basket_key(_basket(params={"definition": {"rules": [1, 3]}}))

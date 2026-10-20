@@ -413,8 +413,9 @@ def random_words(r: RandomBeat) -> str:
 
 def basket_key(basket: Basket) -> str:
     """One try: the fixed basket (its assets, in order: leg order can change reservations and fills) and its
-    settings."""
-    return trials.content_hash({"strategy": basket.strategy, "params": basket.params, "assets": basket.names})
+    settings; a rule-builder definition's title renames it on screen only (B-16), so a retitle is the same try."""
+    return trials.content_hash({"strategy": basket.strategy, "params": trials._untitled(basket.params),
+                                "assets": basket.names})
 
 
 def idea_hash(basket: Basket) -> str:
