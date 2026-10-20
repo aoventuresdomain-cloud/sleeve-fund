@@ -23,6 +23,7 @@ from test_halt_ref import (
 from test_portfolio_settings import _form, _n, _text
 
 from sleeve_fund import compliance_rules as rules
+from sleeve_fund.paper.exec_client import publish
 
 UK = ZoneInfo("Europe/London")
 BRAKES = ("fund_stop_loss", "fund_day_loss", "fund_drawdown")
@@ -36,6 +37,7 @@ def client(store, tmp_path, monkeypatch):  # noqa: F811
     monkeypatch.setenv("DASHBOARD_PASSWORD", AUTH[1])
     monkeypatch.setattr(app_mod, "TEARSHEETS", tmp_path)
     monkeypatch.setattr(app_mod, "LEDGER", tmp_path / "idea_ledger.jsonl")
+    publish(store, {})  # the supervisor started with the order client off, as in deploy format (paper)
     return TestClient(app_mod.create_app(store)), store
 
 
@@ -100,14 +102,23 @@ def test_the_review_says_so_when_the_book_has_no_mark_to_rebase_from(client):
     assert "T5 Drawdown halt back on: the fund's book has no mark yet, so it measures from the first mark." in page
 
 
-def test_switching_a_brake_off_is_refused_on_the_review_while_the_order_client_is_on(client, monkeypatch):
+@pytest.mark.parametrize("said", ["on", "unknown"])
+def test_switching_a_brake_off_is_refused_on_the_review_unless_the_supervisor_said_the_client_is_off(
+        client, monkeypatch, said):
+    """CR MUST: in deploy format only the supervisor has the order client's settings, so the page reads what it
+    published (exec_client.client_state), not the dashboard's own environment, which is left empty here."""
     c, store = client  # noqa: F811
-    for k, v in {"EXEC_MODE": "demo", "EXEC_HOST": "api-demo.bybit.com", "BYBIT_DEMO_API_KEY": "k",
-                 "BYBIT_DEMO_API_SECRET": "s"}.items():
-        monkeypatch.setenv(k, v)
-    r = _review(c, 1, **_off("fund_drawdown"))
-    page = _text(r.text)
-    assert "Not saved." in page and "can't be switched off while the exchange order client is on" in page
+    for k in ("EXEC_MODE", "EXEC_HOST"):
+        monkeypatch.delenv(k, raising=False)
+    if said == "on":
+        publish(store, {"EXEC_MODE": "demo", "EXEC_HOST": "api-demo.bybit.com", "BYBIT_DEMO_API_KEY": "k",
+                        "BYBIT_DEMO_API_SECRET": "s"})
+    else:
+        monkeypatch.setattr("sleeve_fund.paper.exec_client.published_on", lambda st: None)
+    page = _text(_review(c, 1, **_off("fund_drawdown")).text)
+    when = ("while the exchange order client is on" if said == "on"
+            else "until the supervisor has said the exchange order client is off")
+    assert "Not saved." in page and f"T5 Drawdown halt can't be switched off {when}" in page, page[:800]
     assert "Apply these changes" not in page and _n(store) == 1
 
 

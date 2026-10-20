@@ -64,7 +64,7 @@ from sleeve_fund.store import (
     is_backtest,
     utcnow,
 )
-from sleeve_fund.paper.exec_client import exec_settings
+from sleeve_fund.paper.exec_client import client_state
 from sleeve_fund.paper.runtime import (EXITS_ONLY, RESUMABLE, clearing_action, entry_blocked, liquidation_event,
                                       pair_ral_figures)
 from sleeve_fund.strategies import (
@@ -1763,9 +1763,13 @@ def create_app(store: Store | None = None) -> FastAPI:
             return page(request, "portfolio_settings.html", v=v, mode="edit", saved="", errors=errors, form=form)
         cur = v["current"]
         switches = compliance.brake_switches(cur["tests"], tests)
-        if any(not on for _, on in switches) and exec_settings(os.environ).on:  # the store refuses it too (B-31)
+        # B-31 (CR MUST): the one reader of the supervisor's order client, as the store's save reads it; refused unless off
+        client = client_state(st()) if any(not on for _, on in switches) else "off"
+        if client != "off":
             names = ", ".join(compliance_rules.name(k) for k, on in switches if not on)
-            errors = [f"{names} can't be switched off while the exchange order client is on. {compliance.PAPER_ONLY}"]
+            when = ("while the exchange order client is on" if client == "on"
+                    else "until the supervisor has said the exchange order client is off")
+            errors = [f"{names} can't be switched off {when}. {compliance.PAPER_ONLY}"]
             return page(request, "portfolio_settings.html", v=v, mode="edit", saved="", errors=errors, form=form)
         lines = compliance_rules.changes(cur["tests"], tests, cur["groups"], groups)
         warned = compliance_rules.warnings(tests)
