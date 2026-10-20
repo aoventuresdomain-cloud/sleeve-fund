@@ -787,7 +787,8 @@ BINANCE = register(VenueProfile(
     maintenance_limits={"BTC/USDT": 1_200_000_000},  # past it the venue takes no position; nor do we
     price_ticks={"BTC/USDT": "0.1"},  # B-36b: kept with its tiers, read 20 Oct 2026; another pair is checked in with its table
     live_tick=paper_venue_tick,
-    # B-44: kept from the same listing (tests/data/fee_live/instruments-info-BTCUSDT.json, read 20 Oct 2026)
+    # B-44: kept as the listing's documented shape gives it (tests/data/fee_live/instruments-info-BTCUSDT.json, not
+    # captured from the venue); the live read on the server wins and says so if it differs
     lot_sizes={"BTC/USDT": ("0.001", "0.001")},
     live_lot=paper_venue_lot,
     core_pairs=("BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "SUI/USDT"),
