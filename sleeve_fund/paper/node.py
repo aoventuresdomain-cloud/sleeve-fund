@@ -11,7 +11,6 @@ import argparse
 import dataclasses
 import hashlib
 import os
-import re
 import sys
 import threading
 from functools import partial
@@ -46,7 +45,7 @@ from sleeve_fund.venues import venue as venue_profile
 
 
 def _tag(name: str) -> str:
-    return re.sub(r"[^A-Z0-9]+", "-", name.upper()).strip("-")
+    return router.tag_of(name)
 
 
 def strategy_id(cls_name: str, name: str) -> StrategyId:

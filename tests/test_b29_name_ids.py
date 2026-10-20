@@ -2,7 +2,12 @@
 
 The form's own suggested names did it (candle-step-btcusdt-1m, trend-filter-btcusd-1h): the trader id became
 "PAPER-CANDLE-STEP-BTCUSDT-", which the engine refuses, so the node exited 1 and restarted in a loop. Every id
-built from the cut tag must be one the engine takes, and a name that works today must keep the ids it has."""
+built from the cut tag must be one the engine takes, and a name that works today must keep the ids it has.
+
+HoE QA ruling (20 Oct): ids must also be distinct for distinct names. A bare 20-character cut gave
+candle-step-btcusdt-1m and candle-step-btcusdt-5m one trader and one account (PAPER-CANDLE-STEP-BTCUSDT), so their
+orders and fills mixed. A tag of 20 characters or fewer keeps its ids exactly; a longer one is its cut plus a hash of
+the whole tag; and a name whose ids would equal a live Strategy's is refused at create."""
 import itertools
 import pathlib
 import re
@@ -49,22 +54,52 @@ def test_every_id_the_paper_node_builds_from_a_name_is_one_the_engine_takes(name
 
 
 @pytest.mark.parametrize("name", SUGGESTED + EDGES)
-def test_a_name_that_works_today_keeps_its_ids(name):
+def test_a_short_name_keeps_the_ids_it_has_today(name):
     tag = node._tag(name)
-    if _old_cut(tag).endswith("-"):
-        pytest.skip("this name crashed before; it had no ids to keep")
+    if len(tag) > 20:
+        pytest.skip("a longer tag gets a hash (HoE ruling 2): see the next cells")
     venue = next(iter(VENUES)).upper()
-    assert node.trader_id(tag) == f"PAPER-{tag[:20]}"
-    assert str(node.strategy_id("CandleStep", name)).startswith(f"CandleStep-{tag[:20]}-")
-    assert router.route(name, venue, VENUES, tag=tag).account_id == f"{venue}-PAPER-{tag[:20]}"
-    assert node.account_id(f"{venue}_P1", name) == f"{venue}_P1-PAPER-{tag[:20]}"
+    assert node.trader_id(tag) == f"PAPER-{tag}"
+    assert str(node.strategy_id("CandleStep", name)).startswith(f"CandleStep-{tag}-")
+    assert router.route(name, venue, VENUES, tag=tag).account_id == f"{venue}-PAPER-{tag}"
+    assert node.account_id(f"{venue}_P1", name) == f"{venue}_P1-PAPER-{tag}"
+
+
+def test_the_pms_short_names_keep_their_ids_exactly():
+    assert node.trader_id(node._tag("cs-default")) == "PAPER-CS-DEFAULT"
+    assert node.trader_id(node._tag("timed-test")) == "PAPER-TIMED-TEST"
+    assert router.cut_tag("A" * 20) == "A" * 20
+
+
+@pytest.mark.parametrize("name", [n for n in SUGGESTED + EDGES if len(node._tag(n)) > 20])
+def test_a_long_name_gets_its_cut_plus_a_hash_of_the_whole_tag(name):
+    tag = node._tag(name)
+    cut = router.cut_tag(tag)
+    head, _, digest = cut.rpartition("-")
+    assert len(cut) <= 20 and re.fullmatch(r"[0-9A-F]{6}", digest) and tag.startswith(head) and not head.endswith("-")
+
+
+def test_two_names_sharing_their_first_20_tag_characters_get_different_ids():
+    """RED on 274ecd88 and on the first B-29 cut: both were trader PAPER-CANDLE-STEP-BTCUSDT and one account."""
+    a, b = "candle-step-btcusdt-1m", "candle-step-btcusdt-5m"
+    venue = next(iter(VENUES)).upper()
+    assert node.trader_id(node._tag(a)) != node.trader_id(node._tag(b))
+    assert (router.route(a, venue, VENUES, tag=node._tag(a)).account_id
+            != router.route(b, venue, VENUES, tag=node._tag(b)).account_id)
+    assert node.account_id(f"{venue}_P1", a) != node.account_id(f"{venue}_P1", b)
+
+
+def test_every_suggested_and_edge_name_gets_its_own_trader_id():
+    names = sorted(set(SUGGESTED + EDGES))
+    ids = {node.trader_id(node._tag(n)) for n in names}
+    assert len(ids) == len(names)
 
 
 def test_no_id_in_the_paper_node_or_router_cuts_a_tag_by_hand():
     """Pins the call sites: every cut goes through router.cut_tag, so no builder can drift back to a raw [:20]."""
     for path in ("sleeve_fund/paper/node.py", "sleeve_fund/router.py"):
         src = (pathlib.Path(__file__).resolve().parents[1] / path).read_text()
-        assert "[:20]" not in src.replace("tag[:20].rstrip", ""), path
+        assert "[:20]" not in src, path
     src = (pathlib.Path(__file__).resolve().parents[1] / "sleeve_fund/paper/node.py").read_text()
     assert src.count("TraderId.from_str(trader_id(tag))") == 3
 
@@ -121,3 +156,43 @@ def test_a_strategy_put_away_after_an_error_no_longer_counts_as_halted(tmp_path,
     assert "1 halted" in bar()  # red-first: it waits for the PM while it is still a live Strategy
     store.archive("candle-step-btcusdt-1m")
     assert "halted" not in bar()
+
+
+@pytest.fixture(params=["sqlite", "postgres"])
+def journal(request, tmp_path):
+    import os
+
+    from sleeve_fund.store import Store, make_engine, metadata
+
+    if request.param == "sqlite":
+        return Store(f"sqlite:///{tmp_path}/t.db")
+    url = os.environ.get("TEST_DATABASE_URL")
+    if not url:
+        pytest.skip("CI runs these against Postgres too (TEST_DATABASE_URL)")
+    engine = make_engine(url)
+    metadata.drop_all(engine)
+    return Store(engine=engine)
+
+
+def _make(store, name):
+    store.create_sleeve(name=name, strategy="candle_step", instrument="BTC/USDT", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=0, desired_state="stopped")
+
+
+def test_a_name_whose_ids_equal_a_live_strategys_is_refused_at_create(journal):
+    """HoE ruling 3: Timed Test and timed-test share one tag, so one trader and one account."""
+    store = journal
+    _make(store, "timed-test")
+    with pytest.raises(ValueError, match="share ids with Strategy timed-test"):
+        _make(store, "Timed Test")
+    assert [s.name for s in store.sleeves()] == ["timed-test"]
+    _make(store, "candle-step-btcusdt-1m")
+    _make(store, "candle-step-btcusdt-5m")  # distinct ids now: both are made
+
+
+def test_a_put_away_strategy_doesnt_block_a_name_with_its_ids(journal):
+    store = journal
+    _make(store, "timed-test")
+    store.archive("timed-test")
+    _make(store, "Timed_Test")
+    assert "Timed_Test" in {s.name for s in store.sleeves()}
