@@ -82,7 +82,7 @@ ROOT = HERE.parent.parent
 TEARSHEETS = study_run.TEARSHEETS
 LEDGER = study_run.LEDGER
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,40}$")
-FUND_BANNER_PAGES = {"home.html", "sleeve.html", "portfolio_settings.html"}  # C7: Portfolio, a Strategy, Portfolio Settings
+FUND_BANNER_PAGES = {"home.html", "sleeve.html", "portfolio_settings.html", "risk.html", "trades.html"}  # C7: every fund page listing positions or limits
 VERSION = os.environ.get("APP_VERSION", "dev")[:12]
 ORDER_HISTORY_ROWS = 15  # the strategy page's Order history; the Blotter has the rest
 
