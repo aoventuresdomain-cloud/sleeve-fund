@@ -1065,6 +1065,13 @@ gate_decisions_t = Table(
     # book_equity (T1-T3 loss if stops are hit, T4 gross or net); NULL for T5 and when no test bound it
     Column("would_be", EXACT),
     Column("side", SmallInteger),  # +1 long, -1 short; requested_qty stays unsigned
+    # B-24 (DA, 0032; Advisor B24-LEVERAGE): the leverage figures the gate computed for this idea, unrounded, inside its
+    # lock: margin leverage, share of the fund, gross after and net per underlying after (signed). All four or none
+    # (rows before it, error rows); once written they never change (GATE_LEVERAGE triggers below).
+    Column("margin_leverage", EXACT),
+    Column("share_of_fund", EXACT),
+    Column("gross_after", EXACT),
+    Column("net_underlying_after", EXACT),
     CheckConstraint(_in("outcome", GATE_OUTCOMES), name="gate_decisions_outcome"),
     CheckConstraint(_in("limit_hit", GATE_LIMITS), name="gate_decisions_limit_hit"),
     CheckConstraint(_in("stage", GATE_STAGES), name="gate_decisions_stage"),
@@ -1122,6 +1129,27 @@ shadow_outcomes_t = Table(
     CheckConstraint(_in("method", SHADOW_METHODS), name="shadow_outcomes_method"),
     CheckConstraint("(kind = 'refusal' AND hypothetical AND method = 'replay') "
                     "OR (kind = 'trim' AND NOT hypothetical AND method = 'trade_scaled')", name="shadow_outcomes_shape"),
+)
+# B-24 (DA, 0032; Advisor B24-LEVERAGE, QD): the same four figures at each fill of a gate decision, at that fill's price,
+# written by the paper gate's fill hook in the transaction that reduces the reservation. One per (decision, fill); keyed by
+# the trade id, not fills.id: a research run's gate fills have no fills row. Write-once. price_source: "fill" (what the gate
+# writes), "expected_fill" (the decision's own price) and "mark" (a display recompute, so the dashboard can label it).
+GATE_FILL_FIGURES = ("margin_leverage", "share_of_fund", "gross_after", "net_underlying_after")
+GATE_PRICE_SOURCES = ("expected_fill", "fill", "mark")
+gate_fill_marks_t = Table(
+    "gate_fill_marks",
+    metadata,
+    Column("id", BIG_ID, primary_key=True),
+    Column("decision_id", BIG_ID, ForeignKey("gate_decisions.id", ondelete="RESTRICT"), nullable=False),
+    Column("trade_id", String(64), nullable=False),
+    Column("price", EXACT, nullable=False),
+    Column("price_source", String(16), nullable=False),
+    *(Column(f, EXACT, nullable=False) for f in GATE_FILL_FIGURES),
+    Column("marked_at", TS, nullable=False),
+    UniqueConstraint("decision_id", "trade_id", name="gate_fill_marks_decision_trade"),
+    CheckConstraint(_in("price_source", GATE_PRICE_SOURCES), name="gate_fill_marks_price_source"),
+    CheckConstraint("price > 0", name="gate_fill_marks_price"),
+    CheckConstraint("margin_leverage >= 0 AND share_of_fund >= 0 AND gross_after >= 0", name="gate_fill_marks_figures"),
 )
 # Bridge A (DA, 0027; Advisor BRIDGE-3): the PM's compliance tests, versioned whole. One version is every test and the
 # asset-group map together, so a decision that records its version re-checks exactly. Written only through
@@ -1253,7 +1281,48 @@ SHADOW_SQLITE = (
     f"CREATE TRIGGER shadow_outcomes_kind BEFORE INSERT ON shadow_outcomes WHEN {SHADOW_WRONG_KIND} BEGIN "
     "SELECT RAISE(ABORT, 'a shadow outcome is a trim of a trimmed decision or a refusal of a rejected one'); END",
 )
-for _t, _pg, _lite in ((gate_decisions_t, GATE_IDEA_PG, GATE_IDEA_SQLITE), (shadow_outcomes_t, SHADOW_PG, SHADOW_SQLITE)):
+# B-24 (DA, 0032): the decision's four leverage figures are all there or none, only net may be below 0, and once written
+# they never change; a row without them may get them once. Triggers, so 0032 adds them without rebuilding gate_decisions
+# on SQLite. A fill mark is write-once.
+GATE_LEVERAGE_BAD = ("NOT ((NEW.margin_leverage IS NULL AND NEW.share_of_fund IS NULL AND NEW.gross_after IS NULL "
+                     "AND NEW.net_underlying_after IS NULL) OR (NEW.margin_leverage IS NOT NULL AND NEW.share_of_fund "
+                     "IS NOT NULL AND NEW.gross_after IS NOT NULL AND NEW.net_underlying_after IS NOT NULL)) "
+                     "OR NEW.margin_leverage < 0 OR NEW.share_of_fund < 0 OR NEW.gross_after < 0")
+GATE_LEVERAGE_MESSAGE = ("gate_decisions: the four leverage figures are all set or none, only net may be below 0, "
+                         "and once set they never change")
+GATE_LEVERAGE_FROZEN = {
+    "postgresql": "OLD.margin_leverage IS NOT NULL AND (NEW.margin_leverage, NEW.share_of_fund, NEW.gross_after, "
+                  "NEW.net_underlying_after) IS DISTINCT FROM (OLD.margin_leverage, OLD.share_of_fund, "
+                  "OLD.gross_after, OLD.net_underlying_after)",
+    "sqlite": "OLD.margin_leverage IS NOT NULL AND (NEW.margin_leverage IS NOT OLD.margin_leverage OR NEW.share_of_fund "
+              "IS NOT OLD.share_of_fund OR NEW.gross_after IS NOT OLD.gross_after OR NEW.net_underlying_after IS NOT "
+              "OLD.net_underlying_after)",
+}
+GATE_LEVERAGE_PG = (
+    "CREATE OR REPLACE FUNCTION gate_leverage_shape() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+    f"IF {GATE_LEVERAGE_BAD} OR (TG_OP = 'UPDATE' AND {GATE_LEVERAGE_FROZEN['postgresql']}) THEN RAISE EXCEPTION "
+    f"USING ERRCODE = 'check_violation', MESSAGE = '{GATE_LEVERAGE_MESSAGE}'; END IF; RETURN NEW; END $$",
+    "CREATE TRIGGER gate_decisions_leverage BEFORE INSERT OR UPDATE ON gate_decisions FOR EACH ROW "
+    "EXECUTE FUNCTION gate_leverage_shape()",
+)
+GATE_LEVERAGE_SQLITE = (
+    f"CREATE TRIGGER gate_decisions_leverage_insert BEFORE INSERT ON gate_decisions WHEN {GATE_LEVERAGE_BAD} "
+    f"BEGIN SELECT RAISE(ABORT, '{GATE_LEVERAGE_MESSAGE}'); END",
+    f"CREATE TRIGGER gate_decisions_leverage_update BEFORE UPDATE ON gate_decisions WHEN {GATE_LEVERAGE_BAD} "
+    f"OR ({GATE_LEVERAGE_FROZEN['sqlite']}) BEGIN SELECT RAISE(ABORT, '{GATE_LEVERAGE_MESSAGE}'); END",
+)
+GATE_FILL_MARKS_PG = (
+    "CREATE OR REPLACE FUNCTION gate_fill_mark_write_once() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+    "RAISE EXCEPTION USING ERRCODE = 'check_violation', MESSAGE = 'gate_fill_marks is write-once'; END $$",
+    "CREATE TRIGGER gate_fill_marks_write_once BEFORE UPDATE OR DELETE ON gate_fill_marks FOR EACH ROW "
+    "EXECUTE FUNCTION gate_fill_mark_write_once()",
+)
+GATE_FILL_MARKS_SQLITE = tuple(
+    f"CREATE TRIGGER gate_fill_marks_no_{op.lower()} BEFORE {op} ON gate_fill_marks BEGIN "
+    "SELECT RAISE(ABORT, 'gate_fill_marks is write-once'); END" for op in ("UPDATE", "DELETE"))
+for _t, _pg, _lite in ((gate_decisions_t, GATE_IDEA_PG, GATE_IDEA_SQLITE), (shadow_outcomes_t, SHADOW_PG, SHADOW_SQLITE),
+                       (gate_decisions_t, GATE_LEVERAGE_PG, GATE_LEVERAGE_SQLITE),
+                       (gate_fill_marks_t, GATE_FILL_MARKS_PG, GATE_FILL_MARKS_SQLITE)):
     for _sql in _pg:
         event.listen(_t, "after_create", DDL(_sql).execute_if(dialect="postgresql"))
     for _sql in _lite:
@@ -1906,6 +1975,7 @@ RESET_STAYS = {
     # ids hold), and follows it
     acks_t: "an ack names its event by id: the event moves with the run, and the ack still points at it",
     shadow_outcomes_t: "one per gate decision, which stays with the Strategy (above); write-once, never moved",
+    gate_fill_marks_t: "a gate decision's fills, which stay with the Strategy (above); write-once, never moved",
 }
 STRATEGY_COLUMNS = frozenset({"sleeve", "sleeve_id", "parent", "strategy_id"})
 
@@ -4735,6 +4805,47 @@ class Store:
             q = q.where(func.coalesce(t.c.parent, t.c.name) == strategy)
         with self.engine.connect() as c:
             return _rows(c.execute(q))
+
+    def record_fill_mark(self, decision_id: int, trade_id: str, price, price_source: str, *, margin_leverage,
+                         share_of_fund, gross_after, net_underlying_after, marked_at: datetime | None = None,
+                         conn=None) -> str:
+        """B-24: a gate decision's four leverage figures at one of its fills (Advisor B24-LEVERAGE). "new" when
+        written, "same" when this fill holds the same mark already (a rerun; marked_at aside), and ValueError when it
+        holds another (write-once: never overwritten). LookupError for a decision that isn't there (SQLite doesn't hold
+        the foreign key). conn: the fill path's own transaction, so the mark lands with the reservation's reduce."""
+        figures = {"margin_leverage": margin_leverage, "share_of_fund": share_of_fund, "gross_after": gross_after,
+                   "net_underlying_after": net_underlying_after}
+        row = dict(decision_id=decision_id, trade_id=trade_id, price=to_decimal(price, "price"),
+                   price_source=price_source, **{k: to_decimal(v, k) for k, v in figures.items()},
+                   marked_at=marked_at or utcnow())
+        t = gate_fill_marks_t
+
+        def write(c):
+            if c.execute(select(gate_decisions_t.c.id).where(gate_decisions_t.c.id == decision_id)).first() is None:
+                raise LookupError(f"gate decision {decision_id} isn't there: no fill mark for it")
+            have = c.execute(select(t).where(t.c.decision_id == decision_id, t.c.trade_id == trade_id)).first()
+            if have is None:
+                c.execute(insert(t).values(**row))
+            return have
+
+        if conn is not None:
+            have = write(conn)
+        else:
+            with self.engine.begin() as c:
+                have = write(c)
+        if have is None:
+            return "new"
+        if have.price_source == price_source and all(
+                stored(getattr(have, k)) == stored(row[k]) for k in ("price", *GATE_FILL_FIGURES)):
+            return "same"
+        raise ValueError(f"decision {decision_id} already has a mark for fill {trade_id} at {stored(have.price)}; "
+                         "a fill mark is never rewritten")
+
+    def fill_marks(self, decision_id: int) -> list[dict]:
+        """A gate decision's fill marks, oldest first (B-24)."""
+        t = gate_fill_marks_t
+        with self.engine.connect() as c:
+            return _rows(c.execute(select(t).where(t.c.decision_id == decision_id).order_by(t.c.marked_at, t.c.id)))
 
     # --- compliance tests (bridge A, DA 0027; Advisor BRIDGE-3) -----------------------------------------------
 

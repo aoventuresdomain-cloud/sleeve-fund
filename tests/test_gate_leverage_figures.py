@@ -5,6 +5,7 @@ error rows), and once written never change; a fill mark is write-once. The datab
 Postgres (TEST_DATABASE_URL). Expected figures are written out here, not computed by the code under test."""
 from __future__ import annotations
 
+import itertools
 import os
 import uuid
 from datetime import datetime, timezone
@@ -24,6 +25,7 @@ LEV = {"margin_leverage": Decimal("2.25"), "share_of_fund": Decimal("0.0375"), "
 AT = datetime(2026, 10, 20, 18, 0, tzinfo=timezone.utc)
 _SCHEMAS: list[str] = []
 _ENGINES: list = []
+_SEQ = itertools.count(1)  # gate_decisions.seq is unique: a refused row is refused for its figures alone
 
 
 def _engine(schema: str | None = None):
@@ -67,7 +69,8 @@ def _decision(store, **over) -> int:
     sid = store.create_sleeve(name=f"s{uuid.uuid4().hex[:6]}", strategy="buy_and_hold", instrument="BTC/USD",
                               bar_spec="1-HOUR-LAST-INTERNAL", starting_balance=1_000).id
     with store.engine.begin() as c:
-        return c.execute(insert(gate_decisions_t).returning(gate_decisions_t.c.id), [_row(sid, **over)]).scalar_one()
+        return c.execute(insert(gate_decisions_t).returning(gate_decisions_t.c.id),
+                         [_row(sid, seq=next(_SEQ), **over)]).scalar_one()
 
 
 def _figures(store, did):
