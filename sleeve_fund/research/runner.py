@@ -21,7 +21,7 @@ from nautilus_trader.model import AccountType, Currency, CurrencyPair, Money, Om
 
 from sleeve_fund import bars as bar_rule
 from sleeve_fund import funding, markets, open_risk
-from sleeve_fund.data import bar_type_for, decision_bar_type, to_bars
+from sleeve_fund.data import bar_type_for, check_feed_precision, decision_bar_type, to_bars
 from sleeve_fund.instruments import BOOK_SHARE, BarOpens, ExecBars, FeeSchedule, ScheduleFeeModel, fill_model, pair_of
 from sleeve_fund.spreads import SpreadSeries
 from sleeve_fund.store import utcnow as _utcnow
@@ -437,6 +437,14 @@ def add_leg(engine: BacktestEngine, plan: RunPlan, instrument: CurrencyPair | No
     return Leg(plan, instrument, strategy, fee_model, feed, feed_type, coarse, exec_minutes)
 
 
+def _add_bars(engine: BacktestEngine, leg: Leg, bars: list) -> None:
+    """Hands one slice of a leg's bars to the engine, refused at load if they carry another price precision than the
+    leg's instrument (B43-PRECISION (a)). shortcut: each slice's first and last bar are checked, not every bar (a slice
+    is built by one to_bars call at one precision); check every bar if a slice is ever assembled from parts."""
+    check_feed_precision(leg.instrument, bars[:1] + bars[-1:])
+    engine.add_data(bars)
+
+
 def feed_legs(engine: BacktestEngine, legs: list[Leg]) -> None:
     """Run the engine over every leg's bars. Fed in slices so memory stays at one slice of engine bars however long
     the run: five years of minutes at once is about 2.6 million bar objects. Streaming gives the same result. Each
@@ -444,7 +452,7 @@ def feed_legs(engine: BacktestEngine, legs: list[Leg]) -> None:
     if len(legs) == 1:
         leg = legs[0]
         for i in range(0, len(leg.feed), CHUNK_BARS):
-            engine.add_data(to_bars(leg.feed.iloc[i:i + CHUNK_BARS], leg.instrument, leg.feed_type))
+            _add_bars(engine, leg, to_bars(leg.feed.iloc[i:i + CHUNK_BARS], leg.instrument, leg.feed_type))
             engine.run(streaming=True)
             engine.clear_data()
     else:
@@ -454,7 +462,7 @@ def feed_legs(engine: BacktestEngine, legs: list[Leg]) -> None:
             for leg in legs:
                 part = leg.feed.loc[lo:hi]
                 if len(part):
-                    engine.add_data(to_bars(part, leg.instrument, leg.feed_type))
+                    _add_bars(engine, leg, to_bars(part, leg.instrument, leg.feed_type))
             engine.run(streaming=True)
             engine.clear_data()
     engine.end()
