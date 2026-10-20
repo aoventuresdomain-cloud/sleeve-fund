@@ -953,9 +953,9 @@ window.Console = (() => {
   }
 
   // B-35: a model that places no stop is held to 1x on a perpetual (strategies.check_perp_stop, "always a stop, or
-  // 1x"). With no stop set the form picks the highest profile within that and says why, so its defaults save; a stop
-  // set under the exits frees the choice. The backtest form does the same, so research runs at paper's leverage
-  // (Advisor B35-STOPLESS-DEFAULT).
+  // 1x"). With no stop set the form says so beside the risk profile, which stays as the PM picked it (HoE ruling (a),
+  // 20 Oct); the save holds it there by its own leverage cap. The backtest form does the same, so research runs at
+  // paper's leverage (Advisor B35-STOPLESS-DEFAULT).
   function stoplessHold(form) {
     if (!form || !form.elements.strategy || !form.elements.risk_profile) return;
     const $ = (n) => form.elements[n];
@@ -963,14 +963,11 @@ window.Console = (() => {
       const max = Number($("strategy").selectedOptions[0]?.dataset.stoplessMax);
       const note = form.querySelector("#stopless-note");
       const held = max > 0 && $("market") && $("market").value !== "spot" && !(form.querySelector("[data-kind=stop]")?.value);
+      // B-35 (a): the save holds it at 1x by its own leverage cap (app._form_params); the risk profile stays as picked.
       if (note) {
         note.hidden = !held;
-        note.textContent = held ? `This model places no stop, so on a perpetual it is held to ${max}x leverage. Set a stop under the exits to choose more.` : "";
+        note.textContent = held ? `No stop, so capped at ${max}x leverage on a perpetual; the risk profile's other limits still apply. Set a stop under the exits to use the profile's leverage.` : "";
       }
-      const prof = $("risk_profile");
-      if (!held || Number(prof.selectedOptions[0].dataset.lev) <= max) return;
-      const fit = [...prof.options].filter((o) => Number(o.dataset.lev) <= max).sort((a, b) => Number(b.dataset.lev) - Number(a.dataset.lev))[0];
-      if (fit) { prof.value = fit.value; prof.dispatchEvent(new Event("change", {bubbles: true})); }
     };
     form.addEventListener("change", holdStopless);
     holdStopless();

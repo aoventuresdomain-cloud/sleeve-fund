@@ -53,7 +53,7 @@ from sleeve_fund.research import run as study_run
 from sleeve_fund.research.ledger import IdeaLedger, opened_words
 from sleeve_fund.research.holdout import HoldoutLocks
 from sleeve_fund.research.trials import TrialsRegister
-from sleeve_fund.risk import PROFILES, leverage_cap
+from sleeve_fund.risk import OWN_LEVERAGE, PROFILES, leverage_cap
 from sleeve_fund.store import (
     BACKTEST_PREFIX,
     HALT_FLATTEN,
@@ -2761,6 +2761,10 @@ def _form_params(form, strategy: str) -> dict:
             params["maker_wait_minutes"] = int(str(form.get("maker_wait_minutes", "")).strip() or 15)
         except ValueError:
             raise ValueError("go to market after: a whole number of minutes") from None
+    # B-35 (a), the PM's "a stop, or 1x": a model that places no stop is held at 1x on a perpetual by its own leverage
+    # cap (risk.OWN_LEVERAGE, a number), under the risk profile the PM picked, which stays as picked.
+    if market != markets.SPOT and strategy in REGISTRY and not places_stop(strategy, params):
+        params.setdefault(OWN_LEVERAGE, int(STOPLESS_MAX_LEVERAGE))
     return params
 
 
