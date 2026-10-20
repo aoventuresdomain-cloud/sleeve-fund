@@ -146,8 +146,10 @@ class VenueStub:
                 body = self.rfile.read(n).decode() if n else ""
                 stub.seen.append((self.command, self.path, body))
                 stub.headers.append(dict(self.headers))
-                out = json.dumps(stub.route(self.command, self.path, body)).encode()
-                self.send_response(200)
+                answer = stub.route(self.command, self.path, body)
+                status = answer.pop("__status__", 200) if isinstance(answer, dict) else 200
+                out = json.dumps(answer).encode()
+                self.send_response(status)
                 self.send_header("content-type", "application/json")
                 self.send_header("content-length", str(len(out)))
                 self.end_headers()
@@ -202,6 +204,15 @@ class VenueStub:
                     self._clients.discard(ws)
 
         asyncio.run_coroutine_threadsafe(send(), self._ws_loop).result(5)
+
+    def drop(self) -> None:
+        """Close every WebSocket from the venue's side, as a dropped connection (the fault cells, B-05 M3)."""
+        async def close():
+            for ws in list(self._clients):
+                await ws.close()
+                self._clients.discard(ws)
+
+        asyncio.run_coroutine_threadsafe(close(), self._ws_loop).result(5)
 
     def stop(self) -> None:
         if self._http is not None:

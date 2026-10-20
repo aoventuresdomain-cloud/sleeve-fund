@@ -152,6 +152,29 @@ def adapter_kwargs(s: ExecSettings, environ) -> dict:
             "margin_mode": "ISOLATED_MARGIN"}
 
 
+def node_configs(s: ExecSettings, environ, *, urls: dict | None = None, http_timeout_secs: int | None = None) -> tuple:
+    """The Bybit data and execution client configs a paper node adds with the client ON (B-05): one function for
+    demo and live (adapter_kwargs), linear perpetuals, isolated margin. The client never retries an order request on
+    its own (max_retries=0): a create that timed out is looked up by its id before anything is sent again (MUST 2).
+    urls: the stand-in venue's addresses in cells (base_url_http and the WebSocket ones); never set in paper."""
+    from nautilus_trader.adapters import bybit
+
+    kw = adapter_kwargs(s, environ)
+    urls = dict(urls or {})
+    common = {"product_types": [bybit.BybitProductType.LINEAR],
+              "environment": getattr(bybit.BybitEnvironment, kw["environment"]), "api_key": kw["api_key"],
+              "api_secret": kw["api_secret"], "base_url_http": urls.pop("base_url_http", kw["base_url_http"]),
+              "max_retries": 0, "http_timeout_secs": http_timeout_secs}
+    ws_public, ws_private, ws_trade = (urls.pop(k, None) for k in ("base_url_ws_public", "base_url_ws_private",
+                                                                     "base_url_ws_trade"))
+    if urls:
+        raise ValueError(f"unknown client addresses: {sorted(urls)}")
+    data = bybit.BybitDataClientConfig(**common, base_url_ws_public=ws_public, base_url_ws_private=ws_private)
+    execution = bybit.BybitExecutionClientConfig(**common, base_url_ws_private=ws_private, base_url_ws_trade=ws_trade,
+                                                 margin_mode=getattr(bybit.BybitMarginMode, kw["margin_mode"]))
+    return data, execution
+
+
 class Limiter:
     """Production limits per endpoint, as token buckets refilled continuously. take() answers send, wait or refuse:
     an exit, a stop or a cancel (opening=False) always goes, ahead of any entry; an entry over the limit waits, and
@@ -207,6 +230,53 @@ def assert_off(environ) -> None:
         raise PaperSafetyError(f"{MODE_ENV}={s.mode}: the exchange order client can't run a paper node yet (its "
                                "market data on the exchange is on the drill list); unset it to run on the simulated "
                                "client")
+
+
+# Order ids ON (drill-prep MUST 6, EXEC-SPEC MUST 5 finding; B-05). Paper's ids (O-date-time-<trader>-<strategy>-n)
+# and the A2 close ids (orphan-close-<entry>-n) pass 36 characters, the venue's orderLinkId limit. ON, every order the
+# fund sends is in its namespace (stop_mover.ID_PREFIX, Advisor STOP-CLAIM): an entry, exit or stop is "sf-" and a
+# UUID's 32 hex digits; a late fill's close is "sf-z" and 32 hex digits of its entry id and number, so two writers
+# racing journal one row, as the OFF id does. "z" is no hex digit, so a close is told from any other order of ours.
+CLOSE_ID_PREFIX = "sf-z"
+
+
+def order_id() -> str:
+    """A new order id for the client ON: 35 characters, in the fund's namespace."""
+    import uuid
+
+    return f"sf-{uuid.uuid4().hex}"
+
+
+def close_id(entry_id: str, n: int = 0) -> str:
+    """The A2 close id ON for the (n+1)th close of `entry_id`'s late fills: deterministic, 36 characters."""
+    import hashlib
+
+    return CLOSE_ID_PREFIX + hashlib.sha1(f"{entry_id}#{n}".encode()).hexdigest()[:32]
+
+
+def may_resend(row: dict | None) -> bool:
+    """MUST 2 (spec section 5): after a create whose answer never came, the order is looked up by its own id before
+    anything is sent again. Only the venue's word that it has no such order, or that it refused it with nothing
+    filled, lets a new one go; a working, filled or part-filled order, or no answer at all (the lookup raised and
+    there is no row to pass), never does."""
+    if row is None:
+        return True
+    return row.get("orderStatus") == "Rejected" and str(row.get("cumExecQty") or "0") in ("0", "0.0", "")
+
+
+FEE_TOLERANCE = 0.01  # EXEC-SPEC MUST 3: a venue fee more than a cent off FEE-LIVE's on one fill is alerted
+
+
+def fee_gap(*, qty: float, price: float, fee: float, rate: float | None) -> str | None:
+    """EXEC-SPEC MUST 3 (drill-prep line 4): the fill is booked at the fee the venue reported; this names a gap of
+    more than a cent from what FEE-LIVE's rate gives for it, or None. No rate known: nothing to compare (None)."""
+    if rate is None:
+        return None
+    expected = abs(qty * price) * rate
+    if abs(fee - expected) <= FEE_TOLERANCE:
+        return None
+    return (f"the venue charged {fee:.2f} on a fill where the fee rate in use gives {expected:.2f}: the venue's is "
+            "booked; check the account's fee tier")
 
 
 # Resting stops through the client (drill prep, QD; findings /mnt/project-files/sleeve-fund/qd/exec-client-stop-
