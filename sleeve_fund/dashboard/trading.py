@@ -510,8 +510,21 @@ def open_position(x: dict, fills: list[dict], orders: dict[str, dict],
         # inside the fund over the fund's equity, as its summary's (B-20): its own equity is its P&L from 0
         "weight": x["exposure"] if x.get("in_fund") else x["position_value"] / x["equity"] if x["equity"] else 0.0,
         "in_fund": bool(x.get("in_fund")),
+        "sizing": entry_sizing(entry),
         "fees": sum(float(f["fee"] or 0.0) for f in fills[:own + 1]) if own is not None else None,
     }
+
+
+def entry_sizing(entry: dict | None) -> dict | None:
+    """PAGE-SIZE (Advisor, 20 Oct): what the entry's decision journal says it was sized to, never worked again: its
+    order's quantity at the close it decided at, over the fund equity it was sized off (F-FC-4, journaled inside the
+    fund only). None when the entry doesn't journal them. T1's room and the loss at the stop aren't journaled before
+    B-24, so they aren't shown."""
+    sig = (entry or {}).get("signal") or {}
+    fund, close, qty = sig.get("fund_equity"), sig.get("close"), (entry or {}).get("qty")
+    if not fund or fund <= 0 or not close or not qty:
+        return None
+    return {"value_share": abs(float(qty)) * float(close) / float(fund)}
 
 
 def perp_view(x: dict, position: dict | None, funding: list[dict]) -> dict | None:
