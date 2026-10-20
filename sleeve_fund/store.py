@@ -1362,19 +1362,25 @@ GATE_LEVERAGE_SQLITE = (
     f"CREATE TRIGGER gate_decisions_leverage_update BEFORE UPDATE ON gate_decisions WHEN {GATE_LEVERAGE_BAD} "
     f"OR ({GATE_LEVERAGE_FROZEN['sqlite']}) BEGIN SELECT RAISE(ABORT, '{GATE_LEVERAGE_MESSAGE}'); END",
 )
-# PAGE-SIZE-T1 (DA, 0034): T1's three inputs on a decision are all there or none and size_share only with them, none
-# below 0, risk per unit above 0, and once written they never change. Triggers, so 0034 adds them without rebuilding gate_decisions on SQLite.
+# PAGE-SIZE-T1 (DA, 0034): T1's three inputs on a decision are all there or none, size_share set exactly when they leave
+# room (cap above used), none below 0, risk per unit above 0. None of the four ever changes, a NULL included (no backfill
+# of today's cap onto an old row; CR F2), nor book_equity once set: the page's "% of the fund" divides by it (Advisor).
+# Triggers, so 0034 adds them without rebuilding gate_decisions on SQLite.
 GATE_T1_BAD = ("NOT ((NEW.t1_used_before IS NULL AND NEW.t1_cap IS NULL AND NEW.risk_per_unit IS NULL "
                "AND NEW.size_share IS NULL) OR (NEW.t1_used_before IS NOT NULL AND NEW.t1_cap IS NOT NULL "
                "AND NEW.risk_per_unit IS NOT NULL)) OR NEW.t1_used_before < 0 OR NEW.t1_cap < 0 "
-               "OR NEW.risk_per_unit <= 0 OR NEW.size_share < 0")
-GATE_T1_MESSAGE = ("gate_decisions: the T1 used, cap and risk per unit are all set or none, size share only with them, "
-                   "none below 0, risk per unit above 0, and once set they never change")
+               "OR NEW.risk_per_unit <= 0 OR NEW.size_share < 0 "
+               "OR (NEW.t1_cap <= NEW.t1_used_before AND NEW.size_share IS NOT NULL) "
+               "OR (NEW.t1_cap > NEW.t1_used_before AND NEW.size_share IS NULL)")
+GATE_T1_MESSAGE = ("gate_decisions: the T1 used, cap and risk per unit are all set or none, size share exactly when "
+                   "they leave room, none below 0, risk per unit above 0; they never change, nor book_equity once set")
 GATE_T1_FROZEN = {
-    "postgresql": "OLD.t1_cap IS NOT NULL AND (NEW.t1_used_before, NEW.t1_cap, NEW.risk_per_unit, NEW.size_share) "
-                  "IS DISTINCT FROM (OLD.t1_used_before, OLD.t1_cap, OLD.risk_per_unit, OLD.size_share)",
-    "sqlite": "OLD.t1_cap IS NOT NULL AND (NEW.t1_used_before IS NOT OLD.t1_used_before OR NEW.t1_cap IS NOT "
-              "OLD.t1_cap OR NEW.risk_per_unit IS NOT OLD.risk_per_unit OR NEW.size_share IS NOT OLD.size_share)",
+    "postgresql": "(NEW.t1_used_before, NEW.t1_cap, NEW.risk_per_unit, NEW.size_share) IS DISTINCT FROM (OLD.t1_used_before, "
+                  "OLD.t1_cap, OLD.risk_per_unit, OLD.size_share) OR (OLD.book_equity IS NOT NULL AND NEW.book_equity IS DISTINCT "
+                  "FROM OLD.book_equity)",
+    "sqlite": "NEW.t1_used_before IS NOT OLD.t1_used_before OR NEW.t1_cap IS NOT OLD.t1_cap OR NEW.risk_per_unit IS NOT "
+              "OLD.risk_per_unit OR NEW.size_share IS NOT OLD.size_share OR (OLD.book_equity IS NOT NULL AND NEW.book_equity "
+              "IS NOT OLD.book_equity)",
 }
 GATE_T1_PG = (
     "CREATE OR REPLACE FUNCTION gate_t1_shape() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "

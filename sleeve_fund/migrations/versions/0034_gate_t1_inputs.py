@@ -5,7 +5,8 @@ risk_per_unit (the order's, expected fill to stop with the fee), in fund currenc
 (approved_qty x risk_per_unit over the room, cap less used; a fraction, NULL with no room). Exact, nullable; QD2's
 writer fills them, the page's "sized at x% of the room T1 allows" and "risk if the stop is hit" read them. A trigger
 holds their shape, so gate_decisions is not rebuilt on SQLite: the first three all or none (T1 off, or not reached),
-size_share only with them, none below 0, risk per unit above 0, and once set they never change.
+size_share exactly when they leave room, none below 0, risk per unit above 0. None of the four ever changes, a NULL
+included (no backfill onto an old row), nor book_equity once set: the page's "% of the fund" divides by it.
 
 Additive only, skipped when a Store on the same code built it first (create_all). Downgrade drops them only while no
 row holds them, and refuses otherwise (never destroy data without a DA review).
@@ -31,13 +32,17 @@ COLUMNS = ('t1_used_before', 't1_cap', 'risk_per_unit', 'size_share')
 BAD = ("NOT ((NEW.t1_used_before IS NULL AND NEW.t1_cap IS NULL AND NEW.risk_per_unit IS NULL "
        "AND NEW.size_share IS NULL) OR (NEW.t1_used_before IS NOT NULL AND NEW.t1_cap IS NOT NULL "
        "AND NEW.risk_per_unit IS NOT NULL)) OR NEW.t1_used_before < 0 OR NEW.t1_cap < 0 "
-       "OR NEW.risk_per_unit <= 0 OR NEW.size_share < 0")
-MESSAGE = ("gate_decisions: the T1 used, cap and risk per unit are all set or none, size share only with them, "
-           "none below 0, risk per unit above 0, and once set they never change")
-FROZEN_PG = ("OLD.t1_cap IS NOT NULL AND (NEW.t1_used_before, NEW.t1_cap, NEW.risk_per_unit, NEW.size_share) "
-             "IS DISTINCT FROM (OLD.t1_used_before, OLD.t1_cap, OLD.risk_per_unit, OLD.size_share)")
-FROZEN_SQLITE = ("OLD.t1_cap IS NOT NULL AND (NEW.t1_used_before IS NOT OLD.t1_used_before OR NEW.t1_cap IS NOT "
-                 "OLD.t1_cap OR NEW.risk_per_unit IS NOT OLD.risk_per_unit OR NEW.size_share IS NOT OLD.size_share)")
+       "OR NEW.risk_per_unit <= 0 OR NEW.size_share < 0 "
+       "OR (NEW.t1_cap <= NEW.t1_used_before AND NEW.size_share IS NOT NULL) "
+       "OR (NEW.t1_cap > NEW.t1_used_before AND NEW.size_share IS NULL)")
+MESSAGE = ("gate_decisions: the T1 used, cap and risk per unit are all set or none, size share exactly when "
+           "they leave room, none below 0, risk per unit above 0; they never change, nor book_equity once set")
+FROZEN_PG = ("(NEW.t1_used_before, NEW.t1_cap, NEW.risk_per_unit, NEW.size_share) IS DISTINCT FROM (OLD.t1_used_before, "
+             "OLD.t1_cap, OLD.risk_per_unit, OLD.size_share) OR (OLD.book_equity IS NOT NULL AND NEW.book_equity IS DISTINCT "
+             "FROM OLD.book_equity)")
+FROZEN_SQLITE = ("NEW.t1_used_before IS NOT OLD.t1_used_before OR NEW.t1_cap IS NOT OLD.t1_cap OR NEW.risk_per_unit IS NOT "
+                 "OLD.risk_per_unit OR NEW.size_share IS NOT OLD.size_share OR (OLD.book_equity IS NOT NULL AND NEW.book_equity "
+                 "IS NOT OLD.book_equity)")
 PG = (
     "CREATE OR REPLACE FUNCTION gate_t1_shape() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
     f"IF {BAD} OR (TG_OP = 'UPDATE' AND {FROZEN_PG}) THEN RAISE EXCEPTION "

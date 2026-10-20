@@ -2,7 +2,8 @@
 (the loss at the stops per asset), which QD2's writer fills and the page reads: t1_used_before, t1_cap and risk_per_unit
 (fund currency, as the check compared them) and size_share (approved x risk per unit over T1's room, a fraction; NULL
 with no room). The database holds their shape: the first three all or none, size_share only with them, none below 0,
-risk per unit above 0, and once written they never change. Older rows keep none. SQLite and Postgres
+risk per unit above 0, size_share exactly when there is room; once written they never change, a NULL
+included, nor book_equity once set (the page's "% of the fund" divides by it). Older rows keep none. SQLite and Postgres
 (TEST_DATABASE_URL). The writer's cells are QD2's."""
 from __future__ import annotations
 
@@ -67,11 +68,23 @@ def _shape(store):
             _decision(store, **{**GOOD, k: bad})
     full = {**GOOD, "t1_used_before": D("800"), "size_share": None}  # no room left: the three, and no share
     assert _t1_of(store, _decision(store, **full)) == full
-    did = _decision(store, **GOOD)
-    for k, v in (("t1_cap", D(900)), ("size_share", D("0.5")), ("size_share", None)):
+    for bad in ({**full, "size_share": D(0)}, {**GOOD, "size_share": None},  # a share with no room; room with no share
+                {**GOOD, "t1_used_before": D("800.01"), "size_share": D(0)}):
+        with pytest.raises(DatabaseError):
+            _decision(store, **bad)
+    did = _decision(store, **GOOD, book_equity=D(20_000))
+    for k, v in (("t1_cap", D(900)), ("size_share", D("0.5")), ("size_share", None), ("book_equity", D(19_000)),
+                 ("book_equity", None)):
         with pytest.raises(DatabaseError), store.engine.begin() as c:
             c.execute(update(gate_decisions_t).where(gate_decisions_t.c.id == did).values({k: v}))
     assert _t1_of(store, did) == GOOD
+    old = _decision(store)  # NULL stays NULL: today's T1 is never written onto an older row (CR F2)
+    with pytest.raises(DatabaseError), store.engine.begin() as c:
+        c.execute(update(gate_decisions_t).where(gate_decisions_t.c.id == old).values(GOOD))
+    with store.engine.begin() as c:  # an update that leaves them alone passes; a row without a book may get one
+        c.execute(update(gate_decisions_t).where(gate_decisions_t.c.id == did).values(stage="submit"))
+        c.execute(update(gate_decisions_t).where(gate_decisions_t.c.id == old).values(book_equity=D(20_000)))
+    assert _t1_of(store, old) == NONE
 
 
 def test_the_columns_are_all_or_none_never_below_zero_and_never_rewritten(store):
