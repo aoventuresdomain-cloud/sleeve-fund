@@ -124,3 +124,52 @@ def test_cr2_with_no_live_lot_the_kept_lot_wins_over_the_other_venues_contract(m
     monkeypatch.setattr(PAPER, "live_lot", down if live_lot == "unreadable" else None)
     inst = PAPER.instrument("BTC", "USDT")
     assert inst.size_increment.as_decimal() == D("0.001") and inst.min_quantity.as_decimal() == D("0.001")
+
+
+# --- Advisor B44-STEP (22:05 UK): a listed step the engine can't round to is an error at start; entries refused, exits run
+
+def test_b44_step_an_unusable_listed_step_is_said_with_both_steps_and_cleared_by_a_good_read(built):
+    PAPER.lot_refusals.clear()
+    built(lambda pair: paper_venue_lot(pair, get_json=listing("0.005", "0.005")))
+    why = PAPER.lot_refusals["BTC/USDT"]
+    assert "BTCUSDT-PERP lists a quantity step of 0.005" in why and "the kept step 0.001" in why
+    assert "new entries are refused" in why and "exits and stops still run" in why
+    built(lambda pair: paper_venue_lot(pair, get_json=listing()))
+    assert "BTC/USDT" not in PAPER.lot_refusals
+
+
+def _strategy(monkeypatch):
+    from types import SimpleNamespace
+
+    from test_fee_live_wiring import T, _store
+
+    store = _store()
+    monkeypatch.setitem(PAPER.lot_refusals, "BTC/USDT", "BTCUSDT-PERP lists a quantity step of 0.005, ...")
+    return store, SimpleNamespace(_backtest=False, runtime=SimpleNamespace(store=store, name="p1", venue="BINANCE",
+                                                                           now=lambda: T))
+
+
+def test_b44_step_entries_on_that_symbol_are_refused_and_the_start_raises_an_error(monkeypatch):
+    store, s = _strategy(monkeypatch)
+    assert LongFlatStrategy._venue_terms_refusal(s).startswith("Entry refused: BTCUSDT-PERP lists a quantity step")
+    LongFlatStrategy._say_lot(s)
+    (e,) = store.events_of(("lot_step_refused",))
+    assert e["level"] == "error" and "0.005" in e["message"]
+
+
+def test_b44_step_exits_still_run_while_entries_are_refused(prices, instrument, full_margin, monkeypatch):
+    """Entries ask _venue_terms_refusal; exits never do. Allowed once (the entry), refused after: the exit still fills."""
+    from sleeve_fund.research.runner import run_backtest
+    from test_backtest import _path
+
+    asked = []
+
+    def refusal(self):
+        asked.append(1)
+        return None if len(asked) == 1 else "Entry refused: BTCUSDT-PERP lists a quantity step of 0.005"
+
+    monkeypatch.setattr(LongFlatStrategy, "_venue_terms_refusal", refusal)
+    feed = _path(prices, [100.0, 100.5, 100.8, 101.5, 101.5, 101.0, 100.0, 99.0, 98.5])
+    res = run_backtest("ping_pong", feed, instrument, {"market": "perp"}, half_spread=0, risk_profile="aggressive")
+    sides = list(res.fills["side"]) if not res.fills.empty else []
+    assert len(asked) >= 2 and sides[:2] == ["BUY", "SELL"], sides
