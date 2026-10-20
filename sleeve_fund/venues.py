@@ -112,6 +112,10 @@ class VenueProfile:
     risk_limit_url: str = ""
     fee_rate_path: str = ""
     maintenance_limits: dict[str, float] = field(default_factory=dict)  # pair -> the venue's last published ceiling
+    # B-36b: pair -> the contract's price tick, kept beside its tiers (read through markets.price_tick), and how the
+    # venue's live tick is read for the start check (check_price_ticks)
+    price_ticks: dict[str, str] = field(default_factory=dict)
+    live_tick: Callable[[str], Decimal] | None = None
     # FEE-LIVE: the published range a fetched fee rate must fall in ({"maker": (lowest, VIP 0), "taker": ...}) and
     # where it was read; a profile without one has no fetched rates (venue_terms refuses to read them)
     fee_bounds: dict[str, tuple] | None = None
@@ -426,6 +430,15 @@ def binance_contract(pair: str, get_json=None) -> dict:
     return out
 
 
+def binance_tick(pair: str, get_json=None) -> Decimal:
+    """The perpetual's live price tick, exactly as exchangeInfo's PRICE_FILTER gives it (B-36b)."""
+    info = _binance_listing(pair, get_json)
+    f = {x["filterType"]: x for x in info.get("filters", [])}
+    if "PRICE_FILTER" not in f:
+        raise ValueError(f"the venue lists no price tick for {pair}")
+    return Decimal(f["PRICE_FILTER"]["tickSize"]).normalize()
+
+
 def _binance_klines(pair: str, interval: str, start_ms: int | None = None, limit: int = 1500,
                     get_json=None) -> pd.DataFrame:
     """Candles by OPEN time, the forming one included."""
@@ -683,6 +696,8 @@ BINANCE = register(VenueProfile(
     risk_limit_url="https://api.bybit.com/v5/market/risk-limit?category=linear&symbol={symbol}",
     fee_rate_path="/v5/account/fee-rate",
     maintenance_limits={"BTC/USDT": 1_200_000_000},  # past it the venue takes no position; nor do we
+    price_ticks={"BTC/USDT": "0.1"},  # B-36b: kept with its tiers, read 20 Oct 2026; another pair is checked in with its table
+    live_tick=binance_tick,
     core_pairs=("BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "SUI/USDT"),
     hub=True,
 ))

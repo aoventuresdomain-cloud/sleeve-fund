@@ -407,6 +407,54 @@ def check_maintenance(store, now=None) -> Section:
     return sec
 
 
+def _live_tick(venue: str, pair: str):
+    """The venue's live contract tick for `pair`, from its public listing (no key)."""
+    from sleeve_fund.venues import venue as venue_profile
+
+    profile = venue_profile(venue)
+    if profile.live_tick is None:
+        raise ValueError("this venue has no way to read its contract tick")
+    return profile.live_tick(pair)
+
+
+def check_price_ticks(store, live_tick=None) -> Section:
+    """B-36b (HoE, 20 Oct): a perp Strategy's prices round to the contract tick kept beside its tiers
+    (markets.price_tick). One whose venue's live tick differs from the kept one is a FAIL, named, with both ticks, as is
+    one whose tick isn't kept or can't be read: never run on an assumed tick (the VS-1 pattern). One line per pair."""
+    from decimal import Decimal
+
+    from sleeve_fund import markets
+    from sleeve_fund.venues import DEFAULT_VENUE
+
+    read = live_tick or _live_tick
+    sec, seen = Section("Price ticks"), {}
+    for s in store.sleeves():
+        if s.lifecycle == "retired" or (s.params or {}).get("market") != "perp":
+            continue
+        venue = getattr(s, "venue", None) or DEFAULT_VENUE
+        kept = markets.price_tick(venue, s.instrument)
+        if kept is None:
+            sec.add(FAIL, f"{s.name}: {s.instrument} has no price tick kept, so its prices can't be rounded as the venue "
+                          "does: refused until the venue's tick is checked in with its tiers")
+            continue
+        key = (venue, s.instrument)
+        if key not in seen:
+            try:
+                seen[key] = Decimal(str(read(venue, s.instrument))).normalize()
+            except Exception as exc:  # noqa: BLE001 - an unreachable venue is a FAIL, never an assumed tick
+                seen[key] = exc
+        live = seen[key]
+        if isinstance(live, Exception):
+            sec.add(FAIL, f"{s.name}: the venue's price tick for {s.instrument} couldn't be read ({live}), so the kept "
+                          f"tick {kept} is unconfirmed")
+        elif live != kept:
+            sec.add(FAIL, f"{s.name}: the venue's price tick for {s.instrument} is now {live}, not the kept {kept}: "
+                          "refused until the kept tick is checked in again")
+    if not sec.failed:
+        sec.add(PASS, "every perp Strategy's instrument trades at the price tick kept for it")
+    return sec
+
+
 def check_venue_terms(store, now=None) -> Section:
     """FEE-LIVE (Advisor FEE-LIVE-DW): each perp Strategy's instrument's fee rates and margin tiers, as fetched from the
     venue. Over 72 h old, or never fetched, is a FAIL (its entries are refused; exits and stops run); over 24 h, or the
@@ -491,7 +539,7 @@ def run(url: str, environ: dict[str, str] | None = None) -> tuple[bool, str]:
     store = read_only_store(url)
     engine = store.engine
     sections = [check_store(engine), check_keys(env, engine), check_exec_target(env, exec_gates(env, engine)),
-                check_alerts(env), check_venues(engine), check_maintenance(store), check_venue_terms(store),
+                check_alerts(env), check_venues(engine), check_maintenance(store), check_price_ticks(store), check_venue_terms(store),
                 check_books(store), check_assets(store), check_warmups(store), check_account_sharing(env, engine),
                 check_strength(store)]
     ok = not any(s.failed for s in sections)

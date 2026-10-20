@@ -240,7 +240,8 @@ def most_it_can_lose(x: dict, bound: float | None = None) -> float:
         return equity
     entry, lev = x.get("entry_px") or x["price"], risk.leverage_cap(x["profile"], s.params)
     cash = trading.margin_cash(x)  # inside the fund, with its funding added back as the engine does (B-20)
-    liq = markets.isolated_liquidation(cash, qty, entry, lev, t.maintenance_margin)
+    liq = markets.isolated_liquidation(cash, qty, entry, lev, t.maintenance_margin, fees=x.get("entry_fees") or 0.0,
+                                       tick=markets.liquidation_tick(s.venue, s.instrument))
     taker = float(markets.fees_for(s.params, venue_profile(s.venue).fees, s.venue).taker)
     cap = markets.gap_loss_cap(qty, entry, lev, cash + qty * entry, taker, liq)  # what the engine books (P1-D3)
     return min(max(cap + x.get("unrealised", 0.0), 0.0), equity)
