@@ -105,18 +105,22 @@ def check(profile: RiskProfile, equity: float, peak: float, day_open: float, hal
 
 def own_leverage(params: dict | None) -> float | None:
     """B-35 (a): a Strategy's own leverage cap (params["max_leverage"]), or None when it has none or it isn't a number
-    of at least 1x (the model's config refuses such a value on save and Start, check_own_leverage)."""
+    of at least 1x to 2 dp (the model's config refuses such a value on save and Start, check_own_leverage). Below
+    1x is refused, never a cap (Advisor): the venue's minimum is 1x; smaller exposure is size share, not leverage."""
     v = (params or {}).get(OWN_LEVERAGE)
     if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v < 1:
+        return None
+    if round(v, 2) != v:  # Advisor B-35 (a): to 2 dp, the venue's leverage step
         return None
     return float(v)
 
 
 def check_own_leverage(v) -> None:
-    """B-35 (a): raises ValueError for a Strategy's own leverage cap that isn't a number of at least 1x."""
+    """B-35 (a): raises ValueError for a Strategy's own leverage cap that isn't a number of at least 1x to 2 dp."""
     if v is not None and own_leverage({OWN_LEVERAGE: v}) is None:
-        raise ValueError(f"{OWN_LEVERAGE} {v!r} must be a number of at least 1 (times); it can lower the risk "
-                         "profile's leverage cap, never raise it")
+        raise ValueError(f"{OWN_LEVERAGE} {v!r} must be a number of times, minimum 1x, to 2 decimal places (the "
+                         "venue's step): minimum 1x; use size share to trade smaller. It can lower the risk profile's "
+                         "leverage cap, never raise it")
 
 
 def capped_leverage(p: RiskProfile, params: dict | None = None) -> float:

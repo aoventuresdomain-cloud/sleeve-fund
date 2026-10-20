@@ -36,7 +36,7 @@ def test_b35_stopless_perp_model_saves_on_its_defaults_capped_at_1x():
 
 
 @pytest.mark.parametrize("profile, own, cap", [("aggressive", 5, 3.0), ("aggressive", 2, 2.0), ("balanced", 1, 1.0),
-                                               ("balanced", 1.5, 1.5), ("conservative", 3, 1.0),
+                                               ("balanced", 1.5, 1.5), ("balanced", 1.25, 1.25), ("conservative", 3, 1.0),
                                                ("aggressive", None, 3.0)])
 def test_b35b_the_own_cap_lowers_the_profiles_never_raises_it(profile, own, cap):
     params = {**PERP, **({} if own is None else {"max_leverage": own})}
@@ -45,7 +45,7 @@ def test_b35b_the_own_cap_lowers_the_profiles_never_raises_it(profile, own, cap)
     assert risk.position_cap(PROFILES[profile], params) == pytest.approx(PROFILES[profile].max_position_pct * cap)
 
 
-@pytest.mark.parametrize("bad", ["two", True, 0, -1, 0.5, math.nan, math.inf, [2]])
+@pytest.mark.parametrize("bad", ["two", "1", True, 0, -1, 0.5, 0.99, 1.555, math.nan, math.inf, [2]])
 def test_b35c_a_missing_or_invalid_own_cap_reads_the_profile_and_is_refused_on_save(bad):
     from nautilus_trader.model import BarType, InstrumentId
 
@@ -55,7 +55,7 @@ def test_b35c_a_missing_or_invalid_own_cap_reads_the_profile_and_is_refused_on_s
     assert risk.leverage_cap(PROFILES["aggressive"], params) == 3.0  # never above the profile, never a crash
     assert risk.position_cap(PROFILES["aggressive"], params) == pytest.approx(PROFILES["aggressive"].max_position_pct * 3)
     _, config_cls = REGISTRY["ping_pong"]
-    with pytest.raises(ValueError, match="max_leverage"):
+    with pytest.raises(ValueError, match="max_leverage .*minimum 1x; use size share to trade smaller"):
         config_cls(instrument_id=InstrumentId.from_str("BTC/USDT.BINANCE"),
                    bar_type=BarType.from_str("BTC/USDT.BINANCE-1-HOUR-LAST-EXTERNAL"),
                    assumed_taker_fee=0.00055, assumed_half_spread=0.0, **params)
@@ -106,10 +106,11 @@ def test_b35h_a_paper_runtime_sizes_on_the_capped_leverage():
     assert risk.position_cap(p, PERP) == pytest.approx(0.66)
 
 
-@pytest.mark.parametrize("own, notional", [(None, "6600"), (1, "3300"), (5, "6600")])
+@pytest.mark.parametrize("own, notional", [(None, "6600"), (1, "3300"), (1.5, "4950"), (5, "6600")])
 def test_b35i_paper_sizes_a_perp_entry_on_the_capped_leverage(tmp_path, own, notional):
     """End to end on the paper runtime (balanced, 10,000): the margin cap is 33% of equity; at the profile's 2x the
-    entry's notional is 6,600, held to 1x by its own cap 3,300, and an own cap above the profile changes nothing."""
+    entry's notional is 6,600, held to 1x by its own cap 3,300, at 1.5x 4,950, and an own cap above the profile
+    changes nothing."""
     from decimal import Decimal
 
     from test_long_short import _meta, _record
@@ -128,4 +129,9 @@ def test_b35i_paper_sizes_a_perp_entry_on_the_capped_leverage(tmp_path, own, not
     # the engine's margin and liquidation read the same cap: a long margined at 1x has no liquidation price; at 2x it
     # is about half the entry (60,000 x (1 - 1/2 + the maintenance margin))
     liq = entry["signal"].get("liquidation_px")
-    assert (liq is None) if own == 1 else (29_000 < liq < 31_500), entry["signal"]
+    if own == 1:
+        assert liq is None, entry["signal"]
+    else:  # a long's liquidation at leverage L: entry x (1 - 1/L + the maintenance margin, 0.5% here)
+        lev = 1.5 if own == 1.5 else 2.0
+        want = Decimal(str(entry["avg_px"])) * (1 - 1 / Decimal(str(lev)) + Decimal("0.005"))
+        assert abs(Decimal(str(liq)) - want) <= want * Decimal("0.002"), (liq, want)
