@@ -228,6 +228,10 @@ class StudyResult:
     pbo: object = None
     # The ablation report (research.ablation), when one was run for this definition: shown, never judged.
     ablation: object = None
+    # B-22 (Advisor B22-DOUBLE-FEES): the out-of-sample windows re-run at twice the venue's fees (_double_fees), and
+    # their daily net returns, on the out-of-sample days. None for a study whose windows weren't re-run.
+    double_fees: dict | None = None
+    double_fee_returns: pd.Series | None = None
 
     @property
     def compare_returns(self) -> pd.Series:
@@ -414,6 +418,36 @@ def _worse(a: pd.Series, b: pd.Series) -> bool:
         sharpe = summary(r)["sharpe"]
         return (-math.inf if math.isnan(sharpe) else sharpe, float((1 + r).prod() - 1) if len(r) else 0.0)
     return key(a) < key(b)
+
+
+def doubled(fees: FeeSchedule) -> FeeSchedule:
+    """B-22: exactly twice a schedule, maker and taker both."""
+    return FeeSchedule(maker=fees.maker * 2, taker=fees.taker * 2)
+
+
+def _double_fees(base: pd.Series, twice: pd.Series, runs: list, fees: FeeSchedule) -> dict | None:
+    """B-22's stored result (what the page shows, Advisor B22-DOUBLE-FEES): the out-of-sample period's net return at
+    twice the fees (`twice`, daily) beside the base (`base`); passed when it is above 0. runs: (base run, double-fee
+    run) of each window re-run, for their round trips and whether the trades themselves moved (a real re-run). Plain
+    values only. None when no window chose a setting to re-run."""
+    if not runs or not len(twice):
+        return None
+    net = float((1 + twice).prod() - 1)
+
+    def trips(run) -> int:
+        return len(round_trips(run.fills, run.shorts))
+
+    def same(a, b) -> bool:
+        if not len(a) or not len(b):  # a window that never traded has no fill columns at all
+            return len(a) == len(b)
+        return len(a) == len(b) and bool((a["filled_qty"].to_numpy() == b["filled_qty"].to_numpy()).all()
+                                          and (a["avg_px"].to_numpy() == b["avg_px"].to_numpy()).all())
+
+    return {"passed": net > 0, "net_return": net, "base_net_return": float((1 + base).prod() - 1),
+            "maker": fees.maker, "taker": fees.taker,
+            "oos_start": twice.index[0], "oos_end": twice.index[-1], "oos_days": len(twice),
+            "round_trips": sum(trips(t) for _, t in runs), "base_round_trips": sum(trips(b) for b, _ in runs),
+            "trades_differ": not all(same(b.fills, t.fills) for b, t in runs)}
 
 
 COST_LADDER = (0.0, 0.0002, 0.0005, 0.001, 0.0015, 0.002, 0.003, 0.004, 0.008)
@@ -641,7 +675,7 @@ def run_study(
     errors: list = []
     error_count = [0]
     folds_n = max(0, (len(research) - train_bars - test_bars) // test_bars + 1)
-    total = (1 + len(combos) * (1 + len(COST_LADDER)) + 2 + folds_n * (len(combos) + 1) + len(COST_LADDER)
+    total = (1 + len(combos) * (1 + len(COST_LADDER)) + 2 + folds_n * (len(combos) + 2) + len(COST_LADDER)
              + (2 if use_holdout and holdout_days else 0))
     done = [0]
 
@@ -902,6 +936,17 @@ def run_study(
         if _worse(opposite, ruled):
             folds, oos_parts, bench_parts, compare_by = alt_folds, alt_oos, alt_bench, alt_compare
             first_touch["judged_on"] = "opposite"
+    # B-22 (Advisor B22-DOUBLE-FEES): each window again with the settings it chose, at twice its fees, its spread,
+    # slippage and funding as they were, judged on what G1 judged (the opposite resolution when that was worse). A real
+    # re-run, never the fees subtracted: paying more leaves less to trade with, so the trades themselves move. A window
+    # that chose nothing sat flat, at any fee. Never the holdout, and never counted again in G1's first-touch share.
+    twice_parts, twice_runs = list(oos_parts), []
+    for k, window, run in windows:
+        rerun = bt(spec.name, window[1], window[3], oos=True, trade_from=window[2][0] - bar,
+                   fees=doubled(paid(window[3])), flip=first_touch.get("judged_on") == "opposite")
+        twice_parts[k] = scored(k, *window, rerun)[1]
+        twice_runs.append((run, rerun))
+    double_fee_returns = pd.concat(twice_parts) if twice_parts else pd.Series(dtype=float)
     oos_days = [sum(days for days, _, _ in compare_by)]
     compare_parts = [part for _, part, _ in compare_by if part is not None]
     spot_parts = [spot for _, _, spot in compare_by if spot is not None]
@@ -966,6 +1011,9 @@ def run_study(
         fee_note=(f"{pct(run_fees.maker)} maker on post-only orders, {pct(run_fees.taker)} taker "
                   f"on every other order, plus {spread_words} on orders that take liquidity; break-even: {breakeven}"),
         fee_basis=run_fees,
+        double_fee_returns=double_fee_returns,
+        double_fees=_double_fees(pd.concat(oos_parts) if oos_parts else pd.Series(dtype=float), double_fee_returns,
+                                 twice_runs, doubled(run_fees)),
         oos_uncharged_returns=pd.concat(
             [part if f.uncharged_returns is None else f.uncharged_returns for f, part in zip(folds, oos_parts)])
         if any(f.absorbed for f in folds) else None,
