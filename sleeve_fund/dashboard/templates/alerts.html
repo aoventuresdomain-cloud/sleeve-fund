@@ -6,9 +6,11 @@
   <div class="actions range" role="group" aria-label="Show">
     <a class="button {{ '' if show == 'open' else 'secondary' }}" href="/alerts">Open</a>
     <a class="button {{ '' if show == 'all' else 'secondary' }}" href="/alerts?show=all">All, including acknowledged</a>
+    {% if open_count %}<a class="button secondary" href="/alerts/ack-all">Acknowledge all</a>{% endif %}
   </div>
   <p class="lede">Ack does not change the strategy.</p>
 </div>
+{% if cleared %}<div class="okbox" role="status">Acknowledged {{ cleared }} alert{{ 's' if cleared != 1 }}. Each keeps its row under All, including acknowledged.</div>{% endif %}
 <section class="panel" data-live="alerts" data-live-forms>
 {% if alerts %}
 <ul class="alerts">

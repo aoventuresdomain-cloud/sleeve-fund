@@ -467,9 +467,35 @@ def create_app(store: Store | None = None) -> FastAPI:
         return RedirectResponse("/risk#system", status_code=303)
 
     @app.get("/alerts", response_class=HTMLResponse)
-    def alerts_page(request: Request, _: str = Depends(require_pm), show: str = "open"):
+    def alerts_page(request: Request, _: str = Depends(require_pm), show: str = "open", cleared: int = 0):
         rows = st().alerts(limit=300, include_acked=(show == "all"))
-        return page(request, "alerts.html", alerts=rows, show=show)
+        return page(request, "alerts.html", alerts=rows, show=show, cleared=max(cleared, 0),
+                    open_count=st().open_alert_count())
+
+    @app.get("/alerts/ack-all", response_class=HTMLResponse)
+    def ack_all_confirm(request: Request, _: str = Depends(require_pm)):
+        """B-17's confirm step: how many open alerts Acknowledge all clears. Their ids are fixed here, so an alert
+        raised after this page was shown stays open."""
+        rows = st().alerts(limit=100_000, include_acked=False)
+        return page(request, "alerts_ack_all.html", alerts=rows)
+
+    @app.post("/alerts/ack-all")
+    async def ack_all(request: Request, actor: str = Depends(require_pm), _o: None = Depends(same_origin)):
+        """Acknowledges the alerts the confirm step listed, each through the existing ack (Store.ack, which keeps the
+        row and is a no-op on one already acknowledged), noted as cleared with Acknowledge all."""
+        form = await request.form()
+        try:
+            ids = [int(i) for i in form.getlist("ids")]
+        except ValueError:
+            raise HTTPException(400, "not an alert id") from None
+        done = 0
+        for event_id in ids:
+            try:
+                st().ack(event_id, actor, ACK_ALL_NOTE)
+                done += 1
+            except KeyError:
+                continue  # not an alert (an info event, a backtest's): nothing to clear
+        return RedirectResponse(f"/alerts?cleared={done}", status_code=303)
 
     @app.post("/alerts/{event_id}/ack")
     def ack_alert(event_id: int, note: str = Form(""), next: str = Form("/alerts"),
@@ -2487,6 +2513,7 @@ TEST_FIELDS = {
                     ("run_for_hours", "Run for, hours", "Until stopped", "Empty runs it until you stop it.")),
 }
 PERCENT_PARAMS = {"candle_step": {"size_share"}}
+ACK_ALL_NOTE = "cleared with Acknowledge all"  # B-17: each alert Acknowledge all clears keeps this note
 # A model that decides on one candle length only: choosing it on the form picks that chip (B-35), as the model
 # refuses any other (donchian.py: "decides on daily candles").
 MODEL_BAR = {"donchian": "1-DAY-LAST-EXTERNAL"}
