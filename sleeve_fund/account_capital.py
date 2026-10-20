@@ -188,9 +188,11 @@ def due(store, account: str, now: datetime, live: bool) -> bool:
     return not newest or _utc(now) - newest[0]["fetched_at"] >= (LIVE_EVERY if live else PAPER_EVERY)
 
 
-def fetch_account(store, account: str, *, client, live: bool, book: Decimal, now: datetime | None = None) -> None:
+def fetch_account(store, account: str, *, client, live: bool, book: Decimal | None, book_why: str = "",
+                  now: datetime | None = None) -> None:
     """One read of `account`'s marked equity (client: a signed, read-only V5 client's call(method, path, params), or
-    None when this server has no key for it), kept with the book at that moment. A paper account's first good read is
+    None when this server has no key for it), kept with the book at that moment (book None, with book_why, when it
+    can't be marked: a failed read, so it is said once per spell, CR2 MUST 1). A paper account's first good read is
     the anchor. A live account is never read before G2. Then the alerts: a gap past the alert line, a gap past 2% on a
     live account (which the PM acknowledges), and a read failing, each once when it starts and once when it ends."""
     at = now or datetime.now(timezone.utc)
@@ -199,6 +201,8 @@ def fetch_account(store, account: str, *, client, live: bool, book: Decimal, now
     reason = None
     if live:
         reason = NOT_BEFORE_G2
+    elif book is None:
+        reason = book_why or "the book can't be marked yet"
     elif client is None:
         reason = "this server has no read-only key for the account"
     if reason is None:

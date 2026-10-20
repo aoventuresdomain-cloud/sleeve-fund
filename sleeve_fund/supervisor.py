@@ -1347,7 +1347,7 @@ class Supervisor:
         env = os.environ if environ is None else environ
         now = now or utcnow()
         try:
-            book = None
+            book, why = None, ""
             for a in self.store.accounts():
                 live = a["kind"] == "live"
                 if live and not a["sleeves"]:
@@ -1356,9 +1356,13 @@ class Supervisor:
                     continue
                 if not account_capital.due(self.store, a["name"], now, live):
                     continue
-                book = fund_equity(self.store) if book is None else book
+                if book is None and not why:
+                    try:  # unmarked (after a restart or a fill): a failed read, said once per spell, not every pass
+                        book = fund_equity(self.store)
+                    except Exception as exc:  # noqa: BLE001 - kept as the read's reason
+                        why = f"the book can't be marked yet ({type(exc).__name__}: {exc})"
                 account_capital.fetch_account(self.store, a["name"], client=None if live else mirror.fee_client(env),
-                                              live=live, book=book, now=now)
+                                              live=live, book=book, book_why=why, now=now)
         except Exception as exc:  # noqa: BLE001 - said; display only, the next pass tries again
             self.store.event(None, "warning", "account_capital_pass_failed", f"account capital: {type(exc).__name__}: {exc}")
 
