@@ -193,6 +193,28 @@ def leverage(book: Book, intent: Intent, qty: Decimal) -> dict[str, Decimal]:
             "net_underlying_after": (book.net(intent.underlying) + intent.side * order) / e}
 
 
+def fill_mark(book: Book, intent: Intent, decided: dict[str, Decimal], filled: Decimal, avg_px: Decimal
+              ) -> dict[str, Decimal]:
+    """B-24 (Advisor B24-LEVERAGE): a fill's figures, the decision's own (leverage) at the fill: `filled` of the order
+    so far at its average fill price, on the book the decision was judged on. The margin leverage is the decision's
+    (the cap it was sent under). {} when the book has no equity, as leverage."""
+    marked = leverage(book, replace(intent, price=avg_px), filled)
+    if marked and "margin_leverage" in decided:
+        marked["margin_leverage"] = decided["margin_leverage"]
+    return marked
+
+
+def fill_breach(marked: dict[str, Decimal], profile: PortfolioProfile) -> str | None:
+    """B-24 cell j: a fill that lands the fund over T4 (gross, or net in its underlying) by slippage, in words for the
+    alert; None within. Never refuses anything: the fill has happened, and the next opening is held by the check."""
+    if not marked:
+        return None
+    over = [f"{name} {float(v):.4f}x over its {cap:g}x" for name, v, cap in (
+        ("gross", marked["gross_after"], profile.gross),
+        ("net in its underlying", abs(marked["net_underlying_after"]), profile.net_instrument)) if v > Decimal(str(cap))]
+    return "a fill took the fund's " + " and ".join(over) + " (slippage past T4)" if over else None
+
+
 def decide(book: Book, intent: Intent, profile: PortfolioProfile) -> Decision:
     """_decide's answer with B-24's leverage figures for the position it leaves (at the quantity approved; a refusal's
     are the position as it stands)."""
