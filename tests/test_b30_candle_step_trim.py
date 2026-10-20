@@ -23,6 +23,9 @@ class _Config(CandleStepConfig):
         super().__init__(**kw)
 
 
+_LAST: dict = {}  # the last _run's store
+
+
 def _run(tmp_path, monkeypatch, *, size_share=0.6, minutes=9):
     import pandas as pd
     import test_exposure_gate_xfails as h
@@ -44,6 +47,7 @@ def _run(tmp_path, monkeypatch, *, size_share=0.6, minutes=9):
     plan = h.Plan(t0=h.STD_T0, minutes=minutes, balance=200_000.0, params={"size_share": size_share}, tag="b30")
     h.run(tmp_path, store, plan, monkeypatch)
     rows = [o for o in store.orders(h.NAME, limit=1000) if "cycle" in (o["signal"] or {})]
+    _LAST["store"] = store
     return sorted(rows, key=lambda o: (o["ts"], o["id"])), h
 
 
@@ -95,7 +99,7 @@ def test_restart_reads_the_sent_q_from_the_journal(tmp_path, monkeypatch):
 
 
 
-@pytest.mark.parametrize("how", ["not_submitted", "under_the_venue_minimum"])
+@pytest.mark.parametrize("how", ["not_submitted", "under_the_venue_minimum", "gate_allows_under_a_lot"])
 def test_a_step_0_that_is_never_sent_sets_no_q_and_the_cycle_opens_nothing(tmp_path, monkeypatch, how):
     """CR follow-up on B-30: an entry refused at _submit (CHOKE) or left under the venue minimum after the gate tells
     the model nothing. Were Q set anyway, step 2 ("sell the rest and short Q") would open a short of Q on a book that
@@ -113,6 +117,32 @@ def test_a_step_0_that_is_never_sent_sets_no_q_and_the_cycle_opens_nothing(tmp_p
             return real(self, side, qty, intent, reason, signal, *a, **k)
 
         monkeypatch.setattr(LongFlatStrategy, "_submit", submit)
+    elif how == "gate_allows_under_a_lot":
+        # The common case (CR): the gate approves less than one lot (a T4 trim with the book at its limit), the
+        # "Entry skipped: the portfolio limits allowed X" branch.
+        from sleeve_fund.paper.portfolio_gate import PaperGate
+
+        real_gate = PaperGate.__call__
+
+        class _UnderALot:
+            def __init__(self, gated):
+                self._g = gated
+
+            def __getattr__(self, name):
+                return getattr(self._g, name)
+
+            @property
+            def approved_qty(self):
+                return D("0.0001")  # the lot is 0.001
+
+        def gate(self, strategy, intent, ts_ns):
+            out = real_gate(self, strategy, intent, ts_ns)
+            if out is None or refused or intent.get("what") != "entry":
+                return out
+            refused.append(None)  # the cycle is read from the journal below
+            return _UnderALot(out)
+
+        monkeypatch.setattr(PaperGate, "__call__", gate)
     else:
         real = LongFlatStrategy._under_min_notional
 
@@ -123,8 +153,23 @@ def test_a_step_0_that_is_never_sent_sets_no_q_and_the_cycle_opens_nothing(tmp_p
             return real(self, approved, intent)
 
         monkeypatch.setattr(LongFlatStrategy, "_under_min_notional", under)
-    rows, _ = _run(tmp_path, monkeypatch, minutes=15)
+    told: list[tuple[int, D]] = []  # every Q the model was told: (cycle, qty)
+    real_told = CandleStep.entry_sent
+
+    def entry_sent(self, qty, values):
+        told.append((values.get("cycle"), qty))
+        return real_told(self, qty, values)
+
+    monkeypatch.setattr(CandleStep, "entry_sent", entry_sent)
+    rows, h = _run(tmp_path, monkeypatch, minutes=15)
     assert refused, "set-up: no step 0 was refused"
+    if refused[0] is None:  # the skip's cycle: its bar closed in the minute the skip was noted
+        from sleeve_fund.strategies.candle_step import step_at
+
+        skipped = [e for e in h._events(_LAST["store"]) if "Entry skipped" in (e["message"] or "")]
+        assert len(skipped) == 1, ("set-up: the gate's under-a-lot answer didn't reach the skip once", skipped)
+        refused[0] = step_at(skipped[0]["ts"], 1)[0]
+    assert [c for c, _ in told if c == refused[0]] == [], told  # never told a Q for the refused step 0
     in_cycle = [(o["signal"]["step"], o["intent"], o["side"]) for o in rows if o["signal"]["cycle"] == refused[0]]
     assert in_cycle == [], in_cycle  # no Q: steps 1-5 of that cycle ask for nothing, so no short on a flat book
     later = [o for o in rows if o["signal"]["cycle"] > refused[0]]
