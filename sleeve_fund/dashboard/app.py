@@ -2552,6 +2552,7 @@ ACK_ALL_NOTE = "cleared with Acknowledge all"  # B-17: each alert Acknowledge al
 # A model that decides on one candle length only: choosing it on the form picks that chip (B-35), as the model
 # refuses any other (donchian.py: "decides on daily candles").
 MODEL_BAR = {"donchian": "1-DAY-LAST-EXTERNAL"}
+MODEL_BAR_WORDS = {"donchian": "The Donchian ensemble decides on daily candles"}  # the model's own refusal
 
 
 def _strategy_choices(tests: bool = False) -> list[dict]:
@@ -2572,7 +2573,7 @@ def _strategy_choices(tests: bool = False) -> list[dict]:
                     "stopless_max": None if places_stop(name, None) else STOPLESS_MAX_LEVERAGE,
                     # and one sized by weight is refused on a perpetual (check_perp_sizing): offered there, greyed
                     "perp_refused": PERP_WEIGHT_REFUSAL if REGISTRY[name][0].weight_sized(spec.default_params or {})
-                    else None, "bar": MODEL_BAR.get(name)})
+                    else None, "bar": MODEL_BAR.get(name), "bar_words": MODEL_BAR_WORDS.get(name)})
     return out
 
 

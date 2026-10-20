@@ -982,47 +982,71 @@ window.Console = (() => {
     if (!form) return;
     const $ = (n) => form.elements[n];
     $("strategy").addEventListener("change", () => applyPrefill(form, $("strategy").selectedOptions[0]));
-    // B-35: a model that decides on one candle length picks that chip when chosen (the model refuses any other).
-    const pickBar = () => {
-      const want = $("strategy").selectedOptions[0]?.dataset.bar;
-      const chip = want && form.querySelector(`input[name=bar_spec][value="${want}"]`);
-      if (chip && !chip.checked) { chip.checked = true; chip.dispatchEvent(new Event("change", {bubbles: true})); }
-    };
-    $("strategy").addEventListener("change", pickBar); pickBar();
-    // B-35: only the candle lengths the venue's strategies can be saved with (app.venue_bars, the save's own check);
-    // the others are greyed with the reason, and a greyed pick moves to 1h built from trades.
-    const venueBars = () => {
+    // B-35 (QT3's s5 sweep, HoQA MUST): the model saved is the model picked, or the form says why it can't be. One
+    // source for the chips: those the venue's strategies can be saved with (app.venue_bars, the save's own check) that
+    // the model can use (app.MODEL_BAR: one that decides on one candle length picks that chip). The others are greyed
+    // with the reason, and a greyed pick moves to one offered. The model is never changed for the PM.
+    const VENUE_WORDS = "Strategies on this market decide on candles built from its minutes, so the venue's own candles aren't available";
+    const chips = () => [...form.querySelectorAll(".chip-pick input[name=bar_spec]")];  // not a backtest's fixed one
+    const offerChips = () => {
       const v = form.querySelector("[data-pl-venue]");
-      if (!v || v.dataset.bars === undefined || !v.dataset.bars) return;
-      const ok = v.dataset.bars.split(" ");
-      const chips = [...form.querySelectorAll(".chip-pick input[name=bar_spec]")];  // not a backtest's fixed one
-      chips.forEach((c) => {
-        const allowed = ok.includes(c.value);
-        c.disabled = !allowed;
-        c.closest("label").title = allowed ? "" : "Strategies on this market decide on candles built from its minutes, so the venue's own candles aren't available";
+      const ok = v && v.dataset.bars ? v.dataset.bars.split(" ") : null;
+      const opt = $("strategy").selectedOptions[0];
+      const want = opt?.dataset.bar;
+      const all = chips();
+      all.forEach((c) => {
+        const byVenue = !ok || ok.includes(c.value);
+        const byModel = !want || c.value === want;
+        c.disabled = !(byVenue && byModel);
+        c.closest("label").title = !byVenue ? VENUE_WORDS : !byModel ? `${opt.dataset.barWords}, so this candle length isn't available` : "";
       });
-      const on = chips.find((c) => c.checked);
-      if (on && on.disabled) {
-        const to = chips.find((c) => c.value === "1-HOUR-LAST-INTERNAL" && !c.disabled) || chips.find((c) => !c.disabled);
-        if (to) { to.checked = true; to.dispatchEvent(new Event("change", {bubbles: true})); }
-      }
+      const on = all.find((c) => c.checked);
+      const to = (want && all.find((c) => c.value === want && !c.disabled))
+        || ((!on || on.disabled) && (all.find((c) => c.value === "1-HOUR-LAST-INTERNAL" && !c.disabled) || all.find((c) => !c.disabled)));
+      if (to && to !== on) { to.checked = true; to.dispatchEvent(new Event("change", {bubbles: true})); }
     };
-    form.querySelector("[data-pl-venue]")?.addEventListener("change", venueBars); venueBars();
-    // and one sized by weight can't trade a perpetual yet (check_perp_sizing): there it is greyed, with the reason.
+    // Why the picked model can't be saved here, in words, or "": sized by weight on a perpetual (check_perp_sizing),
+    // or no candle length both the venue and the model allow.
+    const refusal = () => {
+      const opt = $("strategy").selectedOptions[0];
+      if (!opt) return "";
+      const label = (opt.dataset.label || opt.textContent).split(" (")[0];
+      const name = label.charAt(0).toUpperCase() + label.slice(1);
+      if ($("market").value !== "spot" && opt.dataset.perpRefused) return `${name} is ${opt.dataset.perpRefused}. Pick a spot market or another model.`;
+      if (opt.dataset.bar && chips().length && chips().every((c) => c.disabled)) return `${opt.dataset.barWords}, which this market doesn't offer. Pick another market or another model.`;
+      return "";
+    };
+    const guard = () => {
+      const why = refusal();
+      const note = document.getElementById("model-refused");
+      if (note) { note.hidden = !why; note.textContent = why; }
+      form.querySelectorAll("button[data-label]").forEach((b) => {
+        if (why && !b.hasAttribute("data-model-refused")) { b.toggleAttribute("data-model-refused", true); b.toggleAttribute("data-blocked", true); b.disabled = true; }
+        if (!why && b.hasAttribute("data-model-refused")) { b.removeAttribute("data-model-refused"); b.removeAttribute("data-blocked"); b.disabled = false; form.dispatchEvent(new Event("change")); }
+      });
+      return why;
+    };
+    // A model sized by weight can't trade a perpetual yet: there it is greyed with the reason, unless it is the pick,
+    // which stays picked with the refusal shown (it was moved to another model without a word).
     const perpModels = () => {
       const perp = $("market").value !== "spot";
       [...$("strategy").options].forEach((o) => {
         if (!o.dataset.perpRefused) return;
         o.dataset.label ??= o.textContent;
-        o.disabled = perp;
+        o.disabled = perp && !o.selected;
         o.textContent = perp ? `${o.dataset.label}, ${o.dataset.perpRefused.split(":")[1].trim()}` : o.dataset.label;
       });
-      if ($("strategy").selectedOptions[0]?.disabled) {
-        $("strategy").value = [...$("strategy").options].find((o) => !o.disabled).value;
-        $("strategy").dispatchEvent(new Event("change", {bubbles: true}));
-      }
     };
-    $("market").addEventListener("change", perpModels); perpModels();
+    const recheck = () => { perpModels(); offerChips(); guard(); };
+    $("strategy").addEventListener("change", recheck);
+    $("market").addEventListener("change", recheck);
+    form.querySelector("[data-pl-venue]")?.addEventListener("change", recheck);
+    recheck();
+    form.addEventListener("submit", (e) => {
+      if (!guard()) return;
+      e.preventDefault();
+      document.getElementById("model-refused")?.scrollIntoView({block: "center"});
+    });
     const pct = (x) => `${(x * 100).toFixed(0)}%`;
     const sync = () => {
       const strat = $("strategy").value;
