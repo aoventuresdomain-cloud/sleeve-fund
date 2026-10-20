@@ -1112,6 +1112,15 @@ gate_decisions_t = Table(
     Column("gross_after", EXACT),
     Column("net_underlying_after", EXACT),
     Column("held_before", EXACT),
+    # PAGE-SIZE-T1 (DA, 0034; Advisor PAGE-SIZE; QD2 writes them): the exact inputs T1 judged the order on, in fund
+    # currency like book_equity: the loss at the stops already in its underlying (reservations in), T1's cap, and the
+    # order's risk per unit (expected fill to stop, fee in); and size_share, approved_qty x risk_per_unit over T1's room
+    # (cap less used), a fraction, NULL when there is no room. The first three all or none (none: T1 off, or not reached),
+    # size_share only with them; none below 0, risk per unit above 0; once written never changed (GATE_T1 triggers below).
+    Column("t1_used_before", EXACT),
+    Column("t1_cap", EXACT),
+    Column("risk_per_unit", EXACT),
+    Column("size_share", EXACT),
     CheckConstraint(_in("outcome", GATE_OUTCOMES), name="gate_decisions_outcome"),
     CheckConstraint(_in("limit_hit", GATE_LIMITS), name="gate_decisions_limit_hit"),
     CheckConstraint(_in("stage", GATE_STAGES), name="gate_decisions_stage"),
@@ -1353,6 +1362,33 @@ GATE_LEVERAGE_SQLITE = (
     f"CREATE TRIGGER gate_decisions_leverage_update BEFORE UPDATE ON gate_decisions WHEN {GATE_LEVERAGE_BAD} "
     f"OR ({GATE_LEVERAGE_FROZEN['sqlite']}) BEGIN SELECT RAISE(ABORT, '{GATE_LEVERAGE_MESSAGE}'); END",
 )
+# PAGE-SIZE-T1 (DA, 0034): T1's three inputs on a decision are all there or none and size_share only with them, none
+# below 0, risk per unit above 0, and once written they never change. Triggers, so 0034 adds them without rebuilding gate_decisions on SQLite.
+GATE_T1_BAD = ("NOT ((NEW.t1_used_before IS NULL AND NEW.t1_cap IS NULL AND NEW.risk_per_unit IS NULL "
+               "AND NEW.size_share IS NULL) OR (NEW.t1_used_before IS NOT NULL AND NEW.t1_cap IS NOT NULL "
+               "AND NEW.risk_per_unit IS NOT NULL)) OR NEW.t1_used_before < 0 OR NEW.t1_cap < 0 "
+               "OR NEW.risk_per_unit <= 0 OR NEW.size_share < 0")
+GATE_T1_MESSAGE = ("gate_decisions: the T1 used, cap and risk per unit are all set or none, size share only with them, "
+                   "none below 0, risk per unit above 0, and once set they never change")
+GATE_T1_FROZEN = {
+    "postgresql": "OLD.t1_cap IS NOT NULL AND (NEW.t1_used_before, NEW.t1_cap, NEW.risk_per_unit, NEW.size_share) "
+                  "IS DISTINCT FROM (OLD.t1_used_before, OLD.t1_cap, OLD.risk_per_unit, OLD.size_share)",
+    "sqlite": "OLD.t1_cap IS NOT NULL AND (NEW.t1_used_before IS NOT OLD.t1_used_before OR NEW.t1_cap IS NOT "
+              "OLD.t1_cap OR NEW.risk_per_unit IS NOT OLD.risk_per_unit OR NEW.size_share IS NOT OLD.size_share)",
+}
+GATE_T1_PG = (
+    "CREATE OR REPLACE FUNCTION gate_t1_shape() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+    f"IF {GATE_T1_BAD} OR (TG_OP = 'UPDATE' AND {GATE_T1_FROZEN['postgresql']}) THEN RAISE EXCEPTION "
+    f"USING ERRCODE = 'check_violation', MESSAGE = '{GATE_T1_MESSAGE}'; END IF; RETURN NEW; END $$",
+    "CREATE TRIGGER gate_decisions_t1 BEFORE INSERT OR UPDATE ON gate_decisions FOR EACH ROW "
+    "EXECUTE FUNCTION gate_t1_shape()",
+)
+GATE_T1_SQLITE = (
+    f"CREATE TRIGGER gate_decisions_t1_insert BEFORE INSERT ON gate_decisions WHEN {GATE_T1_BAD} "
+    f"BEGIN SELECT RAISE(ABORT, '{GATE_T1_MESSAGE}'); END",
+    f"CREATE TRIGGER gate_decisions_t1_update BEFORE UPDATE ON gate_decisions WHEN {GATE_T1_BAD} "
+    f"OR ({GATE_T1_FROZEN['sqlite']}) BEGIN SELECT RAISE(ABORT, '{GATE_T1_MESSAGE}'); END",
+)
 GATE_FILL_MARKS_PG = (
     "CREATE OR REPLACE FUNCTION gate_fill_mark_write_once() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
     "RAISE EXCEPTION USING ERRCODE = 'check_violation', MESSAGE = 'gate_fill_marks is write-once'; END $$",
@@ -1364,6 +1400,7 @@ GATE_FILL_MARKS_SQLITE = tuple(
     "SELECT RAISE(ABORT, 'gate_fill_marks is write-once'); END" for op in ("UPDATE", "DELETE"))
 for _t, _pg, _lite in ((gate_decisions_t, GATE_IDEA_PG, GATE_IDEA_SQLITE), (shadow_outcomes_t, SHADOW_PG, SHADOW_SQLITE),
                        (gate_decisions_t, GATE_LEVERAGE_PG, GATE_LEVERAGE_SQLITE),
+                       (gate_decisions_t, GATE_T1_PG, GATE_T1_SQLITE),
                        (gate_fill_marks_t, GATE_FILL_MARKS_PG, GATE_FILL_MARKS_SQLITE)):
     for _sql in _pg:
         event.listen(_t, "after_create", DDL(_sql).execute_if(dialect="postgresql"))
