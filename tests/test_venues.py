@@ -97,6 +97,9 @@ MAY_NAME_A_VENUE = {
     "0020_orders_venue.py": "freezes the default venue of the day as a literal, so the orders backfill never moves (DA)",
     "exec_target.py": "the order client's closed list of hosts and key variables per mode, refusing everything else "
                       "(KEYHOST; as mirror.py, TEC approved by the HoE 15 Oct)",
+    "exec_client.py": "the exchange order client's adapter configs and exchange profile for its one venue (B-05, ships "
+                      "OFF; TEC-B05-KEYS)",
+    "exec_reconcile.py": "cites the venue's own API pages for the position and open-order fields it reconciles (B-05)",
 }
 
 
