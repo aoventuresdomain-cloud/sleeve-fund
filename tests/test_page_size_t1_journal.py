@@ -45,3 +45,13 @@ def test_t1_off_leaves_the_four_null(store, monkeypatch):
     monkeypatch.setattr(compliance, "load", lambda *a, **k: replace(real(*a, **k), asset_open_risk=None))
     row = _row(store, _approved(store))
     assert [row[k] for k in FOUR] == [None] * 4
+
+
+def test_a_later_cap_change_leaves_the_entrys_row_as_recorded(store):
+    """Advisor: the row is what T1 compared when the entry was judged; the PM halving T1 afterwards changes nothing in
+    it (the page reads the row, never today's cap)."""
+    rid = _approved(store)
+    before = {k: _row(store, rid)[k] for k in FOUR}
+    compliance.save(store, replace(compliance.load(store), asset_open_risk=0.02), "pm", "qa: T1 halved")
+    assert compliance.load(store).asset_open_risk == 0.02
+    assert {k: _row(store, rid)[k] for k in FOUR} == before and money(before["t1_cap"]) == D(800)
