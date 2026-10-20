@@ -35,7 +35,7 @@ def risk_view(store: Store, summaries: list[dict], book: dict) -> dict:
         in_fund = bool(x.get("in_fund"))
         # Inside the fund its own equity is its P&L from 0 and its own halt doesn't act (B-20): what it has at stake
         # is bounded by the fund's equity, and only the fund's brakes halt.
-        shocks, at_stake = [], most_it_can_lose(x, book["equity"] if in_fund else None)
+        shocks, at_stake = [], most_it_can_lose(x, book["equity"]) if in_fund else most_it_can_lose(x)
         perp_held = bool(x.get("qty")) and markets.is_perp(s.params)
         for shock in SHOCKS:
             # Signed: a long loses in a fall, a short in a rally, at most what it has at stake (most_it_can_lose).
