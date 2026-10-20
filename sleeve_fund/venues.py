@@ -154,10 +154,34 @@ class VenueProfile:
                 limits = self.contract(f"{base}/{quote}")
             except Exception as exc:  # noqa: BLE001 - unreachable venue: the precisions given, cautious limits
                 print(f"{self.label}: contract limits for {base}/{quote} unavailable ({exc!r})", file=sys.stderr)
+        tick = self.contract_tick(f"{base}/{quote}")
+        if tick is not None:  # B-43: the one tick source, over the contract limits' and the default's
+            limits["price_precision"] = max(0, -tick.as_tuple().exponent)
         return perpetual(base, quote, fees=fees or self.fees, venue=self.venue, symbol=self.symbol_of(f"{base}/{quote}"),
                          price_precision=limits.get("price_precision", price_precision),
                          size_precision=limits.get("size_precision", min(size_precision, 3)),
                          min_quantity=limits.get("min_quantity"), min_notional=limits.get("min_notional", 5.0))
+
+    def contract_tick(self, pair: str) -> Decimal | None:
+        """B-43: the price tick an instrument on `pair` is built with: the venue's live tick, else the kept one (B-36b),
+        said on stderr either way they part (Advisor): a failed read takes the kept tick, never 0.01; a live tick that
+        differs from the kept one wins (the start check refuses that Strategy until it is checked in). None when the
+        venue reads no tick and keeps none."""
+        kept = self.price_ticks.get(pair)
+        kept = Decimal(kept).normalize() if kept else None
+        if self.live_tick is None:
+            return kept
+        try:
+            live = Decimal(str(self.live_tick(pair))).normalize()
+        except Exception as exc:  # noqa: BLE001 - an unreachable venue: the kept tick, said
+            if kept is not None:
+                print(f"{self.label}: live price tick for {pair} unavailable ({exc!r}); the kept price tick {kept} is "
+                      "used", file=sys.stderr)
+            return kept
+        if kept is not None and live != kept:
+            print(f"{self.label}: the live price tick {live} for {pair} differs from the kept {kept}; the live one is "
+                  "used", file=sys.stderr)
+        return live
 
     def key_env(self, account: str) -> tuple[str, str]:
         """The two server environment variables holding a live account's key and secret on this venue."""
@@ -430,13 +454,29 @@ def binance_contract(pair: str, get_json=None) -> dict:
     return out
 
 
-def binance_tick(pair: str, get_json=None) -> Decimal:
-    """The perpetual's live price tick, exactly as exchangeInfo's PRICE_FILTER gives it (B-36b)."""
-    info = _binance_listing(pair, get_json)
-    f = {x["filterType"]: x for x in info.get("filters", [])}
-    if "PRICE_FILTER" not in f:
+# B-43 (Advisor 20 Oct): the paper venue's own public instrument listing, the venue its tiers (risk_limit_url) and fees
+# come from and paper and the demo copy price against: the source of the live price tick, never another venue's.
+PAPER_INSTRUMENTS_URL = "https://api.bybit.com/v5/market/instruments-info?category=linear&symbol={symbol}"
+
+
+def paper_venue_tick(pair: str, get_json=None) -> Decimal:
+    """The paper venue's live price tick for the linear perpetual on `pair`, exactly as its listing's priceFilter gives it
+    (B-43). Raises ValueError when the venue refuses the request, doesn't list the pair, or lists it not trading."""
+    from sleeve_fund.data import _get_json
+
+    sym = binance_symbol(pair)  # BTC/USDT -> BTCUSDT, the same form on both venues
+    answer = (get_json or _get_json)(PAPER_INSTRUMENTS_URL.format(symbol=sym))
+    if answer.get("retCode") != 0:
+        raise ValueError(f"the venue refused the listing for {pair} ({answer.get('retMsg')})")
+    rows = [r for r in (answer.get("result") or {}).get("list", []) if r.get("symbol") == sym]
+    if not rows:
+        raise ValueError(f"the venue does not list a {pair} perpetual")
+    if rows[0].get("status") != "Trading":
+        raise ValueError(f"the venue lists {pair} but it is not trading ({rows[0].get('status')})")
+    tick = (rows[0].get("priceFilter") or {}).get("tickSize")
+    if not tick:
         raise ValueError(f"the venue lists no price tick for {pair}")
-    return Decimal(f["PRICE_FILTER"]["tickSize"]).normalize()
+    return Decimal(tick).normalize()
 
 
 def _binance_klines(pair: str, interval: str, start_ms: int | None = None, limit: int = 1500,
@@ -697,7 +737,7 @@ BINANCE = register(VenueProfile(
     fee_rate_path="/v5/account/fee-rate",
     maintenance_limits={"BTC/USDT": 1_200_000_000},  # past it the venue takes no position; nor do we
     price_ticks={"BTC/USDT": "0.1"},  # B-36b: kept with its tiers, read 20 Oct 2026; another pair is checked in with its table
-    live_tick=binance_tick,
+    live_tick=paper_venue_tick,
     core_pairs=("BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "SUI/USDT"),
     hub=True,
 ))
