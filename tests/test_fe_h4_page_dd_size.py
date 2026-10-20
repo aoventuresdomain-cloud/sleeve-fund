@@ -148,3 +148,27 @@ def test_the_halts_drawdown_is_never_negative_and_unusable_figures_read_as_not_m
         assert riskops.fund_drawdown(store) is None, bad
         words, _ = _words(c, "/")
         assert "Drawdown from peak –" in words, bad
+
+
+def test_the_headline_measures_from_the_halts_reference_not_the_days_start(c, store):  # noqa: F811
+    """CR MUST M1 on 6b1324fe: a past high-water mark of 101,000 above today's start of 98,000, the book at 99,000 (a
+    small gain today, still under the peak). The headline is 1 - book / reference, 1.98%, the figure book_breach halts
+    at; from the day's start it would read 0."""
+    from sleeve_fund.paper.portfolio_gate import PaperGate
+    from sleeve_fund.portfolio.limits import book_breach
+    from sleeve_fund.risk import PORTFOLIO
+
+    _hold(store)
+    _long(store)
+    _mark(store, 99_000, hwm=101_000)
+    ledger = PaperGate(store).ledger
+    ledger.set_state(replace(ledger.state(), day_start_equity=Decimal(98_000)))
+    st = ledger.state()
+    assert st.reference() > st.day_start_equity and st.equity > st.day_start_equity
+    words, _ = _words(c, "/")
+    shown = Decimal(re.search(r"Drawdown from peak (\d+\.\d\d)%", words).group(1)) / 100
+    assert shown == round(1 - st.equity / st.reference(), 4) == Decimal("0.0198")
+    halt = replace(PORTFOLIO, drawdown=float(shown), daily_loss=None)
+    assert book_breach(halt, st.equity, st.reference(), st.day_start_equity).action == "halt"
+    assert book_breach(replace(halt, drawdown=float(shown + Decimal("0.0001"))), st.equity, st.reference(),
+                       st.day_start_equity) is None
