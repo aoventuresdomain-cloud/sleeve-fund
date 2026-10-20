@@ -1,6 +1,7 @@
 # QR top 3, #1 trend following, long leg. Decision candle: 4h. Researcher draft 14 Oct; Quant Developer to review.
 version = 1
 name = "qr01-trend-ema-long"
+title = "Trend Cross (21/55, 4h) · Long"
 reason = """Prices under-react to news, then trend for weeks; hedgers pay to shed risk. Be long from the candle the
 21-period EMA crosses above the 55 on 4h candles until it crosses back, with a 3 ATR(14) stop for a sudden break."""
 

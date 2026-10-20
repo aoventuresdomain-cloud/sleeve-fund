@@ -1,6 +1,7 @@
 # QR top 3, #3 squeeze breakout, short leg (half risk). Decision candle: 1h.
 version = 1
 name = "qr03-squeeze-short"
+title = "Squeeze Breakout (1h) · Short"
 reason = """Mirror of the long leg: after a Bollinger-inside-Keltner squeeze, sell a close below the last 20 candles'
 low on at least 1.5 x normal volume within 10 candles. Out on a 2.5 ATR trailing stop, a close back above the
 channel's middle, or after 48 hours; initial stop 2 ATR."""

@@ -1,6 +1,7 @@
 # QR top 3, #2, short leg (half risk). Decision candle: 4h.
 version = 1
 name = "qr02-dip-short"
+title = "Trend Pullback (sell the rally, 4h) · Short"
 reason = """Mirror of the long leg: inside a downtrend (close below the daily 200-day SMA), sell a sharp short bounce
 (RSI(2) above 90 on 4h). Cover when RSI(2) is back below 30, the close is back below its 5-period SMA, or after 10
 candles; 2.5 ATR(14) stop."""

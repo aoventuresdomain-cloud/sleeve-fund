@@ -63,7 +63,7 @@ TIMES = ("hour", "weekday", "day_of_month", "days_to_month_end")
 # The values a time operand can take (G3): a rule comparing one with a number outside them is refused.
 TIME_RANGE = {"hour": (0, 23), "weekday": (0, 6), "day_of_month": (1, 31), "days_to_month_end": (0, 30)}
 SINCE_ENTRY = {"max_since_entry": max, "min_since_entry": min}
-TOP_KEYS = ("version", "name", "reason", "blocks", "long", "short", "exits", "costs")
+TOP_KEYS = ("version", "name", "title", "reason", "blocks", "long", "short", "exits", "costs")
 LEVEL_EXITS = ("stop", "trail", "exit_at_level")
 SIDE_EXITS = ("time_stop", *LEVEL_EXITS)  # what [exits.long] and [exits.short] may hold (G1)
 MAX_BREAKOUT_SLIPPAGE_BP = 500
@@ -166,10 +166,10 @@ def _canonical(x):
 
 
 def definition_hash(defn: dict, venue: str | None = None) -> str:
-    """The definition's content hash: the trials register's key for a variant. Its name and reason are left out,
-    so rewording the reason is not a new variant; any change to its blocks, rules, exits or costs is, and so is
+    """The definition's content hash: the trials register's key for a variant. Its name, display title and reason are
+    left out, so renaming it on screen or rewording the reason is not a new variant (B-16, HoE 20 Oct); any change to its blocks, rules, exits or costs is, and so is
     running it on a venue whose day (and so its slower candles) starts away from 00:00 UTC (Advisor 6 Oct, 4.4)."""
-    body = {k: v for k, v in defn.items() if k not in ("name", "reason")}
+    body = {k: v for k, v in defn.items() if k not in ("name", "title", "reason")}
     if venue is not None:
         from sleeve_fund.venues import VENUES, base_venue
 
@@ -240,6 +240,8 @@ def check_definition(defn: dict, bar_spec: str | None = None, bar_minutes: int |
         raise ValueError(f"definition version must be {VERSION}, got {defn.get('version')!r}")
     if not isinstance(defn.get("reason"), str) or not defn["reason"].strip():
         raise ValueError("a definition carries its reason, written before it is tested")
+    if "title" in defn and (not isinstance(defn["title"], str) or not defn["title"].strip()):
+        raise ValueError("a definition's title is the name the dashboard shows, a line of text, or left out")
     if bar_minutes is None and bar_spec:
         from sleeve_fund.data import spec_minutes
 
