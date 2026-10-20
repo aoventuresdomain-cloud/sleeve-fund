@@ -1053,7 +1053,9 @@ window.Console = (() => {
     form.querySelector("[data-pl-venue]")?.addEventListener("change", recheck);
     recheck();
     form.addEventListener("submit", (e) => {
-      if (!guard()) return;
+      // A check's mark holds the submit off whatever turned its disabled flag back off (HoE on guard()).
+      const held = e.submitter && (e.submitter.hasAttribute("data-blocked") || e.submitter.hasAttribute("data-model-refused"));
+      if (!guard() && !held) return;
       e.preventDefault();
       document.getElementById("model-refused")?.scrollIntoView({block: "center"});
     });
