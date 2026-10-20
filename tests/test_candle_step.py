@@ -169,7 +169,9 @@ def test_must_2_a_flip_at_the_size_limit_closes_in_full_and_ends_short_exactly_a
     run = _at_the_limit()
     fills = run.legs["cs"].fills.sort_values("ts_last")
     sides = [(r["side"], D(str(r["filled_qty"]))) for _, r in fills.iterrows()]
-    assert sides[:4] == [("BUY", D(500)), ("SELL", D(200)), ("SELL", D(300)), ("SELL", sides[3][1])]
+    # B-30 (TEC, HoE to approve): Q is the 500 sent after the trim, not the 600 asked, so "sell half" sells 250 and
+    # the flip's close the other 250 (was 200 then 300: 40% of the trimmed entry, the PM's 15 Oct defect).
+    assert sides[:4] == [("BUY", D(500)), ("SELL", D(250)), ("SELL", D(250)), ("SELL", sides[3][1])]
     flip = run.decisions[1]
     assert (flip["side"], flip["outcome"], flip["limit"]) == (-1, "trimmed", "net_instrument")
     assert "(now 0.00x)" in flip["reason"]  # gated after the close filled: the book was flat
