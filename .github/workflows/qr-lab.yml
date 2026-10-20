@@ -1,10 +1,8 @@
 name: qr-lab
 # Quant Researcher re-score (20 Oct 2026): BTC perpetual, development years only (to 2025-10-19; the holdout year is
 # never downloaded), each rule-builder definition through the real engine on the fee ladder. Touches no server.
+# Paused 20 Oct 14:47 UK until Head of Engineering v3 approves (public repo: results and logs are published).
 on:
-  push:
-    branches: [claude/project-thread-ohkqss]
-    paths: [research/qr-lab/**, .github/workflows/qr-lab.yml]
   workflow_dispatch:
 permissions: { contents: write }
 concurrency: { group: qr-lab, cancel-in-progress: true }
