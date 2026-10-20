@@ -535,8 +535,8 @@ def test_b38zf_the_edges_level_with_the_95th_is_no_beat_and_a_bottom_rung_at_0_i
 
 def test_b38zg_each_trip_takes_its_own_opening_entrys_request_whatever_adds_or_open_trips_come_before():
     """CR B-38 (a): leg "x" opens 1 @ 100 (request 1.0, sent), adds 0.5 inside that trip (an add: not an opening),
-    has an entry refused, then opens 2 @ 110 (request 2.5, trimmed to 2). Trip 1 is 1.0 x 100, trip 2 2.5 x 110: the
-    add and the refusal never shift it."""
+    has an entry refused, then opens 2 @ 110 (request 2.5, trimmed to 2) with a sent non-entry decision on the same
+    bar. Trip 1 is 1.0 x 100, trip 2 2.5 x 110: the add, the refusal and the other decision never shift it."""
     from types import SimpleNamespace
 
     idx = pd.date_range("2024-01-02", periods=10, tz="UTC")
@@ -548,7 +548,7 @@ def test_b38zg_each_trip_takes_its_own_opening_entrys_request_whatever_adds_or_o
                                         "kind": kind, "requested": req, "approved": ok, "price": px}
     run = SimpleNamespace(legs={"x": SimpleNamespace(fills=fills)}, decisions=[
         dec(0, "entry", 1.0, 1.0, 100.0), dec(1, "add", 0.5, 0.5, 101.0), dec(4, "entry", 3.0, 0.0, 108.0),
-        dec(5, "entry", 2.5, 2.0, 110.0)])
+        dec(5, "exit", 5.0, 5.0, 110.0), dec(5, "entry", 2.5, 2.0, 110.0)])  # a sent exit on the entry's bar
     spec = SimpleNamespace(prices=pd.DataFrame({"close": 100.0}, index=idx))
     got = bk._trips(run, "x", spec, PARAMS)
     assert [(g.entry, g.exit, g.notional) for g in got] == [(0, 3, 100.0), (5, 7, 275.0)]
