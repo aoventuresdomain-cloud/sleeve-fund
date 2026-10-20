@@ -455,6 +455,60 @@ def check_price_ticks(store, live_tick=None) -> Section:
     return sec
 
 
+def _hub_lot(venue: str, pair: str):
+    """The (step, minimum) paper's instrument carries: the data venue's contract, as the hub relays its definition."""
+    from sleeve_fund.venues import venue as venue_profile
+
+    c = venue_profile(venue).contract(pair)
+    return Decimal(10) ** -int(c["size_precision"]), Decimal(str(c["min_quantity"])).normalize()
+
+
+def _paper_lot(venue: str, pair: str):
+    """The paper venue's listed (step, minimum) for `pair` (B-44), from its public listing (no key)."""
+    from sleeve_fund.venues import venue as venue_profile
+
+    profile = venue_profile(venue)
+    if profile.live_lot is None:
+        raise ValueError("this venue has no way to read its lot size")
+    return profile.live_lot(pair)
+
+
+def check_lot_sizes(store, hub_lot=None, paper_lot=None) -> Section:
+    """B-44 (HoE 23:19 UK, option ii; Advisor): paper sizes on the hub's instrument (the data venue's definition), so a
+    perp Strategy whose hub step or minimum differs from the paper venue's listed lot is a FAIL, named, with both lots,
+    as is one whose listed step the engine can't round to (not a power of ten) or whose lots can't be read: fail-closed,
+    as the price tick. One line per pair. shortcut: paper doesn't read the paper venue's lot itself; a MUST before G2."""
+    from sleeve_fund.venues import DEFAULT_VENUE, LotStepUnusable
+
+    hub_read, paper_read = hub_lot or _hub_lot, paper_lot or _paper_lot
+    sec, seen = Section("Lot sizes"), {}
+    for s in store.sleeves():
+        if s.lifecycle == "retired" or (s.params or {}).get("market") != "perp":
+            continue
+        venue = getattr(s, "venue", None) or DEFAULT_VENUE
+        key = (venue, s.instrument)
+        if key not in seen:
+            try:
+                hub = tuple(Decimal(str(x)).normalize() for x in hub_read(venue, s.instrument))
+                listed = tuple(Decimal(str(x)).normalize() for x in paper_read(venue, s.instrument))
+                seen[key] = (hub, listed)
+            except LotStepUnusable as exc:
+                seen[key] = f"the paper venue lists a quantity step of {exc.step}, not a power of ten, which the engine " \
+                            "can't round to"
+            except Exception as exc:  # noqa: BLE001 - an unreachable venue is a FAIL, never an assumed lot
+                seen[key] = f"the lot size couldn't be read ({exc})"
+        got = seen[key]
+        if isinstance(got, str):
+            sec.add(FAIL, f"{s.name}: for {s.instrument}, {got}: refused until it can be")
+        elif got[0] != got[1]:
+            (hs, hm), (ls, lm) = got
+            sec.add(FAIL, f"{s.name}: {s.instrument} sizes on step {hs}, minimum {hm}, but the paper venue lists step "
+                          f"{ls}, minimum {lm}: refused until they match")
+    if not sec.failed:
+        sec.add(PASS, "every perp Strategy's instrument sizes on the paper venue's listed lot")
+    return sec
+
+
 def check_venue_terms(store, now=None) -> Section:
     """FEE-LIVE (Advisor FEE-LIVE-DW): each perp Strategy's instrument's fee rates and margin tiers, as fetched from the
     venue. Over 72 h old, or never fetched, is a FAIL (its entries are refused; exits and stops run); over 24 h, or the
@@ -561,7 +615,8 @@ def run(url: str, environ: dict[str, str] | None = None) -> tuple[bool, str]:
     store = read_only_store(url)
     engine = store.engine
     sections = [check_store(engine), check_keys(env, engine), check_exec_target(env, exec_gates(env, engine)),
-                check_alerts(env), check_venues(engine), check_maintenance(store), check_price_ticks(store), check_venue_terms(store),
+                check_alerts(env), check_venues(engine), check_maintenance(store), check_price_ticks(store), check_lot_sizes(store),
+                check_venue_terms(store),
                 check_books(store), check_assets(store), check_warmups(store), check_account_sharing(env, engine),
                 check_strength(store), check_account_capital(store, env)]
     ok = not any(s.failed for s in sections)

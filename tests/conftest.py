@@ -1,4 +1,5 @@
 import os
+from decimal import Decimal
 
 import pytest
 
@@ -115,6 +116,15 @@ def _price_tick_read(monkeypatch, request):
 
     monkeypatch.setattr(start_check, "_live_tick", lambda venue, pair: markets.price_tick(venue, pair))
     monkeypatch.setattr(venue("BINANCE"), "live_tick", lambda pair: markets.price_tick("BINANCE", pair))
+
+    def kept_lot(pair):  # B-44: the kept lot read back as the live one; none kept, the contract limits stand
+        kept = venue("BINANCE").lot_sizes.get(pair)
+        if kept is None:
+            raise ValueError("unreachable from a build machine")
+        return tuple(Decimal(x) for x in kept)
+
+    monkeypatch.setattr(venue("BINANCE"), "live_lot", kept_lot)
+    monkeypatch.setattr(start_check, "_hub_lot", lambda v, pair: kept_lot(pair))  # the hub's contract, as kept
 
 
 @pytest.fixture(autouse=True)

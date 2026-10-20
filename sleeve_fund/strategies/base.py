@@ -1222,6 +1222,7 @@ class LongFlatStrategy(Strategy):
             self.recorder.start(self.instrument)
         if not self._backtest:
             self._say_tick()
+            self._say_lot()
         if self.runtime is not None and hasattr(self.runtime.store, "set_grid"):
             # DA-9: the journal takes this instrument's quantities to its lot.
             self.runtime.store.set_grid(lot_decimals=self.instrument.size_precision)
@@ -2089,6 +2090,8 @@ class LongFlatStrategy(Strategy):
         store, name = self.runtime.store, self.runtime.name
         row = store.sleeve(name)
         profile = venue_profile(getattr(self.runtime, "venue", None) or row.venue)
+        if row.instrument in profile.lot_refusals:  # B44-STEP: a listed step the engine can't round to
+            return f"Entry refused: {profile.lot_refusals[row.instrument]}"
         if not profile.fee_bounds or not profile.perpetual:  # a simulated perp on a spot venue charges LOW_FEE_PERP
             return None
         account = store.account_of(name)
@@ -4582,8 +4585,10 @@ class LongFlatStrategy(Strategy):
     def _lot(self) -> Decimal:
         """The smallest size an order carries: the instrument's step, never finer than the account can hold
         the base currency in. A venue can list 8 lot decimals for a currency the engine keeps at 6 (XRP, ADA);
-        an 8-decimal buy then leaves 1e-7 behind after a full exit, and reconcile halts (review round 9, B9-1)."""
-        return max(self.instrument.size_increment.as_decimal(), Decimal(10) ** -lot_decimals(self.instrument))
+        an 8-decimal buy then leaves 1e-7 behind after a full exit, and reconcile halts (review round 9, B9-1).
+        Normalised because quantize honours only the exponent: a step of 10 must floor 23 to 20, not keep 23 (B-44).
+        shortcut: a step of 10 or more prints sizes as 2E+1 in event words; format them if a venue ever lists one."""
+        return max(self.instrument.size_increment.as_decimal(), Decimal(10) ** -lot_decimals(self.instrument)).normalize()
 
     def _tick(self) -> float | None:
         """The price tick a liquidation price rounds to toward the entry (margin.to_tick): the one kept for the
@@ -4611,6 +4616,18 @@ class LongFlatStrategy(Strategy):
         self.runtime.store.event(self.runtime.name, "warning", "price_tick_kept",
                                  f"the instrument's price tick is {float(inc):g}; liquidation prices round to the kept "
                                  f"tick {kept:g}, as the venue's tiers are priced and the pages show")
+
+    def _say_lot(self) -> None:
+        """B44-STEP (Advisor): a start whose venue lists a quantity step the engine can't round to raises an error in
+        the journal, naming the symbol and both steps; its entries are refused (_venue_terms_refusal), exits run."""
+        from sleeve_fund.venues import venue as venue_profile
+
+        if self.runtime is None:
+            return
+        row = self.runtime.store.sleeve(self.runtime.name)
+        why = venue_profile(getattr(self.runtime, "venue", None) or row.venue).lot_refusals.get(row.instrument)
+        if why:
+            self.runtime.store.event(self.runtime.name, "error", "lot_step_refused", why)
 
     def _held_qty(self, qty: float) -> float:
         """A fill's quantity as the account holds it. A venue can print and fill at 8 lot decimals in a
