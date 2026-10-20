@@ -65,20 +65,24 @@ def risk_view(store: Store, summaries: list[dict], book: dict) -> dict:
     equity = book["equity"] or 1.0
     # Inside the fund only the fund's drawdown brake halts (T5b, B-20): a move that takes the book's drawdown to it
     fund_limit = fund_halt_limit(store) if book.get("fund_cash") else None
-    dd = book.get("drawdown", 0.0)
-    peak = book["equity"] / (1 - dd) if dd < 1 else 0.0
+    # measured as the gate measures it, from PortfolioState.reference() (the high-water mark from every mark, or the
+    # PM's Resume re-base), never from the daily curve's drawdown, which misses an intraday peak (CR MUST 1). None
+    # when it can't be read: the fund's halt is then unknown, never "would not halt".
+    reference = fund_halt_reference(store) if fund_limit is not None else None
     scenarios = []
     for i, shock in enumerate(SHOCKS):
         # The book's loss is every leg's, a pair's row carrying its two legs' signed sum; a test-account Strategy is
         # outside the fund's book (it still halts on its own limit).
         loss = sum(r["shocks"][i]["loss"] for r in rows
                    if r["x"]["sleeve"].desired_state == "running" and not r["x"].get("test_account"))
-        fund_halt = fund_limit is not None and peak > 0 and 1 - (book["equity"] - loss) / peak >= fund_limit
+        fund_halt = (False if fund_limit is None else None if reference is None
+                     else 1 - (book["equity"] - loss) / reference >= fund_limit)
         scenarios.append({"shock": shock, "loss": loss, "pnl": -loss, "loss_pct": loss / equity, "fund_halt": fund_halt,
                           "breaches": [r["x"]["sleeve"].name for r in rows if r["shocks"][i]["breach"]],
                           "unhedged": [r["x"]["sleeve"].name for r in rows if r["shocks"][i].get("unhedged")]})
     largest = largest_asset(book["allocation"], book["equity"])
     return {"rows": rows, "scenarios": scenarios, "largest": largest,
+            "fund_halt_unknown": fund_limit is not None and reference is None,
             **{k: held[k] for k in ("accounts", "book", "unallocated", "margin", "open_risk", "estimated", "through", "left_out", "trailing", "hint", "spot",
                                        "spot_risk", "spot_left_out", "spot_hint")},
             "down20": next(sc for sc in scenarios if sc["shock"] == -0.20),
@@ -103,6 +107,19 @@ def fund_halt_limit(store: Store) -> float | None:
     """T5b, the fund's drawdown halt, as the gate reads it; None when off or unreadable (B-20)."""
     p = limits_in_force(store)
     return float(p.drawdown) if p is not None and p.drawdown else None
+
+
+def fund_halt_reference(store: Store) -> float | None:
+    """What the fund's drawdown halt measures from, as the gate reads it (PortfolioState.reference()); None before the
+    supervisor's first mark or when the gate's state can't be read (printed)."""
+    from sleeve_fund.paper.portfolio_gate import PaperGate
+
+    try:
+        ref = PaperGate(store).ledger.state().reference()
+    except Exception as exc:  # noqa: BLE001 - unknown, said so on the page, never a stand-in peak
+        print(f"risk page: can't read the fund's halt reference: {exc!r}")
+        return None
+    return float(ref) if ref is not None and ref > 0 else None
 
 
 def _fold_pairs(store: Store, rows: list[dict]) -> list[dict]:

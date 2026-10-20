@@ -54,6 +54,19 @@ def _long(store, name="held-long", balance=0):  # noqa: F811
     return store.sleeve(name)
 
 
+def _mark(store, equity=100_000, hwm=None):  # noqa: F811
+    """The supervisor's marks of the fund as the gate keeps them (gate.mark_book): one at the high-water mark `hwm`
+    (if any) a minute ago, then `equity` now."""
+    from sleeve_fund.paper.portfolio_gate import PaperGate
+    from sleeve_fund.portfolio.gate import mark_book
+    from sleeve_fund.risk import PORTFOLIO
+
+    ledger, now = PaperGate(store).ledger, datetime.now(UTC)
+    if hwm is not None:
+        mark_book(ledger, str(hwm), now - timedelta(minutes=1), PORTFOLIO)
+    mark_book(ledger, str(equity), now, PORTFOLIO)
+
+
 def _engine_liquidation(store, s):  # noqa: F811
     """The engine's liquidation for the position, worked independently of the dashboard: base.py's
     isolated_liquidation(cash + self._funded()), funded = the fund's book x VIRTUAL_HEADROOM (paper/node.py)."""
@@ -130,6 +143,7 @@ def test_fund_held_stress_counts_the_position_not_its_pnl(store):  # noqa: F811
 def test_fund_held_no_page_states_a_strategys_own_halt_room_or_capital(c, store):  # noqa: F811
     _hold(store)
     s = _long(store)
+    _mark(store, 99_896.7)  # the gate's mark, which the fund's halt line reads its high-water mark from
     for path in ("/", "/risk", "/setup", f"/sleeves/{s.name}", "/sleeves/new"):
         words, _ = _words(c, path)
         hits = [w for w in OLD_RULE if re.search(w, words)]
