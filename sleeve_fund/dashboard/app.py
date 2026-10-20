@@ -2101,9 +2101,25 @@ def venue_choices() -> list[dict]:
     """Every venue a strategy can be researched, backtested or paper traded on, for the forms' venue field."""
     from sleeve_fund.venues import VENUES
 
-    return [{"key": v.name.lower(), "label": v.label, "perpetual": v.perpetual, "pairs": _hints(v.name),
-             "bars": venue_bars(v.name)}
+    return [{"key": v.name.lower(), "label": v.label, "perpetual": v.perpetual,
+             "pairs": [p for p in _hints(v.name) if offered(v.name, p)], "bars": venue_bars(v.name)}
             for v in VENUES.values() if v.data_client is not None or v.minute_loader is not None]
+
+
+def offered(venue: str, pair: str) -> bool:
+    """Whether the forms offer `pair` on `venue`: on a perpetual venue only where its published margin tiers are kept,
+    since a strategy is refused there without them (markets.maintenance_for, VS-1; B-39, QT3's sweep: ETH/USDT
+    perpetual was offered, then refused). With venue_bars, the one source of what the forms offer."""
+    from sleeve_fund.venues import venue as venue_profile
+
+    profile = venue_profile(venue)
+    if not profile.perpetual:
+        return True
+    try:
+        markets.maintenance_for(profile, pair)
+    except markets.NoMaintenanceTable:
+        return False
+    return True
 
 
 def venue_bars(venue: str) -> list[str]:
@@ -2158,7 +2174,7 @@ def instrument_options(store: Store, listing=None) -> list[dict]:
             logging.getLogger(__name__).info(f"couldn't list {v['label']}'s instruments: {exc!r}")
             listed = []
         kind = "perpetual" if v["perpetual"] else "spot"
-        pairs = list(dict.fromkeys([*stored, *v["pairs"], *sorted(listed)]))
+        pairs = [p for p in dict.fromkeys([*stored, *v["pairs"], *sorted(listed)]) if offered(v["key"], p)]
         out += [{"value": p, "venue": v["key"], "group": "Perpetuals" if v["perpetual"] else "Spot",
                  "label": f"{p} {kind}", "badge": stored[p]["text"] if p in stored else "not stored yet",
                  "tone": stored[p]["tone"] if p in stored else "", "stored": p in stored} for p in pairs]
