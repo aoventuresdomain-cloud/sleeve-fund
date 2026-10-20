@@ -230,7 +230,7 @@ def failed_row(*, strategy: str, params: dict, source: str, error: str, setup: d
     that counts joins it rather than adding one (Data Architect); without them, by its strategy and settings
     alone, so the same failing run retried is still one variant."""
     definition = (legacy_definition_hash(strategy, params, setup) if setup is not None else
-                  content_hash({"unkeyed": strategy, "params": params}))
+                  content_hash({"unkeyed": strategy, "params": _untitled(params)}))
     # A paper strategy was chosen having seen everything up to now, whatever failed (QA P1-T8, as model_run_row);
     # a backtest's bars are unknown, which a holdout reads as overlapping.
     data_start, data_end = (OPEN_START, datetime.now(timezone.utc)) if source == "strategy" else (None, None)
@@ -314,10 +314,21 @@ def legacy_idea_hash(idea: str) -> str:
     return content_hash({"idea": idea})
 
 
+def _untitled(params: dict) -> dict:
+    """params without a rule-builder definition's display title (B-16), which renames it on screen only: a rules
+    Strategy's params carry its whole definition (definitions.to_params), so a retitle must not make a new variant
+    here either (CR B-16 follow-up). Params with no titled definition come back as they are, so no key changes."""
+    defn = params.get("definition") if isinstance(params, dict) else None
+    if not isinstance(defn, dict) or "title" not in defn:
+        return params
+    return {**params, "definition": {k: v for k, v in defn.items() if k != "title"}}
+
+
 def legacy_definition_hash(idea: str, params: dict, setup: dict | None = None) -> str:
     """A hand-coded model's variant. setup holds what else someone could choose to make a result look better:
     the risk profile (and so the sizing), the walk-forward windows and the fee assumed when choosing (Advisor,
     6 Oct 2026). Fee-ladder rungs are not part of it. Counter lines imported from before it kept none."""
+    params = _untitled(params)
     return content_hash({"idea": idea, "params": params} if setup is None else
                         {"idea": idea, "params": params, "setup": setup})
 
