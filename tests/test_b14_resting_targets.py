@@ -23,13 +23,13 @@ UP = [(5, 0.0), (20, 0.015), (10, 0.03), (5, 0.0), (10, -0.03), (10, 0.0)]
 DOWN = [(5, 0.0), (20, 0.008), (5, 0.0), (10, -0.03), (10, 0.0)]
 
 
-def _run(tmp_path, *, targets=None, stops=False, legs=UP, tp=0.01):
+def _run(tmp_path, *, targets=None, stops=False, legs=UP, tp=0.01, size=1.0):
     params = {"rise": 0.01, "dip": 0.005, "stop_loss": 0.01, "take_profit": tp, **PERP}
     if targets is not None:
         params["resting_targets"] = targets
     if stops:
         params["resting_stops"] = True
-    _record(tmp_path / "a.jsonl.gz", _meta(10_000, params), legs)
+    _record(tmp_path / "a.jsonl.gz", _meta(10_000, params), legs, size=size)
     store = Store.in_memory()
     replay(tmp_path / "a.jsonl.gz", with_fills=True, store=store)
     orders = store.orders(NAME)[::-1]  # oldest first
@@ -185,9 +185,350 @@ def test_b14k_a_touch_of_the_target_leaves_the_close_to_the_resting_limit(rests,
     sent = []
     strat = SimpleNamespace(
         _safety_pending=None, _entry_px=60_000.0, _stop_frac=0.01, _tp_frac=0.01, _busy=lambda: False,
-        _backtest=False, _restore=None, _entry_side=1, _backstop_since=None, _target_rests=lambda: rests,
+        _backtest=False, _restore=None, _entry_side=1, _backstop_since=None, _target_since=None,
+        _target_waits=lambda price, side: rests,
         _backstop_waits=lambda price, side: False, runtime=None, _margin=False,
         log=SimpleNamespace(info=lambda *a: None), _lock_exit_leg=lambda *a: None,
         _exit_at_market=lambda *a: sent.append(a))
     assert LongFlatStrategy._check_exits(strat, 60_600.0) is closes
     assert bool(sent) is closes and (not sent or sent[0][0] == "take_profit")
+
+
+# ---- the Advisor's ruling (HEAD6-B13-B14, 20 Oct): points 5 to 9 ---------------------------------------------------
+
+HELD = {"rise": 0.4, "dip": 0.005, "stop_loss": 0.01, "take_profit": 0.02, **PERP}  # a long held: never rises 40%
+
+
+def _held(tmp_path, prices, **more):
+    """ping_pong's long held on a given price path (one trade a second, 0.05 each), resting targets on."""
+    from test_prop_inv import HOUR0, _record_prices
+
+    _record_prices(tmp_path / "a.jsonl.gz", _meta(10_000, {**HELD, "resting_targets": True, **more}), prices, HOUR0)
+    store = Store.in_memory()
+    replay(tmp_path / "a.jsonl.gz", with_fills=True, store=store)
+    return store, store.orders(NAME)[::-1], store.fills(NAME, limit=10_000)[::-1]
+
+
+def _opening():
+    from test_r_i5_1_exit_lock import _ticks
+
+    return _ticks([(5, 0.0, 0.05), (10, 0.004, 0.05)])[0]  # flat, then the buy
+
+
+@pytest.mark.parametrize("past, through", [(0.0, False), (0.1, True)])
+def test_b14l_a_touch_of_the_target_fills_nothing_a_trade_through_fills_it_at_its_level(tmp_path, past, through):
+    """HEAD6 6 and 9a: paper's limit fills on a trade through its level, never a touch. The price climbs to the
+    target's level and trades there for a minute (or a tick, 0.1, above it), then falls back 50."""
+    prices = _opening()
+    _, orders, _ = _held(tmp_path / "pre", prices)
+    level = _targets(orders)[0]["signal"]["target_px"]  # where the target rests, read off the run up to it
+    last = prices[-1]
+    tape = prices + [round(last + (level - last) * i / 120, 1) for i in range(1, 121)] + [level + past] * 60
+    store, orders, fills = _held(tmp_path / "run", tape + [level - 50] * 60)
+    targets = _targets(orders)
+    assert len(targets) == 1 and targets[0]["signal"]["target_px"] == level
+    closes = [f for f in fills if f["order_id"] != next(o for o in orders if o["intent"] == "entry")["order_id"]]
+    if not through:
+        assert targets[0]["status"] == "accepted" and targets[0]["filled_qty"] == 0  # still resting, untouched
+        assert closes == [] and store.journal_book(NAME, 10_000)["qty"] == pytest.approx(0.11)
+        assert not [o for o in orders if o["intent"] == "take_profit" and o["order_type"] == "MARKET"]
+    else:  # all of it at its level, as a maker, in the trades' sizes (0.05 a trade)
+        assert targets[0]["status"] == "filled" and targets[0]["filled_qty"] == pytest.approx(0.11)
+        assert [f["order_id"] for f in closes] == [targets[0]["order_id"]] * 3
+        assert [round(f["qty"], 8) for f in closes] == [0.05, 0.05, 0.01]
+        for f in closes:
+            assert Decimal(str(f["price"])) == Decimal(str(level))
+            assert abs(Decimal(str(f["fee"])) - Decimal(str(f["qty"])) * Decimal(str(level)) * MAKER) <= Decimal("0.01")
+        assert store.journal_book(NAME, 10_000)["qty"] == pytest.approx(0, abs=1e-9)
+
+
+@pytest.mark.parametrize("stops", [False, True])
+def test_b14m_a_part_filled_target_leaves_the_stop_and_target_sized_to_what_is_left(tmp_path, stops):
+    """HEAD6 5 and 9b: trades of 0.03 take the long's 0.11 target in parts. After each part the stop covers what is
+    left, and the target keeps covering it too: all 0.11 fill at its level, nothing at market. With resting stops on
+    (A1), the short after it is stopped in parts: its target follows it down to what is left."""
+    store, orders, fills = _run(tmp_path, targets=True, stops=stops, size=0.03)
+    long_target = _targets(orders)[0]
+    parts = [Decimal(str(f["qty"])) for f in fills if f["order_id"] == long_target["order_id"]]
+    assert len(parts) > 1 and sum(parts) == Decimal("0.11") and long_target["status"] == "filled"
+    assert not [o for o in orders if o["intent"] == "take_profit" and o["order_type"] == "MARKET"]
+    left = [float(Decimal("0.11") - sum(parts[:i + 1])) for i in range(len(parts) - 1)]  # after each part but the last
+    if not stops:  # the watched stop's journal rows, resized as each part filled
+        first = next(f["ts"] for f in fills if f["order_id"] == long_target["order_id"])
+        sizes = [o["qty"] for o in orders if o["order_type"] == "STOP (watched)" and o["side"] == "SELL"
+                 and o["ts"] >= first]
+        assert [round(q, 8) for q in sizes] == left
+    else:
+        stop = next(o for o in orders if o["intent"] == "stop_loss" and o["order_type"] == "STOP")
+        assert stop["status"] == "canceled" and round(stop["qty"], 8) == left[-1]
+        assert stop["message"].endswith("as part of the position closed")
+        short_target = _targets(orders)[1]
+        stop2 = next(o for o in orders if o["intent"] == "stop_loss" and o["side"] == "BUY")
+        parts2 = [Decimal(str(f["qty"])) for f in fills if f["order_id"] == stop2["order_id"]]
+        assert len(parts2) > 1 and short_target["status"] == "canceled"
+        assert Decimal(str(short_target["qty"])) == sum(parts2) - parts2[0]  # what the stop's first part left
+    assert store.journal_book(NAME, 10_000)["qty"] == pytest.approx(0, abs=1e-9)
+
+
+def test_b14n_after_a_restart_each_position_has_exactly_one_resting_target():
+    """HEAD6 9c: killed 30 s before a candle close and restarted 30 s after it, with the long held: the target
+    rested before is ended on the restart, and one is placed again, for all of the position at the same level."""
+    from datetime import timedelta
+
+    from paper_scenarios import NAME as SCENARIO
+    from test_prop_inv import HOUR0, _at, _start_ns
+    from test_r_i5_1_exit_lock import _ticks
+    from test_r_i5_2_missed_candle import _ab
+
+    a, b, _, (restart, _) = _ab("ping_pong", {**HELD, "take_profit": 0.05, "resting_targets": True},
+                                _ticks([(5, 0.0, 0.05), (30, 0.004, 0.05)]),
+                                lambda a: _at(_start_ns(HOUR0)) + timedelta(minutes=20))
+    for store in (a, b):
+        live = [o for o in _targets(store.orders(SCENARIO)) if o["status"] in ("submitted", "accepted")]
+        assert len(live) == 1 and live[0]["qty"] == pytest.approx(store.journal_book(SCENARIO, 10_000)["qty"])
+    before, after = _targets(b.orders(SCENARIO)[::-1])
+    assert before["status"] == "canceled" and "restarted" in before["message"]
+    assert before["signal"]["target_px"] == after["signal"]["target_px"]
+    assert _targets(a.orders(SCENARIO))[0]["signal"]["target_px"] == after["signal"]["target_px"]
+
+
+def test_b14o_the_compliance_tests_read_the_same_book_with_targets_on(tmp_path, monkeypatch):
+    """HEAD6 9d: T1 to T4 never see a target. The paper gate passes it through unchecked (a reduce-only close),
+    and the book the tests measure (every position at its stop) is the same with a target resting as without."""
+    from sleeve_fund import supervisor
+    from sleeve_fund.paper.portfolio_gate import fund_holdings, paper_gate
+
+    monkeypatch.setattr(supervisor, "outside_fund_book", lambda *a, **k: False)  # the replay's USD test Strategy, as if in
+
+    legs = [(5, 0.0), (10, 0.0)]  # the long opened, its target resting at the end
+    on, on_orders, _ = _run(tmp_path / "on", targets=True, legs=legs, tp=0.05)
+    off, off_orders, _ = _run(tmp_path / "off", legs=legs, tp=0.05)
+    assert [t["status"] for t in _targets(on_orders)] == ["accepted"] and not _targets(off_orders)
+    entry = [_strip([o]) for o in on_orders if o["intent"] == "entry"]
+    assert entry and entry == [_strip([o]) for o in off_orders if o["intent"] == "entry"]
+    held = fund_holdings(on, atr_pct=lambda s: 0.02)
+    assert held and held == fund_holdings(off, atr_pct=lambda s: 0.02)
+    gate = paper_gate(on)
+    assert gate(NAME, {"what": "take_profit", "reduce_only": True, "qty": 0.11}, 0) is None
+
+
+@pytest.mark.parametrize("stops", [False, True])
+def test_b14p_the_target_never_holds_more_than_the_position(tmp_path, monkeypatch, stops):
+    """HEAD6 9f: every size the target is ever given (sent, or resized: what it has left to fill) is at most the
+    position held when it is given, through entries filled in slices and exits filled in parts."""
+    from sleeve_fund.strategies.base import LongFlatStrategy
+
+    sizes, send, modify = [], LongFlatStrategy.submit_order, LongFlatStrategy.modify_order
+
+    def spy_send(self, order, *a, **k):
+        if self._target_order(order):
+            sizes.append((order.quantity.as_double(), float(self._position_qty())))
+        return send(self, order, *a, **k)
+
+    def spy_modify(self, coid, quantity=None, *a, **k):
+        order = self.cache.order(coid)
+        if self._target_order(order) and quantity is not None:
+            sizes.append((quantity.as_double() - order.filled_qty.as_double(), float(self._position_qty())))
+        return modify(self, coid, quantity, *a, **k)
+
+    monkeypatch.setattr(LongFlatStrategy, "submit_order", spy_send)
+    monkeypatch.setattr(LongFlatStrategy, "modify_order", spy_modify)
+    _run(tmp_path, targets=True, stops=stops, size=0.03)
+    assert len(sizes) >= 2 and all(qty <= pos + 1e-12 for qty, pos in sizes), sizes
+
+
+@pytest.mark.parametrize("filled, held, total", [("0", "0.11", "0.11"),  # an add: 0.05 grows to the 0.11 held
+                                                 ("0.03", "0.08", "0.11"),  # its own part fill: nothing to change
+                                                 ("0.03", "0.13", "0.16")])  # an add after a part fill
+def test_b14p2_an_add_grows_the_target_to_the_position_and_no_further(filled, held, total):
+    _p2(filled, held, total, on=True)
+
+
+@pytest.mark.parametrize("intent", ["stop_loss", "take_profit"])
+def test_b14p3_with_resting_targets_off_a_part_filled_exit_is_resized_as_before(intent):
+    """HoQA: off, _resize_exits sizes a part-filled exit (a backtest's or A1's stop) to the position alone, as on
+    274ecd88: 0.03 filled of 0.11 with 0.08 held goes to 0.08, never to 0.11."""
+    _p2("0.03", "0.08", "0.08", on=False, intent=intent)
+
+
+def _p2(filled, held, total, on, intent="take_profit"):
+    from decimal import ROUND_DOWN as _
+
+    from nautilus_trader.model import OrderStatus, Price, Quantity
+
+    from sleeve_fund.strategies.base import LongFlatStrategy
+
+    sent = []
+    order = SimpleNamespace(client_order_id="T", status=OrderStatus.ACCEPTED, price=Price(60_600.0, 1),
+                            trigger_price=Price(59_400.0, 1),
+                            quantity=Quantity.from_str("0.11" if filled != "0" else "0.05"),
+                            filled_qty=Quantity.from_str(filled))
+    strat = SimpleNamespace(_resting_targets=lambda: on,
+        _position_qty=lambda: Decimal(held), _lot=lambda: Decimal("0.00000001"), _min_qty=lambda: Decimal("0.00000001"),
+        instrument=SimpleNamespace(size_precision=8, price_precision=1), _entry_side=1, _entry_px=60_000.0,
+        modify_order=lambda coid, quantity=None, price=None, trigger_price=None: sent.append(
+            (quantity, price or trigger_price)),
+        _open_target=lambda *a, **k: None, _resizing={}, _resize_due=False)
+    LongFlatStrategy._resize_exits(strat, {intent: order}, {intent: 0.01})
+    level = 60_600.0 if intent == "take_profit" else 59_400.0
+    if Decimal(total) == order.quantity.as_decimal():
+        assert sent == []
+    else:
+        assert [(q.as_decimal(), p.as_double()) for q, p in sent] == [(Decimal(total), level)]
+        if on:
+            assert Decimal(total) - Decimal(filled) == Decimal(held)  # what it has left to fill is the position
+
+
+def _crossing(monkeypatch):
+    """Every resting target goes out 5% on the wrong side of its entry, so the venue refuses it (a post-only limit
+    that would take liquidity): what a refusal looks like, end to end."""
+    from sleeve_fund.strategies.base import LongFlatStrategy
+
+    real = LongFlatStrategy._place_exits
+
+    def crossing(self, plan):
+        if "take_profit" in plan:
+            was = self._entry_px
+            self._entry_px = was * (1 - (self._entry_side or 1) * 0.05)
+            try:
+                real(self, {"take_profit": plan["take_profit"]})
+            finally:
+                self._entry_px = was
+            plan = {k: v for k, v in plan.items() if k != "take_profit"}
+        if plan:
+            real(self, plan)
+
+    monkeypatch.setattr(LongFlatStrategy, "_place_exits", crossing)
+    monkeypatch.setattr(LongFlatStrategy, "_through_target", lambda self, level, side: False)
+
+
+def test_b14q_a_refused_target_is_benign_journaled_and_the_watched_target_closes(tmp_path, monkeypatch):
+    """HEAD6 7: a refused resting target is not a safety exit: benign for F-RX-2 (never one of its refused closes in
+    a row, no block), journaled with the venue's words and an info event, sent once per position (no retry on every
+    trade), and the watched target closes the position at market in its place."""
+    from sleeve_fund.ops_health import REJECTS_OPEN
+
+    _crossing(monkeypatch)
+    store, orders, fills = _run(tmp_path, targets=True)
+    targets = _targets(orders)
+    entries = [o for o in orders if o["intent"] == "entry" and o["filled_qty"] > 0]
+    assert len(targets) == len(entries) == 2  # one each, never sent again on the next trade
+    for t in targets:
+        assert t["status"] == "rejected" and "POST_ONLY" in t["message"] and t["signal"]["benign_reject"] is True
+    closing = {r["order_id"]: r for r in store.closing_orders(NAME)}
+    assert all(closing[t["order_id"]]["benign"] for t in targets)
+    events = store.events(NAME, limit=1_000)
+    assert not [e for e in events if e["kind"] == REJECTS_OPEN]
+    assert not [e for e in events if e["kind"] == "order_rejected"]  # no warning for it
+    refused = [e for e in events if e["kind"] == "resting_target_refused"]
+    assert len(refused) == 2 and {e["level"] for e in refused} == {"info"}
+    market = [o for o in orders if o["intent"] == "take_profit" and o["order_type"] == "MARKET"]
+    assert market and market[0]["filled_qty"] == pytest.approx(entries[0]["filled_qty"])  # the watched one, at market
+
+
+def test_b14r_three_targets_refused_in_a_row_raise_an_info_alert_on_their_own_count():
+    from sleeve_fund.paper.runtime import BENIGN_REJECT, RESTING_TARGETS_REFUSED, SleeveRuntime
+
+    calls = []
+    store = SimpleNamespace(update_order=lambda oid, **k: calls.append(("order", oid, k["status"])),
+                            merge_order_signal=lambda oid, sig: calls.append(("signal", oid, sig)),
+                            event=lambda name, level, kind, msg, ts=None: calls.append(("event", level, kind, msg)))
+    rt = SimpleNamespace(store=store, name=NAME, now=lambda: None)
+    for n in range(1, 8):
+        SleeveRuntime.on_target_refused(rt, f"T{n}", "would take liquidity", n)
+    assert [c[1] for c in calls if c[0] == "order"] == [f"T{n}" for n in range(1, 8)]
+    assert all(c[2] == {BENIGN_REJECT: True} for c in calls if c[0] == "signal")
+    events = [c for c in calls if c[0] == "event"]
+    assert {e[1] for e in events} == {"info"}
+    alerts = [e for e in events if e[2] == RESTING_TARGETS_REFUSED]
+    assert [e[3].split()[0] for e in alerts] == ["3", "6"]  # at 3 in a row, and each further 3
+    assert no_venues(alerts[0][3]) == alerts[0][3]
+
+
+@pytest.mark.parametrize("refusals, target, left", [(2, True, 0), (2, False, 2)])
+def test_b14s_a_target_the_venue_takes_ends_the_refusals_in_a_row(refusals, target, left):
+    from sleeve_fund.strategies.base import LongFlatStrategy
+
+    order = object()
+    strat = SimpleNamespace(
+        _target_refusals=refusals, _target_order=lambda o: target and o is order,
+        cache=SimpleNamespace(order=lambda coid: order), _order_status=lambda e, s: None, runtime=None,
+        _cancel_on_accept=set(), _resize_if_due=lambda: None)
+    LongFlatStrategy.on_order_accepted(strat, SimpleNamespace(client_order_id="T", ts_init=0))
+    assert strat._target_refusals == left
+
+
+@pytest.mark.parametrize("status, grace_passed, waits", [
+    ("ACCEPTED", True, True), ("PARTIALLY_FILLED", True, True), ("PENDING_UPDATE", True, True),
+    ("SUBMITTED", False, True), ("SUBMITTED", True, False), ("REJECTED", False, False), ("CANCELED", False, False)])
+def test_b14t_through_the_target_a_live_one_waits_an_unanswered_one_gets_the_grace(status, grace_passed, waits):
+    """HEAD6 6: through the level, a target the venue holds is left to fill (filled or live: nothing to do); one sent
+    and unanswered waits backstop_grace_ms, then is given up (never waited on again) and the watched one closes at
+    market; refused, cancelled or none: the watched one closes at once."""
+    from nautilus_trader.model import OrderStatus
+
+    from sleeve_fund.strategies.base import LongFlatStrategy
+
+    events = []
+    order = SimpleNamespace(status=getattr(OrderStatus, status), price=SimpleNamespace(as_double=lambda: 61_200.0),
+                            client_order_id="T")
+    now = [10_000_000_000]
+    strat = SimpleNamespace(
+        _resting_targets=lambda: True, _resting_exits=lambda: {"take_profit": order}, _target_since=None,
+        clock=SimpleNamespace(timestamp_ns=lambda: now[0]), _cfg=SimpleNamespace(backstop_grace_ms=1_000),
+        _targets_lost=set(), _cancel_on_accept=set(),
+        runtime=SimpleNamespace(name=NAME, now=lambda: None, store=SimpleNamespace(
+            event=lambda *a, **k: events.append(a))))
+    assert LongFlatStrategy._target_waits(strat, 61_200.0, 1) is (status != "REJECTED" and status != "CANCELED")
+    first = LongFlatStrategy._target_waits(strat, 61_200.1, 1)  # through it: the grace starts here
+    now[0] += 1_000_000_000 if grace_passed else 999_000_000
+    assert LongFlatStrategy._target_waits(strat, 61_200.1, 1) is waits
+    lost = status == "SUBMITTED" and grace_passed
+    assert first is (status not in ("REJECTED", "CANCELED"))
+    assert strat._targets_lost == ({"T"} if lost else set()) and strat._cancel_on_accept == strat._targets_lost
+    assert [e[2] for e in events] == (["resting_target_unanswered"] if lost else [])
+
+
+@pytest.mark.parametrize("what, status, busy", [("target", "SUBMITTED", False), ("target", "PENDING_UPDATE", False),
+                                                ("target", "PENDING_CANCEL", True), ("entry", "SUBMITTED", True)])
+def test_b14u_an_unanswered_target_never_holds_up_the_stop_and_a_lost_one_is_not_waited_on(what, status, busy):
+    """HEAD6 6 and 8: targets are independent of stops. A target on its way or being resized doesn't make the
+    strategy busy, so the watched stop still fires (a cancel in flight still counts: a close is under way); and one
+    given up after the grace is left out of the orders a close waits for (_targets_lost)."""
+    from nautilus_trader.model import OrderStatus, OrderType
+
+    from sleeve_fund.strategies.base import LongFlatStrategy
+
+    order = SimpleNamespace(client_order_id="T", status=getattr(OrderStatus, status), is_closed=False,
+                            order_type=OrderType.LIMIT if what == "target" else OrderType.MARKET)
+    strat = SimpleNamespace(
+        _risk_stop_id=None, strategy_id="S", _cfg=SimpleNamespace(instrument_id="I"), _unsent=lambda: [],
+        cache=SimpleNamespace(orders_inflight=lambda **k: [order], orders_open=lambda **k: []),
+        _resting_targets=lambda: True, decisions={"T": {"intent": "take_profit" if what == "target" else "entry"}},
+        _targets_lost=set())
+    strat._target_order = lambda o: LongFlatStrategy._target_order(strat, o)
+    assert LongFlatStrategy._busy(strat) is busy
+    assert LongFlatStrategy._working(strat) == [order]
+    strat._targets_lost.add("T")
+    assert LongFlatStrategy._working(strat) == []
+
+
+def test_b14v_a_touch_never_starts_an_unanswered_targets_grace():
+    """HEAD6 6: the grace counts from a trade through the level. Trades at it, however long, leave an unanswered
+    target waiting (a limit there wouldn't have filled either); the first trade through starts it."""
+    from nautilus_trader.model import OrderStatus
+
+    from sleeve_fund.strategies.base import LongFlatStrategy
+
+    order = SimpleNamespace(status=OrderStatus.SUBMITTED, price=SimpleNamespace(as_double=lambda: 61_200.0),
+                            client_order_id="T")
+    now = [10_000_000_000]
+    strat = SimpleNamespace(
+        _resting_targets=lambda: True, _resting_exits=lambda: {"take_profit": order}, _target_since=None,
+        clock=SimpleNamespace(timestamp_ns=lambda: now[0]), _cfg=SimpleNamespace(backstop_grace_ms=1_000),
+        _targets_lost=set(), _cancel_on_accept=set(), runtime=None)
+    for _ in range(3):
+        assert LongFlatStrategy._target_waits(strat, 61_200.0, 1) is True
+        now[0] += 2_000_000_000
+    assert strat._target_since is None and not strat._targets_lost
+    assert LongFlatStrategy._target_waits(strat, 61_200.1, 1) is True and strat._target_since == now[0]
