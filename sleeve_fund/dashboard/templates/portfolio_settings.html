@@ -24,7 +24,7 @@
   <p class="ps-ver"><span class="chip running">Version {{ v.version }}</span>{% if cur %}<span> · in force since {{ cur.created_at|uk }}</span><span> · set by {{ cur.created_by }}</span>{% endif %}</p>
 </div>
 {% if saved %}<div class="okbox" role="status">Saved as version {{ saved }}. It applies from the next trade idea.</div>{% endif %}
-<div class="ps-fixed"><span><b>Edits apply to new trades only.</b> Open positions and working orders are not changed.</span><span>The whole-fund test and the loss brakes can be changed but not switched off.</span><span>If the compliance tests can't be read, no new trade goes out.</span></div>
+<div class="ps-fixed"><span><b>Edits apply to new trades only.</b> Open positions and working orders are not changed.</span><span>If the compliance tests can't be read, no new trade goes out.</span></div>
 {% if errors %}<div class="warnbox ps-err" role="alert"><b>Not saved.</b><ul>{% for e in errors %}<li>{{ e }}</li>{% endfor %}</ul></div>{% endif %}
 
 {% if mode == 'review' %}

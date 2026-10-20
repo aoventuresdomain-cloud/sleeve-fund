@@ -467,6 +467,32 @@ def resume_after_halt(ledger: Ledger) -> PortfolioState:
         return st
 
 
+def rebase_brakes(ledger: Ledger, *, drawdown: bool, day: bool) -> tuple[PortfolioState, list[str]]:
+    """B-31 (Advisor B31-BRAKE-SWITCH, 20 Oct): a T5 brake switched back on judges from the book at that moment, as the
+    PM's Resume re-bases the halt (resume_after_halt), so switching one on never halts or pauses the fund at once. The
+    drawdown halt's reference becomes the book; the daily pause counts the rest of the day from it (the next day
+    starts afresh at mark_book). The true high-water mark is kept, and a halt or pause in force is never lifted.
+    Nothing marked yet: nothing to re-base (the first mark sets every reference). Returns the state and, per brake
+    re-based, its words for the journal: the level and the true drawdown from the peak."""
+    with ledger.lock():
+        st = ledger.state()
+        words = []
+        if st.equity is None or not (drawdown or day):
+            return st, words
+        below = 1 - st.equity / st.hwm if st.hwm else Decimal(0)
+        if drawdown:
+            st = replace(st, halt_reference=st.equity)
+            words.append(f"T5 drawdown halt switched back on: it now measures from {st.equity:,.2f}; the book is "
+                         f"{below:.1%} below its peak of {st.hwm:,.2f}, which is kept")
+        if day:
+            down = 1 - st.equity / st.day_start_equity if st.day_start_equity else Decimal(0)
+            st = replace(st, day_start_equity=st.equity)
+            words.append(f"T5 daily loss pause switched back on: today's loss now counts from {st.equity:,.2f}; the "
+                         f"day was {down:.1%} down at the time")
+        ledger.set_state(st)
+        return st, words
+
+
 def apply_flow(ledger: Ledger, amount, idle: Callable[[], str | None] | None = None,
                now: datetime | None = None, carry: bool = True) -> PortfolioState | None:
     """Capital added (> 0) or withdrawn (< 0), so a deposit isn't a gain and a withdrawal isn't a loss (Advisor 3).

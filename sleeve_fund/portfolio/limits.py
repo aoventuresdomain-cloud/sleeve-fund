@@ -140,9 +140,8 @@ def _net_room(net: Decimal, cap: Decimal, signed_per_unit: Decimal) -> Decimal |
 
 def _caps_on(e: Decimal, profile: PortfolioProfile) -> dict[str, Decimal]:
     """The caps of the order limits the PM has on, keyed as LIMITS. A test switched off (None) is off: it has no cap,
-    binds nothing and has no figure (B-32, PM 15 Oct), the way _stop_tests already treats T1 and T2. The same holds
-    for T3, which can't be switched off today (compliance_rules.LOCKED refuses the save): B-31's locked half is then
-    only that switch (HoE, 20 Oct)."""
+    binds nothing and has no figure (B-32, PM 15 Oct), the way _stop_tests already treats T1 and T2. T3 too, since
+    B-31 (PM 20 Oct: no test is locked on)."""
     return {k: scale(e, getattr(profile, k)) for k in LIMITS if getattr(profile, k) is not None}
 
 
@@ -341,7 +340,7 @@ def book_breach(profile: PortfolioProfile, equity: Decimal, reference: Decimal, 
         return BookBreach("halt", f"the book's figures aren't usable (book {equity}, reference {reference}, "
                                   f"day start {day_start})")
     top = max(reference, equity)
-    # A brake switched off (None) never fires (B-32; locked today, B-31's locked half is the switch).
+    # A brake switched off (None) never fires (B-32; switchable since B-31).
     if profile.drawdown is not None and equity <= top - scale(top, profile.drawdown):
         return BookBreach("halt", f"the book is {1 - equity / top:.1%} below its reference {top:,.2f}, at the "
                                   f"{profile.drawdown:.0%} portfolio drawdown limit")
