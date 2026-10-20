@@ -169,7 +169,9 @@ def test_must_2_a_flip_at_the_size_limit_closes_in_full_and_ends_short_exactly_a
     run = _at_the_limit()
     fills = run.legs["cs"].fills.sort_values("ts_last")
     sides = [(r["side"], D(str(r["filled_qty"]))) for _, r in fills.iterrows()]
-    assert sides[:4] == [("BUY", D(500)), ("SELL", D(200)), ("SELL", D(300)), ("SELL", sides[3][1])]
+    # B-30 (TEC, HoE to approve): Q is the 500 sent after the trim, not the 600 asked, so "sell half" sells 250 and
+    # the flip's close the other 250 (was 200 then 300: 40% of the trimmed entry, the PM's 15 Oct defect).
+    assert sides[:4] == [("BUY", D(500)), ("SELL", D(250)), ("SELL", D(250)), ("SELL", sides[3][1])]
     flip = run.decisions[1]
     assert (flip["side"], flip["outcome"], flip["limit"]) == (-1, "trimmed", "net_instrument")
     assert "(now 0.00x)" in flip["reason"]  # gated after the close filled: the book was flat
@@ -206,3 +208,19 @@ def test_only_the_test_strategy_keeps_a_target_below_costs_by_default():
     from sleeve_fund.strategies.candle_step import SPEC
 
     assert SPEC.default_params["keep_sub_cost_target"] is True and on in ([], ["candle_step"])
+
+
+def test_b30_cover_half_is_half_the_short_held_after_a_trimmed_flip():
+    """B-30 (HoE 20 Oct, QT3's research-engine cell): the flip's short is trimmed below Q at the gate (0.5 of a book a
+    little under 100,000), and step 3's "cover half" buys back half the short actually held, not the short less Q/2."""
+    from decimal import ROUND_DOWN
+
+    run = _at_the_limit()
+    fills = run.legs["cs"].fills.sort_values("ts_last")
+    sides = [(r["side"], D(str(r["filled_qty"]))) for _, r in fills.iterrows()]
+    short = sides[3][1]
+    assert short < D(500)  # trimmed: the case this pins
+    lot = D(str(run.legs["cs"].fills["filled_qty"].iloc[0])).as_tuple().exponent
+    half = (short / 2).quantize(D(1).scaleb(lot) if lot < 0 else D(1), rounding=ROUND_DOWN)
+    assert sides[4] == ("BUY", half), (short, sides[4])
+    assert sides[4][1] != short - D(250)  # never back to -Q/2
