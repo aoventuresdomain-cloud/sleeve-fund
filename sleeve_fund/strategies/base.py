@@ -37,6 +37,7 @@ from sleeve_fund.data import bar_minutes
 from sleeve_fund import router
 from sleeve_fund import compliance_rules, ramp, strength
 from sleeve_fund.instruments import BOOK_SHARE, lot_decimals, pair_of, taker_slippage, target_fill_px
+from sleeve_fund import margin
 from sleeve_fund.margin import entry_liquidation
 from sleeve_fund.portfolio.compliance import KEY as COMPLIANCE_KEY
 from sleeve_fund.paper.runtime import FILL_HANDLER_PAUSE  # noqa: F401  (T-FIX8's name, kept for its callers)
@@ -366,6 +367,7 @@ class LongFlatConfig(StrategyConfig):
         maker_wait_minutes: int | None = None,
         resting_stops: bool = False,
         backstop_grace_ms: int = 1000,
+        max_leverage: float | None = None,
         raced_fill_window_ms: int | None = None,
         max_participation: float | None = MAX_PARTICIPATION,
         volume_scale: float = 1.0,
@@ -517,6 +519,10 @@ class LongFlatConfig(StrategyConfig):
         # A1 (BGL-1): paper rests the stop at the venue as a reduce-only order, as a backtest does, and keeps watching
         # it in the process as a backstop. Built OFF: the supervisor refuses it until the test-network drills pass.
         self.resting_stops = bool(resting_stops)
+        # B-35 (a): the Strategy's own leverage cap on a perpetual, under its risk profile's (risk.capped_leverage):
+        # a number of at least 1x, refused here otherwise, so a bad value never saves or starts
+        risk.check_own_leverage(max_leverage)
+        self.max_leverage = None if max_leverage is None else float(max_leverage)
         # A1 (Advisor b): with a stop resting, the watched level waits this long for the venue's stop to fill before it
         # closes at market itself (none past half the way to liquidation, or for a stop the venue refused).
         if int(backstop_grace_ms) != backstop_grace_ms or not 0 <= backstop_grace_ms <= 3_000:  # Advisor: 3 s at most
@@ -631,6 +637,9 @@ class LongFlatStrategy(Strategy):
         # LIQ-FUND-1 (Advisor 17:20 UK, 13 Oct): funding taken from, or credited to, that margin since _liq_px was fixed,
         # and the instant (ns) after which a settlement is the position's. _liq_now moves the price by it.
         self._liq_funded, self._liq_from = 0.0, None
+        # LIQ-FEE (HoE 15 Oct): the entry fees the open position still holds on its isolated margin
+        # (margin.entry_fees_after), which come off it
+        self._entry_fees = 0.0
         # STOP-LOOSEN-1 (Advisor 17:10 UK, 13 Oct): whether the open position's stop has been held inside the
         # half-liquidation cap yet (it alerts once per position), and how many positions were (the tear sheet's count).
         self._stop_capped = False
@@ -1154,6 +1163,8 @@ class LongFlatStrategy(Strategy):
                 raise RuntimeError(f"{why} ({e.reason})") from e
         if self.recorder is not None:
             self.recorder.start(self.instrument)
+        if not self._backtest:
+            self._say_tick()
         if self.runtime is not None and hasattr(self.runtime.store, "set_grid"):
             # DA-9: the journal takes this instrument's quantities to its lot.
             self.runtime.store.set_grid(lot_decimals=self.instrument.size_precision)
@@ -1584,6 +1595,7 @@ class LongFlatStrategy(Strategy):
             # entry's price (CR #146).
             recent, fills = store.orders(name, limit=200), store.fills(name, limit=None)  # every fill: F242-3
             filled = {f["order_id"] for f in fills}
+            self._entry_fees = float(self.runtime.book.get("entry_fees") or 0.0)  # the journal's, as replayed
             held = next((o for o in recent if o.get("intent") == "entry" and o.get("side") == opened
                          and o["order_id"] in filled), None)
             fixed = next((o for o in recent
@@ -1735,7 +1747,9 @@ class LongFlatStrategy(Strategy):
         if self._margin:
             lev = LongFlatStrategy._max_leverage(self)
             liq = markets.isolated_liquidation(cash + self._funded(), qty, entry, lev,
-                                               self._cfg.perp.maintenance_margin)
+                                               self._cfg.perp.maintenance_margin,
+                                            fees=getattr(self, "_entry_fees", 0.0),  # a stub book may hold none
+                                               tick=LongFlatStrategy._tick(self))
         target = liq if liq is not None else 0.0
         if side * (mark - target) <= 0:
             return  # already through liquidation: the liquidation guard closes it
@@ -2588,7 +2602,7 @@ class LongFlatStrategy(Strategy):
         self._noted.discard("entry_refused_venue_terms")
         # CUT-A: the simulated account posts the margin, with the fund's virtual funding back in (_mark nets it out)
         liq, distance = entry_liquidation(cash + self._funded(), float(qty), close, side, self._cfg.assumed_taker_fee,
-                                          self._cfg.perp.maintenance_margin, lev)
+                                          self._cfg.perp.maintenance_margin, lev, tick=LongFlatStrategy._tick(self))
         if liq is not None:
             signal["liquidation_px"] = round(liq, 8)
             signal["leverage"] = round(notional / base, 4)  # of what it was sized off: the fund's equity inside it
@@ -4116,9 +4130,13 @@ class LongFlatStrategy(Strategy):
         return True
 
     def _max_leverage(self) -> float:
-        """The leverage cap this strategy's sizing, isolated margin and liquidation price use: its risk profile's, or a
+        """The leverage cap this strategy's sizing, isolated margin and liquidation price use: its risk profile's (lowered
+        by its own max_leverage, B-35 (a), as risk.leverage_cap), or a
         two-leg Strategy's perp leg's own, never above 2x or the profile's (P2-8, Advisor B; leg_leverage)."""
         profile = self.runtime.profile.max_leverage if self.runtime is not None else 1.0
+        own = getattr(getattr(self, "_cfg", None), "max_leverage", None)  # B-35 (a): the Strategy's own, lower cap
+        if own is not None:
+            profile = min(own, profile)
         leg = getattr(self, "leg_leverage", None)  # called on a test's stand-in strategy too, which has none
         if leg is not None:  # effective: min(the leg's setting, 2x, the profile's cap) (Advisor 05:35 UK)
             return min(leg, 2.0, profile)
@@ -4343,6 +4361,33 @@ class LongFlatStrategy(Strategy):
         an 8-decimal buy then leaves 1e-7 behind after a full exit, and reconcile halts (review round 9, B9-1)."""
         return max(self.instrument.size_increment.as_decimal(), Decimal(10) ** -lot_decimals(self.instrument))
 
+    def _tick(self) -> float | None:
+        """The price tick a liquidation price rounds to toward the entry (margin.to_tick): the one kept for the
+        instrument (markets.liquidation_tick, B-43), which the dashboard reads and the start check holds equal to the
+        paper venue's live tick; the instrument's own where none is kept. Paper's instrument is defined by the market
+        data's venue, whose tick may differ (CR, B-36b): the kept one is what the tiers are priced in."""
+        from sleeve_fund import markets
+
+        instrument = getattr(self, "instrument", None)  # a test's stub may hold none: no rounding, as before
+        iid = getattr(instrument, "id", None)
+        if iid is not None:
+            kept = markets.liquidation_tick(str(iid.venue), str(iid.symbol))
+            if kept is not None:
+                return kept
+        inc = getattr(instrument, "price_increment", None) if instrument is not None else None
+        return float(inc) if inc is not None else None
+
+    def _say_tick(self) -> None:
+        """B-43 (Advisor): a start whose instrument carries a price tick other than the kept one says so, once, in the
+        journal: its liquidation rounds to the kept tick (_tick), its orders to the instrument's."""
+        inc = getattr(self.instrument, "price_increment", None)
+        kept = LongFlatStrategy._tick(self)
+        if self.runtime is None or inc is None or kept is None or float(inc) == kept:
+            return
+        self.runtime.store.event(self.runtime.name, "warning", "price_tick_kept",
+                                 f"the instrument's price tick is {float(inc):g}; liquidation prices round to the kept "
+                                 f"tick {kept:g}, as the venue's tiers are priced and the pages show")
+
     def _held_qty(self, qty: float) -> float:
         """A fill's quantity as the account holds it. A venue can print and fill at 8 lot decimals in a
         currency the engine keeps at 6 (XRP, ADA): the account rounds each fill to 6, so the journal must
@@ -4429,7 +4474,9 @@ class LongFlatStrategy(Strategy):
             return None
         entry = self._entry_px if self._entry_px else self._net_position()[1]
         return markets.isolated_liquidation(cash + LongFlatStrategy._funded(self), qty, entry,
-                                            LongFlatStrategy._max_leverage(self), table)
+                                            LongFlatStrategy._max_leverage(self), table,
+                                            fees=getattr(self, "_entry_fees", 0.0),  # a stub book may hold none
+                                            tick=LongFlatStrategy._tick(self))
 
     def _hold_stop_capped(self, asked: float) -> bool:
         """Set the stop for `asked`, held inside the half-liquidation cap (_capped_stop). Journals a clamp only when
@@ -4472,7 +4519,9 @@ class LongFlatStrategy(Strategy):
         lev = LongFlatStrategy._max_leverage(self)
         entry = self._entry_px if self._entry_px else self._net_position()[1]
         return markets.isolated_liquidation(cash + LongFlatStrategy._funded(self), qty, entry, lev,
-                                            self._cfg.perp.maintenance_margin)
+                                            self._cfg.perp.maintenance_margin,
+                                            fees=getattr(self, "_entry_fees", 0.0),  # a stub book may hold none
+                                            tick=LongFlatStrategy._tick(self))
 
     def _position_opened(self, fills: list[dict]) -> int:
         """When the position held now opened (ns): its first fill since the journal was last flat or went through
@@ -6510,7 +6559,7 @@ class LongFlatStrategy(Strategy):
                 and self._entry_side == -sign):
             px, fee = self._book_liquidation(coid, sign, qty, px, fee, held[1])
         if self._margin:
-            opening = self._track_entry(sign, event.last_qty.as_decimal(), qty, px)
+            opening = self._track_entry(sign, event.last_qty.as_decimal(), qty, px, fee)
             if opening:
                 self._set_liq(journal_id, intrabar[0] if intrabar is not None else event.ts_event)
                 # The fill re-averaged the entry and fixed its liquidation price: the stop as a share of that entry,
@@ -6627,7 +6676,7 @@ class LongFlatStrategy(Strategy):
         if getattr(self, "pair", None) is not None and not self._backtest:
             self.pair.on_mark(self, px)  # Advisor M5: a two-leg Strategy's guards run on every fill of either leg
 
-    def _track_entry(self, sign: int, filled: Decimal, qty: float, px: float) -> bool:
+    def _track_entry(self, sign: int, filled: Decimal, qty: float, px: float, fee: float = 0.0) -> bool:
         """Perp: the entry book after a fill, read from the venue's position (already updated when the fill
         arrives), never kept up incrementally: one exit that left a lot behind once put the incremental
         book out of phase for good, booking every later short as a reduction of a phantom long, so no
@@ -6637,6 +6686,9 @@ class LongFlatStrategy(Strategy):
         half = self._lot() / 2
         side = 0 if abs(post) < half else (1 if post > 0 else -1)
         pre = post - sign * filled
+        held_fees = getattr(self, "_entry_fees", 0.0)  # a stub book may hold none
+        self._entry_fees = margin.entry_fees_after(held_fees, float(pre), float(sign * filled), fee,
+                                                   float(half * 2))
         if side == 0:
             self._entry_px, self._entry_qty, self._entry_side = None, 0.0, 0
             self._stop_frac = self._tp_frac = self._liq_px = self._liq_from = None

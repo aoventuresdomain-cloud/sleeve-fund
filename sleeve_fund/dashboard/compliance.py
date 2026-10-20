@@ -1,7 +1,7 @@
 """Portfolio Settings (Bridge Drop A): the five compliance tests the gate applies to every idea, their use now, the
-asset-group map, an edit with a confirm step and the history of versions. The rules (keys, words, bounds, what can't be
-switched off) are sleeve_fund.compliance_rules'; the rows are the DA's versioned compliance tables, read and written
-through the Store only. Use now is the entry gate's own book (as withdrawal.limits_in_use): display only."""
+asset-group map, an edit with a confirm step and the history of versions. The rules (keys, words, bounds) are
+sleeve_fund.compliance_rules'; the rows are the DA's versioned compliance tables, read and written through the Store
+only. Use now is the entry gate's own book (as withdrawal.limits_in_use): display only."""
 
 from __future__ import annotations
 
@@ -11,12 +11,13 @@ from zoneinfo import ZoneInfo
 
 from sleeve_fund import compliance_rules as rules
 from sleeve_fund.dashboard.riskops import NEAR_LIMIT
+from sleeve_fund.portfolio.limits import day_return
 from sleeve_fund.store import Store
 
 UK = ZoneInfo("Europe/London")
 ACTION_WORDS = {"trim": "Refuse or trim", "refuse": "Refuse", "pause_day": "Pause new trades", "halt": "Flatten and halt"}
-# B-31: what a row switched off stops checking, in the review step, before the PM's confirm tick. The locked rows
-# (T3, T5) can't be switched off yet, so they have no words here.
+# B-31: what a row switched off stops checking, in the review step, before the PM's confirm tick. A pause or halt in
+# force when its brake goes off stays in force (Advisor B31-BRAKE-SWITCH, gate state kept by QD's 75f96a6).
 OFF_WORDS = {
     "asset_stop_loss": "new trades are no longer trimmed to a loss per asset if every stop is hit.",
     "type_stop_loss": "new trades are no longer trimmed to a loss per asset group if every stop is hit, and an asset "
@@ -24,10 +25,88 @@ OFF_WORDS = {
     "fund_gross": "new trades are no longer trimmed to a gross size for the fund.",
     "asset_net": "new trades are no longer trimmed to a net size on one asset.",
     "fund_margin": "new trades are no longer trimmed to the margin the fund may post.",
+    "fund_stop_loss": "new trades are no longer trimmed to a loss for the whole fund if every stop is hit.",
+    "fund_day_loss": "today's loss no longer pauses new trades. A pause already in force stays until the next day "
+                     "begins.",
+    "fund_drawdown": "a fall from the peak no longer closes everything and halts. A halt already in force stays until "
+                     "you restart the fund.",
 }
+# B-31: T3 and the T5 brakes switch off for paper testing only (Store.add_compliance_version refuses it otherwise).
+BRAKES = ("fund_stop_loss", "fund_day_loss", "fund_drawdown")
+PAPER_ONLY = "Switching the whole-fund test or a loss brake off is for paper testing only."
 # The rules every order keeps whatever the compliance tests (PM capital model, 14 Oct).
 ORDER_RULES = ("The order rules still apply to every trade: a stop, or 1x leverage without one; a stop within half the "
                "distance to liquidation; and the leverage cap.")
+# Portfolio Settings' fixed lines: the order rules are the only rules with no off switch (Advisor, 20 Oct 17:00 UK).
+NO_OFF_SWITCH = ("The order rules apply to every trade and have no off switch: a stop, or 1x leverage without one; a "
+                 "stop within half the distance to liquidation; and the leverage cap.")
+
+
+def brake_switches(old: dict[str, dict], new: dict[str, dict]) -> list[tuple[str, bool]]:
+    """(key, switched on) for each of T3 and the T5 brakes the new set switches off or back on (B-31)."""
+    return [(k, bool(new[k].get("enabled"))) for k in BRAKES
+            if k in new and bool(old.get(k, {}).get("enabled", True)) != bool(new[k].get("enabled"))]
+
+
+def rebase_words(store: Store, old: dict[str, dict], new: dict[str, dict]) -> list[str]:
+    """B-31 (Advisor MUST 2): before a T5 brake goes back on, what it will judge from. The gate re-bases it to the book
+    at that moment (gate.rebase_brakes), so the PM reads the level and, for the halt, the true fall from the peak, which
+    is kept. Display only: the figures are the gate's last mark."""
+    back_on = [k for k, on in brake_switches(old, new) if on and k in ("fund_drawdown", "fund_day_loss")]
+    if not back_on:
+        return []
+    from sleeve_fund.paper.portfolio_gate import PaperGate
+
+    try:
+        st = PaperGate(store).ledger.state()
+    except Exception:  # noqa: BLE001 - the words say so; the gate re-bases on its own either way
+        st = None
+    out = []
+    for k in back_on:
+        if st is None or st.equity is None or st.equity <= 0:
+            out.append(f"{rules.name(k)} back on: the fund's book has no mark yet, so it measures from the first mark.")
+        elif k == "fund_drawdown":
+            below = 1 - st.equity / st.hwm if st.hwm else Decimal(0)
+            out.append(f"{rules.name(k)} back on: it will measure from {st.equity:,.2f}, the book now. The book is "
+                       f"{below:.1%} below its peak of {st.hwm:,.2f}, which is kept.")
+        else:
+            down = 1 - st.equity / st.day_start_equity if st.day_start_equity else Decimal(0)
+            out.append(f"{rules.name(k)} back on: today's loss will count from {st.equity:,.2f}. The day is "
+                       f"{down:.1%} down now.")
+    return out
+
+
+def brakes_off(store: Store) -> list[dict]:
+    """B-31 (Advisor MUST 4): T3 and each T5 brake switched off in the version in force, with when it went off (the
+    first version of the run that has it off) and that version's reason, for the banner that stays on the fund pages
+    until it is back on."""
+    try:
+        return _brakes_off(store)
+    except Exception:  # noqa: BLE001 - every fund page reads this: say it can't be read, never a broken page (CR)
+        return [{"key": "unreadable", "unreadable": True}]
+
+
+def _brakes_off(store: Store) -> list[dict]:
+    current = as_set(store.compliance())[0]
+    off = [k for k in BRAKES if k in current and not current[k]["enabled"]]
+    if not off:
+        return []
+    out, sets = [], {}
+    versions = store.compliance_versions()  # newest first
+    for k in off:
+        first = None
+        for v in versions:
+            if v["version"] not in sets:
+                sets[v["version"]] = as_set(store.compliance(v["version"]))[0]
+            if sets[v["version"]].get(k, {}).get("enabled", True):
+                break
+            first = v
+        at = first["created_at"] if first else None
+        if at is not None and at.tzinfo is None:
+            at = at.replace(tzinfo=UTC)
+        out.append({"key": k, "name": rules.name(k), "since": f"{at.astimezone(UK):%d %b %H:%M} UK" if at else None,
+                    "reason": (first or {}).get("note") or ""})
+    return out
 
 
 def switched_off(old: dict[str, dict], new: dict[str, dict]) -> list[str]:
@@ -146,10 +225,28 @@ def use_now(store: Store, groups: dict[str, str]) -> dict:
         "fund_gross": (book.gross() / eq, ""),
         "asset_net": (net / eq, net_asset),
         "fund_margin": (book.margin() / eq, ""),
-        "fund_day_loss": (max(Decimal(0), 1 - eq / day_start) if day_start else Decimal(0), ""),
+        # DAY-RET: the daily pause's own figure (limits.day_return), never worked out again here
+        "fund_day_loss": (max(Decimal(0), -(day_return(eq, day_start) or Decimal(0))), ""),
         "fund_drawdown": (max(Decimal(0), 1 - eq / reference) if reference else Decimal(0), ""),
     }
     return {"source": "gate", **{k: {"used": share, "what": what} for k, (share, what) in used.items()}}
+
+
+def day_figure(store: Store, now=None) -> dict:
+    """Today's return for the pages (DAY-RET): gate.day_figure on the fund's state, with today's T5 re-base if any
+    (portfolio_brake_rebased). FE shows this; it never works the figure out again."""
+    from sleeve_fund.gate_ledger import DbLedger
+    from sleeve_fund.portfolio.gate import day_figure as figure
+    from sleeve_fund.store import utcnow
+
+    now = now or utcnow()
+    # by kind, so a busy day's other events never push it out; gate.day_figure drops one from before today's open
+    e = next((e for e in store.events_of(("portfolio_brake_rebased",), limit=20)
+              if str(e["message"]).startswith("T5 daily loss pause")), None)
+    rebased = e["ts"] if e else None
+    if rebased is not None and rebased.tzinfo is None:
+        rebased = rebased.replace(tzinfo=UTC)
+    return figure(DbLedger(store, lambda: ()).state(), now, rebased)
 
 
 def _tone(used: Decimal, limit: Decimal) -> str:
@@ -168,7 +265,7 @@ def page(store: Store) -> dict:
         u = use.get(r.key)
         rows.append({"key": r.key, "test": r.test, "label": r.label, "limit": t["limit"], "enabled": t["enabled"],
                      "shown": rules.show(r.key, t["limit"]),
-                     "edit": rules.edit(r.key, t["limit"]), "locked": r.locked, "low": rules.show(r.key, r.low),
+                     "edit": rules.edit(r.key, t["limit"]), "low": rules.show(r.key, r.low),
                      "high": rules.show(r.key, r.high), "unit": r.unit, "action": ACTION_WORDS.get(r.action, r.action),
                      "used": rules.show(r.key, u["used"]) if u else None, "what": u["what"] if u else "",
                      "rest": u.get("rest", "") if u else "",
@@ -182,7 +279,8 @@ def page(store: Store) -> dict:
             "groups": [{"asset": a, "group": groups.get(a)} for a in sorted(names, key=lambda a: (a in groups, a))],
             "group_names": rules.GROUPS, "unmapped_words": rules.UNMAPPED,
             "t2_on": tests.get("type_stop_loss", {}).get("enabled", False), "history": history(store),
-            "refused": refused(store, limit=50), "current": {"tests": tests, "groups": groups}}
+            "refused": refused(store, limit=50), "current": {"tests": tests, "groups": groups},
+            "no_off_switch": NO_OFF_SWITCH}
 
 
 def history(store: Store, limit: int = 30) -> list[dict]:
@@ -211,9 +309,11 @@ def from_form(form) -> tuple[dict[str, dict], dict[str, str], list[str]]:
             errors.append(f"{rules.name(r.key)}: '{raw}' isn't a number.")
             continue
         tests[r.key] = {"limit": v / 100 if r.unit == "%" else v,
-                        # As asked, locked or not: a locked test asked off is refused by validate(), never quietly put back on
-                        # (F-LOCKED-OFF). The page sends a locked test's on as a hidden field.
+                        # As asked: every test has its checkbox since B-31 (F-LOCKED-OFF: never quietly put back on).
                         "enabled": form.get(f"{r.key}.enabled") in ("on", "1", "true")}
+    # Advisor cell f: a switch for anything but a compliance test (the order rules have none) is refused, never ignored.
+    unknown = sorted({k.rsplit(".", 1)[0] for k in form if k.endswith((".enabled", ".limit"))} - set(rules.KEYS))
+    errors += [f"{k} isn't a compliance test, and the order rules have no off switch." for k in unknown]
     groups = {}
     for key in form:
         if key.startswith("group.") and form.get(key) in rules.GROUPS:

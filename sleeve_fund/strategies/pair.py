@@ -497,7 +497,7 @@ class Pair:
             return {}
         side = self.sides[id(leg)]
         liq, _ = entry_liquidation(cash, float(qty), px, side, leg._cfg.assumed_taker_fee,
-                                   leg._cfg.perp.maintenance_margin, leg._max_leverage())
+                                   leg._cfg.perp.maintenance_margin, leg._max_leverage(), tick=leg._tick())
         out = {"close": px, "leverage": round(float(qty) * px / equity, 4)}
         if liq is not None:
             out["liquidation_px"] = round(liq, 8)

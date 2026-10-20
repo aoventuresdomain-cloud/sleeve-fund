@@ -9,8 +9,8 @@ import pytest
 from test_browser import _open, _step, browser  # noqa: F401 - the browser fixture
 from test_fe_b20_browser import held_site  # noqa: F401 - a fund-held store, served
 
-from sleeve_fund.dashboard.app import _strategy_choices
-from sleeve_fund.risk import PROFILES
+from sleeve_fund.dashboard.app import _form_params, _strategy_choices
+from sleeve_fund.risk import OWN_LEVERAGE, PROFILES, leverage_cap
 from sleeve_fund.strategies import STOPLESS_MAX_LEVERAGE, places_stop
 
 MODELS = [c["name"] for c in _strategy_choices(tests=True)]
@@ -54,8 +54,9 @@ def test_b35_every_model_saves_on_its_untouched_defaults(held_site, browser, mod
     s = store.sleeve(name)
     assert s.starting_balance == 0
     perp = s.params.get("market") == "perp"
-    if perp and not places_stop(s.strategy, s.params):
-        assert PROFILES[s.risk_profile].max_leverage <= STOPLESS_MAX_LEVERAGE, (model, s.risk_profile)
+    if perp and not places_stop(s.strategy, s.params):  # TEC-B35A: held at 1x by its own cap, the profile as picked
+        assert leverage_cap(PROFILES[s.risk_profile], s.params) == STOPLESS_MAX_LEVERAGE, (model, s.risk_profile)
+        assert s.params[OWN_LEVERAGE] == 1, s.params
     assert errors == []
     page.context.close()
 
@@ -65,9 +66,9 @@ def test_b35_a_stopless_perp_says_why_its_held_to_1x_and_a_stop_frees_the_profil
     page, errors = _open(browser, f"{base}/sleeves/new?instrument=BTC/USDT&venue=binance")
     _choose(page, "trend_filter", "perp")
     _step(page, "Capital and risk")
-    assert PROFILES[page.input_value("#risk_profile")].max_leverage <= STOPLESS_MAX_LEVERAGE
+    assert page.input_value("#risk_profile") == "balanced"  # TEC-B35A: the profile stays as picked
     note = page.locator("#stopless-note")
-    assert note.is_visible() and "places no stop" in note.inner_text() and "1x" in note.inner_text()
+    assert note.is_visible() and "No stop, so capped at 1x" in note.inner_text(), note.inner_text()
     _step(page, "Orders and exits")
     page.select_option("#stop_kind", "pct")
     page.fill("#stop_loss_pct", "2")
@@ -102,8 +103,9 @@ def test_b35_the_backtest_form_holds_a_stopless_perp_to_1x_as_paper_does(held_si
     """Advisor B35-STOPLESS-DEFAULT's condition: research runs the Strategy at the leverage paper will, 1x."""
     base, _ = held_site
     page, errors = _open(browser, f"{base}/backtest?{WHERE['perp']}&strategy=trend_filter")
-    assert PROFILES[page.input_value("#risk_profile")].max_leverage <= STOPLESS_MAX_LEVERAGE
+    assert page.input_value("#risk_profile") == "balanced"  # TEC-B35A: as picked; its own cap holds it at 1x
     assert page.locator("#stopless-note").is_visible()
+    assert _form_params({"market": "perp"}, "trend_filter")[OWN_LEVERAGE] == 1  # the backtest form's params
     assert errors == []
     page.context.close()
 

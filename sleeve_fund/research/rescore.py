@@ -20,6 +20,7 @@ import re
 import sys
 from pathlib import Path
 
+from sleeve_fund.research.pinned import parse as parse_pinned
 from sleeve_fund.venues import RESEARCH_VENUE
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -65,8 +66,9 @@ def pick(rows: list, spec: str | None) -> list:
     return chosen
 
 
-def request(name: str, minutes: int, venue: str, pair: str):
-    """The store study one row runs: rules, its definition's params, perp, the locked holdout."""
+def request(name: str, minutes: int, venue: str, pair: str, pinned=None):
+    """The store study one row runs: rules, its definition's params, perp, the locked holdout, on the list's pinned
+    dates (B-37)."""
     from sleeve_fund.research.run import StudyRequest
     from sleeve_fund.strategies.definitions import load_definition_file, to_params
 
@@ -79,7 +81,7 @@ def request(name: str, minutes: int, venue: str, pair: str):
         params["allow_short"] = True
     return StudyRequest(strategy="rules", pair=pair, venue=venue, minutes=minutes, risk_profile=None,
                         train_days=TRAIN_DAYS, test_days=TEST_DAYS, holdout_days=HOLDOUT_DAYS, use_holdout=False,
-                        params=params, label=name)
+                        params=params, label=name, pinned=pinned)
 
 
 def main(argv: list[str] | None = None, run=None, journal=None) -> int:
@@ -94,8 +96,12 @@ def main(argv: list[str] | None = None, run=None, journal=None) -> int:
         print("refused: venue must be lower-case letters, pair like BTC/USDT")
         return 2
     try:
-        rows = pick(rows_of(Path(args.list).read_text(encoding="utf-8")), args.rows)
-        reqs = [(n, name, request(name, minutes, args.venue, args.pair)) for n, name, minutes in rows]
+        text = Path(args.list).read_text(encoding="utf-8")
+        pinned = parse_pinned(text)  # B-37: a list that pins no dates is refused before anything runs
+        if pinned.holdout_days != HOLDOUT_DAYS:
+            raise ValueError(f"the list pins a {pinned.holdout_days}-day holdout, not {HOLDOUT_DAYS}")
+        rows = pick(rows_of(text), args.rows)
+        reqs = [(n, name, request(name, minutes, args.venue, args.pair, pinned)) for n, name, minutes in rows]
     except (OSError, ValueError) as exc:
         print(f"refused: {exc}")
         return 2

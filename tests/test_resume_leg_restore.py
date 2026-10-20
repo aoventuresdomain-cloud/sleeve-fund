@@ -186,12 +186,14 @@ def _half_way_cap(e, liq, share):
 
 def _worked_out_again(strat, e):
     """The leg's liquidation price from its journaled entry, size and cash, its Strategy's leverage cap and the
-    maintenance table now: independently of the strategy's restore."""
+    maintenance table now, its entry fee off the margin and on the tick toward the entry (LIQ-FEE): independently of
+    the strategy's restore."""
     from sleeve_fund import margin
 
     book = strat.runtime.book
     return margin.isolated_liquidation(book["cash"] + FUNDED, book["qty"], e["px"], strat.runtime.profile.max_leverage,
-                                       strat._cfg.perp.maintenance_margin)
+                                       strat._cfg.perp.maintenance_margin, fees=float(book["entry_fees"]),
+                                       tick=float(strat.instrument.price_increment))  # LIQ-FEE, HoE TEC
 
 
 def test_every_perp_leg_comes_back_on_its_own_margin_and_the_nearer_liquidation_price(store, instrument):

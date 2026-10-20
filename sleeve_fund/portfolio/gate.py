@@ -456,6 +456,28 @@ def carried(st: PortfolioState) -> dict:
                 "carried_day_return": r, "carried_day": st.day if r is not None else None}
 
 
+def day_ret(state: PortfolioState) -> Decimal | None:
+    """Today's return of the fund's book as the daily pause measures it (limits.day_return on the state's day start):
+    the figure the pages show, so page and brake are the same number (DAY-RET)."""
+    from sleeve_fund.portfolio.limits import day_return
+
+    return None if state.day is None else day_return(state.equity, state.day_start_equity)
+
+
+def day_figure(state: PortfolioState, now: datetime, rebased_at: datetime | None = None) -> dict:
+    """What a page shows for today (DAY-RET): the pause's own figure (day_ret), its label, and when the day resets in
+    UK time, worked out from the reset (00:00 UTC), never written as a fixed hour: 01:00 UK in summer, 00:00 UK from
+    Sun 25 Oct. rebased_at: a T5 day pause switched back on today (B-31 re-base); the figure then measures from that,
+    and the label says so (Advisor DAY-RET (B) condition)."""
+    from zoneinfo import ZoneInfo
+
+    uk = ZoneInfo("Europe/London")
+    today = state.day is not None and rebased_at is not None and trading_day(rebased_at) == state.day
+    return {"value": day_ret(state),
+            "label": f"Today (since re-base at {rebased_at.astimezone(uk):%H:%M} UK)" if today else "Today",
+            "resets": f"{next_utc_midnight(now).astimezone(uk):%H:%M} UK"}
+
+
 def resume_after_halt(ledger: Ledger) -> PortfolioState:
     """The PM's Resume after a portfolio halt: clears it and re-bases the halt's reference to the book now, so it
     doesn't fire again at once; the next halt is the drawdown limit below this. A pause for the day stays until
@@ -465,6 +487,32 @@ def resume_after_halt(ledger: Ledger) -> PortfolioState:
         st = replace(st, halted=None, halt_reference=st.equity)
         ledger.set_state(st)
         return st
+
+
+def rebase_brakes(ledger: Ledger, *, drawdown: bool, day: bool) -> tuple[PortfolioState, list[str]]:
+    """B-31 (Advisor B31-BRAKE-SWITCH, 20 Oct): a T5 brake switched back on judges from the book at that moment, as the
+    PM's Resume re-bases the halt (resume_after_halt), so switching one on never halts or pauses the fund at once. The
+    drawdown halt's reference becomes the book; the daily pause counts the rest of the day from it (the next day
+    starts afresh at mark_book). The true high-water mark is kept, and a halt or pause in force is never lifted.
+    Nothing marked yet: nothing to re-base (the first mark sets every reference). Returns the state and, per brake
+    re-based, its words for the journal: the level and the true drawdown from the peak."""
+    with ledger.lock():
+        st = ledger.state()
+        words = []
+        if st.equity is None or not (drawdown or day):
+            return st, words
+        below = 1 - st.equity / st.hwm if st.hwm else Decimal(0)
+        if drawdown:
+            st = replace(st, halt_reference=st.equity)
+            words.append(f"T5 drawdown halt switched back on: it now measures from {st.equity:,.2f}; the book is "
+                         f"{below:.1%} below its peak of {st.hwm:,.2f}, which is kept")
+        if day:
+            down = 1 - st.equity / st.day_start_equity if st.day_start_equity else Decimal(0)
+            st = replace(st, day_start_equity=st.equity)
+            words.append(f"T5 daily loss pause switched back on: today's loss now counts from {st.equity:,.2f}; the "
+                         f"day was {down:.1%} down at the time")
+        ledger.set_state(st)
+        return st, words
 
 
 def apply_flow(ledger: Ledger, amount, idle: Callable[[], str | None] | None = None,

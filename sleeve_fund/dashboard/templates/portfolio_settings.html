@@ -24,7 +24,7 @@
   <p class="ps-ver"><span class="chip running">Version {{ v.version }}</span>{% if cur %}<span> · in force since {{ cur.created_at|uk }}</span><span> · set by {{ cur.created_by }}</span>{% endif %}</p>
 </div>
 {% if saved %}<div class="okbox" role="status">Saved as version {{ saved }}. It applies from the next trade idea.</div>{% endif %}
-<div class="ps-fixed"><span><b>Edits apply to new trades only.</b> Open positions and working orders are not changed.</span><span>The whole-fund test and the loss brakes can be changed but not switched off.</span><span>If the compliance tests can't be read, no new trade goes out.</span></div>
+<div class="ps-fixed"><span><b>Edits apply to new trades only.</b> Open positions and working orders are not changed.</span><span>If the compliance tests can't be read, no new trade goes out.</span><span>{{ v.no_off_switch }}</span></div>
 {% if errors %}<div class="warnbox ps-err" role="alert"><b>Not saved.</b><ul>{% for e in errors %}<li>{{ e }}</li>{% endfor %}</ul></div>{% endif %}
 
 {% if mode == 'review' %}
@@ -60,8 +60,8 @@
         <td class="ps-name">{% if multi %}{{ sub.get(r.key, r.label) }}{% else %}<b>{{ g.test }} {{ g.name }}</b>{% endif %}</td>
         <td class="ps-desc">{{ desc.get(r.key, r.label) }}{% if r.key == 'asset_net' %} At {{ r.shown }} that is at most {{ "{:,.0f}".format(100000 * r.limit) }} on one asset at a 100,000 fund.{% endif %}</td>
         <td class="ps-lim">{% if editing %}{% set fv = (form.get(r.key ~ '.limit') if form else none) %}<span class="ps-input"><input name="{{ r.key }}.limit" value="{{ fv if fv is not none else r.edit }}" inputmode="decimal" size="5" aria-label="{{ r.label }}, in {{ r.unit }}"><span>{{ r.unit }}</span></span><span class="faint ps-bounds">{{ r.low }} to {{ r.high }}</span>{% elif r.enabled %}{{ r.shown }}{% else %}<span class="faint" title="Switched off: its limit is kept, and switching it back on restores it">saved {{ r.shown }}</span>{% endif %}</td>
-        <td>{% if not r.enabled and not r.locked %}<span class="muted">not checked</span>{% elif r.used is not none %}<div class="ps-use {{ r.tone }}"{% if r.rest %} title="{{ r.rest }}"{% endif %}><span>{% if r.what %}{{ r.what }} {% endif %}{{ r.used }} <span class="faint">of {{ r.shown }}</span></span>{% if r.fill is defined and r.fill is not none %}<span class="track"><i style="width:{{ [r.fill, 100]|min }}%"></i></span>{% endif %}</div>{% else %}<span class="muted">–</span>{% endif %}</td>
-        <td>{% if r.locked %}{% if editing %}<input type="hidden" name="{{ r.key }}.enabled" value="on">{% endif %}<span class="ps-tog" title="Can be changed but not switched off"><span class="sw locked"></span>Locked on</span>{% elif editing %}<label class="ps-tog"><input type="checkbox" class="sw" name="{{ r.key }}.enabled"{{ ' checked' if (form.get(r.key ~ '.enabled') if form else r.enabled) }}> On</label>{% else %}<span class="ps-tog"><span class="sw{{ '' if r.enabled else ' off' }}"></span>{{ 'On' if r.enabled else 'Off' }}</span>{% endif %}</td>
+        <td>{% if not r.enabled %}<span class="muted">not checked</span>{% elif r.used is not none %}<div class="ps-use {{ r.tone }}"{% if r.rest %} title="{{ r.rest }}"{% endif %}><span>{% if r.what %}{{ r.what }} {% endif %}{{ r.used }} <span class="faint">of {{ r.shown }}</span></span>{% if r.fill is defined and r.fill is not none %}<span class="track"><i style="width:{{ [r.fill, 100]|min }}%"></i></span>{% endif %}</div>{% else %}<span class="muted">–</span>{% endif %}</td>
+        <td>{% if editing %}<label class="ps-tog"><input type="checkbox" class="sw" name="{{ r.key }}.enabled"{{ ' checked' if (form.get(r.key ~ '.enabled') if form else r.enabled) }}> On</label>{% else %}<span class="ps-tog"><span class="sw{{ '' if r.enabled else ' off' }}"></span>{{ 'On' if r.enabled else 'Off' }}</span>{% endif %}</td>
         <td class="ps-act">{{ r.action }}</td>
       </tr>{% endfor %}
     </tbody>{% endfor %}

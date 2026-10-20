@@ -53,7 +53,7 @@ from sleeve_fund.research import run as study_run
 from sleeve_fund.research.ledger import IdeaLedger, opened_words
 from sleeve_fund.research.holdout import HoldoutLocks
 from sleeve_fund.research.trials import TrialsRegister
-from sleeve_fund.risk import PROFILES, leverage_cap
+from sleeve_fund.risk import OWN_LEVERAGE, PROFILES, leverage_cap, own_leverage
 from sleeve_fund.store import (
     BACKTEST_PREFIX,
     HALT_FLATTEN,
@@ -64,6 +64,7 @@ from sleeve_fund.store import (
     is_backtest,
     utcnow,
 )
+from sleeve_fund.paper.exec_client import client_state
 from sleeve_fund.paper.runtime import (EXITS_ONLY, RESUMABLE, clearing_action, entry_blocked, liquidation_event,
                                       pair_ral_figures)
 from sleeve_fund.strategies import (
@@ -254,6 +255,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         ctx.setdefault("shell", shell())
         if name in FUND_BANNER_PAGES:  # C7: one banner at the top, only when it applies
             ctx.setdefault("fund_banner", compliance.fund_banner(st()))
+            ctx.setdefault("brakes_off", compliance.brakes_off(st()))  # B-31: a brake off, until it is back on
         return templates.TemplateResponse(request, name, ctx)
 
     def _saved_backtest_summary(name: str | None) -> dict | None:
@@ -313,8 +315,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         # Margin used and Open risk, as the position figures compute them (UI v2, item 7), once they exist.
         if "open_risk" in positions:
             book.update(margin_used=positions["margin"], open_risk=positions["open_risk"])
-        fund_dd = ({"drawdown": riskops.fund_drawdown(st()), "limit": riskops.fund_halt_limit(st())}
-                   if book["fund_cash"] else None)  # PAGE-DD: inside the fund, the halt's own figure
+        fund_dd = riskops.fund_drawdown_view(st()) if book["fund_cash"] else None  # PAGE-DD: inside the fund, the halt's own figure
         return page(request, "home.html", fund_dd=fund_dd,
                     summaries=legs.fold(st(), [x for x in summaries if x["sleeve"].name not in put_away], frames),
                     leg_flags=legs.flags(st()),
@@ -405,8 +406,7 @@ def create_app(store: Store | None = None) -> FastAPI:
             halt = ("fund", limit) if limit else None
         chart = riskops.drawdown_chart(bookm.book_curve(summaries, frames, bookm.fund_cash(st())),
                                        halt=halt[1] if halt else None)
-        fund_dd = ({"drawdown": riskops.fund_drawdown(st()), "limit": riskops.fund_halt_limit(st())}
-                   if book["fund_cash"] else None)  # PAGE-DD
+        fund_dd = riskops.fund_drawdown_view(st()) if book["fund_cash"] else None  # PAGE-DD
         return page(request, "risk.html", fund_dd=fund_dd, book=book, risk=risk, health=health, chart=chart, size=riskops.gate_size(st(), book),
                     halt_name=halt[0] if halt else None, stress=riskops.stress_bars(risk["scenarios"]),
                     status=riskops.status_word(riskops.status_items(risk["rows"], health), running),
@@ -1744,6 +1744,9 @@ def create_app(store: Store | None = None) -> FastAPI:
     def _compliance_form(request_form) -> tuple[dict, dict, list[str], int]:
         tests, groups, errors = compliance.from_form(request_form)
         errors += compliance_rules.validate(tests) if not errors else []
+        if not errors and tests.get("type_stop_loss", {}).get("enabled") and not groups:  # B-42 (F-V3-EMPTYGROUPS)
+            errors.append(f"{compliance_rules.name('type_stop_loss')} is on but no asset has a group, so it would judge "
+                          "nothing. Give the assets their groups, or switch it off.")
         try:
             expected = int(request_form.get("expected_version", ""))
         except ValueError:
@@ -1761,8 +1764,20 @@ def create_app(store: Store | None = None) -> FastAPI:
         if errors:
             return page(request, "portfolio_settings.html", v=v, mode="edit", saved="", errors=errors, form=form)
         cur = v["current"]
+        switches = compliance.brake_switches(cur["tests"], tests)
+        # B-31 (CR MUST): the one reader of the supervisor's order client, as the store's save reads it; refused unless off
+        client = client_state(st()) if any(not on for _, on in switches) else "off"
+        if client != "off":
+            names = ", ".join(compliance_rules.name(k) for k, on in switches if not on)
+            when = ("while the exchange order client is on" if client == "on"
+                    else "until the supervisor has said the exchange order client is off")
+            errors = [f"{names} can't be switched off {when}. {compliance.PAPER_ONLY}"]
+            return page(request, "portfolio_settings.html", v=v, mode="edit", saved="", errors=errors, form=form)
         lines = compliance_rules.changes(cur["tests"], tests, cur["groups"], groups)
         warned = compliance_rules.warnings(tests)
+        if any(not on for _, on in switches):
+            warned.append(compliance.PAPER_ONLY)
+        warned += compliance.rebase_words(st(), cur["tests"], tests)
         no_group = [g["asset"] for g in v["groups"] if not groups.get(g["asset"])]
         if cur["tests"].get("type_stop_loss", {}).get("enabled") and not tests["type_stop_loss"]["enabled"] and no_group:
             warned.append(f"Assets with no group ({', '.join(no_group)}) will no longer be refused. They still count "
@@ -1797,6 +1812,10 @@ def create_app(store: Store | None = None) -> FastAPI:
                                                   expected_version=expected)
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from None
+        for key, on in compliance.brake_switches(cur[0], tests):  # B-31: every brake switch is an alert
+            st().event(None, "warning", "portfolio_brake_switch",
+                       f"{compliance_rules.name(key)} switched {'back on' if on else 'off'} "
+                       f"(compliance tests v{version}): {reason}")
         return RedirectResponse(f"/portfolio-settings?saved={version}", status_code=303)
 
     @app.get("/setup", response_class=HTMLResponse)
@@ -2438,7 +2457,7 @@ KIND_WORDS = {"handler_failed": "Strategy error", "maker_fill_above_tape": "Make
               "mark_unavailable": "No price to value the book", "price_feed_back": "Price feed back",
               "heartbeat_stale": "Heartbeat late", "process_crash": "Process crashed", "process_start": "Process started",
               "process_stop": "Process stopped", "supervisor_error": "Supervisor error",
-              "supervisor_start": "Supervisor started", "fee_fetch_failed": "Couldn't fetch fees", "fees": "Fees",
+              "supervisor_start": "Supervisor started", "exec_client": "Order client", "fee_fetch_failed": "Couldn't fetch fees", "fees": "Fees",
               "alert_send_failed": "Couldn't send alert", "alerts_sent": "Alerts sent", "alerts_config": "Alerts set up",
               "backup_problem": "Backup problem", "exits_change": "Exits changed", "settings_applied": "Settings applied",
               "stop_rejected": "Stop refused", "stop_reset": "Stop reset", "exits_applied": "Exits applied", "warmup_short": "Short warm-up",
@@ -2761,6 +2780,10 @@ def _form_params(form, strategy: str) -> dict:
             params["maker_wait_minutes"] = int(str(form.get("maker_wait_minutes", "")).strip() or 15)
         except ValueError:
             raise ValueError("go to market after: a whole number of minutes") from None
+    # B-35 (a), the PM's "a stop, or 1x": a model that places no stop is held at 1x on a perpetual by its own leverage
+    # cap (risk.OWN_LEVERAGE, a number), under the risk profile the PM picked, which stays as picked.
+    if market != markets.SPOT and strategy in REGISTRY and not places_stop(strategy, params):
+        params.setdefault(OWN_LEVERAGE, int(STOPLESS_MAX_LEVERAGE))
     return params
 
 
@@ -2897,7 +2920,8 @@ def _order_rules(s, x: dict) -> dict:
     rpt = s.params.get("risk_per_trade")
     stop = bool(s.params.get("stop_loss") or s.params.get("stop_atr"))
     lev = leverage_cap(x["profile"], s.params) if markets.is_perp(s.params) and stop else 1.0
-    return {"risk_pct": float(rpt) * 100 if rpt else None, "leverage": lev, "stop": stop}
+    return {"risk_pct": float(rpt) * 100 if rpt else None, "leverage": lev, "stop": stop,
+            "own_leverage": own_leverage(s.params)}  # B-35 (a): its own cap, under the profile's
 
 
 def _risk_to_stop(x: dict, position: dict | None, store, sleeve) -> float | None:

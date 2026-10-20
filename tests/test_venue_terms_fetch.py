@@ -202,13 +202,15 @@ def test_0029_migrated_table_equals_create_alls_and_refuses_edits(engine, tmp_pa
 
 
 def test_0029_downgrade_refuses_while_fetches_are_kept(engine):
+    """Built at 0029 itself: from head, "-1" runs the newest migration's downgrade, not 0029's (TEC, B-16/B-24)."""
     from alembic import command
 
-    schema.migrate(engine, log=lambda _: None)
+    with engine.begin() as conn:
+        command.upgrade(schema._config(conn), "0029")
     with engine.begin() as c:
         c.execute(text("INSERT INTO venue_terms_fetch (venue, kind, instrument, source, fetched_at, ok, reason) "
                        "VALUES ('BINANCE', 'fee', 'BTC/USDT', 'fee-rate', :t, 0, 'timeout')"), {"t": T})
-    with pytest.raises(NotImplementedError, match="never dropped"), engine.begin() as conn:
+    with pytest.raises(NotImplementedError, match="holds fetches: they are never dropped"), engine.begin() as conn:
         command.downgrade(schema._config(conn), "-1")
     with engine.begin() as c:
         c.execute(text("DROP TABLE venue_terms_fetch"))

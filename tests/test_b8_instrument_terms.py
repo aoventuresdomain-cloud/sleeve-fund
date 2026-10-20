@@ -130,14 +130,22 @@ def test_a_simulated_perp_and_an_extra_pair_are_both_reported(tmp_path, capfd):
 
 
 def test_the_engine_side_is_the_instrument_paper_builds_so_a_contract_that_fails_shows_its_fallback(tmp_path, capfd,
-                                                                                                   contract):
+                                                                                                   contract,
+                                                                                                   monkeypatch):
+    from sleeve_fund.venues import venue
+
     _sleeve(tmp_path, "a", "BTC/USDT", "binance")
     contract.limits = OSError("venue unreachable")  # paper then builds the cautious fallback
+    monkeypatch.setattr(venue("BINANCE"), "live_tick", lambda pair: (_ for _ in ()).throw(OSError("unreachable")))
     venue_terms = _venue([_symbol("BTCUSDT", min_qty="0.01")], BTC_FUNDING)
     assert b8.main([], get=venue_terms, pattern=str(tmp_path / "*.toml")) == 1
-    got = {line[15:37].strip(): line for line in capfd.readouterr().out.splitlines()
-           if line.startswith("BTC/USDT")}
-    assert got["tick"].endswith("MUST")  # the fallback's 2-place tick, 0.01, is finer than the venue's 0.1
+    out, err = capfd.readouterr()
+    got = {line[15:37].strip(): line for line in out.splitlines() if line.startswith("BTC/USDT")}
+    # B-43 (Advisor): with both the contract limits and the live tick unreadable, paper builds the kept tick, 0.1,
+    # never the 2-place default, and says it is the kept one (CR F1: the engine column reads 0.1)
+    assert got["tick"].split()[-3:] == ["0.10", "0.1", "PASS"], got["tick"]
+    assert "contract limits for BTC/USDT unavailable" in err
+    assert "live price tick for BTC/USDT unavailable" in err and "the kept price tick 0.1 is used" in err
     assert got["min quantity"].endswith("MUST")  # no minimum given: paper's is one lot, 0.001, under the venue's 0.01
     assert got["min notional"].endswith("MUST")  # 5 under the venue's 100
     assert got["lot step"].endswith("PASS")  # the fallback caps the size at 3 places: 0.001, the venue's own
