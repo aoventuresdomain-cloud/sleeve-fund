@@ -298,3 +298,54 @@ def test_0033_downgrade_refuses_while_reads_are_kept(tmp_path):
     with eng.begin() as c:
         c.execute(text("DROP TABLE account_capital_fetch"))
     _clean(eng)
+
+
+# --- CR2 (21:05 UK) ------------------------------------------------------------------------------------------------
+
+def test_cr2_must1_an_unmarked_book_is_a_failed_read_said_once_not_every_pass(store, monkeypatch):
+    from sleeve_fund import mirror, supervisor
+
+    def unmarked(s):
+        raise RuntimeError("BTC/USDT has no mark")
+
+    monkeypatch.setattr(supervisor, "fund_equity", unmarked)
+    env = {mirror.BYBIT_KEY_ENV: "k", mirror.BYBIT_SECRET_ENV: "s"}
+    sup = supervisor.Supervisor(store)
+    for minutes in (0, 5, 10):
+        sup.check_account_capital(env, now=T + timedelta(minutes=minutes))
+    rows = store.account_reads("paper", limit=5)
+    assert len(rows) == 3 and not any(r["ok"] for r in rows)
+    assert rows[0]["reason"].startswith("the book can't be marked yet (RuntimeError: BTC/USDT has no mark")
+    assert _kinds(store) == [ac.READ_FAILED] and store.events_of(("account_capital_pass_failed",)) == []
+
+
+def test_cr2_must2_the_alert_line_is_never_below_50_usdt(store):
+    client = Recorded(wallet("5000"), wallet("5040"), wallet("5060"))
+    ac.fetch_account(store, "paper", client=client, live=False, book=D("5000"), now=T)
+    ac.fetch_account(store, "paper", client=client, live=False, book=D("5000"), now=T + timedelta(minutes=5))
+    v = ac.view(store, "paper", T + timedelta(minutes=5))
+    assert v.alert_at == D("50") and v.gap == D("40") and not v.alerting
+    ac.fetch_account(store, "paper", client=client, live=False, book=D("5000"), now=T + timedelta(minutes=10))
+    assert ac.view(store, "paper", T + timedelta(minutes=10)).alerting and _kinds(store) == [ac.GAP_ALERT]
+
+
+def test_cr2_boundaries_on_the_line_is_inside(store):
+    # follow-up a: exactly on the alert line, exactly 2%, exactly 5 minutes old are all inside
+    _live_read(store, "live-1", "99500", "100000", T)
+    v = ac.view(store, "live-1", T + timedelta(minutes=5), live=True)
+    assert v.gap == D("-500") and not v.alerting and v.state == ac.FRESH
+    _live_read(store, "live-1", "98000", "100000", T + timedelta(minutes=1))
+    assert not ac.view(store, "live-1", T + timedelta(minutes=1), live=True).over_refuse
+
+
+def test_cr2_the_start_check_fails_when_the_setting_is_on_and_a_live_account_holds_a_strategy(store):
+    # follow-up b
+    from sleeve_fund.start_check import check_account_capital
+
+    store.create_account("live-1", "live", venue="BINANCE")
+    store.create_sleeve(name="a", strategy="ping_pong", instrument="BTC/USDT", bar_spec="1-MINUTE-LAST-INTERNAL",
+                        starting_balance=10_000, venue="BINANCE", params={"market": "perp"})
+    store.assign_account("a", "live-1")
+    sec = check_account_capital(store, ON, now=T)
+    assert sec.failed and "isn't wired into the entry check" in sec.lines[-1][1]
+    assert not check_account_capital(store, {}, now=T).failed
