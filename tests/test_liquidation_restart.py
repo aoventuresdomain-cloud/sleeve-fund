@@ -86,8 +86,9 @@ def test_an_entry_journals_the_liquidation_price_from_its_own_fill():
     fill = next(f for f in run.fills if f["order_id"] == entry["order_id"])
     qty, px = -fill["qty"], fill["price"]
     cash = 10_000 - fill["fee"] - qty * px  # the journal's spot-style cash: a short holds its sale's proceeds
-    expected = markets.isolated_liquidation(cash, qty, px, 3.0, 0.005)
-    assert entry["signal"]["position_liquidation_px"] == pytest.approx(expected, rel=1e-6)
+    # LIQ-FEE (HoE TEC): the entry fee off the margin, then on the tick toward the entry (down, for a short)
+    expected = markets.isolated_liquidation(cash, qty, px, 3.0, 0.005, fees=fill["fee"])
+    assert 0 <= expected - entry["signal"]["position_liquidation_px"] < 0.1 + 1e-9
     assert "liquidation_px" in entry["signal"]  # the decision's own estimate from the close stays
 
 
@@ -116,6 +117,7 @@ def test_an_add_sets_the_price_again_from_the_average_entry_and_the_whole_positi
         _track_entry, _set_liq = LongFlatStrategy._track_entry, LongFlatStrategy._set_liq
         _liq_from_entry, _backtest = LongFlatStrategy._liq_from_entry, False
         _entry_px, _entry_qty, _entry_side, _liq_px = None, 0.0, 0, None
+        _entry_fees, instrument, _tick = 0.0, None, LongFlatStrategy._tick  # LIQ-FEE (HoE TEC): fees held, no tick
         runtime = SimpleNamespace(profile=SimpleNamespace(max_leverage=3.0),
                                   store=SimpleNamespace(merge_order_signal=lambda oid, v: merged.update({oid: v})))
         _cfg = SimpleNamespace(perp=SimpleNamespace(maintenance_margin=0.005))
@@ -133,14 +135,15 @@ def test_an_add_sets_the_price_again_from_the_average_entry_and_the_whole_positi
         def fill(self, oid, qty, px):
             self.post += side * Decimal(str(qty))
             self.cash -= side * qty * px + qty * px * 0.0005
-            assert self._track_entry(side, Decimal(str(qty)), qty, px)
+            assert self._track_entry(side, Decimal(str(qty)), qty, px, qty * px * 0.0005)
             self._set_liq(oid)
 
     book = Book()
     book.fill("A", 0.05, 60_000.0)
     book.fill("B", 0.10, 60_000.0 * qa.favourable(side, 0.05))
     avg = (0.05 * 60_000.0 + 0.10 * 60_000.0 * qa.favourable(side, 0.05)) / 0.15
-    expected = markets.isolated_liquidation(book.cash, side * 0.15, avg, 3.0, 0.005)
+    fees = (0.05 * 60_000.0 + 0.10 * 60_000.0 * qa.favourable(side, 0.05)) * 0.0005  # both opening fills' (LIQ-FEE)
+    expected = markets.isolated_liquidation(book.cash, side * 0.15, avg, 3.0, 0.005, fees=fees)
     first, add = merged["A"]["position_liquidation_px"], merged["B"]["position_liquidation_px"]
     assert add == pytest.approx(expected, rel=1e-6) and book._liq_px == pytest.approx(expected, rel=1e-6)
     assert first != pytest.approx(add, rel=1e-4)  # the add moved it

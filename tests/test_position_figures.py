@@ -51,16 +51,19 @@ def test_every_page_shows_the_same_margin_and_liquidation_for_a_position(client,
     _book(store)
     lev = profile("balanced").max_leverage
     mm = markets.terms({"market": "perp"}, "binance", "BTC/USDT").maintenance_margin  # VS-1: rates are per pair
-    for name, qty, entry, cash in (("pp-short", -0.05, 60_000, 12_998.5), ("rsi-long", 1.0, 3_000, 6_998.8)):
+    for name, qty, entry, cash, fee in (("pp-short", -0.05, 60_000, 12_998.5, 1.5),
+                                        ("rsi-long", 1.0, 3_000, 6_998.8, 1.2)):
         for url in ("/", f"/sleeves/{name}", "/risk", "/trades"):
             assert c.get(url, auth=AUTH).status_code == 200, url
         page = {**_by_page(seen, name), "strategy": seen["sleeve.html"]["position"]}
         # Isolated: notional at entry over the leverage cap, and liquidated from that margin alone.
         margin = abs(qty) * entry / lev
         t = markets.tier_at(mm, abs(qty) * entry)  # the stand-in table's one tier; a real table re-checks it
-        a = (margin - qty * entry + t.amount) / (t.rate * abs(qty) - qty)  # maintenance on the value at the price
-        b = (abs(qty) * entry * t.rate - t.amount - (margin - qty * entry)) / qty  # on the entry value
+        backing = margin - fee  # LIQ-FEE (HoE TEC): its entry fee comes off the margin the liquidation works from
+        a = (backing - qty * entry + t.amount) / (t.rate * abs(qty) - qty)  # maintenance on the value at the price
+        b = (abs(qty) * entry * t.rate - t.amount - (backing - qty * entry)) / qty  # on the entry value
         liq = max(a, b) if qty > 0 else min(a, b)  # the nearer of the two (VS-1-TABLE)
+        assert liq == pytest.approx(markets.isolated_liquidation(cash, qty, entry, lev, mm, fees=fee))
         for where, p in page.items():
             assert p["margin"] == pytest.approx(margin), where
             assert p["leverage"] == pytest.approx(lev), where
