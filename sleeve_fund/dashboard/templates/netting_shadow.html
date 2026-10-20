@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% from "_macros.html" import book_tabs %}
+{% block title %}Netting shadow · Multi-Strategy Fund{% endblock %}
+{% block content %}
+<div class="page-head">
+  <h1>Portfolio</h1>
+</div>
+{{ book_tabs('netting') }}
+{% include "_netting_shadow.html" %}
+{% endblock %}

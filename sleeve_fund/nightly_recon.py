@@ -84,11 +84,38 @@ def positions(store) -> Section:
     return sec
 
 
+def netting_shadow(store) -> Section:
+    """B-13: the netting shadow's unexplained difference per account (Advisor HEAD6 4): over the 5 bp line it fails
+    the night, so it is alerted, and blocks nothing (it is a shadow; trading is unaffected)."""
+    from decimal import Decimal
+
+    from sleeve_fund.portfolio.netting_paper import over_line
+    from sleeve_fund.supervisor import _in_book, fund_equity
+
+    sec = Section("Netting shadow (trading unaffected)")
+    sleeves = {s.name: s for s in store.sleeves()}
+    try:
+        equity = Decimal(repr(float(fund_equity(store))))
+        over = over_line(store, lambda n: n in sleeves and _in_book(store, sleeves[n]), equity)
+    except (ValueError, LookupError, RuntimeError) as e:
+        sec.add(NOTE, f"couldn't work out the netting shadow tonight: {e}")
+        return sec
+    except Exception as e:  # noqa: BLE001 - CR2: a fault of its own fails this section only, never the night's others
+        sec.add(FAIL, f"the netting shadow failed tonight (trading unaffected): {type(e).__name__}: {e}")
+        return sec
+    for what in over:
+        sec.add(FAIL, what)
+    if not over:
+        sec.add(PASS, "every account's Strategies add up to it within the 5 bp line")
+    return sec
+
+
 def compare(url: str) -> list[Section]:
-    """check_books, the book check and the positions by asset, against the journal at url, opened read-only."""
+    """check_books, the book check, the positions by asset and the netting shadow's residual, against the journal at
+    url, opened read-only."""
     store = read_only_store(url)
     try:
-        return [check_books(store, cent=True), identity(store), positions(store)]
+        return [check_books(store, cent=True), identity(store), positions(store), netting_shadow(store)]
     finally:
         store.engine.dispose()
 

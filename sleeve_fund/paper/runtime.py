@@ -149,6 +149,8 @@ def clearing_action(sleeve, now: datetime | None = None, since: datetime | None 
 # event when it ends, with how many orders it refused. Each refused order is its own decision row.
 BLOCK_STARTED, BLOCK_CLEARED, BLOCK_PREFIX = "entry_blocked", "entry_block_cleared", "Nothing opens. "
 BENIGN_REJECT = "benign_reject"  # A1: a reduce-only close refused with the position already flat (on its row's signal)
+TARGET_REFUSALS = 3  # B-14 (Advisor HEAD6 7): resting targets refused in a row before an info alert
+RESTING_TARGETS_REFUSED = "resting_targets_refused"
 RACED_FILL = "raced_fill"  # an opening order that filled after the gate closed, with the ms after (P1-SG15)
 ENTRY_CANCELLED = "resting_entry_cancelled"  # resting opening orders cancelled at a block, with the ms after it (P1-SG15)
 # Inside an episode, which causes hold changed (one of several cleared, or another began): an info row, never an
@@ -1572,6 +1574,21 @@ class SleeveRuntime:
         self.store.event(self.name, "info", "order_rejected_benign",
                          f"order {order_id} refused with the position already flat: {message or 'no reason given'}",
                          ts=self.now())
+
+    def on_target_refused(self, order_id: str, message: str, in_row: int) -> None:
+        """B-14 (Advisor HEAD6 7): the venue refused a resting target. Not a safety exit, so benign for F-RX-2
+        (BENIGN_REJECT on its row, as on_benign_reject) and an info event; the watched target closes in its place. Its
+        own count: TARGET_REFUSALS in a row adds an info alert (each further run of that many again)."""
+        self.store.update_order(order_id, status="rejected", message=message)
+        if hasattr(self.store, "merge_order_signal"):
+            self.store.merge_order_signal(order_id, {BENIGN_REJECT: True})
+        self.store.event(self.name, "info", "resting_target_refused",
+                         f"resting target {order_id} refused: {message or 'no reason given'}; the target is watched on "
+                         "every trade instead and closes at market", ts=self.now())
+        if in_row % TARGET_REFUSALS == 0:
+            self.store.event(self.name, "info", RESTING_TARGETS_REFUSED,
+                             f"{in_row} resting targets refused in a row; each closes as a watched target at market "
+                             "instead", ts=self.now())
 
     def on_order_modify_rejected(self, order_id: str, message: str = "") -> None:
         """F-RX-1: the venue refused to resize a working order (a resting stop). Journaled as an event only: the

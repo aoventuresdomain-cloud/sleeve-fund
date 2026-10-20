@@ -1,0 +1,26 @@
+{# B-13: the netting shadow, read from the paper journal (dashboard/netting_view.py). Shadow, not evidence. #}
+<section class="panel" aria-labelledby="netting-h">
+  <div class="panel-head"><h2 id="netting-h">Netting <span class="chip">Shadow, not evidence</span></h2></div>
+  <p class="muted">What one combined order per candle and asset would have saved if each account's Strategies had traded together. It changes no order, fill or Strategy figure, and it never counts as Strategy evidence.</p>
+  {% if n.error %}<p class="warn" role="status">Can't work out the shadow right now: {{ n.error }}</p>
+  {% elif not n.accounts %}<p class="muted">No paper fills yet.</p>
+  {% else %}{% for a in n.accounts %}
+  <h3>Account {{ a.n }}: {{ a.strategies|join(', ') }}</h3>
+  <table>
+    <tbody>
+      <tr><th scope="row">Saved in fees</th><td class="num">{{ '{:,.2f}'.format(a.fee) }}</td></tr>
+      <tr><th scope="row">Saved in spread (opposite orders matched)</th><td class="num">{{ '{:,.2f}'.format(a.crossed) }}</td></tr>
+      <tr><th scope="row">Total saved</th><td class="num"><strong>{{ '{:,.2f}'.format(a.total) }}</strong></td></tr>
+      <tr><th scope="row">Orders: combined against alone</th><td class="num">{{ a.orders_sent }} against {{ a.orders_alone }}</td></tr>
+      <tr><th scope="row">Candles with more than one Strategy trading</th><td class="num">{{ a.bars_shared }}</td></tr>
+      {% if a.baseline %}<tr><th scope="row">Funding charged at the cautious rate for a missing figure</th><td class="num">{{ '{:,.2f}'.format(a.baseline) }}</td></tr>{% endif %}
+      {% if a.corrections %}<tr><th scope="row">Funding corrections counted, not combined</th><td class="num">{{ a.corrections }}</td></tr>{% endif %}
+      <tr><th scope="row">Unexplained difference</th><td class="num {{ 'warn' if a.residual_over }}">{{ '{:,.2f}'.format(a.residual) }} ({{ '%.1f'|format(a.residual_bp) }} bp{% if a.residual_over %}, over the {{ '%g'|format(n.limit_bp) }} bp line{% endif %})</td></tr>
+    </tbody>
+  </table>
+  {% if a.opposed %}<table>
+    <thead><tr><th>Strategy pair</th><th class="num">Opposed exposure</th></tr></thead>
+    <tbody>{% for o in a.opposed %}<tr><td>{{ o.pair }}</td><td class="num">{{ '%.1f'|format(o.share * 100) }}%</td></tr>{% endfor %}</tbody>
+  </table>{% endif %}
+  {% endfor %}{% endif %}
+</section>

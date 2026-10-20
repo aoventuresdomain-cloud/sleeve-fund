@@ -2798,7 +2798,8 @@ class Store:
             q = q.where(o.ts >= since)
         with self.engine.connect() as c:
             rows = _rows(c.execute(q.order_by(o.ts, o.id)))
-        # A1 (Advisor): benign: refused with nothing left to close (paper.runtime.BENIGN_REJECT): never one in a row
+        # A1 (Advisor): benign: refused with nothing left to close (paper.runtime.BENIGN_REJECT), or a resting target
+        # refused (B-14, not a safety exit): never one in a row
         return [{**{k: v for k, v in r.items() if k != "signal"},
                  "benign": bool((r["signal"] or {}).get("benign_reject"))} for r in rows]
 
