@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from nautilus_trader.model import Bar
 
 from sleeve_fund.data import bar_minutes
+from sleeve_fund.instruments import target_on_tick
 from sleeve_fund.strategies.base import MAX_STOP, MIN_STOP, IdeaSpec, LongFlatConfig, LongFlatStrategy
 from sleeve_fund.strategies.definitions import (CATALOGUE, LEVEL_EXITS, Checked, Compiled, Env, block_value,
                                                 check_definition, definition_hash, load_definition_file, side_exits,
@@ -597,7 +598,7 @@ class Rules(LongFlatStrategy):
         tp = self._take_profit(self._entry_side or 1)
         if tp is None or self._tp_level is None:
             return super()._target_price()  # a {level} target with no level now has no _tp_frac either
-        return round(self._tp_level, self.instrument.price_precision)
+        return target_on_tick(self._tp_level, self._entry_side or 1, self.instrument.price_precision)
 
     def _target_form(self) -> str:
         tp = self._take_profit(self._entry_side or 1)

@@ -256,24 +256,26 @@ def test_qr01b_with_its_3_atr_stop_and_a_3r_target_reconciles(instrument):
     res = run_backtest("rules", df, instrument, params=to_params(defn), bar_minutes=1440, half_spread=0.0002,
                        risk_profile="balanced")  # with a profile, so the run keeps its journal
     f = res.fills.sort_values("ts_last")
-    rows = [(res.decisions[o]["intent"], res.decisions[o].get("signal") or {}, float(f.loc[o, "avg_px"]))
-            for o in f.index]
+    rows = [(res.decisions[o]["intent"], res.decisions[o].get("signal") or {}, float(f.loc[o, "avg_px"]),
+             float(f.loc[o, "filled_qty"])) for o in f.index]
     targets, entry = [], None
-    for k, s, px in rows:
+    for k, s, px, qty in rows:
         if k == "entry":
             entry = (s, px)
         elif k == "take_profit":  # 3R in price from that entry's fill and its 3 ATR stop level as planned
             stop_level = entry[0]["close"] * (1 - entry[0]["stop_frac"])
             fill = s["entry_px"]  # the engine's entry, the fill before the report's cent rounding
-            # to 0.05: the journaled stop share is rounded to 6 places (x 3R), the target to the tick
-            assert s["target_px"] == pytest.approx(fill + 3 * (fill - stop_level), abs=0.05), (s, entry)
-            targets.append((s, px))
-    assert targets, [k for k, _, _ in rows]
-    for s, px in targets:
+            # to 0.05: the journaled stop share is rounded to 6 places (x 3R); and up to a tick past it, the tick
+            # past the exact level (target_on_tick)
+            gap = s["target_px"] - (fill + 3 * (fill - stop_level))
+            assert -0.05 <= gap <= 0.05 + 10.0 ** -instrument.price_precision, (gap, s, entry)
+            targets.append((s, px, qty))
+    assert targets, [k for k, *_ in rows]
+    for s, px, qty in targets:
         assert s["target_form"] == "r=3" and s["exit_kind"] == "take_profit"
         assert px < s["target_px"], (px, s)  # never better than the level (rule 3)
         # the level less the floor; the report carries the fee's cent rounding into the price (D13 pin e)
-        assert px == pytest.approx(s["target_px"] * (1 - 0.0005), rel=2e-6), (px, s)
+        assert px == pytest.approx(s["target_px"] * (1 - 0.0005), abs=1.5 * 0.0100001 / qty + 1e-9), (px, qty, s)
     book = replay_book(res.journal.fills_, 10_000.0, res.journal.funding_total("backtest"),
                        res.journal.insurance_total("backtest"))
     marked = book["cash"] + book["qty"] * float(df["close"].iloc[-1])
