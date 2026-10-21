@@ -329,7 +329,8 @@ def section(r) -> list[str]:
     closes = getattr(r, "research_closes", None)
     if closes is not None and len(daily_closes(closes)) >= 2:
         out += [f"Price-only hold over the window (price only, no fees): {price_only_hold(closes):+.2%}, the price "
-                "itself held from the first daily close to the last, no funding.", ""]
+                "itself held from the first daily close to the last, no funding. Context only: the G1 checks above "
+                "are the judge.", ""]
         io = in_and_out(run.equity, run.exposure, closes)
         days = io["days_in"] + io["days_out"]
         out += ["Where the return came from: each day is the move into its daily close, in the market when a position "

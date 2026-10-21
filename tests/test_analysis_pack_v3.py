@@ -102,4 +102,5 @@ def test_the_sheet_carries_the_new_lines(sheet):
     assert "| Best trade's share of total profit |" in text and "| Best 3 trades' share of total profit |" in text
     close = prices["close"].astype(float)
     assert f"Price-only hold over the window (price only, no fees): {close.iloc[-1] / close.iloc[0] - 1:+.2%}" in text
+    assert "Context only: the G1 checks above are the judge." in text  # never worded as the bar (Advisor, 21 Oct)
     assert "| In the market |" in text and "| Out of the market |" in text

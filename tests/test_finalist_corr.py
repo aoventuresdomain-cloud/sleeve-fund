@@ -89,34 +89,91 @@ def test_an_out_of_sample_day_past_the_research_period_is_refused_and_nothing_wr
     assert not oos_returns_path(tmp_path / "s.md").exists()
 
 
-def _sheet(d, name, asset, oos, price):
+def _sheet(d, name, dataset, oos, price=None):
     path = d / f"{name}.md"
-    path.write_text(f"# {name}\n", encoding="utf-8")
+    path.write_text(f"# {name}\n\nDataset `{dataset}` · research period\n", encoding="utf-8")
+    price = oos * 0 if price is None else price
     pd.DataFrame({"return": oos, "price": price}, index=pd.Index(oos.index, name="date")).to_csv(
         oos_returns_path(path), date_format="%Y-%m-%d")
-    return path, asset
+    return path
 
 
-def test_the_section_shows_each_pair_with_its_days_and_the_btc_column(tmp_path):
-    btc = pd.Series(_walk(100, seed=5), index=_days(100))
-    eth = pd.Series(_walk(100, seed=6), index=_days(100))
-    a, _ = _sheet(tmp_path, "trend_btc", "BTC/USDT", 2 * btc, btc)
-    b, _ = _sheet(tmp_path, "dip_eth", "ETH/USDT", -eth.iloc[30:], eth.iloc[30:])
-    # the ETH sheet first: BTC's column must still be BTC's price, never the first file's
-    text = "\n".join(fs.oos_section([b, a], {"trend_btc": "BTC/USDT", "dip_eth": "ETH/USDT"}))
-    want = np.corrcoef(2 * btc.iloc[30:], -eth.iloc[30:])[0, 1]
+END = pd.Timestamp("2025-06-01", tz="UTC")
+
+
+@pytest.fixture(scope="module")
+def stored(tmp_path_factory):
+    """120 days of BTC/USDT minute bars on BINANCE in a history store, to 1 Jun 2025, and BTC's daily return each day
+    worked out here from the minutes to END: a day stamped D closes on the minute opening at D - 1 minute."""
+    from sleeve_fund.history import HistoryStore
+
+    # a day of minutes past END: the store keeps its last stored minute as forming, so END's is the last whole day
+    idx = pd.date_range(END - pd.Timedelta(days=120), END + pd.Timedelta(days=1, minutes=-1), freq="1min", tz="UTC")
+    c = 30_000 * np.exp(np.cumsum(np.random.default_rng(8).normal(0, 0.0008, len(idx))))
+    o = np.r_[c[0], c[:-1]]
+    minutes = pd.DataFrame({"open": o, "high": np.maximum(o, c), "low": np.minimum(o, c), "close": c, "volume": 5.0},
+                           index=idx)
+    hist = HistoryStore(tmp_path_factory.mktemp("hist"))
+    hist.append("BINANCE", "BTC/USDT", minutes, cursor="x")
+    stamps = pd.date_range(END - pd.Timedelta(days=119), END, freq="1D")
+    close = pd.Series(minutes["close"].reindex(stamps - pd.Timedelta(minutes=1)).to_numpy(), index=stamps)
+    want = (close / close.shift(1) - 1).dropna()
+    want.index = want.index.tz_localize(None)
+    return hist, want
+
+
+def test_btc_s_price_return_is_read_from_the_store_for_the_same_days(stored):
+    hist, want = stored
+    days = want.index[-90:]
+    got, why = fs.btc_returns(hist, "BINANCE", "BTC/USDT", days)
+    assert why == "" and list(got.index) == list(days)
+    assert got.tolist() == pytest.approx(want.reindex(days).tolist())
+
+
+def test_btc_reads_n_a_with_its_reason_when_the_store_does_not_cover_the_days(stored):
+    hist, want = stored
+    days = pd.date_range(want.index[-30], periods=40, freq="1D")  # ten days past the store's end
+    got, why = fs.btc_returns(hist, "BINANCE", "BTC/USDT", days)
+    assert got is None and "10 of the 40" in why and "BINANCE" in why
+    got, why = fs.btc_returns(hist, "KRAKEN", "BTC/USD", days)
+    assert got is None and "no stored history" in why
+
+
+def test_the_section_shows_each_pair_with_its_days_and_btc_from_the_store(tmp_path, stored):
+    hist, want = stored
+    days = want.index[-100:]
+    eth = pd.Series(_walk(100, seed=6), index=days)
+    trend = 2 * want.reindex(days) + 0.001
+    a = _sheet(tmp_path, "trend_btc", "binance-btcusdt-store-240m", trend)
+    b = _sheet(tmp_path, "dip_eth", "binance-ethusdt-store", -eth.iloc[30:])
+    text = "\n".join(fs.oos_section([b, a], hist))  # the ETH sheet first
+    pair = np.corrcoef(trend.iloc[30:], -eth.iloc[30:])[0, 1]
+    assert f"| 1 dip_eth | 1.00 (70 d) | {pair:.2f} (70 d) | " in text
+    to_btc = np.corrcoef(-eth.iloc[30:], want.reindex(days).iloc[30:])[0, 1]
+    assert text.splitlines()[[i for i, x in enumerate(text.splitlines()) if x.startswith("| 1 dip_eth")][0]].endswith(
+        f"| {to_btc:.2f} (70 d) |")
     assert "| 2 trend_btc | " in text and "| 1.00 (100 d) | 1.00 (100 d) |" in text
-    assert f"| 1 dip_eth | 1.00 (70 d) | {want:.2f} (70 d) |" in text
-    assert f"| {np.corrcoef(-eth.iloc[30:], btc.iloc[30:])[0, 1]:.2f} (70 d) |" in text  # dip_eth to BTC's price
     assert "out of sample only" in text.lower() and "blank under 60" in text
+    assert "BTC/USDT on BINANCE" in text  # where the BTC column came from
+
+
+def test_the_btc_column_reads_n_a_with_the_reason_when_the_store_falls_short(tmp_path, stored):
+    hist, want = stored
+    days = pd.date_range(want.index[-70], periods=80, freq="1D")  # past the store's end
+    a = _sheet(tmp_path, "trend_btc", "binance-btcusdt-store", pd.Series(_walk(80, seed=9), index=days))
+    text = "\n".join(fs.oos_section([a], hist))
+    assert text.rstrip().splitlines()[-1].endswith("| n/a |")
+    assert "BTC column: n/a" in text and "10 of the 80" in text
+    text = "\n".join(fs.oos_section([a], None))
+    assert "BTC column: n/a" in text and "no stored history" in text
 
 
 def test_the_section_says_which_sheets_have_no_out_of_sample_file(tmp_path):
     btc = pd.Series(_walk(70, seed=7), index=_days(70))
-    a, _ = _sheet(tmp_path, "trend_btc", "BTC/USDT", btc, btc)
+    a = _sheet(tmp_path, "trend_btc", "binance-btcusdt-store", btc, btc)
     old = tmp_path / "old_run.md"
     old.write_text("# old\n", encoding="utf-8")
-    text = "\n".join(fs.oos_section([a, old], {"trend_btc": "BTC/USDT", "old_run": "BTC/USDT"}))
+    text = "\n".join(fs.oos_section([a, old], None))
     assert "old_run.md" in text and "re-run" in text.lower()
 
 

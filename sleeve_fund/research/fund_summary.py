@@ -15,7 +15,7 @@ Under the tables, the correlation of the strategies' daily returns (each sheet's
 the days they all share. A sheet without its returns file, or a returns file without its sheet, is refused: the page
 never mixes a figure with a series from another run. Then (d) FINALIST-CORR (Advisor, 21 Oct): the out-of-sample
 daily returns (.oos-returns.csv, run.write_oos_returns) pair by pair over the days both have, each with its count,
-blank under MIN_PAIR_DAYS, and each strategy against the plain BTC price return.
+blank under MIN_PAIR_DAYS, and each strategy against the plain BTC price return read from the history store.
 
 python -m sleeve_fund.research.fund_summary SHEET.md ... --out summary.md [--holdout-status FILE.json]
 FILE.json, kept under research/quant-researcher/: {"strategy name": {"status": "spent" | "leaked", "date": "YYYY-MM-DD",
@@ -164,32 +164,62 @@ def to_price(series: dict[str, pd.Series], price: pd.Series) -> tuple[pd.Series,
     return pd.Series({k: v[0] for k, v in out.items()}), pd.Series({k: v[1] for k, v in out.items()})
 
 
-def oos_section(sheets: list[Path], assets: dict[str, str]) -> list[str]:
-    """(d) The finalists' out-of-sample daily returns correlated pair by pair, with BTC's price return beside them.
-    `assets`: each sheet's stem to its instrument (a BTC one's price column is BTC's price)."""
+_DATASET = re.compile(r"^Dataset `([a-z0-9]+)-[a-z0-9]+-store", re.M)
+
+
+def btc_returns(history, venue: str, pair: str, days: pd.DatetimeIndex) -> tuple[pd.Series | None, str]:
+    """BTC's plain daily price return (close to close, daily bars stamped at their close) on `days`, read from the
+    history store; None and the reason when the store doesn't cover every one of them."""
+    if history is None:
+        return None, "no stored history given"
+    try:
+        bars = history.read(venue, pair, 1440, start=days[0] - pd.Timedelta(days=2), end=days[-1] + pd.Timedelta(days=1))
+    except KeyError:
+        return None, f"no stored history for {pair} on {venue}"
+    close = bars["close"].astype(float)
+    ret = (close / close.shift(1) - 1).dropna()
+    ret.index = ret.index.tz_localize(None) if ret.index.tz is not None else ret.index
+    missing = days.difference(ret.index)
+    if len(missing):
+        return None, (f"the stored {pair} history on {venue} misses {len(missing)} of the {len(days)} out-of-sample "
+                      f"days (first {missing[0]:%Y-%m-%d})")
+    return ret.reindex(days), ""
+
+
+def oos_section(sheets: list[Path], history, venue: str | None = None, pair: str = "BTC/USDT") -> list[str]:
+    """(d) The finalists' out-of-sample daily returns correlated pair by pair, with BTC's plain price return beside
+    them, read from the history store for the same calendar days (Advisor, 21 Oct). `venue`: the store's venue for
+    BTC; None reads it from the sheets' datasets when they all name one."""
     out = ["## Correlation of out-of-sample daily returns, pair by pair", ""]
     missing = [s.name for s in sheets if not oos_returns_path(s).exists()]
     if missing:
         return out + [f"Not shown: {', '.join(missing)} {'has' if len(missing) == 1 else 'have'} no out-of-sample "
                       "returns file. Re-run the study: it writes one beside the sheet.", ""]
-    read = {s.stem: pd.read_csv(oos_returns_path(s), index_col="date", parse_dates=["date"]) for s in sheets}
-    series = {k: f["return"] for k, f in read.items()}
-    btc = [f["price"] for k, f in read.items() if str(assets.get(k, "")).split("/")[0] == "BTC"]
-    price = pd.concat(btc).groupby(level=0).first() if btc else None
-    corr, days = pairwise(series)
+    series = {s.stem: pd.read_csv(oos_returns_path(s), index_col="date", parse_dates=["date"])["return"]
+              for s in sheets}
+    if venue is None:
+        named = {m.group(1).upper() for s in sheets for m in [_DATASET.search(s.read_text(encoding="utf-8"))] if m}
+        venue = named.pop() if len(named) == 1 else None
+    days = pd.DatetimeIndex(sorted(set().union(*(x.index for x in series.values()))))
+    if venue is None:
+        price, why = None, "the sheets don't name one venue's stored history"
+    else:
+        price, why = btc_returns(history, venue, pair, days)
+    corr, counts = pairwise(series)
     to_btc, btc_days = to_price(series, price) if price is not None else (None, None)
     out += ["Out of sample only (the walk-forward test windows), net of costs; a day out of the market counts as 0. "
             "Each pair is over the calendar days both have, the count beside it, blank under "
             f"{MIN_PAIR_DAYS} days. The last column is each strategy against the plain BTC price return: a set all "
             "close to it is mostly long BTC."
-            + ("" if price is not None else " No BTC sheet in the set, so that column reads n/a."), ""]
+            + (f" BTC: {pair} on {venue}, daily closes from the stored history." if price is not None
+               else f" BTC column: n/a, {why}."), ""]
     cell = lambda c, n: f"({n} d)" if pd.isna(c) else f"{c:.2f} ({n} d)"  # noqa: E731
     names = list(series)
     out.append("| | " + " | ".join(str(i) for i in range(1, len(names) + 1)) + " | BTC price |")
     out.append("| --- |" + " --- |" * (len(names) + 1))
     for i, a in enumerate(names, 1):
         last = "n/a" if to_btc is None else cell(to_btc[a], int(btc_days[a]))
-        out.append(f"| {i} {a} | " + " | ".join(cell(corr.loc[a, b], int(days.loc[a, b])) for b in names)
+        out.append(f"| {i} {a} | " + " | ".join(cell(corr.loc[a, b], int(counts.loc[a, b])) for b in names)
                    + f" | {last} |")
     return out + [""]
 
@@ -206,7 +236,8 @@ def _cells(r: dict) -> list[str]:
             *(f"*{c}*" for c in figures)]
 
 
-def page(sheets: list[Path], holdout_status: dict | None = None, status_source: str | None = None) -> str:
+def page(sheets: list[Path], holdout_status: dict | None = None, status_source: str | None = None,
+         history=None, btc_venue: str | None = None) -> str:
     _check(sheets)
     ranked = rows(sheets, holdout_status)
     out = ["# Fund summary", "",
@@ -227,8 +258,7 @@ def page(sheets: list[Path], holdout_status: dict | None = None, status_source: 
         out += [f"| {i} | " + " | ".join(_cells(r)) + " |" for i, r in enumerate(section, 1)]
         out.append("")
     names = [r["name"] for section in ranked.values() for r in section]
-    finalists = oos_section(sorted(sheets, key=lambda s: names.index(s.stem)),
-                            {r["name"]: r["instrument"] for section in ranked.values() for r in section})
+    finalists = oos_section(sorted(sheets, key=lambda s: names.index(s.stem)), history, btc_venue)
     corr, common = correlation(sheets)
     out += ["## Correlation of daily returns", ""]
     if len(common) < 2:
@@ -250,10 +280,15 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="python -m sleeve_fund.research.fund_summary")
     ap.add_argument("sheets", nargs="+", type=Path)
     ap.add_argument("--out", type=Path, required=True)
+    ap.add_argument("--history", type=Path, help="the history store's folder, for BTC's price (default: the usual one)")
+    ap.add_argument("--btc-venue", help="the venue whose stored BTC/USDT the BTC column reads (default: the sheets')")
     ap.add_argument("--holdout-status", type=Path, help="JSON under research/quant-researcher/: {strategy: {status, date, reason}}")
     args = ap.parse_args(argv)
     marks = json.loads(args.holdout_status.read_text(encoding="utf-8")) if args.holdout_status else None
-    text = page(args.sheets, marks, str(args.holdout_status) if args.holdout_status else None)
+    from sleeve_fund.history import HistoryStore
+
+    text = page(args.sheets, marks, str(args.holdout_status) if args.holdout_status else None,
+                HistoryStore(args.history), args.btc_venue)
     args.out.write_text(text, encoding="utf-8")
     _, common = correlation(args.sheets)
     print(f"fund summary: {len(args.sheets)} strategies, {len(common)} common days: {args.out}")  # counts only
