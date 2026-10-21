@@ -1558,8 +1558,10 @@ def missing_funding(params: dict, instrument, after: pd.Timestamp, until: pd.Tim
     if terms.funding_venue is None:
         return 0
     series = funding.rates(terms.funding_venue, pair_of(instrument), root)
-    due = markets.funding_times(_utc(after).to_pydatetime(), _utc(until).to_pydatetime(),
-                                terms.funding_hours)
+    # The settlements the engine charges (markets.settlement_times): the venue's own record times, so a 4-hour stretch
+    # is checked at every 4 hours, not only at the profile's fixed hours (Advisor, 21 Oct)
+    due = markets.settlement_times(_utc(after).to_pydatetime(), _utc(until).to_pydatetime(), terms.funding_hours,
+                                   series)
     return sum(funding.rate_at(series, pd.Timestamp(t)) is None for t in due)
 
 

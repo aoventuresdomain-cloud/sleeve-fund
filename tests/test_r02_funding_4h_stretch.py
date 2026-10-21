@@ -90,3 +90,43 @@ def test_the_spot_check_compares_each_sampled_rate_and_the_most_negative_with_th
     out = history.funding_sample(profile, "BTC/USDT", count=4)
     assert out["checked"] == 4 and out["matched"] == 2
     assert sorted(m["venue"] for m in out["mismatches"]) == ["0.00025000", "0.01000000"]
+
+
+def test_the_hold_gate_counts_a_missing_4_hourly_record_the_engine_would_charge(tmp_path, monkeypatch):
+    """Advisor (21 Oct): study.missing_funding checks the settlements the engine charges, so a 4-hour stretch missing
+    its 04:00 record blocks the buy-and-hold price; on the fixed 00/08/16 schedule it would pass unseen."""
+    from test_binance import INFO
+
+    from sleeve_fund.research.study import missing_funding
+
+    b = venue("binance")
+    monkeypatch.setattr(b, "contract", lambda pair: binance_contract(pair, get_json=lambda url: INFO))
+    times = (pd.date_range("2025-10-03 00:00", "2025-10-03 16:00", freq="8h", tz="UTC")
+             .append(pd.date_range("2025-10-03 20:00", "2025-10-04 20:00", freq="4h", tz="UTC"))
+             .append(pd.date_range("2025-10-05 00:00", "2025-10-06 00:00", freq="8h", tz="UTC")))
+    times = times[times != utc("2025-10-04 04:00")]  # the hole
+    _kept(tmp_path, monkeypatch, [[int(t.timestamp() * 1000), 0.0001] for t in times])
+    inst = b.instrument("BTC", "USDT")
+    assert missing_funding({"market": "perp"}, inst, utc("2025-10-03 01:00"), utc("2025-10-06 00:00")) == 1
+    assert missing_funding({"market": "perp"}, inst, utc("2025-10-05 01:00"), utc("2025-10-06 00:00")) == 0
+
+
+def test_the_spot_check_always_samples_a_settlement_from_inside_a_4_hour_stretch(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from sleeve_fund import history
+
+    times = (pd.date_range("2024-01-01", "2024-03-01", freq="8h", tz="UTC")
+             .append(pd.date_range("2024-03-01 04:00", "2024-03-02", freq="4h", tz="UTC"))
+             .append(pd.date_range("2024-03-02 08:00", "2024-05-01", freq="8h", tz="UTC")))
+    _kept(tmp_path, monkeypatch, [[int(t.timestamp() * 1000), 0.0001] for t in times])
+    stretch = {t.isoformat() for t in pd.date_range("2024-03-01 04:00", "2024-03-02", freq="4h", tz="UTC")}
+
+    def raw(pair, start_ms):
+        return [{"fundingTime": int(t.timestamp() * 1000), "fundingRate": "0.00010000"}
+                for t in times if t.timestamp() * 1000 >= start_ms][:3]
+
+    profile = SimpleNamespace(name="BINANCE", label="Binance", funding_raw=raw)
+    for seed in range(5):
+        out = history.funding_sample(profile, "BTC/USDT", count=1, seed=seed)
+        assert stretch & set(out["sampled"]) and out["mismatches"] == []

@@ -963,8 +963,14 @@ def funding_sample(profile, pair: str, root=None, count: int = 10, seed: int = 2
     if kept.empty:
         return out
     rng = np.random.default_rng(seed)
-    picks = sorted(set(rng.choice(len(kept), size=min(count, len(kept)), replace=False).tolist())
-                   | {int(np.argmin(kept.to_numpy()))})
+    picks = set(rng.choice(len(kept), size=min(count, len(kept)), replace=False).tolist()) | {int(np.argmin(kept))}
+    # Advisor: a settlement from inside a shorter-interval stretch (4-hourly among 8-hourly) is always checked too
+    steps = kept.index.to_series().diff().iloc[1:]  # as Timedeltas, whatever the index's unit
+    short = np.nonzero((steps < steps.median() - funding.MATCH).to_numpy())[0] + 1 if len(steps) else np.array([], int)
+    if len(short) and not picks & set(short.tolist()):
+        picks.add(int(rng.choice(short)))
+    picks = sorted(picks)
+    out["sampled"] = [kept.index[i].isoformat() for i in picks]
     for i in picks:
         ts, stored = kept.index[i], float(kept.iloc[i])
         rows = profile.funding_raw(pair, int((ts - funding.MATCH).timestamp() * 1000))
