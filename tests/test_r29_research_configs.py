@@ -30,7 +30,8 @@ def repo(tmp_path):
     r.mkdir()
     _git(r, "init", "-q", "-b", "main")
     for path, body in (("configs/definitions/qr01_a.toml", "version = 1\n"), ("configs/studies/list-a.md", "# a\n"),
-                       ("sleeve_fund/x.py", "x = 1\n")):
+                       ("sleeve_fund/x.py", "x = 1\n"),
+                       ("configs/definition_pins.toml", '[qr01_a]\ndefinition_hash = "aa"\nidea_hash = "bb"\n')):
         (r / path).parent.mkdir(parents=True, exist_ok=True)
         (r / path).write_text(body)
     _git(r, "add", "-A")
@@ -57,6 +58,16 @@ def _write(path: str, body: str = "new\n"):
     return edit
 
 
+def _append(path: str, body: str):
+    def edit(r: Path):
+        with open(r / path, "a") as f:
+            f.write(body)
+    return edit
+
+
+PIN = "configs/definition_pins.toml"
+
+
 def _both(*edits):
     def edit(r: Path):
         for e in edits:
@@ -66,7 +77,9 @@ def _both(*edits):
 
 CASES = {
     "a new definition": (_write("configs/definitions/qr20_volume_surge.toml"), True),
-    "an edited definition": (_write("configs/definitions/qr01_a.toml", "version = 2\n"), True),
+    # HoE R-29 v3 (CR M1, HoQA): an edited definition is a new trials key: a code change, a deploy and a TEC.
+    "an edited definition": (_write("configs/definitions/qr01_a.toml", "version = 2\n"), False),
+    "an edited study list": (_write("configs/studies/list-a.md", "# a, rows\n"), True),
     "a study list only": (_write("configs/studies/qr-rescore-list.md", "# rows\n"), True),
     "definition and study list": (_both(_write("configs/definitions/qr21_x.toml"),
                                         _write("configs/studies/list-b.md")), True),
@@ -79,8 +92,13 @@ CASES = {
     "a variant and a study list": (_both(_write("configs/definitions/variants/qr01b_v1.toml"),
                                          _write("configs/studies/qr-rescore-list.md")), True),
     "a new definition and its pin": (_both(_write("configs/definitions/qr24_x_long.toml"),
-                                           _write("configs/definition_pins.toml", "[qr24_x_long]\n")), True),
-    "a pin alone": (_write("configs/definition_pins.toml", "[qr01_a]\n"), True),
+                                           _append(PIN, '\n[qr24_x_long]\ndefinition_hash = "cc"\n')), True),
+    "a pin added alone": (_append(PIN, '\n[qr25_y]\ndefinition_hash = "dd"\n'), True),
+    "a pin changed": (_write(PIN, '[qr01_a]\ndefinition_hash = "a2"\nidea_hash = "bb"\n'), False),
+    "a pin removed": (_write(PIN, '[qr01_a]\ndefinition_hash = "aa"\n'), False),
+    "an edited definition with its changed pin": (_both(_write("configs/definitions/qr01_a.toml", "version = 2\n"),
+                                                        _write(PIN, '[qr01_a]\ndefinition_hash = "a2"\n'
+                                                                    'idea_hash = "b2"\n')), False),
     "a nested directory": (_write("configs/definitions/sub/qr22.toml"), False),
     "a directory under the variants": (_write("configs/definitions/variants/sub/qr22.toml"), False),
     "an upper-case variant": (_write("configs/definitions/variants/QR22.toml"), False),
@@ -102,6 +120,12 @@ def test_the_path_rule(repo, name):
     edit, want = CASES[name]
     base, head = _change(repo, edit)
     assert _config_only(repo, base, head) is want, name
+
+
+def test_an_edited_variant_is_not_config_only(repo):
+    _change(repo, _write("configs/definitions/variants/qr01b_v1.toml"))
+    base, head = _change(repo, _write("configs/definitions/variants/qr01b_v1.toml", "v2\n"))
+    assert not _config_only(repo, base, head)
 
 
 def test_the_path_rule_refuses_what_is_not_a_commit(repo):
@@ -292,4 +316,18 @@ def test_the_definition_pins_live_in_one_config_file_both_hash_checks_read():
     assert sorted(pins) == sorted(p.stem for p in (ROOT / "configs" / "definitions").glob("qr*.toml"))
     assert all(set(v) == {"definition_hash", "idea_hash"} for v in pins.values())
     assert b16.BEFORE == {k: (v["definition_hash"], v["idea_hash"]) for k, v in pins.items()}
+    # HoE R-29 v3 (CR M1): today's 21 pins stay frozen in test code, so changing one is a test edit and a TEC.
+    assert len(b16.FROZEN) == 21 and b16.FROZEN.items() <= b16.BEFORE.items()
     assert gaps.QR_HASHES == {k: v["definition_hash"] for k, v in pins.items()}
+
+
+def test_a_study_from_main_needs_its_commits_tests_passed():
+    """HoE R-29 v3 (HoQA F2): configs_from=main reads only a commit whose push run of tests.yml on main passed, by the
+    same gh run list gate as deploy.yml."""
+    study = STUDY.read_text()
+    assert "permissions: { contents: read, actions: read }" in study
+    gate = study.split("- name: Require green tests for this commit", 1)[1].split("- name:", 1)[0]
+    assert "inputs.configs_from == 'main'" in gate and "GH_TOKEN: ${{ github.token }}" in gate
+    assert ('gh run list --workflow tests.yml --commit "$GITHUB_SHA" --branch main --event push --status success'
+            in gate) and "exit 1" in gate
+    assert study.index("- name: Require green tests for this commit") < study.index("- name: Stage the research configs")
