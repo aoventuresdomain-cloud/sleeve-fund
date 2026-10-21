@@ -228,3 +228,15 @@ def test_a_store_study_writes_its_out_of_sample_file_beside_the_sheet(tmp_path):
                                          test_days=30), ledger_path=tmp_path / "l.jsonl", out_dir=tmp_path, history=hist)
     got = pd.read_csv(oos_returns_path(sheet), index_col="date", parse_dates=["date"])
     assert len(got) >= 20 and got["price"].notna().all()  # set-up: a 30-day test window inside 90 research days
+
+
+def test_two_sheets_with_the_same_name_are_refused_in_words(tmp_path):
+    days = _days(70)
+    (tmp_path / "btc").mkdir()
+    (tmp_path / "eth").mkdir()
+    a = _sheet(tmp_path / "btc", "trend", "binance-btcusdt-store", pd.Series(_walk(70, seed=12), index=days))
+    b = _sheet(tmp_path / "eth", "trend", "binance-ethusdt-store", pd.Series(_walk(70, seed=13), index=days))
+    with pytest.raises(ValueError, match="trend.*share one name"):
+        fs.oos_section([a, b], None)
+    with pytest.raises(ValueError, match="trend.*share one name"):
+        fs.page([a, b])

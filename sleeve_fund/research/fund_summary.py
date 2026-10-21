@@ -51,7 +51,20 @@ class Unmatched(ValueError):
     """A sheet without its returns file, or a returns file without its sheet."""
 
 
+def _unique(sheets: list[Path]) -> None:
+    """Rows, matrices and their files are keyed by a sheet's name: two sheets with one name would overwrite each
+    other in silence, so they are refused."""
+    seen: dict[str, list[str]] = {}
+    for s in sheets:
+        seen.setdefault(s.stem, []).append(str(s))
+    clash = {k: v for k, v in seen.items() if len(v) > 1}
+    if clash:
+        raise ValueError("; ".join(f"{', '.join(v)} share one name, {k}" for k, v in clash.items())
+                         + ": rename one so each sheet's name is its own")
+
+
 def _check(sheets: list[Path]) -> None:
+    _unique(sheets)
     bad = [f"{s.name}: no returns file beside it" for s in sheets if not returns_path(s).exists()]
     for d in sorted({s.parent for s in sheets}):
         bad += [f"{f.name}: no tear sheet beside it" for f in sorted(d.glob("*.returns.csv"))
@@ -192,6 +205,7 @@ def oos_section(sheets: list[Path], history, venue: str | None = None, pair: str
     """(d) The finalists' out-of-sample daily returns correlated pair by pair, with BTC's plain price return beside
     them, read from the history store for the same calendar days (Advisor, 21 Oct). `venue`: the store's venue for
     BTC; None reads it from the sheets' datasets when they all name one."""
+    _unique(sheets)
     out = ["## Correlation of out-of-sample daily returns, pair by pair", ""]
     missing = [s.name for s in sheets if not oos_returns_path(s).exists()]
     if missing:
