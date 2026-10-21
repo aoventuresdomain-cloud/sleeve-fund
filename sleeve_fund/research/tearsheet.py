@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 
 from sleeve_fund import funding, markets
-from sleeve_fund.research import mintrl, regime_split
+from sleeve_fund.research import analysis_pack, mintrl, periods, regime_split
 from sleeve_fund.research.guardrails import CANDIDATE_CHECK, G1_RULES, MIN_OOS_TRADES, nearby_scored
 from sleeve_fund.research.ledger import IdeaLedger
 from sleeve_fund.research.metrics import (
@@ -21,6 +21,7 @@ from sleeve_fund.research.metrics import (
     years_covered,
 )
 from sleeve_fund.research.pbo import PBO_CHECK, g1_row
+from sleeve_fund.research.random_entry import CLOSE_PRICED
 from sleeve_fund.research.study import StudyResult
 
 ROBUST_SHARE = 0.6
@@ -120,6 +121,87 @@ def _idea(r: StudyResult) -> str:
     from sleeve_fund.research.trials import legacy_idea_hash
 
     return getattr(r, "idea_hash", None) or legacy_idea_hash(r.spec.name)
+
+
+def _period_label(p) -> str:
+    return f"{p.label} ({p.partial})" if p.partial else p.label
+
+
+def _period_tables(r: StudyResult) -> list[str]:
+    """R-13: the scored window's returns by year and by month, the Strategy's against buy-and-hold's."""
+    eq, hold = periods.scored(r)
+    trips = [vars(t) for t in periods.trade_rows(r.full_period) if t.closed is not None]
+    years, hold_years = periods.periods(eq, "Y", trips), {p.label: p for p in periods.periods(hold, "Y")}
+    out = ["## Returns by year", "",
+           f"Over the scored window ({_scored_words(eq)}), after fees and funding; a partial year says which part, "
+           f"and its Sharpe is n/a under {periods.MIN_SHARPE_DAYS} days. Trades are counted in the year they closed.", "",
+           "| Year | Strategy | Buy and hold | Difference | Strategy Sharpe | Buy-and-hold Sharpe | Strategy max DD "
+           "| Buy-and-hold max DD | Trades |",
+           "| --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
+    for p in years:
+        b = hold_years.get(p.label)
+        out.append(f"| {_period_label(p)} | {_pct(p.ret)} | {_pct(b.ret if b else None)} "
+                   f"| {_pct(p.ret - b.ret if b else None)} | {_num(p.sharpe)} | {_num(b.sharpe if b else None)} "
+                   f"| {_pct(p.max_dd)} | {_pct(b.max_dd if b else None)} | {p.trades} |")
+    out += ["", "## Returns by month", "",
+            "Each month end on end, so the months compound to the window's total return; p marks a partial month.", ""]
+    months, hold_months = periods.periods(eq, "M"), {p.label: p for p in periods.periods(hold, "M")}
+    by = {p.label: p for p in months}
+    hold_by_year = hold_years
+    for title, cell, year_cell in (
+            ("Strategy", lambda m: m and m.ret, lambda y: y.ret),
+            ("Buy and hold", lambda m: hold_months.get(m.label).ret if m and m.label in hold_months else None,
+             lambda y: hold_by_year[y.label].ret if y.label in hold_by_year else None),
+            ("Difference", lambda m: m.ret - hold_months[m.label].ret if m and m.label in hold_months else None,
+             lambda y: y.ret - hold_by_year[y.label].ret if y.label in hold_by_year else None)):
+        out += [f"**{title}**", "", "| Year | " + " | ".join(periods.MONTHS) + " | Year |",
+                "| --- |" + " --- |" * 13]
+        for y in years:
+            cells = []
+            for i in range(1, 13):
+                m = by.get(f"{y.label}-{i:02d}")
+                cells.append("" if m is None else _pct(cell(m)) + (" p" if m.partial else ""))
+            out.append(f"| {y.label} | " + " | ".join(cells) + f" | {_pct(year_cell(y))}{' p' if y.partial else ''} |")
+        out.append("")
+    return out
+
+
+def _scored_words(eq) -> str:
+    first, last = periods.span(eq)
+    return f"the full research period, the closes of {first:%d %b %Y} to {last:%d %b %Y}"
+
+
+def _every_trade(r: StudyResult, files: bool, shown: int) -> list[str]:
+    """R-15: every trade of the scored window with the equity after it; the sheet lists the first `shown`, the CSV
+    beside it all of them, and says so."""
+    rows = periods.trade_rows(r.full_period)
+    eq, _ = periods.scored(r)
+    out = ["## Every trade", "",
+           f"Starting capital: {float(eq.iloc[0]):,.0f}. Every trade of the scored window ({_scored_words(eq)}), after "
+           "fees and funding, with the equity after it and its drawdown at the trade's close from the equity's peak so far "
+           "(marked to market daily; the headline max drawdown, from the whole daily curve, can be deeper, since a "
+           "trough inside a trade shows here only if it lasts to the close); funding and any insurance-fund cover "
+           "are booked to the trade they fell in; P&L % is of the equity before the trade. Sizes round to the venue's lot, so a smaller "
+           "account's sizes and returns can differ slightly from a larger one's. A position still open at the end is "
+           "the last row, marked to market there, so the P&L column sums to the end equity less the start.", ""]
+    if files:
+        out += ["Beside this sheet: the [trade list (CSV)](beside:trades.csv), the [daily equity (CSV)](beside:equity.csv) "
+                "and the [equity curve against buy-and-hold (SVG)](beside:equity.svg).", ""]
+    if not rows:
+        return out + ["No trades.", ""]
+    out += ["| # | Side | Entry | Entry price | Exit | Exit price | Size | Notional | Held | Fees | Funding | P&L "
+            "| P&L % | Exit reason | Equity after | Drawdown at trade close |",
+            "| --- |" + " --- |" * 15]
+    for t in rows[:shown]:
+        out.append(f"| {t.n} | {t.side} | {t.opened:%d %b %Y %H:%M} | {t.entry_px:,.6g} "
+                   f"| {'open' if t.closed is None else f'{t.closed:%d %b %Y %H:%M}'} "
+                   f"| {'' if t.exit_px is None else f'{t.exit_px:,.6g}'} | {t.qty:,.6g} | {t.notional:,.2f} "
+                   f"| {t.held / pd.Timedelta(days=1):.1f} days | {t.fees:,.2f} | {t.funding:,.2f} | {t.pnl:,.2f} "
+                   f"| {_pct(t.pnl_pct)} | {t.reason} | {t.equity_after:,.2f} | {_pct(t.drawdown)} |")
+    if len(rows) > shown:
+        where = "the [trade list (CSV)](beside:trades.csv)" if files else "the trade list beside this sheet"
+        out += ["", f"{shown} of {len(rows)} trades shown; every trade is in {where}."]
+    return out + [""]
 
 
 def _asset_class(r: StudyResult, spec) -> str:
@@ -510,10 +592,30 @@ def _span(minutes: int) -> str:
         f"{minutes / 60:g} hours" if minutes >= 60 else f"{minutes} minutes")
 
 
+# R-12 (Advisor SCORE-WINDOW, 21 Oct 2026): this round only, QR-B1, QR-B2 and QR-B3 must pass on both windows.
+OLD_WINDOW_CHECK = "Also passes on the old three-year walk-forward (this round)"
+SCREENING_DISCLOSURE = ("Disclosed: the earlier lab rounds (3 Oct 2026) looked at 2020 to 2022 when these ideas were "
+                        "screened.")
+
+
+def old_window_check(old: StudyResult, ledger: IdeaLedger, register=None) -> tuple[str, str, str]:
+    """R-12: the old three-year walk-forward's G1 verdict on the same settings, as one more G1 check: the sheet passes
+    only when the continuous window and this both pass."""
+    verdict, failed = g1_verdict(g1_checks(old, ledger, register))
+    why = f"failed: {', '.join(failed)}" if verdict == "FAIL" else (
+        f"not judged: {', '.join(failed)}" if verdict == NOT_JUDGED else "every check passed")
+    return OLD_WINDOW_CHECK, verdict, f"G1 {verdict} on the walk-forward ({old.settings.split(' · ')[-1]}): {why}"
+
+
 def render(r: StudyResult, ledger: IdeaLedger, register=None, liquidation_ack: str | dict | None = None,
-           flat: StudyResult | None = None) -> str:
+           flat: StudyResult | None = None, old: StudyResult | None = None, files: bool = False,
+           shown_trades: int = 50) -> str:
     """flat: for a strength-sized variant (G5), its flat version's study on the same windows, shown side by side
-    (strength_report); without it the flat version stays."""
+    (strength_report); without it the flat version stays. old: R-12, the same settings' old three-year walk-forward
+    study beside a continuous window's: one more G1 check, so the sheet passes only when both do. files: the sheet's
+    trade list, daily equity and curve sit beside it (run.write_beside), linked as beside:<kind>, which the
+    dashboard points at its own route for them, so the sheet itself names no run stamp and two runs of one study
+    still render the same; shown_trades: the trades listed on the sheet itself (R-15)."""
     spec = r.spec
     oos = summary(r.oos_returns)
     oos_b = _bench(r.oos_benchmark_returns)
@@ -570,6 +672,8 @@ def render(r: StudyResult, ledger: IdeaLedger, register=None, liquidation_ack: s
     out.append("## G1 checks")
     out.append("")
     checks = g1_checks(r, ledger, register, liquidation_ack)
+    if old is not None:
+        checks.append(old_window_check(old, ledger, register))
     verdict, failed = g1_verdict(checks)
     if verdict == NOT_JUDGED:
         why = r.not_judged or "; ".join(e for name, v, e in checks if name in failed and v == NOT_JUDGED)
@@ -583,6 +687,19 @@ def render(r: StudyResult, ledger: IdeaLedger, register=None, liquidation_ack: s
     for name, result, evidence in checks:
         out.append(f"| {name} | {result} | {evidence} |")
     out.append("")
+    if getattr(r, "warmup_bars", None) is not None:  # R-11
+        out.append(f"> Scored continuously: {r.settings.split(' · ')[-1]}. The holdout stays locked.")
+        out.append("")
+    by_year = getattr(r, "random_entry_by_year", None) or {}
+    if by_year:  # R-14
+        out.append("> Random entry by test year (each year's trips, whole, against draws in that year): " + "; ".join(
+            f"{y}: {re_.return_percentile:.0f}th percentile of {re_.draws:,} draws, {re_.trades} trades"
+            if re_.trades else f"{y}: no trades" for y, re_ in by_year.items()) + ".")
+        out.append(f"> {CLOSE_PRICED}.")
+        out.append("")
+    if old is not None:
+        out.append(f"> {SCREENING_DISCLOSURE}")
+        out.append("")
     for label in getattr(r, "fill_labels", None) or []:
         out.append(f"> Fills: {label}. Without 1-minute bars, what traded first inside a bar is unknown, so a stop the "
                    "bar traded through was filled at its worst price, and a stop and a target both inside one bar as the "
@@ -624,11 +741,28 @@ def render(r: StudyResult, ledger: IdeaLedger, register=None, liquidation_ack: s
     if getattr(r, "hold_note", ""):
         out.append(f"Benchmark: {r.hold_note}.")
         out.append("")
+    if getattr(r, "bar_note", ""):  # BH-102 rule 3: which hold set the bar, both Sharpes beside it
+        out.append(f"G1 {r.bar_note}.")
+        out.append("")
+    if getattr(r, "hold_liquidated", None):  # BH-102: a 1x perp hold whose funding took its margin is liquidated
+        out.append("The perp hold was liquidated on " + "; ".join(r.hold_liquidated) + ", and held nothing after.")
+        out.append("")
     spot = getattr(r, "spot_hold_returns", None)
-    if spot is not None and len(spot.dropna()) >= 2:
+    perp = getattr(r, "perp_hold_returns", None)
+    if perp is not None and len(perp.dropna()) >= 2 and getattr(r, "bar_hold", "") not in ("", "perp hold"):
+        # BH-102 rule 3: the bar is another hold; the perp's beside it
+        p_ = summary(perp)
+        out.append(f"Holding the 1x perpetual instead, out-of-sample: CAGR {_pct(p_['cagr'])}, Sharpe "
+                   f"{_num(p_['sharpe'])}, max drawdown {_pct(p_['max_drawdown'])} (shown, not the G1 benchmark).")
+        out.append("")
+    elif spot is not None and len(spot.dropna()) >= 2:
         s_ = summary(spot)
         out.append(f"Holding spot instead, out-of-sample: CAGR {_pct(s_['cagr'])}, Sharpe {_num(s_['sharpe'])}, "
                    f"max drawdown {_pct(s_['max_drawdown'])} (shown, not the G1 benchmark).")
+        out.append("")
+    schedule = getattr(getattr(r, "full_period", None), "funding_schedule", "")
+    if schedule:
+        out.append(f"Funding schedule: {schedule}.")
         out.append("")
     stress = getattr(r, "funding_stress", None)
     if stress:
@@ -637,6 +771,7 @@ def render(r: StudyResult, ledger: IdeaLedger, register=None, liquidation_ack: s
                    f"{stress['assumed']:.2%}, the strategy returns {_pct(s1)} (from {_pct(s0)}) and the perpetual buy "
                    f"and hold {_pct(h1)} (from {_pct(h0)}). The assumed rate is light in strong uptrends.")
         out.append("")
+    out.extend(_period_tables(r))
     out.append(f"## Trading and costs (full research period, {r.research_start:%d %b %Y} to {r.research_end:%d %b %Y}, "
                "default params)")  # R-16: the span the table's trips and funding cover
     out.append("")
@@ -654,9 +789,15 @@ def render(r: StudyResult, ledger: IdeaLedger, register=None, liquidation_ack: s
     out.append(f"- Time in the market: {r.full_period.exposure.abs().gt(0.001).mean():.0%} of bars hold a position")
     out.append(f"- Stops clamped: {_n(getattr(r.full_period, 'stops_clamped', 0), 'trade')}, held at half the way to "
                "the liquidation price when the level loosened past it or funding moved it nearer")
+    refused = getattr(r.full_period, "entries_refused_liquidation", 0)
+    if refused:  # BH-102: a run the rule refuses throughout would otherwise show zero trades and say nothing
+        out.append(f"- Entries refused: {refused} entr{'y' if refused == 1 else 'ies'}, the stop more than its share "
+                   "of the way to the liquidation price (a fully paid 1x long is exempt)")
     out.append("")
     out.append(_double_fees_line(r))
     out.append("")
+    out += analysis_pack.section(r)  # R-17/R-18/R-19: risk, trades and costs, before the cost ladder
+    out.extend(_every_trade(r, files, shown_trades))
     if r.cost_ladder:
         chosen = getattr(r, "chosen_params", None) or r.default_params
         out.append(f"## Cost ladder (full research period, chosen settings {json.dumps(chosen)})")
@@ -722,6 +863,10 @@ def render(r: StudyResult, ledger: IdeaLedger, register=None, liquidation_ack: s
         out.append(f"- {_n(counts['variants'], 'distinct variant')} of this idea tried so far, in studies, backtests and "
                    f"paper strategies ({counts['evaluations']} evaluations including walk-forward refits): the N its "
                    f"results are judged by.{uncertain}")
+        from sleeve_fund.research.candidates import BUDGET_PER_IDEA, configurations
+
+        out.append(f"- Budget: {len(configurations(register, _idea(r)))} of {BUDGET_PER_IDEA} configurations used "
+                   "for this idea family (the fund summary shows it beside the ranking, R-20).")
     out.append(f"- {_n(project['ideas'], 'idea')} and {_n(project['variants'], 'distinct variant')} tested so far "
                f"across the project ({project['evaluations']} evaluations), shown for awareness. By family: "
                + ", ".join(f"{k} {v}" for k, v in project["ideas_by_family"].items()))
@@ -736,6 +881,12 @@ def render(r: StudyResult, ledger: IdeaLedger, register=None, liquidation_ack: s
     from sleeve_fund.research.strength_report import section as strength_section
 
     out += strength_section(r, flat)
+    from sleeve_fund.research.equal_exposure import section as equal_exposure_section
+
+    out += equal_exposure_section(getattr(r, "equal_exposure", None))
+    from sleeve_fund.research.placebo import section as placebo_section
+
+    out += placebo_section(getattr(r, "placebo", None))
     out.append("## Caveats")
     out.append("")
     out.append("- Signal orders go to the venue as the bar that triggered them closes: at market, paying the taker fee "

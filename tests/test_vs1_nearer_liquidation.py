@@ -48,9 +48,14 @@ def test_the_entry_at_exactly_300000_takes_tier_2_and_the_table_meets_there():
     assert 300_000 * t.rate - t.amount == pytest.approx(300_000 * 0.0033)  # 990 either side of the ceiling
 
 
-def test_a_fully_paid_1x_long_still_has_no_liquidation():
-    """A finds none (the long is paid for); B's ~0.33%-of-entry price isn't taken as one (PE1, to the HoE)."""
-    assert entry_liquidation(60_000, 1, 60_000, 1, 0.0, _btc(), 1)[0] is None
+def test_a_fully_paid_1x_long_liquidates_at_bs_maintenance_price():
+    """TEC-BH102-1X (HoE, Advisor 21 Oct): A finds none (the long is paid for); B's maintenance-on-entry price is the
+    position's. Until 21 Oct it wasn't taken as one, and a funded 1x hold could go below zero (BH-102)."""
+    from sleeve_fund import margin
+
+    got = entry_liquidation(60_000, 1, 60_000, 1, 0.0, _btc(), 1)[0]
+    assert got == pytest.approx(margin._entry_value_liquidation(0.0, 1, 60_000, _btc()))
+    assert 0 < got < 0.01 * 60_000
 
 
 @pytest.mark.parametrize("side, fixed, want", [(1, 40_198.00, 40_598.00), (-1, 79_736.87, 79_338.19)])

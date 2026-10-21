@@ -1,0 +1,35 @@
+# Pre-registered variant V2. Decision candle: 4h. (research/quant-researcher/trend-variants-preregistration.md, PM approved the round
+# 21 Oct): the parent qr01_trend_ema_long with one change, no new long while the funding rate is in the top decile of its
+# trailing 90 days. Exits, stops and candles are the parent's. Studies only (R-06).
+# QR top 3, #1 trend following, long leg. Decision candle: 4h. Researcher draft 14 Oct; Quant Developer to review.
+version = 1
+name = "qr01-trend-ema-long-v2-funding"
+title = "Trend Cross (21/55, 4h) · Long · funding filter"
+reason = """Prices under-react to news, then trend for weeks; hedgers pay to shed risk. Be long from the candle the
+21-period EMA crosses above the 55 on 4h candles until it crosses back, with a 3 ATR(14) stop for a sudden break."""
+
+[blocks.fast]
+kind = "ema"
+period = 21
+
+[blocks.slow]
+kind = "ema"
+period = 55
+
+[blocks.atr]
+kind = "atr"
+period = 14
+
+[blocks.fund]
+kind = "funding_decile"
+window_days = 90
+
+[long]
+entry = { all = [
+    { left = "fast", op = "crosses_above", right = "slow" },
+    { left = "fund", op = "<", right = 10 },
+] }
+exit = { left = "fast", op = "<", right = "slow" }
+
+[exits]
+stop = { level = { sub = ["close", { mul = [3.0, "atr"] }] } }

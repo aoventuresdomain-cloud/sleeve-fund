@@ -136,23 +136,26 @@ def test_funding_paid_moves_the_liquidation_price_closer_and_the_position_is_liq
     assert liq[0]["reason"].startswith("Liquidated"), liq[0]["reason"]
 
 
-# A credit moves it away: a gap through the fixed price that stays clear of the moved one (and of the cut) is survived.
+# TEC-BH102-CREDIT (HoE, Advisor 21 Oct 13:16): a credit goes to the available balance, never the margin, so it moves
+# nothing: the gap through the fixed price, clear of where LIQ-FUND-1 would have moved it, liquidates it at the fixed
+# price. Until 21 Oct a credit moved it away and this gap was survived.
 CREDITS = [pytest.param(1, -0.10, 0.3417, id="long"), pytest.param(-1, 0.12, 0.3416, id="short")]
 
 
 @pytest.mark.parametrize("where", ["backtest", "paper"])
 @pytest.mark.parametrize(("side", "rate", "depth"), CREDITS)
-def test_a_funding_credit_moves_the_liquidation_price_away(hourly, monkeypatch, where, side, rate, depth):
+def test_a_funding_credit_leaves_the_liquidation_price_where_it_was_fixed(hourly, monkeypatch, where, side, rate,
+                                                                         depth):
     _rate(monkeypatch, rate)
     p = _prices(side, depth)
     orders, fixed, qty, funded, entry = _book(where, p, side)
     assert funded > 0, ("set-up: the 08:00 settlement was a credit", funded)
-    now = moved(fixed, qty, funded, entry)
     gap = float(p[-1])
-    assert (fixed - now) * side > 0, "a credit moves it away from the price"
     assert (gap - fixed) * side <= 0, "set-up: the gap is through the fixed price"
-    assert (gap - now) * side / gap > 0.07, "set-up: the moved price is clear of the gap and of the 7% cut"
-    assert not [o for o in orders if o["intent"] in ("liquidation", "liquidation_cut")], [o["intent"] for o in orders]
+    assert (gap - moved(fixed, qty, funded, entry)) * side / gap > 0.07, "set-up: clear of the old moved price"
+    liq = [o for o in orders if o["intent"] == "liquidation"]
+    assert liq, [o["intent"] for o in orders]
+    assert liq[0]["signal"]["liquidation_px"] == pytest.approx(fixed, rel=1e-6)
 
 
 def test_a_restart_reads_the_funding_since_the_fill_back_from_the_journal(hourly, monkeypatch):
@@ -310,7 +313,8 @@ def _ledger(where, prices, side):
 
 # Advisor 17:45 UK (13 Oct), MUST: bankruptcy moves by the same funding, b' = b - f / q, so a liquidation loses exactly
 # the isolated margin plus the entry and liquidation fees, the funding inside that, never on top (#155). The funding
-# lines and the liquidation's line sum to it; a credit is taken with the margin.
+# lines and the liquidation's line sum to it. TEC-BH102-CREDIT (HoE, Advisor 21 Oct): a credit goes to the available
+# balance, not the margin, so the liquidation loses the margin and fees and the credit is kept beside it.
 LOSSES = [pytest.param(1, 0.05, 0.2834, id="long-paid"), pytest.param(-1, -0.05, 0.282, id="short-paid"),
           pytest.param(1, -0.05, 0.40, id="long-credited"), pytest.param(-1, 0.05, 0.40, id="short-credited")]
 
@@ -323,8 +327,9 @@ def test_a_liquidation_loses_exactly_the_margin_and_fees_with_the_funding_inside
     cash, margin, entry_fee, liq_fee, funding, pnl = _ledger(where, _prices(side, depth), side)
     assert abs(funding) > 100, ("set-up: the 08:00 settlement moved the margin", funding)
     lost = margin + entry_fee + liq_fee
-    assert 10_000 - cash == pytest.approx(lost, abs=0.02)
-    assert funding + pnl - entry_fee - liq_fee == pytest.approx(-lost, abs=0.02)
+    paid, credited = min(funding, 0.0), max(funding, 0.0)
+    assert 10_000 - cash == pytest.approx(lost - credited, abs=0.02)
+    assert paid + pnl - entry_fee - liq_fee == pytest.approx(-lost, abs=0.02)
 
 
 # F242-1 (CR, HoE MUST FIX 13 Oct): the funding a position's margin has taken stays the position's when it is added to,

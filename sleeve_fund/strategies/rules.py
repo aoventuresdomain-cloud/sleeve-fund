@@ -14,19 +14,53 @@ that fired, the block values, the candles they were read from and where those ca
 from __future__ import annotations
 
 import math
+from collections import deque
 from datetime import datetime, timezone
+from decimal import Decimal
 
 from nautilus_trader.model import Bar
 
 from sleeve_fund.data import bar_minutes
 from sleeve_fund.strategies.base import MAX_STOP, MIN_STOP, IdeaSpec, LongFlatConfig, LongFlatStrategy
-from sleeve_fund.strategies.definitions import (CATALOGUE, LEVEL_EXITS, Checked, Compiled, Env, block_value,
-                                                check_definition, definition_hash, load_definition_file, side_exits,
-                                                timeframe_label, to_params)
+from sleeve_fund.strategies.definitions import (CATALOGUE, DAY_NS, LEVEL_EXITS, Checked, Compiled, Env, FundingDecile,
+                                                block_value, check_definition, definition_hash, load_definition_file,
+                                                side_exits, timeframe_label, to_params)
 from sleeve_fund.strategies.timeframes import MINUTE_NS
 
 _hash_of = definition_hash  # RulesConfig takes a parameter of that name
 FIRST_TOUCH_RERUN = 0.05  # an ambiguous share above this re-runs G1 the other way (Advisor ~22:07)
+# R-07 (pre-registered variants V3/V4, studies only): an entry sized to a target volatility. Each a named choice the
+# Advisor may rule on: realised volatility is the sample standard deviation of daily close-to-close log returns (UTC
+# days), annualised over a 365-day year.
+VOL_SIZE_LOG_RETURNS = True
+VOL_SIZE_DDOF = 1
+VOL_SIZE_YEAR_DAYS = 365
+VOL_SIZE_LIMIT = "volatility target"  # the sizing limit's name in the journal's "sized by"
+
+
+def check_vol_target_size(cfg) -> dict | None:
+    """The vol_target_size setting, validated: {"annual": 0.40, "lookback_days": 30}. None: off."""
+    if cfg is None:
+        return None
+    if not isinstance(cfg, dict) or set(cfg) - {"annual", "lookback_days"} or "annual" not in cfg:
+        raise ValueError(f"vol_target_size takes annual (e.g. 0.40 for 40% a year) and lookback_days, not {cfg!r}")
+    annual, days = cfg["annual"], cfg.get("lookback_days", 30)
+    if isinstance(annual, bool) or not isinstance(annual, (int, float)) or not 0 < annual <= 5:
+        raise ValueError(f"vol_target_size annual is a fraction above 0 and at most 5 (0.40 for 40% a year), not {annual!r}")
+    if isinstance(days, bool) or not isinstance(days, int) or not 2 <= days <= 365:
+        raise ValueError(f"vol_target_size lookback_days is a whole number of days from 2 to 365, not {days!r}")
+    return {"annual": float(annual), "lookback_days": days}
+
+
+def realised_vol(closes: list) -> float | None:
+    """The annualised realised volatility of daily closes, oldest first (VOL_SIZE_*), or None when it can't be read."""
+    rets = [(math.log(b / a) if VOL_SIZE_LOG_RETURNS else b / a - 1) for a, b in zip(closes, closes[1:])
+            if a > 0 and b > 0]
+    if len(rets) != len(closes) - 1 or len(rets) <= VOL_SIZE_DDOF:
+        return None
+    mean = sum(rets) / len(rets)
+    var = sum((r - mean) ** 2 for r in rets) / (len(rets) - VOL_SIZE_DDOF)
+    return math.sqrt(var * VOL_SIZE_YEAR_DAYS)
 
 SPEC = IdeaSpec(
     listed=False,
@@ -50,8 +84,12 @@ __all__ = ["CATALOGUE", "SPEC", "Rules", "RulesConfig", "check_definition", "def
 
 class RulesConfig(LongFlatConfig):
     def __init__(self, *, definition: dict | None = None, definition_version: int | None = None,
-                 definition_hash: str | None = None, **kwargs) -> None:
+                 definition_hash: str | None = None, vol_target_size: dict | None = None,
+                 blocked_entries=None, **kwargs) -> None:
         super().__init__(**kwargs)
+        self.vol_target_size = check_vol_target_size(vol_target_size)  # R-07, studies only (check_study_only)
+        # R-24, a study's placebo calibration only: the decision candles (close ns) on which no entry opens
+        self.blocked_entries = frozenset(int(x) for x in blocked_entries or ())
         if not definition:
             raise ValueError("a rules strategy needs its definition (a file in configs/definitions/)")
         checked = check_definition(definition, bar_minutes=bar_minutes(self.bar_type))
@@ -176,6 +214,48 @@ class Rules(LongFlatStrategy):
         # until ns -> (high, low) of the venue's own candle closing then, where the decision candle is built from the
         # 1-minute bars and so would miss a minute they lack (a backtest on exec_prices); None: the bar is the venue's
         self.range_source = None
+        # R-07: (UTC day, its last close) for the realised volatility a vol_target_size entry is sized on
+        vol = config.vol_target_size
+        self._days: deque = deque(maxlen=vol["lookback_days"] + 2 if vol else 1)
+        self.vol_skipped = 0  # entries skipped for want of the volatility to size them on
+
+    def funding_blocks(self) -> list:
+        """R-06: the definition's funding rate decile blocks, which the runner hands their stored rates."""
+        return [b for b in self.rules.blocks.values() if isinstance(b, FundingDecile)]
+
+    def rule_counts(self) -> dict:
+        """For the sheet: candles a funding rate decile had no rate on and read its top decile on (R-06, counted apart),
+        entries vol sizing skipped (R-07)."""
+        out = {}
+        if self.funding_blocks():
+            out["funding_no_rate"] = max(b.no_rate for b in self.funding_blocks())
+            out["funding_top_decile"] = max(b.top_decile for b in self.funding_blocks())
+        if self.c.vol_target_size:
+            out["vol_skipped"] = self.vol_skipped
+        return out
+
+    def _extra_size_limit(self, limits: dict, base: float) -> str | None | bool:
+        """R-07: with vol_target_size, the entry's notional is at most base x annual / realised volatility, one more
+        sizing limit, so the smallest still wins: it only ever shrinks an entry, never past today's size or caps. Set
+        at entry, never rebalanced in a trade. Skipped, journaled, when the volatility can't be read yet."""
+        cfg = self.c.vol_target_size
+        if cfg is None:
+            return None
+        need = cfg["lookback_days"] + 1
+        ts = self.env.ts
+        today = (ts - 1) // DAY_NS
+        done = [c for d, c in self._days if d < today or ts % DAY_NS == 0]
+        vol = realised_vol(done[-need:]) if len(done) >= need else None
+        if not vol:
+            self.vol_skipped += 1
+            self._note("entry_skipped_vol_target", f"Entry skipped: volatility sizing needs {need} daily closes to "
+                       f"read {cfg['lookback_days']} days of realised volatility, and {len(done)} are to hand",
+                       level="info")
+            return False
+        self._noted.discard("entry_skipped_vol_target")
+        limits[VOL_SIZE_LIMIT] = Decimal(repr(base)) * Decimal(repr(cfg["annual"])) / Decimal(repr(vol))
+        return (f"volatility {vol:.2%} a year over {cfg['lookback_days']} days against a {cfg['annual']:.0%} target: "
+                f"at most {cfg['annual'] / vol:.0%} of fund")
 
     @classmethod
     def warmup_needed(cls, params: dict, bar_minutes: int) -> int:
@@ -215,6 +295,11 @@ class Rules(LongFlatStrategy):
                           bar.volume.as_double())
         self._feed.update_ohlcv(o, h, lo, c, v, bar.ts_event)
         env.ohlcv, env.ts, env.bar = (o, h, lo, c, v), int(bar.ts_event), env.bar + 1
+        if self.c.vol_target_size:  # a candle belongs to the UTC day its close falls in (00:00 ends the old one)
+            day = (env.ts - 1) // DAY_NS
+            if self._days and self._days[-1][0] == day:
+                self._days.pop()
+            self._days.append((day, c))
         if self.rules.touches:
             env.minutes, env.minutes_due = self._minutes_of(bar), bar_minutes(self._cfg.bar_type)
             env.span = self.range_source(env.ts) if self.range_source is not None else None
@@ -296,7 +381,7 @@ class Rules(LongFlatStrategy):
             side = self.rules.sides.get(sign)
             if side is not None and ended and (sign == ended or not side["reverse"]):
                 continue
-            if side is not None and side["entry"].test(env):
+            if side is not None and side["entry"].test(env) and env.ts not in self.c.blocked_entries:
                 armed = [s.armed_at for s in self.rules.setups if s.armed_at is not None]
                 side["entry"].consume()
                 self._leg, self._held, self._leg_ts = sign, 0, env.ts

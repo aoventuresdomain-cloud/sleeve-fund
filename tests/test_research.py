@@ -695,7 +695,7 @@ def test_a_perp_studys_benchmark_pays_the_fee_its_strategy_pays(tmp_path, instru
 
     costs, runs = [], []
     real_bench, real_bt = study._benchmarks, study.run_backtest
-    monkeypatch.setattr(study, "_benchmarks", lambda *a: costs.append(a[3]) or real_bench(*a))
+    monkeypatch.setattr(study, "_benchmarks", lambda *a, **k: costs.append(a[3]) or real_bench(*a, **k))
     monkeypatch.setattr(study, "run_backtest", lambda *a, **k: runs.append((a[3], k, r := real_bt(*a, **k))) and r or r)
     r = run_study(perp, synthetic_ohlcv(days=1100, seed=3), instrument, dataset="syn", ledger=IdeaLedger(tmp_path / "l"),
                   synthetic=True, holdout_days=0, train_days=365, test_days=365, half_spread=0)
@@ -735,12 +735,22 @@ def test_a_simulated_perps_buy_and_hold_is_a_perp_with_spot_beside_it_and_a_fund
     assert len(r.oos_benchmark_returns) == len(r.compare_returns) == len(r.oos_returns)
     assert r.spot_hold_returns is not None and len(r.spot_hold_returns) == len(r.oos_returns)
     # The perp hold pays 0.05% to open, not the spot venue's 0.80%, and funding as it goes: not the spot hold.
-    assert not np.allclose(r.oos_benchmark_returns.to_numpy(), r.spot_hold_returns.to_numpy())
+    perp, spot = r.perp_hold_returns, r.spot_hold_returns
+    assert not np.allclose(perp.to_numpy(), spot.reindex(perp.index).to_numpy())
     assert "1x long perpetual" in r.hold_note and "assumed funding" in r.hold_note
     stress = r.funding_stress
     assert stress["rate"] == 0.0003 and stress["hold"][1] < stress["hold"][0]  # a long pays more funding
     text = render(r, IdeaLedger(tmp_path / "l"))
-    assert "Holding spot instead" in text and "Funding stress" in text
+    assert "Funding stress" in text
+    # BH-102 rule 3 (Advisor 21 Oct; TEC-BH102-HOLD 3): the headline is the higher-Sharpe hold over the days both
+    # cover, the other shown beside it, labelled
+    sharpe = lambda x: x.mean() / x.std(ddof=1)  # noqa: E731 - the ranking needs only the order, not the scale
+    both = perp.index.intersection(spot.index)
+    spot_wins = sharpe(spot.reindex(both)) > sharpe(perp.reindex(both))
+    headline, other = (spot, "Holding the 1x perpetual instead") if spot_wins else (perp, "Holding spot instead")
+    assert r.bar_hold == ("spot hold" if spot_wins else "perp hold")
+    assert np.allclose(r.oos_benchmark_returns.to_numpy(), headline.reindex(r.oos_benchmark_returns.index).to_numpy())
+    assert other in text and f"G1 {r.bar_note}." in text
     # The hold is priced, so the Sharpe check has a figure: not "no verdict" (the hold-insufficient path). A simulated
     # perp's funding is NOT JUDGED (#163, Advisor 6 Oct), so the verdict itself shows N/A under that headline.
     _, ev = {n: (v, e) for n, v, e in g1_checks(r, IdeaLedger(tmp_path / "l"))}[SHARPE_CHECK]

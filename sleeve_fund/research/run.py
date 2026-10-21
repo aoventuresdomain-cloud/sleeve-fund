@@ -64,6 +64,15 @@ class StudyRequest:
     label: str | None = None
     # B-37: a study list's pinned dates (research.pinned.Pinned): the study reads those days only, whatever day it runs.
     pinned: object | None = None
+    # R-11: "walk_forward" (as before) or "continuous" (pinned settings only: a warm-up, then scored to the research end)
+    score_window: str = "walk_forward"
+    # R-12, this round only: also run the old walk-forward on the same settings (never counted as a try), and pass
+    # only when both windows pass
+    old_window_too: bool = False
+    # R-24: a filtered variant's parent definition (a rule-builder definition), whose entries a placebo blocks at
+    # random in the share the variant's filter blocked; None: no placebo
+    placebo_parent: dict | None = None
+    starting_capital: float = 10_000.0  # R-15: the account every run starts from (the PM's $1,000 run)
 
     def exits(self) -> dict:
         """The exits every run of the study trades with, as the strategy takes them."""
@@ -84,6 +93,12 @@ class StudyRequest:
             raise ValueError("holdout days can't be negative")
         if "/" not in self.pair:
             raise ValueError(f"instrument {self.pair!r} should look like BTC/USD")
+        if self.old_window_too and self.score_window != "continuous":
+            raise ValueError("the old walk-forward verdict is shown beside a continuous window's only")
+        if self.placebo_parent is not None and self.score_window != "continuous":
+            raise ValueError("the placebo runs on a continuous scoring window only")
+        if not 0 < self.starting_capital < float("inf"):
+            raise ValueError("the starting capital must be above 0")
 
 
 def _bars(minutes: int) -> str:
@@ -165,14 +180,25 @@ def run_store_study(req: StudyRequest, store=None, progress=None, ledger_path: P
     ledger = IdeaLedger(ledger_path or LEDGER)
     register = TrialsRegister(store) if store is not None else None
     dataset = dataset_name(profile.name, req.pair, req.minutes)
-    result = run_study(
-        spec, prices, instrument, dataset=dataset, ledger=ledger, default_params=req.params,
-        holdout_days=req.holdout_days,
-        train_days=req.train_days, test_days=req.test_days, use_holdout=req.use_holdout,
-        exits=req.exits(),
-        risk_profile=req.risk_profile, exec_prices=exec_prices, half_spread=spread, progress=progress,
-        oos_exec_prices=oos_exec, minute_loader=minutes_between, register=register,
-        locks=HoldoutLocks(store) if store is not None else None, pinned=req.pinned)
+    def study(window: str, ledger, register, progress):
+        return run_study(
+            spec, prices, instrument, dataset=dataset, ledger=ledger, default_params=req.params,
+            holdout_days=req.holdout_days,
+            train_days=req.train_days, test_days=req.test_days, use_holdout=req.use_holdout,
+            exits=req.exits(),
+            risk_profile=req.risk_profile, exec_prices=exec_prices, half_spread=spread, progress=progress,
+            oos_exec_prices=oos_exec, minute_loader=minutes_between, register=register,
+            locks=HoldoutLocks(store) if store is not None else None, pinned=req.pinned, score_window=window,
+            placebo_parent=req.placebo_parent if window == req.score_window else None,
+            starting_capital=req.starting_capital)
+
+    result = study(req.score_window, ledger, register, progress)
+    old = None
+    if req.old_window_too:  # R-12: the same settings on the old window, its runs counted nowhere (no new try)
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as scratch:
+            old = study("walk_forward", IdeaLedger(Path(scratch) / "old_window.jsonl"), None, None)
     # The fees the strategy's runs paid: a perpetual market's own when it trades one, not the venue's spot rates (RE-COST).
     paid = result.fee_basis
     fee_words = fees.text if paid is None or paid == fees.fees else \
@@ -195,14 +221,74 @@ def run_store_study(req: StudyRequest, store=None, progress=None, ledger_path: P
     while out.exists():  # two runs in the same second
         n += 1
         out = out.with_name(f"{stem}-{n}.md")
-    out.write_text(render(result, ledger, register), encoding="utf-8")
+    out.write_text(render(result, ledger, register, old=old, files=True), encoding="utf-8")
     write_results(result, out)
+    write_returns(result, out)
+    write_oos_returns(result, out)
+    write_beside(result, out)
     return out
+
+
+BESIDE = ("trades.csv", "equity.csv", "equity.svg")  # R-15: what sits beside a sheet as <stem>-<kind>, all it may
+
+
+def write_beside(result, sheet: Path) -> None:
+    """R-15: the sheet's every trade, its daily equity and buy-and-hold's, and their curve, beside it, never trimmed."""
+    from sleeve_fund.research import periods
+
+    eq, hold = periods.scored(result)
+    files = {"trades.csv": periods.trades_csv(periods.trade_rows(result.full_period)),
+             "equity.csv": periods.equity_csv(eq, hold),
+             "equity.svg": periods.equity_svg(eq, hold, f"{sheet.stem}: equity, Strategy and buy and hold")}
+    for kind in BESIDE:
+        sheet.with_name(f"{sheet.stem}-{kind}").write_text(files[kind], encoding="utf-8")
 
 
 def results_path(sheet: Path) -> Path:
     """B-22: the stored figures beside a tear sheet, for the page to read as fields rather than words."""
     return sheet.with_suffix(".results.json")
+
+
+def returns_path(sheet: Path) -> Path:
+    """R-20: the daily returns a tear sheet's "Risk, trades and costs" section is computed on, beside it."""
+    return sheet.with_suffix(".returns.csv")
+
+
+def write_returns(result, sheet: Path) -> Path:
+    """R-20 (HoE, 21 Oct): the strategy's daily returns over the sheet's window (the full research period until R-11's
+    scored window), as CSV (date, return), written in the same step as the sheet, for the fund summary's correlation
+    matrix. Never a holdout day: a series running past the research period is refused, not written."""
+    from sleeve_fund.research.metrics import daily_returns
+
+    ret = daily_returns(result.full_period.equity)
+    if len(ret) and ret.index[-1] > result.research_end:
+        raise ValueError(f"the returns run to {ret.index[-1]}, past the research period's end {result.research_end}: "
+                         "a holdout day would be in them")
+    path = returns_path(sheet)
+    path.write_text("date,return\n" + "".join(f"{t:%Y-%m-%d},{v!r}\n" for t, v in ret.items()), encoding="utf-8")
+    return path
+
+
+def oos_returns_path(sheet: Path) -> Path:
+    """(d) FINALIST-CORR: the out-of-sample daily returns and the asset's price return on those days, beside the sheet."""
+    return sheet.with_suffix(".oos-returns.csv")
+
+
+def write_oos_returns(result, sheet: Path) -> Path:
+    """(d) FINALIST-CORR (HoE, 21 Oct): the strategy's out-of-sample daily returns (the walk-forward test windows,
+    net of costs, a day out of the market a 0) and the asset's plain price return each of those days, as CSV
+    (date, return, price), for the fund summary's finalist correlation. Never a holdout day, as write_returns."""
+    from sleeve_fund.research.metrics import daily_returns
+
+    ret = result.oos_returns
+    if len(ret) and ret.index[-1] > result.research_end:
+        raise ValueError(f"the out-of-sample returns run to {ret.index[-1]}, past the research period's end "
+                         f"{result.research_end}: a holdout day would be in them")
+    price = daily_returns(result.research_closes).reindex(ret.index)
+    path = oos_returns_path(sheet)
+    path.write_text("date,return,price\n" + "".join(f"{t:%Y-%m-%d},{v!r},{p!r}\n"
+                                                    for t, v, p in zip(ret.index, ret, price)), encoding="utf-8")
+    return path
 
 
 def write_results(result, sheet: Path) -> Path:

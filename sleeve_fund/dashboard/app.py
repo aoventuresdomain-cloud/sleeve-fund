@@ -18,7 +18,7 @@ import secrets
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import urlencode, urlparse
+from urllib.parse import quote, urlencode, urlparse
 from zoneinfo import ZoneInfo
 
 import markdown
@@ -74,6 +74,7 @@ from sleeve_fund.strategies import (
     STOPLESS_MAX_LEVERAGE,
     check_perp_sizing,
     check_perp_stop,
+    check_study_only,
     places_stop,
 )
 from sleeve_fund.strategies.base import exit_warmup, maker_orders_enabled
@@ -920,6 +921,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                     s = st().sleeve(name)
                     check_perp_sizing(s.strategy, s.params)
                     check_perp_stop(s.strategy, s.params, s.risk_profile)
+                    check_study_only(s.strategy, s.params)  # R-06/R-07: studies only
                     try:
                         defaults = _defaults(s.strategy)
                     except ModuleNotFoundError as exc:
@@ -1398,10 +1400,29 @@ def create_app(store: Store | None = None) -> FastAPI:
         return Response(path.read_bytes(), media_type="text/markdown; charset=utf-8",
                         headers={"Content-Disposition": f'attachment; filename="{path.name}"'})
 
+    @app.get("/research/{sheet}/file/{kind}")
+    def tearsheet_file(sheet: str, kind: str, _: str = Depends(require_pm)):
+        """R-15: a file beside the sheet, one of run.BESIDE by its exact name only: the trade list, the daily equity
+        or its curve, never any other path."""
+        from sleeve_fund.research.run import BESIDE
+
+        if kind not in BESIDE:
+            raise HTTPException(404, "no such file")
+        path = _sheet_path(sheet).with_name(f"{_sheet_path(sheet).stem}-{kind}")
+        if not path.is_file():
+            raise HTTPException(404, "no such file")
+        media = "image/svg+xml" if kind.endswith(".svg") else "text/csv; charset=utf-8"
+        headers = {"X-Content-Type-Options": "nosniff", "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'"}
+        if kind.endswith(".csv"):
+            headers["Content-Disposition"] = f'attachment; filename="{path.name}"'
+        return Response(path.read_bytes(), media_type=media, headers=headers)
+
     @app.get("/research/{sheet}", response_class=HTMLResponse)
     def tearsheet(request: Request, sheet: str, _: str = Depends(require_pm)):
         path = _sheet_path(sheet)
         html = markdown.markdown(path.read_text(encoding="utf-8"), extensions=["tables"])
+        # R-15: the files beside the sheet, by their fixed names only, at this sheet's own route for them.
+        html = html.replace('href="beside:', f'href="/research/{quote(path.stem)}/file/')
         # Results as status chips, so a FAIL can't be missed in a wall of text.
         for word, tone, label in (("PASS", "running", "Pass"), ("FAIL", "halted", "Fail"), ("WARN", "paused", "Warn"),
                                   ("INFO", "stopped", "Info"), ("NOT JUDGED", "paused", "Not judged"),
@@ -3164,6 +3185,7 @@ def _check_strategy_params(cfg: SleeveConfig, half_spread: float = 0.0) -> None:
 
     check_perp_sizing(cfg.strategy, cfg.params)
     check_perp_stop(cfg.strategy, cfg.params, cfg.risk_profile)
+    check_study_only(cfg.strategy, cfg.params)  # R-06/R-07: studies only until the PM approves
     _, config_cls = REGISTRY[cfg.strategy]
     params = dict(cfg.params)
     params.pop("max_notional", None)

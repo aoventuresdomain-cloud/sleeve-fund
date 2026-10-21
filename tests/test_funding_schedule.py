@@ -1,5 +1,5 @@
-"""An instrument the venue moves from 8-hour to 1-hour settlements mid-run (Advisor, 6 Oct 2026): the interim guard
-says so on the backtest, and every settlement is charged at its stored time (QA P1-O1, #155)."""
+"""An instrument the venue moves from 8-hour to 1-hour settlements mid-run (Advisor, 6 Oct 2026): the backtest says
+so (informational since SOL-FUND, 21 Oct), and every settlement is charged at its stored time (QA P1-O1, #155)."""
 
 from __future__ import annotations
 
@@ -20,9 +20,11 @@ def _run(b):
     return backtest(b, hourly_bars("2025-10-03 00:00", "2025-10-05 00:00"), win(("2025-10-03 01:00", "2026-01-01", 1)))
 
 
-def test_the_backtest_says_the_settlement_schedule_does_not_fit(binance):
+def test_the_backtest_says_the_settlement_schedule_changed(binance):
+    # SOL-FUND (Advisor 21 Oct; TEC-SOLFUND-GUARD): informational, not a refusal, since each is charged at its time
     _switch()
-    assert _run(binance).funding_schedule.startswith("funding schedule mismatch: BTC/USDT settled 1 hours apart")
+    assert _run(binance).funding_schedule == ("BTC/USDT settled every 1 hours for 16 steps from 2025-10-04 09:00 UTC; "
+                                              "each charged at its own time and rate")
 
 
 def test_an_unchanged_schedule_is_no_mismatch(binance):

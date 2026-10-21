@@ -1,0 +1,57 @@
+# Pre-registered variant V1. Decision candle: 4h. (research/quant-researcher/trend-variants-preregistration.md, PM approved the round
+# 21 Oct): the parent qr01b_trend_multispeed_long with one change, no new long while the funding rate is in the top decile of its
+# trailing 90 days. Exits, stops and candles are the parent's. Studies only (R-06).
+# QR #1 default form (Advisor 14 Oct): multi-speed trend, long leg. Decision candle: 4h.
+version = 1
+name = "qr01b-trend-multispeed-long-v1-funding"
+title = "Trend Consensus (3 speeds, 4h) · Long · funding filter"
+reason = """Three EMA pairs (8/32, 16/64, 32/128) each vote on the trend, so no single setting decides. Go long when
+all three agree, leave when two of the three turn down; 3 ATR(14) stop."""
+
+[blocks.f1]
+kind = "ema"
+period = 8
+
+[blocks.s1]
+kind = "ema"
+period = 32
+
+[blocks.f2]
+kind = "ema"
+period = 16
+
+[blocks.s2]
+kind = "ema"
+period = 64
+
+[blocks.f3]
+kind = "ema"
+period = 32
+
+[blocks.s3]
+kind = "ema"
+period = 128
+
+[blocks.atr]
+kind = "atr"
+period = 14
+
+[blocks.fund]
+kind = "funding_decile"
+window_days = 90
+
+[long]
+entry = { all = [
+    { left = "f1", op = ">", right = "s1" },
+    { left = "f2", op = ">", right = "s2" },
+    { left = "f3", op = ">", right = "s3" },
+    { left = "fund", op = "<", right = 10 },
+] }
+exit = { any = [
+    { all = [{ left = "f1", op = "<", right = "s1" }, { left = "f2", op = "<", right = "s2" }] },
+    { all = [{ left = "f1", op = "<", right = "s1" }, { left = "f3", op = "<", right = "s3" }] },
+    { all = [{ left = "f2", op = "<", right = "s2" }, { left = "f3", op = "<", right = "s3" }] },
+] }
+
+[exits]
+stop = { level = { sub = ["close", { mul = [3.0, "atr"] }] } }

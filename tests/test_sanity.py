@@ -859,7 +859,7 @@ def test_a_perp_entry_puts_up_the_position_cap_as_margin_and_its_liquidation_pri
     never over it; and the liquidation price it reports is where that isolated margin falls to the maintenance
     margin: below the entry for a long, above it for a short, at the textbook (1 -/+ 1/leverage cap) /
     (1 -/+ maintenance) of the entry, and outside the profile's minimum distance. A long at 1x is fully paid for
-    and has none."""
+    and liquidates at the maintenance on it (TEC-BH102-1X, HoE and Advisor 21 Oct; until then it had none)."""
     prof = risk.PROFILES[profile]
     j = run_backtest("probe_ls", _swing(), TICK_INST, {"period": 5, **PERP}, starting_capital=10_000,
                      risk_profile=profile, bar_minutes=60, half_spread=HALF).journal
@@ -869,9 +869,6 @@ def test_a_perp_entry_puts_up_the_position_cap_as_margin_and_its_liquidation_pri
     for o in entries:
         sig = o["signal"]
         assert sig["sized_by"] == f"{profile} risk profile cap", sig
-        if o["side"] == "BUY" and prof.max_leverage <= 1:
-            assert "liquidation_px" not in sig, sig
-            continue
         lev, liq, close = sig["leverage"], sig["liquidation_px"], sig["close"]
         # The margin, notional over the leverage cap, is the position cap of the equity at entry, never more.
         assert prof.max_position_pct * 0.94 <= lev / prof.max_leverage <= prof.max_position_pct, sig
@@ -881,7 +878,10 @@ def test_a_perp_entry_puts_up_the_position_cap_as_margin_and_its_liquidation_pri
         # that leverage, not at the notional over the whole equity (review round 13, U13-2).
         # The nearer of the two formulas (VS-1-TABLE): a long's is on its entry value, 1 - 1/leverage + maintenance;
         # a short's on its value at the price, (1 + 1/leverage) / (1 + maintenance).
-        textbook = 1 - 1 / prof.max_leverage + m if side > 0 else (1 + 1 / prof.max_leverage) / (1 + m)
+        # A long's is nearer by its entry fee rate (LIQ-FEE), which only a 1x long's, at maintenance, is too small to
+        # hide inside the tolerance (TEC-BH102-1X).
+        taker = float(PERP_FEES.fees.taker)
+        textbook = 1 - 1 / prof.max_leverage + m + taker if side > 0 else (1 + 1 / prof.max_leverage) / (1 + m)
         assert liq / close == pytest.approx(textbook, rel=2e-3), sig
         assert abs(liq / close - 1) >= prof.min_liquidation_distance, sig
 

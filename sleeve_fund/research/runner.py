@@ -58,6 +58,10 @@ class BacktestResult:
     reentries_on_exit_candle: int = 0
     # A perpetual's funding payments as {"ts", "amount"} (+ received, - paid), oldest first.
     funding: list = field(default_factory=list)
+    # A rule-builder run's studies-only counts (Rules.rule_counts): funding_no_rate (R-06), vol_skipped (R-07).
+    rule_counts: dict = field(default_factory=dict)
+    # R-24: the stored settled rates its funding rate deciles read (funding_decile_source), for a placebo's fast path
+    funding_source: tuple | None = None
     # A perpetual's settlements as (ts, the venue's rate missing, a position held), and from them N of M held
     # settlements charged the baseline and the longest stretch of held time without the rate (QA P1-O17).
     funding_marks: list = field(default_factory=list)
@@ -66,7 +70,8 @@ class BacktestResult:
     funding_baseline_longest: pd.Timedelta = pd.Timedelta(0)
     # A simulated perp: no venue's rates at all, every settlement charged the baseline (Advisor, 6 Oct 2026)
     funding_simulated: bool = False
-    # Why the venue's stored settlements don't fit the schedule charged, or "" (funding.schedule_mismatch)
+    # The run's stored settlements closer together than the schedule's interval, each charged at its own time, or ""
+    # (funding.schedule_note; informational since SOL-FUND)
     funding_schedule: str = ""
     # Shortfalls past the bankruptcy price the venue's insurance fund took, as {"ts", "amount"}.
     insurance: list = field(default_factory=list)
@@ -91,6 +96,8 @@ class BacktestResult:
     # A perpetual's positions whose stop was held at half the way to the liquidation price at least once, because a
     # level loosened past it or funding moved the price nearer (STOP-LOOSEN-1).
     stops_clamped: int = 0
+    # Entry signals refused because the stop was past its share of the way to the liquidation price (BH-102).
+    entries_refused_liquidation: int = 0
     # The largest open risk one of those entries would have carried, as a share of this strategy's equity.
     open_risk_max: float = 0.0
     # Why paper would refuse to start these settings, when it would (a stopless model above 1x on a perp): the run
@@ -140,6 +147,26 @@ def _book_volume(feed: pd.DataFrame, instrument) -> pd.DataFrame:
 
 
 PAPER_REFUSED = "would be refused on paper (stopless above 1x)"
+
+
+FUNDING_BLOCK_NEEDS = ("the funding rate decile block reads the venue's stored settled funding rates, so it needs a "
+                       "perpetual on a venue that publishes them")
+
+
+def funding_decile_source(strategy, instrument) -> tuple:
+    """R-06: the stored settled rates a funding rate decile reads, as (times ns, rates, interval ns), sorted; a rate
+    the store holds but can't be believed (funding.believable) is left out, as the charge leaves it out."""
+    terms = strategy._cfg.perp
+    if terms is None or terms.funding_venue is None:
+        raise ValueError(FUNDING_BLOCK_NEEDS)
+    pair = pair_of(instrument)
+    cap = funding.cap_of(terms.funding_venue, pair)
+    s = funding.rates(terms.funding_venue, pair)
+    interval = int(pd.Timedelta(markets.funding_interval(terms.funding_hours)).value)
+    if not len(s):  # none stored (funding.rates gives an empty series): no value on any candle, never an assumed one
+        return np.array([], dtype=np.int64), np.array([], dtype=float), interval
+    s = s[[funding.believable(r, cap) for r in s.to_numpy()]]
+    return s.index.as_unit("ns").asi8.copy(), s.to_numpy(dtype=float).copy(), interval
 
 
 def paper_refusal(strategy: str, params: dict | None, risk_profile: str | None) -> str | None:
@@ -385,6 +412,10 @@ def add_leg(engine: BacktestEngine, plan: RunPlan, instrument: CurrencyPair | No
         **params,
     )
     strategy = plan.strategy_cls(cfg).attach_runtime(runtime)
+    if getattr(strategy, "funding_blocks", None) and strategy.funding_blocks():
+        source = funding_decile_source(strategy, instrument)
+        for block in strategy.funding_blocks():
+            block.source = source
     if plan.minutes_in:
         strategy.minute_source, strategy.range_source = minutes_from(exec_prices), ranges_from(prices)
     for node in getattr(getattr(strategy, "rules", None), "touches", ()):
@@ -521,9 +552,13 @@ def leg_result(engine: BacktestEngine, leg: Leg) -> BacktestResult:
         handler_error_count=strategy.handler_error_count,
         labels=fills_label(leg.exec_minutes, fee_model.intrabar) if leg.coarse else [],
         first_touch=touched,
+        rule_counts=strategy.rule_counts() if hasattr(strategy, "rule_counts") else {},
+        funding_source=next((b.source for b in strategy.funding_blocks()), None)
+        if getattr(strategy, "funding_blocks", None) else None,
         reentries_on_exit_candle=reentries_on_exit_candle(fills, strategy.decisions, plan.bar_minutes),
         open_risk_binds=strategy.open_risk_binds,
         stops_clamped=strategy.stops_clamped,
+        entries_refused_liquidation=strategy.entries_refused_liquidation,
         open_risk_max=strategy.open_risk_max,
         paper_refusal=paper_refusal(plan.strategy_name, plan.params, plan.risk_profile),
         portfolio_gate=dict(strategy.portfolio_gate),
@@ -613,12 +648,12 @@ def _funding_row(strategy, ts, amount: float, kind: str) -> dict:
 
 
 def _funding_schedule(strategy, instrument, prices: pd.DataFrame) -> str:
-    """funding.schedule_mismatch over the run, for a perp charged the venue's own rates."""
+    """funding.schedule_note over the run, for a perp charged the venue's own rates."""
     terms = strategy._cfg.perp
     if terms is None or terms.funding_venue is None or not len(prices):
         return ""
-    return funding.schedule_mismatch(terms.funding_venue, pair_of(instrument), terms.funding_hours,
-                                     start=prices.index[0], end=prices.index[-1]) or ""
+    return funding.schedule_note(terms.funding_venue, pair_of(instrument), terms.funding_hours,
+                                 start=prices.index[0], end=prices.index[-1])
 
 
 def _funding_interval(strategy) -> pd.Timedelta:

@@ -603,6 +603,22 @@ def _build_config(sleeve) -> None:
                assumed_taker_fee=float(cfg.fees.taker), **cfg.params)
 
 
+def check_study_only(store) -> Section:
+    """R-06/R-07: no Strategy uses what studies only may run (the funding rate decile block, sizing to a target
+    volatility) until the PM approves it for paper; any that does fails, named, as its Start is refused."""
+    from sleeve_fund.strategies import study_only_uses
+
+    sec = Section("Studies-only settings")
+    for s in store.sleeves(include_legs=False):
+        found = study_only_uses(s.params)
+        if found:
+            sec.add(FAIL, f"{s.name}: uses {' and '.join(found)}, which runs in studies only until the PM approves "
+                          "it for paper, so its Start is refused")
+    if not sec.lines:
+        sec.add(PASS, "no Strategy uses a studies-only block or sizing")
+    return sec
+
+
 def check_strength(store) -> Section:
     """G5: every Strategy set to size by signal strength builds the config its node will: a valid setting, not
     rebalancing to a target weight (CR F-G5-1; a band the Model injects counts, QD F-G5-3) and not a pair's leg (QD
@@ -634,7 +650,7 @@ def run(url: str, environ: dict[str, str] | None = None) -> tuple[bool, str]:
                 check_alerts(env), check_venues(engine), check_maintenance(store), check_price_ticks(store), check_lot_sizes(store),
                 check_venue_terms(store),
                 check_books(store), check_assets(store), check_warmups(store), check_account_sharing(env, engine),
-                check_strength(store), check_account_capital(store, env)]
+                check_strength(store), check_study_only(store), check_account_capital(store, env)]
     ok = not any(s.failed for s in sections)
     out = [f"Start check: {'PASS' if ok else 'FAIL'}",
            f"{datetime.now(UTC):%Y-%m-%d %H:%M} UTC, {journal_kind(url)} journal, read-only",
