@@ -36,7 +36,8 @@ from sleeve_fund import lifecycle, markets, open_risk, risk
 from sleeve_fund.data import bar_minutes
 from sleeve_fund import router
 from sleeve_fund import compliance_rules, ramp, strength
-from sleeve_fund.instruments import BOOK_SHARE, lot_decimals, pair_of, taker_slippage, target_fill_px
+from sleeve_fund.instruments import (BOOK_SHARE, lot_decimals, pair_of, taker_slippage, target_fill_px, target_level,
+                                     target_reached)
 from sleeve_fund import margin
 from sleeve_fund.margin import entry_liquidation
 from sleeve_fund.portfolio.compliance import KEY as COMPLIANCE_KEY
@@ -296,7 +297,7 @@ def replay_missed(minutes, side: int, venue: dict, guards: dict, target: float |
             level = venue.get(intent)
             if level is not None and side * (o - level) <= 0:
                 return intent, o, level, close, worst
-        if target is not None and side * (o - target) >= 0:
+        if target is not None and target_reached(side, o, o, target):
             return "take_profit", target_px, target, close, worst
         for intent in ("stop_loss", "liquidation"):
             level = venue.get(intent)
@@ -306,7 +307,7 @@ def replay_missed(minutes, side: int, venue: dict, guards: dict, target: float |
             level = guards.get(intent)
             if level is not None and side * (worst - level) <= 0:
                 return intent, level, level, close, worst
-        if target is not None and side * (best - target) >= 0:
+        if target is not None and target_reached(side, h, lo, target):
             return "take_profit", target_px, target, close, worst
     return None
 
@@ -1696,6 +1697,22 @@ class LongFlatStrategy(Strategy):
         if c.take_profit_r and stop is not None and stop > 0:
             return r_target(c.take_profit_r, stop, self._round_trip_cost(), side or self._entry_side or 1)
         return None
+
+    def _target_price(self) -> float | None:
+        """The open position's target as a price on the instrument's tick: the one level the backtest's bar, paper's
+        tick and the outage replay all judge a touch of (TP-EXIT rule 2). None without a target."""
+        if not self._tp_frac or self._entry_px is None:
+            return None
+        return target_level(self._entry_px, self._entry_side or 1, self._tp_frac, self.instrument.price_precision)
+
+    def _target_form(self) -> str:
+        """How the target was set, for the journal (TP-EXIT rule 6): a share of the entry, or R after costs."""
+        c = self._cfg
+        return f"{c.take_profit:.4g} of the entry" if c.take_profit else f"r={c.take_profit_r:g}" if c.take_profit_r else ""
+
+    def _target_values(self, level: float) -> dict:
+        """What a take-profit's exit records beside its fill: the level, its kind and how it was set (rules 6, 7)."""
+        return {"target_px": round(level, 8), "exit_kind": "take_profit", "target_form": self._target_form()}
 
     def _stop_cfg(self) -> dict:
         """The stop settings, journaled with each entry, so a later edit can tell whether it changed the stop."""
@@ -3172,7 +3189,7 @@ class LongFlatStrategy(Strategy):
         stop = self._replayed_stop(side, venue.get("stop_loss"))
         if stop is not None:
             venue["stop_loss"] = stop
-        target = entry * (1 + side * self._tp_frac) if self._tp_frac else None
+        target = self._target_price()
         cash = qty = 0.0
         if self._margin and self.runtime is not None:
             equity, cash, qty, _ = self._mark()
@@ -3268,8 +3285,10 @@ class LongFlatStrategy(Strategy):
             if intent in EXIT_LEGS:
                 self._lock_exit_leg(side if self._margin else True)
                 self._entry_px = None  # don't fire again while the order is in flight
-                self._exit_at_market(intent, reason, {"entry_px": entry, intent: self._stop_frac
-                                                      if intent == "stop_loss" else self._tp_frac}, px)
+                values = {"entry_px": entry, intent: self._stop_frac if intent == "stop_loss" else self._tp_frac}
+                if intent == "take_profit":
+                    values.update(self._target_values(target))
+                self._exit_at_market(intent, reason, values, px)
             elif intent == "liquidation":
                 self._liquidation_guard(cash, qty, px)
             else:  # the risk guard: the tick judges the equity at the minute's worst price, as it would have
@@ -3593,11 +3612,11 @@ class LongFlatStrategy(Strategy):
                                      f"{side * tp:+.2%} from entry", ts=self.runtime.now())
         reason = (f"Take-profit: the {level:,.6g} target, {tp:.1%} {'above' if side > 0 else 'below'} the "
                   f"{self._entry_px:,.6g} entry"
-                  + (f" ({self._cfg.take_profit_r:g}R after costs)" if self._cfg.take_profit_r else "")
+                  + (f" ({self._target_form()})" if self._target_form() else "")
                   + f", was reached, so it {'sells' if side > 0 else 'buys'} at market, booked at {book:,.6g}: the "
                   f"target less the taker's {float(taker_slippage(spread)):.2%} slippage (a bar that also reached "
                   "the stop takes the stop first)")
-        values = {"entry_px": self._entry_px, "take_profit": tp, "target_px": level}
+        values = {"entry_px": self._entry_px, "take_profit": tp, **self._target_values(level)}
         self._lock_exit_leg(side if self._margin else True)
         self._entry_px = None
         self._outage_book = {"book_px": book}
@@ -3621,9 +3640,9 @@ class LongFlatStrategy(Strategy):
             return None
         if self.fee_model is not None and self._opened_seq == self.fee_model.bar_seq:
             return None  # filled inside this bar: its extremes may have come before the fill, so judge from the next
-        level = Price(self._entry_px * (1 + side * tp), self.instrument.price_precision).as_double()
-        if not (bar.high.as_double() >= level if side > 0 else bar.low.as_double() <= level):
-            return None  # a market order on touch: reaching the level is enough (Advisor 19:40)
+        level = self._target_price()
+        if level is None or not target_reached(side, bar.high.as_double(), bar.low.as_double(), level):
+            return None  # a market order on touch: reaching the level is enough (Advisor 19:40, TP-EXIT rule 2)
         return level
 
     def _flip_after_target(self, bar: Bar, held: int) -> None:
@@ -3660,7 +3679,9 @@ class LongFlatStrategy(Strategy):
         side = self._entry_side or 1
         move = price / self._entry_px - 1
         gain = side * move  # what the position made: a short gains as the price falls
-        hit = ("stop_loss" if stop is not None and gain <= -stop else "take_profit" if tp and gain >= tp else None)
+        target = self._target_price() if tp else None
+        hit = ("stop_loss" if stop is not None and gain <= -stop
+               else "take_profit" if target is not None and target_reached(side, price, price, target) else None)
         if hit != "stop_loss":
             self._backstop_since = None
         if hit != "take_profit":
@@ -3692,7 +3713,7 @@ class LongFlatStrategy(Strategy):
             if liq is not None:
                 values["liquidation_px"] = round(liq, 8)  # GAP-LIQ: judged on its fill (_gap_liquidation)
         if hit == "take_profit":  # the level beside the real fill, for fills-against-model (Advisor L12)
-            values["target_px"] = round(self._entry_px * (1 + side * tp), 8)
+            values.update(self._target_values(target))
         self._lock_exit_leg(side if self._margin else True)
         self._entry_px = None  # don't fire again while the sell is in flight
         self._exit_at_market(hit, reason, values, price)

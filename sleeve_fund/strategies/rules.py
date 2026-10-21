@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from nautilus_trader.model import Bar
 
 from sleeve_fund.data import bar_minutes
-from sleeve_fund.strategies.base import MAX_STOP, MIN_STOP, IdeaSpec, LongFlatConfig, LongFlatStrategy
+from sleeve_fund.strategies.base import MAX_STOP, MIN_STOP, IdeaSpec, LongFlatConfig, LongFlatStrategy, r_target
 from sleeve_fund.strategies.definitions import (CATALOGUE, LEVEL_EXITS, Checked, Compiled, Env, block_value,
                                                 check_definition, definition_hash, load_definition_file, side_exits,
                                                 timeframe_label, to_params)
@@ -169,6 +169,7 @@ class Rules(LongFlatStrategy):
         self._leg_ts: int | None = None  # ns: the close of the candle the leg opened on, for a wall-clock time stop
         self._held_before: dict[int, bool] = {}  # whether each side's entry rule held on the candle before
         self._levels: dict | None = None  # the open position's level exits, by kind, set when it opened
+        self._tp_level: float | None = None  # a {level} take-profit's price, worked at each close (TP-EXIT rule 6)
         self._why: tuple[str, dict] | None = None  # why the leg changed on this candle, with the lineage payload
         # first_touch: (after ns, until ns) -> the 1-minute bars closing in (after, until], as (close ns, open, high,
         # low, close): the backtest's own minutes (research.runner), the hub's in paper (paper.node)
@@ -509,6 +510,10 @@ class Rules(LongFlatStrategy):
         `exit_at_level` follows its own, `stop` stays where it opened; the tightest becomes the position's stop
         from the next candle. Returns (kind, level) when this close is already past it."""
         side = self._entry_side or 1
+        tp = self._take_profit(side)
+        if self._entry_px is not None and tp is not None and tp[0] == "level":
+            self._tp_level = self._fresh_target(tp[1], side, self.env.ohlcv[3])
+            self._tp_frac = side * (self._tp_level / self._entry_px - 1) if self._tp_level is not None else None
         if self._entry_px is None or not self._side_levels(side):
             return None
         now = self._level_values(side) or {}
@@ -532,6 +537,45 @@ class Rules(LongFlatStrategy):
         if self._hold_stop_capped(side * (1 - level / self._entry_px)) and self._backtest:
             self._rest_exits()  # moves the resting stop
         return None
+
+    def _take_profit(self, side: int) -> tuple | None:
+        return self._side_exits(side).get("take_profit")
+
+    def _target_for(self, stop: float | None, side: int | None = None) -> float | None:
+        """TP-EXIT: {r = N} is N times this stop's distance after costs, worked once, at entry (rule 5); {level} is
+        the level now, as a share of the close, held back while it is on the wrong side (rule 6)."""
+        side = side or self._entry_side or 1
+        tp = self._take_profit(side)
+        if tp is None:
+            return super()._target_for(stop, side)
+        if tp[0] == "r":
+            return r_target(tp[1], stop, self._round_trip_cost(), side) if stop is not None and stop > 0 else None
+        close = self.env.ohlcv[3] if self.env.ohlcv else None
+        self._tp_level = self._fresh_target(tp[1], side, close)
+        return side * (self._tp_level / close - 1) if self._tp_level is not None else None
+
+    def _fresh_target(self, fn, side: int, close: float | None) -> float | None:
+        """A {level} target as this close leaves it: None (and noted) while it isn't past the close on the position's
+        side, so it can't fire on the next candle."""
+        level = fn(self.env)
+        if level is None or not close or side * (level - close) <= 0:
+            if level is not None and close:
+                self._note("target_level_wrong_side", f"Target held back: the take-profit level {level:,.6g} is "
+                           f"{'at or below' if side > 0 else 'at or above'} the close {close:,.6g}, so it can't be a "
+                           "target on the next candle")
+            return None
+        self._noted.discard("target_level_wrong_side")
+        return level
+
+    def _target_price(self) -> float | None:
+        tp = self._take_profit(self._entry_side or 1)
+        if tp is None or tp[0] != "level":
+            return super()._target_price()
+        return None if self._tp_level is None else round(self._tp_level, self.instrument.price_precision)
+
+    def _target_form(self) -> str:
+        tp = self._take_profit(self._entry_side or 1)
+        return tp[2] if tp is not None else super()._target_form()
 
     def _side_ratchet(self, side: int) -> bool:
         return self._side_exits(side).get("ratchet", True)

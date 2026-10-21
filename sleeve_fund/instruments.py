@@ -7,6 +7,7 @@ venue is assumed. Each venue's rates live in its profile (sleeve_fund.venues).
 from __future__ import annotations
 
 import math
+import operator
 
 from dataclasses import dataclass
 from decimal import ROUND_HALF_EVEN, ROUND_HALF_UP, Decimal
@@ -167,6 +168,24 @@ TAKER_SLIPPAGE_FLOOR = Decimal("0.0005")
 def taker_slippage(half_spread) -> Decimal:
     """A market order's slippage as a share of the price: half the spread, at least TAKER_SLIPPAGE_FLOOR."""
     return max(Decimal(str(half_spread)), TAKER_SLIPPAGE_FLOOR)
+
+
+# TP-EXIT (Advisor rule 2, HoE 21 Oct): a target is reached on a TOUCH, the level itself traded, in the backtest, paper's
+# tick and the outage replay alike. The comparison is this one parameter, so the three paths can't drift apart.
+TARGET_REACHED = operator.ge
+
+
+def target_reached(side: int, high: float, low: float, level: float) -> bool:
+    """Whether a position on `side` reached its target `level` within a range: a long's high, a short's low, at or
+    past the level (a tick is a range of one price)."""
+    best = high if side > 0 else low
+    return TARGET_REACHED(side * best, side * level)
+
+
+def target_level(entry: float, side: int, share: float, price_precision: int) -> float:
+    """The target's price: `share` past the entry on the position's side, on the instrument's tick (one level for
+    all three paths, so an exact touch of it is a touch in each)."""
+    return round(entry * (1 + side * share), price_precision)
 
 
 def target_fill_px(level, long: bool, half_spread) -> Decimal:
