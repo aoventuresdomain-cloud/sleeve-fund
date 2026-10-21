@@ -1,0 +1,577 @@
+"""TP-EXIT (HoE, Advisor 21 Oct 2026): a take-profit exit in a definition, {r = N} or {level = "<block>.<output>"}, and
+one rule for reaching it in all three paths:
+1. a taker fill at the level less max(half spread, 0.05 %), with the taker fee (target_fill_px);
+2. reached on a TOUCH (>= for a long, <= for a short) in the backtest, paper's tick and the outage replay: one shared
+   target_reached, its operator one parameter, and one target_level on the instrument's tick, so an exact touch is a
+   touch in each (the parity cell below has a bar whose high is the level exactly);
+3. never better than the level, a gap included;
+4. the stop goes first;
+5. {r}: R is the initial stop distance, frozen at entry;
+6. {level}: worked from closed candles and refreshed each candle; on the wrong side it doesn't fire on that candle;
+   the form is logged;
+7. every exit records its kind."""
+from __future__ import annotations
+
+import copy
+import os
+import re
+
+os.environ.setdefault("BACKTEST_ISOLATE", "0")
+
+import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
+import pytest  # noqa: E402
+
+from sleeve_fund.instruments import target_level, target_on_tick, target_reached  # noqa: E402
+from sleeve_fund.strategies.base import replay_missed  # noqa: E402
+from sleeve_fund.strategies.definitions import check_definition, to_params  # noqa: E402
+from test_hub_146_qa import _probe  # noqa: E402,F401 - the probe strategy the parity cells trade
+
+TP = 0.02
+
+
+# --- the shared rule ------------------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("side", [1, -1], ids=["long", "short"])
+def test_a_target_is_reached_on_a_touch_and_not_a_tick_short_of_it(side):
+    level = 61_200.0
+    assert target_reached(side, level, level, level)  # an exact touch
+    assert target_reached(side, level + side * 0.1, level + side * 0.1, level)  # through it
+    assert not target_reached(side, level - side * 0.1, level - side * 0.1, level)  # a tick short
+    # a long reads the high, a short the low: the other extreme never reaches it
+    hi, lo = (level, level - 50) if side > 0 else (level + 50, level)
+    assert target_reached(side, hi, lo, level)
+    assert not target_reached(side, lo if side > 0 else hi, lo if side > 0 else hi, level)
+
+
+def test_the_target_level_is_on_the_instruments_tick_and_never_better_than_the_exact_level():
+    """HoE TEC-TPEXIT-B14AA (3): a level between ticks goes to the tick past it, up for a long and down for a short,
+    so the target is never reached before the exact level is; one on a tick (to a millionth of one) stays there."""
+    from nautilus_trader.model import Price
+
+    def px(v):  # the tick as a Price's value, which the bars' prices are
+        return Price(v, 1).as_double()
+
+    assert target_level(60_000.06, 1, TP, 1) == px(61_200.1)  # 61,200.0612 up
+    assert target_level(60_000.06, -1, TP, 1) == px(58_800.0)  # 58,800.0588 down
+    assert target_level(60_000.05454545, 1, 0.01, 1) == px(60_600.1)  # b14aa's paper target, 60,600.055 up
+    assert target_level(60_060.0, 1, 0.03, 1) == px(61_861.8)  # 61,861.8 within float noise of its tick: stays
+    assert target_level(60_060.0, -1, 0.03, 1) == px(58_258.2)
+    # Advisor: the cases nearest would move toward the entry, a long at x.x4 and a short at x.x6
+    assert target_level(100.0, 1, 0.0004, 1) == px(100.1)  # 100.04: up, not down to 100.0
+    assert target_level(100.0, -1, 0.0004, 1) == px(99.9)  # 99.96: down, not up to 100.0
+
+
+@pytest.mark.parametrize("side", [1, -1], ids=["long", "short"])
+def test_the_outage_replay_takes_an_exact_touch_and_never_books_better_than_the_level(side):
+    level = 61_200.0 if side > 0 else 58_800.0
+    flat = 60_000.0
+    touch = (1, flat, level if side > 0 else flat, flat if side > 0 else level)
+    hit = replay_missed([touch], side, {}, {}, level, target_px=level * (1 - side * 0.0005))
+    assert hit is not None and hit[0] == "take_profit" and hit[2] == level
+    assert side * (hit[1] - level) <= 0  # never better than the level
+    gap = (1, level + side * 300, level + side * 400, level + side * 200)  # opens through it
+    hit = replay_missed([gap], side, {}, {}, level, target_px=level * (1 - side * 0.0005))
+    assert hit[0] == "take_profit" and side * (hit[1] - level) <= 0, hit  # a gap books the level's fill, not the open
+    both = (1, flat, max(level, flat * 1.03), min(level, flat * 0.97))  # the stop and the target in one minute
+    hit = replay_missed([both], side, {"stop_loss": flat * (1 - side * 0.01)}, {}, level)
+    assert hit[0] == "stop_loss", hit  # the stop goes first
+
+
+# --- parity: an exact touch fires in the backtest, paper and the replay -------------------------------------------
+
+def _touched(prices, level, at=(7.5, 7 + 50 / 60)):
+    p = prices.copy()
+    s = np.arange(len(p))
+    p[(s >= at[0] * 60) & (s < at[1] * 60)] = level
+    return p
+
+
+SETUPS = [("spot-long", False, "aggressive", 1), ("perp-3x-long", True, "aggressive", 1),
+          ("perp-3x-short", True, "aggressive", -1)]
+
+
+@pytest.mark.parametrize("label, perp, profile, side", SETUPS, ids=[s[0] for s in SETUPS])
+@pytest.mark.parametrize("path", ["backtest", "paper", "replay"])
+def test_an_exact_touch_of_the_target_fires_in_every_path(path, label, perp, profile, side):
+    """Advisor rule 2: a bar (or tick) whose high (a long's) or low (a short's) is the level exactly takes the target,
+    in the backtest, paper's tick and the outage replay, booked at the level less the taker's slippage."""
+    import test_hub_146_qa as qa
+
+    def run(p):
+        kw = {"side": side, "perp": perp, "profile": profile, "tp": TP, "stop": 0.01, "leave": 25}
+        if path == "backtest":
+            return None, qa.backtest(p, **kw)
+        if path == "paper":
+            r = qa.paper(p, **kw)
+        else:
+            r = qa.restart(p, 6, 12, qty=0.05, **kw)
+        return r, r.sequence()
+
+    flat = qa.flat_prices(30)
+    _, seq = run(flat)
+    entry = next(r[3] for r in seq if r[0] == "entry")
+    level = target_level(entry, side, TP, 1)
+    p = _touched(flat, level)
+    m = qa.minutes_of(p).iloc[7]
+    assert float(m["high" if side > 0 else "low"]) == level  # an exact touch, nothing through it
+    _, seq = run(p)
+    assert next(r[3] for r in seq if r[0] == "entry") == entry  # the same entry, so the same level
+    ex = qa.first_exit(seq)
+    assert ex[0] == "take_profit", (path, seq)
+    assert side * (ex[3] - level) <= 0, (ex, level)  # never better than the level
+    if path != "paper":  # paper's market order fills at the market; the backtest and replay book the model
+        assert ex[3] == pytest.approx(level * (1 - side * 0.0005), rel=1e-6), (ex, level)
+
+
+# --- the definition -------------------------------------------------------------------------------------------------
+
+BASE = {"version": 1, "reason": "A test case, written before it is run.",
+        "blocks": {"atr": {"kind": "atr", "period": 14}, "dc": {"kind": "donchian", "period": 20}},
+        "long": {"entry": {"left": "close", "op": ">", "right": 0}},
+        "exits": {"stop": {"level": {"sub": ["close", {"mul": [3.0, "atr"]}]}}}}
+
+
+def _with_tp(tp, exits=None):
+    d = copy.deepcopy(BASE)
+    if exits is not None:
+        d["exits"] = exits
+    d["exits"]["take_profit"] = tp
+    return d
+
+
+@pytest.mark.parametrize("tp", [{"r": 3}, {"r": 0.5}, {"level": "dc.upper"}])
+def test_a_take_profit_in_r_or_at_a_level_is_accepted(tp):
+    check_definition(_with_tp(tp), bar_spec="15-MINUTE-LAST-INTERNAL")
+
+
+@pytest.mark.parametrize("tp, exits, words", [
+    ({"r": 3}, {}, "take_profit needs a stop"),
+    ({"r": 3, "level": "dc.upper"}, None, "take_profit is"),
+    ({}, None, "take_profit is"),
+    ({"r": 0}, None, "take_profit.r"),
+    ({"r": 51}, None, "take_profit.r"),
+    ({"r": True}, None, "take_profit.r"),
+    ({"level": "nope.upper"}, None, "unknown reference"),
+])
+def test_a_malformed_take_profit_is_refused_with_its_reason(tp, exits, words):
+    with pytest.raises(ValueError, match=words):
+        check_definition(_with_tp(tp, exits), bar_spec="15-MINUTE-LAST-INTERNAL")
+
+
+def _bars(closes, highs=None, start="2025-10-03 00:01"):
+    idx = pd.date_range(start, periods=len(closes), freq="1min", tz="UTC")
+    c = np.asarray(closes, dtype=float)
+    h = np.asarray(highs if highs is not None else c, dtype=float)
+    return pd.DataFrame({"open": c, "high": np.maximum(h, c), "low": c, "close": c, "volume": 1e3}, index=idx)
+
+
+def _run(defn, df, instrument):
+    from sleeve_fund.research.runner import run_backtest
+
+    return run_backtest("rules", df, instrument, params=to_params(defn), bar_minutes=1, half_spread=0)
+
+
+def _exits(res):
+    f = res.fills.sort_values("ts_last")
+    return [(res.decisions[o]["intent"], res.decisions[o].get("signal") or {}) for o in f.index
+            if res.decisions[o]["intent"] != "entry"]
+
+
+def _entry_signal(res):
+    f = res.fills.sort_values("ts_last")
+    return next(res.decisions[o].get("signal") or {} for o in f.index if res.decisions[o]["intent"] == "entry")
+
+
+def _entry_fill(res):
+    f = res.fills.sort_values("ts_last")
+    return next(float(f.loc[o, "avg_px"]) for o in f.index if res.decisions[o]["intent"] == "entry")
+
+
+def test_an_r_target_is_r_times_the_initial_stop_in_price_from_the_fill_and_frozen(instrument):
+    """Rule 5 (Advisor, HoE 21 Oct): {r = 2} on a 1% trailing stop is the entry fill + 2 x (the fill - the stop level
+    the entry was planned with), costs charged on the fills, not in the level; the trail then tightens with the price
+    and the target stays where the fill set it."""
+    defn = {"version": 1, "reason": "A test case, written before it is run.", "blocks": {},
+            "long": {"entry": {"left": "close", "op": ">", "right": 0}},
+            "exits": {"trail": {"level": {"mul": [0.99, "close"]}}, "take_profit": {"r": 2}}}
+    closes = [100.0] * 3 + [100.3, 100.6, 100.9, 101.2, 101.5] + [104.0] * 5
+    res = _run(defn, _bars(closes), instrument)
+    entry, fill = _entry_signal(res), _entry_fill(res)
+    stop_level = entry["close"] * (1 - entry["stop_frac"])  # 99: the trail's level when the entry was planned
+    exits = _exits(res)
+    assert exits and exits[0][0] == "take_profit", exits
+    sig = exits[0][1]
+    assert sig["target_form"] == "r=2"
+    assert sig["target_px"] == pytest.approx(round(fill + 2 * (fill - stop_level), 1), abs=0.051), (sig, fill)
+
+
+def test_a_level_target_is_refreshed_each_candle_and_never_fires_on_a_candle_it_is_on_the_wrong_side(instrument):
+    """Rule 6: {level = "m.value"}, a 3-candle average of the closes, worked at each close for the next candle. After
+    the 00:04 close (101) it is 100.33, under the close: the wrong side for a long's target, so the 00:05 candle's
+    high of 103 doesn't take it. After the 00:07 close (98) it is 99, above: the 00:08 candle's high of 100 takes it,
+    at 99 less the taker's slippage."""
+    defn = {"version": 1, "reason": "A test case, written before it is run.",
+            "blocks": {"m": {"kind": "sma", "period": 3}},
+            "long": {"entry": {"left": "close", "op": ">", "right": 0}},
+            "exits": {"stop": {"level": {"mul": [0.9, "close"]}}, "take_profit": {"level": "m"}}}
+    closes = [100.0, 100.0, 100.0, 101.0, 101.0, 98.0, 98.0, 98.0, 98.0, 98.0]
+    highs = list(closes)
+    highs[4], highs[7] = 103.0, 100.0
+    df = _bars(closes, highs)
+    res = _run(defn, df, instrument)
+    exits = _exits(res)
+    assert exits and exits[0][0] == "take_profit", exits
+    sig = exits[0][1]
+    assert sig["target_form"] == "level=m" and sig["target_px"] == pytest.approx(99.0), sig
+    f = res.fills.sort_values("ts_last")
+    when = next(f.loc[o, "ts_last"] for o in f.index if res.decisions[o]["intent"] == "take_profit")
+    assert when >= df.index[7], (when, "fired on the wrong-side candle")
+
+
+def test_the_target_form_and_the_exit_kind_are_journaled(instrument):
+    defn = {"version": 1, "reason": "A test case, written before it is run.", "blocks": {},
+            "long": {"entry": {"left": "close", "op": ">", "right": 0}},
+            "exits": {"stop": {"level": {"mul": [0.99, "close"]}}, "take_profit": {"r": 1}}}
+    res = _run(defn, _bars([100.0] * 3 + [110.0] * 4), instrument)
+    exits = _exits(res)
+    assert exits[0][0] == "take_profit" and exits[0][1]["target_form"] == "r=1", exits
+    assert exits[0][1]["exit_kind"] == "take_profit"
+
+
+def test_qr01b_with_its_3_atr_stop_and_a_3r_target_reconciles(instrument):
+    """The HoE's reconcile: qr01b's own definition with take_profit = {r = 3} beside its 3 ATR(14) stop, daily bars.
+    Each target is 3R in price from its entry's fill (HoE 21 Oct); every take-profit fills on a touch of it, booked at the level
+    less the taker's slippage, never better; and the journal's cash is the run's end equity.
+    TEC-TPEXIT-QR01B-TICK (HoE 21 Oct), target exits only: (1) the target may sit up to one instrument tick past the
+    exact 3R, the tick past it on the position's worse side (TP-EXIT rule 2, instruments.target_on_tick); (2) the
+    journal's fill is the level less the floor exactly, and the report's price, which folds the exit fee's cent
+    rounding into it, is held to D13 pin e (1.5 cents over the quantity). Entries, stops, fees and P&L stay exact."""
+    import tomllib
+    from pathlib import Path
+
+    from sleeve_fund.data import synthetic_ohlcv
+    from sleeve_fund.research.runner import run_backtest
+    from sleeve_fund.store import replay_book
+
+    defn = tomllib.loads((Path(__file__).resolve().parents[1] / "configs/definitions/qr01b_trend_multispeed_long.toml")
+                         .read_text())
+    defn["exits"]["take_profit"] = {"r": 3}
+    df = synthetic_ohlcv(days=3000, seed=11)
+    res = run_backtest("rules", df, instrument, params=to_params(defn), bar_minutes=1440, half_spread=0.0002,
+                       risk_profile="balanced")  # with a profile, so the run keeps its journal
+    f = res.fills.sort_values("ts_last")
+    rows = [(res.decisions[o]["intent"], res.decisions[o].get("signal") or {}, float(f.loc[o, "avg_px"]),
+             float(f.loc[o, "filled_qty"])) for o in f.index]
+    targets, entry = [], None
+    for k, s, px, qty in rows:
+        if k == "entry":
+            entry = (s, px)
+        elif k == "take_profit":  # 3R in price from that entry's fill and its 3 ATR stop level as planned
+            stop_level = entry[0]["close"] * (1 - entry[0]["stop_frac"])
+            fill = s["entry_px"]  # the engine's entry, the fill before the report's cent rounding
+            # to 0.05: the journaled stop share is rounded to 6 places (x 3R); and up to a tick past it, the tick
+            # past the exact level (target_on_tick)
+            gap = s["target_px"] - (fill + 3 * (fill - stop_level))
+            assert -0.05 <= gap <= 0.05 + 10.0 ** -instrument.price_precision, (gap, s, entry)
+            targets.append((s, px, qty))
+    assert targets, [k for k, *_ in rows]
+    for s, px, qty in targets:
+        assert s["target_form"] == "r=3" and s["exit_kind"] == "take_profit"
+        assert px < s["target_px"], (px, s)  # never better than the level (rule 3)
+        # the level less the floor; the report carries the fee's cent rounding into the price (D13 pin e)
+        assert px == pytest.approx(s["target_px"] * (1 - 0.0005), abs=1.5 * 0.0100001 / qty + 1e-9), (px, qty, s)
+    orders = res.journal.orders_ if isinstance(res.journal.orders_, dict) else {
+        o["order_id"]: o for o in res.journal.orders_}
+    exits = [(orders[f["order_id"]]["signal"]["target_px"], f["price"]) for f in res.journal.fills_
+             if orders[f["order_id"]]["intent"] == "take_profit"]
+    assert len(exits) == len(targets)
+    for level, fill in exits:  # the journal's fill: the level less the taker's floor, exactly
+        assert fill == pytest.approx(level * (1 - 0.0005), rel=1e-12, abs=1e-9), (fill, level)
+    book = replay_book(res.journal.fills_, 10_000.0, res.journal.funding_total("backtest"),
+                       res.journal.insurance_total("backtest"))
+    marked = book["cash"] + book["qty"] * float(df["close"].iloc[-1])
+    assert marked == pytest.approx(float(res.equity.iloc[-1]), abs=0.05), (book, float(res.equity.iloc[-1]))
+
+
+@pytest.mark.parametrize("tp, words", [({"r": 3}, "3R (price), from the entry fill to the stop"),
+                                       ({"level": "dc.upper"}, "as set at each close")])
+def test_the_strategy_tab_says_the_take_profit_in_words(tp, words):
+    from sleeve_fund.dashboard import strategy_words
+
+    (long_,) = strategy_words.rules(check_definition(_with_tp(tp)), 15)
+    assert ("Take-profit" in dict(long_["levels"])) and words in dict(long_["levels"])["Take-profit"], long_["levels"]
+
+
+@pytest.mark.parametrize("study", [{"take_profit_r": 2.0}, {"take_profit": 0.05}])
+def test_a_definitions_take_profit_and_a_study_wide_one_are_refused_together(study, instrument):
+    """HoE 21 Oct: the definition's {r} is R in price, the study-wide take_profit_r R after costs; a run may carry one
+    target, never both, so which one applied is never in doubt."""
+    from sleeve_fund.research.runner import run_backtest
+
+    defn = _with_tp({"r": 3})
+    with pytest.raises(ValueError, match="one take-profit"):
+        run_backtest("rules", _bars([100.0] * 30), instrument, params={**to_params(defn), **study}, bar_minutes=1,
+                     half_spread=0)
+
+
+def test_the_sheet_says_a_definitions_r_is_in_price():
+    from sleeve_fund.research.study import _definition_target_words, _exit_words
+
+    assert _definition_target_words(to_params(_with_tp({"r": 3}))) == ", take-profit at 3R (price)"
+    assert _definition_target_words(to_params(_with_tp({"level": "dc.upper"}))) == ", take-profit at the level dc.upper"
+    assert _exit_words({"take_profit_r": 3}) == "take-profit making 3R after costs"  # the study-wide one, unchanged
+
+
+def test_each_trades_r_is_its_own_stop_from_its_own_fill(instrument):
+    """Advisor round 1 (2): R comes from this trade's planned stop, never the last trade's: two trades in a row with
+    stops of clearly different distance (a 3 x ATR stop after a quiet and then a wild stretch), each target the fill
+    +- 2 x |its fill - its own stop level|."""
+    defn = {"version": 1, "reason": "A test case, written before it is run.", "blocks": {"atr": {"kind": "atr",
+                                                                                                  "period": 3}},
+            "long": {"entry": {"left": "close", "op": ">", "right": 0}},
+            "exits": {"stop": {"level": {"sub": ["close", {"mul": [3.0, "atr"]}]}}, "take_profit": {"r": 2}}}
+    c = np.r_[100.0 + 0.3 * (np.arange(80) % 2), 110.0, 110.0 + 2.0 * (np.arange(9) % 2), np.full(10, 200.0)]
+    n = len(c)  # 60 candles of warm-up for the ATR, then the two trades
+    # a quiet stretch (ATR about 0.3: a stop about 1 below), a jump to 110 that takes the first target, then a stop
+    # set across the jump (ATR about 4 or more), and 200, through the second target
+    idx = pd.date_range("2025-10-03 00:01", periods=n, freq="1min", tz="UTC")
+    df = pd.DataFrame({"open": np.r_[100.0, c[:-1]], "high": np.maximum(c, np.r_[100.0, c[:-1]]),
+                       "low": np.minimum(c, np.r_[100.0, c[:-1]]), "close": c, "volume": 1e3}, index=idx)
+    res = _run(defn, df, instrument)
+    f = res.fills.sort_values("ts_last")
+    trades, entry = [], None
+    for o in f.index:
+        d = res.decisions[o]
+        sig = d.get("signal") or {}
+        if d["intent"] == "entry":
+            entry = sig
+        elif d["intent"] == "take_profit":
+            stop_level = entry["close"] * (1 - entry["stop_frac"])
+            fill = sig["entry_px"]
+            trades.append((fill - stop_level, sig["target_px"], round(fill + 2 * (fill - stop_level), 1)))
+    assert len(trades) >= 2, [res.decisions[o]["intent"] for o in f.index]
+    (r1, got1, want1), (r2, got2, want2) = trades[:2]
+    assert abs(r2 / r1 - 1) > 0.5, (r1, r2)  # clearly different stops
+    assert got1 == pytest.approx(want1, abs=0.051) and got2 == pytest.approx(want2, abs=0.051), trades
+
+
+def test_ablation_takes_the_take_profit_off_on_its_own_and_with_the_last_stop():
+    """Advisor (TP-EXIT round 1): take_profit is an ablation unit of its own; removing a side's last stop removes its
+    take_profit too, as "no stop, no take-profit", run, never refused."""
+    from sleeve_fund.research import ablation
+
+    defn = _with_tp({"r": 3})
+    assert "exits.take_profit" in ablation.units(defn)
+    status, variant, _ = ablation.remove(defn, "exits.take_profit")
+    assert status == "ran" and "take_profit" not in variant["exits"] and "stop" in variant["exits"]
+    status, variant, note = ablation.remove(defn, "exits.stop")
+    assert status == "ran" and "exits" not in variant, (status, variant, note)
+    assert ablation.describe(defn, "exits.stop") == "no stop, no take-profit"
+    assert ablation.describe(defn, "exits.take_profit") == "take profit exit"
+
+
+def _supervised_rules(tmp_path, monkeypatch, sleeves):
+    from types import SimpleNamespace
+
+    from sleeve_fund import supervisor
+    from sleeve_fund.store import Store
+
+    store = Store(f"sqlite:///{tmp_path}/tp.db")
+    for name, defn in sleeves:
+        store.create_sleeve(name=name, strategy="rules", instrument="BTC/USDT", bar_spec="1-HOUR-LAST-INTERNAL",
+                            starting_balance=1_000, venue="binance", params={"market": "spot", "definition": defn})
+    started = []
+    monkeypatch.setattr(supervisor.subprocess, "Popen", lambda *a, **k: started.append(a[0][-1]) or
+                        SimpleNamespace(pid=1, poll=lambda: None, send_signal=lambda *a: None, wait=lambda **k: 0))
+    return store, supervisor.Supervisor(store), started
+
+
+def test_start_refuses_an_r_take_profit_until_its_target_survives_a_restart(tmp_path, monkeypatch):
+    """HoE 21 Oct (TP-RESTART): an {r} target is set from the opening fill and lives in memory only, so a restart
+    would lose it. Until it is journaled and restored, Start refuses it in words; a {level} target is worked out
+    afresh at each close, so it starts. Backtests and studies are unaffected."""
+    from sleeve_fund.strategies import TARGET_RESTART_REFUSAL, check_target_restart
+
+    shared, per_side = _with_tp({"r": 3}), copy.deepcopy(BASE)
+    per_side["exits"] = {"long": {"stop": BASE["exits"]["stop"], "take_profit": {"r": 2.5}}}
+    store, sup, started = _supervised_rules(tmp_path, monkeypatch, [
+        ("r3", shared), ("r25", per_side), ("level", _with_tp({"level": "dc.upper"})), ("none", copy.deepcopy(BASE))])
+    for _ in range(3):
+        sup.step()
+    assert sorted(started) == ["level", "none"]
+    for name, n in (("r3", "3"), ("r25", "2.5")):
+        s = store.sleeve(name)
+        assert s.desired_state == "stopped" and s.status == "stopped"
+        assert s.status_reason == f"not started: {TARGET_RESTART_REFUSAL.format(n=n)}"
+        assert [e["kind"] for e in store.events(name, limit=100)].count("start_refused") == 1
+    assert TARGET_RESTART_REFUSAL.format(n="3") == ("take-profit at 3×R can't run on paper until its target "
+                                                    "survives a restart (TP-RESTART)")
+    check_target_restart("buy_and_hold", {"market": "spot"})  # no definition, nothing to refuse
+
+
+@pytest.mark.parametrize("precision", [1, 2, 4])
+@pytest.mark.parametrize("side", [1, -1], ids=["long", "short"])
+def test_the_target_level_is_a_prices_value_so_a_bar_at_it_touches_it(side, precision):
+    """Advisor (v4): round() differs from a Price's value by a float hair in about a fifth of cases (60,060.06 x 1.03
+    at 2 decimals: 61,861.86 against 61,861.859999...), so a bar built from Prices exactly at the level missed it. The
+    level is the Price's value, and a bar's extreme at it reaches it, for either side, at every precision."""
+    from nautilus_trader.model import Price
+
+    rng = np.random.default_rng(precision)
+    entries = [60_060.06, 58_858.8, *rng.uniform(1.0, 100_000.0, 200)]
+    for entry in entries:
+        level = target_level(float(entry), side, 0.03, precision)
+        assert level == Price(level, precision).as_double()  # a Price's value, on the tick
+        exact = float(entry) * (1 + side * 0.03)
+        assert side * (level - exact) >= -10.0 ** -precision * 1e-6  # never short of the exact level
+        assert side * (level - exact) < 10.0 ** -precision  # and less than a tick past it
+        bar = Price(level, precision).as_double()  # the bar's high (long) or low (short), exactly at the level
+        assert target_reached(side, bar, bar, level)
+    assert round(60_060.06 * 1.03, 2) != Price(60_060.06 * 1.03, 2).as_double()  # the hair this pins
+
+
+# --- a definition's target on the tick (Advisor's v4 blocker) --------------------------------------------------------
+
+def _qd():
+    import test_tp_exit as qd
+
+    return qd
+
+
+@pytest.mark.parametrize("form", ["r", "level"])
+@pytest.mark.parametrize("side", ["long", "short"])
+def test_a_definitions_target_between_ticks_goes_past_it_and_fires_on_a_bar_exactly_there(side, form):
+    """Advisor (v4): a definition's target takes the same tick rule as every other (instruments.target_on_tick), at
+    two decimals: 3R from a 100 fill with a 2.0013 stop is 106.0039 (93.9961 short). Nearest would put it at 106.00
+    (94.00), toward the entry; it goes to 106.01 (93.99). A bar exactly there fires it; a bar a tick short of it, at
+    the level nearest would give, does not. The {level} form at 100 + 6.0039 (100 - 6.0039) the same."""
+    qd = _qd()
+    from sleeve_fund.venues import venue
+
+    sign = 1 if side == "long" else -1
+    tp = {"r": 3} if form == "r" else {"level": {"add" if sign > 0 else "sub": ["close", 6.0039]}}
+    defn = qd._defn(tp, side=side, stop=2.0013)
+    inst = venue("KRAKEN").instrument("BTC", "USD", price_precision=2)
+    params = {**to_params(defn), **({"market": "perp", "allow_short": True} if sign < 0 else {})}
+    want, short_of = (106.01, 106.00) if sign > 0 else (93.99, 94.00)
+
+    def run(extreme):
+        from sleeve_fund.research.runner import run_backtest
+
+        df = qd._bars(40)
+        df = qd._set(df, 20, **({"high": extreme} if sign > 0 else {"low": extreme}))
+        return run_backtest("rules", df, inst, params=params, bar_minutes=1, half_spread=0.0, fees=qd.FEES)
+
+    hit = qd._first(run(want))
+    assert hit is not None and hit[4]["target_px"] == pytest.approx(want, abs=1e-9), hit
+    assert qd._first(run(short_of)) is None  # a tick short of it: nearest's level, toward the entry
+
+
+def test_the_paper_tick_the_backtest_and_the_replay_take_a_definitions_target_on_the_tick_past_it(tmp_path):
+    """Advisor (v4), all three paths: a definition's {r} target between ticks (the fill 60,006, the stop 1,200.013
+    below the entry close: 3R = 3,618.039, so 63,624.039) is 63,624.1 in each. A trade at 63,624.0, where nearest would
+    put it, takes it in none; a trade at 63,624.1 takes it in the same minute in the paper tick, the backtest's bar
+    and the outage replay."""
+    import test_tick_bar_parity as tbp
+
+    from sleeve_fund.instruments import target_fill_px
+    from sleeve_fund.research.runner import run_backtest
+
+    qd = _qd()
+    half = tbp.SPREAD / 2 / 60_000
+    params = to_params(qd._defn({"r": 3}, stop=1_200.013))
+
+    def session(touch, name):
+        prices = np.full(40 * 60, 60_000.0)
+        prices[25 * 60 + 30] = touch
+        path = tmp_path / f"{name}.jsonl.gz"
+        trades = tbp._record(path, prices, "rules", params, "aggressive")
+        bars = trades.resample("1min", closed="left", label="right").ohlc()
+        bars["volume"] = 1e9
+        res = run_backtest("rules", bars, tbp.INST, params=params, starting_capital=10_000, risk_profile="aggressive",
+                           bar_minutes=1, half_spread=half, fees=qd.FEES)
+        orders, _ = tbp.replay(path, with_fills=True)
+        return bars, res, [o for o in orders if o["intent"] == "take_profit"]
+
+    fill = qd._entry_fill(session(64_000.0, "probe")[1])
+    exact = fill + 3 * abs(fill - (60_000.0 - 1_200.013))
+    level = target_on_tick(exact, 1, 1)
+    assert level == pytest.approx(63_624.1) and round(exact, 1) == pytest.approx(63_624.0)  # the case nearest moves
+    bars, res, paper = session(round(exact, 1), "short_of")
+    assert qd._first(res) is None and paper == []  # a tick short of it: neither the bar nor the tick takes it
+    row = bars.loc[bars.index[bars["high"] >= round(exact, 1)][0]]
+    assert replay_missed([(0, row["open"], row["high"], row["low"])], 1, {}, {}, level) is None
+    bars, res, paper = session(level, "touch")
+    bt = qd._first(res)
+    minute = bars.index[bars["high"] >= level][0]
+    assert bt is not None and bt[1] == minute and bt[4]["target_px"] == pytest.approx(level, abs=1e-9)
+    assert paper and tbp._minute(pd.Timestamp(paper[0]["ts"]).to_pydatetime()) == minute.to_pydatetime()
+    assert paper[0]["signal"]["target_px"] == pytest.approx(level, abs=1e-9)
+    row = bars.loc[minute]
+    hit = replay_missed([(minute.value, row["open"], row["high"], row["low"])], 1, {}, {}, level,
+                        float(target_fill_px(level, True, half)))
+    assert hit is not None and hit[0] == "take_profit" and hit[2] == level
+
+
+# --- CR M1 on 3081ab76: the paper tick, a fill with no stop level, a short-only {r}, the snap ------------------------
+
+def test_the_paper_tick_takes_an_r_target_a_float_hair_above_its_tick_at_that_tick_and_not_before(tmp_path):
+    """CR M1 (1): paper's tick path judges the target on the tick (target_on_tick), not the gain against the exact
+    share. From paper's 60,006 fill, a 1,200.4 stop puts 3R at 63,625.200000000004, a float hair above the 63,625.2
+    tick: a trade at 63,625.2 takes it (the share would miss it by the hair); a trade at 63,625.1, a tick before it,
+    does not."""
+    import test_tick_bar_parity as tbp
+
+    qd = _qd()
+    params = to_params(qd._defn({"r": 3}, stop=1_200.4))
+
+    def paper(touch, name):
+        prices = np.full(40 * 60, 60_000.0)
+        prices[25 * 60 + 30] = touch
+        path = tmp_path / f"{name}.jsonl.gz"
+        tbp._record(path, prices, "rules", params, "aggressive")
+        orders, _ = tbp.replay(path, with_fills=True)
+        return orders
+
+    (entry,) = [o for o in paper(60_000.0, "flat") if o["intent"] == "entry"]
+    exact = entry["avg_px"] + 3 * abs(entry["avg_px"] - (60_000.0 - 1_200.4))
+    assert 0 < exact - 63_625.2 < 1e-7 and target_on_tick(exact, 1, 1) == 63_625.2, exact  # the hair this cell needs
+    assert 63_625.2 / entry["avg_px"] - 1 < exact / entry["avg_px"] - 1  # where the share would miss it
+    assert [o for o in paper(63_625.1, "before") if o["intent"] == "take_profit"] == []
+    (hit,) = [o for o in paper(63_625.2, "at") if o["intent"] == "take_profit"]
+    assert hit["signal"]["target_px"] == pytest.approx(63_625.2, abs=1e-9)
+
+
+def test_an_r_fill_with_no_stop_level_notes_it_and_sets_no_target():
+    """CR M1 (2): R is measured from the stop level known at the fill; with none (no plan and no levels yet), the
+    fill notes target_no_stop_level and sets no target, never R from a share of the price nor an error in the
+    fill handler."""
+    from types import SimpleNamespace
+
+    from sleeve_fund.strategies.rules import Rules
+
+    notes = []
+    s = SimpleNamespace(_take_profit=lambda side: ("r", 3.0, "3R"), _entry_px=60_000.0, _entry_side=1, _r_stop=None,
+                        _levels={}, _tp_frac=0.05, _tp_level=63_000.0, _note=lambda kind, words: notes.append(kind))
+    Rules._fill_target(s)
+    assert notes == ["target_no_stop_level"] and s._tp_level is None and s._tp_frac is None
+
+
+def test_start_refuses_a_short_only_r_take_profit_too():
+    """CR M1 (3): TP-RESTART's refusal reads both sides; a definition whose only {r} target is on its short side
+    is refused as a long one is."""
+    from sleeve_fund.strategies import TARGET_RESTART_REFUSAL, check_target_restart
+
+    defn = copy.deepcopy(BASE)
+    defn["exits"] = {"short": {"stop": BASE["exits"]["stop"], "take_profit": {"r": 2}}}
+    with pytest.raises(ValueError, match=re.escape(TARGET_RESTART_REFUSAL.format(n="2"))):
+        check_target_restart("rules", {"definition": defn})
+
+
+def test_a_level_a_float_hair_past_a_tick_snaps_to_it_rather_than_a_tick_further():
+    """CR M1 (4): within 1e-6 of a tick the level is on it (as margin.to_tick): float noise above a long's tick, or
+    below a short's, never moves the target a whole tick past the level."""
+    assert target_on_tick(100.00000000001, 1, 2) == 100.0
+    assert target_on_tick(99.99999999999, -1, 2) == 100.0
+    assert target_on_tick(63_625.200000000004, 1, 1) == 63_625.2

@@ -7,9 +7,10 @@ venue is assumed. Each venue's rates live in its profile (sleeve_fund.venues).
 from __future__ import annotations
 
 import math
+import operator
 
 from dataclasses import dataclass
-from decimal import ROUND_HALF_EVEN, ROUND_HALF_UP, Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_EVEN, ROUND_HALF_UP, Decimal
 
 from nautilus_trader.backtest import SimulationModule
 from nautilus_trader.execution import FeeModel
@@ -167,6 +168,38 @@ TAKER_SLIPPAGE_FLOOR = Decimal("0.0005")
 def taker_slippage(half_spread) -> Decimal:
     """A market order's slippage as a share of the price: half the spread, at least TAKER_SLIPPAGE_FLOOR."""
     return max(Decimal(str(half_spread)), TAKER_SLIPPAGE_FLOOR)
+
+
+# TP-EXIT (Advisor rule 2, HoE 21 Oct): a target is reached on a TOUCH, the level itself traded, in the backtest, paper's
+# tick and the outage replay alike. The comparison is this one parameter, so the three paths can't drift apart.
+TARGET_REACHED = operator.ge
+
+
+def target_reached(side: int, high: float, low: float, level: float) -> bool:
+    """Whether a position on `side` reached its target `level` within a range: a long's high, a short's low, at or
+    past the level (a tick is a range of one price)."""
+    best = high if side > 0 else low
+    return TARGET_REACHED(side * best, side * level)
+
+
+def target_on_tick(level: float, side: int, price_precision: int | None) -> float:
+    """A target price on the instrument's tick, as a Price's value (the bars' prices are Prices: round() differs from
+    one by a float hair, so an exact touch would miss). Between ticks it goes to the tick past it, up for a long and
+    down for a short, so it is never reached before the exact level is (HoE TEC-TPEXIT-B14AA (3), Advisor); within a
+    millionth of a tick of one it is that tick, so float noise never moves it a whole tick (as margin.to_tick). The
+    one rounding of every target, a share of the entry's and a definition's alike. Exact with no precision."""
+    if price_precision is None:
+        return level
+    n = Decimal(repr(level)).scaleb(price_precision)
+    near = n.to_integral_value(ROUND_HALF_EVEN)
+    n = near if abs(n - near) < Decimal("1e-6") else n.to_integral_value(ROUND_CEILING if side > 0 else ROUND_FLOOR)
+    return Price(float(n.scaleb(-price_precision)), price_precision).as_double()
+
+
+def target_level(entry: float, side: int, share: float, price_precision: int | None) -> float:
+    """The target's price: `share` past the entry on the position's side, on the tick (target_on_tick), one level
+    for all three paths, so an exact touch of it is a touch in each."""
+    return target_on_tick(entry * (1 + side * share), side, price_precision)
 
 
 def target_fill_px(level, long: bool, half_spread) -> Decimal:

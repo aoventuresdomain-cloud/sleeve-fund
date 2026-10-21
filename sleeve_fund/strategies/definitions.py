@@ -65,7 +65,8 @@ TIME_RANGE = {"hour": (0, 23), "weekday": (0, 6), "day_of_month": (1, 31), "days
 SINCE_ENTRY = {"max_since_entry": max, "min_since_entry": min}
 TOP_KEYS = ("version", "name", "title", "reason", "blocks", "long", "short", "exits", "costs")
 LEVEL_EXITS = ("stop", "trail", "exit_at_level")
-SIDE_EXITS = ("time_stop", *LEVEL_EXITS)  # what [exits.long] and [exits.short] may hold (G1)
+SIDE_EXITS = ("time_stop", *LEVEL_EXITS, "take_profit")  # what [exits.long] and [exits.short] may hold (G1)
+MAX_TAKE_PROFIT_R = 50  # as take_profit_r's cap: a multiple of R
 MAX_BREAKOUT_SLIPPAGE_BP = 500
 
 class ClosedChannel(Donchian):
@@ -673,6 +674,8 @@ def _check_exit_table(exits: dict, blocks: dict, uses_prev: list, side: str, nam
         if not form or isinstance(n, bool) or not isinstance(n, int) or n < 1 or ts.get("count", "bars") != "bars":
             raise ValueError(f"{name('time_stop')} is {{minutes = N}} (wall-clock), {{bars = N}} (that many candles of "
                              "time) or {bars = N, count = \"bars\"} (the candles that came), N a whole number, at least 1")
+    if "take_profit" in exits:
+        _check_take_profit(exits, blocks, uses_prev, name("take_profit"))
     for kind in LEVEL_EXITS:
         if kind not in exits:
             continue
@@ -691,6 +694,26 @@ def _check_exit_table(exits: dict, blocks: dict, uses_prev: list, side: str, nam
             raise ValueError(f"{where}: {e['level']} is never {'below' if side == 'long' else 'above'} the "
                              f"close, so as the {side} side's stop it would hold back every {side} entry; a level "
                              "exit works only on the stop side")
+
+
+def _check_take_profit(exits: dict, blocks: dict, uses_prev: list, where: str) -> None:
+    """TP-EXIT (HoE, Advisor 21 Oct): {r = N}, the entry fill +- N x R, R in price from the fill to the initial stop
+    level (not the study-wide take_profit_r, which is R after costs), or {level = <operand>}, a level worked at each
+    close. Never without a stop: R is the stop's distance, and a target
+    alone would leave the position unguarded on the other side."""
+    tp = exits["take_profit"]
+    if not isinstance(tp, dict) or len(tp) != 1 or not set(tp) <= {"r", "level"}:
+        raise ValueError(f"{where} is {{r = N}} (N x R in price, from the entry fill to the stop) or {{level = ...}}, one "
+                         "of the two")
+    if not set(exits) & set(LEVEL_EXITS):
+        raise ValueError(f"{where}: take_profit needs a stop (stop, trail or exit_at_level) on the same side")
+    if "r" in tp:
+        r = tp["r"]
+        if isinstance(r, bool) or not isinstance(r, (int, float)) or not 0 < r <= MAX_TAKE_PROFIT_R:
+            raise ValueError(f"{where}.r is a number above 0, at most {MAX_TAKE_PROFIT_R}: a multiple of R, the entry "
+                             "fill's distance to the stop")
+    else:
+        _check_operand(tp["level"], f"{where}.level", blocks, uses_prev)
 
 
 def _check_costs(costs: dict, defn: dict) -> None:
@@ -775,7 +798,17 @@ class Compiled:
         return {"time_stop": (("minutes", ts["minutes"]) if "minutes" in ts else ("count", ts["bars"]) if "count" in ts
                               else ("bars", ts["bars"]) if ts else None),
                 "levels": {k: self.operand(exits[k]["level"])[0] for k in LEVEL_EXITS if k in exits},
-                "ratchet": bool((exits.get("trail") or {}).get("ratchet", True))}
+                "ratchet": bool((exits.get("trail") or {}).get("ratchet", True)),
+                "take_profit": self._take_profit(exits.get("take_profit"))}
+
+    def _take_profit(self, tp: dict | None) -> tuple | None:
+        """("r", N, form) or ("level", fn(env), form), form the words the journal records (TP-EXIT rule 6)."""
+        if not tp:
+            return None
+        if "r" in tp:
+            return ("r", float(tp["r"]), f"r={tp['r']:g}")
+        return ("level", self.operand(tp["level"])[0], f"level={tp['level']}" if isinstance(tp["level"], str)
+                else "level")
 
     # operands: (fn(env) -> float | None, key, slowest timeframe read)
     def operand(self, x):

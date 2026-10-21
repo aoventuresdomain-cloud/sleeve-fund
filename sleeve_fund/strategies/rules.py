@@ -21,6 +21,7 @@ from decimal import Decimal
 from nautilus_trader.model import Bar
 
 from sleeve_fund.data import bar_minutes
+from sleeve_fund.instruments import target_on_tick
 from sleeve_fund.strategies.base import MAX_STOP, MIN_STOP, IdeaSpec, LongFlatConfig, LongFlatStrategy
 from sleeve_fund.strategies.definitions import (CATALOGUE, DAY_NS, LEVEL_EXITS, Checked, Compiled, Env, FundingDecile,
                                                 block_value, check_definition, definition_hash, load_definition_file,
@@ -86,6 +87,12 @@ class RulesConfig(LongFlatConfig):
     def __init__(self, *, definition: dict | None = None, definition_version: int | None = None,
                  definition_hash: str | None = None, vol_target_size: dict | None = None,
                  blocked_entries=None, **kwargs) -> None:
+        exits = (definition or {}).get("exits") or {}
+        if (kwargs.get("take_profit") or kwargs.get("take_profit_r")) and any(
+                "take_profit" in e for e in (exits, exits.get("long") or {}, exits.get("short") or {})):
+            # HoE 21 Oct: the definition's {r} is R in price, the study's take_profit_r R after costs: one target only
+            raise ValueError("the definition sets its own take_profit: a run carries one take-profit, so leave the "
+                             "study's take_profit and take_profit_r unset")
         super().__init__(**kwargs)
         self.vol_target_size = check_vol_target_size(vol_target_size)  # R-07, studies only (check_study_only)
         # R-24, a study's placebo calibration only: the decision candles (close ns) on which no entry opens
@@ -207,6 +214,8 @@ class Rules(LongFlatStrategy):
         self._leg_ts: int | None = None  # ns: the close of the candle the leg opened on, for a wall-clock time stop
         self._held_before: dict[int, bool] = {}  # whether each side's entry rule held on the candle before
         self._levels: dict | None = None  # the open position's level exits, by kind, set when it opened
+        self._tp_level: float | None = None  # the take-profit's price: {r} from the fill, {level} at each close (TP-EXIT)
+        self._r_stop: float | None = None  # the stop level an {r} target measures R from, as the entry was planned
         self._why: tuple[str, dict] | None = None  # why the leg changed on this candle, with the lineage payload
         # first_touch: (after ns, until ns) -> the 1-minute bars closing in (after, until], as (close ns, open, high,
         # low, close): the backtest's own minutes (research.runner), the hub's in paper (paper.node)
@@ -594,6 +603,10 @@ class Rules(LongFlatStrategy):
         `exit_at_level` follows its own, `stop` stays where it opened; the tightest becomes the position's stop
         from the next candle. Returns (kind, level) when this close is already past it."""
         side = self._entry_side or 1
+        tp = self._take_profit(side)
+        if self._entry_px is not None and tp is not None and tp[0] == "level":
+            self._tp_level = self._fresh_target(tp[1], side, self.env.ohlcv[3])
+            self._tp_frac = side * (self._tp_level / self._entry_px - 1) if self._tp_level is not None else None
         if self._entry_px is None or not self._side_levels(side):
             return None
         now = self._level_values(side) or {}
@@ -617,6 +630,64 @@ class Rules(LongFlatStrategy):
         if self._hold_stop_capped(side * (1 - level / self._entry_px)) and self._backtest:
             self._rest_exits()  # moves the resting stop
         return None
+
+    def _take_profit(self, side: int) -> tuple | None:
+        return self._side_exits(side).get("take_profit")
+
+    def _target_for(self, stop: float | None, side: int | None = None) -> float | None:
+        """TP-EXIT: {r = N} is N x R in price, R the distance from the entry to the initial stop level, worked from the
+        fill (_fill_target) and then frozen (Advisor rule 5, HoE 21 Oct: costs are charged on the fills, not built into
+        the level); until the fill, from this close. {level} is the level now, as a share of the close, held back
+        while it is on the wrong side (rule 6)."""
+        side = side or self._entry_side or 1
+        tp = self._take_profit(side)
+        if tp is None:
+            return super()._target_for(stop, side)
+        close = self.env.ohlcv[3] if self.env.ohlcv else None
+        if tp[0] == "r":
+            self._r_stop = self._tightest(self._levels, side) if self._levels else None
+            self._tp_level = None
+            return tp[1] * stop if stop is not None and stop > 0 else None
+        self._tp_level = self._fresh_target(tp[1], side, close)
+        return side * (self._tp_level / close - 1) if self._tp_level is not None else None
+
+    def _fresh_target(self, fn, side: int, close: float | None) -> float | None:
+        """A {level} target as this close leaves it: None (and noted) while it isn't past the close on the position's
+        side, so it can't fire on the next candle."""
+        level = fn(self.env)
+        if level is None or not close or side * (level - close) <= 0:
+            if level is not None and close:
+                self._note("target_level_wrong_side", f"Target held back: the take-profit level {level:,.6g} is "
+                           f"{'at or below' if side > 0 else 'at or above'} the close {close:,.6g}, so it can't be a "
+                           "target on the next candle")
+            return None
+        self._noted.discard("target_level_wrong_side")
+        return level
+
+    def _fill_target(self) -> None:
+        tp = self._take_profit(self._entry_side or 1)
+        if tp is None or tp[0] != "r" or not self._entry_px:
+            return
+        side = self._entry_side or 1
+        if self._r_stop is None and self._levels:  # a fill with no plan of its own (a resting entry): the levels now
+            self._r_stop = self._tightest(self._levels, side)
+        if self._r_stop is None:  # never R from a share of the price: no target rather than a wrong one
+            self._note("target_no_stop_level", "No take-profit on this entry: its stop level wasn't known at the fill, "
+                       "so R can't be measured from it")
+            self._tp_frac = self._tp_level = None
+            return
+        self._tp_level = self._entry_px + side * tp[1] * abs(self._entry_px - self._r_stop)
+        self._tp_frac = side * (self._tp_level / self._entry_px - 1)
+
+    def _target_price(self) -> float | None:
+        tp = self._take_profit(self._entry_side or 1)
+        if tp is None or self._tp_level is None:
+            return super()._target_price()  # a {level} target with no level now has no _tp_frac either
+        return target_on_tick(self._tp_level, self._entry_side or 1, self.instrument.price_precision)
+
+    def _target_form(self) -> str:
+        tp = self._take_profit(self._entry_side or 1)
+        return tp[2] if tp is not None else super()._target_form()
 
     def _side_ratchet(self, side: int) -> bool:
         return self._side_exits(side).get("ratchet", True)
