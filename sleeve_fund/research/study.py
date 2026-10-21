@@ -1049,15 +1049,15 @@ def run_study(
     fill = _draw_fill(spec, folds, minutes, oos_exec_prices, instrument, research, float(run_fees.taker))
     result.random_entry, result.random_side = _benchmarks(
         research, folds, test_bars, float(run_fees.taker), series if series is not None else spread_used,
-        full_default.shorts, leverage, market.get("market"), fill=fill)
+        full_default.shorts, leverage, market.get("market"), True, fill)
     if any(f.trip_charges for f in folds):  # the strategy's trips uncharged, for information only (ABSORB-GAP)
         result.random_entry_uncharged, result.random_side_uncharged = _benchmarks(
             research, folds, test_bars, float(run_fees.taker), series if series is not None else spread_used,
-            full_default.shorts, leverage, market.get("market"), charged=False, fill=fill)
+            full_default.shorts, leverage, market.get("market"), False, fill)
     for rung in ladder:  # the benchmark at each rung's own cost, as the rung's runs pay it (RE-COST)
         at_rung, _ = _benchmarks(research, folds, test_bars, rung.fee + slip,
                                  series if series is not None else spread_used, full_default.shorts, leverage,
-                                 market.get("market"), fill=fill)
+                                 market.get("market"), True, fill)
         if at_rung.trades:
             rung.oos_timing_return, rung.random_return = at_rung.strategy_return, at_rung.median_random_return
     if hold_market == markets.PERP and not market:
