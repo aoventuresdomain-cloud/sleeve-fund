@@ -1,0 +1,19 @@
+# QR-B12 price-vs-average family, try 3 (21 Oct 2026, Quant Researcher). Decision candle: 1d.
+# Sources: Brock, Lakonishok and LeBaron (1992), "Simple technical trading rules and the stochastic properties of
+# stock returns", Journal of Finance 47(5); Corbet, Eraslan, Lucey and Sensoy (2019), "The effectiveness of technical
+# trading rules in cryptocurrency markets", Finance Research Letters 31, 32-37.
+version = 1
+name = "qr23-vma-band-sma50-long"
+title = "BLL VMA(1,50,1%) with Hold-Inside-Band (daily) · Long"
+reason = """The variable-length moving-average rule of Brock, Lakonishok and LeBaron, the rule Corbet et al. (2019)
+found best on this asset, with buy signals stronger than sell signals. Buy when the close is more than 1% above its
+50-day average, go to cash when it is more than 1% below; the band cuts whipsaw trades. Traded with hold-inside-band: inside the band the previous state is kept (the paper gives no signal there). (1, 50, 1%) is the paper's
+standard setting, fixed before any run. No stop, as in the papers (held at 1x)."""
+
+[blocks.sma]
+kind = "sma"
+period = 50
+
+[long]
+entry = { left = "close", op = ">", right = { mul = [1.01, "sma"] } }
+exit = { left = "close", op = "<", right = { mul = [0.99, "sma"] } }

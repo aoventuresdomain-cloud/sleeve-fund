@@ -1,0 +1,21 @@
+# QR new family B12 (21 Oct 2026, Quant Researcher): the 200-day trend rule, long leg. Decision candle: 1d.
+version = 1
+name = "qr21-trend-sma200-long"
+title = "200-Day Trend (daily) · Long"
+reason = """The oldest fund trend rule: be long while the daily close is above its 200-day average and in cash below
+it, so the big declines are sat out and the long rises are held. A 3 ATR(14) stop guards against a sudden break."""
+
+[blocks.sma]
+kind = "sma"
+period = 200
+
+[blocks.atr]
+kind = "atr"
+period = 14
+
+[long]
+entry = { left = "close", op = ">", right = "sma" }
+exit = { left = "close", op = "<", right = "sma" }
+
+[exits]
+stop = { level = { sub = ["close", { mul = [3.0, "atr"] }] } }

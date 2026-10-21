@@ -1,0 +1,18 @@
+# QR-B12 price-vs-average family, try 2 (21 Oct 2026, Quant Researcher). Decision candle: 1d.
+# Source: Detzel, Liu, Strauss, Zhou and Zhu (2021), "Learning and predictability via technical analysis: evidence
+# from bitcoin and stocks with hard-to-value fundamentals", Financial Management 50(1), 107-137.
+version = 1
+name = "qr22-price-above-sma20-long"
+title = "Price Above 20-Day Average (daily) · Long"
+reason = """Detzel et al. (2021) find that the ratio of price to its moving average forecasts daily returns in and
+out of sample, and that holding when price is above the average (cash below) beats buy-and-hold on a risk-adjusted
+basis; they test 5- to 100-day averages. The 20-day, the middle of their set, is fixed here before any run. No stop,
+as in the paper (held at 1x)."""
+
+[blocks.sma]
+kind = "sma"
+period = 20
+
+[long]
+entry = { left = "close", op = ">", right = "sma" }
+exit = { left = "close", op = "<", right = "sma" }

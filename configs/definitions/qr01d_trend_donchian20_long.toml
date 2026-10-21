@@ -1,0 +1,25 @@
+# QR-B3 Donchian trend, try 2 (21 Oct 2026, Quant Researcher): the turtles' faster System 1. Decision candle: 1d.
+version = 1
+name = "qr01d-trend-donchian20-long"
+title = "Channel Breakout Trend (20-day, daily) · Long"
+reason = """The turtles' System 1: buy a daily close above the highest high of the last 20 days, hold with a stop that
+only tightens at the lowest low of the last 10 days. The faster published rule beside the 55/20 (row 5), which made
+too few trades to judge."""
+
+[blocks.entry_dc]
+kind = "donchian"
+period = 20
+
+[blocks.exit_dc]
+kind = "donchian"
+period = 10
+
+[long]
+entry = { left = "close", op = ">", right = { prev = "entry_dc.upper" } }
+breakout = true
+
+[exits]
+trail = { level = "exit_dc.lower", ratchet = true }
+
+[costs]
+breakout_slippage_bp = 5
