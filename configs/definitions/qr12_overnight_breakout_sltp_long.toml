@@ -1,0 +1,39 @@
+# QR-B8 overnight breakout family, SL/TP exit-set try (21 Oct 2026, Quant Researcher). Decision candle: 1h.
+# Variant of qr12_overnight_breakout_long, pre-registered before any run (PM 21 Oct 14:42-14:44 UK: every strategy carries an explicit
+# stop-loss and take-profit; values are the breakout type's convention, Advisor 21 Oct, never tuned per strategy).
+# take_profit needs TP-EXIT (Deploy 2): syntax provisional until it is live.
+version = 1
+name = "qr12-overnight-breakout-sltp-long"
+title = "Overnight Breakout (1h) + SL/TP · Long"
+reason = """qr12_overnight_breakout_long with the breakout take-profit added: fixed 2R measured from the parent's own stop, and a 10-candle time stop where the parent has none; whichever exit fires first wins. Entry and the morning exit unchanged; the parent's own 2.0 ATR stop is kept (Advisor: the type's stop applies only where a parent has none), so R is measured from it; the parent has no time stop, so the 10-candle one is added. Held at 1x."""
+
+[blocks.dc]
+kind = "donchian"
+period = 10
+timeframe = "1d"
+
+[blocks.atr]
+kind = "atr"
+period = 14
+
+[long]
+entry = { all = [
+    { left = "close", op = ">", right = "dc.upper" },
+    { any = [
+        { left = { time = "hour", tz = "Europe/London" }, op = ">=", right = 21 },
+        { left = { time = "hour", tz = "Europe/London" }, op = "<", right = 6 },
+    ] },
+] }
+exit = { all = [
+    { left = { time = "hour", tz = "Europe/London" }, op = ">=", right = 8 },
+    { left = { time = "hour", tz = "Europe/London" }, op = "<", right = 21 },
+] }
+breakout = true
+
+[costs]
+breakout_slippage_bp = 5
+
+[exits]
+stop = { level = { sub = ["close", { mul = [2.0, "atr"] }] } }
+take_profit = { r = 2.0 }
+time_stop = { bars = 10 }

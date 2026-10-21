@@ -100,3 +100,60 @@ idea_hash = "bc267b3b2ec714e0"
 [qr01e_trend_multispeed_trail_long]
 definition_hash = "8ffdb00228df3499"
 idea_hash = "100cdd465d4dca00"
+# Append to configs/definition_pins.toml. HoE re-checks on main's head before the PR.
+
+[qr01_trend_ema_sltp_long]
+definition_hash = "bdc30d4e5594d163"
+idea_hash = "1936332bb6a37387"
+
+[qr01b_trend_multispeed_sltp_long]
+definition_hash = "d0a2be87f9bd2cff"
+idea_hash = "7ae923949a885100"
+
+[qr01c_trend_donchian_sltp_long]
+definition_hash = "b81be769e6335697"
+idea_hash = "cad51105a0d07be5"
+
+[qr01d_trend_donchian20_sltp_long]
+definition_hash = "ff8148677aa7f541"
+idea_hash = "cad51105a0d07be5"
+
+[qr02_dip_sltp_long]
+definition_hash = "3edee45603d48b12"
+idea_hash = "05b0d1f684e90f9b"
+
+[qr03_squeeze_sltp_long]
+definition_hash = "75690f453b7cc914"
+idea_hash = "ce15516a76ca4513"
+
+[qr10_capitulation_sltp_long]
+definition_hash = "aed38c75950cadf7"
+idea_hash = "58adb46f8574ee1b"
+
+[qr11_exhaustion_sltp_long]
+definition_hash = "ff6100468a831673"
+idea_hash = "14140a09adbf31a1"
+
+[qr12_overnight_breakout_sltp_long]
+definition_hash = "59b4a2a4ba5800aa"
+idea_hash = "569125babe11fe28"
+
+[qr20_volume_surge_breakout_sltp_long]
+definition_hash = "7fecf309388ceb7c"
+idea_hash = "b9526c1ee0f457c9"
+
+[qr21_trend_sma200_sltp_long]
+definition_hash = "d41552fa72a9486a"
+idea_hash = "945caff6f3a621c0"
+
+[qr22_price_above_sma20_sltp_long]
+definition_hash = "e382515a22ebc7e0"
+idea_hash = "945caff6f3a621c0"
+
+[qr23_vma_band_sma50_sltp_long]
+definition_hash = "03b27dd3c2c62a55"
+idea_hash = "0c9269dfc1a62e57"
+
+[qr30_rsi_8020_reversal]
+definition_hash = "5f5556da26db40ba"
+idea_hash = "66fb76f17c2a5ec3"

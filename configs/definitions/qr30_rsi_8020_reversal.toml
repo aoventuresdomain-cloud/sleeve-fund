@@ -1,0 +1,42 @@
+# QR-B14 RSI 80/20 reversal, family QR-B14 counted by hand (HoE 17:59 UK, PM's own idea), try 1, long and short in one Strategy. Decision candle: 15m.
+# Pre-registered before any run, PM-approved first round after Deploy 2. Exits are the mean-reversion type's
+# convention (Advisor 21 Oct): 2 ATR(14) stop, take-profit resting at the 20-candle average, 20-candle time stop
+# (time stop = the target average's length, Advisor 18:00 UK). Advisor OK 18:00 UK.
+# Pre-registered QR-B14 try 2 (run only after try 1, counted): the turn back out of the zone, long on RSI crossing
+# above 20, short on crossing below 80, everything else identical. Nothing else in QR-B14 without a new pre-registration.
+version = 1
+name = "qr30-rsi-8020-reversal"
+title = "RSI 80/20 Reversal (15m) · Long and Short"
+reason = """The classic RSI(14) extremes: go long when the 15-minute RSI falls below 20 (oversold), go short when it rises
+above 80 (overbought), expecting the price to snap back towards its 20-candle average. Entries trigger on the cross
+into the zone, so one extreme gives one trade. Each side carries a 2 ATR(14) stop, a take-profit resting at the
+20-candle average and a 20-candle time stop; whichever fires first wins. 14, 80/20 and the exits are the textbook and
+type defaults, fixed before any run. Held at 1x."""
+
+[blocks.rsi]
+kind = "rsi"
+period = 14
+
+[blocks.sma20]
+kind = "sma"
+period = 20
+
+[blocks.atr]
+kind = "atr"
+period = 14
+
+[long]
+entry = { left = "rsi", op = "crosses_below", right = 20 }
+
+[short]
+entry = { left = "rsi", op = "crosses_above", right = 80 }
+
+[exits.long]
+stop = { level = { sub = ["close", { mul = [2.0, "atr"] }] } }
+take_profit = { level = "sma20" }
+time_stop = { bars = 20 }
+
+[exits.short]
+stop = { level = { add = ["close", { mul = [2.0, "atr"] }] } }
+take_profit = { level = "sma20" }
+time_stop = { bars = 20 }

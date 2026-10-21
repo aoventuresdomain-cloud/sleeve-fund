@@ -1,0 +1,25 @@
+# QR-B12 family, SL/TP exit-set try (21 Oct 2026, Quant Researcher). Decision candle: 1d.
+# Variant of qr23_vma_band_sma50_long, pre-registered before any run (PM 21 Oct 14:42-14:44 UK: every strategy carries an explicit
+# stop-loss and take-profit; values are the trend type's convention, Advisor 21 Oct, never tuned per strategy).
+# take_profit needs TP-EXIT (Deploy 2): syntax provisional until it is live.
+version = 1
+name = "qr23-vma-band-sma50-sltp-long"
+title = "BLL VMA(1,50,1%) (daily) + SL/TP · Long"
+reason = """qr23_vma_band_sma50_long with the trend exit set: 3 ATR(14) stop at entry, fixed 3R take-profit, 3 ATR(14) trail that only tightens; whichever exit fires first wins. Entry is a cross above the upper band (as qr23b) so it re-arms; band exit unchanged. QR-B12 try 6. Held at 1x."""
+
+[blocks.sma]
+kind = "sma"
+period = 50
+
+[blocks.atr]
+kind = "atr"
+period = 14
+
+[long]
+entry = { left = "close", op = "crosses_above", right = { mul = [1.01, "sma"] } }
+exit = { left = "close", op = "<", right = { mul = [0.99, "sma"] } }
+
+[exits]
+stop = { level = { sub = ["close", { mul = [3.0, "atr"] }] } }
+take_profit = { r = 3.0 }
+trail = { level = { sub = ["close", { mul = [3.0, "atr"] }] }, ratchet = true }

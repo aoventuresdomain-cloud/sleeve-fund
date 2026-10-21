@@ -1,0 +1,43 @@
+# QR-B7 exhaustion reversal family, SL/TP exit-set try (21 Oct 2026, Quant Researcher). Decision candle: 15m.
+# Variant of qr11_exhaustion_long, pre-registered before any run (PM 21 Oct 14:42-14:44 UK: every strategy carries an explicit
+# stop-loss and take-profit; values are the mr type's convention, Advisor 21 Oct, never tuned per strategy).
+# take_profit needs TP-EXIT (Deploy 2): syntax provisional until it is live.
+version = 1
+name = "qr11-exhaustion-sltp-long"
+title = "Exhaustion Reversal (15m) + SL/TP · Long"
+reason = """qr11_exhaustion_long with the mean-reversion take-profit added, resting at the 20-candle average (the parent's own stop kept); whichever exit fires first wins. Entry, the back-to-the-middle-band exit and the 12-hour time stop unchanged; the target rests at the middle band (its own 20-candle average); the parent's own 1.5 ATR stop is kept (Advisor: the type's stop applies only where a parent has none), so R is measured from it. The take-profit and the parent's own close exit are the same level (bb.mid): the take-profit simply takes it intrabar, a candle earlier, so exit counts read as take-profit. Held at 1x."""
+
+[blocks.rsi1h]
+kind = "rsi"
+period = 14
+timeframe = "1h"
+
+[blocks.rvol1h]
+kind = "relative_volume"
+period = 20
+timeframe = "1h"
+
+[blocks.rsi]
+kind = "rsi"
+period = 14
+
+[blocks.bb]
+kind = "bollinger"
+period = 20
+k = 2.0
+
+[blocks.atr]
+kind = "atr"
+period = 14
+
+[long]
+entry = { setup = { all = [
+    { left = "rsi1h", op = "<", right = 15 },
+    { left = "rvol1h", op = ">=", right = 2.0 },
+] }, trigger = { left = "rsi", op = "crosses_above", right = 30 }, expire_after = { bars = 4, timeframe = "1h" } }
+exit = { left = "close", op = ">=", right = "bb.mid" }
+
+[exits]
+stop = { level = { sub = ["close", { mul = [1.5, "atr"] }] } }
+take_profit = { level = "bb.mid" }
+time_stop = { minutes = 720 }
