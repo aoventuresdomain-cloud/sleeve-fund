@@ -38,6 +38,7 @@ EXACT_UP_TO = 7  # 7! = 5,040 orders: every one, under DRAWS
 VAR_LEVEL = 0.95
 WORST_DRAWDOWNS = 5
 BEST_TRADES = 5
+BEST_FEW = (1, 3)  # the best trade's and the best 3's share too, beside the best 5's (HoE 21 Oct)
 
 
 # R-17: returns and risk
@@ -170,8 +171,8 @@ def _longest_loss_run(rets) -> int:
 
 def trade_figures(trips: list[dict], start: float) -> dict:
     """Payoff ratio, largest win and loss, streaks (each losing streak with the fall it caused in trade-by-trade
-    equity) and the best 5 trades' share of the total profit. `trips`: closed trades oldest first, as metrics.trades;
-    `start`: the equity before the first."""
+    equity) and the best 1, 3 and 5 trades' share of the total profit (None unless the total is a profit).
+    `trips`: closed trades oldest first, as metrics.trades; `start`: the equity before the first."""
     pnl = [t["pnl"] for t in trips]
     wins = [p > 0 for p in pnl]
     won = [t for t in trips if t["pnl"] > 0]
@@ -186,7 +187,8 @@ def trade_figures(trips: list[dict], start: float) -> dict:
         peak = equity[: i + 1].max()
         falls.append((n, float(equity[i + 1: i + n + 1].min() / peak - 1)))
     total = sum(pnl)
-    top = sorted(pnl, reverse=True)[:BEST_TRADES]
+    ranked = sorted(pnl, reverse=True)
+    share = lambda n: sum(ranked[:n]) / total if total > 0 else None  # noqa: E731
     largest_win = max(trips, key=lambda t: t["pnl"]) if won else None
     largest_loss = min(trips, key=lambda t: t["pnl"]) if lost else None
     return {
@@ -199,7 +201,7 @@ def trade_figures(trips: list[dict], start: float) -> dict:
         "longest_loss_streak": max((n for w, _, n in runs if not w), default=0),
         # the losing streaks, longest first (then the deeper fall): (length, fall from the peak before it)
         "loss_streaks": sorted(falls, key=lambda x: (-x[0], x[1])),
-        "best5_share": sum(top) / total if total > 0 else None,
+        **{f"best{n}_share": share(n) for n in (*BEST_FEW, BEST_TRADES)},
     }
 
 
@@ -348,6 +350,11 @@ def section(r) -> list[str]:
     worst = tf["loss_streaks"][:3]
     out.append("| Losing streaks, longest first, with the fall each caused | "
                + ("none" if not worst else "; ".join(f"{n} in a row: {f:.2%}" for n, f in worst)) + " |")
+    for n in BEST_FEW:
+        v = tf[f"best{n}_share"]
+        whose = "Best trade's" if n == 1 else f"Best {n} trades'"
+        out.append(f"| {whose} share of total profit | "
+                   + ("n/a (no total profit)" if v is None else f"{v:.0%}") + " |")
     out.append(f"| Best {BEST_TRADES} trades' share of total profit | "
                + ("n/a (no total profit)" if tf["best5_share"] is None else f"{tf['best5_share']:.0%}") + " |")
     out.append("")
