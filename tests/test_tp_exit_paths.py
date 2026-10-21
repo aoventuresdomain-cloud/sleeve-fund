@@ -43,9 +43,14 @@ def test_a_target_is_reached_on_a_touch_and_not_a_tick_short_of_it(side):
     assert not target_reached(side, lo if side > 0 else hi, lo if side > 0 else hi, level)
 
 
-def test_the_target_level_is_on_the_instruments_tick():
-    assert target_level(60_000.06, 1, TP, 1) == 61_200.1
-    assert target_level(60_000.06, -1, TP, 1) == 58_800.1
+def test_the_target_level_is_on_the_instruments_tick_and_never_better_than_the_exact_level():
+    """HoE TEC-TPEXIT-B14AA (3): a level between ticks goes to the tick past it, up for a long and down for a short,
+    so the target is never reached before the exact level is; one on a tick (to a millionth of one) stays there."""
+    assert target_level(60_000.06, 1, TP, 1) == 61_200.1  # 61,200.0612 up
+    assert target_level(60_000.06, -1, TP, 1) == 58_800.0  # 58,800.0588 down
+    assert target_level(60_000.05454545, 1, 0.01, 1) == 60_600.1  # b14aa's paper target, 60,600.055 up
+    assert target_level(60_060.0, 1, 0.03, 1) == 61_861.8  # 61,861.8 within float noise of its tick: stays
+    assert target_level(60_060.0, -1, 0.03, 1) == 58_258.2
 
 
 @pytest.mark.parametrize("side", [1, -1], ids=["long", "short"])
@@ -395,7 +400,10 @@ def test_the_target_level_is_a_prices_value_so_a_bar_at_it_touches_it(side, prec
     entries = [60_060.06, 58_858.8, *rng.uniform(1.0, 100_000.0, 200)]
     for entry in entries:
         level = target_level(float(entry), side, 0.03, precision)
-        assert level == Price(float(entry) * (1 + side * 0.03), precision).as_double()
+        assert level == Price(level, precision).as_double()  # a Price's value, on the tick
+        exact = float(entry) * (1 + side * 0.03)
+        assert side * (level - exact) >= -10.0 ** -precision * 1e-6  # never short of the exact level
+        assert side * (level - exact) < 10.0 ** -precision  # and less than a tick past it
         bar = Price(level, precision).as_double()  # the bar's high (long) or low (short), exactly at the level
         assert target_reached(side, bar, bar, level)
     assert round(60_060.06 * 1.03, 2) != Price(60_060.06 * 1.03, 2).as_double()  # the hair this pins
