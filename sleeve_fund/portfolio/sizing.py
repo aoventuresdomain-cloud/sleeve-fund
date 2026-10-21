@@ -189,7 +189,7 @@ def liquidation_distance(i: SizingInputs) -> float:
     engine's own margin.entry_liquidation (isolated margin at the leverage, the venue's maintenance margin, measured
     from the entry with the fee paid), not a copy of it. On isolated margin the distance doesn't depend on the size
     while the margin and fee fit the balance, so it is measured on half the equity's notional, which always fits.
-    inf when nothing liquidates it (a long at 1x or less is fully paid for).
+    inf when nothing liquidates it; a fully paid 1x long liquidates at maintenance (BH-102), so it has a distance.
 
     On a venue's tiers (VS-1) the distance shrinks as the notional reaches a higher tier, so it is measured at the
     most this equity can put on at the leverage (all of it as margin, the fee aside): never further than any size's."""

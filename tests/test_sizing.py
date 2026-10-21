@@ -427,3 +427,18 @@ def test_steps_between_fractions_send_only_the_difference_and_skip_below_the_min
     assert small.qty == 0 and "below the venue's smallest order" in small.skipped
     # Closing to 0 always goes in full, however small.
     assert step_order(D("0.900"), D("0.010"), 0.0, D("0.001"), D("0.350")).qty == D("-0.010")
+
+
+@pytest.mark.parametrize(("stop", "refused"), [(0.329, True), (0.327, False)], ids=["over", "under"])
+def test_bh102_a_1x_long_stop_past_its_share_of_the_way_to_liquidation_is_refused(stop, refused):
+    """BH-102 (Advisor 21 Oct): a fully paid 1x long now liquidates at maintenance, so the stop rule covers it too.
+    Its liquidation is the nearer of A (maintenance on the value at the price: p = fee / (q (1 - mm)), a share of a
+    percent of the entry) and B (on the entry value: p = fee / q + mm E), so B: the distance is 1 - fee rate - mm =
+    1 - 0.001 - 0.005 = 99.4%, and the conservative 33% share of it is 32.802%. Before BH-102 a 1x long had no
+    liquidation price and any stop sized. A stopless 1x position isn't sized here (no sizing without a stop)."""
+    s = size_entry(_in(perp=True, leverage=1.0, maintenance_margin=0.005, stop_frac=stop, stop_to_liquidation=0.33,
+                       position_cap_pct=1.0, risk_per_trade=0.9))
+    if refused:
+        assert not s.ok and s.qty == 0 and "liquidation price" in s.skipped and "99.40% away" in s.skipped, s.skipped
+    else:
+        assert s.ok and s.qty > 0, s.skipped
