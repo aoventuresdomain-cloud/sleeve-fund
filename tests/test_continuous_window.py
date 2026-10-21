@@ -298,3 +298,23 @@ def test_a_block_fed_another_block_warms_up_after_its_input_has():
                "long": {"entry": {"all": [EMA["long"]["entry"], {"left": "smooth", "op": ">", "right": 50}]},
                         "exit": EMA["long"]["exit"]}}
     assert continuous_warmup("rules", to_params(chained), 240) == 300 + 300
+
+
+def test_an_rsi_divergence_adds_its_swing_room_to_the_rsis_warm_up():
+    """CR F1: a divergence needs its RSI settled (10 x rsi_period), then the swing room it looks back over."""
+    assert block_warmup("rsi_divergence", {"rsi_period": 14}) == 140 + 3 + 3 + 50
+    assert block_warmup("rsi_divergence", {"rsi_period": 20, "left": 5, "right": 2, "max_gap": 30}) == 200 + 37
+
+
+def test_a_chain_on_a_slower_timeframe_adds_along_the_chain_then_converts_once():
+    """Advisor 21 Oct: chained blocks share a timeframe (the builder refuses an input on another), so the warm-up is
+    added within that timeframe's candles and converted once, (a + b + 1) x tf / bar: the part candle a run starts in
+    is counted once, as Rules.warmup_needed counts it, never once per block."""
+    daily = {**EMA, "blocks": {**EMA["blocks"], "rsi": {"kind": "rsi", "period": 30, "timeframe": "1d"},
+                               "smooth": {"kind": "ema", "period": 30, "input": "rsi", "timeframe": "1d"}},
+             "long": {"entry": {"all": [EMA["long"]["entry"], {"left": "smooth", "op": ">", "right": 50}]},
+                      "exit": EMA["long"]["exit"]}}
+    assert continuous_warmup("rules", to_params(daily), 240) == (300 + 300 + 1) * 6
+    across = {**daily, "blocks": {**daily["blocks"], "smooth": {"kind": "ema", "period": 30, "input": "rsi"}}}
+    with pytest.raises(ValueError, match="chained blocks share one"):
+        continuous_warmup("rules", to_params(across), 240)
