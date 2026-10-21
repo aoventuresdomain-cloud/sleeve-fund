@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 
 from sleeve_fund import funding
-from sleeve_fund.research import mintrl, regime_split
+from sleeve_fund.research import analysis_pack, mintrl, regime_split
 from sleeve_fund.research.guardrails import CANDIDATE_CHECK, G1_RULES, MIN_OOS_TRADES, nearby_scored
 from sleeve_fund.research.ledger import IdeaLedger
 from sleeve_fund.research.metrics import (
@@ -646,6 +646,7 @@ def render(r: StudyResult, ledger: IdeaLedger, register=None, liquidation_ack: s
     out.append("")
     out.append(_double_fees_line(r))
     out.append("")
+    out += analysis_pack.section(r)  # R-17/R-18/R-19: risk, trades and costs, before the cost ladder
     if r.cost_ladder:
         chosen = getattr(r, "chosen_params", None) or r.default_params
         out.append(f"## Cost ladder (full research period, chosen settings {json.dumps(chosen)})")
