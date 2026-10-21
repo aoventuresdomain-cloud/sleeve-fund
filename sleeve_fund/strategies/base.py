@@ -600,9 +600,19 @@ def handler_error_words(handler: str, exc: BaseException | str) -> str:
 def fund_margin(owner, ts, amount: float) -> None:
     """LIQ-FUND-1: a funding movement settled after the liquidation price was fixed is the position's margin's
     (_liq_now). One settled before the fill (a late publish, a reversal) was the position's before it, so it doesn't
-    count. A plain function, as the funding writers are, so an engine-like holder without the fields moves nothing."""
+    count. A plain function, as the funding writers are, so an engine-like holder without the fields moves nothing.
+    At 1x (_liq_free set) a payment comes off the available balance beside the position first and only the rest off
+    its margin, and a credit goes to that balance (BH-102, Advisor 21 Oct: a fully invested 1x has none spare). Above
+    1x every movement is still the margin's (LIQ-FUND-1) until the venue's own rule is cited."""
     since = getattr(owner, "_liq_from", None)
     if getattr(owner, "_liq_px", None) is not None and since is not None and int(pd_ts(ts).value) > since:
+        free = getattr(owner, "_liq_free", None)
+        if free is not None:
+            if amount >= 0:
+                owner._liq_free = free + amount
+                return
+            used = min(free, -amount)
+            owner._liq_free, amount = free - used, amount + used
         owner._liq_funded += amount
 
 
@@ -693,6 +703,9 @@ class LongFlatStrategy(Strategy):
         # LIQ-FUND-1 (Advisor 17:20 UK, 13 Oct): funding taken from, or credited to, that margin since _liq_px was fixed,
         # and the instant (ns) after which a settlement is the position's. _liq_now moves the price by it.
         self._liq_funded, self._liq_from = 0.0, None
+        # BH-102: at 1x, the available balance beside the position, which funding is paid from before its margin
+        # (fund_margin); None above 1x, or after a restart until the next entry fill (every payment the margin's).
+        self._liq_free: float | None = None
         # LIQ-FEE (HoE 15 Oct): the entry fees the open position still holds on its isolated margin
         # (margin.entry_fees_after), which come off it
         self._entry_fees = 0.0
@@ -4792,6 +4805,14 @@ class LongFlatStrategy(Strategy):
         self._liq_px = self._liq_from_entry(cash, qty) if qty else None
         if self._liq_from is None:
             self._liq_funded, self._liq_from = 0.0, since
+        self._liq_free = None
+        if self._liq_px is not None and LongFlatStrategy._max_leverage(self) <= 1:
+            # The balance less the margin the position holds (its notional less the entry fees, and any funding
+            # already drawn from it): what funding is paid from first (BH-102).
+            entry = self._entry_px if self._entry_px else self._net_position()[1]
+            balance = cash + LongFlatStrategy._funded(self) + qty * entry
+            held = min(abs(qty) * entry, max(balance, 0.0)) - getattr(self, "_entry_fees", 0.0) + self._liq_funded
+            self._liq_free = max(balance - held, 0.0)
         if self._liq_px is not None and self.runtime is not None and not self._backtest:
             self.runtime.store.merge_order_signal(order_id, {"position_liquidation_px": round(self._liq_px, 8)})
 
@@ -7024,7 +7045,7 @@ class LongFlatStrategy(Strategy):
                                                    float(half * 2))
         if side == 0:
             self._entry_px, self._entry_qty, self._entry_side = None, 0.0, 0
-            self._stop_frac = self._tp_frac = self._liq_px = self._liq_from = None
+            self._stop_frac = self._tp_frac = self._liq_px = self._liq_from = self._liq_free = None
             self._liq_funded, self._stop_capped = 0.0, False
             self._funding_skip = None
             self._replan_pending = self._plan_entry = None
