@@ -251,3 +251,12 @@ def test_qr01b_with_its_3_atr_stop_and_a_3r_target_reconciles(instrument):
                        res.journal.insurance_total("backtest"))
     marked = book["cash"] + book["qty"] * float(df["close"].iloc[-1])
     assert marked == pytest.approx(float(res.equity.iloc[-1]), abs=0.05), (book, float(res.equity.iloc[-1]))
+
+
+@pytest.mark.parametrize("tp, words", [({"r": 3}, "3R after costs, from the stop's distance as the trade opens"),
+                                       ({"level": "dc.upper"}, "as set at each close")])
+def test_the_strategy_tab_says_the_take_profit_in_words(tp, words):
+    from sleeve_fund.dashboard import strategy_words
+
+    (long_,) = strategy_words.rules(check_definition(_with_tp(tp)), 15)
+    assert ("Take-profit" in dict(long_["levels"])) and words in dict(long_["levels"])["Take-profit"], long_["levels"]
