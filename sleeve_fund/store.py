@@ -1112,6 +1112,15 @@ gate_decisions_t = Table(
     Column("gross_after", EXACT),
     Column("net_underlying_after", EXACT),
     Column("held_before", EXACT),
+    # PAGE-SIZE-T1 (DA, 0034; Advisor PAGE-SIZE; QD2 writes them): the exact inputs T1 judged the order on, in fund
+    # currency like book_equity: the loss at the stops already in its underlying (reservations in), T1's cap, and the
+    # order's risk per unit (expected fill to stop, fee in); and size_share, approved_qty x risk_per_unit over T1's room
+    # (cap less used), a fraction, NULL when there is no room. The first three all or none (none: T1 off, or not reached),
+    # size_share only with them; none below 0, risk per unit above 0; once written never changed (GATE_T1 triggers below).
+    Column("t1_used_before", EXACT),
+    Column("t1_cap", EXACT),
+    Column("risk_per_unit", EXACT),
+    Column("size_share", EXACT),
     CheckConstraint(_in("outcome", GATE_OUTCOMES), name="gate_decisions_outcome"),
     CheckConstraint(_in("limit_hit", GATE_LIMITS), name="gate_decisions_limit_hit"),
     CheckConstraint(_in("stage", GATE_STAGES), name="gate_decisions_stage"),
@@ -1353,6 +1362,39 @@ GATE_LEVERAGE_SQLITE = (
     f"CREATE TRIGGER gate_decisions_leverage_update BEFORE UPDATE ON gate_decisions WHEN {GATE_LEVERAGE_BAD} "
     f"OR ({GATE_LEVERAGE_FROZEN['sqlite']}) BEGIN SELECT RAISE(ABORT, '{GATE_LEVERAGE_MESSAGE}'); END",
 )
+# PAGE-SIZE-T1 (DA, 0034): T1's three inputs on a decision are all there or none, size_share set exactly when they leave
+# room (cap above used), none below 0, risk per unit above 0. None of the four ever changes, a NULL included (no backfill
+# of today's cap onto an old row; CR F2), nor book_equity once set: the page's "% of the fund" divides by it (Advisor).
+# Triggers, so 0034 adds them without rebuilding gate_decisions on SQLite.
+GATE_T1_BAD = ("NOT ((NEW.t1_used_before IS NULL AND NEW.t1_cap IS NULL AND NEW.risk_per_unit IS NULL "
+               "AND NEW.size_share IS NULL) OR (NEW.t1_used_before IS NOT NULL AND NEW.t1_cap IS NOT NULL "
+               "AND NEW.risk_per_unit IS NOT NULL)) OR NEW.t1_used_before < 0 OR NEW.t1_cap < 0 "
+               "OR NEW.risk_per_unit <= 0 OR NEW.size_share < 0 "
+               "OR (NEW.t1_cap <= NEW.t1_used_before AND NEW.size_share IS NOT NULL) "
+               "OR (NEW.t1_cap > NEW.t1_used_before AND NEW.size_share IS NULL)")
+GATE_T1_MESSAGE = ("gate_decisions: the T1 used, cap and risk per unit are all set or none, size share exactly when "
+                   "they leave room, none below 0, risk per unit above 0; they never change, nor book_equity once set")
+GATE_T1_FROZEN = {
+    "postgresql": "(NEW.t1_used_before, NEW.t1_cap, NEW.risk_per_unit, NEW.size_share) IS DISTINCT FROM (OLD.t1_used_before, "
+                  "OLD.t1_cap, OLD.risk_per_unit, OLD.size_share) OR (OLD.book_equity IS NOT NULL AND NEW.book_equity IS DISTINCT "
+                  "FROM OLD.book_equity)",
+    "sqlite": "NEW.t1_used_before IS NOT OLD.t1_used_before OR NEW.t1_cap IS NOT OLD.t1_cap OR NEW.risk_per_unit IS NOT "
+              "OLD.risk_per_unit OR NEW.size_share IS NOT OLD.size_share OR (OLD.book_equity IS NOT NULL AND NEW.book_equity "
+              "IS NOT OLD.book_equity)",
+}
+GATE_T1_PG = (
+    "CREATE OR REPLACE FUNCTION gate_t1_shape() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+    f"IF {GATE_T1_BAD} OR (TG_OP = 'UPDATE' AND {GATE_T1_FROZEN['postgresql']}) THEN RAISE EXCEPTION "
+    f"USING ERRCODE = 'check_violation', MESSAGE = '{GATE_T1_MESSAGE}'; END IF; RETURN NEW; END $$",
+    "CREATE TRIGGER gate_decisions_t1 BEFORE INSERT OR UPDATE ON gate_decisions FOR EACH ROW "
+    "EXECUTE FUNCTION gate_t1_shape()",
+)
+GATE_T1_SQLITE = (
+    f"CREATE TRIGGER gate_decisions_t1_insert BEFORE INSERT ON gate_decisions WHEN {GATE_T1_BAD} "
+    f"BEGIN SELECT RAISE(ABORT, '{GATE_T1_MESSAGE}'); END",
+    f"CREATE TRIGGER gate_decisions_t1_update BEFORE UPDATE ON gate_decisions WHEN {GATE_T1_BAD} "
+    f"OR ({GATE_T1_FROZEN['sqlite']}) BEGIN SELECT RAISE(ABORT, '{GATE_T1_MESSAGE}'); END",
+)
 GATE_FILL_MARKS_PG = (
     "CREATE OR REPLACE FUNCTION gate_fill_mark_write_once() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
     "RAISE EXCEPTION USING ERRCODE = 'check_violation', MESSAGE = 'gate_fill_marks is write-once'; END $$",
@@ -1364,6 +1406,7 @@ GATE_FILL_MARKS_SQLITE = tuple(
     "SELECT RAISE(ABORT, 'gate_fill_marks is write-once'); END" for op in ("UPDATE", "DELETE"))
 for _t, _pg, _lite in ((gate_decisions_t, GATE_IDEA_PG, GATE_IDEA_SQLITE), (shadow_outcomes_t, SHADOW_PG, SHADOW_SQLITE),
                        (gate_decisions_t, GATE_LEVERAGE_PG, GATE_LEVERAGE_SQLITE),
+                       (gate_decisions_t, GATE_T1_PG, GATE_T1_SQLITE),
                        (gate_fill_marks_t, GATE_FILL_MARKS_PG, GATE_FILL_MARKS_SQLITE)):
     for _sql in _pg:
         event.listen(_t, "after_create", DDL(_sql).execute_if(dialect="postgresql"))
@@ -2798,7 +2841,8 @@ class Store:
             q = q.where(o.ts >= since)
         with self.engine.connect() as c:
             rows = _rows(c.execute(q.order_by(o.ts, o.id)))
-        # A1 (Advisor): benign: refused with nothing left to close (paper.runtime.BENIGN_REJECT): never one in a row
+        # A1 (Advisor): benign: refused with nothing left to close (paper.runtime.BENIGN_REJECT), or a resting target
+        # refused (B-14, not a safety exit): never one in a row
         return [{**{k: v for k, v in r.items() if k != "signal"},
                  "benign": bool((r["signal"] or {}).get("benign_reject"))} for r in rows]
 
@@ -3855,6 +3899,14 @@ class Store:
         q = select(book_marks_t.c.equity).where(book_marks_t.c.ts <= ts).order_by(book_marks_t.c.ts.desc()).limit(1)
         with self.engine.connect() as c:
             return c.execute(q).scalar()
+
+    def book_mark_at_or_before(self, ts: datetime) -> dict | None:
+        """The fund's last minute mark at or before `ts` (book_marks) as {ts, equity}, or None before the first."""
+        q = (select(book_marks_t.c.ts, book_marks_t.c.equity).where(book_marks_t.c.ts <= ts)
+             .order_by(book_marks_t.c.ts.desc()).limit(1))
+        with self.engine.connect() as c:
+            rows = _rows(c.execute(q))
+        return rows[0] if rows else None
 
     def first_book_mark(self) -> dict | None:
         q = select(book_marks_t.c.ts, book_marks_t.c.equity).order_by(book_marks_t.c.ts).limit(1)
@@ -5008,6 +5060,13 @@ class Store:
             return "same"
         raise ValueError(f"decision {decision_id} already has a mark for fill {trade_id} at {stored(have.price)}; "
                          "a fill mark is never rewritten")
+
+    def entry_decision(self, order_id: str) -> dict | None:
+        """The gate's decision an order was sent under, its whole row (PAGE-SIZE), or None when it was never gated."""
+        t = gate_decisions_t
+        with self.engine.connect() as c:
+            r = c.execute(select(t).where(t.c.order_id == order_id).order_by(t.c.id.desc()).limit(1)).first()
+        return dict(r._mapping) if r else None
 
     def fill_marks(self, decision_id: int) -> list[dict]:
         """A gate decision's fill marks, oldest first (B-24)."""

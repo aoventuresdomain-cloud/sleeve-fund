@@ -289,11 +289,12 @@ def test_0033_downgrade_refuses_while_reads_are_kept(tmp_path):
 
     eng = make_engine(os.environ.get("TEST_DATABASE_URL") or f"sqlite:///{tmp_path}/m.db")
     _clean(eng)
-    schema.migrate(eng, log=lambda _: None)
+    with eng.begin() as conn:  # built at 0033 itself: from head, "-1" runs the newest migration's downgrade (TEC, DA 0034)
+        command.upgrade(schema._config(conn), "0033")
     with eng.begin() as c:
         c.execute(text("INSERT INTO account_capital_fetch (account, fetched_at, ok, reason, anchor) "
                        "VALUES ('paper', :t, 0, 'timeout', 0)"), {"t": T})
-    with pytest.raises(NotImplementedError, match="never dropped"), eng.begin() as conn:
+    with pytest.raises(NotImplementedError, match="holds reads: they are never dropped"), eng.begin() as conn:
         command.downgrade(schema._config(conn), "-1")
     with eng.begin() as c:
         c.execute(text("DROP TABLE account_capital_fetch"))

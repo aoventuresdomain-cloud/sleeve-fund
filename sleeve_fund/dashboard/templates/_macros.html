@@ -74,6 +74,7 @@
   <a href="/trades" {{ 'aria-current=page' if active == 'trades' }}>Positions and trades</a>
   <a href="/orders" {{ 'aria-current=page' if active == 'orders' }}>Orders</a>
   <a href="/fills" {{ 'aria-current=page' if active == 'fills' }}>Fills vs model</a>
+  <a href="/netting-shadow" {{ 'aria-current=page' if active == 'netting' }}>Netting (shadow)</a>
 </nav>{% endmacro %}
 {% macro pts(x) %}<span class="{{ 'gain' if x > 0.00005 else ('loss' if x < -0.00005 else 'muted') }}">{{ '+' if x > 0.00005 else ('−' if x < -0.00005 else '') }}{{ '%.1f'|format((x * 100)|abs) }} pts</span>{% endmacro %}
 {# A two-leg Strategy (P2-8 step 7): the red flag while one of its pair's alerts is waiting to be acknowledged (M4),
@@ -104,4 +105,4 @@
 
 {# PAGE-SIZE: a fund-held entry's size as its decision journal records it (trading.entry_sizing). T1's room and the
    loss at the stop aren't journaled before B-24, so they aren't shown. #}
-{% macro entry_size(p) %}{% if p and p.sizing %}Position value: {{ p.sizing.value_share|pct0 }} of fund equity (share of fund {{ '%.2f'|format(p.sizing.value_share) }}×){% if p.perp_limit and p.leverage %}<div>margin leverage {{ '%.2f'|format(p.leverage) }}×</div>{% endif %}{% elif p %}<span class="faint">The size it was decided at isn't in its entry's record</span>{% else %}<span class="faint">No open position</span>{% endif %}{% endmacro %}
+{% macro entry_size(p) %}{% if p and p.sizing %}{% if p.sizing.gated %}{% set t = p.sizing.t1 %}<div>{% if t and t.room_share is not none %}Sized at {{ t.room_share|pct0 }} of the room T1 allows{% elif t %}<span class="faint">Room T1 allows: n/a (none left when it was sized)</span>{% else %}<span class="faint">Room T1 allows: not in this entry's record</span>{% endif %}</div><div>{% if t %}Risk if the stop is hit: {{ t.stop_share|pct1 }} of the fund (T1 limit {{ '%g'|format(t.t1_limit * 100) }}%){% else %}<span class="faint">Risk if the stop is hit: not in this entry's record</span>{% endif %}</div>{% endif %}Position value: {{ p.sizing.value_share|pct0 }} of fund equity (share of fund {{ '%.2f'|format(p.sizing.value_share) }}×){% if p.perp_limit and p.leverage %}<div>margin leverage {{ '%.2f'|format(p.leverage) }}×</div>{% endif %}{% elif p %}<span class="faint">The size it was decided at isn't in its entry's record</span>{% else %}<span class="faint">No open position</span>{% endif %}{% endmacro %}

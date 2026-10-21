@@ -105,3 +105,19 @@ def test_the_page_figures_opposed_exposure_and_margin_on_net_against_the_sum(run
     n = runs[1].netting
     assert 0 < n["opposed_exposure"]["a/b"] <= 1
     assert 0 < n["notional_peak"]["net"] <= n["notional_peak"]["sum"]  # margin on net: information, never P&L
+
+
+# --- F265-1 (CR on #265, B-13): a taker mismatch is refused before the run, not after it ---------------------------
+
+def test_f265_1_a_taker_fee_mismatch_is_refused_before_anything_runs(monkeypatch):
+    import sleeve_fund.research.portfolio_run as pr
+
+    ran = []
+    monkeypatch.setattr(pr, "plan_run", lambda *a, **k: ran.append(a) or (_ for _ in ()).throw(AssertionError("ran")))
+    specs = [_spec("a", 2, PERP, **BUSY, fees=FeeSchedule(D("0.0002"), D("0.00055"))),
+             _spec("b", 2, PERP, **BUSY, fees=FeeSchedule(D("0.0002"), D("0.0006")))]
+    with pytest.raises(ValueError, match="same taker fee"):
+        run_portfolio(specs, LOOSE, netting=True)
+    assert ran == []  # refused up front: no Strategy was planned, let alone run
+    with pytest.raises(AssertionError, match="ran"):  # off, netting's rule doesn't apply: the run starts
+        run_portfolio(specs, LOOSE)

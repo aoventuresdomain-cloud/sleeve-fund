@@ -12,6 +12,7 @@ import pandas as pd
 from sleeve_fund import backups, markets, risk
 from sleeve_fund.dashboard import legs, trading
 from sleeve_fund.dashboard.legs import label
+from sleeve_fund.dashboard.metrics import shown_status
 from sleeve_fund.store import Store, utcnow
 from sleeve_fund.venues import venue as venue_profile
 
@@ -377,14 +378,15 @@ def health_view(store: Store, summaries: list[dict], backup_dir: Path | None = N
     }
 
 
-def status_items(rows: list[dict], health: dict) -> list[dict]:
+def status_items(rows: list[dict], health: dict, store: Store | None = None) -> list[dict]:
     """What keeps the desk from All clear, worst first: each item's level ("bad" or "warn") and a line
     that names it. Bad: a strategy halted or in error, a process not reporting, a balance mismatch.
-    Warn: a strategy paused, a limit more than 80% used, a stale price feed, a backup problem."""
+    Warn: a strategy paused, a limit more than 80% used, a stale price feed, a backup problem. store: for each
+    Strategy's shown status (metrics.shown_status); without it, the stored one."""
     bad, warn = [], []
     for r in rows:
         s = r["x"]["sleeve"]
-        if s.status in ("halted", "error"):
+        if (shown_status(s, store) if store else s.status) in ("halted", "error"):
             bad.append(f"{label(s.name)} is {s.status}" + (f": {s.status_reason}" if s.status_reason else ""))
         elif s.status == "paused":
             warn.append(f"{label(s.name)} is paused" + (f": {s.status_reason}" if s.status_reason else ""))
@@ -392,7 +394,7 @@ def status_items(rows: list[dict], health: dict) -> list[dict]:
     bad += [f"{label(name)}'s balance doesn't match the venue's" for name in health["mismatched"]]
     for r in rows:
         s = r["x"]["sleeve"]
-        if s.status in ("halted", "error"):
+        if (shown_status(s, store) if store else s.status) in ("halted", "error"):
             continue  # already named, worse
         # The limits that halt or pause (the per-Strategy position cap is gone: TEC-FE-CAP, HoE 14 Oct 2026).
         used = [(r["dd_used"], "drawdown"), (r["day_used"], "daily loss")]

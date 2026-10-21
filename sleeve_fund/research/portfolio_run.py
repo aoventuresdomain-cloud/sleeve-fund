@@ -212,6 +212,8 @@ def run_portfolio(specs: list[LegSpec], profile: PortfolioProfile = PORTFOLIO, u
     read it (BRIDGE-3, as paper sizes off the supervisor's last mark), not its own account: a multi-asset Strategy's
     run (research.multi_asset); off, every run sizes as before."""
     _check(specs)
+    if netting:
+        _netting_taker(specs)  # F265-1: a taker mismatch is refused before the run, not after it
     order = tuple(s.name for s in specs)
     # A Strategy deciding on bars as short as its execution bars is fed its decision bars alone (run_backtest's
     # own rule); its exec_prices still mark it every hour.
@@ -479,11 +481,7 @@ def netting_shadow(results: dict[str, BacktestResult], specs: list[LegSpec], hou
         return halves.get((inst, ts), next(float(s.half_spread or results[s.name].half_spread) for s in specs
                                            if str(s.instrument.id) == inst))
 
-    taker = {str(s.instrument.id): s.fees.taker if s.fees is not None else _instrument_taker(s.instrument)
-             for s in specs}
-    if len(set(taker.values())) > 1:
-        raise ValueError("netting_shadow: the Strategies on one account must pay the same taker fee")
-    sh = nt.shadow(fills, funding, mark, half, next(iter(taker.values())) if taker else Decimal(0))
+    sh = nt.shadow(fills, funding, mark, half, _netting_taker(specs))
     saving = sh.saving()
     sub = sh.strategy_cash()
     equity = sum((_exact(s.capital) for s in specs), _exact(unallocated))
@@ -506,6 +504,15 @@ def netting_shadow(results: dict[str, BacktestResult], specs: list[LegSpec], hou
         "opposed_exposure": {"/".join(k): v for k, v in nt.opposed_exposure(fills, price, days).items()},
         "notional_peak": _notional_peak(fills, price, days),
     }
+
+
+def _netting_taker(specs: list[LegSpec]) -> Decimal:
+    """The one taker fee the shadow's account pays: every Strategy's, each from its own fee schedule (or its market's).
+    Raises ValueError when they differ, before anything runs (F265-1)."""
+    taker = {s.fees.taker if s.fees is not None else _instrument_taker(s.instrument) for s in specs}
+    if len(taker) > 1:
+        raise ValueError("netting_shadow: the Strategies on one account must pay the same taker fee")
+    return next(iter(taker)) if taker else Decimal(0)
 
 
 def _instrument_taker(instrument) -> Decimal:

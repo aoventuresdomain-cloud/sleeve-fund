@@ -134,12 +134,13 @@ class Shadow:
 
 
 def net_orders(fills: Iterable[Fill], mark: Callable[[str, int], Decimal], half_spread: Callable[[str, int], object],
-               taker: Decimal) -> tuple[NetOrder, ...]:
+               taker: Decimal | Callable[[str, int], Decimal]) -> tuple[NetOrder, ...]:
     """The bar's intents per instrument as one net order each (§2.2), in time then instrument order. mark(instrument,
     ts): the decision mark step A's market orders fill from; half_spread(instrument, ts): the half spread its fill model
-    charged a market order there. Only a bar whose intents cross is repriced; one whose intents all go one way is what
+    charged a market order there. taker: the venue's taker fee, or taker(instrument, ts), the rate in force on that bar
+    (paper, where it is read from the journal). Only a bar whose intents cross is repriced; one whose intents all go one way is what
     step A sent (its volume-weighted price, its fees: a stop's or a target's own booking stays as it was)."""
-    taker = money(taker, "taker")
+    rate_at = taker if callable(taker) else (lambda _i, _t, r=money(taker, "taker"): r)
     groups: dict[tuple[int, str], list[Fill]] = defaultdict(list)
     for f in fills:
         groups[(f.ts, f.instrument)].append(f)
@@ -152,7 +153,7 @@ def net_orders(fills: Iterable[Fill], mark: Callable[[str, int], Decimal], half_
         elif net:
             m, slip = money(mark(instrument, ts), "mark"), _ratio(half_spread(instrument, ts))
             price = m * (1 + slip) if net > 0 else m * (1 - slip)
-            fee = abs(net) * price * taker
+            fee = abs(net) * price * money(rate_at(instrument, ts), "taker")
         else:
             price, fee = money(mark(instrument, ts), "mark"), ZERO
         out.append(NetOrder(instrument, ts, net, crossed, price, fee,
@@ -166,7 +167,7 @@ def _ratio(r) -> Decimal:
 
 
 def shadow(fills: Iterable[Fill], funding: Iterable[Funding], mark: Callable[[str, int], Decimal],
-           half_spread: Callable[[str, int], object], taker: Decimal,
+           half_spread: Callable[[str, int], object], taker: Decimal | Callable[[str, int], Decimal],
            funding_quantum: Decimal = Decimal("0.00000001")) -> Shadow:
     """Step B in shadow over a step A run's fills and funding (§2.3, §2.6). Each Strategy's sub-ledger is its own step A
     lines; the account trades the net orders and pays funding on the net position (rate x position x mark, rounded to
