@@ -64,6 +64,14 @@ class StudyRequest:
     label: str | None = None
     # B-37: a study list's pinned dates (research.pinned.Pinned): the study reads those days only, whatever day it runs.
     pinned: object | None = None
+    # R-11: "walk_forward" (as before) or "continuous" (pinned settings only: a warm-up, then scored to the research end)
+    score_window: str = "walk_forward"
+    # R-12, this round only: also run the old walk-forward on the same settings (never counted as a try), and pass
+    # only when both windows pass
+    old_window_too: bool = False
+    # R-24: a filtered variant's parent definition (a rule-builder definition), whose entries a placebo blocks at
+    # random in the share the variant's filter blocked; None: no placebo
+    placebo_parent: dict | None = None
 
     def exits(self) -> dict:
         """The exits every run of the study trades with, as the strategy takes them."""
@@ -84,6 +92,10 @@ class StudyRequest:
             raise ValueError("holdout days can't be negative")
         if "/" not in self.pair:
             raise ValueError(f"instrument {self.pair!r} should look like BTC/USD")
+        if self.old_window_too and self.score_window != "continuous":
+            raise ValueError("the old walk-forward verdict is shown beside a continuous window's only")
+        if self.placebo_parent is not None and self.score_window != "continuous":
+            raise ValueError("the placebo runs on a continuous scoring window only")
 
 
 def _bars(minutes: int) -> str:
@@ -165,14 +177,24 @@ def run_store_study(req: StudyRequest, store=None, progress=None, ledger_path: P
     ledger = IdeaLedger(ledger_path or LEDGER)
     register = TrialsRegister(store) if store is not None else None
     dataset = dataset_name(profile.name, req.pair, req.minutes)
-    result = run_study(
-        spec, prices, instrument, dataset=dataset, ledger=ledger, default_params=req.params,
-        holdout_days=req.holdout_days,
-        train_days=req.train_days, test_days=req.test_days, use_holdout=req.use_holdout,
-        exits=req.exits(),
-        risk_profile=req.risk_profile, exec_prices=exec_prices, half_spread=spread, progress=progress,
-        oos_exec_prices=oos_exec, minute_loader=minutes_between, register=register,
-        locks=HoldoutLocks(store) if store is not None else None, pinned=req.pinned)
+    def study(window: str, ledger, register, progress):
+        return run_study(
+            spec, prices, instrument, dataset=dataset, ledger=ledger, default_params=req.params,
+            holdout_days=req.holdout_days,
+            train_days=req.train_days, test_days=req.test_days, use_holdout=req.use_holdout,
+            exits=req.exits(),
+            risk_profile=req.risk_profile, exec_prices=exec_prices, half_spread=spread, progress=progress,
+            oos_exec_prices=oos_exec, minute_loader=minutes_between, register=register,
+            locks=HoldoutLocks(store) if store is not None else None, pinned=req.pinned, score_window=window,
+            placebo_parent=req.placebo_parent if window == req.score_window else None)
+
+    result = study(req.score_window, ledger, register, progress)
+    old = None
+    if req.old_window_too:  # R-12: the same settings on the old window, its runs counted nowhere (no new try)
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as scratch:
+            old = study("walk_forward", IdeaLedger(Path(scratch) / "old_window.jsonl"), None, None)
     # The fees the strategy's runs paid: a perpetual market's own when it trades one, not the venue's spot rates (RE-COST).
     paid = result.fee_basis
     fee_words = fees.text if paid is None or paid == fees.fees else \
@@ -195,7 +217,7 @@ def run_store_study(req: StudyRequest, store=None, progress=None, ledger_path: P
     while out.exists():  # two runs in the same second
         n += 1
         out = out.with_name(f"{stem}-{n}.md")
-    out.write_text(render(result, ledger, register), encoding="utf-8")
+    out.write_text(render(result, ledger, register, old=old), encoding="utf-8")
     write_results(result, out)
     write_returns(result, out)
     write_oos_returns(result, out)

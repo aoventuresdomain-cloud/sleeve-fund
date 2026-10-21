@@ -21,6 +21,7 @@ from sleeve_fund.research.metrics import (
     years_covered,
 )
 from sleeve_fund.research.pbo import PBO_CHECK, g1_row
+from sleeve_fund.research.random_entry import CLOSE_PRICED
 from sleeve_fund.research.study import StudyResult
 
 ROBUST_SHARE = 0.6
@@ -510,10 +511,26 @@ def _span(minutes: int) -> str:
         f"{minutes / 60:g} hours" if minutes >= 60 else f"{minutes} minutes")
 
 
+# R-12 (Advisor SCORE-WINDOW, 21 Oct 2026): this round only, QR-B1, QR-B2 and QR-B3 must pass on both windows.
+OLD_WINDOW_CHECK = "Also passes on the old three-year walk-forward (this round)"
+SCREENING_DISCLOSURE = ("Disclosed: the earlier lab rounds (3 Oct 2026) looked at 2020 to 2022 when these ideas were "
+                        "screened.")
+
+
+def old_window_check(old: StudyResult, ledger: IdeaLedger, register=None) -> tuple[str, str, str]:
+    """R-12: the old three-year walk-forward's G1 verdict on the same settings, as one more G1 check: the sheet passes
+    only when the continuous window and this both pass."""
+    verdict, failed = g1_verdict(g1_checks(old, ledger, register))
+    why = f"failed: {', '.join(failed)}" if verdict == "FAIL" else (
+        f"not judged: {', '.join(failed)}" if verdict == NOT_JUDGED else "every check passed")
+    return OLD_WINDOW_CHECK, verdict, f"G1 {verdict} on the walk-forward ({old.settings.split(' · ')[-1]}): {why}"
+
+
 def render(r: StudyResult, ledger: IdeaLedger, register=None, liquidation_ack: str | dict | None = None,
-           flat: StudyResult | None = None) -> str:
+           flat: StudyResult | None = None, old: StudyResult | None = None) -> str:
     """flat: for a strength-sized variant (G5), its flat version's study on the same windows, shown side by side
-    (strength_report); without it the flat version stays."""
+    (strength_report); without it the flat version stays. old: R-12, the same settings' old three-year walk-forward
+    study beside a continuous window's: one more G1 check, so the sheet passes only when both do."""
     spec = r.spec
     oos = summary(r.oos_returns)
     oos_b = _bench(r.oos_benchmark_returns)
@@ -570,6 +587,8 @@ def render(r: StudyResult, ledger: IdeaLedger, register=None, liquidation_ack: s
     out.append("## G1 checks")
     out.append("")
     checks = g1_checks(r, ledger, register, liquidation_ack)
+    if old is not None:
+        checks.append(old_window_check(old, ledger, register))
     verdict, failed = g1_verdict(checks)
     if verdict == NOT_JUDGED:
         why = r.not_judged or "; ".join(e for name, v, e in checks if name in failed and v == NOT_JUDGED)
@@ -583,6 +602,19 @@ def render(r: StudyResult, ledger: IdeaLedger, register=None, liquidation_ack: s
     for name, result, evidence in checks:
         out.append(f"| {name} | {result} | {evidence} |")
     out.append("")
+    if getattr(r, "warmup_bars", None) is not None:  # R-11
+        out.append(f"> Scored continuously: {r.settings.split(' · ')[-1]}. The holdout stays locked.")
+        out.append("")
+    by_year = getattr(r, "random_entry_by_year", None) or {}
+    if by_year:  # R-14
+        out.append("> Random entry by test year (each year's trips, whole, against draws in that year): " + "; ".join(
+            f"{y}: {re_.return_percentile:.0f}th percentile of {re_.draws:,} draws, {re_.trades} trades"
+            if re_.trades else f"{y}: no trades" for y, re_ in by_year.items()) + ".")
+        out.append(f"> {CLOSE_PRICED}.")
+        out.append("")
+    if old is not None:
+        out.append(f"> {SCREENING_DISCLOSURE}")
+        out.append("")
     for label in getattr(r, "fill_labels", None) or []:
         out.append(f"> Fills: {label}. Without 1-minute bars, what traded first inside a bar is unknown, so a stop the "
                    "bar traded through was filled at its worst price, and a stop and a target both inside one bar as the "
@@ -762,6 +794,12 @@ def render(r: StudyResult, ledger: IdeaLedger, register=None, liquidation_ack: s
     from sleeve_fund.research.strength_report import section as strength_section
 
     out += strength_section(r, flat)
+    from sleeve_fund.research.equal_exposure import section as equal_exposure_section
+
+    out += equal_exposure_section(getattr(r, "equal_exposure", None))
+    from sleeve_fund.research.placebo import section as placebo_section
+
+    out += placebo_section(getattr(r, "placebo", None))
     out.append("## Caveats")
     out.append("")
     out.append("- Signal orders go to the venue as the bar that triggered them closes: at market, paying the taker fee "
