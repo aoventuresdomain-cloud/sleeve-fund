@@ -142,3 +142,26 @@ def test_the_deploy_skips_a_research_config_only_change_and_keeps_its_record():
     assert "research-config-only change, no restart" in pick
     skip = pick.split("research_config_only.sh", 1)[1]
     assert 'echo "current=false"' in skip.split("else", 1)[0], "nothing ships, so .deployed_sha stays"
+
+
+def test_the_research_page_shows_a_study_whose_definition_is_not_in_the_image(tmp_path, monkeypatch):
+    """A study of a definition merged after the deploy writes its sheet as any other; the Research page lists and
+    renders it from the sheet alone, never looking the definition up in the image's configs."""
+    from fastapi.testclient import TestClient
+
+    from sleeve_fund.dashboard import app as app_mod
+    from sleeve_fund.research import rescore
+    from sleeve_fund.store import Store
+
+    stem = "qr99_not_in_image_long_binance-btcusdt-store_20261021-130000"
+    assert not (rescore.DEFINITIONS / "qr99_not_in_image_long.toml").exists()
+    monkeypatch.setenv("DASHBOARD_PASSWORD", "test-pw")
+    monkeypatch.setenv("TEARSHEET_DIR", str(tmp_path))
+    (tmp_path / f"{stem}.md").write_text("# Tear sheet: qr99_not_in_image_long\n\n| a | b |\n| - | - |\n| 1 | 2 |\n")
+    monkeypatch.setattr(app_mod, "TEARSHEETS", tmp_path)
+    monkeypatch.setattr(app_mod, "LEDGER", tmp_path / "idea_ledger.jsonl")
+    c = TestClient(app_mod.create_app(Store(f"sqlite:///{tmp_path}/t.db")))
+    auth = ("pm", "test-pw")
+    assert stem in c.get("/research", auth=auth).text
+    page = c.get(f"/research/{stem}", auth=auth)
+    assert page.status_code == 200 and "qr99_not_in_image_long" in page.text
