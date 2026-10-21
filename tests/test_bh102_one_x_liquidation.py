@@ -80,3 +80,33 @@ def test_a_1x_hold_on_funding_it_can_carry_is_never_liquidated(tmp_path, monkeyp
     res, _ = _funded_hold(tmp_path, monkeypatch, 0.0001)
     assert "liquidation" not in _intents(res) and len(res.fills) == 1
     assert float(res.equity.min()) > 0.0
+
+
+def test_a_1x_position_pays_funding_from_its_free_balance_first_then_its_margin():
+    """Advisor (BH-102 Q1/Q3): at 1x, a payment comes off the available balance beside the position first and only
+    the rest off its margin; a credit goes to the available balance. After settlements past the free balance the
+    price is entry x (maintenance + fee rate) + the drained funding / qty, to the cent."""
+    import types
+
+    from sleeve_fund.strategies.base import fund_margin
+
+    qty, entry, fee = 0.2, 30_000.0, 3.3  # 6,000 of a 10,000 balance at 1x
+    owner = types.SimpleNamespace(_liq_px=entry * MM + fee / qty, _liq_from=0, _liq_funded=0.0, _liq_free=4_000.0)
+    for ts, amount in ((1, -1_500.0), (2, 250.0), (3, -2_500.0), (4, -400.0)):
+        fund_margin(owner, pd.Timestamp(ts, unit="s", tz="UTC"), amount)
+    # 4,000 free + 250 credited = 4,250 taken first; the other 150 of the 4,400 paid came off the margin.
+    assert owner._liq_free == pytest.approx(0.0) and owner._liq_funded == pytest.approx(-150.0)
+    liq = margin.shifted_liquidation(owner._liq_px, qty, owner._liq_funded, MM, entry=entry)
+    assert round(liq, 2) == round(entry * MM + fee / qty + 150.0 / qty, 2)
+
+
+def test_above_1x_funding_still_moves_the_margin_until_the_venue_rule_is_cited():
+    """Advisor: 2x and 3x keep LIQ-FUND-1 (every movement is the margin's) until the venue's own document is cited."""
+    import types
+
+    from sleeve_fund.strategies.base import fund_margin
+
+    owner = types.SimpleNamespace(_liq_px=20_000.0, _liq_from=0, _liq_funded=0.0, _liq_free=None)
+    fund_margin(owner, pd.Timestamp(1, unit="s", tz="UTC"), -100.0)
+    fund_margin(owner, pd.Timestamp(2, unit="s", tz="UTC"), 30.0)
+    assert owner._liq_funded == pytest.approx(-70.0)
