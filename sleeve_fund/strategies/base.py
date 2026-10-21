@@ -5607,12 +5607,18 @@ class LongFlatStrategy(Strategy):
         """Backtest on a perp: the nearest price, from here, at which the risk guard or the liquidation cut
         acts on the open position, and which one: the drawdown halt (equity falls to the peak less the
         profile's drawdown), the daily-loss pause (to the day's opening equity less its daily loss), or the
-        cut (the price within the profile's distance of liquidation). None when flat or already past."""
+        cut (the price within the profile's distance of liquidation). None when flat or already past. With no risk
+        profile (a benchmark's run, no runtime), the venue's liquidation alone, at its price (BH-102, Advisor 21 Oct)."""
         rt = self.runtime
         equity, cash, qty, price = self._mark()
         if qty == 0 or equity <= 0 or price <= 0:
             return None
-        p, side = rt.profile, (1 if qty > 0 else -1)
+        side = 1 if qty > 0 else -1
+        if rt is None:
+            liq = self._liq_now(cash, qty)
+            return (liq, "liquidation") if liq is not None and 0 < liq and (liq < price if side > 0 else liq > price) \
+                else None
+        p = rt.profile
         # The halt and the pause judge a two-leg Strategy's both legs summed (Advisor E): their level is where the
         # pair's book reaches them, rested here only when it lies on this leg's losing side; else the tick finds it.
         equity, g_cash, g_qty = self._guard_book(equity, cash, qty, price)
@@ -5638,8 +5644,9 @@ class LongFlatStrategy(Strategy):
         """Backtest on a perp: keep a reduce-only stop for the whole position resting at the price the risk
         guard would act at (_risk_level), re-priced each bar. Paper judges every trade and closes on the one
         that breaches; judged at a minute's worst price but closed at its close, a backtest's risk exit was
-        kinder by the wick. The stop fills at its level, or at the open if the price gaps through it."""
-        if not (self._backtest and self._margin and self.runtime is not None) or self.instrument is None:
+        kinder by the wick. The stop fills at its level, or at the open if the price gaps through it. With no runtime
+        (no risk profile), the venue's liquidation only (BH-102)."""
+        if not (self._backtest and self._margin) or self.instrument is None:
             return
         stop = self._resting_exits().get("stop_loss") if self._entry_side else None
         if stop is not None:  # GAP-LIQ: the resting stop is judged against the liquidation price as of this bar
@@ -5648,7 +5655,8 @@ class LongFlatStrategy(Strategy):
         if order is not None and order.is_closed:
             order, self._risk_stop_id = None, None
         want = None
-        if self.runtime.status == "running" and self._pending_exit is None and self._flip is None:
+        if ((self.runtime is None or self.runtime.status == "running") and self._pending_exit is None
+                and self._flip is None):
             want = self._risk_level()
         qty = self._position_qty().quantize(self._lot(), rounding=ROUND_HALF_EVEN)
         if want is None or qty < self._min_qty():
@@ -5673,7 +5681,7 @@ class LongFlatStrategy(Strategy):
         side = self._pos_side()
         exit_side, word = (OrderSide.SELL, "sell") if side > 0 else (OrderSide.BUY, "buy")
         what = {"risk_halt": "the drawdown halt", "risk_pause": "the daily-loss pause",
-                "liquidation_cut": "the cut before liquidation"}[intent]
+                "liquidation_cut": "the cut before liquidation", "liquidation": "the venue's liquidation"}[intent]
         if side == 0:
             return
         coid = self._new_coid()
@@ -5684,6 +5692,10 @@ class LongFlatStrategy(Strategy):
         # cancelled whenever the position closes some other way, most risk stops never trade.
         self.decisions[self._risk_stop_id] = {"intent": intent, "reason": f"Risk stop: {word} where {what} acts",
                                               "signal": {"kind": intent}, "journaled": False, "liq": liq}
+        if intent == "liquidation":  # no runtime: booked at the bankruptcy price (_book_liquidation), as paper's
+            self.decisions[self._risk_stop_id].update(
+                reason=f"Liquidated: the price reached the liquidation price {level:,.6g}",
+                signal={"kind": intent, "liquidation_px": round(level, 8)})
         self._sent.append(coid)
         self.submit_order(stop)
 
@@ -5726,7 +5738,8 @@ class LongFlatStrategy(Strategy):
         self._risk_stop_id = None
         if intent == "liquidation":
             self._exit_lock, self._flip = -sign, None
-            self._on_tick()  # the risk check halts on what is left
+            if self.runtime is not None:
+                self._on_tick()  # the risk check halts on what is left
         elif intent == "liquidation_cut":
             self.runtime.store.event(self.runtime.name, "warning", "liquidation_cut",
                                      f"Cut to avoid liquidation: the risk stop filled at {price:,.6g}",

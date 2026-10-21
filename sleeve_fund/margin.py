@@ -98,11 +98,12 @@ def nearer_liquidation(cash: float, qty: float, entry: float, maintenance: Maint
     """The liquidation price used everywhere (Advisor ruling VS-1-TABLE, 15 Oct): formula A (liquidation_price, the
     maintenance on the position's value at the price) and formula B (on its entry value) are both worked and the
     NEARER kept, a long's higher and a short's lower, until the venue's own formula is proved against it (before
-    G2). Where A finds none (a long fully paid for) there is none: B's price there is a share of a percent of the
-    entry and isn't taken as one."""
+    G2). Where A finds none (a long fully paid for, at 1x) B's is the price: a 1x position liquidates at maintenance
+    like any other (BH-102, Advisor 21 Oct), so funding drawn from its margin brings it up from a share of a percent
+    of the entry until it does."""
     a = liquidation_price(cash, qty, maintenance)
     if a is None:
-        return None
+        return _entry_value_liquidation(cash, qty, entry, maintenance) if qty > 0 else None
     b = _entry_value_liquidation(cash, qty, entry, maintenance)
     if b is None:
         return a
@@ -137,7 +138,8 @@ def isolated_liquidation(cash: float, qty: float, entry: float, leverage: float,
     entry_fees_after fill by fill): they come off its isolated margin, so the price is nearer by fees / qty, the
     entry fee rate x the entry (LIQ-FEE: HoE and Advisor (a), 15 Oct; the QA master's C-NA3-LIQ). The fee is booked
     once, to cash, as before: only the liquidation price moves. None when flat, or when no positive price liquidates
-    it (a long at 1x or less is fully paid for). The one liquidation function: the fill, the decision's estimate, a
+    it. A long at 1x is fully paid for, its notional all its margin, and liquidates at maintenance on it (BH-102):
+    cash beside it is not its margin. The one liquidation function: the fill, the decision's estimate, a
     restart's recompute and safety stop, and the dashboard all work it here. With the instrument's tick, the result is
     rounded to it toward the entry, up for a long and down for a short, so float error only brings it nearer
     (Advisor MUST, LIQ-FEE close; to_tick)."""
@@ -145,8 +147,6 @@ def isolated_liquidation(cash: float, qty: float, entry: float, leverage: float,
         return None
     # The balance (cash + qty x entry) is after the fee already: a cap at it takes nothing more off
     margin = min(isolated_margin(qty, entry, leverage), max(cash + qty * entry, 0.0))
-    if qty > 0 and margin >= qty * entry:
-        return None  # a long fully paid for: nothing liquidates it, its fee aside (the margin is all it can lose)
     margin = min(margin, isolated_margin(qty, entry, leverage) - max(fees, 0.0))
     return to_tick(nearer_liquidation(margin - qty * entry, qty, entry, maintenance), qty, tick)
 
