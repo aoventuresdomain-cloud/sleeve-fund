@@ -379,3 +379,24 @@ def test_a_one_pair_request_runs_the_single_study_untouched(tmp_path, monkeypatc
                                   history=b37._History(p.holdout_end + timedelta(days=1)))
     text = out.read_text()
     assert text.startswith("# Tear sheet:") and "Basket" not in text and "pooled" not in text
+
+
+def test_the_basket_passes_the_studys_market_to_every_leg(monkeypatch):
+    """RESEARCH-SPOT-FEES (DA wires the market's meaning): whatever study_market returns goes into every leg's params."""
+    seen = []
+    monkeypatch.setattr(run_mod, "study_market", lambda req: {"market": "perp", "probe": req.market})
+
+    def spy(basket, *a, **k):
+        seen.append(basket.params)
+        raise RuntimeError("stop here")
+
+    monkeypatch.setattr(bk, "basket_study", spy)
+    with pytest.raises(RuntimeError, match="stop here"):
+        run_mod.run_store_study(_req(market="perp"), store=Store("sqlite://"), history=_History())
+    assert seen and seen[0]["market"] == "perp" and seen[0]["probe"] == "perp" and seen[0]["rsi_period"] == 4
+
+
+def test_an_unwired_market_is_refused_in_words():
+    with pytest.raises(ValueError, match="isn't wired yet"):
+        run_mod.study_market(_req(market="spot-lowfee"))
+    assert run_mod.study_market(_req()) == {}

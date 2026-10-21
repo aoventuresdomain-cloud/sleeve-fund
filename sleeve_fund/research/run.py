@@ -65,6 +65,9 @@ class StudyRequest:
     label: str | None = None
     # B-37: a study list's pinned dates (research.pinned.Pinned): the study reads those days only, whatever day it runs.
     pinned: object | None = None
+    # RESEARCH-SPOT-FEES (HoE, 21 Oct): the study's market, whatever its params or risk profile say: "spot-lowfee" for
+    # the research spot market, "perp" for the perpetual. None: as today (the params' market, else the venue's).
+    market: str | None = None
     # R-11: "walk_forward" (as before) or "continuous" (pinned settings only: a warm-up, then scored to the research end)
     score_window: str = "walk_forward"
     # R-12, this round only: also run the old walk-forward on the same settings (never counted as a try), and pass
@@ -104,6 +107,8 @@ class StudyRequest:
             raise ValueError("the old walk-forward verdict is shown beside a continuous window's only")
         if self.placebo_parent is not None and self.score_window != "continuous":
             raise ValueError("the placebo runs on a continuous scoring window only")
+        if self.market is not None and not isinstance(self.market, str):
+            raise ValueError(f"a study's market is a name, not {self.market!r}")
         if self.pairs is not None:
             self._validate_pairs()
 
@@ -125,6 +130,13 @@ class StudyRequest:
             raise ValueError("an asset list is studied on daily bars only")
         if self.placebo_parent is not None or self.old_window_too:
             raise ValueError("an asset list runs without the placebo or the old window beside it")
+
+
+def study_market(req: StudyRequest) -> dict:
+    """The params overlay for the study's market (RESEARCH-SPOT-FEES, DA's to wire): {} for None."""
+    if req.market is None:
+        return {}
+    raise ValueError(f"a study's market setting ({req.market}) isn't wired yet")
 
 
 def _bars(minutes: int) -> str:

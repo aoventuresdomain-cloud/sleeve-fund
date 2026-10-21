@@ -70,7 +70,7 @@ def run_store_basket(req, store=None, out_dir: Path | None = None, history=None)
     from sleeve_fund.instruments import history_price_decimals
     from sleeve_fund.research import pinned as pinning
     from sleeve_fund.research.holdout import HoldoutLocks
-    from sleeve_fund.research.run import TEARSHEETS, spec_of
+    from sleeve_fund.research.run import TEARSHEETS, spec_of, study_market
     from sleeve_fund.research.study import CONTINUOUS, continuous_warmup
     from sleeve_fund.research.trials import TrialsRegister
     from sleeve_fund.venues import venue as venue_profile
@@ -109,7 +109,7 @@ def run_store_basket(req, store=None, out_dir: Path | None = None, history=None)
                                               price_precision=history_price_decimals(prices["close"])))
         daily.append(prices)
     daily = common_clock(daily, bases)
-    params = {**(req.params or spec.default_params or {}), **req.exits()}
+    params = {**(req.params or spec.default_params or {}), **req.exits(), **study_market(req)}  # every leg's market
     warmup = continuous_warmup(req.strategy, params, req.minutes) if req.score_window == CONTINUOUS else None
     if req.pinned is not None and req.holdout_days != req.pinned.holdout_days:
         raise ValueError(f"pinned dates: the holdout is {req.pinned.holdout_days} days, not {req.holdout_days}")
