@@ -342,3 +342,42 @@ def test_ablation_takes_the_take_profit_off_on_its_own_and_with_the_last_stop():
     assert status == "ran" and "exits" not in variant, (status, variant, note)
     assert ablation.describe(defn, "exits.stop") == "no stop, no take-profit"
     assert ablation.describe(defn, "exits.take_profit") == "take profit exit"
+
+
+def _supervised_rules(tmp_path, monkeypatch, sleeves):
+    from types import SimpleNamespace
+
+    from sleeve_fund import supervisor
+    from sleeve_fund.store import Store
+
+    store = Store(f"sqlite:///{tmp_path}/tp.db")
+    for name, defn in sleeves:
+        store.create_sleeve(name=name, strategy="rules", instrument="BTC/USDT", bar_spec="1-HOUR-LAST-INTERNAL",
+                            starting_balance=1_000, venue="binance", params={"market": "spot", "definition": defn})
+    started = []
+    monkeypatch.setattr(supervisor.subprocess, "Popen", lambda *a, **k: started.append(a[0][-1]) or
+                        SimpleNamespace(pid=1, poll=lambda: None, send_signal=lambda *a: None, wait=lambda **k: 0))
+    return store, supervisor.Supervisor(store), started
+
+
+def test_start_refuses_an_r_take_profit_until_its_target_survives_a_restart(tmp_path, monkeypatch):
+    """HoE 21 Oct (TP-RESTART): an {r} target is set from the opening fill and lives in memory only, so a restart
+    would lose it. Until it is journaled and restored, Start refuses it in words; a {level} target is worked out
+    afresh at each close, so it starts. Backtests and studies are unaffected."""
+    from sleeve_fund.strategies import TARGET_RESTART_REFUSAL, check_target_restart
+
+    shared, per_side = _with_tp({"r": 3}), copy.deepcopy(BASE)
+    per_side["exits"] = {"long": {"stop": BASE["exits"]["stop"], "take_profit": {"r": 2.5}}}
+    store, sup, started = _supervised_rules(tmp_path, monkeypatch, [
+        ("r3", shared), ("r25", per_side), ("level", _with_tp({"level": "dc.upper"})), ("none", copy.deepcopy(BASE))])
+    for _ in range(3):
+        sup.step()
+    assert sorted(started) == ["level", "none"]
+    for name, n in (("r3", "3"), ("r25", "2.5")):
+        s = store.sleeve(name)
+        assert s.desired_state == "stopped" and s.status == "stopped"
+        assert s.status_reason == f"not started: {TARGET_RESTART_REFUSAL.format(n=n)}"
+        assert [e["kind"] for e in store.events(name, limit=100)].count("start_refused") == 1
+    assert TARGET_RESTART_REFUSAL.format(n="3") == ("take-profit at 3×R can't run on paper until its target "
+                                                    "survives a restart (TP-RESTART)")
+    check_target_restart("buy_and_hold", {"market": "spot"})  # no definition, nothing to refuse
