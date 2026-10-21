@@ -389,6 +389,7 @@ class LongFlatConfig(StrategyConfig):
         allow_short: bool = False,
         demo_mirror: bool = False,
         keep_sub_cost_target: bool = False,
+        assumed_tiers_pair: str | None = None,
         trade_from: int | None = None,
         leg: dict | None = None,
         signal_strength: dict | None = None,
@@ -558,7 +559,11 @@ class LongFlatConfig(StrategyConfig):
         # a liquidation price and leverage limits (sleeve_fund.markets); allow_short lets it go short.
         self.market = market
         self.allow_short = bool(allow_short)
-        self.perp = markets.terms({"market": market}, str(instrument_id.venue), str(instrument_id.symbol))
+        # Research only (PM, 21 Oct): a study on a perp pair with no kept tiers runs on this kept pair's
+        # (markets.research_tiers_pair). Paper never sets it; its start check refuses such a pair whatever is set.
+        self.assumed_tiers_pair = assumed_tiers_pair
+        self.perp = markets.terms({"market": market}, str(instrument_id.venue), str(instrument_id.symbol),
+                                  assume_from=assumed_tiers_pair)
         # Read by the demo mirror (sleeve_fund.mirror), not by the strategy: paper is unchanged.
         self.demo_mirror = bool(demo_mirror)
         # C8 (Drop B): keep a take-profit even when a hit would not cover the round trip's costs (the entry's check
