@@ -712,6 +712,10 @@ def render(r: StudyResult, ledger: IdeaLedger, register=None, liquidation_ack: s
         out.append(f"- {_n(counts['variants'], 'distinct variant')} of this idea tried so far, in studies, backtests and "
                    f"paper strategies ({counts['evaluations']} evaluations including walk-forward refits): the N its "
                    f"results are judged by.{uncertain}")
+        from sleeve_fund.research.candidates import BUDGET_PER_IDEA, configurations
+
+        out.append(f"- Budget: {len(configurations(register, _idea(r)))} of {BUDGET_PER_IDEA} configurations used "
+                   "for this idea family (the fund summary shows it beside the ranking, R-20).")
     out.append(f"- {_n(project['ideas'], 'idea')} and {_n(project['variants'], 'distinct variant')} tested so far "
                f"across the project ({project['evaluations']} evaluations), shown for awareness. By family: "
                + ", ".join(f"{k} {v}" for k, v in project["ideas_by_family"].items()))

@@ -281,6 +281,11 @@ def caveats(r) -> list[str]:
     return out
 
 
+def window_total(eq: pd.Series) -> float:
+    """The total return of daily closes, first to last: what compounding the sheet's returns file gives (R-20)."""
+    return float(eq.iloc[-1] / eq.iloc[0] - 1)
+
+
 def section(r) -> list[str]:
     """The R-17/R-18/R-19 section of a tear sheet. Window: the full period (labelled) until R-11's scored window."""
     from sleeve_fund.research.metrics import daily_returns
@@ -293,6 +298,9 @@ def section(r) -> list[str]:
     end = eq.index[-1] if len(eq) else None
     out = ["## Risk, trades and costs", "",
            "Over the full research period (the scored window replaces it once R-11 lands). UTC calendar periods.", ""]
+    if len(eq) >= 2:  # the figure the returns file beside the sheet compounds to (R-20)
+        out += [f"Total return over the window: {window_total(eq):+.2%} ({_d(eq.index[0])} to "
+                f"{_d(eq.index[-1])}), from the daily closes.", ""]
 
     roll, broll = rolling_12m(ret), rolling_12m(bret)
     out.append("| Figure | Strategy | Buy and hold |")
