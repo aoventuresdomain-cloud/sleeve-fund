@@ -19,8 +19,8 @@ from sleeve_fund.venues import venue
 pytestmark = [pytest.mark.no_maintenance_tables, pytest.mark.venue_terms_live]
 PAPER = venue("BINANCE")
 PAIR = "BTC/USDT"
-T = datetime(2026, 10, 15, 12, tzinfo=UTC)
-D1 = T + timedelta(days=1)  # the pasted table (15 Oct 00:00) is 36 h old: the daily pull is due
+T = datetime(2026, 10, 21, 12, tzinfo=UTC)  # TEC-TIERS3-C/D2: the kept tables are read 21 Oct
+D1 = T + timedelta(days=1)  # the pasted table (21 Oct 00:00) is 36 h old: the daily pull is due
 FEE = {"symbol": "BTCUSDT", "maker": "0.0002", "taker": "0.0004"}
 
 

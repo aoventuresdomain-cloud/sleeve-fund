@@ -83,14 +83,12 @@ def is_perp(params: dict | None) -> bool:
     return market_of(params) not in (SPOT, SPOT_LOWFEE)
 
 
-def terms(params: dict | None, venue: str | None = None, pair: str | None = None,
-          assume_from: str | None = None) -> PerpTerms | None:
+def terms(params: dict | None, venue: str | None = None, pair: str | None = None) -> PerpTerms | None:
     """What the strategy's market costs and risks. On a venue that lists perpetuals (sleeve_fund.venues), the
     perp market is that venue's own: its fees, spread, settled funding and, for `pair` (BASE/QUOTE or the venue's
     own symbol), its maintenance tiers (VS-1). Without a pair its maintenance_margin is None: only what reads no
     liquidation (fees, funding, labels) asks so. Elsewhere a perp is simulated on the venue's spot prices at a
-    low-fee perp venue's published rates. assume_from: research only (research_tiers_pair), the kept pair whose
-    tiers stand in for a pair with none."""
+    low-fee perp venue's published rates."""
     m = market_of(params)
     if not is_perp(params):
         return None
@@ -101,7 +99,7 @@ def terms(params: dict | None, venue: str | None = None, pair: str | None = None
         if profile.perpetual:
             if m != PERP:
                 raise ValueError("this venue trades its own perpetuals: choose the perp market")
-            return native_terms(profile, pair, assume_from)
+            return native_terms(profile, pair)
     if m == PERP_FUNDING_STRESS:
         from dataclasses import replace
 
@@ -120,40 +118,15 @@ def held_terms(params: dict | None, venue: str | None, pair: str | None) -> tupl
         return terms(params, venue), False
 
 
-def native_terms(profile, pair: str | None = None, assume_from: str | None = None) -> PerpTerms:
+def native_terms(profile, pair: str | None = None) -> PerpTerms:
     """A perpetual venue's own terms: its fee schedule and spread (None: the venue's), the funding it settles,
-    and, for `pair`, the venue's own maintenance tiers (VS-1; maintenance_for). None without a pair. assume_from
-    (research only): a pair with no kept table takes that kept pair's tiers and last ceiling, said in the label."""
-    label, table_pair = profile.label, pair
-    if pair is not None and assume_from is not None and not profile.maintenance_tiers.get(_table_key(profile, pair)):
-        label, table_pair = f"{label}, {assumed_tiers_words(assume_from, pair)}", assume_from
-    return PerpTerms(label, None, None, LOW_FEE_PERP.funding_rate, profile.funding_hours,
-                     maintenance_for(profile, table_pair) if pair is not None else None,  # type: ignore[arg-type]
+    and, for `pair`, the venue's own maintenance tiers (VS-1; maintenance_for). None without a pair. Research, paper and
+    live read the same tables: R-28's research reuse of BTC's for a pair with none is retired (PAPER-TIERS-3)."""
+    return PerpTerms(profile.label, None, None, LOW_FEE_PERP.funding_rate, profile.funding_hours,
+                     maintenance_for(profile, pair) if pair is not None else None,  # type: ignore[arg-type]
                      funding_venue=profile.name,
-                     max_notional=profile.maintenance_limits.get(_table_key(profile, table_pair), float("inf"))
+                     max_notional=profile.maintenance_limits.get(_table_key(profile, pair), float("inf"))
                      if pair is not None else float("inf"))
-
-
-# The PM, 21 Oct 2026 11:01 UK: "use the same margins, margins don't change per asset". Research only: a study on a
-# perp pair whose venue tiers aren't kept runs on BTC's. Paper, the start check and every page still refuse it (VS-1).
-RESEARCH_TIERS_PAIR = "BTC/USDT"
-
-
-def assumed_tiers_words(assume_from: str, pair: str) -> str:
-    return f"Margin tiers: {assume_from.split('/')[0]}'s table assumed for {pair} (PM, 21 Oct)"
-
-
-def research_tiers_pair(params: dict | None, venue: str | None, pair: str) -> str | None:
-    """The kept pair a research run assumes the tiers of (RESEARCH_TIERS_PAIR) for the venue's own perp on `pair`
-    when no table is kept for it; None when it needs none (spot, a simulated perp, or a pair whose table is kept)."""
-    if venue is None or market_of(params) != PERP:
-        return None
-    from sleeve_fund.venues import venue as venue_profile
-
-    profile = venue_profile(venue)
-    if not profile.perpetual or profile.maintenance_tiers.get(_table_key(profile, pair)):
-        return None
-    return RESEARCH_TIERS_PAIR
 
 
 class NoMaintenanceTable(ValueError):

@@ -69,8 +69,8 @@ def test_advisor_the_stop_rule_still_refuses_a_perp_simulated_on_a_spot_venue(pr
 
 
 def test_a_perp_on_a_perpetual_venue_with_no_kept_tick_still_fails():
-    sec = start_check.check_price_ticks(_store("BINANCE", "ETH/USDT"), live_tick=lambda v, p: D("0.01"))
-    assert sec.failed and any("ETH/USDT" in w and "no price tick kept" in w for w in _fails(sec)), sec.lines
+    sec = start_check.check_price_ticks(_store("BINANCE", "SUI/USDT"), live_tick=lambda v, p: D("0.01"))
+    assert sec.failed and any("SUI/USDT" in w and "no price tick kept" in w for w in _fails(sec)), sec.lines
 
 
 def test_a_perp_on_a_perpetual_venue_with_a_lot_mismatch_still_fails():

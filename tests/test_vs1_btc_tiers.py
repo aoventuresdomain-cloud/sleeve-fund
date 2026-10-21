@@ -1,7 +1,8 @@
 """VS-1 tables (HoE 15 Oct, data only): the engine's perp profile keeps the paper venue's published maintenance tiers
 for BTC/USDT, hand-checked by the DA (pe1-plans/vs1-tiers.md: 35 tiers, continuous at every ceiling, the last
 unbounded). Tier 1 is 0.33% to 300,000 with no deduction; tier 2 is 0.5% with a 510 deduction, so the table meets
-at the ceiling. Any other pair still has no table and a perp on it is refused."""
+at the ceiling. A pair with no table kept (SUI/USDT) is refused (TEC-TIERS3-B/C, 21 Oct: ETH, SOL and XRP now keep
+their own tables, read with BTC's in one pass; BTC's is unchanged)."""
 from __future__ import annotations
 
 import math
@@ -22,8 +23,9 @@ def test_btc_keeps_the_paper_venues_published_tiers_with_their_source():
     assert len(table) == 35 and table[-1].ceiling == math.inf
     assert table[0] == (300_000, 0.0033, 0) and table[1] == (2_000_000, 0.005, 510)
     assert 300_000 * 0.0033 - 0 == pytest.approx(300_000 * 0.005 - 510)  # continuous at tier 1's ceiling
-    assert perp.maintenance_basis == "paper venue risk-limit BTCUSDT, 15 Oct 2026, research/venue-data/" \
-                                     "paper-venue-risk-limit-BTCUSDT-2026-10-15.json"
+    assert perp.maintenance_basis == "paper venue risk-limit and instruments-info for BTCUSDT, ETHUSDT, SOLUSDT and " \
+                                     "XRPUSDT, read 21 Oct 2026 21:30 UTC, research/venue-data/" \
+                                     "paper-venue-tables-2026-10-21.md"
 
 
 @pytest.mark.parametrize("side, a_tiers, nearer, a_flat", [(1, 40_132.44, 40_198.00, 40_201.01),
@@ -41,7 +43,7 @@ def test_a_3x_btc_position_of_150000_liquidates_where_the_da_worked_it_out(side,
     assert round(entry_liquidation(100_000, 2.5, 60_000, side, 0.0, table, 3)[0], 2) == nearer
 
 
-@pytest.mark.parametrize("pair", ["ETH/USDT", "SOL/USDT", "XRP/USDT", "SUI/USDT"])
+@pytest.mark.parametrize("pair", ["SUI/USDT"])
 def test_every_other_pair_is_still_refused_until_its_table_is_kept(pair):
     with pytest.raises(markets.NoMaintenanceTable, match=pair):
         markets.maintenance_for(venue("BINANCE"), pair)

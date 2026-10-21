@@ -25,7 +25,7 @@ pytestmark = [pytest.mark.no_maintenance_tables, pytest.mark.venue_terms_live]
 DATA = Path(__file__).parent / "data" / "fee_live"
 PAPER = venue("BINANCE")
 PAIR = "BTC/USDT"
-T = datetime(2026, 10, 15, 12, tzinfo=UTC)
+T = datetime(2026, 10, 22, 12, tzinfo=UTC)  # D2: after the kept tables' read date (21 Oct), so the pasted seed is the older fetch
 
 
 def _answer():

@@ -19,7 +19,7 @@ def test_the_kept_tick_is_read_through_one_reader_and_none_where_not_kept():
 
     assert price_tick("BINANCE", "BTC/USDT") == Decimal("0.1")
     assert price_tick("BINANCE", "BTCUSDT-PERP") == Decimal("0.1")  # the venue's own symbol too, as maintenance_for
-    assert price_tick("BINANCE", "ETH/USDT") is None
+    assert price_tick("BINANCE", "SUI/USDT") is None  # TEC-TIERS3-B: was ETH/USDT
     assert price_tick("KRAKEN", "BTC/USD") is None  # a spot venue keeps no contract tick
 
 
@@ -58,8 +58,8 @@ def test_the_start_check_fails_in_words_a_perp_whose_live_tick_differs():
 
 
 def test_the_start_check_fails_a_perp_whose_tick_is_not_kept_or_cant_be_read():
-    sec = _check(_store("ETH/USDT"), lambda venue, pair: Decimal("0.01"))
-    assert sec.failed and any("ETH/USDT" in w and "no price tick kept" in w for k, w in sec.lines if k == "FAIL")
+    sec = _check(_store("SUI/USDT"), lambda venue, pair: Decimal("0.01"))
+    assert sec.failed and any("SUI/USDT" in w and "no price tick kept" in w for k, w in sec.lines if k == "FAIL")
 
     def unreachable(venue, pair):
         raise OSError("no route")

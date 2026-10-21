@@ -265,14 +265,13 @@ def test_a_study_list_row_runs_perp_or_spot_by_its_market_column_alone(tmp_path,
     assert called == [] and "a study's market is perp or spot-lowfee" in capfd.readouterr().out
 
 
-def test_the_perp_line_on_a_pair_with_no_kept_tiers_assumes_btcs_and_says_so(spot_study_eth):
-    """CR M1: the perp comparison of a spot-lowfee study on ETH ran with no tiers and crashed; it runs on BTC's
-    assumed tiers, as an ETH perp study does, and the sheet says so under the comparison."""
+def test_the_perp_line_on_eth_runs_on_eths_own_tiers_and_assumes_none(spot_study_eth):
+    """CR M1: the perp comparison of a spot-lowfee study on ETH ran with no tiers and crashed. TEC-TIERS3-A
+    (PAPER-TIERS-3): ETH's own table is kept now, so the perp line runs on it and the sheet assumes none (R-28 gone)."""
     r, sheet = spot_study_eth
     assert r.spot_vs_perp["perp"]["funding_paid"] > 0 and r.spot_vs_perp["spot"]["funding_paid"] == 0
-    section = sheet.split("## Spot against the perpetual (research only)", 1)[1].split("\n## ", 1)[0]
-    assert "Margin tiers: BTC's table assumed for ETH/USDT (PM, 21 Oct)" in section
-    assert "Margin tiers" not in sheet.split("## Spot against the perpetual", 1)[0]  # the spot runs need none
+    assert "margin_note" not in r.spot_vs_perp
+    assert "Margin tiers" not in sheet
 
 
 def test_the_entry_tier_line_reads_its_fees_from_the_schedule(spot_study):
