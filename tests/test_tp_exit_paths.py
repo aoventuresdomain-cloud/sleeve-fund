@@ -21,7 +21,7 @@ import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 import pytest  # noqa: E402
 
-from sleeve_fund.instruments import target_level, target_reached  # noqa: E402
+from sleeve_fund.instruments import target_level, target_on_tick, target_reached  # noqa: E402
 from sleeve_fund.strategies.base import replay_missed  # noqa: E402
 from sleeve_fund.strategies.definitions import check_definition, to_params  # noqa: E402
 from test_hub_146_qa import _probe  # noqa: E402,F401 - the probe strategy the parity cells trade
@@ -415,3 +415,86 @@ def test_the_target_level_is_a_prices_value_so_a_bar_at_it_touches_it(side, prec
         bar = Price(level, precision).as_double()  # the bar's high (long) or low (short), exactly at the level
         assert target_reached(side, bar, bar, level)
     assert round(60_060.06 * 1.03, 2) != Price(60_060.06 * 1.03, 2).as_double()  # the hair this pins
+
+
+# --- a definition's target on the tick (Advisor's v4 blocker) --------------------------------------------------------
+
+def _qd():
+    import test_tp_exit as qd
+
+    return qd
+
+
+@pytest.mark.parametrize("form", ["r", "level"])
+@pytest.mark.parametrize("side", ["long", "short"])
+def test_a_definitions_target_between_ticks_goes_past_it_and_fires_on_a_bar_exactly_there(side, form):
+    """Advisor (v4): a definition's target takes the same tick rule as every other (instruments.target_on_tick), at
+    two decimals: 3R from a 100 fill with a 2.0013 stop is 106.0039 (93.9961 short). Nearest would put it at 106.00
+    (94.00), toward the entry; it goes to 106.01 (93.99). A bar exactly there fires it; a bar a tick short of it, at
+    the level nearest would give, does not. The {level} form at 100 + 6.0039 (100 - 6.0039) the same."""
+    qd = _qd()
+    from sleeve_fund.venues import venue
+
+    sign = 1 if side == "long" else -1
+    tp = {"r": 3} if form == "r" else {"level": {"add" if sign > 0 else "sub": ["close", 6.0039]}}
+    defn = qd._defn(tp, side=side, stop=2.0013)
+    inst = venue("KRAKEN").instrument("BTC", "USD", price_precision=2)
+    params = {**to_params(defn), **({"market": "perp", "allow_short": True} if sign < 0 else {})}
+    want, short_of = (106.01, 106.00) if sign > 0 else (93.99, 94.00)
+
+    def run(extreme):
+        from sleeve_fund.research.runner import run_backtest
+
+        df = qd._bars(40)
+        df = qd._set(df, 20, **({"high": extreme} if sign > 0 else {"low": extreme}))
+        return run_backtest("rules", df, inst, params=params, bar_minutes=1, half_spread=0.0, fees=qd.FEES)
+
+    hit = qd._first(run(want))
+    assert hit is not None and hit[4]["target_px"] == pytest.approx(want, abs=1e-9), hit
+    assert qd._first(run(short_of)) is None  # a tick short of it: nearest's level, toward the entry
+
+
+def test_the_paper_tick_the_backtest_and_the_replay_take_a_definitions_target_on_the_tick_past_it(tmp_path):
+    """Advisor (v4), all three paths: a definition's {r} target between ticks (the fill 60,006, the stop 1,200.013
+    below the entry close: 3R = 3,618.039, so 63,624.039) is 63,624.1 in each. A trade at 63,624.0, where nearest would
+    put it, takes it in none; a trade at 63,624.1 takes it in the same minute in the paper tick, the backtest's bar
+    and the outage replay."""
+    import test_tick_bar_parity as tbp
+
+    from sleeve_fund.instruments import target_fill_px
+    from sleeve_fund.research.runner import run_backtest
+
+    qd = _qd()
+    half = tbp.SPREAD / 2 / 60_000
+    params = to_params(qd._defn({"r": 3}, stop=1_200.013))
+
+    def session(touch, name):
+        prices = np.full(40 * 60, 60_000.0)
+        prices[25 * 60 + 30] = touch
+        path = tmp_path / f"{name}.jsonl.gz"
+        trades = tbp._record(path, prices, "rules", params, "aggressive")
+        bars = trades.resample("1min", closed="left", label="right").ohlc()
+        bars["volume"] = 1e9
+        res = run_backtest("rules", bars, tbp.INST, params=params, starting_capital=10_000, risk_profile="aggressive",
+                           bar_minutes=1, half_spread=half, fees=qd.FEES)
+        orders, _ = tbp.replay(path, with_fills=True)
+        return bars, res, [o for o in orders if o["intent"] == "take_profit"]
+
+    fill = qd._entry_fill(session(64_000.0, "probe")[1])
+    exact = fill + 3 * abs(fill - (60_000.0 - 1_200.013))
+    level = target_on_tick(exact, 1, 1)
+    assert level == pytest.approx(63_624.1) and round(exact, 1) == pytest.approx(63_624.0)  # the case nearest moves
+    bars, res, paper = session(round(exact, 1), "short_of")
+    assert qd._first(res) is None and paper == []  # a tick short of it: neither the bar nor the tick takes it
+    row = bars.loc[bars.index[bars["high"] >= round(exact, 1)][0]]
+    assert replay_missed([(0, row["open"], row["high"], row["low"])], 1, {}, {}, level) is None
+    bars, res, paper = session(level, "touch")
+    bt = qd._first(res)
+    minute = bars.index[bars["high"] >= level][0]
+    assert bt is not None and bt[1] == minute and bt[4]["target_px"] == pytest.approx(level, abs=1e-9)
+    assert paper and tbp._minute(pd.Timestamp(paper[0]["ts"]).to_pydatetime()) == minute.to_pydatetime()
+    assert paper[0]["signal"]["target_px"] == pytest.approx(level, abs=1e-9)
+    row = bars.loc[minute]
+    hit = replay_missed([(minute.value, row["open"], row["high"], row["low"])], 1, {}, {}, level,
+                        float(target_fill_px(level, True, half)))
+    assert hit is not None and hit[0] == "take_profit" and hit[2] == level

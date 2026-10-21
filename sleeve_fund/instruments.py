@@ -182,20 +182,24 @@ def target_reached(side: int, high: float, low: float, level: float) -> bool:
     return TARGET_REACHED(side * best, side * level)
 
 
-def target_level(entry: float, side: int, share: float, price_precision: int | None) -> float:
-    """The target's price: `share` past the entry on the position's side, on the instrument's tick (one level for
-    all three paths, so an exact touch of it is a touch in each). Between ticks it goes to the tick past it, up for
-    a long and down for a short, so it is never reached before the exact level is (HoE TEC-TPEXIT-B14AA (3)); within
-    a millionth of a tick of one it is that tick, so float noise never moves it a whole tick (as margin.to_tick).
-    A Price's value, as the bars' prices are: round() differs from it by a float hair, so an exact touch would miss.
-    Exact with no precision (no instrument)."""
-    level = entry * (1 + side * share)
+def target_on_tick(level: float, side: int, price_precision: int | None) -> float:
+    """A target price on the instrument's tick, as a Price's value (the bars' prices are Prices: round() differs from
+    one by a float hair, so an exact touch would miss). Between ticks it goes to the tick past it, up for a long and
+    down for a short, so it is never reached before the exact level is (HoE TEC-TPEXIT-B14AA (3), Advisor); within a
+    millionth of a tick of one it is that tick, so float noise never moves it a whole tick (as margin.to_tick). The
+    one rounding of every target, a share of the entry's and a definition's alike. Exact with no precision."""
     if price_precision is None:
         return level
     n = Decimal(repr(level)).scaleb(price_precision)
     near = n.to_integral_value(ROUND_HALF_EVEN)
     n = near if abs(n - near) < Decimal("1e-6") else n.to_integral_value(ROUND_CEILING if side > 0 else ROUND_FLOOR)
     return Price(float(n.scaleb(-price_precision)), price_precision).as_double()
+
+
+def target_level(entry: float, side: int, share: float, price_precision: int | None) -> float:
+    """The target's price: `share` past the entry on the position's side, on the tick (target_on_tick), one level
+    for all three paths, so an exact touch of it is a touch in each."""
+    return target_on_tick(entry * (1 + side * share), side, price_precision)
 
 
 def target_fill_px(level, long: bool, half_spread) -> Decimal:
