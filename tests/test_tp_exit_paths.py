@@ -267,7 +267,7 @@ def test_qr01b_with_its_3_atr_stop_and_a_3r_target_reconciles(instrument):
     assert marked == pytest.approx(float(res.equity.iloc[-1]), abs=0.05), (book, float(res.equity.iloc[-1]))
 
 
-@pytest.mark.parametrize("tp, words", [({"r": 3}, "3R after costs, from the stop's distance as the trade opens"),
+@pytest.mark.parametrize("tp, words", [({"r": 3}, "3R (price), from the entry fill to the stop"),
                                        ({"level": "dc.upper"}, "as set at each close")])
 def test_the_strategy_tab_says_the_take_profit_in_words(tp, words):
     from sleeve_fund.dashboard import strategy_words
@@ -294,3 +294,51 @@ def test_the_sheet_says_a_definitions_r_is_in_price():
     assert _definition_target_words(to_params(_with_tp({"r": 3}))) == ", take-profit at 3R (price)"
     assert _definition_target_words(to_params(_with_tp({"level": "dc.upper"}))) == ", take-profit at the level dc.upper"
     assert _exit_words({"take_profit_r": 3}) == "take-profit making 3R after costs"  # the study-wide one, unchanged
+
+
+def test_each_trades_r_is_its_own_stop_from_its_own_fill(instrument):
+    """Advisor round 1 (2): R comes from this trade's planned stop, never the last trade's: two trades in a row with
+    stops of clearly different distance (a 3 x ATR stop after a quiet and then a wild stretch), each target the fill
+    +- 2 x |its fill - its own stop level|."""
+    defn = {"version": 1, "reason": "A test case, written before it is run.", "blocks": {"atr": {"kind": "atr",
+                                                                                                  "period": 3}},
+            "long": {"entry": {"left": "close", "op": ">", "right": 0}},
+            "exits": {"stop": {"level": {"sub": ["close", {"mul": [3.0, "atr"]}]}}, "take_profit": {"r": 2}}}
+    c = np.r_[100.0 + 0.3 * (np.arange(80) % 2), 110.0, 110.0 + 2.0 * (np.arange(9) % 2), np.full(10, 200.0)]
+    n = len(c)  # 60 candles of warm-up for the ATR, then the two trades
+    # a quiet stretch (ATR about 0.3: a stop about 1 below), a jump to 110 that takes the first target, then a stop
+    # set across the jump (ATR about 4 or more), and 200, through the second target
+    idx = pd.date_range("2025-10-03 00:01", periods=n, freq="1min", tz="UTC")
+    df = pd.DataFrame({"open": np.r_[100.0, c[:-1]], "high": np.maximum(c, np.r_[100.0, c[:-1]]),
+                       "low": np.minimum(c, np.r_[100.0, c[:-1]]), "close": c, "volume": 1e3}, index=idx)
+    res = _run(defn, df, instrument)
+    f = res.fills.sort_values("ts_last")
+    trades, entry = [], None
+    for o in f.index:
+        d = res.decisions[o]
+        sig = d.get("signal") or {}
+        if d["intent"] == "entry":
+            entry = sig
+        elif d["intent"] == "take_profit":
+            stop_level = entry["close"] * (1 - entry["stop_frac"])
+            fill = sig["entry_px"]
+            trades.append((fill - stop_level, sig["target_px"], round(fill + 2 * (fill - stop_level), 1)))
+    assert len(trades) >= 2, [res.decisions[o]["intent"] for o in f.index]
+    (r1, got1, want1), (r2, got2, want2) = trades[:2]
+    assert abs(r2 / r1 - 1) > 0.5, (r1, r2)  # clearly different stops
+    assert got1 == pytest.approx(want1, abs=0.051) and got2 == pytest.approx(want2, abs=0.051), trades
+
+
+def test_ablation_takes_the_take_profit_off_on_its_own_and_with_the_last_stop():
+    """Advisor (TP-EXIT round 1): take_profit is an ablation unit of its own; removing a side's last stop removes its
+    take_profit too, as "no stop, no take-profit", run, never refused."""
+    from sleeve_fund.research import ablation
+
+    defn = _with_tp({"r": 3})
+    assert "exits.take_profit" in ablation.units(defn)
+    status, variant, _ = ablation.remove(defn, "exits.take_profit")
+    assert status == "ran" and "take_profit" not in variant["exits"] and "stop" in variant["exits"]
+    status, variant, note = ablation.remove(defn, "exits.stop")
+    assert status == "ran" and "exits" not in variant, (status, variant, note)
+    assert ablation.describe(defn, "exits.stop") == "no stop, no take-profit"
+    assert ablation.describe(defn, "exits.take_profit") == "take profit exit"
