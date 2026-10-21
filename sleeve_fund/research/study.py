@@ -993,8 +993,9 @@ def run_study(
         alt_cmp = pd.concat([s for s in spots if s is not None])
         both = perp_cmp.index.intersection(alt_cmp.index)
         ps, ss = _sharpe_or_floor(perp_cmp.reindex(both)), _sharpe_or_floor(alt_cmp.reindex(both))
-        # TEC-BH102-HOLD item 4, held for the Advisor: a perp hold that misses any window (a settlement there has no
-        # known rate) keeps today's rule, its windows unjudged, and the other hold never stands in
+        # TEC-BH102-HOLD item 4, ruled (A) by the Advisor (21 Oct), deferred to after Deploy 2: a fold missing a
+        # settlement will get the perp hold at the baseline rate, labelled, the bar still chosen once per sheet. Until
+        # then a perp hold that misses any window keeps today's rule: its windows unjudged, the other hold never in
         misses = any(part is None for _, part, _ in compare_by)
         switched = ss > ps and not misses
         bar_hold = alt_label if switched else "perp hold"
@@ -1232,9 +1233,9 @@ def run_study(
             result.holdout = summary(h_ret)
             if switched and price_only:  # the bar's hold, as on every other line (BH-102 rule 3)
                 result.holdout_benchmark = _summary_or_none(price_hold_returns(h_start, prices.index[-1]))
-            elif switched:
-                b_all = bt("buy_and_hold", prices, {}, benchmark=True)
-                result.holdout_benchmark = summary(whole_days(daily_returns(b_all.equity), h_start, bar))
+            elif switched:  # the spot hold bought at the close before the holdout, as the price-only one is (Advisor)
+                b_h = bt("buy_and_hold", prices[prices.index >= h_start - bar], {}, benchmark=True)
+                result.holdout_benchmark = summary(whole_days(daily_returns(b_h.equity), h_start, bar))
             elif perp_hold:
                 hb_ret = hold_returns(h_start, prices.index[-1])
                 result.holdout_benchmark = None if hb_ret is None else _summary_or_none(hb_ret)
@@ -1636,7 +1637,7 @@ PRICE_HOLD_TAKER = 0.001
 def price_hold_equity(closes: pd.Series, cost: float, capital: float) -> pd.Series:
     """BH-102 rule 3 (Advisor, 21 Oct): on a venue with no spot market, the asset's own price held, bought at the
     first close and sold at the last, each paying `cost` (the base-tier spot taker fee plus half the spread): no
-    funding, nothing to liquidate. A free hold would be an easier bar the other way. The first close shows the capital
+    funding, nothing to liquidate. A free hold would be the harder bar. The first close shows the capital
     before the entry, as the engine's hold does, so the entry fee falls in the first day's return and a window's
     returns pay both fees."""
     eq = capital * (1 - cost) * closes.astype(float) / float(closes.iloc[0])

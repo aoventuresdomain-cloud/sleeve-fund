@@ -148,3 +148,34 @@ def test_the_holdout_is_judged_against_the_same_bar(tmp_path, monkeypatch):
     eq.iloc[-1] *= 1 - COST
     want = eq.pct_change().iloc[1:]
     assert r.holdout_benchmark["sharpe"] == pytest.approx(study_mod.summary(want)["sharpe"])
+
+
+def test_a_spot_bar_on_the_holdout_buys_at_the_close_before_it(tmp_path, instrument, monkeypatch):
+    """Advisor round 1 (3): when the spot hold sets the bar, the holdout's hold is bought at the close before the
+    holdout's first day, as the price-only hold is, not at the start of all the prices. A simulated perp whose assumed
+    funding is 0.3% a settlement drains its hold, so the spot hold sets the bar; the buy-and-hold runs are watched."""
+    from dataclasses import replace
+
+    from sleeve_fund import markets
+    from sleeve_fund.data import synthetic_ohlcv
+    from sleeve_fund.research.ledger import IdeaLedger
+    from sleeve_fund.research.study import run_study
+    from sleeve_fund.strategies.trend_filter import SPEC
+
+    monkeypatch.setattr(markets, "LOW_FEE_PERP", replace(markets.LOW_FEE_PERP, funding_rate=0.003))
+    monkeypatch.setattr(study_mod.StudyResult, "not_judged", property(lambda self: ""))  # 1-minute rule: pinned elsewhere
+    spot_holds, real = [], study_mod.run_backtest
+
+    def spy(name, df, inst, params, **k):
+        if name == "buy_and_hold" and params.get("market", "spot") == "spot":
+            spot_holds.append(df.index[0])
+        return real(name, df, inst, params, **k)
+
+    monkeypatch.setattr(study_mod, "run_backtest", spy)
+    prices = synthetic_ohlcv(days=800, seed=4)
+    perp = replace(SPEC, param_grid={k: v[:1] for k, v in SPEC.param_grid.items()} | {"market": ["perp"]},
+                   default_params={"fast": 20, "slow": 50, "market": "perp"})
+    r = run_study(perp, prices, instrument, dataset="syn", ledger=IdeaLedger(tmp_path / "l.jsonl"), synthetic=True,
+                  holdout_days=100, train_days=300, test_days=200, use_holdout=True)
+    assert r.bar_hold == "spot hold" and r.holdout is not None, (r.bar_note, r.holdout_withheld)
+    assert prices.index[-101] in spot_holds  # the close before the holdout's first day
