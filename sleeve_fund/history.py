@@ -947,6 +947,38 @@ def funding_backfill(profile, pair: str, since: pd.Timestamp, root=None, pages: 
     return out
 
 
+def funding_sample(profile, pair: str, root=None, count: int = 10, seed: int = 20261021) -> dict:
+    """R-02 spot check (Advisor, 21 Oct), read-only: `count` stored settlements drawn at random (seeded) and the most
+    negative stored rate, each compared with the venue's own record for that settlement as it sends it: the same time
+    (within funding.MATCH), the same value exactly at the venue's precision, so the same sign. A scale or sign slip
+    (a percent kept as a fraction, a flipped sign) shows as a mismatch. Nothing is written."""
+    from decimal import Decimal
+
+    from sleeve_fund import funding
+
+    if profile.funding_raw is None:
+        raise ValueError(f"{profile.label} has no funding records to check against")
+    kept = funding.rates(profile.name, pair, root)
+    out = {"pair": pair, "kept": len(kept), "checked": 0, "matched": 0, "mismatches": []}
+    if kept.empty:
+        return out
+    rng = np.random.default_rng(seed)
+    picks = sorted(set(rng.choice(len(kept), size=min(count, len(kept)), replace=False).tolist())
+                   | {int(np.argmin(kept.to_numpy()))})
+    for i in picks:
+        ts, stored = kept.index[i], float(kept.iloc[i])
+        rows = profile.funding_raw(pair, int((ts - funding.MATCH).timestamp() * 1000))
+        near = [r for r in rows if abs(pd.Timestamp(int(r["fundingTime"]), unit="ms", tz="UTC") - ts) <= funding.MATCH]
+        venue_rate = near[0].get("fundingRate") if near else None
+        out["checked"] += 1
+        if venue_rate is not None and Decimal(str(venue_rate)) == Decimal(repr(stored)):
+            out["matched"] += 1
+        else:
+            out["mismatches"].append({"at": ts.isoformat(), "stored": stored, "venue": venue_rate})
+    out["most_negative"] = {"at": kept.idxmin().isoformat(), "stored": float(kept.min())}
+    return out
+
+
 def _now() -> pd.Timestamp:
     return pd.Timestamp.now(tz="UTC")
 
@@ -1313,6 +1345,11 @@ def main(argv: list[str] | None = None) -> int:
     tb.add_argument("--until", default=None,
                     help="UTC minute to stop before (default: the newest closed minute stored)")
     tb.add_argument("--dry-run", action="store_true", help="count the minutes it would add; write nothing")
+    fs = sub.add_parser("funding-sample", help="read-only: random stored funding rates checked against the venue's")
+    fs.add_argument("pairs", nargs="*", help="instruments (default: core list plus sleeves')")
+    fs.add_argument("--venue", default=None)
+    fs.add_argument("--count", type=int, default=10, help="random settlements per instrument (plus its most negative)")
+    fs.add_argument("--seed", type=int, default=20261021)
     exp = sub.add_parser("export", help="one instrument's stored 1-minute candles in a window, as CSV (read-only)")
     exp.add_argument("pair", help="instrument, e.g. BTC/USDT")
     exp.add_argument("--venue", default=None)
@@ -1357,6 +1394,13 @@ def main(argv: list[str] | None = None) -> int:
             print(out)
             failed |= not out["complete"]
         return 2 if failed else 0
+    if args.cmd == "funding-sample":  # read-only
+        bad = False
+        for pair in args.pairs or [p for p, _ in _pairs_in_use(profile.name)]:
+            out = funding_sample(profile, pair, args.root, args.count, args.seed)
+            print(out)
+            bad |= bool(out["mismatches"]) or not out["checked"]
+        return 2 if bad else 0
     if args.cmd == "taker-backfill":  # only adds taker figures the store lacks; no candle is touched
         since = pd.Timestamp(args.since, tz="UTC")
         until = pd.Timestamp(args.until, tz="UTC") if args.until else None

@@ -59,6 +59,8 @@ class VenueProfile:
     # (pair, cursor) -> (volume and taker_buy by open time, next cursor, caught_up), for the store's taker-buy
     # volume beside its minutes (R-22); None where the venue's candles carry none
     taker_loader: Callable[[str, str], tuple] | None = None
+    # (pair, start ms) -> the venue's settled funding records as it sends them, for the read-only spot check (R-02)
+    funding_raw: Callable[[str, int], list] | None = None
     # pair -> None, raising ValueError when the venue doesn't list it (public data, no key)
     check_listed: Callable[[str], None] | None = None
     request_interval: float = 1.0  # seconds between loader requests, within the venue's rate limit
@@ -671,6 +673,21 @@ def binance_funding(pair: str, start_ms: int, get_json=None) -> list[tuple[int, 
     return [(int(r["fundingTime"]), _number_or_none(r.get("fundingRate"))) for r in rows]  # a null: refused by funding
 
 
+def binance_funding_raw(pair: str, start_ms: int, get_json=None) -> list[dict]:
+    """The venue's settled funding records from `start_ms` exactly as it sends them (rates as its own strings), up to
+    3: the read-only spot check of the stored rates against the venue (R-02, Advisor) compares with these, not with
+    the loader's parsed figures, so a parse or scale slip in the loader would show."""
+    import urllib.parse
+
+    from sleeve_fund.data import _get_json
+
+    q = {"symbol": binance_symbol(pair), "startTime": start_ms, "limit": 3}
+    rows = (get_json or _get_json)(f"{BINANCE_FAPI}/fundingRate?" + urllib.parse.urlencode(q))
+    if isinstance(rows, dict):
+        raise ValueError(f"Binance: {rows.get('msg', rows)}")
+    return rows
+
+
 BINANCE_FUTURES_DATA = "https://fapi.binance.com/futures/data"
 BINANCE_OI_DAYS = 30  # Binance keeps open interest history for the latest 30 days only
 
@@ -800,6 +817,7 @@ BINANCE = register(VenueProfile(
     minute_loader=binance_minutes,
     minute_cursor_at=lambda ts: str(int(ts.timestamp() * 1000)),
     taker_loader=binance_taker_minutes,
+    funding_raw=binance_funding_raw,
     check_listed=lambda pair: (_binance_listing(pair), None)[1],
     request_interval=0.5,  # a 1,500-candle page weighs 10 of Binance's 2,400 a minute
     # BTC and ETH perpetuals trade a cent or less apart; 0.01% half spread is cautious for them, light for small ones.
