@@ -563,14 +563,14 @@ def create_app(store: Store | None = None) -> FastAPI:
                 raise ValueError("other assets: a backtest decided on its one instrument; create it on that alone")
             instruments = [str(form.get("instrument", "")).strip().upper(), *others] if others else [
                 str(form.get("instrument", ""))]
+            if others and (odd := [a for a in others if a.split("/")[-1] != instruments[0].split("/")[-1]]):
+                raise ValueError(f"{', '.join(odd)}: every asset shares the instrument's quote currency, "
+                                 f"{instruments[0].split('/')[-1]}")  # before the venue is asked about any of them
             for one in instruments:
                 try:
                     _check_listed(st(), str(form.get("venue") or "") or None, one)
                 except ValueError as exc:
                     raise ValueError(f"{one}: {exc}" if others else str(exc)) from exc
-                if others and one.split("/")[-1] != instruments[0].split("/")[-1]:  # before asking the venue
-                    raise ValueError(f"{one}: every asset shares the instrument's quote currency, "
-                                     f"{instruments[0].split('/')[-1]}")
             params = _form_params(form, strategy)
             tested = str(form.get("tested_bar_spec") or BACKTEST_BAR_SPEC)
             if form.get("from") == "backtest" and form.get("bar_spec") != tested:
@@ -587,9 +587,16 @@ def create_app(store: Store | None = None) -> FastAPI:
             def named(one, exc):  # a refusal for one of several assets says which
                 return ValueError(f"{one}: {exc}") if others else exc
 
-            for one in instruments:
+            if others:  # every asset whose perp tiers aren't kept, named, before the first one's settings check stops
+                from types import SimpleNamespace
+
+                if why := _tiers_missing([SimpleNamespace(params=params, venue=cfg.venue, instrument=one)
+                                          for one in instruments]):
+                    raise ValueError(why)
+            for one in instruments:  # each asset as its own instrument: its precision, units and spread (Advisor)
                 try:
-                    _check_strategy_params(cfg, resolve_spread(cfg.venue, one, st()).half_spread)
+                    _check_strategy_params(replace(cfg, instrument=one) if others else cfg,
+                                           resolve_spread(cfg.venue, one, st()).half_spread)
                 except ValueError as exc:
                     raise named(one, exc) from exc
             check_hub_bar_spec(cfg.venue, cfg.bar_spec)
@@ -617,12 +624,6 @@ def create_app(store: Store | None = None) -> FastAPI:
             trial, uncounted = _trial(_strategy_trial_metrics, st(), cfg, strategy, params, cfg.risk_profile,
                                       fallback={"strategy": strategy, "params": params, "source": "strategy"})
             stopped = {"desired_state": "stopped"} if strategy in TEST_PREFILL else {}
-            if others and not stopped:  # made running, its node starts now: an asset it can't start on is refused here
-                from types import SimpleNamespace
-
-                if why := _tiers_missing([SimpleNamespace(params=params, venue=cfg.venue, instrument=one)
-                                          for one in instruments]):
-                    raise ValueError(why)
             if others:  # fund-held, 0 own capital, one quote currency, a leg row each, in one transaction, or none
                 rows = _saved("strategy", st().create_legs, name=name, strategy=strategy, bar_spec=cfg.bar_spec,
                               assets=instruments, params=params, starting_balance=cfg.starting_balance,

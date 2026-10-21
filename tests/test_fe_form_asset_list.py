@@ -76,10 +76,10 @@ PERP = {"instrument": "BTC/USDT", "venue": "binance", "assets": "ETH/USDT", "mar
 
 @pytest.mark.no_maintenance_tables  # the venue as it is: BTC/USDT's tiers kept, ETH/USDT's not
 def test_start_refuses_a_perp_asset_with_no_kept_tiers_naming_it_and_starts_nothing(c, store):  # noqa: F811
-    r = _post(c, **PERP, strategy="candle_step", stop_loss_pct="0.1", take_profit_pct="0.1",
-              p_candle_step__size_share="10")  # a test model: made stopped
-    assert r.headers["location"] == "/sleeves/duo", r.headers["location"]
-    assert store.legs("duo") == ["duo", "duo~ETH"] and store.sleeve("duo").desired_state == "stopped"
+    # made while ETH/USDT's tiers were kept (the form now refuses it): Start still checks every asset at the click
+    store.create_legs(name="duo", strategy="ping_pong", bar_spec="1-MINUTE-LAST-INTERNAL", assets=["BTC/USDT", "ETH/USDT"],
+                      params={"market": "perp", "stop_loss": 0.02}, starting_balance=0, universe_date="2026-10-21",
+                      venue="BINANCE", desired_state="stopped")
     r = c.post("/sleeves/duo/command", data={"command": "start", "reason": "go"}, auth=AUTH, headers=SAME,
                follow_redirects=False)
     assert "ETH/USDT" in parse_qs(urlparse(r.headers["location"]).query).get("command_error", [""])[0], r.headers["location"]
@@ -87,7 +87,7 @@ def test_start_refuses_a_perp_asset_with_no_kept_tiers_naming_it_and_starts_noth
 
 
 @pytest.mark.no_maintenance_tables
-def test_a_create_that_would_run_at_once_refuses_an_asset_with_no_kept_tiers(c, store):  # noqa: F811
+def test_a_create_refuses_an_asset_with_no_kept_tiers(c, store):  # noqa: F811
     assert "ETH/USDT" in _error(_post(c, **PERP, stop_loss_pct="2"))
     assert not any(s.name.startswith("duo") for s in store.sleeves())
 
@@ -148,3 +148,78 @@ def test_a_research_only_market_is_refused_as_on_a_one_asset_create(c, store):  
     why = _error(_post(c, assets="ETH/USD", market=markets.PERP_FUNDING_STRESS))
     assert why == f"market: one of {', '.join(markets.MARKETS)}", why
     assert not any(s.name.startswith("duo") for s in store.sleeves())
+
+
+# ---------------------------------------------------------------- CR M1: every per-asset check reaches every asset
+
+def _refuses_eth(monkeypatch, attr, fake):
+    from sleeve_fund.dashboard import app as app_mod
+
+    real = getattr(app_mod, attr)
+    monkeypatch.setattr(app_mod, attr, lambda *a, **k: fake(real, *a, **k))
+
+
+def _gone(store):  # noqa: F811
+    return not any(s.name.startswith("duo") for s in store.sleeves())
+
+
+def test_a_second_asset_not_listed_on_the_venue_is_refused_named(c, store, monkeypatch):  # noqa: F811
+    def listed(real, st, venue, pair):
+        if pair == "ETH/USD":
+            raise ValueError("instrument: the venue doesn't list it")
+        return real(st, venue, pair)
+
+    _refuses_eth(monkeypatch, "_check_listed", listed)
+    assert _error(_post(c, assets="ETH/USD")) == "ETH/USD: instrument: the venue doesn't list it" and _gone(store)
+
+
+def test_a_second_asset_whose_spread_fails_the_settings_is_refused_named(c, store, monkeypatch):  # noqa: F811
+    def checked(real, cfg, half_spread):
+        if cfg.instrument == "ETH/USD":  # checked as its own instrument (Advisor), not the first asset's
+            raise ValueError("stop: inside the spread")
+        return real(cfg, half_spread)
+
+    _refuses_eth(monkeypatch, "_check_strategy_params", checked)
+    assert _error(_post(c, assets="ETH/USD")) == "ETH/USD: stop: inside the spread" and _gone(store)
+
+
+def test_a_second_asset_with_no_history_is_refused_named(c, store, monkeypatch):  # noqa: F811
+    def gaps(real, venue, instrument, *a, **k):
+        return "no history kept" if instrument == "ETH/USD" else real(venue, instrument, *a, **k)
+
+    _refuses_eth(monkeypatch, "_warmup_gaps", gaps)
+    assert _error(_post(c, assets="ETH/USD")).startswith("ETH/USD: no history kept") and _gone(store)
+
+
+def test_a_second_asset_short_of_slower_candles_is_refused_named(c, store, monkeypatch):  # noqa: F811
+    from sleeve_fund.dashboard import app as app_mod
+
+    def slower(real, venue, instrument, minutes, candles):  # the first asset has its candles
+        if instrument == "ETH/USD":
+            raise ValueError("1-hour candles: too few kept")
+
+    _refuses_eth(monkeypatch, "_check_slower_history", slower)
+    model = app_mod.REGISTRY["ping_pong"][0]
+    monkeypatch.setattr(model, "slower_needs", lambda p: {60: 5}, raising=False)
+    assert _error(_post(c, assets="ETH/USD")) == "ETH/USD: 1-hour candles: too few kept" and _gone(store)
+
+
+def test_every_row_is_on_the_account_chosen(c, store):  # noqa: F811
+    store.create_account("research", "paper")
+    _post(c, assets="ETH/USD SOL/USD", account="research")
+    assert {n: store.account_of(n) for n in store.legs("duo")} == dict.fromkeys(["duo", "duo~ETH", "duo~SOL"],
+                                                                                 "research")
+
+
+def test_a_mixed_quote_is_refused_naming_it_before_the_venue_is_asked(c, store, monkeypatch):  # noqa: F811
+    """CR F1, F4."""
+    asked = []
+    _refuses_eth(monkeypatch, "_check_listed", lambda real, st, venue, pair: asked.append(pair))
+    assert _error(_post(c, assets="ETH/EUR SOL/USD")) == "ETH/EUR: every asset shares the instrument's quote currency, USD"
+    assert asked == [] and _gone(store)
+
+
+def test_other_assets_on_a_create_from_a_backtest_are_refused(c, store):  # noqa: F811
+    """CR F2: a backtest decided on its one instrument."""
+    why = _error(_post(c, assets="ETH/USD", **{"from": "backtest"}))
+    assert why.startswith("other assets: a backtest decided on its one instrument") and _gone(store)
