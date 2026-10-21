@@ -142,7 +142,7 @@ def test_unknown_form_is_refused():
 
 
 def _sentences(stem: str, decision: int | None = None) -> list[dict]:
-    path = next(DEFS.glob(f"{stem}*.toml"))
+    path = DEFS / f"{stem}.toml"  # the exact file: a prefix also matches its _sltp variant, in disk order
     return words.rules(check_definition(load_definition_file(path)), decision)
 
 
@@ -154,7 +154,7 @@ def test_same_kind_on_two_candles_says_which():
 
 def test_clock_hours_say_the_candle_closes():
     """QD 2: the rule tests the hour at the candle's close, not the clock."""
-    (s,) = _sentences("qr12")
+    (s,) = _sentences("qr12_overnight_breakout_long")
     assert "the candle closes at or after 21:00 or before 06:00 London time" in s["entry"]
     assert s["exit"] == "Sell when the candle closes between 08:00 and 21:00 London time"
 
@@ -172,7 +172,7 @@ def test_candle_before_is_said_once():
     (lng,) = _sentences("qr13_level_continuation_long", 60)
     assert lng["entry"].count("as of the candle before") == 0 and lng["entry"].startswith("Buy when, at the candle before, the close was above")
     assert "inside this candle, the price reaches" in lng["entry"] and "levels as set at the candle before" in lng["entry"]
-    (cap,) = _sentences("qr10", 1440)
+    (cap,) = _sentences("qr10_capitulation_long", 1440)
     assert "the previous candle's high" in cap["exit"] and "daily" not in cap["entry"]
 
 
