@@ -18,6 +18,7 @@
       <legend>1. Market</legend>
       <div class="grid2">
         {{ instrument_field(pre) }}
+        {% if fund_held and not from_bt %}<div class="field"><label for="assets">Other assets <span class="faint">(optional)</span></label><input id="assets" name="assets" value="{{ pre.get('assets', '') }}" placeholder="e.g. ETH/USD" autocomplete="off" spellcheck="false"><p class="hint">The same Model and settings on each, as one Strategy with a row for each asset, on the instrument's venue and quote currency. The first asset is the main one, and the order breaks ties between same-candle entries. The asset list is fixed once created. A different list is a new Strategy.</p></div>{% endif %}
         <div class="field"><span class="label" id="bar_spec-l">Candle length</span>{{ candle_chips('bar_spec' if not from_bt else 'bar_spec_shown', bar_choices(bar_specs), pre.get('bar_spec', '1-HOUR-LAST-INTERNAL'), id='bar_spec', disabled=from_bt) }}{% if from_bt %}<p class="hint">As backtested.</p>{% endif %}</div>
       </div>
     </fieldset>
