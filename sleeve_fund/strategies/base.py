@@ -718,6 +718,9 @@ class LongFlatStrategy(Strategy):
         # half-liquidation cap yet (it alerts once per position), and how many positions were (the tear sheet's count).
         self._stop_capped = False
         self.stops_clamped = 0
+        # BH-102: the entry signals refused for a stop past its share of the way to the liquidation price (the tear
+        # sheet's count): a backtest journals no events, so a run refused throughout would show zero trades silently.
+        self.entries_refused_liquidation = 0
         self._cash_adj = 0.0
         self._funding_since = None  # the last time funding was settled up to
         # Perp: the position and the last trade price held at each hour's start, as the first event past it
@@ -2825,6 +2828,7 @@ class LongFlatStrategy(Strategy):
             # lets it run stopless, so the stop's share isn't asked of it (Advisor (A), 21 Oct). A 1x short keeps it.
             fully_paid = side > 0 and lev <= 1
             if self._stop_frac and not fully_paid and self._stop_frac > share * distance:
+                self.entries_refused_liquidation += 1
                 self._note("entry_refused_liquidation",
                            f"Entry refused: its {self._stop_frac:.2%} stop is more than {share:.0%} of the way to the "
                            f"liquidation price {liq:,.6g} ({distance:.2%} away)")

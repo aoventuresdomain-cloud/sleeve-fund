@@ -667,6 +667,10 @@ def render(r: StudyResult, ledger: IdeaLedger, register=None, liquidation_ack: s
     out.append(f"- Time in the market: {r.full_period.exposure.abs().gt(0.001).mean():.0%} of bars hold a position")
     out.append(f"- Stops clamped: {_n(getattr(r.full_period, 'stops_clamped', 0), 'trade')}, held at half the way to "
                "the liquidation price when the level loosened past it or funding moved it nearer")
+    refused = getattr(r.full_period, "entries_refused_liquidation", 0)
+    if refused:  # BH-102: a run the rule refuses throughout would otherwise show zero trades and say nothing
+        out.append(f"- Entries refused: {refused} entr{'y' if refused == 1 else 'ies'}, the stop more than its share "
+                   "of the way to the liquidation price (a fully paid 1x long is exempt)")
     out.append("")
     out.append(_double_fees_line(r))
     out.append("")
