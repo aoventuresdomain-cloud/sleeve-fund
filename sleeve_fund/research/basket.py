@@ -37,7 +37,7 @@ from sleeve_fund.research.holdout import HoldoutLocks
 from sleeve_fund.research.metrics import daily_closes, fills_to_rows, trades
 from sleeve_fund.research.multi_asset import FIXED_LIST, AssetData, check_assets, leg_names, underlying
 from sleeve_fund.research.portfolio_run import LegSpec, PortfolioResult, run_portfolio
-from sleeve_fund.research.random_entry import BAR, DRAWS, _random_entries
+from sleeve_fund.research.random_entry import BAR, DRAWS, HELD_BACK_MAX, Trade, _random_entries
 from sleeve_fund.research.candidates import BUDGET_PER_IDEA, configurations
 from sleeve_fund.research.study import COST_LADDER, _between, doubled
 from sleeve_fund.risk import PORTFOLIO, PortfolioProfile
@@ -141,6 +141,12 @@ class BasketStudy:
     tries: int = 0  # baskets of this model tried
     configuration: int = 0  # this basket's place among its model's configurations (of BUDGET_PER_IDEA)
     key: str = ""
+    # STUDY-ASSET-LIST (Advisor ruling 21 Oct), with basket_study(filled=True): random entry filled as the engine fills
+    # on the pooled book (it decides in place of `random`, which stays close-priced, without a verdict), the hold bar
+    # (long-only baskets only) and, for a basket with SOL, the same study without it (diagnostic only).
+    pooled: Any = None
+    hold: Any = None
+    without_sol: dict | None = None
 
     @property
     def gate_touched(self) -> float:
@@ -473,9 +479,10 @@ def _created(t: dict) -> pd.Timestamp:
 
 def basket_study(basket: Basket, windows, research_end: date, *, register: trials.TrialsRegister, dataset: str,
                  capital: float = 10_000.0, profile: PortfolioProfile = PORTFOLIO, warm_days: int = 200,
-                 ladder: bool = True, draws: int = DRAWS, seed: int = 0) -> BasketStudy:
+                 ladder: bool = True, draws: int = DRAWS, seed: int = 0, filled: bool = False) -> BasketStudy:
     """The basket's study over the walk-forward's test windows ((first day, last day), in order), never reading a bar
-    after research_end. Its holdout stays sealed: open_holdout is the separate final step."""
+    after research_end. Its holdout stays sealed: open_holdout is the separate final step. filled: a study request's
+    asset list (STUDY-ASSET-LIST): random entry judged filled on the pooled book, the hold bar, and without SOL."""
     windows = tuple(tuple(w) for w in windows)
     if not windows or windows[-1][1] > research_end:
         raise ValueError(f"the test windows must end by the research end {research_end}")
@@ -514,6 +521,16 @@ def basket_study(basket: Basket, windows, research_end: date, *, register: trial
         ladder=rungs, breakeven=ladder_breakeven(rungs) if rungs else (None, "not tested"),
         asset_breakeven={a: ladder_breakeven(r) for a, r in per_asset.items() if r})
     study.key = basket_key(basket)
+    if filled:
+        study.pooled = pooled_random(base, names, specs, basket.params, windows, capital, touched, draws, seed)
+        study.hold = hold_bar(base, specs, basket.params, windows, capital)
+        if "SOL" in names_of:  # Advisor Q3: shown beside, its own re-run; never a condition or a try
+            rest = [a for a, n in zip(assets, names_of) if n != "SOL"]
+            m, rn, rs = measured(rest, None)
+            study.without_sol = {"assets": [n for n in names_of if n != "SOL"], "net": m.net,
+                                 "sharpe": _sharpe(m.returns.to_numpy()),
+                                 "random": pooled_random(m, rn, rs, basket.params, windows, capital,
+                                                         gate_touched(m.run, windows), draws, seed)}
     study.tries, study.configuration = record_try(
         register, basket, dataset, _since(first, warm_days, basket), pd.Timestamp(last + timedelta(days=1), tz="UTC"),
         None if math.isnan(study.random.sharpe) else study.random.sharpe)
@@ -576,11 +593,18 @@ def open_holdout(study: BasketStudy, period: tuple[date, date], locks: HoldoutLo
 def verdict(study: BasketStudy, holdout: Holdout | None) -> str:
     """PASS only with all four. FAIL when one is judged and fails; NOT JUDGED when the random check couldn't be
     (it can't pass then); NOT YET while the holdout is sealed."""
-    failed = (study.random.judged and not study.random.beats) or not study.double_fees.passed \
+    pooled, hold = getattr(study, "pooled", None), getattr(study, "hold", None)
+    if pooled is not None:  # STUDY-ASSET-LIST: the filled pooled comparison decides; the hold bar once it is proven
+        random_failed, judged = pooled.verdict == "FAIL", pooled.verdict == "PASS"
+        held = hold is None or (BH102_LIVE and hold.beats)
+        random_failed = random_failed or (hold is not None and BH102_LIVE and not hold.beats)
+    else:
+        random_failed, judged, held = study.random.judged and not study.random.beats, study.random.judged, True
+    failed = random_failed or not study.double_fees.passed \
         or not study.left_out.passed or (holdout is not None and not holdout.passed)
     if failed:
         return "FAIL"
-    if not study.random.judged:
+    if not judged or not held:
         return "NOT JUDGED"
     return "NOT YET" if holdout is None else "PASS"
 
@@ -594,10 +618,25 @@ def render(study: BasketStudy, holdout: Holdout | None = None) -> str:
     b, base = study.basket, study.base
     days = len(base.returns)
     v = verdict(study, holdout)
+    pooled = getattr(study, "pooled", None)
+    not_judged = "NOT JUDGED: the random benchmark couldn't be judged, so the basket can't pass"
+    if pooled is not None and pooled.verdict == "PASS" and study.hold is not None and not BH102_LIVE:
+        not_judged = f"NOT JUDGED: the hold bar is {UNPROVEN}, so the basket can't pass yet"
     head = {"NOT YET": "NOT YET: the locked holdout is sealed until its own final step",
-            "NOT JUDGED": "NOT JUDGED: the random benchmark couldn't be judged, so the basket can't pass",
-            "PASS": "PASS", "FAIL": "FAIL"}[v]
+            "NOT JUDGED": not_judged, "PASS": "PASS", "FAIL": "FAIL"}[v]
     lo = study.left_out
+    if pooled is None:
+        random_rows = [f"| Beats random entries (95th percentile) | {random_words(study.random)} |"]
+        left_random = random_words(lo.random) if lo.random is not None else None
+        concentrated = "; concentrated: over half the net from one asset"
+        viewed = ""
+    else:
+        random_rows = [f"| Beats random entries, filled on the pooled book (95th percentile) | {pooled_words(pooled, study.random.seed)} |",
+                       f"| Hold bar (long-only baskets) | {hold_words(study.hold)} |",
+                       f"| Random entries, close-priced | {close_priced_words(study.random)} |"]
+        left_random = close_priced_words(lo.random) if lo.random is not None else None
+        concentrated = "; CONCENTRATED: over half the pooled profit from one asset"
+        viewed = "; holdout already viewed; paper is the forward test"
     lines = [
         f"# Basket study: {b.name} ({b.strategy} on {', '.join(b.names)})", "",
         f"**Basket verdict:** {head}", "",
@@ -607,20 +646,21 @@ def render(study: BasketStudy, holdout: Holdout | None = None) -> str:
         f"Out-of-sample: {study.windows[0][0]} to {study.windows[-1][1]}, {days} days, one fund run of the whole "
         f"basket at the venue's fees: net {_pct(base.net)}.", "",
         "| Condition | Result |", "| --- | --- |",
-        f"| Beats random entries (95th percentile) | {random_words(study.random)} |",
+        *random_rows,
         f"| Net above 0 at 2x the venue's fees | {'PASS' if study.double_fees.passed else 'FAIL'}, net "
         f"{_pct(study.double_fees.net)} |",
         f"| Best asset left out ({lo.asset}, {lo.share:.0%} of the pooled net) | {'PASS' if lo.passed else 'FAIL'}, "
-        f"net {_pct(lo.net)}{'; concentrated: over half the net from one asset' if lo.concentrated else ''}"
-        f"{'; info, without it: ' + random_words(lo.random) if lo.random is not None else ''} |",
+        f"net {_pct(lo.net)}{concentrated if lo.concentrated else ''}"
+        f"{'; info, without it: ' + left_random if left_random is not None else ''} |",
         "| Locked holdout at the venue's fees | " + (
             "sealed: opened once, as its own final step" if holdout is None else
             f"{'PASS' if holdout.passed else 'FAIL'}, net {_pct(holdout.net)} ({holdout.period[0]} to "
-            f"{holdout.period[1]})") + " |", "",
+            f"{holdout.period[1]})") + viewed + " |", "",
         f"The compliance tests trimmed or refused {study.gate[0]:,.2f} of {study.gate[1]:,.2f} intended entry notional "
         f"on the test days ({study.gate_touched:.1%} of entry notional).", "",
         f"**Pooled break-even fee:** {study.breakeven[1]} (one fee per side on every fill, real runs on the cost "
         "ladder)", "",
+        *_without_sol_lines(study),
         "## Per asset (diagnostic only, never a verdict)", "",
         "| Asset | Out-of-sample net P&L | Share | Break-even fee |", "| --- | --- | --- | --- |",
     ]
@@ -631,3 +671,318 @@ def render(study: BasketStudy, holdout: Holdout | None = None) -> str:
         lines.append(f"| {a} | {totals[a]:,.2f} | {totals[a] / whole if whole else math.nan:.0%} | {be} |")
     lines += ["", f"On a PASS, {NEXT}." if v != "PASS" else f"PASS, so {NEXT}.", ""]
     return "\n".join(lines)
+
+
+# ---- STUDY-ASSET-LIST (Advisor ruling 21 Oct): random entry on the pooled book, filled as the engine fills ---------
+
+@dataclass
+class PooledLeg:
+    """One asset's side of the pooled random-entry comparison: its realised trips on its decision bars, each one's
+    return as the engine booked it (fees, fills, funding) and its intended entry notional over the fund's capital,
+    and the pricer that fills its draws as the engine fills the definition (fills.Pricer)."""
+
+    asset: str
+    trades: list
+    realised: np.ndarray
+    weights: np.ndarray
+    windows: list[tuple[int, int]]
+    pricer: Any
+    gaps: np.ndarray
+    stops: np.ndarray
+    in_market: float
+
+
+def random_entry_pooled(legs: list[PooledLeg], reconciled: tuple, draws: int = DRAWS, seed: int = 0,
+                        why_not: str = ""):
+    """PR E's comparison on the pooled book (Advisor Q1): the statistic is the sum of every asset's realised trip P&L
+    at its intended notional, over the fund's capital; each draw moves the entry times of EVERY asset's trips at once,
+    each asset keeping its own trip count, sides and holding periods (as caps) inside its windows, filled by its own
+    pricer, its P&L the sum across the assets. reconciled: (the trips' P&L, the book's moves over them), over the
+    fund's capital: further apart than RECONCILE_PP is NOT JUDGED, as are draws held back above HELD_BACK_MAX."""
+    from sleeve_fund.research.random_entry import (
+        DISAGREE, WEAK_EXPOSURE, RandomEntryResult, _filled_windows, _random_entries, _sharpe)
+
+    rng = np.random.default_rng(seed)
+    per_leg = [(leg, _filled_windows(leg.trades, leg.windows)[0]) for leg in legs]
+    n = sum(len(w[2]) for _, pw in per_leg for w in pw)
+    if n == 0:
+        return RandomEntryResult(math.nan, math.nan, 0.0, 0.0, 0, 0.0, draws, False, False, reconciled=reconciled,
+                                 why_not=why_not)
+    actual, gapped, strategy_stops = [], [], 0
+    for leg, pw in per_leg:
+        for w in pw:
+            k = np.asarray(w[4])
+            actual.append(leg.realised[k] * leg.weights[k])
+            gapped.append((leg.realised[k] + leg.gaps[k]) * leg.weights[k])
+            strategy_stops += int(leg.stops[k].sum())
+    actual = np.concatenate(actual)
+    strategy_total, gap_total = float(actual.sum()), float(np.concatenate(gapped).sum())
+    rets, sharpes = np.empty(draws), np.empty(draws)
+    held_back = stopped = priced = 0
+    for d in range(draws):
+        parts = []
+        for leg, pw in per_leg:  # one draw: every asset's entries move together
+            for start, end, holds, sides, ks in pw:
+                order, entries = _random_entries(rng, start, end, holds)
+                fills = leg.pricer.draws(entries, holds[order], sides[order])
+                held_back, stopped, priced = held_back + fills.held_back, stopped + fills.stopped, priced + len(entries)
+                parts.append(fills.returns * leg.weights[np.asarray(ks)[order]])
+        r = np.concatenate(parts)
+        rets[d], sharpes[d] = float(r.sum()), _sharpe(r)
+    ret_pct = float((rets < strategy_total).mean() * 100)
+    sharpe_pct = float((sharpes < _sharpe(actual)).mean() * 100)
+    exposure = float(np.mean([leg.in_market for leg in legs])) if legs else 0.0
+    return RandomEntryResult(
+        return_percentile=ret_pct, sharpe_percentile=sharpe_pct, strategy_return=strategy_total,
+        median_random_return=float(np.median(rets)), trades=n, exposure=exposure, draws=draws,
+        weak=exposure > WEAK_EXPOSURE, disagree=abs(ret_pct - sharpe_pct) > DISAGREE, reconciled=reconciled,
+        held_back=held_back, held_back_share=held_back / priced if priced else 0.0,
+        stopped_share=stopped / priced if priced else 0.0, why_not=why_not, strategy_stops=strategy_stops,
+        draw_stops=stopped / draws, gap_return=gap_total - strategy_total,
+        gap_percentile=float((rets < gap_total).mean() * 100))
+
+
+def _intended(run: PortfolioResult, name: str) -> tuple[pd.DatetimeIndex, list[float]]:
+    """A leg's sent opening entries (kind "entry", approved above 0), by the bar they were decided on, each with its
+    intended notional: its requested quantity at its expected fill (as _trips reads them)."""
+    opens = sorted((pd.Timestamp(d["bar_ts"]), float(d["requested"]) * float(d["price"])) for d in run.decisions
+                   if d["strategy"] == name and d.get("kind", "entry") == "entry" and float(d["approved"]) > 0)
+    return pd.DatetimeIndex([b for b, _ in opens]), [x for _, x in opens]
+
+
+def pooled_legs(m: Measured, names, specs, params: dict, windows, capital: float) -> tuple[list[PooledLeg], tuple,
+                                                                                            str]:
+    """Each asset's side of the pooled comparison from the fund run, the pooled reconcile (trips' P&L, the book's moves,
+    over the fund's capital), and why the draws can't be filled ('' when they can). The draws fill on each asset's own
+    execution bars, as its leg did, at its venue fee and half spread, with its funding settlements."""
+    from sleeve_fund.research.fills import unmodelled
+    from sleeve_fund.research.study import DrawFill, _settlement_rates, _trip_bars, _trip_reconcile
+    from sleeve_fund.instruments import taker_slippage
+
+    definition = params.get("definition")
+    why = "a hand-coded model has no rule definition to fill its draws from" if not definition else \
+        unmodelled(definition, 1440) or ""
+    clock = specs[0].prices.index
+    legs, pnl, moved = [], 0.0, 0.0
+    for n, s in zip(names, specs):
+        leg = m.run.legs[n]
+        # The draws' levels read the warm-up too, as the leg's own did: positions count from the warm-up's first bar.
+        bars, off = pd.concat([s.warmup_prices, s.prices]), len(s.warmup_prices)
+        idx = bars.index
+        ranges = [(off + s0 - 1, off + e) for s0, e in _ranges(clock, windows)]  # a trip may open on the close before
+        taker = float(base_fees(s.instrument, params).taker) if s.fees is None else float(s.fees.taker)
+        half = _half_spread(s.instrument, params)
+        pricer = None
+        if not why:
+            fill = DrawFill(definition, 1440, s.exec_prices, _settlement_rates(params, s.instrument, bars), taker)
+            pricer = fill.pricer(bars, taker + half, half)
+        rows = trades(fills_to_rows(leg.fills), leg.shorts, leg.funding, open_trip=True) \
+            if leg.fills is not None and not leg.fills.empty else []
+        decided, notionals = _intended(m.run, n)
+        placed, realised, weights, gaps, stops, held = [], [], [], [], [], 0
+        for start, end in ranges:
+            # From the close before the window, or the leg's first mark when that is the warm-up's (nothing held then).
+            out = _trip_reconcile(rows, leg.equity, max(idx[start], leg.equity.index[0]), idx[end], [], leg.decisions)
+            p, mv, _ = out["trip_reconcile"]
+            pnl, moved = pnl + p, moved + mv
+            for t in out["trip_returns"]:
+                e, x = _trip_bars(idx, t["opened"], t["closed"], end)
+                k = int(decided.searchsorted(t["opened"], side="right")) - 1
+                placed.append(Trade(e, x, int(t["side"])))
+                realised.append(t["ret"])
+                weights.append((notionals[k] if k >= 0 else 0.0) / capital)
+                gaps.append(t.get("stop_gap", 0.0) - t.get("stop_level", 0.0) * float(taker_slippage(half)))
+                stops.append(bool(t.get("stopped")))
+                held += x - e
+        bars_in = sum(e - s0 + 1 for s0, e in ranges)
+        legs.append(PooledLeg(underlying(s.instrument), placed, np.asarray(realised, dtype=float),
+                              np.asarray(weights, dtype=float), ranges, pricer, np.asarray(gaps, dtype=float),
+                              np.asarray(stops, dtype=bool), held / bars_in if bars_in else 0.0))
+    return legs, (pnl / capital, moved / capital), why
+
+
+def pooled_random(m: Measured, names, specs, params: dict, windows, capital: float, touched: tuple[float, float],
+                  draws: int = DRAWS, seed: int = 0):
+    """The pooled book against random entries filled as the engine fills (Advisor Q1), NOT JUDGED when the
+    compliance tests trimmed or refused GATE_TOUCH_CAP of the intended entry notional or more."""
+    from sleeve_fund.research.random_entry import RandomEntryResult
+
+    if draws < DRAWS:
+        raise ValueError(f"refused: the random check draws at least {DRAWS:,} times, not {draws:,}")
+    cut, asked = touched
+    share = cut / asked if asked else 0.0
+    legs, reconciled, why = pooled_legs(m, names, specs, params, windows, capital)
+    if share >= GATE_TOUCH_CAP:
+        why = (f"the compliance tests trimmed {share:.1%} of entry notional ({GATE_TOUCH_CAP:.0%} or more), so "
+               "the ungated draws aren't like with like")
+    if why:
+        trades_n = sum(len(leg.trades) for leg in legs)
+        return RandomEntryResult(math.nan, math.nan, 0.0, 0.0, trades_n, 0.0, draws, False, False,
+                                 reconciled=reconciled, why_not=why)
+    return random_entry_pooled(legs, reconciled, draws, seed)
+
+
+# ---- STUDY-ASSET-LIST: the hold bar on the pooled book (Advisor Q2, BH-102 rule 3 pooled) --------------------------
+
+PRICE_ONLY = "price-only hold (no spot market at this venue)"
+FUNDED = "funded perp hold"
+# BH-102 rule 3: until PR E and BH-102 are live, the hold bar's figures are unproven and a basket can't PASS on it.
+BH102_LIVE = False
+UNPROVEN = "unproven until BH-102 is live"
+
+
+@dataclass
+class HoldBar:
+    """The better (by Sharpe over the joined out-of-sample days) of two equal-weight holds of the basket's assets,
+    never rebalanced, each the fund's capital split evenly at the first test day: the funded 1x perp hold and the
+    price-only hold, chosen once and named. The basket passes it with its pooled Sharpe strictly above the bar's."""
+
+    perp_sharpe: float  # nan: no funded perp hold (a spot market, or a missing funding rate)
+    price_sharpe: float
+    chosen: str
+    bar_sharpe: float
+    bar_net: float
+    bar_cagr: float
+    basket_sharpe: float
+    basket_net: float
+    basket_cagr: float
+    liquidated: list[str] = field(default_factory=list)  # assets whose funded hold was liquidated (flat after)
+
+    @property
+    def beats(self) -> bool:
+        return bool(self.basket_sharpe > self.bar_sharpe)
+
+
+def long_only(params: dict) -> bool:
+    """No short side: a rule-builder definition without one, and no allow_short (Advisor Q2: only these get a bar)."""
+    definition = params.get("definition") or {}
+    return not params.get("allow_short") and "short" not in definition
+
+
+def _cagr(net: float, days: int) -> float:
+    return (1 + net) ** (365 / days) - 1 if days and net > -1 else math.nan
+
+
+def _net(r: pd.Series) -> float:
+    return float((1 + r).prod() - 1) if len(r) else 0.0
+
+
+def hold_bar(base: Measured, specs, params: dict, windows, capital: float, hold=None) -> HoldBar | None:
+    """The hold bar for a long-only basket (None for one with a short side): the funded 1x perp hold through the
+    engine (each leg's own buy-and-hold run; a liquidated leg stays flat and is named), and the price-only hold of the
+    same closes paying the spot taker fee and half spread once in and once out, with no funding and no liquidation.
+    hold: (bars, instrument, params, capital) -> a run or its equity, for the funded legs (default: the engine's)."""
+    if not long_only(params):
+        return None
+    from sleeve_fund.research.study import _liquidations
+
+    days = base.returns.index
+    keep = days[_oos(days, windows)]
+    if not len(keep):
+        return None
+    first = keep[0] - DAY  # bought at the close before the first test day
+    each = capital / len(specs)
+    price_parts, perp_parts, liquidated = [], [], []
+    perp = markets.is_perp(params)
+    for s in specs:
+        bars = pd.concat([s.warmup_prices.iloc[-1:], s.prices])  # from the warm-up's last close
+        closes = bars["close"]
+        closes = closes[(closes.index >= first) & (closes.index <= keep[-1])]
+        c = float(base_fees(s.instrument, {}).taker) + _half_spread(s.instrument, {})
+        value = each * (1 - c) * closes / float(closes.iloc[0])
+        value.iloc[-1] *= 1 - c  # out at the last test day's close
+        price_parts.append(value)
+        if perp:
+            run = (hold or _funded_hold)(bars, s.instrument, params, each)
+            eq = run.equity if hasattr(run, "equity") else run
+            daily = eq.resample("1D", closed="right", label="right").last().dropna()
+            daily = daily[(daily.index >= first) & (daily.index <= keep[-1])]
+            perp_parts.append(daily * (each / float(daily.iloc[0])))
+            if hasattr(run, "fills") and _liquidations(run, first, keep[-1], "hold"):
+                liquidated.append(underlying(s.instrument))
+
+    def returns(parts) -> pd.Series:
+        v = pd.concat(parts, axis=1).ffill().sum(axis=1)
+        return v.pct_change().reindex(keep).dropna()
+
+    price = returns(price_parts)
+    perp_r = returns(perp_parts) if perp_parts else None
+    price_s = _sharpe(price.to_numpy())
+    perp_s = _sharpe(perp_r.to_numpy()) if perp_r is not None else math.nan
+    if perp_r is not None and not (perp_s <= price_s) and not math.isnan(perp_s):
+        chosen, bar = FUNDED, perp_r
+    else:
+        chosen, bar = PRICE_ONLY if perp else "price-only hold", price
+    mine = base.returns.reindex(keep).dropna()
+    return HoldBar(perp_s, price_s, chosen, _sharpe(bar.to_numpy()), _net(bar), _cagr(_net(bar), len(bar)),
+                   _sharpe(mine.to_numpy()), _net(mine), _cagr(_net(mine), len(mine)), liquidated)
+
+
+def _funded_hold(bars: pd.DataFrame, instrument, params: dict, capital: float):
+    """One asset's funded 1x perp buy-and-hold through the engine, on its decision bars from the warm-up's last
+    close."""
+    from sleeve_fund.research.runner import run_backtest
+
+    return run_backtest("buy_and_hold", bars, instrument, {"market": markets.market_of(params)},
+                        starting_capital=capital)
+
+
+def hold_words(h: HoldBar | None) -> str:
+    if h is None:
+        return "no hold bar: the basket has a short side (Advisor: long-only baskets only)"
+    perp = "n/a" if math.isnan(h.perp_sharpe) else f"{h.perp_sharpe:.2f}"
+    out = (f"pooled Sharpe {h.basket_sharpe:.2f} (net {_pct(h.basket_net)}, CAGR {_pct(h.basket_cagr)}) against the "
+           f"{h.chosen}'s {h.bar_sharpe:.2f} (net {_pct(h.bar_net)}, CAGR {_pct(h.bar_cagr)}); bar chosen once: "
+           f"{FUNDED} {perp}, {PRICE_ONLY} {h.price_sharpe:.2f}")
+    if h.liquidated:
+        out += f"; the funded hold of {', '.join(h.liquidated)} was liquidated and stayed flat"
+    if not BH102_LIVE:
+        return f"{out}; {UNPROVEN}"
+    return f"{'PASS' if h.beats else 'FAIL'}: {out}"
+
+
+def pooled_words(r, seed: int = 0) -> str:
+    """The filled pooled comparison in words, its verdict first (PR E's, on the pooled book)."""
+    from sleeve_fund.research.random_entry import MARGINAL, NOT_JUDGED, STOP_FILL_LINE
+
+    if r.trades == 0:
+        return "N/A: no out-of-sample trades to compare"
+    if r.why_not:
+        return f"{NOT_JUDGED}: {r.why_not}"
+    trips, book = r.reconciled
+    out = (f"the pooled trips' P&L, {r.strategy_return:+.1%} of the fund's capital, beats {r.return_percentile:.0f}% of "
+           f"{r.draws:,} random-entry draws that move every asset's entries at once, each asset keeping its own "
+           f"trade count, sides and holding periods (median {r.median_random_return:+.1%}; bar: "
+           f"{BAR:.0f}%; seed {seed}); each draw filled as the engine fills the definition's exits on the asset's own "
+           f"bars ({r.stopped_share:.0%} of the draws' trips stopped out); the trips add to {trips:+.1%} against the "
+           f"book's {book:+.1%} over them{' (more than 0.5 points apart: not judged)' if r.unreconciled else ''}")
+    if r.held_back:
+        out += f"; {r.held_back} draw trips ({r.held_back_share:.1%}) priced flat, as the engine would have held them back"
+    if r.too_many_held_back:
+        out += f"; not judged: too many draws held back (above {HELD_BACK_MAX:.0%})"
+    if r.weak:
+        out += f"; in the market {r.exposure:.0%} of the time, so random entries can hardly differ: a weak test"
+    out += (f"; {STOP_FILL_LINE}: {r.strategy_stops} stop exits in the Strategy's trips; at the level its P&L would be "
+            f"{r.gap_return * 100:+.2f} points of capital higher")
+    verdict = "NOT JUDGED" if r.verdict in ("WEAK", NOT_JUDGED) else r.verdict
+    return f"{MARGINAL}: {out}" if r.marginal else f"{verdict}: {out}"
+
+
+def close_priced_words(r: RandomBeat) -> str:
+    """B-38's close-priced comparison, shown without a verdict of its own (HoE ruling 21 Oct: the filled one decides)."""
+    from sleeve_fund.research.random_entry import CLOSE_PRICED
+
+    if not r.judged:
+        return f"{CLOSE_PRICED}; not judged"
+    return (f"the pooled Sharpe {r.sharpe:.2f} is at the {r.percentile:.1f}th percentile of {r.draws:,} random draws "
+            f"(their {BAR:.0f}th {r.bar:.2f}); {CLOSE_PRICED}, no verdict")
+
+
+def _without_sol_lines(study: BasketStudy) -> list[str]:
+    w = getattr(study, "without_sol", None)
+    if not w:
+        return []
+    r = w["random"]
+    pct = "not judged" if r.why_not or r.trades == 0 else f"{r.return_percentile:.0f}th percentile of the filled draws"
+    return [f"**Without SOL** ({', '.join(w['assets'])}; its own re-run, diagnostic only, never a condition or a try): "
+            f"net {_pct(w['net'])}, Sharpe {w['sharpe']:.2f}, random entry {pct}.", ""]

@@ -127,7 +127,7 @@ def run_store_basket(req, store=None, out_dir: Path | None = None, history=None)
     basket = bk.Basket(label, req.strategy, params, tuple(assets), universe)
     dataset = dataset_name(profile.name, req.pairs)
     study = bk.basket_study(basket, tests, research_end, register=TrialsRegister(store), dataset=dataset,
-                            warm_days=warm)
+                            warm_days=warm, filled=True)
     opened = None
     if req.use_holdout:
         opened = bk.open_holdout(study, holdout, HoldoutLocks(store), warm_days=warm)

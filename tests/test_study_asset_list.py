@@ -187,3 +187,195 @@ def test_the_workflow_takes_the_same_pair_list():
     text = (rescore.ROOT / ".github" / "workflows" / "study.yml").read_text()
     pattern = re.search(r'\[\[ "\$PAIR" =~ \^(.+)\$ \]\]', text)[1]
     assert pattern == rescore.PAIRS
+
+
+# ---- the pooled verdict (Advisor ruling 21 Oct) ----------------------------------------------------------------------
+
+import math  # noqa: E402
+
+import numpy as np  # noqa: E402
+
+from sleeve_fund.research import basket as bk  # noqa: E402
+from sleeve_fund.research.fills import DrawFills  # noqa: E402
+from sleeve_fund.research.random_entry import Trade  # noqa: E402
+
+DEFINITION = {
+    "version": 1, "name": "sal-trend", "title": "Trend test", "reason": "test",
+    "blocks": {"fast": {"kind": "ema", "period": 2}, "slow": {"kind": "ema", "period": 4},
+               "atr": {"kind": "atr", "period": 2}},  # a 40-bar warm-up: the fixture's
+    "long": {"entry": {"left": "fast", "op": "crosses_above", "right": "slow"},
+             "exit": {"left": "fast", "op": "<", "right": "slow"}},
+    "exits": {"stop": {"level": {"sub": ["close", {"mul": [3.0, "atr"]}]}}},
+}
+
+
+class _Spy:
+    """A pricer that books each draw trip at +1% (or holds `held` of each call back) and records what it was given."""
+
+    def __init__(self, held: int = 0):
+        self.calls, self.held = [], held
+
+    def draws(self, entries, holds, sides, levs=None):
+        self.calls.append(np.array(entries))
+        return DrawFills(np.full(len(entries), 0.01), min(self.held, len(entries)), 0)
+
+
+def _leg(name, pricer, n=3, start=0, end=60):
+    trades = [Trade(start + 10 * k, start + 10 * k + 3, 1) for k in range(n)]
+    return bk.PooledLeg(name, trades, np.full(n, 0.02), np.full(n, 0.1), [(start, end)], pricer, np.zeros(n),
+                        np.zeros(n, dtype=bool), 0.15)
+
+
+def test_a_pooled_draw_moves_both_assets_entries_in_one_draw():
+    a, b = _Spy(), _Spy()
+    r = bk.random_entry_pooled([_leg("BTC", a), _leg("ETH", b)], (0.012, 0.012), draws=5, seed=3)
+    assert len(a.calls) == len(b.calls) == 5  # each draw prices every asset once
+    assert any(not np.array_equal(x, y) for x, y in zip(a.calls, a.calls[1:]))  # and moves its entries
+    assert any(not np.array_equal(x, y) for x, y in zip(b.calls, b.calls[1:]))
+    # the statistic: every asset's trips at their notional over the fund's capital, summed: 6 x 2% x 0.1
+    assert r.strategy_return == pytest.approx(6 * 0.02 * 0.1)
+    assert r.median_random_return == pytest.approx(6 * 0.01 * 0.1)  # each draw: 6 trips at 1% x 0.1
+    assert r.trades == 6 and r.verdict == "PASS"
+
+
+def test_held_back_above_2_percent_pooled_is_not_judged():
+    # 1 of 3 held back on one asset, none on the other: 1 / 6 of every draw's trips, 16.7%, above 2%
+    r = bk.random_entry_pooled([_leg("BTC", _Spy(held=1)), _leg("ETH", _Spy())], (0.012, 0.012), draws=4)
+    assert r.held_back_share == pytest.approx(1 / 6) and r.verdict == "NOT JUDGED"
+    assert "not judged: too many draws held back" in bk.pooled_words(r)
+    ok = bk.random_entry_pooled([_leg("BTC", _Spy(), n=3), _leg("ETH", _Spy(), n=3)], (0.012, 0.012), draws=4)
+    assert ok.held_back_share == 0 and ok.verdict == "PASS"
+
+
+def test_the_pooled_trips_must_reconcile_to_the_book():
+    r = bk.random_entry_pooled([_leg("BTC", _Spy())], (0.006, 0.0125), draws=2)
+    assert r.verdict == "NOT JUDGED" and "more than 0.5 points apart: not judged" in bk.pooled_words(r)
+
+
+def _measured(returns: list[float], start="2018-03-02") -> bk.Measured:
+    idx = pd.date_range(pd.Timestamp(start, tz="UTC") + pd.Timedelta(days=1), periods=len(returns), freq="1D")
+    return bk.Measured(None, [], pd.DataFrame(), pd.Series(returns, index=idx), 0.0)
+
+
+def _spec(prices: list[float], start="2018-03-02"):
+    from types import SimpleNamespace as NS
+
+    from nautilus_trader.model import Venue
+
+    from sleeve_fund.instruments import spot_pair
+    from test_portfolio_run import FEES
+
+    idx = pd.date_range(pd.Timestamp(start, tz="UTC"), periods=len(prices), freq="1D")
+    bars = pd.DataFrame({"close": prices}, index=idx)
+    return NS(prices=bars.iloc[1:], warmup_prices=bars.iloc[:1], instrument=spot_pair("BTC", "USD", FEES,
+                                                                                        Venue("KRAKEN")))
+
+
+def test_a_long_short_basket_prints_no_hold_bar():
+    m = _measured([0.01, -0.01, 0.02])
+    params = {"definition": {**DEFINITION, "short": DEFINITION["long"]}}
+    assert bk.hold_bar(m, [_spec([100, 101, 102, 103])], params, ((date(2018, 3, 2), date(2018, 3, 4)),), 1e4) is None
+    assert bk.hold_bar(m, [_spec([100, 101, 102, 103])], {"allow_short": True}, ((date(2018, 3, 2), date(2018, 3, 4)),),
+                       1e4) is None
+    assert bk.hold_words(None) == "no hold bar: the basket has a short side (Advisor: long-only baskets only)"
+
+
+def test_the_hold_bar_takes_the_price_only_hold_when_its_sharpe_is_higher_and_names_it():
+    windows = ((date(2018, 3, 2), date(2018, 3, 6)),)
+    m = _measured([0.001, 0.002, -0.001, 0.0, 0.001])
+    rising = [100, 101, 102.5, 103, 104.5, 105]  # the price-only hold: steady gains
+    perp = {"market": "perp"}
+
+    def funded(bars, instrument, params, capital):  # the funded hold: the same days, choppier
+        eq = pd.Series([1.0, 1.02, 0.99, 1.03, 0.98, 1.04], index=bars.index) * capital
+        return eq
+
+    h = bk.hold_bar(m, [_spec(rising), _spec(rising)], perp, windows, 1e4, hold=funded)
+    assert h.chosen == bk.PRICE_ONLY and h.price_sharpe > h.perp_sharpe
+    assert h.bar_sharpe == pytest.approx(h.price_sharpe) and not h.beats
+    words = bk.hold_words(h)
+    assert "against the price-only hold (no spot market at this venue)'s" in words and bk.UNPROVEN in words
+    assert "PASS" not in words and "FAIL" not in words  # unproven until BH-102 is live: no verdict words
+
+    def smooth(bars, instrument, params, capital):  # now the funded hold is the steadier one
+        return pd.Series([1.0, 1.01, 1.02, 1.03, 1.04, 1.05], index=bars.index) * capital
+
+    h2 = bk.hold_bar(m, [_spec(rising), _spec(rising)], perp, windows, 1e4, hold=smooth)
+    assert h2.chosen == bk.FUNDED and h2.bar_sharpe == pytest.approx(h2.perp_sharpe)
+
+
+def test_an_unproven_hold_bar_never_lets_a_basket_pass():
+    from types import SimpleNamespace as NS
+
+    study = NS(random=NS(judged=True, beats=True), double_fees=NS(passed=True), left_out=NS(passed=True),
+               pooled=NS(verdict="PASS"), hold=NS(beats=True))
+    assert bk.verdict(study, NS(passed=True)) == "NOT JUDGED"  # BH102_LIVE is False
+    study.hold = None  # a long/short basket: random entry and the rest decide
+    assert bk.verdict(study, NS(passed=True)) == "PASS"
+    study.pooled = NS(verdict="FAIL")
+    assert bk.verdict(study, NS(passed=True)) == "FAIL"
+    study.pooled = NS(verdict="NOT JUDGED")
+    assert bk.verdict(study, None) == "NOT JUDGED"
+
+
+@pytest.fixture(scope="module")
+def filled(tmp_path_factory):
+    """A two-asset rule-builder basket, untrimmed, its draws filled as the engine fills the definition."""
+    from sleeve_fund.strategies.definitions import to_params
+    from test_b38_basket_study import LOOSE, RESEARCH_END, WINDOWS, _asset, _register
+
+    params = to_params(DEFINITION, "KRAKEN")
+    basket = bk.Basket("sal-trend", "rules", params, (_asset("BTC", 2), _asset("ETH", 5)), "2026-10-21")
+    reg = _register(tmp_path_factory.mktemp("filled"))
+    study = bk.basket_study(basket, WINDOWS, RESEARCH_END, register=reg, dataset="syn", capital=30_000.0,
+                            profile=LOOSE, warm_days=40, ladder=False, filled=True)
+    return study, reg
+
+
+def test_a_rule_basket_is_judged_on_draws_filled_on_the_pooled_book(filled):
+    study, _ = filled
+    p = study.pooled
+    assert p.why_not == "" and p.trades > 0 and p.draws == 1000 and p.held_back_share <= 0.02
+    assert not p.unreconciled, p.reconciled  # its trips add to what the book did over them
+    assert study.gate_touched < bk.GATE_TOUCH_CAP
+    text = bk.render(study)
+    assert "| Beats random entries, filled on the pooled book (95th percentile) | " in text
+    assert "| Random entries, close-priced | " in text and "no verdict" in text
+    assert "| Hold bar (long-only baskets) | pooled Sharpe" in text and study.hold is not None
+    assert "Without SOL" not in text  # no SOL in this basket
+
+
+def test_a_two_asset_basket_registers_exactly_one_try(filled):
+    study, reg = filled
+    rows = [t for t in reg._counted(bk.idea_hash(study.basket)) if str(t["definition_name"]).startswith("basket:")]
+    assert len(rows) == 1 and (study.tries, study.configuration) == (1, 1)
+
+
+def test_a_basket_with_sol_shows_itself_without_it(ran):
+    text = ran[0].read_text()
+    line = next(x for x in text.splitlines() if x.startswith("**Without SOL** (BTC, ETH;"))
+    assert "diagnostic only, never a condition or a try" in line and "net " in line and "Sharpe " in line
+
+
+def test_a_one_pair_request_runs_the_single_study_untouched(tmp_path, monkeypatch):
+    """The single path never reaches the basket code, and writes the single tear sheet (the B-37 job's fixture). Its
+    bytes were checked equal to the sheet before STUDY-ASSET-LIST (c0969acd) by hand; not pinned here, as every later
+    sheet change would have to move a pinned hash."""
+    import test_b37_pinned_dates as b37
+    from datetime import timedelta
+
+    monkeypatch.setattr(run_mod, "exec_step", lambda span, minutes: None)
+    monkeypatch.setattr(run_mod, "OOS_EXEC_BUDGET", 0)
+
+    def refuse(*a, **k):
+        raise AssertionError("a one-pair request reached the basket")
+
+    monkeypatch.setattr(basket_run, "run_store_basket", refuse)
+    monkeypatch.setattr(bk, "basket_study", refuse)
+    p = b37._pins()
+    req = run_mod.StudyRequest(strategy=b37.SPEC.name, pair="BTC/USD", venue="kraken", minutes=1440, train_days=730,
+                               test_days=365, holdout_days=p.holdout_days, pinned=p)
+    out = run_mod.run_store_study(req, ledger_path=tmp_path / "l.jsonl", out_dir=tmp_path / "ts",
+                                  history=b37._History(p.holdout_end + timedelta(days=1)))
+    text = out.read_text()
+    assert text.startswith("# Tear sheet:") and "Basket" not in text and "pooled" not in text
