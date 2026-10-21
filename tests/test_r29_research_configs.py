@@ -194,4 +194,76 @@ def test_the_study_job_stages_the_r06_r07_variants_beside_the_definitions(repo):
     assert out.returncode == 0, out.stderr
     staged = sorted(str(p.relative_to(repo / "staged")) for p in (repo / "staged").rglob("*") if p.is_file())
     assert staged == ["definitions/qr01_a.toml", "definitions/variants/qr01b_v1_funding.toml", "studies/list-a.md"]
-    assert "left out, not a research config by name: configs/definitions/variants/sub/x.toml" in out.stdout
+
+
+@pytest.mark.parametrize("stray", ["configs/definitions/variants/sub/x.toml", "configs/definitions/variants/QR2.toml",
+                                   "configs/definitions/notes.txt", "configs/studies/list.toml"])
+def test_the_study_job_refuses_anything_else_in_the_research_configs(repo, stray):
+    """Advisor R-29 (4): a file under configs/definitions or configs/studies not named as a research config fails
+    the run, named, rather than being left out."""
+    _write(stray)(repo)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "stray")
+    out = subprocess.run(["bash", "-c", _stage_script()], cwd=repo, capture_output=True, text=True)
+    assert out.returncode != 0 and f"not a research config by name: {stray}" in out.stdout
+
+
+def test_the_study_job_reads_the_dispatched_commit_and_only_one_on_main():
+    """Advisor R-29 (1): the configs are taken from the commit the run was dispatched on, by SHA, never by branch name,
+    so main moving after dispatch changes nothing, and that commit must be on main."""
+    study = STUDY.read_text()
+    steps = _steps(study)
+    checkout = steps.split("uses: actions/checkout@v4", 1)[1].split("- name:", 1)[0]
+    assert "ref: ${{ github.sha }}" in checkout and "fetch-depth: 0" in checkout
+    assert "persist-credentials: false" in checkout, "CR F1"
+    on_main = study.split("- name: Check the commit is on main", 1)[1].split("- name:", 1)[0]
+    assert 'git merge-base --is-ancestor "$SHA" origin/main' in on_main and "SHA: ${{ github.sha }}" in on_main
+    assert "inputs.configs_from == 'main'" in on_main
+    assert study.index("- name: Check the commit is on main") < study.index("- name: Stage the research configs")
+    for step in ("Ship the research configs", "Run the list"):
+        body = study.split(f"- name: {step}", 1)[1].split("- name:", 1)[0]
+        assert "SHA: ${{ github.sha }}" in body and "github.ref_name" not in body and "refs/heads" not in body
+
+
+def test_a_study_from_main_says_its_tries_are_counted_by_hand(tmp_path, monkeypatch):
+    """HoE (R-29 v2): every study run with configs_from=main prints "Tries counted by hand until R-25." on its sheet,
+    by a rescore flag study.yml passes on main only; image runs and the dashboard's studies are unchanged."""
+    from test_binance import INFO
+    from test_research import _stored_minutes
+
+    from sleeve_fund import funding
+    from sleeve_fund.history import HistoryStore
+    from sleeve_fund.research import rescore
+    from sleeve_fund.research.run import StudyRequest, run_store_study
+    from sleeve_fund.venues import binance_contract, venue
+
+    assert rescore.TRIES_BY_HAND == "Tries counted by hand until R-25."
+    step = STUDY.read_text().split("- name: Run the list", 1)[1]
+    main_branch, image_branch = step.split('if [ "$FROM" = main ]; then', 1)[1].split("else", 1)
+    assert 'TRIES="--tries-by-hand"' in main_branch and "TRIES" not in image_branch.split("fi", 1)[0]
+    assert "$DRY $TRIES" in step
+    lst = ROOT / "configs" / "studies" / "qr-rescore-list.md"
+    seen = []
+    spy = lambda req, store=None, **kw: seen.append(kw)  # noqa: E731
+    assert rescore.main([str(lst), "--rows", "1", "--tries-by-hand"], run=spy, journal=lambda: None) == 0
+    assert rescore.main([str(lst), "--rows", "1"], run=spy, journal=lambda: None) == 0
+    assert seen == [{"notes": (rescore.TRIES_BY_HAND,)}, {}]
+    b = venue("binance")
+    monkeypatch.setattr(b, "contract", lambda pair: binance_contract(pair, get_json=lambda url: INFO))
+    monkeypatch.setattr(funding, "DEFAULT_ROOT", tmp_path / "funding")
+    hist = HistoryStore(tmp_path / "hist")
+    hist.append("BINANCE", "BTC/USDT", _stored_minutes(130), cursor="x")
+    req = StudyRequest(strategy="buy_and_hold", pair="BTC/USDT", venue="binance", minutes=240,
+                       train_days=60, test_days=30, holdout_days=30)
+    marked = run_store_study(req, ledger_path=tmp_path / "l.jsonl", out_dir=tmp_path / "a", history=hist,
+                             notes=(rescore.TRIES_BY_HAND,)).read_text()
+    plain = run_store_study(req, ledger_path=tmp_path / "l.jsonl", out_dir=tmp_path / "b", history=hist).read_text()
+    assert f"- {rescore.TRIES_BY_HAND}" in marked and rescore.TRIES_BY_HAND not in plain
+
+
+def test_the_definitions_merge_rule_is_written_down():
+    """HoE (R-29 v2): the manual merge gate for a definitions PR, until R-25 counts tries by family."""
+    doc = (ROOT / "docs" / "research-definitions.md").read_text()
+    for must in ("pre-registration", "family", "Advisor", "tries so far", "R-25", "Strategy tab",
+                 "configs_from=image"):
+        assert must in doc, must
