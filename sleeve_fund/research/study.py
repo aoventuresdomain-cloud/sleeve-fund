@@ -270,6 +270,8 @@ class StudyResult:
     # FIRST_TOUCH_FLIP_SHARE, both resolutions' out-of-sample summaries and which one G1 judged ("as ruled" or
     # "opposite"). Empty for a model without one.
     first_touch: dict = field(default_factory=dict)
+    # The research period's closes, for the analysis pack's price-only lines (pack (a) and (c), 21 Oct).
+    research_closes: pd.Series | None = None
 
     @property
     def not_judged(self) -> str:
@@ -1049,6 +1051,7 @@ def run_study(
         default_params=default_params,
         full_period=full_default,
         full_period_benchmark=bench,
+        research_closes=research["close"].astype(float),
         sensitivity=sensitivity,
         pbo=overfit,
         folds=folds,

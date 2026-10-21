@@ -30,7 +30,7 @@ from itertools import permutations
 import numpy as np
 import pandas as pd
 
-from sleeve_fund.research.metrics import PERIODS_PER_YEAR, daily_closes, fills_to_rows, trades
+from sleeve_fund.research.metrics import PERIODS_PER_YEAR, daily_closes, daily_returns, fills_to_rows, trades
 
 SEED = 20261021  # the luck test's draws, fixed so a sheet always reads the same
 DRAWS = 10_000
@@ -38,6 +38,7 @@ EXACT_UP_TO = 7  # 7! = 5,040 orders: every one, under DRAWS
 VAR_LEVEL = 0.95
 WORST_DRAWDOWNS = 5
 BEST_TRADES = 5
+IN_MARKET = 0.001  # |exposure| above this holds a position, as the sheet's time in the market reads it
 BEST_FEW = (1, 3)  # the best trade's and the best 3's share too, beside the best 5's (HoE 21 Oct)
 
 
@@ -283,6 +284,28 @@ def caveats(r) -> list[str]:
     return out
 
 
+def price_only_hold(closes: pd.Series) -> float:
+    """The price itself held over the window, first to last daily close: no fees, no funding, nothing liquidated."""
+    return window_total(daily_closes(closes.astype(float)))
+
+
+def in_and_out(equity: pd.Series, exposure: pd.Series, closes: pd.Series) -> dict:
+    """The Strategy's return and the price's, compounded over the days it was in the market and the days it was out.
+    A day is the move into its daily close; it is in the market when any bar from the close before it (included) to
+    its own (excluded) held a position, so a position held over a close counts in the next day. {"days_in",
+    "days_out", "strategy_in", "price_in", "strategy_out", "price_out"}; a return over no days is None."""
+    own = daily_returns(equity)
+    price = daily_returns(closes.astype(float)).reindex(own.index)
+    held = exposure.abs() > IN_MARKET
+    day = held.index.floor("1D") + pd.Timedelta("1D")  # the daily close whose move each bar sits in
+    in_days = set(day[held.to_numpy()])
+    mask = own.index.isin(list(in_days))
+    over = lambda r, m: float((1 + r[m].dropna()).prod() - 1) if m.any() else None  # noqa: E731
+    return {"days_in": int(mask.sum()), "days_out": int((~mask).sum()),
+            "strategy_in": over(own, mask), "price_in": over(price, mask),
+            "strategy_out": over(own, ~mask), "price_out": over(price, ~mask)}
+
+
 def window_total(eq: pd.Series) -> float:
     """The total return of daily closes, first to last: what compounding the sheet's returns file gives (R-20)."""
     return float(eq.iloc[-1] / eq.iloc[0] - 1)
@@ -303,6 +326,18 @@ def section(r) -> list[str]:
     if len(eq) >= 2:  # the figure the returns file beside the sheet compounds to (R-20)
         out += [f"Total return over the window: {window_total(eq):+.2%} ({_d(eq.index[0])} to "
                 f"{_d(eq.index[-1])}), from the daily closes.", ""]
+    closes = getattr(r, "research_closes", None)
+    if closes is not None and len(daily_closes(closes)) >= 2:
+        out += [f"Price-only hold over the window (price only, no fees): {price_only_hold(closes):+.2%}, the price "
+                "itself held from the first daily close to the last, no funding.", ""]
+        io = in_and_out(run.equity, run.exposure, closes)
+        days = io["days_in"] + io["days_out"]
+        out += ["Where the return came from: each day is the move into its daily close, in the market when a position "
+                "was held during it.", "",
+                "| | Days | Strategy | Price |", "|---|---|---|---|",
+                f"| In the market | {io['days_in']} ({io['days_in'] / days if days else 0:.0%}) | "
+                f"{_p(io['strategy_in'])} | {_p(io['price_in'])} |",
+                f"| Out of the market | {io['days_out']} | {_p(io['strategy_out'])} | {_p(io['price_out'])} |", ""]
 
     roll, broll = rolling_12m(ret), rolling_12m(bret)
     out.append("| Figure | Strategy | Buy and hold |")
