@@ -21,6 +21,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
+from sleeve_fund.instruments import taker_slippage
 from sleeve_fund.markets import LOW_FEE_PERP, liquidation_price
 from sleeve_fund.strategies.base import MAX_STOP, MIN_STOP, replay_missed
 from sleeve_fund.strategies.definitions import (ARITHMETIC, FIELDS, LEVEL_EXITS, SINCE_ENTRY, Compiled, Env,
@@ -105,13 +106,16 @@ class DrawFills:
 class Pricer:
     """A definition's level exits over `prices` (decision candles indexed by close time), for pricing draws.
 
-    cost_per_side: the fee and half spread a market fill pays, one figure or one per candle (SPREAD-PIT).
+    cost_per_side: the fee and half spread a market fill pays, one figure or one per candle (SPREAD-PIT); half_spread:
+    its half spread, the same way. A market entry or a close exit pays cost_per_side, as the engine's do; a stop's exit
+    pays the taker's slippage in place of the half spread, max(half spread, 0.05%), as the engine's stop does (D13;
+    Advisor, PR E round 1).
     exec_prices: the execution bars a level is matched on (the candle itself without them). funding:
     (settlement times ns, rates, baseline mask), each settlement's rate as the engine charges it, a missing or
     simulated one at the baseline both sides pay; None: spot."""
 
     def __init__(self, definition: dict, prices: pd.DataFrame, bar_minutes: int, cost_per_side,
-                 exec_prices: pd.DataFrame | None = None, funding: tuple | None = None) -> None:
+                 exec_prices: pd.DataFrame | None = None, funding: tuple | None = None, half_spread=0.0) -> None:
         from sleeve_fund.strategies.rules import _Feed
 
         why = unmodelled(definition, bar_minutes)
@@ -127,6 +131,7 @@ class Pricer:
                                               for k in ("open", "high", "low", "close", "volume"))
         n = len(self.c)
         self.cost = np.broadcast_to(np.asarray(cost_per_side, dtype=float), n)
+        self.half = np.broadcast_to(np.asarray(half_spread, dtype=float), n)
         if exec_prices is not None and len(exec_prices):
             xi = exec_prices.index if exec_prices.index.tz is not None else exec_prices.index.tz_localize("UTC")
             self.x_ts = xi.as_unit("ns").asi8
@@ -160,11 +165,17 @@ class Pricer:
                 values[k][i] = _nan(fn(env))
         self._leaf = values
 
-    def at_cost(self, cost_per_side) -> "Pricer":
+    def at_cost(self, cost_per_side, half_spread=None) -> "Pricer":
         """This pricer with another fee and half spread per side (a cost-ladder rung), its level pass shared."""
         other = copy.copy(self)
         other.cost = np.broadcast_to(np.asarray(cost_per_side, dtype=float), len(self.c))
+        if half_spread is not None:
+            other.half = np.broadcast_to(np.asarray(half_spread, dtype=float), len(self.c))
         return other
+
+    def _stop_cost(self, j: int) -> float:
+        """A stop exit's cost in candle j: the fee, and the taker's slippage in place of the half spread."""
+        return float(self.cost[j] - self.half[j] + float(taker_slippage(self.half[j])))
 
     @staticmethod
     def _is_leaf(node) -> bool:
@@ -256,7 +267,8 @@ class Pricer:
                 if (self.c[j] <= beyond) if side > 0 else (self.c[j] >= beyond):
                     x, px = j, self.c[j]
                     break
-        return float(side * (px / epx - 1) - self.cost[e] - self.cost[x] - self._funding(e, x, side)), how
+        out = self._stop_cost(x) if how == "stopped" else self.cost[x]
+        return float(side * (px / epx - 1) - self.cost[e] - out - self._funding(e, x, side)), how
 
     def draws(self, entries: np.ndarray, holds: np.ndarray, sides: np.ndarray, levs: np.ndarray | None = None
               ) -> DrawFills:

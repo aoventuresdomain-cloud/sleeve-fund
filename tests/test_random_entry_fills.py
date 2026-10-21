@@ -127,6 +127,7 @@ def _candles(rows):
 
 
 FLAT = (100.0, 100.0, 100.0, 100.0)
+FLOOR = 0.0005  # a stop's exit pays the taker's slippage, max(half spread, 0.05%), as the engine's stop does
 
 
 def test_a_stop_fills_by_the_engines_own_replay_at_its_level_or_at_the_open_it_gapped_through(monkeypatch):
@@ -135,15 +136,15 @@ def test_a_stop_fills_by_the_engines_own_replay_at_its_level_or_at_the_open_it_g
     p = _candles([FLAT, (100, 101, 97, 100.5), FLAT])
     pr = Pricer(_defn(stop={"mul": ["close", 0.98]}), p, 60, 0.001)
     r, how = pr.trip(0, 2, 1)
-    assert how == "stopped" and r == pytest.approx(98 / 100 - 1 - 0.002)
+    assert how == "stopped" and r == pytest.approx(98 / 100 - 1 - 0.002 - FLOOR)
     gap = _candles([FLAT, (96, 97, 95, 96.5), FLAT])
     r, how = Pricer(_defn(stop={"mul": ["close", 0.98]}), gap, 60, 0.001).trip(0, 2, 1)
-    assert how == "stopped" and r == pytest.approx(96 / 100 - 1 - 0.002)
+    assert how == "stopped" and r == pytest.approx(96 / 100 - 1 - 0.002 - FLOOR)
     from sleeve_fund.research import fills
 
     seen = []
     monkeypatch.setattr(fills, "replay_missed", lambda *a, **k: seen.append(a) or ("stop_loss", 90.0, 98.0, 0, 90.0))
-    assert pr.trip(0, 2, 1) == (pytest.approx(90 / 100 - 1 - 0.002), "stopped") and seen  # its booking, as is
+    assert pr.trip(0, 2, 1) == (pytest.approx(90 / 100 - 1 - 0.002 - FLOOR), "stopped") and seen  # its booking, as is
 
 
 def test_a_stop_fills_on_the_first_execution_bar_through_it():
@@ -153,14 +154,14 @@ def test_a_stop_fills_on_the_first_execution_bar_through_it():
                       "low": [100] * 4 + [99.5, 97.8, 97, 98], "close": [100] * 4 + [98, 97.5, 98, 100.5]}, index=x_idx)
     r, how = Pricer(_defn(stop={"mul": ["close", 0.985]}), p, 60, 0.0, exec_prices=x).trip(0, 1, 1)
     # The second exec bar opened through 98.5, so it books at that open; the candle alone would say the level.
-    assert how == "stopped" and r == pytest.approx(98 / 100 - 1)
+    assert how == "stopped" and r == pytest.approx(98 / 100 - 1 - FLOOR)
 
 
 def test_a_trail_ratchets_and_a_close_beyond_a_level_ends_the_trip_at_that_close():
     rows = [FLAT, (100, 106, 100, 105), (105, 105, 103, 104), (104, 104, 101.2, 101.5), FLAT]
     trail = {"sub": ["close", 3]}
     r, how = Pricer(_defn(trail=trail), _candles(rows), 60, 0.0).trip(0, 4, 1)
-    assert how == "stopped" and r == pytest.approx(102 / 100 - 1)  # trail 97 -> 102, kept past 101 at close 2
+    assert how == "stopped" and r == pytest.approx(102 / 100 - 1 - FLOOR)  # trail 97 -> 102, kept past 101 at close 2
     loose = Pricer(_defn(trail=trail, ratchet=False), _candles(rows), 60, 0.0).trip(0, 4, 1)
     assert loose[1] == "closed" and loose[0] == pytest.approx(100 / 100 - 1)  # follows down; held to the cap
     beyond = Pricer(_defn(stop={"mul": ["close", 0.9]}, trail={"mul": ["close", 1.0]}), _candles([FLAT, FLAT]),
@@ -189,7 +190,7 @@ def test_a_shorts_stop_rests_above_and_fills_on_the_high():
     p = _candles([FLAT, (100, 103, 99.5, 100), FLAT])
     pr = Pricer(_defn(stop={"mul": ["close", 1.02]}, short=True), p, 60, 0.0)
     r, how = pr.trip(0, 2, -1)
-    assert how == "stopped" and r == pytest.approx(-(102 / 100 - 1))
+    assert how == "stopped" and r == pytest.approx(-(102 / 100 - 1) - FLOOR)
 
 
 def test_a_levered_draw_is_liquidated_by_the_engines_replay_before_a_stop_past_it():
@@ -274,3 +275,42 @@ def test_the_gap_percentile_is_read_against_the_same_draws():
     assert none.return_percentile < small.gap_percentile < 95 <= big.gap_percentile == 100
     assert big.strategy_return == none.strategy_return and big.verdict == "FAIL" and big.marginal
     assert big.gap_return == pytest.approx(0.05) and big.strategy_stops == 1 and big.draw_stops == 1
+
+
+# ---- PR E round 1 (Advisor): the draws pay what the engine pays; too many held back is NOT JUDGED -----------------
+
+def test_a_draws_stop_exit_pays_the_takers_slippage_floor_and_a_market_exit_the_half_spread():
+    """The engine's market entries and signal exits pay the half spread; its stop pays max(half spread, 0.05%)."""
+    stop = [FLAT, (100, 101, 97, 100.5), FLAT]
+    wide = Pricer(_defn(stop={"mul": ["close", 0.98]}), _candles(stop), 60, 0.0011, half_spread=0.001)
+    assert wide.trip(0, 2, 1) == (pytest.approx(98 / 100 - 1 - 0.0011 - 0.0011), "stopped")  # the spread is wider
+    tight = Pricer(_defn(stop={"mul": ["close", 0.98]}), _candles(stop), 60, 0.0003, half_spread=0.0002)
+    assert tight.trip(0, 2, 1) == (pytest.approx(98 / 100 - 1 - 0.0003 - 0.0006), "stopped")  # fee + the floor
+    closed = Pricer(_defn(stop={"mul": ["close", 0.9]}), _candles([FLAT, FLAT]), 60, 0.0003, half_spread=0.0002)
+    assert closed.trip(0, 1, 1) == (pytest.approx(-0.0006), "closed")  # entry and close exit: fee + half spread
+
+
+def test_a_study_passes_its_half_spread_to_the_draws(monkeypatch):
+    seen = []
+    real = st.DrawFill.pricer
+    monkeypatch.setattr(st.DrawFill, "pricer", lambda self, p, c, h=0.0: seen.append(h) or real(self, p, c, h))
+    _study(_stop_heavy(), _wicky())
+    assert seen and all(np.all(np.asarray(h) > 0) for h in seen)
+
+
+def test_too_many_held_back_draws_are_not_judged():
+    """A long whose exit_at_level sits at the open less 0.5 is on the wrong side of the close on most down candles,
+    so the engine would hold back many draws; priced flat, they pull the draws to zero."""
+    rng = np.random.default_rng(1)
+    c = 100 * np.exp(np.cumsum(rng.normal(0, 0.01, 400)))
+    o = np.r_[100.0, c[:-1]]
+    rows = list(zip(o, np.maximum(o, c) * 1.001, np.minimum(o, c) * 0.999, c))
+    pr = Pricer(_defn(stop={"mul": ["close", 0.9]}) | {"exits": {"stop": {"level": {"mul": ["close", 0.9]}},
+                                                                  "exit_at_level": {"level": {"sub": ["open", 0.5]}}}},
+                _candles(rows), 60, 0.001)
+    trades = [Trade(10 + 20 * k, 15 + 20 * k, 1) for k in range(15)]
+    r = random_entry_filled(trades, np.zeros(15), [(0, 399)], pr, (0.0, 0.0), draws=200)
+    assert r.held_back_share > 0.02 and r.verdict == NOT_JUDGED and "too many draws held back" in r.words
+    ok = RandomEntryResult(99.0, 99.0, 0.5, 0.0, 10, 0.3, 1000, False, False, reconciled=(0.0, 0.0), held_back=2,
+                           held_back_share=0.02)
+    assert ok.verdict == "PASS" and "(2.0%) priced flat" in ok.words

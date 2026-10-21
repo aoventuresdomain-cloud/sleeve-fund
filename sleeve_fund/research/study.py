@@ -1588,14 +1588,14 @@ class DrawFill:
     refused: str = ""  # why a rule definition's exits can't be filled as the engine fills them: NOT JUDGED
     pricers: dict = field(default_factory=dict)
 
-    def pricer(self, prices: pd.DataFrame, cost_per_side):
+    def pricer(self, prices: pd.DataFrame, cost_per_side, half_spread=0.0):
         from sleeve_fund.research.fills import Pricer
 
         key = id(prices)
         if key not in self.pricers:
             self.pricers[key] = Pricer(self.definition, prices, self.bar_minutes, cost_per_side, self.exec_prices,
-                                       self.funding)
-        return self.pricers[key].at_cost(cost_per_side)
+                                       self.funding, half_spread)
+        return self.pricers[key].at_cost(cost_per_side, half_spread)
 
 
 def _benchmarks(prices: pd.DataFrame, folds: list[Fold], test_bars: int, taker: float, spread, shorts: bool,
@@ -1656,7 +1656,7 @@ def _filled_benchmarks(prices, folds, test_bars, taker, half, cost_per_side, sho
     and is filled as the engine fills the definition's own exits (fills.Pricer). The trips must reconcile to the
     windows' equity within RECONCILE_PP, else the comparison is NOT JUDGED."""
     index = prices.index.tz_localize("UTC") if prices.index.tz is None else prices.index
-    pricer = fill.pricer(prices, cost_per_side)
+    pricer = fill.pricer(prices, cost_per_side, half)
     windows, placed, realised, gaps, stops = [], [], [], [], []
     trips_total = equity_total = 1.0
     for f in folds:

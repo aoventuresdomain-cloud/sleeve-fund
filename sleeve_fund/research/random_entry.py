@@ -38,6 +38,9 @@ NOT_JUDGED = "NOT JUDGED"
 STOP_FILL_LINE = ("random draws book stops at the level; the Strategy books the bar's low less 0.05%; the bias is "
                   "against the Strategy")
 MARGINAL = "marginal FAIL, within fill-model gap; re-judge after STOP-FILL unification"
+# Draws the engine would have held back are priced flat, which pulls the draws towards zero; above this share of the
+# draw trips the comparison is NOT JUDGED (Advisor, PR E round 1; re-drawing them can come later).
+HELD_BACK_MAX = 0.02
 
 
 @dataclass(frozen=True)
@@ -74,6 +77,7 @@ class RandomEntryResult:
     # same trips); None for the close-priced comparison of a model with no rule definition to fill stops from.
     reconciled: tuple | None = None
     held_back: int = 0  # draws the engine would have held back (no level yet, or on the wrong side), priced flat
+    held_back_share: float = 0.0  # of the draws' trips
     stopped_share: float = 0.0  # the draws' trips that filled at a level inside a candle
     why_not: str = ""  # why the comparison can't be judged (RANDOM-ENTRY: exits the draws can't fill)
     strategy_stops: int = 0  # the strategy's counted trips its stop closed
@@ -82,6 +86,10 @@ class RandomEntryResult:
     # total return, and the percentile its return would then reach (None: the close-priced comparison).
     gap_return: float = 0.0
     gap_percentile: float | None = None
+
+    @property
+    def too_many_held_back(self) -> bool:
+        return self.held_back_share > HELD_BACK_MAX
 
     @property
     def marginal(self) -> bool:
@@ -96,7 +104,7 @@ class RandomEntryResult:
     def verdict(self) -> str:
         if self.trades == 0:
             return "N/A"
-        if self.unreconciled or self.why_not:
+        if self.unreconciled or self.why_not or self.too_many_held_back:
             return NOT_JUDGED
         if self.weak:
             return "WEAK"
@@ -130,7 +138,10 @@ class RandomEntryResult:
                     f"highs as the engine fills them ({self.stopped_share:.0%} of the draws' trips stopped out), "
                     f"funding charged at the stored settlement times")
             if self.held_back:
-                out += f"; {self.held_back} draw trips priced flat, as the engine would have held them back"
+                out += (f"; {self.held_back} draw trips ({self.held_back_share:.1%}) priced flat, as the engine would "
+                        f"have held them back"
+                        + (f"; not judged: too many draws held back (above {HELD_BACK_MAX:.0%})"
+                           if self.too_many_held_back else ""))
             out += (f"; {STOP_FILL_LINE}: {self.strategy_stops} stop exits in the Strategy's trips, "
                     f"{self.draw_stops:.1f} per draw; at the level its return would be {self.gap_return * 100:+.2f} "
                     f"points higher")
@@ -404,7 +415,8 @@ def random_entry_filled(trades: list[Trade], realised: np.ndarray, windows: list
         median_random_return=float(np.median(rets)), trades=n, exposure=exposure, draws=draws,
         weak=exposure > WEAK_EXPOSURE, disagree=abs(ret_pct - sharpe_pct) > DISAGREE,
         sizing=(REPLACED if REPLACED in how else PERMUTED) if sized else "", reconciled=reconciled,
-        held_back=held_back, stopped_share=stopped / priced if priced else 0.0,
+        held_back=held_back, held_back_share=held_back / priced if priced else 0.0,
+        stopped_share=stopped / priced if priced else 0.0,
         strategy_stops=strategy_stops, draw_stops=stopped / draws, gap_return=_compound(gapped) - strategy_return,
         gap_percentile=float((rets < _compound(gapped)).mean() * 100),
     )
