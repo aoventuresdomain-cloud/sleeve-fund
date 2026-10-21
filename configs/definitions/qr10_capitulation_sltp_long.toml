@@ -1,0 +1,32 @@
+# QR-B6 capitulation rebound family, SL/TP exit-set try (21 Oct 2026, Quant Researcher). Decision candle: 1d.
+# Variant of qr10_capitulation_long, pre-registered before any run (PM 21 Oct 14:42-14:44 UK: every strategy carries an explicit
+# stop-loss and take-profit; values are the mr type's convention, Advisor 21 Oct, never tuned per strategy).
+# take_profit needs TP-EXIT (Deploy 2): syntax provisional until it is live.
+version = 1
+name = "qr10-capitulation-sltp-long"
+title = "Capitulation Rebound (daily) + SL/TP · Long"
+reason = """qr10_capitulation_long with the mean-reversion take-profit added, resting at the 20-candle average (the parent's own stop kept); whichever exit fires first wins. Entry, the close-above-prior-high exit and the 3-candle time stop unchanged; the parent's own 1.5 ATR stop is kept (Advisor: the type's stop applies only where a parent has none), so R is measured from it. Held at 1x."""
+
+[blocks.rvol]
+kind = "relative_volume"
+period = 20
+
+[blocks.sma20]
+kind = "sma"
+period = 20
+
+[blocks.atr]
+kind = "atr"
+period = 14
+
+[long]
+entry = { all = [
+    { left = { sub = ["open", "close"] }, op = ">=", right = { mul = [2.0, "atr"] } },
+    { left = "rvol", op = ">=", right = 2.0 },
+] }
+exit = { left = "close", op = ">", right = { prev = "high" } }
+
+[exits]
+stop = { level = { sub = ["close", { mul = [1.5, "atr"] }] } }
+take_profit = { level = "sma20" }
+time_stop = { bars = 3 }

@@ -35,5 +35,9 @@ def test_a_research_definition_passes_the_builder_checks_at_its_candle_and_build
     Compiled(checked)
     params = to_params(defn)
     assert params["definition"]["name"] == path.stem.replace("_", "-")
-    # a long and a short leg are separate definitions while `exits` is shared by both sides (gap G1)
-    assert ("long" in defn) != ("short" in defn), f"{path.name} carries both sides"
+    # a long and a short leg are separate definitions unless each side has its own exits (gap G1, closed by
+    # TP-EXIT's per-side exits): one side, or both with exits.long and exits.short
+    both = "long" in defn and "short" in defn
+    assert both or ("long" in defn) != ("short" in defn), f"{path.name} carries no side"
+    if both:
+        assert {"long", "short"} <= set(defn.get("exits", {})), f"{path.name} carries both sides on shared exits"

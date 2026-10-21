@@ -1,0 +1,51 @@
+# QR-B5 squeeze breakout family, SL/TP exit-set try (21 Oct 2026, Quant Researcher). Decision candle: 1h.
+# Variant of qr03_squeeze_long, pre-registered before any run (PM 21 Oct 14:42-14:44 UK: every strategy carries an explicit
+# stop-loss and take-profit; values are the breakout type's convention, Advisor 21 Oct, never tuned per strategy).
+# take_profit needs TP-EXIT (Deploy 2): syntax provisional until it is live.
+version = 1
+name = "qr03-squeeze-sltp-long"
+title = "Squeeze Breakout (1h) + SL/TP · Long"
+reason = """qr03_squeeze_long with the breakout take-profit added: fixed 2R measured from the parent's own stop, and a 10-candle time stop where the parent has none; whichever exit fires first wins. Entry, mid-channel exit, 2.5 ATR trail and 48-hour time stop unchanged; the parent's own 2.0 ATR stop is kept (Advisor: the type's stop applies only where a parent has none), so R is measured from it. Held at 1x."""
+
+[blocks.bb]
+kind = "bollinger"
+period = 20
+k = 2.0
+
+[blocks.kc]
+kind = "keltner"
+period = 20
+atr_period = 20
+k = 1.5
+
+[blocks.dc]
+kind = "donchian"
+period = 20
+
+[blocks.rvol]
+kind = "relative_volume"
+period = 20
+
+[blocks.atr]
+kind = "atr"
+period = 14
+
+[long]
+entry = { setup = { all = [
+    { left = "bb.upper", op = "<", right = "kc.upper" },
+    { left = "bb.lower", op = ">", right = "kc.lower" },
+] }, trigger = { all = [
+    { left = "close", op = ">", right = { prev = "dc.upper" } },
+    { left = "rvol", op = ">=", right = 1.5 },
+] }, expire_after = { bars = 10, timeframe = "1h" } }
+exit = { left = "close", op = "<", right = "dc.mid" }
+breakout = true
+
+[costs]
+breakout_slippage_bp = 5
+
+[exits]
+stop = { level = { sub = ["close", { mul = [2.0, "atr"] }] } }
+take_profit = { r = 2.0 }
+time_stop = { minutes = 2880 }
+trail = { level = { sub = ["close", { mul = [2.5, "atr"] }] }, ratchet = true }

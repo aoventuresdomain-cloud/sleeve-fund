@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from sleeve_fund import markets
 from sleeve_fund.instruments import pct
 
 ROOT = Path(__file__).resolve().parent.parent.parent
@@ -38,6 +39,7 @@ EXEC_STEPS = (1, 5, 15, 60)
 OOS_EXEC_BUDGET = 3_000_000
 # Stored history ending longer ago than this is still being backfilled; a study says so.
 STALE_HISTORY = pd.Timedelta(days=1)
+BASKET_POOL = ("BTC", "ETH", "SOL", "XRP")  # STUDY-ASSET-LIST: the research pool an asset list draws from (PM 21 Oct)
 
 
 @dataclass(frozen=True)
@@ -64,6 +66,9 @@ class StudyRequest:
     label: str | None = None
     # B-37: a study list's pinned dates (research.pinned.Pinned): the study reads those days only, whatever day it runs.
     pinned: object | None = None
+    # RESEARCH-SPOT-FEES (HoE, 21 Oct): the study's market, whatever its params or risk profile say: "spot-lowfee" for
+    # the research spot market, "perp" for the perpetual. None: as today (the params' market, else the venue's).
+    market: str | None = None
     # R-11: "walk_forward" (as before) or "continuous" (pinned settings only: a warm-up, then scored to the research end)
     score_window: str = "walk_forward"
     # R-12, this round only: also run the old walk-forward on the same settings (never counted as a try), and pass
@@ -73,6 +78,13 @@ class StudyRequest:
     # random in the share the variant's filter blocked; None: no placebo
     placebo_parent: dict | None = None
     starting_capital: float = 10_000.0  # R-15: the account every run starts from (the PM's $1,000 run)
+    # STUDY-ASSET-LIST (PM 21 Oct): the assets one definition runs on as one basket (research.basket_run), `pair`
+    # their first; None: `pair` alone, as before
+    pairs: tuple[str, ...] | None = None
+
+    def __post_init__(self) -> None:
+        if self.pairs is not None:
+            object.__setattr__(self, "pairs", tuple(self.pairs))
 
     def exits(self) -> dict:
         """The exits every run of the study trades with, as the strategy takes them."""
@@ -99,6 +111,47 @@ class StudyRequest:
             raise ValueError("the placebo runs on a continuous scoring window only")
         if not 0 < self.starting_capital < float("inf"):
             raise ValueError("the starting capital must be above 0")
+        if self.market is not None and not isinstance(self.market, str):
+            raise ValueError(f"a study's market is a name, not {self.market!r}")
+        if self.pairs is not None:
+            self._validate_pairs()
+
+    def _validate_pairs(self) -> None:
+        bases = [p.split("/")[0] if "/" in p else None for p in self.pairs]
+        if None in bases:
+            raise ValueError(f"every listed asset should look like BTC/USDT, not {self.pairs!r}")
+        if not 2 <= len(self.pairs) <= len(BASKET_POOL):
+            raise ValueError(f"an asset list holds 2 to {len(BASKET_POOL)} assets, not {len(self.pairs)}")
+        if len(set(bases)) != len(bases):
+            raise ValueError(f"an asset is listed twice: {', '.join(bases)}")
+        if outside := [b for b in bases if b not in BASKET_POOL]:
+            raise ValueError(f"{', '.join(outside)} is not in the research pool ({', '.join(BASKET_POOL)})")
+        if len({p.split("/")[1] for p in self.pairs}) != 1:
+            raise ValueError("the listed assets are quoted in different currencies")
+        if self.pair != self.pairs[0]:
+            raise ValueError(f"the request's pair {self.pair} is not its list's first asset {self.pairs[0]}")
+        if self.minutes != 1440:
+            raise ValueError("an asset list is studied on daily bars only")
+        if self.placebo_parent is not None or self.old_window_too:
+            raise ValueError("an asset list runs without the placebo or the old window beside it")
+
+
+def study_market(req: StudyRequest) -> dict:
+    """The params overlay for the study's market (RESEARCH-SPOT-FEES, DA's to wire): {} for None."""
+    if req.market is None:
+        return {}
+    raise ValueError(f"a study's market setting ({req.market}) isn't wired yet")
+
+
+def study_market(req: StudyRequest) -> dict:
+    """RESEARCH-SPOT-FEES (HoE, 21 Oct): the params overlay for a study's own market setting, whatever its params or
+    risk profile say: {} for None (as today), {"market": "perp"} or {"market": "spot-lowfee"}; anything else refused.
+    The single and basket study paths both apply it."""
+    if req.market is None:
+        return {}
+    if req.market not in (markets.PERP, markets.SPOT_LOWFEE):
+        raise ValueError(f"a study's market is {markets.PERP} or {markets.SPOT_LOWFEE}, not {req.market!r}")
+    return {"market": req.market}
 
 
 def _bars(minutes: int) -> str:
@@ -140,6 +193,14 @@ def run_store_study(req: StudyRequest, store=None, progress=None, ledger_path: P
     from sleeve_fund.venues import venue as venue_profile
 
     req.validate()
+    if req.market is not None:  # the study's own market over the params' (a short side is refused on spot)
+        from dataclasses import replace as _replace
+
+        req = _replace(req, params={**(req.params or {}), **study_market(req)})
+    if req.pairs is not None:  # STUDY-ASSET-LIST: one basket of the listed assets
+        from sleeve_fund.research.basket_run import run_store_basket
+
+        return run_store_basket(req, store, out_dir=out_dir, history=history)
     spec = spec_of(req.strategy)
     profile = venue_profile(req.venue)
     history = history or HistoryStore()
@@ -202,6 +263,8 @@ def run_store_study(req: StudyRequest, store=None, progress=None, ledger_path: P
     # The fees the strategy's runs paid: a perpetual market's own when it trades one, not the venue's spot rates (RE-COST).
     paid = result.fee_basis
     fee_words = fees.text if paid is None or paid == fees.fees else \
+        f"{pct(paid.maker)} maker, {pct(paid.taker)} taker ({markets.SPOT_LOWFEE_WORDS})" \
+        if markets.market_of(req.params) == markets.SPOT_LOWFEE else \
         f"{pct(paid.maker)} maker, {pct(paid.taker)} taker (the perpetual market's)"
     span = int((prices.index[0] - pd.Timedelta(minutes=req.minutes)).value), int(prices.index[-1].value)
     result.fee_note = f"{fee_words}; the maker rate on post-only orders only; spread: {spread.text(*span)}"

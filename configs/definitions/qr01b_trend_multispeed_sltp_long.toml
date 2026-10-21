@@ -1,0 +1,58 @@
+# QR-B2 family, SL/TP exit-set try (21 Oct 2026, Quant Researcher). Decision candle: 4h.
+# Variant of qr01b_trend_multispeed_long, pre-registered before any run (PM 21 Oct 14:42-14:44 UK: every strategy carries an explicit
+# stop-loss and take-profit; values are the trend type's convention, Advisor 21 Oct, never tuned per strategy).
+# take_profit needs TP-EXIT (Deploy 2): syntax provisional until it is live.
+version = 1
+name = "qr01b-trend-multispeed-sltp-long"
+title = "Trend Consensus (3 speeds, 4h) + SL/TP · Long"
+reason = """qr01b_trend_multispeed_long with the trend exit set: 3 ATR(14) stop at entry, fixed 3R take-profit, 3 ATR(14) trail that only tightens; whichever exit fires first wins. The entry re-arms only when all three votes newly agree (the qr01e form), so a stopped or target-hit trade is not re-bought the next candle; signal exit unchanged. Held at 1x."""
+
+[blocks.f1]
+kind = "ema"
+period = 8
+
+[blocks.s1]
+kind = "ema"
+period = 32
+
+[blocks.f2]
+kind = "ema"
+period = 16
+
+[blocks.s2]
+kind = "ema"
+period = 64
+
+[blocks.f3]
+kind = "ema"
+period = 32
+
+[blocks.s3]
+kind = "ema"
+period = 128
+
+[blocks.atr]
+kind = "atr"
+period = 14
+
+[long]
+entry = { all = [
+    { left = "f1", op = ">", right = "s1" },
+    { left = "f2", op = ">", right = "s2" },
+    { left = "f3", op = ">", right = "s3" },
+    { any = [
+        { left = { prev = "f1" }, op = "<=", right = { prev = "s1" } },
+        { left = { prev = "f2" }, op = "<=", right = { prev = "s2" } },
+        { left = { prev = "f3" }, op = "<=", right = { prev = "s3" } },
+    ] },
+] }
+exit = { any = [
+    { all = [{ left = "f1", op = "<", right = "s1" }, { left = "f2", op = "<", right = "s2" }] },
+    { all = [{ left = "f1", op = "<", right = "s1" }, { left = "f3", op = "<", right = "s3" }] },
+    { all = [{ left = "f2", op = "<", right = "s2" }, { left = "f3", op = "<", right = "s3" }] },
+] }
+
+[exits]
+stop = { level = { sub = ["close", { mul = [3.0, "atr"] }] } }
+take_profit = { r = 3.0 }
+trail = { level = { sub = ["close", { mul = [3.0, "atr"] }] }, ratchet = true }
