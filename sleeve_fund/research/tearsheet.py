@@ -583,6 +583,11 @@ def render(r: StudyResult, ledger: IdeaLedger, register=None, liquidation_ack: s
                    "bar traded through was filled at its worst price, and a stop and a target both inside one bar as the "
                    "stop.")
         out.append("")
+    if getattr(r, "margin_note", ""):
+        out.append(f"> {r.margin_note}. Its liquidation prices and largest position use that table. Price tick and "
+                   "quantity step: the venue's listing when the server reads it, else the contract's own (shortcut: "
+                   "the sheet doesn't say which).")
+        out.append("")
     check = getattr(r, "spot_check", None)
     if check and "gap" in check:
         out.append(f"> 5-minute pass spot-checked on 1-minute bars: the window {check['window']} (seed {check['seed']}) "
