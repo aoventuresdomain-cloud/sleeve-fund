@@ -10,7 +10,7 @@ import math
 import operator
 
 from dataclasses import dataclass
-from decimal import ROUND_HALF_EVEN, ROUND_HALF_UP, Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_EVEN, ROUND_HALF_UP, Decimal
 
 from nautilus_trader.backtest import SimulationModule
 from nautilus_trader.execution import FeeModel
@@ -184,11 +184,18 @@ def target_reached(side: int, high: float, low: float, level: float) -> bool:
 
 def target_level(entry: float, side: int, share: float, price_precision: int | None) -> float:
     """The target's price: `share` past the entry on the position's side, on the instrument's tick (one level for
-    all three paths, so an exact touch of it is a touch in each). A Price's value, as the bars' prices are: round()
-    differs from it by a float hair in about a fifth of cases, so an exact touch would miss. Exact with no precision
-    (no instrument)."""
+    all three paths, so an exact touch of it is a touch in each). Between ticks it goes to the tick past it, up for
+    a long and down for a short, so it is never reached before the exact level is (HoE TEC-TPEXIT-B14AA (3)); within
+    a millionth of a tick of one it is that tick, so float noise never moves it a whole tick (as margin.to_tick).
+    A Price's value, as the bars' prices are: round() differs from it by a float hair, so an exact touch would miss.
+    Exact with no precision (no instrument)."""
     level = entry * (1 + side * share)
-    return level if price_precision is None else Price(level, price_precision).as_double()
+    if price_precision is None:
+        return level
+    n = Decimal(repr(level)).scaleb(price_precision)
+    near = n.to_integral_value(ROUND_HALF_EVEN)
+    n = near if abs(n - near) < Decimal("1e-6") else n.to_integral_value(ROUND_CEILING if side > 0 else ROUND_FLOOR)
+    return Price(float(n.scaleb(-price_precision)), price_precision).as_double()
 
 
 def target_fill_px(level, long: bool, half_spread) -> Decimal:

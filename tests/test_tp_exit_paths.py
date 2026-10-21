@@ -46,11 +46,16 @@ def test_a_target_is_reached_on_a_touch_and_not_a_tick_short_of_it(side):
 def test_the_target_level_is_on_the_instruments_tick_and_never_better_than_the_exact_level():
     """HoE TEC-TPEXIT-B14AA (3): a level between ticks goes to the tick past it, up for a long and down for a short,
     so the target is never reached before the exact level is; one on a tick (to a millionth of one) stays there."""
-    assert target_level(60_000.06, 1, TP, 1) == 61_200.1  # 61,200.0612 up
-    assert target_level(60_000.06, -1, TP, 1) == 58_800.0  # 58,800.0588 down
-    assert target_level(60_000.05454545, 1, 0.01, 1) == 60_600.1  # b14aa's paper target, 60,600.055 up
-    assert target_level(60_060.0, 1, 0.03, 1) == 61_861.8  # 61,861.8 within float noise of its tick: stays
-    assert target_level(60_060.0, -1, 0.03, 1) == 58_258.2
+    from nautilus_trader.model import Price
+
+    def px(v):  # the tick as a Price's value, which the bars' prices are
+        return Price(v, 1).as_double()
+
+    assert target_level(60_000.06, 1, TP, 1) == px(61_200.1)  # 61,200.0612 up
+    assert target_level(60_000.06, -1, TP, 1) == px(58_800.0)  # 58,800.0588 down
+    assert target_level(60_000.05454545, 1, 0.01, 1) == px(60_600.1)  # b14aa's paper target, 60,600.055 up
+    assert target_level(60_060.0, 1, 0.03, 1) == px(61_861.8)  # 61,861.8 within float noise of its tick: stays
+    assert target_level(60_060.0, -1, 0.03, 1) == px(58_258.2)
 
 
 @pytest.mark.parametrize("side", [1, -1], ids=["long", "short"])
