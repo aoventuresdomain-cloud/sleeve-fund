@@ -5,8 +5,9 @@ name: study
 # holdout stays locked: nothing here can open it. Writes research records only, never a Strategy, order, fill or
 # fund row. The log is public, so it shows counts and per-row ran/failed only; the results are read on the Research
 # page. Run it by hand from main: first with dry_run (the default), which checks every row and runs nothing.
-# R-29: by default the run reads the research configs (configs/definitions/*.toml, configs/studies/*.md, nothing
-# else) from main at the commit it was dispatched on, not from the deployed image, so a merged definition runs without
+# R-29: by default the run reads the research configs (configs/definitions/*.toml, the R-06/R-07 variants in
+# configs/definitions/variants/*.toml, configs/studies/*.md, nothing else) from main at the commit it was dispatched
+# on, not from the deployed image, so a merged definition runs without
 # a deploy. They are copied to /opt/sleeve-research/<sha>/ on the server, root-owned and outside the deployed tree,
 # and mounted read-only into this one-off container only: the dashboard, supervisor and mirror keep the image's own.
 # configs_from=image runs on the image's configs, as before.
@@ -61,17 +62,19 @@ jobs:
           # An allowlist read from git itself: regular files (100644 blob) named exactly as below. A symlink or any
           # other type there fails the run; a file with another name is left out and named.
           set -euo pipefail
-          mkdir -p staged/definitions staged/studies
+          mkdir -p staged/definitions/variants staged/studies
           while IFS=$'\t' read -r meta path; do
             read -r mode type _ <<<"$meta"
             if [[ "$mode $type" != "100644 blob" ]]; then
               echo "::error::$path is not a regular file (mode $mode, $type): a symlink or other type is refused"; exit 1
             fi
             if [[ $path =~ ^configs/definitions/[a-z0-9_]+\.toml$ ]]; then cp -- "$path" staged/definitions/
+            # The mount replaces the image's configs/definitions, so the variants a list names go with it (CR M1).
+            elif [[ $path =~ ^configs/definitions/variants/[a-z0-9_]+\.toml$ ]]; then cp -- "$path" staged/definitions/variants/
             elif [[ $path =~ ^configs/studies/[a-z0-9_-]+\.md$ ]]; then cp -- "$path" staged/studies/
             else echo "::notice::left out, not a research config by name: $path"; fi
           done < <(git ls-tree -r HEAD -- configs/definitions configs/studies)
-          echo "staged $(ls staged/definitions | wc -l) definitions and $(ls staged/studies | wc -l) study lists"
+          echo "staged $(ls staged/definitions/*.toml 2>/dev/null | wc -l) definitions, $(ls staged/definitions/variants | wc -l) variants and $(ls staged/studies | wc -l) study lists"
       - name: Check the inputs
         env:
           LIST: ${{ inputs.list }}

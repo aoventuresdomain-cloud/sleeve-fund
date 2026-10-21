@@ -75,7 +75,12 @@ CASES = {
     "a rename into the allowlist": (lambda r: (r / "sleeve_fund/x.py").rename(r / "configs/definitions/x.toml"), False),
     "a rename inside the allowlist": (lambda r: (r / "configs/definitions/qr01_a.toml").rename(
         r / "configs/definitions/qr01_b.toml"), False),
+    "a variant definition": (_write("configs/definitions/variants/qr01_trend_ema_long_v2_funding.toml"), True),
+    "a variant and a study list": (_both(_write("configs/definitions/variants/qr01b_v1.toml"),
+                                         _write("configs/studies/qr-rescore-list.md")), True),
     "a nested directory": (_write("configs/definitions/sub/qr22.toml"), False),
+    "a directory under the variants": (_write("configs/definitions/variants/sub/qr22.toml"), False),
+    "an upper-case variant": (_write("configs/definitions/variants/QR22.toml"), False),
     "an upper-case name": (_write("configs/definitions/QR22.toml"), False),
     "another suffix": (_write("configs/definitions/qr22.py"), False),
     "a study list's other suffix": (_write("configs/studies/list.toml"), False),
@@ -129,6 +134,7 @@ def test_the_study_job_stages_main_at_its_own_commit_by_the_allowlist():
     stage = study.split("- name: Stage the research configs", 1)[1].split("- name:", 1)[0]
     assert "git ls-tree -r" in stage and "100644 blob" in stage
     assert r"^configs/definitions/[a-z0-9_]+\.toml$" in stage and r"^configs/studies/[a-z0-9_-]+\.md$" in stage
+    assert r"^configs/definitions/variants/[a-z0-9_]+\.toml$" in stage
     assert "symlink" in stage
     ship = study.split("- name: Ship the research configs", 1)[1].split("- name:", 1)[0]
     assert "--no-links" in ship and "/opt/sleeve-research/$SHA/" in ship and "tail -n +6" in ship
@@ -165,3 +171,27 @@ def test_the_research_page_shows_a_study_whose_definition_is_not_in_the_image(tm
     assert stem in c.get("/research", auth=auth).text
     page = c.get(f"/research/{stem}", auth=auth)
     assert page.status_code == 200 and "qr99_not_in_image_long" in page.text
+
+
+def _stage_script() -> str:
+    """The shell of study.yml's "Stage the research configs" step, as the runner runs it."""
+    stage = STUDY.read_text().split("- name: Stage the research configs", 1)[1].split("- name:", 1)[0]
+    lines = stage.split("run: |", 1)[1].splitlines()[1:]
+    indent = min(len(line) - len(line.lstrip()) for line in lines if line.strip())
+    return "\n".join(line[indent:] for line in lines) + "\n"
+
+
+def test_the_study_job_stages_the_r06_r07_variants_beside_the_definitions(repo):
+    """CR M1 on R-06/R-07 (HoE): the mount replaces the image's configs/definitions, so the variants a study list
+    names (configs/definitions/variants/*.toml) are staged under it too, or a configs_from=main study can't find them.
+    Anything deeper, or not named as a definition, is still left out."""
+    for path in ("configs/definitions/variants/qr01b_v1_funding.toml", "configs/definitions/variants/sub/x.toml",
+                 "configs/definitions/variants/QR2.toml"):
+        _write(path)(repo)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "variants")
+    out = subprocess.run(["bash", "-c", _stage_script()], cwd=repo, capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+    staged = sorted(str(p.relative_to(repo / "staged")) for p in (repo / "staged").rglob("*") if p.is_file())
+    assert staged == ["definitions/qr01_a.toml", "definitions/variants/qr01b_v1_funding.toml", "studies/list-a.md"]
+    assert "left out, not a research config by name: configs/definitions/variants/sub/x.toml" in out.stdout
