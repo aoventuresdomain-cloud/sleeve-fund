@@ -1035,7 +1035,8 @@ def run_study(
             full_default.shorts, leverage, market.get("market"), charged=False)
     for rung in ladder:  # the benchmark at each rung's own cost, as the rung's runs pay it (RE-COST)
         at_rung, _ = _benchmarks(research, folds, test_bars, rung.fee + slip,
-                                 series if series is not None else spread_used, False, leverage, market.get("market"))
+                                 series if series is not None else spread_used, full_default.shorts, leverage,
+                                 market.get("market"))
         if at_rung.trades:
             rung.oos_timing_return, rung.random_return = at_rung.strategy_return, at_rung.median_random_return
     if hold_market == markets.PERP and not market:
