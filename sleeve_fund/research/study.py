@@ -569,45 +569,69 @@ RECURSIVE_LENGTHS = {"ema": ("period",), "atr": ("period",), "rsi": ("period",),
                      "rsi_divergence": ("rsi_period",)}
 
 
-# Blocks that warm up over time rather than over candles: a calendar period or session (warmup_minutes), a day-anchored
-# VWAP, and the funding decile's trailing days of settlements. block_warmup does not count them in candles yet
-# (Advisor 21 Oct), so a continuous window refuses them (HoE) rather than score through too short a warm-up.
-def warms_up_in_time(kind: str, settings: dict) -> bool:
+def time_warmup_minutes(kind: str, settings: dict) -> int | None:
+    """The minutes a block warms up over when its warm-up is in time rather than candles (Advisor 21 Oct): a calendar
+    period or session (warmup_minutes), a day-anchored VWAP's one day, the funding decile's trailing window_days of
+    settlements. None for a block that warms up over candles."""
     from sleeve_fund.strategies.definitions import BUILDER_BLOCKS
+    from sleeve_fund.strategies.timeframes import DAY_MINUTES
 
-    return (hasattr(BUILDER_BLOCKS[kind], "warmup_minutes") or kind == "funding_decile"
-            or (kind == "vwap" and settings.get("anchor", "day") == "day"))
+    cls = BUILDER_BLOCKS[kind]
+    if hasattr(cls, "warmup_minutes"):
+        return int(cls.warmup_minutes(settings))
+    if kind == "vwap" and settings["anchor"] == "day":
+        return DAY_MINUTES
+    if kind == "funding_decile":
+        return int(settings["window_days"]) * DAY_MINUTES
+    return None
 
 
-def block_warmup(kind: str, settings: dict) -> int:
-    """R-11: the bars one block needs before a continuous window scores: WARMUP_MULTIPLE x N for a recursive block,
-    otherwise its own warm-up as warmup_for reads it (N, or N + 1 where its first value needs the bar before)."""
+def block_warmup(kind: str, settings: dict, candle_minutes: int | None = None) -> int:
+    """R-11: the candles of `candle_minutes` (the block's own size) one block needs before a continuous window scores:
+    WARMUP_MULTIPLE x N for a recursive block; a block that warms up over time, its minutes in candles as the builder
+    counts a calendar period, ceil(minutes / candle) + 1; otherwise its own warm-up as warmup_for reads it (N, or N + 1
+    where its first value needs the bar before)."""
     from sleeve_fund.strategies.definitions import BUILDER_BLOCKS
 
     cls = BUILDER_BLOCKS[kind]
-    s = cls.check_settings({k: v for k, v in settings.items() if k not in ("kind", "timeframe")})
+    s = cls.check_settings({k: v for k, v in settings.items() if k not in ("kind", "timeframe", "input")})
     if kind in RECURSIVE_LENGTHS:
         bars = WARMUP_MULTIPLE * max(int(s[k]) for k in RECURSIVE_LENGTHS[kind])
         return bars + (s["left"] + s["right"] + s["max_gap"] if kind == "rsi_divergence" else 0)
+    minutes = time_warmup_minutes(kind, s)
+    if minutes is not None:
+        if not candle_minutes:
+            raise ValueError(f"a {kind} block warms up over time: its warm-up in candles needs the candle's minutes")
+        return -(-minutes // candle_minutes) + 1
     return int(cls.warmup_bars(**s))  # what warmup_for reads for the block
 
 
 def continuous_warmup(strategy: str, params: dict, bar_minutes: int) -> int:
     """R-11: the warm-up bars of a continuous window, from the rule itself: the most any of its blocks needs
-    (block_warmup), a slower-timeframe block's counted in decision candles, with one more of its candles for the part
-    candle a run starts in (as Rules.warmup_needed counts it)."""
-    from sleeve_fund.strategies.definitions import check_definition, timeframe_minutes
+    (block_warmup, in candles of the block's size, after the warm-up of a block it is fed from, as the builder adds
+    them), a slower-timeframe block's counted in decision candles, with one more of its candles for the part candle a
+    run starts in (as Rules.warmup_needed counts it)."""
+    from sleeve_fund.strategies.definitions import FIELDS, check_definition, timeframe_minutes
 
     if strategy != "rules" or not params.get("definition"):
         raise ValueError("a continuous scoring window reads its warm-up from a rule-builder definition's indicators")
     definition = params["definition"]
     check_definition(definition, bar_minutes=bar_minutes)
+    blocks = definition.get("blocks") or {}
+    own: dict = {}
+
+    def settle(bid: str) -> int:  # candles of the block's size until it and every block it is fed from have settled
+        if bid not in own:
+            block = blocks[bid]
+            candle = timeframe_minutes(block["timeframe"]) if block.get("timeframe") else bar_minutes
+            src = block.get("input")
+            fed = settle(src.partition(".")[0]) if src and src not in FIELDS else 0  # chained blocks share a timeframe
+            own[bid] = block_warmup(block["kind"], block, candle) + fed
+        return own[bid]
+
     need = 0
-    for bid, block in (definition.get("blocks") or {}).items():
-        if warms_up_in_time(block["kind"], block):
-            raise ValueError(f"block {bid} ({block['kind']}) warms up over time, not over candles, which a continuous "
-                             "window's warm-up does not count yet: score it on the walk-forward")
-        bars = block_warmup(block["kind"], block)
+    for bid, block in blocks.items():
+        bars = settle(bid)
         if block.get("timeframe"):
             tf = timeframe_minutes(block["timeframe"])
             bars = (bars + 1) * tf // bar_minutes if tf > bar_minutes else bars

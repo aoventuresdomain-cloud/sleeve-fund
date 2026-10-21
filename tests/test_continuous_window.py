@@ -268,9 +268,33 @@ def _with(kind: str) -> dict:
                      "exit": EMA["long"]["exit"]}}
 
 
-@pytest.mark.parametrize("kind", sorted(TIMED))
-def test_a_continuous_window_refuses_a_block_whose_warm_up_is_in_time_not_candles(kind):
-    """Advisor 21 Oct (HoE: refuse until counted): a calendar period, a session, a day VWAP and the funding decile's
-    trailing days warm up in time; the rule above counts candles, so a continuous window refuses them, in words."""
-    with pytest.raises(ValueError, match="warms up over time"):
-        continuous_warmup("rules", to_params(_with(kind)), 60)
+def test_a_block_that_warms_up_over_time_is_counted_in_candles_of_its_size():
+    """Advisor 21 Oct, defect 1: a calendar period, a session and a day VWAP warm up over time; as the builder counts
+    them (definitions.py), ceil(minutes / candle) + 1 candles of the block's size, never 1-minute bars."""
+    assert block_warmup("prior_period", {"period": "week"}, 60) == 2 * 7 * 24 + 1 == 337  # two weeks, not 20,161
+    assert block_warmup("prior_period", {"period": "day"}, 60) == 2 * 24 + 1 == 49
+    assert block_warmup("session_levels", {"session": "asia"}, 60) == 49
+    assert block_warmup("vwap", {"anchor": "day"}, 60) == 24 + 1
+    assert continuous_warmup("rules", to_params(_with("prior_period")), 60) == 550  # the EMA's 10 x 55 decides
+    assert continuous_warmup("rules", to_params(_with("prior_period")), 15) == 2 * 7 * 96 + 1 == 1345
+    four_hourly = {**_with("prior_period")}
+    four_hourly["blocks"] = {**four_hourly["blocks"], "t": {**TIMED["prior_period"][0], "timeframe": "4h"}}
+    assert continuous_warmup("rules", to_params(four_hourly), 15) == (2 * 7 * 6 + 1 + 1) * 16  # in 4h candles
+
+
+def test_the_funding_deciles_trailing_days_are_counted_in_the_warm_up():
+    """Advisor 21 Oct, defect 2: the decile reads the settlements of its trailing window_days, so a continuous window
+    warms up that many days of candles before it scores, not 0."""
+    assert block_warmup("funding_decile", {"window_days": 90}, 60) == 90 * 24 + 1 == 2161
+    assert continuous_warmup("rules", to_params(_with("funding_decile")), 60) == 2161
+    assert continuous_warmup("rules", to_params(_with("funding_decile")), 1440) == 550
+
+
+def test_a_block_fed_another_block_warms_up_after_its_input_has():
+    """A block read from another's output settles only once its input has: the builder adds the two warm-ups, and
+    the continuous window does too (an EMA of an RSI: 10 x 30 after the RSI's 10 x 30)."""
+    chained = {**EMA, "blocks": {**EMA["blocks"], "rsi": {"kind": "rsi", "period": 30},
+                                 "smooth": {"kind": "ema", "period": 30, "input": "rsi"}},
+               "long": {"entry": {"all": [EMA["long"]["entry"], {"left": "smooth", "op": ">", "right": 50}]},
+                        "exit": EMA["long"]["exit"]}}
+    assert continuous_warmup("rules", to_params(chained), 240) == 300 + 300
