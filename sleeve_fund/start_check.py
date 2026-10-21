@@ -417,12 +417,17 @@ def _live_tick(venue: str, pair: str):
     return profile.live_tick(pair)
 
 
+# FIX-SPOTPERP-CHECK (Advisor 21 Oct): a perp simulated on a spot venue skips the tick and lot checks, never silently
+SKIPPED_SPOT_PERP = "SKIPPED (simulated perp, no perpetual venue)"
+
+
 def check_price_ticks(store, live_tick=None) -> Section:
     """B-36b (HoE, 20 Oct): a perp Strategy's prices round to the contract tick kept beside its tiers
     (markets.price_tick). One whose venue's live tick differs from the kept one is a FAIL, named, with both ticks, as is
     one whose tick isn't kept or can't be read: never run on an assumed tick (the VS-1 pattern). One line per pair.
-    A perp simulated on a spot venue (FIX-SPOTPERP-CHECK) is skipped: it trades on markets.LOW_FEE_PERP, as
-    markets.terms gives it, and a spot venue keeps no contract tick (markets.price_tick says None)."""
+    A perp simulated on a spot venue (FIX-SPOTPERP-CHECK) is skipped, with a NOTE line naming it: it trades on
+    markets.LOW_FEE_PERP, as markets.terms gives it, and a spot venue keeps no contract tick (markets.price_tick says
+    None). Only this check and the lot check skip it; its stop and leverage rules still run."""
     from decimal import Decimal
 
     from sleeve_fund import markets
@@ -436,6 +441,7 @@ def check_price_ticks(store, live_tick=None) -> Section:
             continue
         venue = getattr(s, "venue", None) or DEFAULT_VENUE
         if not venue_profile(venue).perpetual:
+            sec.add(NOTE, f"{s.name}: {SKIPPED_SPOT_PERP}")
             continue
         kept = markets.price_tick(venue, s.instrument)
         if kept is None:
@@ -483,7 +489,7 @@ def check_lot_sizes(store, hub_lot=None, paper_lot=None) -> Section:
     perp Strategy whose hub step or minimum differs from the paper venue's listed lot is a FAIL, named, with both lots,
     as is one whose listed step the engine can't round to (not a power of ten) or whose lots can't be read: fail-closed,
     as the price tick. One line per pair. shortcut: paper doesn't read the paper venue's lot itself; a MUST before G2.
-    A perp simulated on a spot venue is skipped, as in check_price_ticks (FIX-SPOTPERP-CHECK)."""
+    A perp simulated on a spot venue is skipped with a NOTE line, as in check_price_ticks (FIX-SPOTPERP-CHECK)."""
     from sleeve_fund.venues import DEFAULT_VENUE, LotStepUnusable
     from sleeve_fund.venues import venue as venue_profile
 
@@ -494,6 +500,7 @@ def check_lot_sizes(store, hub_lot=None, paper_lot=None) -> Section:
             continue
         venue = getattr(s, "venue", None) or DEFAULT_VENUE
         if not venue_profile(venue).perpetual:
+            sec.add(NOTE, f"{s.name}: {SKIPPED_SPOT_PERP}")
             continue
         key = (venue, s.instrument)
         if key not in seen:
