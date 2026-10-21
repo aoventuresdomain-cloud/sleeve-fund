@@ -569,6 +569,16 @@ RECURSIVE_LENGTHS = {"ema": ("period",), "atr": ("period",), "rsi": ("period",),
                      "rsi_divergence": ("rsi_period",)}
 
 
+# Blocks that warm up over time rather than over candles: a calendar period or session (warmup_minutes), a day-anchored
+# VWAP, and the funding decile's trailing days of settlements. block_warmup does not count them in candles yet
+# (Advisor 21 Oct), so a continuous window refuses them (HoE) rather than score through too short a warm-up.
+def warms_up_in_time(kind: str, settings: dict) -> bool:
+    from sleeve_fund.strategies.definitions import BUILDER_BLOCKS
+
+    return (hasattr(BUILDER_BLOCKS[kind], "warmup_minutes") or kind == "funding_decile"
+            or (kind == "vwap" and settings.get("anchor", "day") == "day"))
+
+
 def block_warmup(kind: str, settings: dict) -> int:
     """R-11: the bars one block needs before a continuous window scores: WARMUP_MULTIPLE x N for a recursive block,
     otherwise its own warm-up as warmup_for reads it (N, or N + 1 where its first value needs the bar before)."""
@@ -593,7 +603,10 @@ def continuous_warmup(strategy: str, params: dict, bar_minutes: int) -> int:
     definition = params["definition"]
     check_definition(definition, bar_minutes=bar_minutes)
     need = 0
-    for block in (definition.get("blocks") or {}).values():
+    for bid, block in (definition.get("blocks") or {}).items():
+        if warms_up_in_time(block["kind"], block):
+            raise ValueError(f"block {bid} ({block['kind']}) warms up over time, not over candles, which a continuous "
+                             "window's warm-up does not count yet: score it on the walk-forward")
         bars = block_warmup(block["kind"], block)
         if block.get("timeframe"):
             tf = timeframe_minutes(block["timeframe"])

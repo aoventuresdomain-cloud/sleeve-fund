@@ -253,3 +253,24 @@ def test_a_trip_across_new_year_stays_whole_in_the_year_it_opened():
     (_, y23, n23), (_, y24, n24) = years
     assert y23.test_end == pd.Timestamp("2024-01-09", tz="UTC")  # on to the close of the trip it opened
     assert n23 + n24 == len(idx) and n23 == idx.get_loc(y23.test_end) + 1  # no bar in two years, none left out
+
+
+TIMED = {"prior_period": ({"kind": "prior_period", "period": "week"}, "high"),
+         "session_levels": ({"kind": "session_levels", "session": "asia"}, "high"),
+         "vwap": ({"kind": "vwap", "anchor": "day"}, "value"),
+         "funding_decile": ({"kind": "funding_decile", "window_days": 90}, "value")}
+
+
+def _with(kind: str) -> dict:
+    block, output = TIMED[kind]
+    return {**EMA, "blocks": {**EMA["blocks"], "t": block},
+            "long": {"entry": {"all": [EMA["long"]["entry"], {"left": "close", "op": ">", "right": f"t.{output}"}]},
+                     "exit": EMA["long"]["exit"]}}
+
+
+@pytest.mark.parametrize("kind", sorted(TIMED))
+def test_a_continuous_window_refuses_a_block_whose_warm_up_is_in_time_not_candles(kind):
+    """Advisor 21 Oct (HoE: refuse until counted): a calendar period, a session, a day VWAP and the funding decile's
+    trailing days warm up in time; the rule above counts candles, so a continuous window refuses them, in words."""
+    with pytest.raises(ValueError, match="warms up over time"):
+        continuous_warmup("rules", to_params(_with(kind)), 60)
