@@ -27,7 +27,7 @@ on:
         required: true
         default: binance
       pair:
-        description: Instrument, e.g. BTC/USDT
+        description: Instrument, e.g. BTC/USDT, or a list run as one basket, e.g. BTC/USDT,ETH/USDT,SOL/USDT,XRP/USDT
         required: true
         default: BTC/USDT
       dry_run:
@@ -104,7 +104,7 @@ jobs:
           [[ "$LIST" =~ ^[a-z0-9][a-z0-9_-]{0,63}\.md$ ]] || { echo "list must be a file name in configs/studies/, like qr-rescore-list.md"; exit 1; }
           [[ -z "$ROWS" || "$ROWS" =~ ^[0-9]+(-[0-9]+)?(,[0-9]+(-[0-9]+)?)*$ ]] || { echo "rows must look like 1-8 or 1,4,7"; exit 1; }
           [[ "$VENUE" =~ ^[a-z]{1,32}$ ]] || { echo "venue must be lower-case letters only"; exit 1; }
-          [[ "$PAIR" =~ ^[A-Z0-9]{1,16}/[A-Z0-9]{1,16}$ ]] || { echo "pair must be like BTC/USDT"; exit 1; }
+          [[ "$PAIR" =~ ^[A-Z0-9]{1,16}/[A-Z0-9]{1,16}(,[A-Z0-9]{1,16}/[A-Z0-9]{1,16}){0,3}$ ]] || { echo "pair must be like BTC/USDT or BTC/USDT,ETH/USDT"; exit 1; }
       - name: Configure SSH
         env:
           KEY: ${{ secrets.DEPLOY_SSH_KEY }}

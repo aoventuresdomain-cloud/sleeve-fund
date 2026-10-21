@@ -36,6 +36,7 @@ TRAIN_DAYS, TEST_DAYS, HOLDOUT_DAYS = 730, 365, 365
 # pinned row continuously after its warm-up; without the line it keeps the walk-forward. This round only, the rows
 # scored on the old window before (QR-B1, QR-B2, QR-B3) also show that window's verdict and pass only if both pass.
 CONTINUOUS_LINE = re.compile(r"^-\s*\*\*Scoring window:\*\*\s*continuous\b", re.M | re.I)
+PAIRS = r"[A-Z0-9]{1,16}/[A-Z0-9]{1,16}(,[A-Z0-9]{1,16}/[A-Z0-9]{1,16}){0,3}"  # one instrument, or a list of up to 4
 OLD_WINDOW_TOO = frozenset({
     "qr01_trend_ema_long", "qr01_trend_ema_short", "qr01b_trend_multispeed_long", "qr01b_trend_multispeed_short",
     "qr01c_trend_donchian_long", "qr01c_trend_donchian_short"})
@@ -77,7 +78,8 @@ def pick(rows: list, spec: str | None) -> list:
 
 def request(name: str, minutes: int, venue: str, pair: str, pinned=None, continuous: bool = False):
     """The store study one row runs: rules, its definition's params, perp, the locked holdout, on the list's pinned
-    dates (B-37), scored continuously after a warm-up when the list says so (R-11)."""
+    dates (B-37), scored continuously after a warm-up when the list says so (R-11). pair: one instrument, or several
+    joined by commas (STUDY-ASSET-LIST), run as one basket."""
     from sleeve_fund.research.run import StudyRequest
     from sleeve_fund.strategies.definitions import load_definition_file, to_params
 
@@ -93,10 +95,12 @@ def request(name: str, minutes: int, venue: str, pair: str, pinned=None, continu
         params["allow_short"] = True
     parent = (load_definition_file(definition_path(variant["parent"]))
               if continuous and variant and variant.get("placebo") else None)  # R-24
-    return StudyRequest(strategy="rules", pair=pair, venue=venue, minutes=minutes, risk_profile=None,
-                        train_days=TRAIN_DAYS, test_days=TEST_DAYS, holdout_days=HOLDOUT_DAYS, use_holdout=False,
+    pairs = pair.split(",") if "," in pair else None
+    return StudyRequest(strategy="rules", pair=pairs[0] if pairs else pair, pairs=pairs, venue=venue, minutes=minutes,
+                        risk_profile=None, train_days=TRAIN_DAYS, test_days=TEST_DAYS, holdout_days=HOLDOUT_DAYS, use_holdout=False,
                         params=params, label=name, pinned=pinned, placebo_parent=parent,
-                        **({"score_window": "continuous", "old_window_too": name in OLD_WINDOW_TOO} if continuous else {}))
+                        **({"score_window": "continuous", "old_window_too": name in OLD_WINDOW_TOO and not pairs}
+                           if continuous else {}))
 
 
 def main(argv: list[str] | None = None, run=None, journal=None) -> int:
@@ -104,12 +108,13 @@ def main(argv: list[str] | None = None, run=None, journal=None) -> int:
     ap.add_argument("list", help="the study list (markdown with a studies table)")
     ap.add_argument("--rows", default="", help="which rows, e.g. 1-8; all by default")
     ap.add_argument("--venue", default=RESEARCH_VENUE.lower(), help="the venue profile whose stored history is read")
-    ap.add_argument("--pair", default="BTC/USDT")
+    ap.add_argument("--pair", default="BTC/USDT",
+                    help="the instrument, or a list run as one basket: BTC/USDT,ETH/USDT,SOL/USDT,XRP/USDT")
     ap.add_argument("--dry-run", action="store_true", help="check every row's definition and settings, run nothing")
     ap.add_argument("--tries-by-hand", action="store_true", help=f"say on each sheet: {TRIES_BY_HAND}")
     args = ap.parse_args(argv)
-    if not re.fullmatch(r"[a-z]{1,32}", args.venue) or not re.fullmatch(r"[A-Z0-9]{1,16}/[A-Z0-9]{1,16}", args.pair):
-        print("refused: venue must be lower-case letters, pair like BTC/USDT")
+    if not re.fullmatch(r"[a-z]{1,32}", args.venue) or not re.fullmatch(PAIRS, args.pair):
+        print("refused: venue must be lower-case letters, pair like BTC/USDT or BTC/USDT,ETH/USDT")
         return 2
     try:
         text = Path(args.list).read_text(encoding="utf-8")
