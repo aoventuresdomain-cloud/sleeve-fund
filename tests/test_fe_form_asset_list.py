@@ -13,6 +13,8 @@ from fastapi.testclient import TestClient
 from test_halt_ref import T0, store  # noqa: F401
 from test_two_legs_node import built  # noqa: F401 (the fixture)
 
+from sleeve_fund.venues import venue
+
 AUTH = ("pm", "pw")
 SAME = {"origin": "http://testserver"}
 FORM = {"name": "duo", "strategy": "ping_pong", "instrument": "BTC/USD", "bar_spec": "1-MINUTE-LAST-INTERNAL",
@@ -71,24 +73,24 @@ def test_a_one_asset_create_is_as_before(c, store):  # noqa: F811
     assert store.legs("duo") == ["duo"] and "assets" not in store.sleeve("duo").params
 
 
-PERP = {"instrument": "BTC/USDT", "venue": "binance", "assets": "ETH/USDT", "market": "perp"}  # ETH/USDT: no tiers kept
+PERP = {"instrument": "BTC/USDT", "venue": "binance", "assets": "SUI/USDT", "market": "perp"}  # SUI/USDT: no tiers kept (TEC-TIERS3-B: was ETH/USDT, whose tiers are kept since 21 Oct)
 
 
-@pytest.mark.no_maintenance_tables  # the venue as it is: BTC/USDT's tiers kept, ETH/USDT's not
+@pytest.mark.no_maintenance_tables  # the venue as it is: BTC/USDT's tiers kept, SUI/USDT's not
 def test_start_refuses_a_perp_asset_with_no_kept_tiers_naming_it_and_starts_nothing(c, store):  # noqa: F811
-    # made while ETH/USDT's tiers were kept (the form now refuses it): Start still checks every asset at the click
-    store.create_legs(name="duo", strategy="ping_pong", bar_spec="1-MINUTE-LAST-INTERNAL", assets=["BTC/USDT", "ETH/USDT"],
+    # made as if SUI/USDT's tiers were kept (the form now refuses it): Start still checks every asset at the click
+    store.create_legs(name="duo", strategy="ping_pong", bar_spec="1-MINUTE-LAST-INTERNAL", assets=["BTC/USDT", "SUI/USDT"],
                       params={"market": "perp", "stop_loss": 0.02}, starting_balance=0, universe_date="2026-10-21",
                       venue="BINANCE", desired_state="stopped")
     r = c.post("/sleeves/duo/command", data={"command": "start", "reason": "go"}, auth=AUTH, headers=SAME,
                follow_redirects=False)
-    assert "ETH/USDT" in parse_qs(urlparse(r.headers["location"]).query).get("command_error", [""])[0], r.headers["location"]
+    assert "SUI/USDT" in parse_qs(urlparse(r.headers["location"]).query).get("command_error", [""])[0], r.headers["location"]
     assert all(store.sleeve(n).desired_state == "stopped" for n in store.legs("duo"))
 
 
 @pytest.mark.no_maintenance_tables
 def test_a_create_refuses_an_asset_with_no_kept_tiers(c, store):  # noqa: F811
-    assert "ETH/USDT" in _error(_post(c, **PERP, stop_loss_pct="2"))
+    assert "SUI/USDT" in _error(_post(c, **PERP, stop_loss_pct="2"))
     assert not any(s.name.startswith("duo") for s in store.sleeves())
 
 
@@ -124,9 +126,11 @@ def test_every_leg_is_the_parents_strategy_bar_for_its_asset(c, store):  # noqa:
 
 
 @pytest.mark.no_maintenance_tables
-def test_a_refusal_names_every_asset_with_no_kept_tiers(c, store):  # noqa: F811
-    why = _error(_post(c, **{**PERP, "assets": "ETH/USDT SOL/USDT"}, stop_loss_pct="2"))
-    assert "ETH/USDT" in why and "SOL/USDT" in why and "BTC/USDT" not in why, why
+def test_a_refusal_names_every_asset_with_no_kept_tiers(c, store, monkeypatch):  # noqa: F811
+    # TEC-TIERS3-B: SUI/USDT is the only listed pair left with no tiers kept, so XRP/USDT's are set aside for this cell
+    monkeypatch.delitem(venue("BINANCE").maintenance_tiers, "XRP/USDT")
+    why = _error(_post(c, **{**PERP, "assets": "SUI/USDT XRP/USDT"}, stop_loss_pct="2"))
+    assert "SUI/USDT" in why and "XRP/USDT" in why and "BTC/USDT" not in why, why
 
 
 def test_the_page_lists_the_assets_in_the_order_given_the_tie_break(c, store):  # noqa: F811

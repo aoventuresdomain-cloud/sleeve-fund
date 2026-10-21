@@ -23,7 +23,7 @@ from sleeve_fund.venues import venue
 # the venue's own BTC/USDT table, not the tests' flat stand-in; FEE-LIVE's rules as they are
 pytestmark = [pytest.mark.no_maintenance_tables, pytest.mark.venue_terms_live]
 DATA = Path(__file__).parent / "data" / "fee_live"
-T = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
+T = datetime(2026, 10, 21, 12, 0, tzinfo=timezone.utc)  # TEC-TIERS3-C/D2: on or after the kept tables' read date
 PAPER = venue("BINANCE")  # the engine's paper perp venue profile
 PAIR = "BTC/USDT"
 
@@ -138,14 +138,15 @@ def test_never_fetched_refuses_entries(store):
     assert "never" in venue_terms.entry_refusal(store, PAPER, PAIR, T)
 
 
-def test_the_pasted_table_counts_as_a_fetch_dated_15_oct_and_refuses_from_18_oct(store):
+def test_the_pasted_table_counts_as_a_fetch_dated_21_oct_and_refuses_from_24_oct(store):
     venue_terms.seed_pasted_tiers(store, PAPER)
     venue_terms.seed_pasted_tiers(store, PAPER)  # once only
-    rows = [r for r in _rows(store) if r["kind"] == "tiers"]
-    assert len(rows) == 1 and rows[0]["source"] == "hand-checked-pasted" and rows[0]["account"] is None
-    t = venue_terms.term(store, PAPER, "tiers", PAIR, datetime(2026, 10, 16, 12, tzinfo=timezone.utc))
+    rows = [r for r in _rows(store) if r["kind"] == "tiers"]  # TEC-TIERS3-C: one per kept table, BTC, ETH, SOL, XRP
+    assert [r["instrument"] for r in rows] == ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT"]
+    assert all(r["source"] == "hand-checked-pasted" and r["account"] is None for r in rows)
+    t = venue_terms.term(store, PAPER, "tiers", PAIR, datetime(2026, 10, 22, 12, tzinfo=timezone.utc))
     assert t.state == "stale" and t.value == PAPER.maintenance_tiers[PAIR]
-    assert venue_terms.term(store, PAPER, "tiers", PAIR, datetime(2026, 10, 18, 1, tzinfo=timezone.utc)).state == "refused"
+    assert venue_terms.term(store, PAPER, "tiers", PAIR, datetime(2026, 10, 24, 1, tzinfo=timezone.utc)).state == "refused"
 
 
 def test_the_daily_tier_pull_reads_the_public_endpoint_and_supersedes_the_pasted_table(store):
@@ -203,7 +204,7 @@ def test_a_pulled_table_that_differs_from_the_engines_refuses_entries_until_it_i
     venue_terms.fetch_fees(store, PAPER, PAIR, client=Recorded(_recorded("fee-rate-BTCUSDT.json")),
                            account="paper-main", live=False, now=T)
     t = venue_terms.term(store, PAPER, "tiers", PAIR, T + timedelta(hours=1))
-    assert t.state == "refused" and t.words.startswith("BTC/USDT margin tiers: tier table changed (fetched 15 Oct 13:00 "
+    assert t.state == "refused" and t.words.startswith("BTC/USDT margin tiers: tier table changed (fetched 21 Oct 13:00 "
                                                        "UK"), t.words
     assert "new entries refused on BTC/USDT until re-checked" in t.words
     assert "tier table changed" in venue_terms.entry_refusal(store, PAPER, PAIR, T + timedelta(hours=1))

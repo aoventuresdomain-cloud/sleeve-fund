@@ -4,7 +4,8 @@ tables the form is refused at save in the direct POST's words (the strategy's ow
 paths go through); the sweep saved because the test harness gives every pair an interim table in-process
 (conftest._vs1_interim_tables) while its node ran without it. The pick-list now offers a perpetual only where its tiers
 are kept (app.offered, beside app.venue_bars for the candle chips). The supervisor's start refusal is PE4's
-(fe-plans/b39/)."""
+(fe-plans/b39/). TEC-TIERS3-B (PAPER-TIERS-3): ETH's, SOL's and XRP's tables are kept now; SUI/USDT is the untiered
+example."""
 
 import pytest
 from test_browser import _open, _step, browser  # noqa: F401 - the browser fixture
@@ -23,13 +24,13 @@ def _submit(page):
 @pytest.mark.no_maintenance_tables
 def test_b39_the_form_refuses_an_untiered_perp_at_save(held_site, browser):  # noqa: F811
     base, store = held_site
-    page, errors = _open(browser, f"{base}/sleeves/new?instrument=ETH/USDT&venue=binance")
+    page, errors = _open(browser, f"{base}/sleeves/new?instrument=SUI/USDT&venue=binance")
     _step(page, "Model")
     page.select_option("#strategy", "dip_buy")
     _submit(page)
     text = page.inner_text("main")
     assert "Not saved" in text and VS1 in text, text[:600]  # the direct POST's words
-    assert all(s.instrument != "ETH/USDT" for s in store.sleeves()), [s.name for s in store.sleeves()]
+    assert all(s.instrument != "SUI/USDT" for s in store.sleeves()), [s.name for s in store.sleeves()]
     assert errors == []
     page.context.close()
 
@@ -37,17 +38,17 @@ def test_b39_the_form_refuses_an_untiered_perp_at_save(held_site, browser):  # n
 @pytest.mark.no_maintenance_tables
 def test_b39_the_pick_list_offers_a_perp_only_where_its_tiers_are_kept():
     """The venue seed and the full listing both go through app.offered: BTC/USDT perpetual (its tiers kept) is
-    offered, ETH/USDT perpetual is not; spot pairs are offered as before."""
+    offered, SUI/USDT perpetual is not; spot pairs are offered as before."""
     from sleeve_fund.dashboard import app as app_mod
     from sleeve_fund.store import Store
 
     perp = next(v for v in app_mod.venue_choices() if v["perpetual"])
-    assert "BTC/USDT" in perp["pairs"] and "ETH/USDT" not in perp["pairs"], perp["pairs"]
+    assert "BTC/USDT" in perp["pairs"] and "SUI/USDT" not in perp["pairs"], perp["pairs"]
     spot = next(v for v in app_mod.venue_choices() if v["key"] == "kraken")
     assert "ETH/USD" in spot["pairs"]
-    listing = {"binance": ["BTC/USDT", "ETH/USDT", "SOL/USDT"], "kraken": ["BTC/USD", "ETH/USD"]}
+    listing = {"binance": ["BTC/USDT", "ETH/USDT", "SUI/USDT"], "kraken": ["BTC/USD", "ETH/USD"]}
     store = Store("sqlite://")
     opts = app_mod.instrument_options(store, lambda venue=None: listing.get(venue, []))
     perps = {o["value"] for o in opts if o["group"] == "Perpetuals"}
-    assert perps == {"BTC/USDT"}, perps
+    assert perps == {"BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT"}, perps  # the venue seed adds every tiered pair
     assert {"BTC/USD", "ETH/USD"} <= {o["value"] for o in opts if o["group"] == "Spot"}

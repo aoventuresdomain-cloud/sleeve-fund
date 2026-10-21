@@ -750,10 +750,12 @@ def _binance_data_client() -> tuple:
 
 # USD-M futures take a GTD order only if it expires more than 600 s ahead (the published goodTillDate rule).
 # ORPHAN-GUARD og1 clamps a short bar's expiry past it; the testnet drill confirms the figure (HoQA, 13 Oct).
-# VS-1 tables (DA, hand-checked 15 Oct 2026, pe1-plans/vs1-tiers.md): the paper venue's published maintenance tiers for
-# linear BTCUSDT, as margin.Tier(notional ceiling, rate, deduction): maintenance = notional x rate - deduction. Tier
-# 1's blank deduction is 0; the last ceiling is unbounded (the venue refuses a position past 1.2bn anyway). Checked
-# continuous at every ceiling. Refreshed by DA-11 before G2; re-paste and re-check when the venue announces a change.
+# VS-1 tables: the paper venue's published maintenance tiers for its linear BTCUSDT, ETHUSDT, SOLUSDT and XRPUSDT, as
+# margin.Tier(notional ceiling, rate, deduction): maintenance = notional x rate - deduction. Tier 1's blank deduction
+# is 0; the last ceiling is unbounded (the venue refuses a position past its last, kept as maintenance_limits). All four
+# read in one pass on 21 Oct 2026 (PAPER-TIERS-3; BTC's unchanged from DA's hand-checked 15 Oct table) and checked
+# against the replies themselves (tests/data/venue_tables, tests/test_paper_tiers_3.py) and continuous at every ceiling.
+# Refreshed by DA-11 before G2; re-read and re-check when the venue announces a change.
 BTCUSDT_TIERS = (
     Tier(300_000, 0.0033, 0),
     Tier(2_000_000, 0.005, 510),
@@ -791,8 +793,119 @@ BTCUSDT_TIERS = (
     Tier(800_000_000, 0.42, 98_382_510),
     Tier(math.inf, 0.6, 242_382_510),
 )
-BTCUSDT_TIERS_BASIS = ("paper venue risk-limit BTCUSDT, 15 Oct 2026, research/venue-data/"
-                       "paper-venue-risk-limit-BTCUSDT-2026-10-15.json")
+ETHUSDT_TIERS = (
+    Tier(300_000, 0.0033, 0),
+    Tier(900_000, 0.005, 510),
+    Tier(1_200_000, 0.0056, 1_050),
+    Tier(1_500_000, 0.0063, 1_890),
+    Tier(1_800_000, 0.0067, 2_490),
+    Tier(2_400_000, 0.0071, 3_210),
+    Tier(3_200_000, 0.0077, 4_650),
+    Tier(4_000_000, 0.0091, 9_130),
+    Tier(5_000_000, 0.01, 12_730),
+    Tier(8_000_000, 0.012, 22_730),
+    Tier(12_000_000, 0.013, 30_730),
+    Tier(16_000_000, 0.014, 42_730),
+    Tier(22_000_000, 0.015, 58_730),
+    Tier(28_000_000, 0.02, 168_730),
+    Tier(32_000_000, 0.025, 308_730),
+    Tier(34_000_000, 0.03, 468_730),
+    Tier(36_000_000, 0.033, 570_730),
+    Tier(38_000_000, 0.035, 642_730),
+    Tier(40_000_000, 0.038, 756_730),
+    Tier(42_000_000, 0.039, 796_730),
+    Tier(44_000_000, 0.042, 922_730),
+    Tier(46_000_000, 0.045, 1_054_730),
+    Tier(48_000_000, 0.05, 1_284_730),
+    Tier(50_000_000, 0.055, 1_524_730),
+    Tier(52_000_000, 0.06, 1_774_730),
+    Tier(54_000_000, 0.068, 2_190_730),
+    Tier(58_000_000, 0.075, 2_568_730),
+    Tier(62_000_000, 0.09, 3_438_730),
+    Tier(66_000_000, 0.1, 4_058_730),
+    Tier(72_000_000, 0.12, 5_378_730),
+    Tier(80_000_000, 0.14, 6_818_730),
+    Tier(100_000_000, 0.18, 10_018_730),
+    Tier(200_000_000, 0.3, 22_018_730),
+    Tier(600_000_000, 0.42, 46_018_730),
+    Tier(math.inf, 0.6, 154_018_730),
+)
+SOLUSDT_TIERS = (
+    Tier(50_000, 0.005, 0),
+    Tier(100_000, 0.0056, 30),
+    Tier(250_000, 0.0063, 100),
+    Tier(400_000, 0.0067, 200),
+    Tier(550_000, 0.0071, 360),
+    Tier(700_000, 0.0077, 690),
+    Tier(850_000, 0.0091, 1_670),
+    Tier(1_000_000, 0.01, 2_435),
+    Tier(2_000_000, 0.0111, 3_535),
+    Tier(3_000_000, 0.0125, 6_335),
+    Tier(4_000_000, 0.0143, 11_735),
+    Tier(6_000_000, 0.0167, 21_335),
+    Tier(8_000_000, 0.02, 41_135),
+    Tier(10_000_000, 0.025, 81_135),
+    Tier(12_000_000, 0.0263, 94_135),
+    Tier(14_000_000, 0.0278, 112_135),
+    Tier(16_000_000, 0.0294, 134_535),
+    Tier(18_000_000, 0.0313, 164_935),
+    Tier(20_000_000, 0.0333, 200_935),
+    Tier(22_000_000, 0.0357, 248_935),
+    Tier(24_000_000, 0.0385, 310_535),
+    Tier(26_000_000, 0.0417, 387_335),
+    Tier(28_000_000, 0.0455, 486_135),
+    Tier(30_000_000, 0.05, 612_135),
+    Tier(35_000_000, 0.0556, 780_135),
+    Tier(40_000_000, 0.0625, 1_021_635),
+    Tier(45_000_000, 0.0714, 1_377_635),
+    Tier(50_000_000, 0.0833, 1_913_135),
+    Tier(60_000_000, 0.1, 2_748_135),
+    Tier(80_000_000, 0.125, 4_248_135),
+    Tier(100_000_000, 0.1667, 7_584_135),
+    Tier(150_000_000, 0.25, 15_914_135),
+    Tier(200_000_000, 0.3497, 30_869_135),
+    Tier(250_000_000, 0.3906, 39_049_135),
+    Tier(math.inf, 0.5, 66_399_135),
+)
+XRPUSDT_TIERS = (
+    Tier(50_000, 0.005, 0),
+    Tier(100_000, 0.0056, 30),
+    Tier(250_000, 0.0063, 100),
+    Tier(400_000, 0.0067, 200),
+    Tier(550_000, 0.0071, 360),
+    Tier(700_000, 0.0077, 690),
+    Tier(850_000, 0.0091, 1_670),
+    Tier(1_000_000, 0.01, 2_435),
+    Tier(2_000_000, 0.0111, 3_535),
+    Tier(3_000_000, 0.0125, 6_335),
+    Tier(4_000_000, 0.0143, 11_735),
+    Tier(6_000_000, 0.0167, 21_335),
+    Tier(8_000_000, 0.02, 41_135),
+    Tier(10_000_000, 0.025, 81_135),
+    Tier(12_000_000, 0.0263, 94_135),
+    Tier(14_000_000, 0.0278, 112_135),
+    Tier(16_000_000, 0.0294, 134_535),
+    Tier(18_000_000, 0.0313, 164_935),
+    Tier(20_000_000, 0.0333, 200_935),
+    Tier(22_000_000, 0.0357, 248_935),
+    Tier(24_000_000, 0.0385, 310_535),
+    Tier(26_000_000, 0.0417, 387_335),
+    Tier(28_000_000, 0.0455, 486_135),
+    Tier(30_000_000, 0.05, 612_135),
+    Tier(35_000_000, 0.0556, 780_135),
+    Tier(40_000_000, 0.0625, 1_021_635),
+    Tier(45_000_000, 0.0714, 1_377_635),
+    Tier(50_000_000, 0.0833, 1_913_135),
+    Tier(60_000_000, 0.1, 2_748_135),
+    Tier(80_000_000, 0.125, 4_248_135),
+    Tier(100_000_000, 0.1667, 7_584_135),
+    Tier(150_000_000, 0.25, 15_914_135),
+    Tier(200_000_000, 0.3497, 30_869_135),
+    Tier(250_000_000, 0.3906, 39_049_135),
+    Tier(math.inf, 0.5, 66_399_135),
+)
+PAPER_VENUE_TIERS_BASIS = ("paper venue risk-limit and instruments-info for BTCUSDT, ETHUSDT, SOLUSDT and XRPUSDT, "
+                           "read 21 Oct 2026 21:30 UTC, research/venue-data/paper-venue-tables-2026-10-21.md")
 
 
 BINANCE_GTD_MIN_LEAD = timedelta(seconds=600)
@@ -831,20 +944,25 @@ BINANCE = register(VenueProfile(
     # 75% of the first-tier maintenance margin rate (0.4%), Binance's rule for its cap; confirmed against fundingInfo
     # once caps are kept from the venue (DA-11).
     published_funding_caps={"BTC/USDT": 0.003},
-    # VS-1: only BTC/USDT's table is kept so far; a perp on any other pair is refused until its table is checked in.
-    maintenance_tiers={"BTC/USDT": BTCUSDT_TIERS},
-    maintenance_basis=BTCUSDT_TIERS_BASIS,
-    maintenance_read_on=date(2026, 10, 15),
+    # VS-1: a perp on a pair with no table kept here (SUI/USDT) is refused, in research too, until its table is checked in.
+    maintenance_tiers={"BTC/USDT": BTCUSDT_TIERS, "ETH/USDT": ETHUSDT_TIERS, "SOL/USDT": SOLUSDT_TIERS,
+                       "XRP/USDT": XRPUSDT_TIERS},
+    maintenance_basis=PAPER_VENUE_TIERS_BASIS,
+    maintenance_read_on=date(2026, 10, 21),
     # The PM's paper venue's public V5 risk-limit page (public market data, read-only, no key) and its signed
     # read-only fee-rate call (FEE-LIVE).
     risk_limit_url="https://api.bybit.com/v5/market/risk-limit?category=linear&symbol={symbol}",
     fee_rate_path="/v5/account/fee-rate",
-    maintenance_limits={"BTC/USDT": 1_200_000_000},  # past it the venue takes no position; nor do we
-    price_ticks={"BTC/USDT": "0.1"},  # B-36b: kept with its tiers, read 20 Oct 2026; another pair is checked in with its table
+    # past the last ceiling the venue takes no position; nor do we
+    maintenance_limits={"BTC/USDT": 1_200_000_000, "ETH/USDT": 1_000_000_000, "SOL/USDT": 300_000_000,
+                        "XRP/USDT": 300_000_000},
+    # B-36b: each pair's tick, kept with its tiers from the same read
+    price_ticks={"BTC/USDT": "0.1", "ETH/USDT": "0.01", "SOL/USDT": "0.01", "XRP/USDT": "0.0001"},
     live_tick=paper_venue_tick,
-    # B-44: kept as the listing's documented shape gives it (tests/data/fee_live/instruments-info-BTCUSDT.json, not
-    # captured from the venue); the live read on the server wins and says so if it differs
-    lot_sizes={"BTC/USDT": ("0.001", "0.001")},
+    # B-44: (quantity step, minimum order quantity) from the same read as the tiers; the live read on the server wins
+    # and says so if it differs
+    lot_sizes={"BTC/USDT": ("0.001", "0.001"), "ETH/USDT": ("0.01", "0.01"), "SOL/USDT": ("0.1", "0.1"),
+               "XRP/USDT": ("0.1", "0.1")},
     live_lot=paper_venue_lot,
     core_pairs=("BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "SUI/USDT"),
     hub=True,

@@ -213,7 +213,7 @@ class StudyResult:
     oos_exec_minutes: int | None = None
     resting_exits: bool = False
     fill_labels: list = field(default_factory=list)
-    # PM, 21 Oct: the sheet's line when a perp pair with no kept tiers was studied on BTC's ("" when its own were kept)
+    # R-28 (retired by PAPER-TIERS-3): a sheet saved before it still says BTC's tiers were assumed; new runs leave it ""
     margin_note: str = ""
     one_way: str = ""
     spot_check: dict | None = None
@@ -781,8 +781,6 @@ def run_study(
     # A venue that lists perpetuals only has no spot: every run, the benchmark too, holds its perpetual.
     market = ({"market": markets.SPOT_LOWFEE} if markets.market_of(default_params) == markets.SPOT_LOWFEE else
               {"market": PERP} if profile is not None and profile.perpetual else {})
-    # PM, 21 Oct: a perp pair with no kept tiers is studied on BTC's, said on the sheet (markets.research_tiers_pair).
-    assumed_tiers = markets.research_tiers_pair(market, str(instrument.id.venue), pair_of(instrument))
     strategy_cap = None
     if risk_profile is not None:
         from sleeve_fund.risk import position_cap as cap_of
@@ -845,10 +843,6 @@ def run_study(
             progress(min(done[0] / total, 0.99))
         guarded = risk_profile is not None and not benchmark
         params = {**params, **(market if market_over is None else market_over)}  # market_over: the spot sheet's perp line
-        tiers = assumed_tiers if market_over is None else markets.research_tiers_pair(
-            market_over, str(instrument.id.venue), pair_of(instrument))  # CR M1: the perp line needs its own
-        if tiers:
-            params = {**params, "assumed_tiers_pair": tiers}
         if not benchmark and not family:
             params = {**params, **exits}
         if position_cap is not None and not guarded:
@@ -1183,11 +1177,8 @@ def run_study(
             return {"end": float(res.equity.iloc[-1]), "cagr": s["cagr"], "sharpe": s["sharpe"],
                     "max_drawdown": s["max_drawdown"], "funding_paid": -sum(f["amount"] for f in res.funding)}
 
-        perp_tiers = markets.research_tiers_pair({"market": PERP}, str(instrument.id.venue), pair_of(instrument))
         spot_vs_perp = {"spot": line(bt(spec.name, research, chosen)),
-                        "perp": line(bt(spec.name, research, chosen, market_over={"market": PERP})),
-                        "margin_note": markets.assumed_tiers_words(perp_tiers, pair_of(instrument))
-                        if perp_tiers else ""}
+                        "perp": line(bt(spec.name, research, chosen, market_over={"market": PERP}))}
     covered = len(pd.concat(compare_parts)) if compare_parts else 0
     hold_insufficient = perp_hold and not switched and covered < HOLD_COVERAGE_FLOOR * oos_days[0]
     if perp_hold:
@@ -1259,7 +1250,6 @@ def run_study(
         breakeven=breakeven,
         oos_exec_minutes=oos_minutes,
         fill_labels=labels,
-        margin_note=markets.assumed_tiers_words(assumed_tiers, pair_of(instrument)) if assumed_tiers else "",
         fee_note=(f"{pct(run_fees.maker)} maker on post-only orders, {pct(run_fees.taker)} taker "
                   f"on every other order, plus {spread_words} on orders that take liquidity; break-even: {breakeven}"
                   + (f" ({markets.SPOT_LOWFEE_WORDS})" if market.get("market") == markets.SPOT_LOWFEE else "")),

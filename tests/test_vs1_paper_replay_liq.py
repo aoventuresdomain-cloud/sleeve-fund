@@ -30,8 +30,8 @@ def test_a_paper_liquidation_books_the_same_tiered_price_on_postgres_as_in_memor
         monkeypatch.setitem(risk.PROFILES, nm, dataclasses.replace(p, max_position_pct=0.1))
     real = markets.terms
 
-    def tiered(params, venue=None, pair=None, assume_from=None):  # R-28: the engine passes assume_from (HoE TEC)
-        t = real(params, venue, pair, assume_from)
+    def tiered(params, venue=None, pair=None):  # TEC-TIERS3-A: R-28's assume_from is gone
+        t = real(params, venue, pair)
         return dataclasses.replace(t, maintenance_margin=TIERS) if t is not None else t
 
     monkeypatch.setattr(markets, "terms", tiered)

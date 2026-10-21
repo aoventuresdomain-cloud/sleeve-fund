@@ -67,9 +67,9 @@ def _record(path, row, asset, minutes_legs):
             px *= step
             t = START + s * 1_000_000_000
             half = px * 0.00001
-            rec.quote(QuoteTick(inst.id, Price(px - half, p), Price(px + half, p), Quantity(100, 3), Quantity(100, 3),
+            rec.quote(QuoteTick(inst.id, Price(px - half, p), Price(px + half, p), Quantity(100, inst.size_precision), Quantity(100, inst.size_precision),
                                 t, t + 1000))
-            rec.trade(TradeTick(inst.id, Price(px, p), Quantity(50, 3),
+            rec.trade(TradeTick(inst.id, Price(px, p), Quantity(50, inst.size_precision),
                                 AggressorSide.BUY if s % 2 else AggressorSide.SELL, TradeId(f"{base}{s}"), t + 2000,
                                 t + 3000))
             s += 1

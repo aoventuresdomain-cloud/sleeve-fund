@@ -70,8 +70,8 @@ def test_funding_paid_moves_the_nearer_price_solved_afresh_from_the_positions_ca
 
 def test_btc_s_table_carries_its_venue_date_and_the_venues_top_ceiling():
     perp = venue("BINANCE")
-    assert "paper venue" in perp.maintenance_basis and "15 Oct 2026" in perp.maintenance_basis
-    assert perp.maintenance_read_on == date(2026, 10, 15)
+    assert "paper venue" in perp.maintenance_basis and "21 Oct 2026" in perp.maintenance_basis
+    assert perp.maintenance_read_on == date(2026, 10, 21)  # TEC-TIERS3-C: all four tables read 21 Oct
     assert markets.terms({"market": "perp"}, "BINANCE", "BTC/USDT").max_notional == 1_200_000_000
 
 
@@ -84,11 +84,11 @@ def test_the_start_check_notes_a_table_older_than_30_days(tmp_path):
     store = Store(f"sqlite:///{tmp_path}/j.db")
     store.create_sleeve(name="p1", strategy="ping_pong", instrument="BTC/USDT", bar_spec="1-MINUTE-LAST-INTERNAL",
                         starting_balance=10_000, venue="BINANCE", params={"market": "perp"})
-    fresh = start_check.check_maintenance(store, now=datetime(2026, 11, 14, tzinfo=UTC))  # 30 days: still fresh
+    fresh = start_check.check_maintenance(store, now=datetime(2026, 11, 20, tzinfo=UTC))  # 30 days: still fresh
     assert not any("days ago" in w for _, w in fresh.lines), fresh.lines
-    old = start_check.check_maintenance(store, now=datetime(2026, 11, 15, tzinfo=UTC))
+    old = start_check.check_maintenance(store, now=datetime(2026, 11, 21, tzinfo=UTC))
     assert not old.failed
-    assert ("NOTE", "BTC/USDT: its maintenance table was read on 15 Oct 2026, 31 days ago; re-paste and re-check it "
+    assert ("NOTE", "BTC/USDT: its maintenance table was read on 21 Oct 2026, 31 days ago; re-paste and re-check it "
                     "(DA-11)") in old.lines, old.lines
 
 
@@ -117,17 +117,17 @@ def test_an_old_table_is_also_an_alert_said_once(monkeypatch):
     store = Store.in_memory()
     store.create_sleeve(name="p1", strategy="ping_pong", instrument="BTC/USDT", bar_spec="1-MINUTE-LAST-INTERNAL",
                         starting_balance=10_000, venue="BINANCE", params={"market": "perp"})
-    at = {"now": datetime(2026, 11, 14, 9, tzinfo=UTC)}
+    at = {"now": datetime(2026, 11, 20, 9, tzinfo=UTC)}
     sent = []
     fwd = Forwarder(store, environ={"ALERT_WEBHOOK_URL": "https://hooks.example.com/x"},
                     send=lambda url, text: sent.append(text), now=lambda: at["now"])
     fwd.step()
     assert not any("maintenance table" in t for t in sent)
-    at["now"] = datetime(2026, 11, 15, 9, tzinfo=UTC)
+    at["now"] = datetime(2026, 11, 21, 9, tzinfo=UTC)
     fwd.step()
     fwd.step()
     said = [t for t in sent if "maintenance table" in t]
-    assert len(said) == 1 and "BTC/USDT: its maintenance table was read on 15 Oct 2026, 31 days ago" in said[0], sent
+    assert len(said) == 1 and "BTC/USDT: its maintenance table was read on 21 Oct 2026, 31 days ago" in said[0], sent
 
 
 def test_an_entry_at_or_past_the_venues_top_tier_is_refused(prices, instrument, full_margin, monkeypatch):

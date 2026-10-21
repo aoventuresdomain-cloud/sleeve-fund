@@ -560,11 +560,9 @@ class LongFlatConfig(StrategyConfig):
         # a liquidation price and leverage limits (sleeve_fund.markets); allow_short lets it go short.
         self.market = market
         self.allow_short = bool(allow_short)
-        # Research only (PM, 21 Oct): a study on a perp pair with no kept tiers runs on this kept pair's
-        # (markets.research_tiers_pair). Paper never sets it; its start check refuses such a pair whatever is set.
-        self.assumed_tiers_pair = assumed_tiers_pair
-        self.perp = markets.terms({"market": market}, str(instrument_id.venue), str(instrument_id.symbol),
-                                  assume_from=assumed_tiers_pair)
+        # assumed_tiers_pair (R-28, retired by PAPER-TIERS-3): taken and ignored, so an older study's stored params
+        # still run; every pair reads its own venue table, or is refused (VS-1)
+        self.perp = markets.terms({"market": market}, str(instrument_id.venue), str(instrument_id.symbol))
         # Read by the demo mirror (sleeve_fund.mirror), not by the strategy: paper is unchanged.
         self.demo_mirror = bool(demo_mirror)
         # C8 (Drop B): keep a take-profit even when a hit would not cover the round trip's costs (the entry's check
