@@ -309,7 +309,11 @@ def test_the_backtest_the_paper_tick_and_replay_take_the_same_exact_touch_bar(tm
     row = bars.loc[minute]
     hit = replay_missed([(minute.value, row["open"], row["high"], row["low"])], 1, {"stop_loss": 58_800.0}, {},
                         level, float(target_fill_px(level, True, half)))
-    assert hit is not None and hit[0] == "take_profit" and hit[1] == pytest.approx(bt[2], rel=1e-6)
+    # The report folds the fee's cent rounding into the fill price (D13 pin e: within 1.5 cents over the quantity).
+    f = res.fills.sort_values("ts_last", kind="stable")
+    qty = next(float(r["filled_qty"]) for o, r in f.iterrows() if res.decisions[o]["intent"] == "take_profit")
+    assert hit is not None and hit[0] == "take_profit"
+    assert hit[1] == pytest.approx(bt[2], abs=1.5 * 0.0100001 / qty + 1e-9)
 
 
 # ---- must-keep: no take_profit, no change ---------------------------------------------------------------------------
