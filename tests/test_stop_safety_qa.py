@@ -549,3 +549,13 @@ def test_a_spot_safety_stop_closes_a_fall_through_half_way_to_zero(store, instru
     assert sells[-1]["price"] <= 0.5 * mark * 1.01  # at half way to zero, or the gap's open below it
     orders = {o["order_id"]: o for o in store.orders("s1")}
     assert "stop" in orders[sells[-1]["order_id"]]["intent"]
+
+
+def test_a_restart_safety_stop_records_its_own_exit_kind(tmp_path):
+    """Advisor (BH-102, 21 Oct): the restart's safety stop is one the backtest never has. Its exit says so, kind
+    "restart_safety_stop", so a paper-versus-backtest mismatch is never put down to the Strategy. (A stopless model
+    gets one only when started for its exits only or held while blocked; a plain restart leaves it stopless.)"""
+    _, orders, fills = _restart(tmp_path, "conservative", 1, [(3, 0.0), (5, -0.60), (4, 0.0)])
+    close, _ = _closes(orders, fills, 1)
+    assert close["signal"]["exit_kind"] == "restart_safety_stop", close["signal"]
+    assert close["reason"].startswith("Restart safety stop: "), close["reason"]
