@@ -169,20 +169,27 @@ def _entry_signal(res):
     return next(res.decisions[o].get("signal") or {} for o in f.index if res.decisions[o]["intent"] == "entry")
 
 
-def test_an_r_target_is_r_times_the_initial_stop_after_costs_and_frozen_at_entry(instrument):
-    """Rule 5: {r = 2} on a 1% trailing stop plans a target making 2R after costs at entry; the trail then tightens
-    with the price and the target stays where the entry set it."""
+def _entry_fill(res):
+    f = res.fills.sort_values("ts_last")
+    return next(float(f.loc[o, "avg_px"]) for o in f.index if res.decisions[o]["intent"] == "entry")
+
+
+def test_an_r_target_is_r_times_the_initial_stop_in_price_from_the_fill_and_frozen(instrument):
+    """Rule 5 (Advisor, HoE 21 Oct): {r = 2} on a 1% trailing stop is the entry fill + 2 x (the fill - the stop level
+    the entry was planned with), costs charged on the fills, not in the level; the trail then tightens with the price
+    and the target stays where the fill set it."""
     defn = {"version": 1, "reason": "A test case, written before it is run.", "blocks": {},
             "long": {"entry": {"left": "close", "op": ">", "right": 0}},
             "exits": {"trail": {"level": {"mul": [0.99, "close"]}}, "take_profit": {"r": 2}}}
-    closes = [100.0] * 3 + [101.0, 102.0, 103.0, 104.0, 105.0] + [108.0] * 5  # the target: about 6.8% (spot costs)
+    closes = [100.0] * 3 + [100.3, 100.6, 100.9, 101.2, 101.5] + [104.0] * 5
     res = _run(defn, _bars(closes), instrument)
-    entry = _entry_signal(res)
-    assert entry["planned_r"] == pytest.approx(2.0, abs=0.01), entry
+    entry, fill = _entry_signal(res), _entry_fill(res)
+    stop_level = entry["close"] * (1 - entry["stop_frac"])  # 99: the trail's level when the entry was planned
     exits = _exits(res)
     assert exits and exits[0][0] == "take_profit", exits
     sig = exits[0][1]
-    assert sig["target_form"] == "r=2" and sig["take_profit"] == pytest.approx(entry["tp_frac"], abs=1e-6), (sig, entry)
+    assert sig["target_form"] == "r=2"
+    assert sig["target_px"] == pytest.approx(round(fill + 2 * (fill - stop_level), 1), abs=0.051), (sig, fill)
 
 
 def test_a_level_target_is_refreshed_each_candle_and_never_fires_on_a_candle_it_is_on_the_wrong_side(instrument):
@@ -220,7 +227,7 @@ def test_the_target_form_and_the_exit_kind_are_journaled(instrument):
 
 def test_qr01b_with_its_3_atr_stop_and_a_3r_target_reconciles(instrument):
     """The HoE's reconcile: qr01b's own definition with take_profit = {r = 3} beside its 3 ATR(14) stop, daily bars.
-    Each entry plans 3R after costs; every take-profit fills on a touch of its entry's target, booked at the level
+    Each target is 3R in price from its entry's fill (HoE 21 Oct); every take-profit fills on a touch of it, booked at the level
     less the taker's slippage, never better; and the journal's cash is the run's end equity."""
     import tomllib
     from pathlib import Path
@@ -238,9 +245,16 @@ def test_qr01b_with_its_3_atr_stop_and_a_3r_target_reconciles(instrument):
     f = res.fills.sort_values("ts_last")
     rows = [(res.decisions[o]["intent"], res.decisions[o].get("signal") or {}, float(f.loc[o, "avg_px"]))
             for o in f.index]
-    entries = [s for k, s, _ in rows if k == "entry"]
-    targets = [(s, px) for k, s, px in rows if k == "take_profit"]
-    assert entries and all(s["planned_r"] == pytest.approx(3.0, abs=0.01) for s in entries), entries[:3]
+    targets, entry = [], None
+    for k, s, px in rows:
+        if k == "entry":
+            entry = (s, px)
+        elif k == "take_profit":  # 3R in price from that entry's fill and its 3 ATR stop level as planned
+            stop_level = entry[0]["close"] * (1 - entry[0]["stop_frac"])
+            fill = s["entry_px"]  # the engine's entry, the fill before the report's cent rounding
+            # to 0.05: the journaled stop share is rounded to 6 places (x 3R), the target to the tick
+            assert s["target_px"] == pytest.approx(fill + 3 * (fill - stop_level), abs=0.05), (s, entry)
+            targets.append((s, px))
     assert targets, [k for k, _, _ in rows]
     for s, px in targets:
         assert s["target_form"] == "r=3" and s["exit_kind"] == "take_profit"
@@ -260,3 +274,23 @@ def test_the_strategy_tab_says_the_take_profit_in_words(tp, words):
 
     (long_,) = strategy_words.rules(check_definition(_with_tp(tp)), 15)
     assert ("Take-profit" in dict(long_["levels"])) and words in dict(long_["levels"])["Take-profit"], long_["levels"]
+
+
+@pytest.mark.parametrize("study", [{"take_profit_r": 2.0}, {"take_profit": 0.05}])
+def test_a_definitions_take_profit_and_a_study_wide_one_are_refused_together(study, instrument):
+    """HoE 21 Oct: the definition's {r} is R in price, the study-wide take_profit_r R after costs; a run may carry one
+    target, never both, so which one applied is never in doubt."""
+    from sleeve_fund.research.runner import run_backtest
+
+    defn = _with_tp({"r": 3})
+    with pytest.raises(ValueError, match="one take-profit"):
+        run_backtest("rules", _bars([100.0] * 30), instrument, params={**to_params(defn), **study}, bar_minutes=1,
+                     half_spread=0)
+
+
+def test_the_sheet_says_a_definitions_r_is_in_price():
+    from sleeve_fund.research.study import _definition_target_words, _exit_words
+
+    assert _definition_target_words(to_params(_with_tp({"r": 3}))) == ", take-profit at 3R (price)"
+    assert _definition_target_words(to_params(_with_tp({"level": "dc.upper"}))) == ", take-profit at the level dc.upper"
+    assert _exit_words({"take_profit_r": 3}) == "take-profit making 3R after costs"  # the study-wide one, unchanged
