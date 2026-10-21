@@ -3676,6 +3676,10 @@ class LongFlatStrategy(Strategy):
                   + (f"stop {_from_entry(level, side)}" if hit == "stop_loss" else
                      f"{level:.1%} target" + (" (below it, for a short)" if side < 0 else "")))
         values = {"entry_px": self._entry_px, "move": move, hit: level}
+        if hit == "stop_loss" and self._stop_basis.startswith("safety stop"):
+            # A stop the backtest never has (_place_safety_stop): its own kind, so a paper-versus-backtest mismatch
+            # is never put down to the Strategy (Advisor, BH-102).
+            values["exit_kind"], reason = "restart_safety_stop", "Restart safety stop: " + reason
         if hit == "stop_loss" and self._margin:
             _, cash, qty, _ = self._mark()
             liq = self._liq_now(cash, qty) if qty else None
