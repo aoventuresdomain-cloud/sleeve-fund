@@ -420,11 +420,14 @@ def _live_tick(venue: str, pair: str):
 def check_price_ticks(store, live_tick=None) -> Section:
     """B-36b (HoE, 20 Oct): a perp Strategy's prices round to the contract tick kept beside its tiers
     (markets.price_tick). One whose venue's live tick differs from the kept one is a FAIL, named, with both ticks, as is
-    one whose tick isn't kept or can't be read: never run on an assumed tick (the VS-1 pattern). One line per pair."""
+    one whose tick isn't kept or can't be read: never run on an assumed tick (the VS-1 pattern). One line per pair.
+    A perp simulated on a spot venue (FIX-SPOTPERP-CHECK) is skipped: it trades on markets.LOW_FEE_PERP, as
+    markets.terms gives it, and a spot venue keeps no contract tick (markets.price_tick says None)."""
     from decimal import Decimal
 
     from sleeve_fund import markets
     from sleeve_fund.venues import DEFAULT_VENUE
+    from sleeve_fund.venues import venue as venue_profile
 
     read = live_tick or _live_tick
     sec, seen = Section("Price ticks"), {}
@@ -432,6 +435,8 @@ def check_price_ticks(store, live_tick=None) -> Section:
         if s.lifecycle == "retired" or (s.params or {}).get("market") != "perp":
             continue
         venue = getattr(s, "venue", None) or DEFAULT_VENUE
+        if not venue_profile(venue).perpetual:
+            continue
         kept = markets.price_tick(venue, s.instrument)
         if kept is None:
             sec.add(FAIL, f"{s.name}: {s.instrument} has no price tick kept, so its prices can't be rounded as the venue "
@@ -477,8 +482,10 @@ def check_lot_sizes(store, hub_lot=None, paper_lot=None) -> Section:
     """B-44 (HoE 23:19 UK, option ii; Advisor): paper sizes on the hub's instrument (the data venue's definition), so a
     perp Strategy whose hub step or minimum differs from the paper venue's listed lot is a FAIL, named, with both lots,
     as is one whose listed step the engine can't round to (not a power of ten) or whose lots can't be read: fail-closed,
-    as the price tick. One line per pair. shortcut: paper doesn't read the paper venue's lot itself; a MUST before G2."""
+    as the price tick. One line per pair. shortcut: paper doesn't read the paper venue's lot itself; a MUST before G2.
+    A perp simulated on a spot venue is skipped, as in check_price_ticks (FIX-SPOTPERP-CHECK)."""
     from sleeve_fund.venues import DEFAULT_VENUE, LotStepUnusable
+    from sleeve_fund.venues import venue as venue_profile
 
     hub_read, paper_read = hub_lot or _hub_lot, paper_lot or _paper_lot
     sec, seen = Section("Lot sizes"), {}
@@ -486,6 +493,8 @@ def check_lot_sizes(store, hub_lot=None, paper_lot=None) -> Section:
         if s.lifecycle == "retired" or (s.params or {}).get("market") != "perp":
             continue
         venue = getattr(s, "venue", None) or DEFAULT_VENUE
+        if not venue_profile(venue).perpetual:
+            continue
         key = (venue, s.instrument)
         if key not in seen:
             try:
