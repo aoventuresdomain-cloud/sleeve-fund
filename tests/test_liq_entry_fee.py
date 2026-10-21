@@ -171,10 +171,13 @@ def test_the_liquidation_price_rounds_to_the_tick_toward_the_entry():
     assert liq == margin.isolated_liquidation(500_000.0 - entry, 1.0, entry, lev, MM, tick=tick)
 
 
-def test_a_long_fully_paid_for_still_has_nothing_to_liquidate_it():
-    """The fee off the margin never gives a 1x long a liquidation price: it is fully paid for, and its safety stop
-    and checks keep treating it so (test_stop_safety_qa, conservative 1x long)."""
-    assert margin.isolated_liquidation(500_000.0 - 60_000.0, 1.0, 60_000.0, 1.0, MM, fees=33.0) is None
+def test_a_long_fully_paid_for_liquidates_at_maintenance_with_its_fee_off_the_margin():
+    """TEC-BH102-1X (HoE, Advisor 21 Oct): a 1x long is fully paid for, its notional all its margin, and liquidates at
+    maintenance on it, nearer by its entry fee as every other position's is: entry x (maintenance + fee rate). Until
+    21 Oct it had none, and a funded hold could go below zero (BH-102)."""
+    got = margin.isolated_liquidation(500_000.0 - 60_000.0, 1.0, 60_000.0, 1.0, MM, fees=33.0)
+    assert got == pytest.approx(_by_hand(1.0, 60_000.0, 1.0, 33.0), rel=1e-12)
+    assert got == pytest.approx(60_000.0 * MM + 33.0, rel=1e-12)  # 333: cash beside it is not its margin
     assert margin.isolated_liquidation(500_000.0 + 60_000.0, -1.0, 60_000.0, 1.0, MM, fees=33.0) is not None  # a short
 
 

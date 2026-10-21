@@ -54,7 +54,10 @@ def _fills(res):
     """(intent, side, close time, qty) per fill, in time order."""
     if res.fills is None or len(res.fills) == 0:
         return []
-    f = res.fills.sort_values(["ts_last", "ts_init"], kind="stable")
+    # TEC-BH102-1XLONG (1): ties broken by the order id's trailing sequence number, the order the engine sent them in;
+    # as strings "...-10" sorts before "...-9", which BH-102's resting liquidation orders reached
+    f = res.fills.assign(_seq=[int(str(o).rsplit("-", 1)[-1]) for o in res.fills.index]).sort_values(
+        ["ts_last", "ts_init", "_seq"], kind="stable")
     return [(res.decisions[o]["intent"], f.loc[o, "side"], f.loc[o, "ts_last"], float(f.loc[o, "filled_qty"]))
             for o in f.index]
 

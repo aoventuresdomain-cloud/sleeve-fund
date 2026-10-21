@@ -415,12 +415,14 @@ def _restart(tmp_path, profile, side, legs, stop_params=None, start_px=ENTRY):
     return store, [o for o in orders if o["order_id"] != "carried"], [f for f in fills if f["order_id"] != "carried"]
 
 
-def _safety_level(side, lev, mark=ENTRY, share=0.5):
+def _safety_level(side, lev, mark=ENTRY, share=0.5, liq=None):
     """R-S3/R-S4: half the REMAINING distance from the mark to the isolated liquidation price, or the profile's
-    share of it if tighter (Advisor 19:15 UK, 13 Oct: a third, conservative); a 1x long has none: half way to zero."""
-    none = side > 0 and lev == 1
-    liq = 0.0 if none else ENTRY * (1 - side / lev) / (1 - side * MM)
-    level = mark + (0.5 if none else min(0.5, share)) * (liq - mark)
+    share of it if tighter (Advisor 19:15 UK, 13 Oct: a third, conservative). A 1x long's is at maintenance, read
+    from the engine (TEC-BH102-1X, HoE and Advisor 21 Oct: one rule; it used to go half way to zero)."""
+    if liq is None:
+        assert not (side > 0 and lev == 1), "a 1x long's liquidation is the engine's: pass it"
+        liq = ENTRY * (1 - side / lev) / (1 - side * MM)
+    level = mark + min(0.5, share) * (liq - mark)
     assert min(mark, liq) < level < max(mark, liq)  # always between the mark and liquidation
     return level
 
@@ -440,8 +442,12 @@ def test_a_restart_without_a_restorable_stop_places_a_safety_stop_half_way_to_li
                                                                                            move):
     # The move runs over 5 minutes, inside the 15 bars the ATR stop needs: only a safety stop can act.
     store, orders, fills = _restart(tmp_path, profile, side, [(3, 0.0), (5, move), (4, 0.0)])
-    _, exit_fill = _closes(orders, fills, side)
-    level = _safety_level(side, LEVERAGE[profile], share=SHARE[profile])
+    close, exit_fill = _closes(orders, fills, side)
+    one_x_long = side > 0 and LEVERAGE[profile] == 1
+    liq = close["signal"]["liquidation_px"] if one_x_long else None  # the engine's own, the function every path uses
+    if one_x_long:
+        assert 0 < liq < 0.01 * ENTRY, close["signal"]  # at maintenance, not zero
+    level = _safety_level(side, LEVERAGE[profile], share=SHARE[profile], liq=liq)
     assert exit_fill["price"] == pytest.approx(level, rel=0.01), (exit_fill["price"], level)
     assert not [o for o in orders if o["intent"] == "entry"]
 
@@ -549,3 +555,13 @@ def test_a_spot_safety_stop_closes_a_fall_through_half_way_to_zero(store, instru
     assert sells[-1]["price"] <= 0.5 * mark * 1.01  # at half way to zero, or the gap's open below it
     orders = {o["order_id"]: o for o in store.orders("s1")}
     assert "stop" in orders[sells[-1]["order_id"]]["intent"]
+
+
+def test_a_restart_safety_stop_records_its_own_exit_kind(tmp_path):
+    """Advisor (BH-102, 21 Oct): the restart's safety stop is one the backtest never has. Its exit says so, kind
+    "restart_safety_stop", so a paper-versus-backtest mismatch is never put down to the Strategy. (A stopless model
+    gets one only when started for its exits only or held while blocked; a plain restart leaves it stopless.)"""
+    _, orders, fills = _restart(tmp_path, "conservative", 1, [(3, 0.0), (5, -0.60), (4, 0.0)])
+    close, _ = _closes(orders, fills, 1)
+    assert close["signal"]["exit_kind"] == "restart_safety_stop", close["signal"]
+    assert close["reason"].startswith("Restart safety stop: "), close["reason"]

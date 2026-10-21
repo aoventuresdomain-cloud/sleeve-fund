@@ -149,7 +149,7 @@ def _restart_at(strat, entry, qty, mark, leverage):
 
 @pytest.mark.parametrize("profile, qty, mark", [
     ("balanced", 2 * 10_000 / 60_000, 42_000.0),  # QA P1-S1: entered at 60,000, restarted at 42,000
-    ("conservative", 10_000 / 60_000, 42_000.0),  # 1x long: no liquidation price, half way to zero
+    ("conservative", 10_000 / 60_000, 42_000.0),  # 1x long: a third of the way to maintenance (TEC-BH102-1X)
     ("conservative", -10_000 / 60_000, 70_000.0),  # 1x short: a third of the way, its profile's cap (Advisor 19:15)
     ("balanced", -2 * 10_000 / 60_000, 75_000.0),
 ])
@@ -157,10 +157,12 @@ def test_the_safety_stop_is_half_the_remaining_distance_from_the_mark_to_liquida
                                                                                      mark):
     strat = _strategy(store, instrument, profile, {**PERP, "allow_short": True, "stop_atr": 2.0})
     stop, liq = _restart_at(strat, 60_000.0, qty, mark, risk.profile(profile).max_leverage)
-    target = liq if liq is not None else 0.0
-    assert (liq is None) == (profile == "conservative" and qty > 0)
-    # the tighter of half and the profile's share of the way (Advisor 19:15 UK, 13 Oct); half way to zero with no liq
-    share = 0.5 if liq is None else min(0.5, risk.profile(profile).stop_to_liquidation)
+    # Every margined position has one, a 1x long's at maintenance (TEC-BH102-1X, HoE and Advisor 21 Oct: one rule,
+    # where a 1x long used to go half way to zero).
+    assert liq is not None
+    target = liq
+    # the tighter of half and the profile's share of the way (Advisor 19:15 UK, 13 Oct)
+    share = min(0.5, risk.profile(profile).stop_to_liquidation)
     assert stop == pytest.approx(mark - share * (mark - target))
     assert min(mark, target) < stop < max(mark, target)  # always between the mark and liquidation
     message = _incident(store)["message"]

@@ -92,6 +92,8 @@ class BacktestResult:
     # A perpetual's positions whose stop was held at half the way to the liquidation price at least once, because a
     # level loosened past it or funding moved the price nearer (STOP-LOOSEN-1).
     stops_clamped: int = 0
+    # Entry signals refused because the stop was past its share of the way to the liquidation price (BH-102).
+    entries_refused_liquidation: int = 0
     # The largest open risk one of those entries would have carried, as a share of this strategy's equity.
     open_risk_max: float = 0.0
     # Why paper would refuse to start these settings, when it would (a stopless model above 1x on a perp): the run
@@ -525,6 +527,7 @@ def leg_result(engine: BacktestEngine, leg: Leg) -> BacktestResult:
         reentries_on_exit_candle=reentries_on_exit_candle(fills, strategy.decisions, plan.bar_minutes),
         open_risk_binds=strategy.open_risk_binds,
         stops_clamped=strategy.stops_clamped,
+        entries_refused_liquidation=strategy.entries_refused_liquidation,
         open_risk_max=strategy.open_risk_max,
         paper_refusal=paper_refusal(plan.strategy_name, plan.params, plan.risk_profile),
         portfolio_gate=dict(strategy.portfolio_gate),
