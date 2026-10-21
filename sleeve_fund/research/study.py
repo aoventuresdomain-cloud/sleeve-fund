@@ -199,6 +199,8 @@ class StudyResult:
     oos_exec_minutes: int | None = None
     resting_exits: bool = False
     fill_labels: list = field(default_factory=list)
+    # PM, 21 Oct: the sheet's line when a perp pair with no kept tiers was studied on BTC's ("" when its own were kept)
+    margin_note: str = ""
     one_way: str = ""
     spot_check: dict | None = None
     # The falsifier (Advisor 18:16): the 1-minute run's end equity less the coarse run's, over starting capital, for the
@@ -348,7 +350,8 @@ class StudyResult:
 
     @property
     def trade_stats(self) -> dict:
-        return trade_stats(trades(fills_to_rows(self.full_period.fills)))
+        return trade_stats(trades(fills_to_rows(self.full_period.fills), self.full_period.shorts,
+                                  self.full_period.funding))  # R-04 short legs; R-16 funding
 
     @property
     def turnover(self) -> float:
@@ -631,6 +634,8 @@ def run_study(
     profile = VENUES.get(str(instrument.id.venue))
     # A venue that lists perpetuals only has no spot: every run, the benchmark too, holds its perpetual.
     market = {"market": PERP} if profile is not None and profile.perpetual else {}
+    # PM, 21 Oct: a perp pair with no kept tiers is studied on BTC's, said on the sheet (markets.research_tiers_pair).
+    assumed_tiers = markets.research_tiers_pair(market, str(instrument.id.venue), pair_of(instrument))
     strategy_cap = None
     if risk_profile is not None:
         from sleeve_fund.risk import position_cap as cap_of
@@ -693,6 +698,8 @@ def run_study(
             progress(min(done[0] / total, 0.99))
         guarded = risk_profile is not None and not benchmark
         params = {**params, **market}
+        if assumed_tiers:
+            params = {**params, "assumed_tiers_pair": assumed_tiers}
         if not benchmark and not family:
             params = {**params, **exits}
         if position_cap is not None and not guarded:
@@ -1008,6 +1015,7 @@ def run_study(
         breakeven=breakeven,
         oos_exec_minutes=oos_minutes,
         fill_labels=labels,
+        margin_note=markets.assumed_tiers_words(assumed_tiers, pair_of(instrument)) if assumed_tiers else "",
         fee_note=(f"{pct(run_fees.maker)} maker on post-only orders, {pct(run_fees.taker)} taker "
                   f"on every other order, plus {spread_words} on orders that take liquidity; break-even: {breakeven}"),
         fee_basis=run_fees,
@@ -1035,7 +1043,8 @@ def run_study(
             full_default.shorts, leverage, market.get("market"), charged=False)
     for rung in ladder:  # the benchmark at each rung's own cost, as the rung's runs pay it (RE-COST)
         at_rung, _ = _benchmarks(research, folds, test_bars, rung.fee + slip,
-                                 series if series is not None else spread_used, False, leverage, market.get("market"))
+                                 series if series is not None else spread_used, full_default.shorts, leverage,
+                                 market.get("market"))
         if at_rung.trades:
             rung.oos_timing_return, rung.random_return = at_rung.strategy_return, at_rung.median_random_return
     if hold_market == markets.PERP and not market:
@@ -1076,8 +1085,8 @@ def run_study(
             f"Traded on {minutes}-minute bars; every figure here is on daily returns (closes at 00:00 UTC), "
             "so Sharpe is annualised as daily and the bootstrap resamples days, as for a daily strategy.")
     if market:
-        result.notes.append("The venue lists perpetuals only, so every run traded the perpetual, long only, "
-                            "paying the funding the venue settled.")
+        result.notes.append(f"The venue lists perpetuals only, so every run traded the perpetual, "
+                            f"{_sides_words(full_default, default_params)}, paying the funding the venue settled.")
     if exits:
         result.notes.append(
             "Exits on top of the signal: " + _exit_words(exits)
@@ -1485,6 +1494,14 @@ def _gross_exposure(exposure: pd.Series, first, last) -> float:
         return 0.0
     idx = exposure.index
     return float(exposure[(idx >= first) & (idx <= last)].abs().sum())
+
+
+def _sides_words(run, params: dict) -> str:
+    """R-04: the sides the research period's default run traded, in words; with no trades, the sides it may take."""
+    sides = {t["side"] for t in trades(fills_to_rows(run.fills), run.shorts)}
+    if not sides:
+        sides = {1, -1} if (params or {}).get("allow_short") else {1}
+    return {frozenset({1}): "long only", frozenset({-1}): "short only"}.get(frozenset(sides), "long and short")
 
 
 def _in_market_bars(exposure: pd.Series, first, last) -> int:
