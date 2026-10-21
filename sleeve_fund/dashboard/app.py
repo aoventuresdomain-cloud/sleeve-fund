@@ -18,7 +18,7 @@ import secrets
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import urlencode, urlparse
+from urllib.parse import quote, urlencode, urlparse
 from zoneinfo import ZoneInfo
 
 import markdown
@@ -1400,10 +1400,29 @@ def create_app(store: Store | None = None) -> FastAPI:
         return Response(path.read_bytes(), media_type="text/markdown; charset=utf-8",
                         headers={"Content-Disposition": f'attachment; filename="{path.name}"'})
 
+    @app.get("/research/{sheet}/file/{kind}")
+    def tearsheet_file(sheet: str, kind: str, _: str = Depends(require_pm)):
+        """R-15: a file beside the sheet, one of run.BESIDE by its exact name only: the trade list, the daily equity
+        or its curve, never any other path."""
+        from sleeve_fund.research.run import BESIDE
+
+        if kind not in BESIDE:
+            raise HTTPException(404, "no such file")
+        path = _sheet_path(sheet).with_name(f"{_sheet_path(sheet).stem}-{kind}")
+        if not path.is_file():
+            raise HTTPException(404, "no such file")
+        media = "image/svg+xml" if kind.endswith(".svg") else "text/csv; charset=utf-8"
+        headers = {"X-Content-Type-Options": "nosniff", "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'"}
+        if kind.endswith(".csv"):
+            headers["Content-Disposition"] = f'attachment; filename="{path.name}"'
+        return Response(path.read_bytes(), media_type=media, headers=headers)
+
     @app.get("/research/{sheet}", response_class=HTMLResponse)
     def tearsheet(request: Request, sheet: str, _: str = Depends(require_pm)):
         path = _sheet_path(sheet)
         html = markdown.markdown(path.read_text(encoding="utf-8"), extensions=["tables"])
+        # R-15: the files beside the sheet, by their fixed names only, at this sheet's own route for them.
+        html = html.replace('href="beside:', f'href="/research/{quote(path.stem)}/file/')
         # Results as status chips, so a FAIL can't be missed in a wall of text.
         for word, tone, label in (("PASS", "running", "Pass"), ("FAIL", "halted", "Fail"), ("WARN", "paused", "Warn"),
                                   ("INFO", "stopped", "Info"), ("NOT JUDGED", "paused", "Not judged"),

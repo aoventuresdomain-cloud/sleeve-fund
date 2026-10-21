@@ -382,7 +382,7 @@ class StudyResult:
     @property
     def trade_stats(self) -> dict:
         return trade_stats(trades(fills_to_rows(self.full_period.fills), self.full_period.shorts,
-                                  self.full_period.funding))  # R-04 short legs; R-16 funding
+                                  self.full_period.funding, self.full_period.insurance))  # R-04 shorts; R-16 flows
 
     @property
     def turnover(self) -> float:
@@ -1268,7 +1268,8 @@ def run_study(
     for rung in ladder:  # the benchmark at each rung's own cost, as the rung's runs pay it (RE-COST)
         at_rung, _ = _benchmarks(research, folds, test_bars, rung.fee + slip,
                                  series if series is not None else spread_used, full_default.shorts, leverage,
-                                 market.get("market"), True, fill)
+                                 market.get("market"), True, fill,
+                                 random_side_test=False)  # the rung: random entry only (CR F1)
         if at_rung.trades:
             rung.oos_timing_return, rung.random_return = at_rung.strategy_return, at_rung.median_random_return
     if hold_market == markets.PERP and not market:
@@ -1956,7 +1957,7 @@ class DrawFill:
 
 def _benchmarks(prices: pd.DataFrame, folds: list[Fold], test_bars: int, taker: float, spread, shorts: bool,
                 leverage: float | None = None, market: str | None = None, charged: bool = True,
-                fill: DrawFill | None = None):
+                fill: DrawFill | None = None, random_side_test: bool = True):
     """The random-entry benchmark, and the random-side test when the strategy can go short, on the folds'
     counted trips. Each trip is placed on the bars it was opened and closed in, and both sides of the comparison
     are priced on those bars' closes, so the benchmark compares timing, not fills. spread: a half spread, or a
@@ -1964,7 +1965,9 @@ def _benchmarks(prices: pd.DataFrame, folds: list[Fold], test_bars: int, taker: 
     alike (SPREAD-PIT). leverage: the risk profile's cap, for a fold that traded the perpetual (its chosen market,
     else `market`): its trips and their draws are liquidated as the engine books one, losing the margin and fees,
     never the move past it (Independent Quant Advisor 7 Oct 00:19 (4)); and, charged, a liquidated trip of the
-    strategy's pays the gap the venue absorbed past it, its draws never (ABSORB-GAP, Advisor ~02:55 UK, option A)."""
+    strategy's pays the gap the venue absorbed past it, its draws never (ABSORB-GAP, Advisor ~02:55 UK, option A).
+    random_side_test: False skips the random-side test for a caller that reads random entry only (the cost ladder's
+    rungs). Not `side`: the trip loop below binds that name (CR M1)."""
     index = prices.index.tz_localize("UTC") if prices.index.tz is None else prices.index
     half = spread.at_many(index.as_unit("ns").asi8) if isinstance(spread, SpreadSeries) else spread
     cost_per_side = taker + half
@@ -1973,12 +1976,13 @@ def _benchmarks(prices: pd.DataFrame, folds: list[Fold], test_bars: int, taker: 
         return max(int(index.searchsorted(ts, side="right")) - 1, 0)
 
     if fill is not None and fill.refused:
-        entry, side = _benchmarks(prices, folds, test_bars, taker, spread, shorts, leverage, market, charged)
+        entry, side = _benchmarks(prices, folds, test_bars, taker, spread, shorts, leverage, market, charged,
+                                  random_side_test=random_side_test)
         entry.why_not = fill.refused
         return entry, side
     if fill is not None and fill.definition is not None:
-        return _filled_benchmarks(prices, folds, test_bars, taker, half, cost_per_side, shorts, leverage, market,
-                                  charged, fill, bar)
+        return _filled_benchmarks(prices, folds, test_bars, taker, half, cost_per_side, shorts and random_side_test,
+                                  leverage, market, charged, fill, bar)
     windows, placed = [], []
     for f in folds:
         end = bar(f.test_end)
@@ -2000,8 +2004,7 @@ def _benchmarks(prices: pd.DataFrame, folds: list[Fold], test_bars: int, taker: 
     bars = sum(f.window_bars for f in folds)
     in_market = sum(f.in_market_bars for f in folds) / bars if bars else None
     entry = random_entry(closes, placed, windows, cost_per_side, in_market=in_market)
-    side = random_side(closes, placed, windows, cost_per_side) if shorts else None
-    return entry, side
+    return entry, random_side(closes, placed, windows, cost_per_side) if shorts and random_side_test else None
 
 
 def _filled_benchmarks(prices, folds, test_bars, taker, half, cost_per_side, shorts, leverage, market, charged,

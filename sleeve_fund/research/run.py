@@ -72,6 +72,7 @@ class StudyRequest:
     # R-24: a filtered variant's parent definition (a rule-builder definition), whose entries a placebo blocks at
     # random in the share the variant's filter blocked; None: no placebo
     placebo_parent: dict | None = None
+    starting_capital: float = 10_000.0  # R-15: the account every run starts from (the PM's $1,000 run)
 
     def exits(self) -> dict:
         """The exits every run of the study trades with, as the strategy takes them."""
@@ -96,6 +97,8 @@ class StudyRequest:
             raise ValueError("the old walk-forward verdict is shown beside a continuous window's only")
         if self.placebo_parent is not None and self.score_window != "continuous":
             raise ValueError("the placebo runs on a continuous scoring window only")
+        if not 0 < self.starting_capital < float("inf"):
+            raise ValueError("the starting capital must be above 0")
 
 
 def _bars(minutes: int) -> str:
@@ -186,7 +189,8 @@ def run_store_study(req: StudyRequest, store=None, progress=None, ledger_path: P
             risk_profile=req.risk_profile, exec_prices=exec_prices, half_spread=spread, progress=progress,
             oos_exec_prices=oos_exec, minute_loader=minutes_between, register=register,
             locks=HoldoutLocks(store) if store is not None else None, pinned=req.pinned, score_window=window,
-            placebo_parent=req.placebo_parent if window == req.score_window else None)
+            placebo_parent=req.placebo_parent if window == req.score_window else None,
+            starting_capital=req.starting_capital)
 
     result = study(req.score_window, ledger, register, progress)
     old = None
@@ -217,11 +221,27 @@ def run_store_study(req: StudyRequest, store=None, progress=None, ledger_path: P
     while out.exists():  # two runs in the same second
         n += 1
         out = out.with_name(f"{stem}-{n}.md")
-    out.write_text(render(result, ledger, register, old=old), encoding="utf-8")
+    out.write_text(render(result, ledger, register, old=old, files=True), encoding="utf-8")
     write_results(result, out)
     write_returns(result, out)
     write_oos_returns(result, out)
+    write_beside(result, out)
     return out
+
+
+BESIDE = ("trades.csv", "equity.csv", "equity.svg")  # R-15: what sits beside a sheet as <stem>-<kind>, all it may
+
+
+def write_beside(result, sheet: Path) -> None:
+    """R-15: the sheet's every trade, its daily equity and buy-and-hold's, and their curve, beside it, never trimmed."""
+    from sleeve_fund.research import periods
+
+    eq, hold = periods.scored(result)
+    files = {"trades.csv": periods.trades_csv(periods.trade_rows(result.full_period)),
+             "equity.csv": periods.equity_csv(eq, hold),
+             "equity.svg": periods.equity_svg(eq, hold, f"{sheet.stem}: equity, Strategy and buy and hold")}
+    for kind in BESIDE:
+        sheet.with_name(f"{sheet.stem}-{kind}").write_text(files[kind], encoding="utf-8")
 
 
 def results_path(sheet: Path) -> Path:
