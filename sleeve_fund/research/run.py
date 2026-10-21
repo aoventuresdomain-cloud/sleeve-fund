@@ -38,6 +38,7 @@ EXEC_STEPS = (1, 5, 15, 60)
 OOS_EXEC_BUDGET = 3_000_000
 # Stored history ending longer ago than this is still being backfilled; a study says so.
 STALE_HISTORY = pd.Timedelta(days=1)
+BASKET_POOL = ("BTC", "ETH", "SOL", "XRP")  # STUDY-ASSET-LIST: the research pool an asset list draws from (PM 21 Oct)
 
 
 @dataclass(frozen=True)
@@ -72,6 +73,13 @@ class StudyRequest:
     # R-24: a filtered variant's parent definition (a rule-builder definition), whose entries a placebo blocks at
     # random in the share the variant's filter blocked; None: no placebo
     placebo_parent: dict | None = None
+    # STUDY-ASSET-LIST (PM 21 Oct): the assets one definition runs on as one basket (research.basket_run), `pair`
+    # their first; None: `pair` alone, as before
+    pairs: tuple[str, ...] | None = None
+
+    def __post_init__(self) -> None:
+        if self.pairs is not None:
+            object.__setattr__(self, "pairs", tuple(self.pairs))
 
     def exits(self) -> dict:
         """The exits every run of the study trades with, as the strategy takes them."""
@@ -96,6 +104,27 @@ class StudyRequest:
             raise ValueError("the old walk-forward verdict is shown beside a continuous window's only")
         if self.placebo_parent is not None and self.score_window != "continuous":
             raise ValueError("the placebo runs on a continuous scoring window only")
+        if self.pairs is not None:
+            self._validate_pairs()
+
+    def _validate_pairs(self) -> None:
+        bases = [p.split("/")[0] if "/" in p else None for p in self.pairs]
+        if None in bases:
+            raise ValueError(f"every listed asset should look like BTC/USDT, not {self.pairs!r}")
+        if not 2 <= len(self.pairs) <= len(BASKET_POOL):
+            raise ValueError(f"an asset list holds 2 to {len(BASKET_POOL)} assets, not {len(self.pairs)}")
+        if len(set(bases)) != len(bases):
+            raise ValueError(f"an asset is listed twice: {', '.join(bases)}")
+        if outside := [b for b in bases if b not in BASKET_POOL]:
+            raise ValueError(f"{', '.join(outside)} is not in the research pool ({', '.join(BASKET_POOL)})")
+        if len({p.split("/")[1] for p in self.pairs}) != 1:
+            raise ValueError("the listed assets are quoted in different currencies")
+        if self.pair != self.pairs[0]:
+            raise ValueError(f"the request's pair {self.pair} is not its list's first asset {self.pairs[0]}")
+        if self.minutes != 1440:
+            raise ValueError("an asset list is studied on daily bars only")
+        if self.placebo_parent is not None or self.old_window_too:
+            raise ValueError("an asset list runs without the placebo or the old window beside it")
 
 
 def _bars(minutes: int) -> str:
@@ -137,6 +166,10 @@ def run_store_study(req: StudyRequest, store=None, progress=None, ledger_path: P
     from sleeve_fund.venues import venue as venue_profile
 
     req.validate()
+    if req.pairs is not None:  # STUDY-ASSET-LIST: one basket of the listed assets
+        from sleeve_fund.research.basket_run import run_store_basket
+
+        return run_store_basket(req, store, out_dir=out_dir, history=history)
     spec = spec_of(req.strategy)
     profile = venue_profile(req.venue)
     history = history or HistoryStore()
