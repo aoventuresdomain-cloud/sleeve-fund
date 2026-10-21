@@ -282,7 +282,8 @@ def test_a_study_from_main_says_its_tries_are_counted_by_hand(tmp_path, monkeypa
     monkeypatch.setattr(study, "run_study", lambda *a, **k: types.SimpleNamespace(
         notes=[], fee_basis=None, breakeven=None))
     monkeypatch.setattr(tearsheet, "render", lambda r, *a, **k: "\n".join(f"- {n}" for n in r.notes))
-    monkeypatch.setattr(run_mod, "write_results", lambda r, out: None)
+    for writer in ("write_results", "write_returns", "write_oos_returns", "write_beside"):  # files beside the sheet
+        monkeypatch.setattr(run_mod, writer, lambda r, out: None)
     b = venue("binance")
     monkeypatch.setattr(b, "contract", lambda pair: binance_contract(pair, get_json=lambda url: INFO))
     monkeypatch.setattr(funding, "DEFAULT_ROOT", tmp_path / "funding")

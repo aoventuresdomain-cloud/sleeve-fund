@@ -695,7 +695,7 @@ def test_a_perp_studys_benchmark_pays_the_fee_its_strategy_pays(tmp_path, instru
 
     costs, runs = [], []
     real_bench, real_bt = study._benchmarks, study.run_backtest
-    monkeypatch.setattr(study, "_benchmarks", lambda *a: costs.append(a[3]) or real_bench(*a))
+    monkeypatch.setattr(study, "_benchmarks", lambda *a, **k: costs.append(a[3]) or real_bench(*a, **k))
     monkeypatch.setattr(study, "run_backtest", lambda *a, **k: runs.append((a[3], k, r := real_bt(*a, **k))) and r or r)
     r = run_study(perp, synthetic_ohlcv(days=1100, seed=3), instrument, dataset="syn", ledger=IdeaLedger(tmp_path / "l"),
                   synthetic=True, holdout_days=0, train_days=365, test_days=365, half_spread=0)
