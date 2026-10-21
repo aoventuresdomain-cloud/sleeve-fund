@@ -104,9 +104,11 @@ def rows(sheets: list[Path], holdout_status: dict | None = None) -> dict[str, li
 
     marks = _marks(holdout_status or {})
     out: dict[str, list[dict]] = {}
+    seen = []
     for path in sheets:
         text = path.read_text(encoding="utf-8")
         s = read_sheet(path)
+        seen.append(s)
         total, dsr, budget = _TOTAL.search(text), _DSR.search(text), _BUDGET.search(text)
         own = "spent" if _OPENED.search(text) else "clean"
         g1 = s["g1"] or "NOT JUDGED"
@@ -119,6 +121,11 @@ def rows(sheets: list[Path], holdout_status: dict | None = None) -> dict[str, li
                "tries": f"{budget.group(1)} of {budget.group(2)}" if budget else "n/a",
                "trades": str(s["oos_trades"]) if s["oos_trades"] is not None else "n/a"}
         out.setdefault(_section(s["instrument"]), []).append(row)
+    # CR F3: a name matching no sheet's strategy (a typo) would leave a spent holdout showing clean: refused
+    unmatched = sorted(set(marks) - {s["strategy"] for s in seen})
+    if unmatched:
+        raise ValueError(f"the holdout status names {', '.join(unmatched)}, which no sheet here is a study of: "
+                         "fix the name, or drop the entry")
     order = sorted(out, key=lambda k: (k != POOLED, k == UNSTATED, k))
     return {k: sorted(out[k], key=_key) for k in order}
 

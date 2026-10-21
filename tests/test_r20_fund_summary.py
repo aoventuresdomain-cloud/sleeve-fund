@@ -177,6 +177,13 @@ def test_among_passes_a_clean_holdout_ranks_above_a_spent_or_leaked_one_whatever
             fs.rows(sheets, {"multi_speed": half})
 
 
+def test_a_holdout_status_naming_no_sheets_strategy_is_refused(tmp_path):
+    sheets = [_put(tmp_path, "a", strategy="multi_speed")]
+    assert fs.rows(sheets, {"multi_speed": _mark("leaked")})["BTC only"][0]["holdout"] == "leaked"
+    with pytest.raises(ValueError, match="multi_sped, which no sheet here is a study of"):
+        fs.rows(sheets, {"multi_speed": _mark("leaked"), "multi_sped": _mark("spent")})
+
+
 def _mark(status):
     return {"status": status, "date": "2026-10-21", "reason": "holdout year read before the lock"}
 
