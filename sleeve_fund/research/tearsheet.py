@@ -630,6 +630,10 @@ def render(r: StudyResult, ledger: IdeaLedger, register=None, liquidation_ack: s
         out.append(f"Holding spot instead, out-of-sample: CAGR {_pct(s_['cagr'])}, Sharpe {_num(s_['sharpe'])}, "
                    f"max drawdown {_pct(s_['max_drawdown'])} (shown, not the G1 benchmark).")
         out.append("")
+    schedule = getattr(getattr(r, "full_period", None), "funding_schedule", "")
+    if schedule:
+        out.append(f"Funding schedule: {schedule}.")
+        out.append("")
     stress = getattr(r, "funding_stress", None)
     if stress:
         (s0, s1), (h0, h1) = stress["strategy"], stress["hold"]

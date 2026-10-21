@@ -66,7 +66,8 @@ class BacktestResult:
     funding_baseline_longest: pd.Timedelta = pd.Timedelta(0)
     # A simulated perp: no venue's rates at all, every settlement charged the baseline (Advisor, 6 Oct 2026)
     funding_simulated: bool = False
-    # Why the venue's stored settlements don't fit the schedule charged, or "" (funding.schedule_mismatch)
+    # The run's stored settlements closer together than the schedule's interval, each charged at its own time, or ""
+    # (funding.schedule_note; informational since SOL-FUND)
     funding_schedule: str = ""
     # Shortfalls past the bankruptcy price the venue's insurance fund took, as {"ts", "amount"}.
     insurance: list = field(default_factory=list)
@@ -613,12 +614,12 @@ def _funding_row(strategy, ts, amount: float, kind: str) -> dict:
 
 
 def _funding_schedule(strategy, instrument, prices: pd.DataFrame) -> str:
-    """funding.schedule_mismatch over the run, for a perp charged the venue's own rates."""
+    """funding.schedule_note over the run, for a perp charged the venue's own rates."""
     terms = strategy._cfg.perp
     if terms is None or terms.funding_venue is None or not len(prices):
         return ""
-    return funding.schedule_mismatch(terms.funding_venue, pair_of(instrument), terms.funding_hours,
-                                     start=prices.index[0], end=prices.index[-1]) or ""
+    return funding.schedule_note(terms.funding_venue, pair_of(instrument), terms.funding_hours,
+                                 start=prices.index[0], end=prices.index[-1])
 
 
 def _funding_interval(strategy) -> pd.Timedelta:

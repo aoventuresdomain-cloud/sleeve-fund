@@ -1,0 +1,55 @@
+name: funding-sample
+# R-02 spot check (Advisor, 21 Oct): random stored funding rates per instrument (seeded) and its most negative one,
+# each compared exactly with the venue's own record as it sends it (python -m sleeve_fund.history funding-sample),
+# inside the venue's hub container on the paper server. Read-only: it reads the funding files and the venue's public
+# history and writes nothing. Fails on any mismatch. Run it by hand from main. Same secrets and variable as
+# history-coverage.
+on:
+  workflow_dispatch:
+    inputs:
+      venue:
+        description: Venue whose stored funding to check (lower-case letters only)
+        required: true
+        default: binance
+      count:
+        description: Random settlements per instrument (plus its most negative)
+        required: true
+        default: "10"
+      pairs:
+        description: Instruments, space-separated, e.g. BTC/USDT ETH/USDT; empty for the core list and every Strategy's
+        required: false
+        default: ""
+jobs:
+  sample:
+    runs-on: ubuntu-24.04
+    permissions: { contents: read }
+    if: ${{ vars.DEPLOY_ENABLED == 'true' && github.ref == 'refs/heads/main' }}
+    env:
+      USER_AT: ${{ vars.DEPLOY_USER || 'root' }}
+    steps:
+      - name: Check the inputs
+        env:
+          VENUE: ${{ inputs.venue }}
+          COUNT: ${{ inputs.count }}
+          PAIRS: ${{ inputs.pairs }}
+        run: |
+          [[ "$VENUE" =~ ^[a-z]{1,32}$ ]] || { echo "venue must be lower-case letters only"; exit 1; }
+          [[ "$COUNT" =~ ^[1-9][0-9]?$ ]] || { echo "count must be 1 to 99"; exit 1; }
+          [[ -z "$PAIRS" || "$PAIRS" =~ ^[A-Z0-9]{1,16}/[A-Z0-9]{1,16}( [A-Z0-9]{1,16}/[A-Z0-9]{1,16})*$ ]] || { echo "pairs must be like BTC/USDT ETH/USDT"; exit 1; }
+      - name: Configure SSH
+        env:
+          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/id_deploy && chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts
+      - name: Check the sample
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          VENUE: ${{ inputs.venue }}
+          COUNT: ${{ inputs.count }}
+          PAIRS: ${{ inputs.pairs }}
+        run: |
+          ssh -i ~/.ssh/id_deploy -o ServerAliveInterval=30 -o ServerAliveCountMax=10 "$USER_AT@$HOST" \
+            "cd /opt/sleeve-fund && sudo docker compose exec -T hub-$VENUE python -u -m sleeve_fund.history funding-sample --venue $VENUE --count $COUNT $PAIRS"
