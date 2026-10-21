@@ -30,6 +30,13 @@ ROW = re.compile(r"^\|\s*(\d+)\s*\|\s*([a-z0-9_]+)\s*\|[^|]*\|\s*(\w+)\s*\|\s*$"
 # The list's common settings (research/quant-researcher/qr-rescore-list.md, 20 Oct): walk-forward 730/365, the
 # holdout's 365 days locked, risk profile none (1x, uncapped, unguarded).
 TRAIN_DAYS, TEST_DAYS, HOLDOUT_DAYS = 730, 365, 365
+# R-11/R-12 (Advisor SCORE-WINDOW, 21 Oct): a list whose common settings say "Scoring window: continuous" scores each
+# pinned row continuously after its warm-up; without the line it keeps the walk-forward. This round only, the rows
+# scored on the old window before (QR-B1, QR-B2, QR-B3) also show that window's verdict and pass only if both pass.
+CONTINUOUS_LINE = re.compile(r"^-\s*\*\*Scoring window:\*\*\s*continuous\b", re.M | re.I)
+OLD_WINDOW_TOO = frozenset({
+    "qr01_trend_ema_long", "qr01_trend_ema_short", "qr01b_trend_multispeed_long", "qr01b_trend_multispeed_short",
+    "qr01c_trend_donchian_long", "qr01c_trend_donchian_short"})
 
 
 def rows_of(text: str) -> list[tuple[int, str, int]]:
@@ -66,9 +73,9 @@ def pick(rows: list, spec: str | None) -> list:
     return chosen
 
 
-def request(name: str, minutes: int, venue: str, pair: str, pinned=None):
+def request(name: str, minutes: int, venue: str, pair: str, pinned=None, continuous: bool = False):
     """The store study one row runs: rules, its definition's params, perp, the locked holdout, on the list's pinned
-    dates (B-37)."""
+    dates (B-37), scored continuously after a warm-up when the list says so (R-11)."""
     from sleeve_fund.research.run import StudyRequest
     from sleeve_fund.strategies.definitions import load_definition_file, to_params
 
@@ -84,7 +91,8 @@ def request(name: str, minutes: int, venue: str, pair: str, pinned=None):
         params["allow_short"] = True
     return StudyRequest(strategy="rules", pair=pair, venue=venue, minutes=minutes, risk_profile=None,
                         train_days=TRAIN_DAYS, test_days=TEST_DAYS, holdout_days=HOLDOUT_DAYS, use_holdout=False,
-                        params=params, label=name, pinned=pinned)
+                        params=params, label=name, pinned=pinned,
+                        **({"score_window": "continuous", "old_window_too": name in OLD_WINDOW_TOO} if continuous else {}))
 
 
 def main(argv: list[str] | None = None, run=None, journal=None) -> int:
@@ -104,7 +112,9 @@ def main(argv: list[str] | None = None, run=None, journal=None) -> int:
         if pinned.holdout_days != HOLDOUT_DAYS:
             raise ValueError(f"the list pins a {pinned.holdout_days}-day holdout, not {HOLDOUT_DAYS}")
         rows = pick(rows_of(text), args.rows)
-        reqs = [(n, name, request(name, minutes, args.venue, args.pair, pinned)) for n, name, minutes in rows]
+        continuous = CONTINUOUS_LINE.search(text) is not None
+        reqs = [(n, name, request(name, minutes, args.venue, args.pair, pinned, continuous))
+                for n, name, minutes in rows]
     except (OSError, ValueError) as exc:
         print(f"refused: {exc}")
         return 2

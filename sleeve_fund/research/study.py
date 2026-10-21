@@ -204,6 +204,11 @@ class StudyResult:
     # The falsifier (Advisor 18:16): the 1-minute run's end equity less the coarse run's, over starting capital, for the
     # research period at the default settings; None when the study's own runs were on 1-minute bars or none were stored.
     bars_only_gap: float | None = None
+    # R-11: how the study was scored (walk_forward or continuous), and a continuous window's warm-up in bars
+    score_window: str = "walk_forward"
+    warmup_bars: int | None = None
+    # R-14: a continuous window's random-entry benchmark per test year (calendar year of the scored window)
+    random_entry_by_year: dict = field(default_factory=dict)
     # R-07: a volatility-sized variant against its parent at the same average gross exposure (equal_exposure)
     equal_exposure: equal_exposure.EqualExposure | None = None
     # Runs of this idea whose trials-register count failed (QA P1-T8): they count in N, but their Sharpes are
@@ -545,6 +550,62 @@ def _bar_words(minutes: int) -> str:
     return "day" if minutes == 1440 else f"{minutes // 60}-hour bar" if minutes % 60 == 0 else f"{minutes}-minute bar"
 
 
+# R-11 (PM chose "Five years" 21 Oct 10:13 UK; Advisor SCORE-WINDOW addendum, warm-up rule as amended 21 Oct): a
+# pinned-setting study fits nothing on its training folds, so it may instead warm up, then score continuously to the
+# research end (the holdout stays locked). The warm-up is the longest any block needs: an exact rolling block (SMA,
+# Donchian, rolling volume...) its N bars, as the library counts them; a recursive one (EMA, Wilder's ATR and RSI)
+# WARMUP_MULTIPLE x N. A study that tunes settings keeps the walk-forward.
+WALK_FORWARD, CONTINUOUS = "walk_forward", "continuous"
+SCORE_WINDOWS = (WALK_FORWARD, CONTINUOUS)
+WARMUP_MULTIPLE = 10
+MIN_SCORED_DAYS = 365
+# Recursive blocks, by kind: the settings whose length decays recursively (an RSI divergence adds its swing room).
+RECURSIVE_LENGTHS = {"ema": ("period",), "atr": ("period",), "rsi": ("period",), "keltner": ("period", "atr_period"),
+                     "rsi_divergence": ("rsi_period",)}
+
+
+def block_warmup(kind: str, settings: dict) -> int:
+    """R-11: the bars one block needs before a continuous window scores: WARMUP_MULTIPLE x N for a recursive block,
+    otherwise its own warm-up as warmup_for reads it (N, or N + 1 where its first value needs the bar before)."""
+    from sleeve_fund.strategies.definitions import BUILDER_BLOCKS
+
+    cls = BUILDER_BLOCKS[kind]
+    s = cls.check_settings({k: v for k, v in settings.items() if k not in ("kind", "timeframe")})
+    if kind in RECURSIVE_LENGTHS:
+        bars = WARMUP_MULTIPLE * max(int(s[k]) for k in RECURSIVE_LENGTHS[kind])
+        return bars + (s["left"] + s["right"] + s["max_gap"] if kind == "rsi_divergence" else 0)
+    return int(cls.warmup_bars(**s))  # what warmup_for reads for the block
+
+
+def continuous_warmup(strategy: str, params: dict, bar_minutes: int) -> int:
+    """R-11: the warm-up bars of a continuous window, from the rule itself: the most any of its blocks needs
+    (block_warmup), a slower-timeframe block's counted in decision candles, with one more of its candles for the part
+    candle a run starts in (as Rules.warmup_needed counts it)."""
+    from sleeve_fund.strategies.definitions import check_definition, timeframe_minutes
+
+    if strategy != "rules" or not params.get("definition"):
+        raise ValueError("a continuous scoring window reads its warm-up from a rule-builder definition's indicators")
+    definition = params["definition"]
+    check_definition(definition, bar_minutes=bar_minutes)
+    need = 0
+    for block in (definition.get("blocks") or {}).values():
+        bars = block_warmup(block["kind"], block)
+        if block.get("timeframe"):
+            tf = timeframe_minutes(block["timeframe"])
+            bars = (bars + 1) * tf // bar_minutes if tf > bar_minutes else bars
+        need = max(need, bars)
+    if need <= 0:
+        raise ValueError("the definition names no indicator to set a continuous window's warm-up from")
+    return need
+
+
+def _day_words(ts: pd.Timestamp, bar: pd.Timedelta) -> str:
+    """'19 Oct 2025': the UTC day a bar belongs to (the day its open falls on)."""
+    from sleeve_fund.research.pinned import day_of
+
+    return f"{day_of(ts, bar):%d %b %Y}"
+
+
 def run_study(
     spec: IdeaSpec,
     prices: pd.DataFrame,
@@ -570,6 +631,7 @@ def run_study(
     locks=None,
     idea_hash: str | None = None,
     pinned=None,
+    score_window: str = "walk_forward",
 ) -> StudyResult:
     """prices: bars of any length that divides a day (daily, hourly, 15-minute, 1-minute...). The holdout,
     train and test windows are in days whatever the bar, and every statistic is on daily returns.
@@ -626,6 +688,18 @@ def run_study(
         combos = [dict(default_params)]
     default_params = default_params or spec.default_params or (combos[0] if combos else {})
     idea_hash = idea_of(default_params, idea_hash)
+    if score_window not in SCORE_WINDOWS:
+        raise ValueError(f"score_window must be one of {', '.join(SCORE_WINDOWS)}, not {score_window!r}")
+    warmup_bars = None
+    if score_window == CONTINUOUS:  # R-11: one window, the warm-up then scored continuously to the research end
+        if len(combos) != 1:
+            raise ValueError(f"a continuous scoring window is for pinned settings only: this study tunes "
+                             f"{len(combos)} settings, so it keeps the walk-forward")
+        warmup_bars = continuous_warmup(spec.name, combos[0], minutes)
+        if warmup_bars + MIN_SCORED_DAYS * per_day > len(research):
+            raise ValueError(f"the warm-up of {warmup_bars:,} bars leaves under {MIN_SCORED_DAYS} days to score "
+                             f"in the {len(research) / per_day:,.0f}-day research period")
+        train_bars, test_bars = warmup_bars, len(research) - warmup_bars
 
     exits = {k: v for k, v in (exits or {}).items() if v is not None}
     from sleeve_fund.venues import VENUES
@@ -877,7 +951,11 @@ def run_study(
         test_idx = through_test.index[train_bars:]
         best, best_sharpe = None, float("-inf")
         surface = []
-        for params in combos:
+        if warmup_bars is not None:  # continuous: the one pinned setting, nothing fitted on the warm-up
+            best, best_sharpe, combos_fit = combos[0], float("nan"), []
+        else:
+            combos_fit = combos
+        for params in combos_fit:
             fit = bt(spec.name, train, params)
             m = summary(daily_returns(fit.equity))
             log(params, "wf_train", m["sharpe"], train)
@@ -1000,7 +1078,10 @@ def run_study(
         risk_profile=risk_profile,
         settings=(f"{risk_profile + ' risk profile' if risk_profile else 'no risk profile'} · "
                   f"exits: {_exit_words(exits) if exits else 'the signal only'} · "
-                  f"walk-forward {train_days} days training, {test_days} days testing"),
+                  + (f"walk-forward {train_days} days training, {test_days} days testing" if warmup_bars is None
+                     else f"continuous: a warm-up of {warmup_bars:,} bars ({warmup_bars / per_day:,.0f} days), then "
+                          f"scored {_day_words(research.index[warmup_bars], bar)} to "
+                          f"{_day_words(research.index[-1], bar)}")),
         errors=errors,
         error_count=error_count[0],
         cost_ladder=ladder,
@@ -1035,6 +1116,14 @@ def run_study(
         result.random_entry_uncharged, result.random_side_uncharged = _benchmarks(
             research, folds, test_bars, float(run_fees.taker), series if series is not None else spread_used,
             full_default.shorts, leverage, market.get("market"), charged=False)
+    result.score_window, result.warmup_bars = score_window, warmup_bars
+    if warmup_bars is not None and windows:  # R-14: the percentile per test year too
+        _k, (_, _, test_idx, *_), run = windows[0]
+        result.random_entry_by_year = {
+            year: _benchmarks(research, [fold], window_bars, float(run_fees.taker),
+                              series if series is not None else spread_used, full_default.shorts, leverage,
+                              market.get("market"))[0]
+            for year, fold, window_bars in _years(folds[0], run, test_idx)}
     if (default_params or {}).get("vol_target_size") is not None:  # R-07: against the parent at equal exposure
         result.equal_exposure = _equal_exposure(
             result, research, folds, windows, oos_parts, bt, scored, bar,
@@ -1504,6 +1593,29 @@ def _trip_sizes(trips: list[dict], test_start, fills: pd.DataFrame, decisions: d
         f, v = sig.get("size_factor"), sig.get("vol_factor")
         if f is not None or v is not None:
             out.append((_utc(t["opened"]), float(1.0 if f is None else f) * float(1.0 if v is None else v)))
+    return out
+
+
+def _years(fold: Fold, run: BacktestResult, test_idx) -> list[tuple[int, Fold, int]]:
+    """R-14: a continuous window cut into its test years, each as (year, a fold of it, its bars). A year holds the
+    trips opened in it, whole: its window runs from its first bar to the later of the year's last bar and the close
+    of its last trip, and the next year starts after that, so no trip is split and no bar is in two years."""
+    out, at, taken = [], 0, 0
+    trips = sorted(fold.trips)
+    for year in sorted(set(test_idx.year)):
+        if at >= len(test_idx):
+            break
+        last = max(int(test_idx.searchsorted(pd.Timestamp(f"{year + 1}-01-01", tz="UTC"), side="right")) - 1, at)
+        # the trips opened on this year's bars (a bar is the year its close falls in, 00:00 1 Jan the old year's)
+        mine = [t for t in trips[taken:] if _utc(t[0]) <= test_idx[last]]
+        taken += len(mine)
+        if mine:
+            last = max(last, int(test_idx.searchsorted(max(_utc(t[1]) for t in mine), side="left")))
+        last = min(last, len(test_idx) - 1)
+        first_ts, last_ts = test_idx[at], test_idx[last]
+        out.append((year, replace(fold, test_end=last_ts, trips=mine, window_bars=last - at + 1,
+                                  in_market_bars=_in_market_bars(run.exposure, first_ts, last_ts)), last - at + 1))
+        at = last + 1
     return out
 
 

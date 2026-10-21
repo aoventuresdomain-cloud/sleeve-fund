@@ -12,6 +12,10 @@ the BTC table is read. These are backtest studies only: no fund, Strategy, demo 
 - **Holdout:** locked. Every study's data ends 2025-10-19, so the last 365 days are never read, and `--use-holdout`
   is never passed.
 - **Walk-forward:** train 730 days, test 365 days. This fits the history before 2025-10-19.
+- **Scoring window:** continuous: a warm-up as each indicator needs to settle (exact rolling windows such as SMA,
+  Donchian and relative volume: their period; recursive EMA and Wilder blocks: 10x their period; the longest applies),
+  then scored to 2025-10-19 (the day before the holdout). QR-B1, QR-B2 and QR-B3 rows also show the old three-year
+  walk-forward verdict and pass only if both pass (SCORE-WINDOW addendum).
 - **Risk:** risk profile "none" (research: 1x, uncapped and unguarded), so signals are judged at fixed margin 1x.
 - **Count:** each row is one pre-registered setting, so one try per idea in the trials register. Ablation variants
   are not counted (Advisor rule).
