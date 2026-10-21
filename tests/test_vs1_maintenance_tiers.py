@@ -82,9 +82,11 @@ def test_a_funding_move_is_a_fresh_solve_never_a_shift_at_the_entry_s_tier():
     assert margin.tier_at(TIERS, margin.shifted_liquidation(p0, qty, -31_000.0, TIERS)) is TIERS[0]
 
 
-def test_flat_or_fully_paid_has_no_liquidation():
+def test_flat_has_no_liquidation_and_fully_paid_liquidates_at_maintenance():
+    """TEC-BH102-1X (HoE, Advisor 21 Oct): flat has none; a 1x long, fully paid for, liquidates at the maintenance on
+    its entry value, here the 60,000 tier's 0.5% less its 50 amount (until 21 Oct it had none: BH-102)."""
     assert margin.liquidation_price(0.0, 0.0, TIERS) is None
-    assert margin.isolated_liquidation(0.0, 1.0, 60_000.0, 1.0, TIERS) is None
+    assert margin.isolated_liquidation(0.0, 1.0, 60_000.0, 1.0, TIERS) == pytest.approx(60_000.0 * 0.005 - 50)
 
 
 def test_a_table_must_be_ordered_and_end_unbounded():

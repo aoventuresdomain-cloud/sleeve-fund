@@ -126,15 +126,15 @@ def test_b35i_paper_sizes_a_perp_entry_on_the_capped_leverage(tmp_path, own, not
     entry = next(o for o in store.orders("ping-pong-test")[::-1] if o["intent"] == "entry" and o["filled_qty"] > 0)
     got = Decimal(str(entry["filled_qty"])) * Decimal(str(entry["avg_px"]))
     assert abs(got - Decimal(notional)) <= Decimal("1"), got
-    # the engine's margin and liquidation read the same cap: a long margined at 1x has no liquidation price; at 2x it
-    # is about half the entry (60,000 x (1 - 1/2 + the maintenance margin))
+    # the engine's margin and liquidation read the same cap: a long's liquidation at leverage L is entry x (1 - 1/L +
+    # the maintenance margin, 0.5% here), nearer by its entry fee: at 2x about half the entry, at 1x (fully paid for)
+    # the maintenance alone (TEC-BH102-1X, HoE and Advisor 21 Oct; until then a 1x long had none)
     liq = entry["signal"].get("liquidation_px")
-    if own == 1:
-        assert liq is None, entry["signal"]
-    else:  # a long's liquidation at leverage L: entry x (1 - 1/L + the maintenance margin, 0.5% here)
-        lev = 1.5 if own == 1.5 else 2.0
-        want = Decimal(str(entry["avg_px"])) * (1 - 1 / Decimal(str(lev)) + Decimal("0.005"))
-        assert abs(Decimal(str(liq)) - want) <= want * Decimal("0.002"), (liq, want)
+    lev = {1: 1.0, 1.5: 1.5}.get(own, 2.0)
+    px, qty = Decimal(str(entry["avg_px"])), Decimal(str(entry["filled_qty"]))
+    fee = sum(Decimal(str(f["fee"])) for f in store.fills("ping-pong-test") if f["order_id"] == entry["order_id"])
+    want = px * (1 - 1 / Decimal(str(lev)) + Decimal("0.005")) + fee / qty
+    assert abs(Decimal(str(liq)) - want) <= px * Decimal("0.0002"), (liq, want)
 
 
 @pytest.mark.parametrize("own, cap, lev", [(None, 0.66, 2.0), (1, 0.33, 1.0)])

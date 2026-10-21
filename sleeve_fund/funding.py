@@ -293,6 +293,31 @@ def schedule_mismatch(venue: str, pair: str, hours: tuple[int, ...], root: str |
             f"every {expected / pd.Timedelta(hours=1):g} hours, so settlements would be missed")
 
 
+def schedule_note(venue: str, pair: str, hours: tuple[int, ...], root: str | Path | None = None,
+                  start: pd.Timestamp | None = None, end: pd.Timestamp | None = None) -> str:
+    """Research's informational line for the stored settlements inside a run that are closer together than the
+    schedule's interval, or "". The engine charges each stored settlement at its own time and rate
+    (markets.settlement_times; QA P1-O1), so such a run is judged (SOL-FUND, Advisor 21 Oct 2026); paper Start still
+    refuses on schedule_mismatch until it reads the venue's published interval."""
+    from sleeve_fund.markets import funding_interval
+
+    t = rates(venue, pair, root).index
+    if not len(t):
+        return ""
+    if start is not None:
+        t = t[t >= start]
+    if end is not None:
+        t = t[t <= end]
+    expected = pd.Timedelta(funding_interval(hours))
+    by_step: dict[pd.Timedelta, list[pd.Timestamp]] = {}
+    for a, b in zip(t, t[1:]):
+        if b - a < expected - MATCH:
+            by_step.setdefault((b - a).round("1min"), []).append(b)
+    parts = [f"every {step / pd.Timedelta(hours=1):g} hours for {len(ends)} step{'s' if len(ends) != 1 else ''} from "
+             f"{ends[0]:%Y-%m-%d %H:%M} UTC" for step, ends in sorted(by_step.items(), key=lambda kv: kv[1][0])]
+    return f"{pair} settled {' and '.join(parts)}; each charged at its own time and rate" if parts else ""
+
+
 # A store is stale once its newest rate is this many settlement intervals old: one late settlement is the venue
 # publishing late, two missed means the collector has stopped (QA P1-O17).
 STALE_INTERVALS = 2

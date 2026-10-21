@@ -34,7 +34,8 @@ def test_isolated_liquidation_is_on_the_notional_over_the_leverage_not_the_whole
     assert markets.liquidation_price(cash, qty, 0.005) > 2.9 * entry  # the old, whole-equity answer
     # A long's is the nearer of the two formulas, the one on its entry value (VS-1-TABLE): entry x (1 - 1/2 + 0.5%)
     assert markets.isolated_liquidation(balance - 0.1 * entry, 0.1, entry, 2, 0.005) == pytest.approx(entry * 0.505)
-    assert markets.isolated_liquidation(balance - 0.1 * entry, 0.1, entry, 1, 0.005) is None  # paid for in full
+    # paid for in full: at maintenance on it (TEC-BH102-1X, HoE and Advisor 21 Oct; until then none: BH-102)
+    assert markets.isolated_liquidation(balance - 0.1 * entry, 0.1, entry, 1, 0.005) == pytest.approx(entry * 0.005)
     # Never more margin than the balance: a 2x position worth 3x the balance has only the balance behind it.
     assert markets.isolated_margin(-0.6, entry, 2, balance) == balance
 
@@ -131,7 +132,10 @@ def test_ping_pong_on_a_perp_shorts_its_short_leg(prices, instrument):
     # Long from 100; +1% at 101.5 sells and shorts; the 0.5% dip at 100.9 covers and goes long; +1% at 102 again.
     closes = [100.0, 100.5, 100.8, 101.5, 101.3, 101.2, 100.9, 101.0, 101.5, 102.0, 102.0]
     res = run_backtest("ping_pong", _path(prices, closes), instrument, PERP, half_spread=0)
-    fills = res.fills.sort_values("ts_last")
+    # An exit and the entry it turns into share a bar: in the order sent, by the id's count (TEC-BH102-1X: the
+    # resting 1x liquidation order now takes ids too, so "-10" and "-9" share a bar and sort as text otherwise).
+    sent = res.fills.index.str.rsplit("-", n=1).str[-1].astype(int)
+    fills = res.fills.assign(sent=sent).sort_values(["ts_last", "sent"])
     assert list(fills["side"]) == ["BUY", "SELL", "SELL", "BUY", "BUY", "SELL", "SELL"]
     intents = [res.decisions[o]["intent"] for o in fills.index]
     assert intents == ["entry", "exit", "entry", "exit", "entry", "exit", "entry"]

@@ -132,13 +132,14 @@ def test_backtest_a_run_after_a_lengthening_to_the_charged_8h_schedule_is_judged
     assert all(f["kind"] == "settled" for f in r.funding)
 
 
-def test_backtest_a_run_across_the_lengthening_is_not_judged_only_for_the_shorter_steps(binance):
-    """The same store, a run that starts while the instrument was still on 4 h: the 18:35 guard (steps shorter than
-    the charged 8 h) makes it not judged; the lengthening itself charges no baseline."""
+def test_backtest_a_run_across_the_lengthening_says_its_shorter_steps_and_charges_no_baseline(binance):
+    """The same store, a run that starts while the instrument was still on 4 h: the run says so, informational since
+    SOL-FUND (Advisor 21 Oct; TEC-SOLFUND-GUARD), as each is charged at its own time; the lengthening itself charges no
+    baseline."""
     write_rates({t: 0.0001 for t in _four_then_eight()})
     r = backtest(binance, hourly_bars("2025-10-03 00:00", "2025-10-06 23:00"),
                  win(("2025-10-03 01:00", "2026-01-01", 1)))
-    assert "mismatch" in r.funding_schedule and "4 hours apart" in r.funding_schedule
+    assert r.funding_schedule.startswith("BTC/USDT settled every 4 hours for ") and "mismatch" not in r.funding_schedule
     assert r.funding_at_baseline == 0
 
 

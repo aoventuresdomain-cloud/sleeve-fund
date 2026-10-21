@@ -197,12 +197,56 @@ def run_store_study(req: StudyRequest, store=None, progress=None, ledger_path: P
         out = out.with_name(f"{stem}-{n}.md")
     out.write_text(render(result, ledger, register), encoding="utf-8")
     write_results(result, out)
+    write_returns(result, out)
+    write_oos_returns(result, out)
     return out
 
 
 def results_path(sheet: Path) -> Path:
     """B-22: the stored figures beside a tear sheet, for the page to read as fields rather than words."""
     return sheet.with_suffix(".results.json")
+
+
+def returns_path(sheet: Path) -> Path:
+    """R-20: the daily returns a tear sheet's "Risk, trades and costs" section is computed on, beside it."""
+    return sheet.with_suffix(".returns.csv")
+
+
+def write_returns(result, sheet: Path) -> Path:
+    """R-20 (HoE, 21 Oct): the strategy's daily returns over the sheet's window (the full research period until R-11's
+    scored window), as CSV (date, return), written in the same step as the sheet, for the fund summary's correlation
+    matrix. Never a holdout day: a series running past the research period is refused, not written."""
+    from sleeve_fund.research.metrics import daily_returns
+
+    ret = daily_returns(result.full_period.equity)
+    if len(ret) and ret.index[-1] > result.research_end:
+        raise ValueError(f"the returns run to {ret.index[-1]}, past the research period's end {result.research_end}: "
+                         "a holdout day would be in them")
+    path = returns_path(sheet)
+    path.write_text("date,return\n" + "".join(f"{t:%Y-%m-%d},{v!r}\n" for t, v in ret.items()), encoding="utf-8")
+    return path
+
+
+def oos_returns_path(sheet: Path) -> Path:
+    """(d) FINALIST-CORR: the out-of-sample daily returns and the asset's price return on those days, beside the sheet."""
+    return sheet.with_suffix(".oos-returns.csv")
+
+
+def write_oos_returns(result, sheet: Path) -> Path:
+    """(d) FINALIST-CORR (HoE, 21 Oct): the strategy's out-of-sample daily returns (the walk-forward test windows,
+    net of costs, a day out of the market a 0) and the asset's plain price return each of those days, as CSV
+    (date, return, price), for the fund summary's finalist correlation. Never a holdout day, as write_returns."""
+    from sleeve_fund.research.metrics import daily_returns
+
+    ret = result.oos_returns
+    if len(ret) and ret.index[-1] > result.research_end:
+        raise ValueError(f"the out-of-sample returns run to {ret.index[-1]}, past the research period's end "
+                         f"{result.research_end}: a holdout day would be in them")
+    price = daily_returns(result.research_closes).reindex(ret.index)
+    path = oos_returns_path(sheet)
+    path.write_text("date,return,price\n" + "".join(f"{t:%Y-%m-%d},{v!r},{p!r}\n"
+                                                    for t, v, p in zip(ret.index, ret, price)), encoding="utf-8")
+    return path
 
 
 def write_results(result, sheet: Path) -> Path:

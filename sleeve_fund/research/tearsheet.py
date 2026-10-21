@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 
 from sleeve_fund import funding, markets
-from sleeve_fund.research import mintrl, regime_split
+from sleeve_fund.research import analysis_pack, mintrl, regime_split
 from sleeve_fund.research.guardrails import CANDIDATE_CHECK, G1_RULES, MIN_OOS_TRADES, nearby_scored
 from sleeve_fund.research.ledger import IdeaLedger
 from sleeve_fund.research.metrics import (
@@ -624,11 +624,28 @@ def render(r: StudyResult, ledger: IdeaLedger, register=None, liquidation_ack: s
     if getattr(r, "hold_note", ""):
         out.append(f"Benchmark: {r.hold_note}.")
         out.append("")
+    if getattr(r, "bar_note", ""):  # BH-102 rule 3: which hold set the bar, both Sharpes beside it
+        out.append(f"G1 {r.bar_note}.")
+        out.append("")
+    if getattr(r, "hold_liquidated", None):  # BH-102: a 1x perp hold whose funding took its margin is liquidated
+        out.append("The perp hold was liquidated on " + "; ".join(r.hold_liquidated) + ", and held nothing after.")
+        out.append("")
     spot = getattr(r, "spot_hold_returns", None)
-    if spot is not None and len(spot.dropna()) >= 2:
+    perp = getattr(r, "perp_hold_returns", None)
+    if perp is not None and len(perp.dropna()) >= 2 and getattr(r, "bar_hold", "") not in ("", "perp hold"):
+        # BH-102 rule 3: the bar is another hold; the perp's beside it
+        p_ = summary(perp)
+        out.append(f"Holding the 1x perpetual instead, out-of-sample: CAGR {_pct(p_['cagr'])}, Sharpe "
+                   f"{_num(p_['sharpe'])}, max drawdown {_pct(p_['max_drawdown'])} (shown, not the G1 benchmark).")
+        out.append("")
+    elif spot is not None and len(spot.dropna()) >= 2:
         s_ = summary(spot)
         out.append(f"Holding spot instead, out-of-sample: CAGR {_pct(s_['cagr'])}, Sharpe {_num(s_['sharpe'])}, "
                    f"max drawdown {_pct(s_['max_drawdown'])} (shown, not the G1 benchmark).")
+        out.append("")
+    schedule = getattr(getattr(r, "full_period", None), "funding_schedule", "")
+    if schedule:
+        out.append(f"Funding schedule: {schedule}.")
         out.append("")
     stress = getattr(r, "funding_stress", None)
     if stress:
@@ -654,9 +671,14 @@ def render(r: StudyResult, ledger: IdeaLedger, register=None, liquidation_ack: s
     out.append(f"- Time in the market: {r.full_period.exposure.abs().gt(0.001).mean():.0%} of bars hold a position")
     out.append(f"- Stops clamped: {_n(getattr(r.full_period, 'stops_clamped', 0), 'trade')}, held at half the way to "
                "the liquidation price when the level loosened past it or funding moved it nearer")
+    refused = getattr(r.full_period, "entries_refused_liquidation", 0)
+    if refused:  # BH-102: a run the rule refuses throughout would otherwise show zero trades and say nothing
+        out.append(f"- Entries refused: {refused} entr{'y' if refused == 1 else 'ies'}, the stop more than its share "
+                   "of the way to the liquidation price (a fully paid 1x long is exempt)")
     out.append("")
     out.append(_double_fees_line(r))
     out.append("")
+    out += analysis_pack.section(r)  # R-17/R-18/R-19: risk, trades and costs, before the cost ladder
     if r.cost_ladder:
         chosen = getattr(r, "chosen_params", None) or r.default_params
         out.append(f"## Cost ladder (full research period, chosen settings {json.dumps(chosen)})")
@@ -722,6 +744,10 @@ def render(r: StudyResult, ledger: IdeaLedger, register=None, liquidation_ack: s
         out.append(f"- {_n(counts['variants'], 'distinct variant')} of this idea tried so far, in studies, backtests and "
                    f"paper strategies ({counts['evaluations']} evaluations including walk-forward refits): the N its "
                    f"results are judged by.{uncertain}")
+        from sleeve_fund.research.candidates import BUDGET_PER_IDEA, configurations
+
+        out.append(f"- Budget: {len(configurations(register, _idea(r)))} of {BUDGET_PER_IDEA} configurations used "
+                   "for this idea family (the fund summary shows it beside the ranking, R-20).")
     out.append(f"- {_n(project['ideas'], 'idea')} and {_n(project['variants'], 'distinct variant')} tested so far "
                f"across the project ({project['evaluations']} evaluations), shown for awareness. By family: "
                + ", ".join(f"{k} {v}" for k, v in project["ideas_by_family"].items()))

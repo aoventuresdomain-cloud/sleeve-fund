@@ -114,7 +114,8 @@ def _over(returns: pd.Series | None, prior: pd.Series, name: str) -> float | Non
 def split(trips: list[dict], bars: pd.DataFrame, hold_equity: pd.Series | None = None,
           equity: pd.Series | None = None) -> list[Split]:
     """trips: closed round trips (metrics.trades: opened, pnl); bars: the period's price bars; hold_equity: buy and
-    hold's equity over the same period; equity: the Strategy's own over it. One Split per dimension."""
+    hold's price path over the same period (the study passes the closes: price only, no fees); equity: the
+    Strategy's own over it. One Split per dimension."""
     lab = labels(daily(bars))
     hold = metrics.daily_returns(hold_equity) if hold_equity is not None and len(hold_equity) > 1 else None
     own = metrics.daily_returns(equity) if equity is not None and len(equity) > 1 else None

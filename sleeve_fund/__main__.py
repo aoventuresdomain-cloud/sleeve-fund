@@ -140,6 +140,11 @@ def main(argv: list[str] | None = None) -> int:
     out = Path(args.out) if args.out else TEARSHEETS / f"{spec.name}_{dataset}.md"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(render(result, ledger, register), encoding="utf-8")
+    from sleeve_fund.research.run import write_oos_returns, write_results, write_returns
+
+    write_results(result, out)  # the sheet's stored figures and daily returns beside it, as the dashboard's run writes
+    write_returns(result, out)
+    write_oos_returns(result, out)
     print(f"tear sheet: {out}")
     return 0
 

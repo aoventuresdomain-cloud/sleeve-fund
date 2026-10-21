@@ -56,6 +56,11 @@ class VenueProfile:
     merge_minutes: bool = False  # the loader's pages split minutes (bars built from trades)
     # time -> the loader's cursor for history starting then, so a backfill need not start at listing
     minute_cursor_at: Callable[[pd.Timestamp], str] | None = None
+    # (pair, cursor) -> (volume and taker_buy by open time, next cursor, caught_up), for the store's taker-buy
+    # volume beside its minutes (R-22); None where the venue's candles carry none
+    taker_loader: Callable[[str, str], tuple] | None = None
+    # (pair, start ms) -> the venue's settled funding records as it sends them, for the read-only spot check (R-02)
+    funding_raw: Callable[[str, int], list] | None = None
     # pair -> None, raising ValueError when the venue doesn't list it (public data, no key)
     check_listed: Callable[[str], None] | None = None
     request_interval: float = 1.0  # seconds between loader requests, within the venue's rate limit
@@ -551,8 +556,9 @@ def paper_venue_tick(pair: str, get_json=None) -> Decimal:
 
 
 def _binance_klines(pair: str, interval: str, start_ms: int | None = None, limit: int = 1500,
-                    get_json=None) -> pd.DataFrame:
-    """Candles by OPEN time, the forming one included."""
+                    get_json=None, taker: bool = False) -> pd.DataFrame:
+    """Candles by OPEN time, the forming one included. taker (R-22): a taker_buy column too, the base volume bought
+    by orders that took liquidity (the kline's taker-buy base volume)."""
     import urllib.parse
 
     from sleeve_fund.data import _get_json
@@ -563,10 +569,11 @@ def _binance_klines(pair: str, interval: str, start_ms: int | None = None, limit
     rows = (get_json or _get_json)(f"{BINANCE_FAPI}/klines?" + urllib.parse.urlencode(q))
     if isinstance(rows, dict):  # an error body: {"code": ..., "msg": ...}
         raise ValueError(f"Binance: {rows.get('msg', rows)}")
+    cols = ["open", "high", "low", "close", "volume"] + (["taker_buy"] if taker else [])
     if not rows:
-        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
-    df = pd.DataFrame([r[:6] for r in rows], columns=["t", "open", "high", "low", "close", "volume"])
-    out = df[["open", "high", "low", "close", "volume"]].astype(float)
+        return pd.DataFrame(columns=cols)
+    df = pd.DataFrame([r[:6] + ([r[9]] if taker else []) for r in rows], columns=["t", *cols])
+    out = df[cols].astype(float)
     out.index = pd.to_datetime(df["t"].astype("int64"), unit="ms", utc=True)
     out.index.name = "timestamp"
     return out
@@ -614,6 +621,15 @@ def binance_minutes(pair: str, cursor: str, get_json=None) -> tuple[pd.DataFrame
     return bars, nxt, len(bars) < 1500
 
 
+def binance_taker_minutes(pair: str, cursor: str, get_json=None) -> tuple[pd.DataFrame, str, bool]:
+    """binance_minutes with each minute's taker-buy base volume (R-22): one page of volume and taker_buy by open
+    time, the next cursor, and whether it caught up."""
+    bars = _binance_klines(pair, "1m", start_ms=int(cursor) if cursor else 0, get_json=get_json, taker=True)
+    if bars.empty:
+        return bars, cursor, True
+    return bars[["volume", "taker_buy"]], str(int(bars.index[-1].timestamp() * 1000)), len(bars) < 1500
+
+
 TRADES_TIMEOUT = 5  # seconds a request for a replayed stop's minute of trades may take (GAP-DOWN)
 TRADES_MAX_PAGES = 10  # pages of 1,000 read for one minute before the replay books its extreme instead
 
@@ -655,6 +671,21 @@ def binance_funding(pair: str, start_ms: int, get_json=None) -> list[tuple[int, 
     if isinstance(rows, dict):
         raise ValueError(f"Binance: {rows.get('msg', rows)}")
     return [(int(r["fundingTime"]), _number_or_none(r.get("fundingRate"))) for r in rows]  # a null: refused by funding
+
+
+def binance_funding_raw(pair: str, start_ms: int, get_json=None) -> list[dict]:
+    """The venue's settled funding records from `start_ms` exactly as it sends them (rates as its own strings), up to
+    3: the read-only spot check of the stored rates against the venue (R-02, Advisor) compares with these, not with
+    the loader's parsed figures, so a parse or scale slip in the loader would show."""
+    import urllib.parse
+
+    from sleeve_fund.data import _get_json
+
+    q = {"symbol": binance_symbol(pair), "startTime": start_ms, "limit": 3}
+    rows = (get_json or _get_json)(f"{BINANCE_FAPI}/fundingRate?" + urllib.parse.urlencode(q))
+    if isinstance(rows, dict):
+        raise ValueError(f"Binance: {rows.get('msg', rows)}")
+    return rows
 
 
 BINANCE_FUTURES_DATA = "https://fapi.binance.com/futures/data"
@@ -785,6 +816,8 @@ BINANCE = register(VenueProfile(
     data_client=_binance_data_client,
     minute_loader=binance_minutes,
     minute_cursor_at=lambda ts: str(int(ts.timestamp() * 1000)),
+    taker_loader=binance_taker_minutes,
+    funding_raw=binance_funding_raw,
     check_listed=lambda pair: (_binance_listing(pair), None)[1],
     request_interval=0.5,  # a 1,500-candle page weighs 10 of Binance's 2,400 a minute
     # BTC and ETH perpetuals trade a cent or less apart; 0.01% half spread is cautious for them, light for small ones.
