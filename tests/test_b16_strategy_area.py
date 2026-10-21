@@ -50,7 +50,9 @@ def test_nav_says_strategy(client):
 def test_list_holds_every_built_strategy(client):
     c, _ = client
     html = c.get("/strategy", auth=AUTH).text
-    assert len(QR_IDS) == 21
+    # R-29: a merged definition adds a QR file with no deploy, so at least the 21 of 21 Oct (their pins are frozen in
+    # test_b16_definition_titles.py, and test_research_gaps.py reads each pinned file, so none can go missing).
+    assert len(QR_IDS) >= 21
     for fid in QR_IDS + ["rsi-bands", "rsi-pullback"]:
         assert f"/strategy?s={fid}" in html
     for model in sa.MODELS:
