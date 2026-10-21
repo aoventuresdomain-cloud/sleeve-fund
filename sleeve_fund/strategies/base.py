@@ -604,9 +604,8 @@ def fund_margin(owner, ts, amount: float) -> None:
     BH-102 (Advisor 21 Oct): a credit goes to the available balance at every leverage, never to the margin, so it
     never moves the price away. At 1x (_liq_free set) a payment comes off that balance first and only the rest off the
     margin (a fully invested 1x has none spare); above 1x a payment is still all the margin's (LIQ-FUND-1), the
-    conservative side, until a drill shows the venue's rule (G2 drill item). The venue's help page, "Funding Fee
-    Calculation" (https://www.bybit.com/en/help-center/article/Funding-fee-calculation), as a web search summarised it
-    on 21 Oct 2026, not read here: a shortfall of the available balance is taken "from the position's initial
+    conservative side, until a drill shows the venue's rule (G2 drill item). The venue's help page on funding fee calculation, as a web
+    search summarised it on 21 Oct 2026, not read here: a shortfall of the available balance is taken "from the position's initial
     margin", bringing the liquidation price closer (isolated margin only). Unverified: confirm in drill."""
     since = getattr(owner, "_liq_from", None)
     if getattr(owner, "_liq_px", None) is not None and since is not None and int(pd_ts(ts).value) > since:
