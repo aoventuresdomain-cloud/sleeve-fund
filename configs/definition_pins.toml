@@ -88,3 +88,15 @@ idea_hash = "703feb3d33753b1c"
 [qr23_vma_band_sma50_long]
 definition_hash = "532b63bfc5402bf8"
 idea_hash = "ea3b0412d58f1c7f"
+
+[qr23b_vma_band_sma50_trail_long]
+definition_hash = "afa7600b0a9ee751"
+idea_hash = "19dd12fe71b499ca"
+
+[qr21b_trend_sma200_trail_long]
+definition_hash = "61a45c040508d6cc"
+idea_hash = "bc267b3b2ec714e0"
+
+[qr01e_trend_multispeed_trail_long]
+definition_hash = "8ffdb00228df3499"
+idea_hash = "100cdd465d4dca00"

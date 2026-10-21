@@ -1,0 +1,60 @@
+# QR-B2 multi-speed trend family, next try (21 Oct 2026, Quant Researcher). Decision candle: 4h.
+# Variant of qr01b long (row 3) with the trend exit set (PM 14:42-14:44 UK; values are the type's convention, Advisor
+# 21 Oct). Trail-only comparison; its SL + TP 3R version waits for TP-EXIT.
+version = 1
+name = "qr01e-trend-multispeed-trail-long"
+title = "Trend Consensus (3 speeds, 4h) + 3 ATR Trail · Long"
+reason = """qr01b long (three EMA pairs vote; long when all three agree, out when two of the three turn down; 3 ATR(14)
+stop) with a 3 ATR(14) trail below the close that only tightens. Re-arm (Advisor (iii)): enter only on the candle the
+three-vote condition turns true, all three agreeing on this candle and not all on the one before, so a trail exit is
+not re-bought the next candle while the votes still agree. Same as qr01b's level entry except a window's first entry
+and after a trail or stop exit. Held at 1x."""
+
+[blocks.f1]
+kind = "ema"
+period = 8
+
+[blocks.s1]
+kind = "ema"
+period = 32
+
+[blocks.f2]
+kind = "ema"
+period = 16
+
+[blocks.s2]
+kind = "ema"
+period = 64
+
+[blocks.f3]
+kind = "ema"
+period = 32
+
+[blocks.s3]
+kind = "ema"
+period = 128
+
+[blocks.atr]
+kind = "atr"
+period = 14
+
+[long]
+entry = { all = [
+    { left = "f1", op = ">", right = "s1" },
+    { left = "f2", op = ">", right = "s2" },
+    { left = "f3", op = ">", right = "s3" },
+    { any = [
+        { left = { prev = "f1" }, op = "<=", right = { prev = "s1" } },
+        { left = { prev = "f2" }, op = "<=", right = { prev = "s2" } },
+        { left = { prev = "f3" }, op = "<=", right = { prev = "s3" } },
+    ] },
+] }
+exit = { any = [
+    { all = [{ left = "f1", op = "<", right = "s1" }, { left = "f2", op = "<", right = "s2" }] },
+    { all = [{ left = "f1", op = "<", right = "s1" }, { left = "f3", op = "<", right = "s3" }] },
+    { all = [{ left = "f2", op = "<", right = "s2" }, { left = "f3", op = "<", right = "s3" }] },
+] }
+
+[exits]
+stop = { level = { sub = ["close", { mul = [3.0, "atr"] }] } }
+trail = { level = { sub = ["close", { mul = [3.0, "atr"] }] }, ratchet = true }
