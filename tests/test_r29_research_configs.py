@@ -184,10 +184,8 @@ def _stage_script() -> str:
 def test_the_study_job_stages_the_r06_r07_variants_beside_the_definitions(repo):
     """CR M1 on R-06/R-07 (HoE): the mount replaces the image's configs/definitions, so the variants a study list
     names (configs/definitions/variants/*.toml) are staged under it too, or a configs_from=main study can't find them.
-    Anything deeper, or not named as a definition, is still left out."""
-    for path in ("configs/definitions/variants/qr01b_v1_funding.toml", "configs/definitions/variants/sub/x.toml",
-                 "configs/definitions/variants/QR2.toml"):
-        _write(path)(repo)
+    Anything deeper, or not named as a definition, fails the run (the next cell)."""
+    _write("configs/definitions/variants/qr01b_v1_funding.toml")(repo)
     _git(repo, "add", "-A")
     _git(repo, "commit", "-qm", "variants")
     out = subprocess.run(["bash", "-c", _stage_script()], cwd=repo, capture_output=True, text=True)
@@ -248,11 +246,21 @@ def test_a_study_from_main_says_its_tries_are_counted_by_hand(tmp_path, monkeypa
     assert rescore.main([str(lst), "--rows", "1", "--tries-by-hand"], run=spy, journal=lambda: None) == 0
     assert rescore.main([str(lst), "--rows", "1"], run=spy, journal=lambda: None) == 0
     assert seen == [{"notes": (rescore.TRIES_BY_HAND,)}, {}]
+    # The study itself stubbed (its sheet's caveats list r.notes: tearsheet.render): the run adds the notes it is given.
+    import types
+
+    from sleeve_fund.research import run as run_mod
+    from sleeve_fund.research import study, tearsheet
+
+    monkeypatch.setattr(study, "run_study", lambda *a, **k: types.SimpleNamespace(
+        notes=[], fee_basis=None, breakeven=None))
+    monkeypatch.setattr(tearsheet, "render", lambda r, *a, **k: "\n".join(f"- {n}" for n in r.notes))
+    monkeypatch.setattr(run_mod, "write_results", lambda r, out: None)
     b = venue("binance")
     monkeypatch.setattr(b, "contract", lambda pair: binance_contract(pair, get_json=lambda url: INFO))
     monkeypatch.setattr(funding, "DEFAULT_ROOT", tmp_path / "funding")
     hist = HistoryStore(tmp_path / "hist")
-    hist.append("BINANCE", "BTC/USDT", _stored_minutes(130), cursor="x")
+    hist.append("BINANCE", "BTC/USDT", _stored_minutes(3), cursor="x")
     req = StudyRequest(strategy="buy_and_hold", pair="BTC/USDT", venue="binance", minutes=240,
                        train_days=60, test_days=30, holdout_days=30)
     marked = run_store_study(req, ledger_path=tmp_path / "l.jsonl", out_dir=tmp_path / "a", history=hist,

@@ -55,12 +55,22 @@ jobs:
       - uses: actions/checkout@v4
         if: inputs.configs_from == 'main'
         with:
-          ref: ${{ github.sha }}  # main at the dispatch commit (the job runs on main only)
+          ref: ${{ github.sha }}  # main at the dispatch commit, by SHA: main moving after dispatch changes nothing
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check the commit is on main
+        if: inputs.configs_from == 'main'
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          # Advisor R-29 (1): only a commit on main is read, never a branch's configs.
+          git fetch --quiet origin main
+          git merge-base --is-ancestor "$SHA" origin/main || { echo "::error::$SHA is not on main"; exit 1; }
       - name: Stage the research configs
         if: inputs.configs_from == 'main'
         run: |
           # An allowlist read from git itself: regular files (100644 blob) named exactly as below. A symlink or any
-          # other type there fails the run; a file with another name is left out and named.
+          # other type there fails the run, and so does a file with any other name, named (Advisor R-29 (4)).
           set -euo pipefail
           mkdir -p staged/definitions/variants staged/studies
           while IFS=$'\t' read -r meta path; do
@@ -72,7 +82,7 @@ jobs:
             # The mount replaces the image's configs/definitions, so the variants a list names go with it (CR M1).
             elif [[ $path =~ ^configs/definitions/variants/[a-z0-9_]+\.toml$ ]]; then cp -- "$path" staged/definitions/variants/
             elif [[ $path =~ ^configs/studies/[a-z0-9_-]+\.md$ ]]; then cp -- "$path" staged/studies/
-            else echo "::notice::left out, not a research config by name: $path"; fi
+            else echo "::error::not a research config by name: $path"; exit 1; fi
           done < <(git ls-tree -r HEAD -- configs/definitions configs/studies)
           echo "staged $(ls staged/definitions/*.toml 2>/dev/null | wc -l) definitions, $(ls staged/definitions/variants | wc -l) variants and $(ls staged/studies | wc -l) study lists"
       - name: Check the inputs
@@ -127,12 +137,13 @@ jobs:
           FROM: ${{ inputs.configs_from }}
           SHA: ${{ github.sha }}
         run: |
-          MOUNTS=
+          MOUNTS= TRIES=
           if [ "$FROM" = main ]; then
             MOUNTS="-v /opt/sleeve-research/$SHA/definitions:/app/configs/definitions:ro -v /opt/sleeve-research/$SHA/studies:/app/configs/studies:ro"
+            TRIES="--tries-by-hand"  # each sheet says so until R-25 counts tries by family (docs/research-definitions.md)
             echo "research configs from main at $SHA"
           else
             echo "research configs from the deployed image"
           fi
           ssh -i ~/.ssh/id_deploy -o ServerAliveInterval=30 -o ServerAliveCountMax=10 "$USER_AT@$HOST" \
-            "cd /opt/sleeve-fund && sudo docker compose run --rm -T --no-deps --name study-$RUN_ID $MOUNTS dashboard python -u -m sleeve_fund.research.rescore configs/studies/$LIST $ROWS --venue $VENUE --pair $PAIR $DRY"
+            "cd /opt/sleeve-fund && sudo docker compose run --rm -T --no-deps --name study-$RUN_ID $MOUNTS dashboard python -u -m sleeve_fund.research.rescore configs/studies/$LIST $ROWS --venue $VENUE --pair $PAIR $DRY $TRIES"
