@@ -50,7 +50,7 @@ def test_the_target_level_is_on_the_instruments_tick():
 
 @pytest.mark.parametrize("side", [1, -1], ids=["long", "short"])
 def test_the_outage_replay_takes_an_exact_touch_and_never_books_better_than_the_level(side):
-    level, px = 61_200.0 if side > 0 else 58_800.0, 1.0
+    level = 61_200.0 if side > 0 else 58_800.0
     flat = 60_000.0
     touch = (1, flat, level if side > 0 else flat, flat if side > 0 else level)
     hit = replay_missed([touch], side, {}, {}, level, target_px=level * (1 - side * 0.0005))
@@ -85,7 +85,7 @@ def test_an_exact_touch_of_the_target_fires_in_every_path(path, label, perp, pro
     import test_hub_146_qa as qa
 
     def run(p):
-        kw = dict(side=side, perp=perp, profile=profile, tp=TP, stop=0.01, leave=25)
+        kw = {"side": side, "perp": perp, "profile": profile, "tp": TP, "stop": 0.01, "leave": 25}
         if path == "backtest":
             return None, qa.backtest(p, **kw)
         if path == "paper":

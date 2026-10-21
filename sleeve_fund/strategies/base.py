@@ -292,7 +292,7 @@ def replay_missed(minutes, side: int, venue: dict, guards: dict, target: float |
     touch), never better than target_px."""
     target_px = target if target_px is None else target_px
     for close, o, h, lo in minutes:
-        worst, best = (lo, h) if side > 0 else (h, lo)
+        worst = lo if side > 0 else h
         for intent in _VENUE_FIRST:
             level = venue.get(intent)
             if level is not None and side * (o - level) <= 0:
