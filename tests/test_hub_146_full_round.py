@@ -120,7 +120,7 @@ def test_na2_a_booked_target_agrees_to_the_cent_in_report_journal_and_cash(label
     tp, entry = tps[0], next(o for o in orders if o["intent"] == "entry")
     (ef,) = fills_of(res, entry["order_id"])
     (tf,) = fills_of(res, tp["order_id"])
-    level = round(ef["price"] * (1 + side * 0.02), 1)
+    level = Price_level(res, side)
     booked = tp_model(level, side)
     assert tf["price"] == pytest.approx(booked, abs=0.1), (tf, booked)  # to the tick
     assert pd.Timestamp(tf["ts"]) == minute(11)  # stamped at the minute it traded in
@@ -162,10 +162,12 @@ def test_l20_a_booked_target_uses_max_half_spread_or_5bp_as_taker_slippage(label
 
 
 def Price_level(res, side, tp=0.02):
-    """The target's level from the entry's journal fill, to the tick."""
+    """The target's level from the entry's journal fill, on the tick past it (target_on_tick: TEC-TPEXIT-HUB146)."""
+    from sleeve_fund.instruments import target_on_tick
+
     entry = next(o for o in orders_of(res) if o["intent"] == "entry")
     (ef,) = fills_of(res, entry["order_id"])
-    return round(ef["price"] * (1 + side * tp), 1)
+    return target_on_tick(ef["price"] * (1 + side * tp), side, 1)
 
 
 @pytest.mark.parametrize("label, perp, profile, side", SETUPS, ids=IDS)

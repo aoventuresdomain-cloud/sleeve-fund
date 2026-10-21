@@ -102,12 +102,33 @@ def check_perp_stop(strategy: str, params: dict | None, risk_profile: str) -> No
                          f"leverage cap to {STOPLESS_MAX_LEVERAGE:g}x, or set a stop-loss, an ATR stop or a swing stop")
 
 
+# HoE 21 Oct (TP-RESTART): an {r} target is set from the opening fill and held in memory only, so until it is journaled
+# and restored on a restart, paper refuses to start one. A {level} target is worked out afresh at each close.
+TARGET_RESTART_REFUSAL = "take-profit at {n}×R can't run on paper until its target survives a restart (TP-RESTART)"
+
+
+def check_target_restart(strategy: str, params: dict | None) -> None:
+    """Refuse to start a rules strategy whose definition takes profit at N×R, shared or on either side (TP-RESTART).
+    Called where paper starts a strategy; backtests and studies still run it."""
+    from sleeve_fund.strategies.definitions import side_exits
+
+    defn = (params or {}).get("definition")
+    if strategy != "rules" or not isinstance(defn, dict):
+        return
+    for side in ("long", "short"):
+        tp = side_exits(defn.get("exits"), side).get("take_profit")
+        if isinstance(tp, dict) and "r" in tp:
+            raise ValueError(TARGET_RESTART_REFUSAL.format(n=f"{tp['r']:g}"))
+
+
 __all__ = [
     "PERP_WEIGHT_REFUSAL",
     "REGISTRY",
     "STOPLESS_MAX_LEVERAGE",
+    "TARGET_RESTART_REFUSAL",
     "check_perp_sizing",
     "check_perp_stop",
+    "check_target_restart",
     "places_stop",
     "BuyAndHold",
     "BuyAndHoldConfig",
