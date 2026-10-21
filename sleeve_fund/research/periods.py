@@ -16,6 +16,7 @@ import pandas as pd
 
 from sleeve_fund.research.metrics import daily_closes, fills_to_rows, max_drawdown, summary, trades
 
+MIN_SHARPE_DAYS = 60
 MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 
 
@@ -79,7 +80,8 @@ def periods(equity: pd.Series, freq: str, trips: list[dict] | None = None) -> li
         if freq == "Y":
             path = pd.concat([pd.Series([prev]), values.reset_index(drop=True)], ignore_index=True)
             rets = path.pct_change().dropna()
-            row.sharpe = summary(rets)["sharpe"] if len(rets) >= 2 else None
+            # A partial year's Sharpe on under MIN_SHARPE_DAYS days is noise, so n/a (Advisor (f), 21 Oct 2026).
+            row.sharpe = summary(rets)["sharpe"] if len(rets) >= (MIN_SHARPE_DAYS if partial else 2) else None
             row.max_dd = max_drawdown(path)
             row.trades = sum(1 for t in trips or [] if t.get("closed") is not None
                              and pd.Timestamp(t["closed"]).year == p.year)
@@ -110,7 +112,7 @@ class TradeRow:
     ret: float  # of the entry notional
     reason: str
     equity_after: float
-    drawdown: float  # the equity after against its marked-to-market peak so far
+    drawdown: float  # at the trade's close: the equity after against its daily marked-to-market peak so far
 
 
 def _naive(ts) -> pd.Timestamp:
@@ -142,7 +144,7 @@ def trade_rows(run) -> list[TradeRow]:
     idx = pd.DatetimeIndex([_naive(t) for t in eq.index])
     values = eq.to_numpy(dtype=float)
     start, end = float(values[0]), float(values[-1])
-    trips = trades(fills_to_rows(run.fills), run.shorts, run.funding, open_trip=True)
+    trips = trades(fills_to_rows(run.fills), run.shorts, run.funding, getattr(run, "insurance", None), open_trip=True)
     decisions = getattr(run, "decisions", {}) or {}
     rows, booked = [], start
     for n, t in enumerate(trips, 1):
@@ -171,7 +173,7 @@ def trade_rows(run) -> list[TradeRow]:
 
 CSV_COLUMNS = ("trade", "side", "entry_time", "entry_price", "exit_time", "exit_price", "size", "notional",
                "holding_hours", "fees", "funding", "pnl", "pnl_pct_of_equity", "return_on_notional", "exit_reason",
-               "equity_after", "drawdown")
+               "equity_after", "drawdown_at_trade_close")
 
 
 def trades_csv(rows: list[TradeRow]) -> str:

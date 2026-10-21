@@ -132,8 +132,8 @@ def _period_tables(r: StudyResult) -> list[str]:
     trips = [vars(t) for t in periods.trade_rows(r.full_period) if t.closed is not None]
     years, hold_years = periods.periods(eq, "Y", trips), {p.label: p for p in periods.periods(hold, "Y")}
     out = ["## Returns by year", "",
-           f"Over the scored window ({_scored_words(eq)}), after fees and funding; a partial year says which part. "
-           "Trades are counted in the year they closed.", "",
+           f"Over the scored window ({_scored_words(eq)}), after fees and funding; a partial year says which part, "
+           f"and its Sharpe is n/a under {periods.MIN_SHARPE_DAYS} days. Trades are counted in the year they closed.", "",
            "| Year | Strategy | Buy and hold | Difference | Strategy Sharpe | Buy-and-hold Sharpe | Strategy max DD "
            "| Buy-and-hold max DD | Trades |",
            "| --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
@@ -177,8 +177,10 @@ def _every_trade(r: StudyResult, files: str | None, shown: int) -> list[str]:
     eq, _ = periods.scored(r)
     out = ["## Every trade", "",
            f"Starting capital: {float(eq.iloc[0]):,.0f}. Every trade of the scored window ({_scored_words(eq)}), after "
-           "fees and funding, with the equity after it and its drawdown from the equity's peak so far (marked to "
-           "market daily); P&L % is of the equity before the trade. Sizes round to the venue's lot, so a smaller "
+           "fees and funding, with the equity after it and its drawdown at the trade's close from the equity's peak so far "
+           "(marked to market daily; the headline max drawdown, from the whole daily curve, can be deeper, since a "
+           "trough inside a trade shows here only if it lasts to the close); funding and any insurance-fund cover "
+           "are booked to the trade they fell in; P&L % is of the equity before the trade. Sizes round to the venue's lot, so a smaller "
            "account's sizes and returns can differ slightly from a larger one's. A position still open at the end is "
            "the last row, marked to market there, so the P&L column sums to the end equity less the start.", ""]
     if files:
@@ -188,7 +190,7 @@ def _every_trade(r: StudyResult, files: str | None, shown: int) -> list[str]:
     if not rows:
         return out + ["No trades.", ""]
     out += ["| # | Side | Entry | Entry price | Exit | Exit price | Size | Notional | Held | Fees | Funding | P&L "
-            "| P&L % | Exit reason | Equity after | Drawdown |",
+            "| P&L % | Exit reason | Equity after | Drawdown at trade close |",
             "| --- |" + " --- |" * 15]
     for t in rows[:shown]:
         out.append(f"| {t.n} | {t.side} | {t.opened:%d %b %Y %H:%M} | {t.entry_px:,.6g} "
