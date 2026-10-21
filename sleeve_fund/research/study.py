@@ -877,7 +877,7 @@ def run_study(
                 trip_sizes=_trip_sizes(window_trips, test_idx[0] - bar, run.fills, run.decisions),
                 gross_exposure=_gross_exposure(run.exposure, test_idx[0], test_idx[-1]),
                 **_trip_reconcile(booked, _flat_until(run, test_idx[0] - bar), test_idx[0] - bar, test_idx[-1],
-                                  _trip_charges(window_trips, test_idx[0] - bar, absorbed)),
+                                  _trip_charges(window_trips, test_idx[0] - bar, absorbed), run.decisions),
             ),
             test_ret, b_ret, parts, run,
         )
@@ -1517,11 +1517,14 @@ def _sides_words(run, params: dict) -> str:
     return {frozenset({1}): "long only", frozenset({-1}): "short only"}.get(frozenset(sides), "long and short")
 
 
-def _trip_reconcile(trips: list[dict], equity: pd.Series, test_start, last, charges: list[tuple]) -> dict:
+def _trip_reconcile(trips: list[dict], equity: pd.Series, test_start, last, charges: list[tuple],
+                    decisions: dict | None = None) -> dict:
     """RANDOM-ENTRY: a window's counted trips as the engine booked them (pnl after fees, fills and funding over
     entry notional, less any ABSORB-GAP charge), and their pnl against what the window's equity did less its carried
     trips': a trip still open at the end from the close before it opened, one carried in to the close it ended at.
-    equity: the window's (flat at the starting capital up to and at test_start)."""
+    equity: the window's (flat at the starting capital up to and at test_start). decisions: the run's, by order id;
+    a trip its stop closed carries stop_gap, what filling that exit at the stop's level, as the draws' are, adds to
+    its return (STOP-FILL gap; Advisor ruling (A), HoE 21 Oct)."""
     start = _utc(test_start)
     charge = dict(charges)
     idx = equity.index if equity.index.tz is not None else equity.index.tz_localize("UTC")
@@ -1542,9 +1545,24 @@ def _trip_reconcile(trips: list[dict], equity: pd.Series, test_start, last, char
             c = charge.get(_utc(t["opened"]), 0.0)
             counted.append({"opened": _utc(t["opened"]), "closed": _utc(t["closed"]), "side": int(t["side"]),
                             "ret": (t["pnl"] / t["cost"] if t["cost"] else 0.0) - c,
-                            "exit_ratio": t["exit_px"] / t["entry_px"] if t["entry_px"] else 1.0})
+                            "exit_ratio": t["exit_px"] / t["entry_px"] if t["entry_px"] else 1.0,
+                            **_stop_gap(t, (decisions or {}).get(str(t.get("exit_order"))))})
             pnl += t["pnl"] - c * t["cost"]
     return {"trip_returns": counted, "trip_reconcile": (pnl, end - base - carried, base)}
+
+
+def _stop_gap(trip: dict, decision: dict | None) -> dict:
+    """A trip's stop exit, if its stop closed it: {"stopped": True, "stop_gap": side x (the stop's level - the
+    price it filled at) over the entry price}; else {}. The backtest books a stop at the bar's low less a slippage
+    (a short's high plus), the draws' replay at the level, so the gap is what the strategy gives up to the draws."""
+    if not decision or decision.get("intent") != "stop_loss":
+        return {}
+    sig, side, entry = decision.get("signal") or {}, int(trip["side"]), trip["entry_px"]
+    level = sig.get("trigger", sig.get("stop_px"))
+    if level is None and sig.get("stop_loss") is not None:
+        level = entry * (1 - side * float(sig["stop_loss"]))
+    gap = side * (float(level) - trip["exit_px"]) / entry if level is not None and entry else 0.0
+    return {"stopped": True, "stop_gap": gap}
 
 
 def _in_market_bars(exposure: pd.Series, first, last) -> int:
@@ -1639,7 +1657,7 @@ def _filled_benchmarks(prices, folds, test_bars, taker, half, cost_per_side, sho
     windows' equity within RECONCILE_PP, else the comparison is NOT JUDGED."""
     index = prices.index.tz_localize("UTC") if prices.index.tz is None else prices.index
     pricer = fill.pricer(prices, cost_per_side)
-    windows, placed, realised = [], [], []
+    windows, placed, realised, gaps, stops = [], [], [], [], []
     trips_total = equity_total = 1.0
     for f in folds:
         end = bar(f.test_end)
@@ -1654,6 +1672,8 @@ def _filled_benchmarks(prices, folds, test_bars, taker, half, cost_per_side, sho
             r = t["ret"] + (fill.run_taker - taker) * (1 + t["exit_ratio"])  # a rung's fee in place of the run's
             uncharged = dict(getattr(f, "trip_charges", []) or []).get(t["opened"], 0.0) if not charged else 0.0
             realised.append(r + uncharged)
+            gaps.append(t.get("stop_gap", 0.0))
+            stops.append(bool(t.get("stopped")))
         if f.trip_reconcile is not None:
             pnl, moved, base = f.trip_reconcile
             if base:
@@ -1663,7 +1683,8 @@ def _filled_benchmarks(prices, folds, test_bars, taker, half, cost_per_side, sho
     in_market = sum(f.in_market_bars for f in folds) / bars if bars else None
     realised = np.asarray(realised, dtype=float)
     entry = random_entry_filled(placed, realised, windows, pricer, (trips_total - 1, equity_total - 1),
-                                in_market=in_market)
+                                in_market=in_market, gaps=np.asarray(gaps, dtype=float),
+                                stops=np.asarray(stops, dtype=bool))
     side = random_side_filled(placed, realised, windows, pricer) if shorts else None
     return entry, side
 

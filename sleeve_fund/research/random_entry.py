@@ -34,6 +34,10 @@ REPLACED = "sizes drawn from the variant's own with replacement (a window's trad
 # equity did over them within this much, absolute, or the comparison is NOT JUDGED.
 RECONCILE_PP = 0.005
 NOT_JUDGED = "NOT JUDGED"
+# STOP-FILL gap (Advisor ruling (A), HoE 21 Oct): the two sides book stops differently until STOP-FILL unifies them.
+STOP_FILL_LINE = ("random draws book stops at the level; the Strategy books the bar's low less 0.05%; the bias is "
+                  "against the Strategy")
+MARGINAL = "marginal FAIL, within fill-model gap; re-judge after STOP-FILL unification"
 
 
 @dataclass(frozen=True)
@@ -72,6 +76,17 @@ class RandomEntryResult:
     held_back: int = 0  # draws the engine would have held back (no level yet, or on the wrong side), priced flat
     stopped_share: float = 0.0  # the draws' trips that filled at a level inside a candle
     why_not: str = ""  # why the comparison can't be judged (RANDOM-ENTRY: exits the draws can't fill)
+    strategy_stops: int = 0  # the strategy's counted trips its stop closed
+    draw_stops: float = 0.0  # the draws' trips that stopped out, per draw
+    # The STOP-FILL gap: the strategy's stop exits re-priced at their levels, as the draws' are; what that adds to its
+    # total return, and the percentile its return would then reach (None: the close-priced comparison).
+    gap_return: float = 0.0
+    gap_percentile: float | None = None
+
+    @property
+    def marginal(self) -> bool:
+        """A FAIL that the STOP-FILL gap added back would turn into a PASS: still a FAIL, never promoted."""
+        return self.verdict == "FAIL" and self.gap_percentile is not None and self.gap_percentile >= BAR
 
     @property
     def unreconciled(self) -> bool:
@@ -116,6 +131,13 @@ class RandomEntryResult:
                     f"funding charged at the stored settlement times")
             if self.held_back:
                 out += f"; {self.held_back} draw trips priced flat, as the engine would have held them back"
+            out += (f"; {STOP_FILL_LINE}: {self.strategy_stops} stop exits in the Strategy's trips, "
+                    f"{self.draw_stops:.1f} per draw; at the level its return would be {self.gap_return * 100:+.2f} "
+                    f"points higher")
+            if self.gap_percentile is not None:
+                out += f", {self.gap_percentile - self.return_percentile:+.0f} percentile points"
+            if self.marginal:
+                out = f"{MARGINAL}: {out}"
         return out
 
 
@@ -335,11 +357,14 @@ def _filled_windows(trades: list[Trade], windows: list[tuple[int, int]]):
 
 def random_entry_filled(trades: list[Trade], realised: np.ndarray, windows: list[tuple[int, int]], pricer,
                         reconciled: tuple, draws: int = DRAWS, seed: int = 0, in_market: float | None = None,
-                        leverage: float | None = None) -> RandomEntryResult:
+                        leverage: float | None = None, gaps: np.ndarray | None = None,
+                        stops: np.ndarray | None = None) -> RandomEntryResult:
     """RANDOM-ENTRY: the strategy's realised trip returns (realised[k] for trades[k]: pnl over entry notional, after
     fees, fills and funding, less any ABSORB-GAP charge) against draws that keep its trips' count, sides and holding
     periods (as caps), placed at random without overlap in each window and priced by `pricer` (fills.Pricer) as the
-    engine fills them. reconciled: (the counted trips compounded on equity, the equity curve over them)."""
+    engine fills them. reconciled: (the counted trips compounded on equity, the equity curve over them). gaps[k]:
+    what filling trades[k]'s stop exit at its level adds to its return (0 for a trip no stop closed); stops[k]: its
+    stop closed it."""
     rng = np.random.default_rng(seed)
     per_window, test_bars, held = _filled_windows(trades, windows)
     n = sum(len(w[2]) for w in per_window)
@@ -350,6 +375,10 @@ def random_entry_filled(trades: list[Trade], realised: np.ndarray, windows: list
     levs = [_levs([trades[k] for k in w[4]], leverage) for w in per_window]
     actual = np.concatenate([np.asarray(realised, dtype=float)[w[4]] * (f if sized else 1)
                              for w, f in zip(per_window, sizes)])
+    ks = [k for w in per_window for k in w[4]]
+    gap = np.zeros(len(realised)) if gaps is None else np.asarray(gaps, dtype=float)
+    gapped = actual + np.concatenate([gap[w[4]] * (f if sized else 1) for w, f in zip(per_window, sizes)])
+    strategy_stops = 0 if stops is None else int(np.asarray(stops, dtype=bool)[ks].sum())
     rets, sharpes = np.empty(draws), np.empty(draws)
     how, held_back, stopped, priced = set(), 0, 0, 0
     for d in range(draws):
@@ -376,6 +405,8 @@ def random_entry_filled(trades: list[Trade], realised: np.ndarray, windows: list
         weak=exposure > WEAK_EXPOSURE, disagree=abs(ret_pct - sharpe_pct) > DISAGREE,
         sizing=(REPLACED if REPLACED in how else PERMUTED) if sized else "", reconciled=reconciled,
         held_back=held_back, stopped_share=stopped / priced if priced else 0.0,
+        strategy_stops=strategy_stops, draw_stops=stopped / draws, gap_return=_compound(gapped) - strategy_return,
+        gap_percentile=float((rets < _compound(gapped)).mean() * 100),
     )
 
 

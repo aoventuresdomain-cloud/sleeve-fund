@@ -13,9 +13,10 @@ import pandas as pd
 import pytest
 
 from sleeve_fund.research import study as st
-from sleeve_fund.research.fills import Pricer, unmodelled
+from sleeve_fund.research.fills import DrawFills, Pricer, unmodelled
 from sleeve_fund.research.ledger import IdeaLedger
-from sleeve_fund.research.random_entry import NOT_JUDGED, RandomEntryResult
+from sleeve_fund.research.random_entry import (MARGINAL, NOT_JUDGED, STOP_FILL_LINE, RandomEntryResult, Trade,
+                                               random_entry_filled)
 from sleeve_fund.strategies.definitions import to_params
 from sleeve_fund.strategies.rules import SPEC as RULES
 from sleeve_fund.venues import venue
@@ -207,3 +208,69 @@ def test_an_exit_the_draws_dont_model_is_refused_in_words():
         Pricer(slow, _candles([FLAT] * 3), 60, 0.0)
     fill = st.DrawFill(None, 60, None, None, 0.001, refused="its draws can't be filled: test")
     assert fill.refused and math.isfinite(fill.run_taker)
+
+
+# ---- the STOP-FILL gap (Advisor ruling (A), HoE 21 Oct): reported, never promoted -----------------------------------
+
+def test_the_sheet_says_how_each_side_books_a_stop_and_counts_each_sides_stop_exits(stop_heavy):
+    re_ = stop_heavy.random_entry
+    stopped = [t for f in stop_heavy.folds for t in f.trip_returns if t.get("stopped")]
+    assert re_.strategy_stops == len(stopped) > 0 and re_.draw_stops > 0
+    assert STOP_FILL_LINE in re_.words and f"{re_.strategy_stops} stop exits in the Strategy's trips" in re_.words
+    assert f"{re_.draw_stops:.1f} per draw" in re_.words
+
+
+def test_the_gap_is_the_strategys_stop_exits_re_priced_at_their_levels(stop_heavy):
+    """The backtest books a long's stop at the bar's low less a slippage, below its level: each gap is a gain given
+    up to the draws, and the gap in total return is the realised trips compounded with them less without."""
+    re_ = stop_heavy.random_entry
+    trips = [t for f in stop_heavy.folds for t in f.trip_returns]
+    gaps = np.array([t.get("stop_gap", 0.0) for t in trips])
+    realised = np.array([t["ret"] for t in trips])
+    assert (gaps[[bool(t.get("stopped")) for t in trips]] > 0).all() and gaps.sum() > 0
+    assert re_.gap_return == pytest.approx(float(np.prod(1 + realised + gaps) - np.prod(1 + realised)), abs=1e-12)
+    assert re_.gap_percentile >= re_.return_percentile
+    assert "percentile points" in re_.words
+
+
+def test_a_stop_exits_gap_is_side_times_level_less_fill_over_entry():
+    long_ = {"side": 1, "entry_px": 100.0, "exit_px": 94.9}
+    stop = {"intent": "stop_loss", "signal": {"entry_px": 100.0, "stop_loss": 0.05, "trigger": 95.0}}
+    assert st._stop_gap(long_, stop)["stop_gap"] == pytest.approx(0.001)
+    assert st._stop_gap({"side": -1, "entry_px": 100.0, "exit_px": 105.1},
+                        {"intent": "stop_loss", "signal": {"stop_loss": 0.05}})["stop_gap"] == pytest.approx(0.001)
+    assert st._stop_gap(long_, {"intent": "exit", "signal": {}}) == {} and st._stop_gap(long_, None) == {}
+
+
+def _gapped(return_percentile, gap_percentile, reconciled=(0.0, 0.0), why_not=""):
+    return RandomEntryResult(return_percentile, return_percentile, 0.1, 0.0, 10, 0.3, 1000, False, False,
+                             reconciled=reconciled, why_not=why_not, strategy_stops=4, draw_stops=3.0,
+                             gap_return=0.02, gap_percentile=gap_percentile)
+
+
+def test_a_fail_the_gap_would_turn_into_a_pass_reads_marginal_and_stays_a_fail():
+    r = _gapped(90.0, 96.0)
+    assert r.verdict == "FAIL" and r.marginal and r.words.startswith(MARGINAL)
+    assert "+6 percentile points" in r.words
+    for other in (_gapped(90.0, 94.0), _gapped(96.0, 99.0), _gapped(90.0, 96.0, (0.0, 0.01)),
+                  _gapped(90.0, 96.0, why_not="test"), _gapped(90.0, None, None)):
+        assert not other.marginal and MARGINAL not in other.words
+
+
+class _Steps:
+    """A stub pricer: each draw's return is set by its entry bar, so the draws are fixed whatever the gap."""
+
+    def draws(self, entries, holds, sides, levs):
+        return DrawFills(np.asarray(entries) % 20 / 1000 - 0.01, 0, 1)
+
+
+def test_the_gap_percentile_is_read_against_the_same_draws():
+    trades, windows = [Trade(10, 12, 1)], [(0, 99)]
+    def run(gap):
+        return random_entry_filled(trades, np.array([0.0]), windows, _Steps(), (0.0, 0.0), draws=500,
+                                   gaps=np.array([gap]), stops=np.array([gap > 0]))
+    none, small, big = run(0.0), run(0.003), run(0.05)
+    assert none.gap_percentile == none.return_percentile and none.strategy_stops == 0
+    assert none.return_percentile < small.gap_percentile < 95 <= big.gap_percentile == 100
+    assert big.strategy_return == none.strategy_return and big.verdict == "FAIL" and big.marginal
+    assert big.gap_return == pytest.approx(0.05) and big.strategy_stops == 1 and big.draw_stops == 1
