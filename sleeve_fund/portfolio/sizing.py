@@ -189,7 +189,8 @@ def liquidation_distance(i: SizingInputs) -> float:
     engine's own margin.entry_liquidation (isolated margin at the leverage, the venue's maintenance margin, measured
     from the entry with the fee paid), not a copy of it. On isolated margin the distance doesn't depend on the size
     while the margin and fee fit the balance, so it is measured on half the equity's notional, which always fits.
-    inf when nothing liquidates it; a fully paid 1x long liquidates at maintenance (BH-102), so it has a distance.
+    inf when nothing liquidates it; a fully paid 1x long liquidates at maintenance (BH-102), so it has a distance,
+    though size_entry doesn't refuse a long's stop on it at 1x or less (Advisor (A), 21 Oct).
 
     On a venue's tiers (VS-1) the distance shrinks as the notional reaches a higher tier, so it is measured at the
     most this equity can put on at the leverage (all of it as margin, the fee aside): never further than any size's."""
@@ -238,7 +239,8 @@ def size_entry(i: SizingInputs) -> Sizing:
         limits[f"{i.leverage:g}x leverage cap"] = equity / (1 / Decimal(repr(i.leverage)) + 2 * taker)
         share = STOP_TO_LIQUIDATION if i.stop_to_liquidation is None else i.stop_to_liquidation
         distance = liquidation_distance(i)
-        if stop > share * distance:
+        # a long at 1x or less is exempt: its liquidation is about 99% down (BH-102; Advisor (A), 21 Oct), as the engine
+        if stop > share * distance and not (i.side > 0 and i.leverage <= 1):
             return Sizing(zero, "", stop, budget, zero, limits, skipped=(
                 f"entry refused: its {stop:.2%} stop is more than {share:.0%} of the way to the liquidation price "
                 f"({distance:.2%} away at {i.leverage:g}x isolated margin); the stop is never moved"))

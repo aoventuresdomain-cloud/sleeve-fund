@@ -2821,7 +2821,10 @@ class LongFlatStrategy(Strategy):
             signal["liquidation_px"] = round(liq, 8)
             signal["leverage"] = round(notional / base, 4)  # of what it was sized off: the fund's equity inside it
             share = self.runtime.profile.stop_to_liquidation if self.runtime is not None else 0.5
-            if self._stop_frac and self._stop_frac > share * distance:
+            # A long at 1x or less liquidates only about 99% down (BH-102): no stop can gap to it, and the PM's rule
+            # lets it run stopless, so the stop's share isn't asked of it (Advisor (A), 21 Oct). A 1x short keeps it.
+            fully_paid = side > 0 and lev <= 1
+            if self._stop_frac and not fully_paid and self._stop_frac > share * distance:
                 self._note("entry_refused_liquidation",
                            f"Entry refused: its {self._stop_frac:.2%} stop is more than {share:.0%} of the way to the "
                            f"liquidation price {liq:,.6g} ({distance:.2%} away)")

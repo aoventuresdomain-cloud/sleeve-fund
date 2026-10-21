@@ -347,6 +347,9 @@ def test_guarantee_3_every_perp_stop_is_within_half_the_engines_distance_to_liqu
 
     s = size_entry(_in(side=side, perp=True, leverage=lev, stop_frac=stop, position_cap_pct=1.0, risk_per_trade=0.5,
                        maintenance_margin=mm, stop_to_liquidation=cap, leg_cost=0.001))
+    if side > 0 and lev <= 1:  # TEC-BH102-1XLONG (2), Advisor (A): a fully paid long is exempt, whatever its stop
+        assert s.ok, s.skipped
+        return
     if not s.ok:
         assert "liquidation" in s.skipped and s.stop_frac == stop
         _, dist = entry_liquidation(10_000.0, 50.0, 100.0, side, 0.001, mm, lev)
@@ -429,16 +432,20 @@ def test_steps_between_fractions_send_only_the_difference_and_skip_below_the_min
     assert step_order(D("0.900"), D("0.010"), 0.0, D("0.001"), D("0.350")).qty == D("-0.010")
 
 
-@pytest.mark.parametrize(("stop", "refused"), [(0.329, True), (0.327, False)], ids=["over", "under"])
-def test_bh102_a_1x_long_stop_past_its_share_of_the_way_to_liquidation_is_refused(stop, refused):
-    """BH-102 (Advisor 21 Oct): a fully paid 1x long now liquidates at maintenance, so the stop rule covers it too.
-    Its liquidation is the nearer of A (maintenance on the value at the price: p = fee / (q (1 - mm)), a share of a
-    percent of the entry) and B (on the entry value: p = fee / q + mm E), so B: the distance is 1 - fee rate - mm =
-    1 - 0.001 - 0.005 = 99.4%, and the conservative 33% share of it is 32.802%. Before BH-102 a 1x long had no
-    liquidation price and any stop sized. A stopless 1x position isn't sized here (no sizing without a stop)."""
-    s = size_entry(_in(perp=True, leverage=1.0, maintenance_margin=0.005, stop_frac=stop, stop_to_liquidation=0.33,
+
+@pytest.mark.parametrize("profile_share", [0.33, 0.5])
+def test_bh102_a_1x_long_is_sized_whatever_its_stop_against_its_99_percent_liquidation(profile_share):
+    """BH-102, Advisor (A) 21 Oct: a fully paid 1x long now has a liquidation price, 1 - fee rate - mm = 99.4% down
+    here, but no stop can gap to it and the PM's rule lets it run stopless, so its stop isn't held to the profile's
+    share of that way: a 60% stop sizes (it would be past 0.33 x 99.4% and 0.5 x 99.4%)."""
+    s = size_entry(_in(perp=True, leverage=1.0, maintenance_margin=0.005, stop_frac=0.60,
+                       stop_to_liquidation=profile_share, position_cap_pct=1.0, risk_per_trade=0.9))
+    assert s.ok and s.qty > 0, s.skipped
+
+
+def test_bh102_a_1x_short_keeps_the_stop_rule():
+    """The exemption is a long's only: a 1x short's liquidation is about one entry-width above, a real gap risk. Its
+    distance at mm 0.5% and fee 0.1% is (1 - fee rate - mm) / (1 + mm), about 98.9%, so a 60% stop is past half."""
+    s = size_entry(_in(side=-1, perp=True, leverage=1.0, maintenance_margin=0.005, stop_frac=0.60,
                        position_cap_pct=1.0, risk_per_trade=0.9))
-    if refused:
-        assert not s.ok and s.qty == 0 and "liquidation price" in s.skipped and "99.40% away" in s.skipped, s.skipped
-    else:
-        assert s.ok and s.qty > 0, s.skipped
+    assert not s.ok and s.qty == 0 and "liquidation price" in s.skipped, s.skipped
