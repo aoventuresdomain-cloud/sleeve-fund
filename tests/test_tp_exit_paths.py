@@ -56,6 +56,9 @@ def test_the_target_level_is_on_the_instruments_tick_and_never_better_than_the_e
     assert target_level(60_000.05454545, 1, 0.01, 1) == px(60_600.1)  # b14aa's paper target, 60,600.055 up
     assert target_level(60_060.0, 1, 0.03, 1) == px(61_861.8)  # 61,861.8 within float noise of its tick: stays
     assert target_level(60_060.0, -1, 0.03, 1) == px(58_258.2)
+    # Advisor: the cases nearest would move toward the entry, a long at x.x4 and a short at x.x6
+    assert target_level(100.0, 1, 0.0004, 1) == px(100.1)  # 100.04: up, not down to 100.0
+    assert target_level(100.0, -1, 0.0004, 1) == px(99.9)  # 99.96: down, not up to 100.0
 
 
 @pytest.mark.parametrize("side", [1, -1], ids=["long", "short"])
