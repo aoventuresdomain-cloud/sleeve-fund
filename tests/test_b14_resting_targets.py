@@ -604,15 +604,16 @@ def test_b14z_stopping_the_strategy_cancels_its_resting_target_with_every_other_
 
 def test_b14aa_off_orders_and_fills_are_byte_identical_to_before_b14_on_both_engines():
     """With resting targets off, a target path and a stop path give the orders and fills the tree before B-14 gave, on
-    the paper replay and the backtest engine (tests/data/b14_off/b14_off_662e8a0b.json, made by b14_off_golden on the D3
-    base 662e8a0b, which has no B-14; TEC-B14AA-REBASE: it differs from b14_off_274ecd88.json, kept, only in B-15's
-    liquidation prices, b14am)."""
+    the paper replay and the backtest engine (tests/data/b14_off/b14_off_73adccae.json, made by b14_off_golden on the
+    TP-EXIT head 73adccae; TEC-TPEXIT-B14AA: it differs from b14_off_662e8a0b.json, kept, only in the paper target
+    exit's signal (b14aa_tp), which was made on the D3 base 662e8a0b, which has no B-14; TEC-B14AA-REBASE: that one
+    differs from b14_off_274ecd88.json, kept, only in B-15's liquidation prices, b14am)."""
     import json
     from pathlib import Path
 
     from b14_off_golden import off_runs
 
-    want = json.loads((Path(__file__).parent / "data" / "b14_off" / "b14_off_662e8a0b.json").read_text())
+    want = json.loads((Path(__file__).parent / "data" / "b14_off" / "b14_off_73adccae.json").read_text())
     got = json.loads(off_runs())
     assert set(got) == {"paper_target", "paper_stop", "backtest_target", "backtest_stop"}
     assert {o["order_type"] for o in got["paper_target"]["orders"] if o["intent"] == "take_profit"} == {"MARKET"}
@@ -620,6 +621,30 @@ def test_b14aa_off_orders_and_fills_are_byte_identical_to_before_b14_on_both_eng
     assert "take_profit" in got["backtest_target"]["intents"] and "stop_loss" in got["backtest_stop"]["intents"]
     for k in want:
         assert got[k] == want[k], k
+
+
+def test_b14aa_tp_the_tp_exit_golden_differs_only_in_the_paper_target_exits_signal():
+    """TEC-TPEXIT-B14AA (HoE 21 Oct): the TP-EXIT golden against the one before it. Orders and fills are identical
+    but for the paper target exit's journaled signal: its target_px, now on the tick past the exact level (TP-EXIT rule
+    2: one level for every path; it was the exact 60,600.05509091, between ticks, which paper alone watched), and its
+    exit_kind and target_form (rules 6 and 7), which it didn't record."""
+    import copy
+    import json
+    from pathlib import Path
+
+    here = Path(__file__).parent / "data" / "b14_off"
+    old = json.loads((here / "b14_off_662e8a0b.json").read_text())
+    new = json.loads((here / "b14_off_73adccae.json").read_text())
+    exits = [i for i, o in enumerate(new["paper_target"]["orders"]) if o.get("intent") == "take_profit"]
+    assert len(exits) == 1
+    signal_old, signal_new = (g["paper_target"]["orders"][exits[0]]["signal"] for g in (old, new))
+    assert {k for k in {*signal_old, *signal_new} if signal_old.get(k) != signal_new.get(k)} == {
+        "target_px", "exit_kind", "target_form"}
+    assert (signal_old["target_px"], signal_new["target_px"]) == (60600.05509091, 60600.1)
+    assert (signal_new["exit_kind"], signal_new["target_form"]) == ("take_profit", "0.01 of the entry")
+    same = copy.deepcopy(new)
+    same["paper_target"]["orders"][exits[0]]["signal"] = signal_old
+    assert same == old  # every other order, every fill, on both engines: identical
 
 
 @pytest.mark.parametrize("bid, ask, last, through", [(60_599.9, 60_600.0, None, False),  # only the ask at the level
