@@ -15,7 +15,7 @@ from sleeve_fund import markets
 from sleeve_fund.instruments import FeeSchedule
 
 SPOT_LOW = {"market": "spot-lowfee"}
-TAKER = 0.001  # the Advisor's taker rate for the research spot schedule (placeholder until the Advisor sets it)
+TAKER = 0.001  # the Advisor's taker rate for the research spot schedule (21 Oct)
 
 
 def _spot(spans) -> dict:
@@ -76,8 +76,7 @@ def test_a_paper_config_refuses_it():
                      starting_balance=0.0, params={"market": "spot-lowfee"}, venue="KRAKEN")
 
 
-@pytest.fixture(scope="module")
-def spot_study(tmp_path_factory):
+def _spot_study(tmp_path_factory, base: str):
     """A trend study on the perp venue's prices, asked for on spot-lowfee; funding stored at 0.3% a settlement, so a
     perp run would pay plenty."""
     import json
@@ -99,18 +98,29 @@ def spot_study(tmp_path_factory):
     prices = synthetic_ohlcv(days=800, seed=4)
     times = pd.date_range(prices.index[0].floor("D") - pd.Timedelta("1D"), prices.index[-1] + pd.Timedelta("1D"),
                           freq="8h")
-    p = funding._path("BINANCE", "BTC/USDT")
+    p = funding._path("BINANCE", f"{base}/USDT")
     p.parent.mkdir(parents=True)
     p.write_text(json.dumps({"rates": [[int(t.timestamp() * 1000), 0.003] for t in times]}))
     funding._cache.clear()
     ledger = IdeaLedger(d / "l.jsonl")
-    r = run_study(SPEC, prices, b.instrument("BTC", "USDT"), dataset="syn", ledger=ledger, synthetic=True,
+    r = run_study(SPEC, prices, b.instrument(base, "USDT"), dataset="syn", ledger=ledger, synthetic=True,
                   holdout_days=0, train_days=300, test_days=200,
                   default_params={"fast": 20, "slow": 50, "market": "spot-lowfee"})
     sheet = tearsheet.render(r, ledger)
     yield r, sheet
     mp.undo()
     funding._cache.clear()
+
+
+@pytest.fixture(scope="module")
+def spot_study(tmp_path_factory):
+    yield from _spot_study(tmp_path_factory, "BTC")
+
+
+@pytest.fixture(scope="module")
+def spot_study_eth(tmp_path_factory):
+    """ETH keeps no margin tiers: research perp runs assume BTC's (R-28), so the sheet's perp line must too (CR M1)."""
+    yield from _spot_study(tmp_path_factory, "ETH")
 
 
 def test_a_study_asked_for_on_spot_lowfee_trades_spot_and_holds_spot(spot_study):
@@ -253,3 +263,22 @@ def test_a_study_list_row_runs_perp_or_spot_by_its_market_column_alone(tmp_path,
     called = []
     assert rescore.main([str(path), "--rows", "1"], run=lambda *a, **k: called.append(1), journal=lambda: None) == 2
     assert called == [] and "a study's market is perp or spot-lowfee" in capfd.readouterr().out
+
+
+def test_the_perp_line_on_a_pair_with_no_kept_tiers_assumes_btcs_and_says_so(spot_study_eth):
+    """CR M1: the perp comparison of a spot-lowfee study on ETH ran with no tiers and crashed; it runs on BTC's
+    assumed tiers, as an ETH perp study does, and the sheet says so under the comparison."""
+    r, sheet = spot_study_eth
+    assert r.spot_vs_perp["perp"]["funding_paid"] > 0 and r.spot_vs_perp["spot"]["funding_paid"] == 0
+    section = sheet.split("## Spot against the perpetual (research only)", 1)[1].split("\n## ", 1)[0]
+    assert "Margin tiers: BTC's table assumed for ETH/USDT (PM, 21 Oct)" in section
+    assert "Margin tiers" not in sheet.split("## Spot against the perpetual", 1)[0]  # the spot runs need none
+
+
+def test_the_entry_tier_line_reads_its_fees_from_the_schedule(spot_study):
+    """CR F1: the line's words come from SPOT_ENTRY_TIER_FEES, not a literal."""
+    from sleeve_fund.research.study import SPOT_ENTRY_TIER_FEES
+
+    _, sheet = spot_study
+    assert (f"Spot at our current entry-tier fee ({float(SPOT_ENTRY_TIER_FEES.maker):.2%} maker, "
+            f"{float(SPOT_ENTRY_TIER_FEES.taker):.2%} taker)") in sheet

@@ -718,8 +718,10 @@ def run_study(
             progress(min(done[0] / total, 0.99))
         guarded = risk_profile is not None and not benchmark
         params = {**params, **(market if market_over is None else market_over)}  # market_over: the spot sheet's perp line
-        if assumed_tiers:
-            params = {**params, "assumed_tiers_pair": assumed_tiers}
+        tiers = assumed_tiers if market_over is None else markets.research_tiers_pair(
+            market_over, str(instrument.id.venue), pair_of(instrument))  # CR M1: the perp line needs its own
+        if tiers:
+            params = {**params, "assumed_tiers_pair": tiers}
         if not benchmark and not family:
             params = {**params, **exits}
         if position_cap is not None and not guarded:
@@ -1047,8 +1049,11 @@ def run_study(
             return {"end": float(res.equity.iloc[-1]), "cagr": s["cagr"], "sharpe": s["sharpe"],
                     "max_drawdown": s["max_drawdown"], "funding_paid": -sum(f["amount"] for f in res.funding)}
 
+        perp_tiers = markets.research_tiers_pair({"market": PERP}, str(instrument.id.venue), pair_of(instrument))
         spot_vs_perp = {"spot": line(bt(spec.name, research, chosen)),
-                        "perp": line(bt(spec.name, research, chosen, market_over={"market": PERP}))}
+                        "perp": line(bt(spec.name, research, chosen, market_over={"market": PERP})),
+                        "margin_note": markets.assumed_tiers_words(perp_tiers, pair_of(instrument))
+                        if perp_tiers else ""}
     covered = len(pd.concat(compare_parts)) if compare_parts else 0
     hold_insufficient = perp_hold and not switched and covered < HOLD_COVERAGE_FLOOR * oos_days[0]
     if perp_hold:

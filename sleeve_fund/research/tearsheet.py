@@ -21,7 +21,7 @@ from sleeve_fund.research.metrics import (
     years_covered,
 )
 from sleeve_fund.research.pbo import PBO_CHECK, g1_row
-from sleeve_fund.research.study import StudyResult
+from sleeve_fund.research.study import SPOT_ENTRY_TIER_FEES, StudyResult
 
 ROBUST_SHARE = 0.6
 # G1's bar: at least this probability that the out-of-sample Sharpe beats the benchmark's by more
@@ -129,7 +129,8 @@ def _spot_section(r: StudyResult) -> list[str]:
         return []
     out = ["## Spot against the perpetual (research only)", ""]
     if tier is not None:
-        out += [f"Spot at our current entry-tier fee (0.40% maker, {tier.fee:.2%} taker): total return "
+        out += [f"Spot at our current entry-tier fee ({float(SPOT_ENTRY_TIER_FEES.maker):.2%} maker, "
+                f"{float(SPOT_ENTRY_TIER_FEES.taker):.2%} taker): total return "
                 f"{_pct(tier.total_return)}, Sharpe {_num(tier.sharpe)}, {tier.round_trips} round trips, fees paid "
                 f"{tier.fees_paid:,.0f}.", ""]
     if both is not None:
@@ -142,6 +143,8 @@ def _spot_section(r: StudyResult) -> list[str]:
             out.append(f"| {words} | {x['end']:,.0f} | {_pct(x['cagr'])} | {_num(x['sharpe'])} "
                        f"| {_pct(x['max_drawdown'])} | {x['funding_paid']:,.0f} |")
         out.append("")
+        if both.get("margin_note"):
+            out += [f"{both['margin_note']}, on the perpetual line only.", ""]
     return out
 
 
