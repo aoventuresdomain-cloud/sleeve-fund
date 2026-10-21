@@ -354,7 +354,7 @@ class Words:
         if "exit_at_level" in exits:
             levels.append(("Exit at", f"{self.value(exits['exit_at_level']['level'])}, as set at the close before"))
         if (tp := exits.get("take_profit")) is not None:  # TP-EXIT: a market order on a touch, after the stop
-            levels.append(("Take-profit", f"{tp['r']:g}R after costs, from the stop's distance as the trade opens"
+            levels.append(("Take-profit", f"{tp['r']:g}R (price), from the entry fill to the stop, set as the trade opens"
                            if "r" in tp else f"{self.value(tp['level'])}, as set at each close; held back while it "
                            "isn't past the price"))
         return {"side": name, "entry": entry, "exit": out, "levels": levels,

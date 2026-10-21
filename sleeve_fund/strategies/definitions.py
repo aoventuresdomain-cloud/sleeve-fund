@@ -66,7 +66,7 @@ SINCE_ENTRY = {"max_since_entry": max, "min_since_entry": min}
 TOP_KEYS = ("version", "name", "title", "reason", "blocks", "long", "short", "exits", "costs")
 LEVEL_EXITS = ("stop", "trail", "exit_at_level")
 SIDE_EXITS = ("time_stop", *LEVEL_EXITS, "take_profit")  # what [exits.long] and [exits.short] may hold (G1)
-MAX_TAKE_PROFIT_R = 50  # as take_profit_r: a multiple of the stop distance
+MAX_TAKE_PROFIT_R = 50  # as take_profit_r's cap: a multiple of R
 MAX_BREAKOUT_SLIPPAGE_BP = 500
 
 class ClosedChannel(Donchian):
@@ -604,20 +604,21 @@ def _check_exit_table(exits: dict, blocks: dict, uses_prev: list, side: str, nam
 
 
 def _check_take_profit(exits: dict, blocks: dict, uses_prev: list, where: str) -> None:
-    """TP-EXIT (HoE, Advisor 21 Oct): {r = N}, N times the stop's distance at entry after costs (take_profit_r), or
-    {level = <operand>}, a level worked at each close. Never without a stop: R is the stop's distance, and a target
+    """TP-EXIT (HoE, Advisor 21 Oct): {r = N}, the entry fill +- N x R, R in price from the fill to the initial stop
+    level (not the study-wide take_profit_r, which is R after costs), or {level = <operand>}, a level worked at each
+    close. Never without a stop: R is the stop's distance, and a target
     alone would leave the position unguarded on the other side."""
     tp = exits["take_profit"]
     if not isinstance(tp, dict) or len(tp) != 1 or not set(tp) <= {"r", "level"}:
-        raise ValueError(f"{where} is {{r = N}} (N times the stop's distance, after costs) or {{level = ...}}, one of the "
-                         "two")
+        raise ValueError(f"{where} is {{r = N}} (N x R in price, from the entry fill to the stop) or {{level = ...}}, one "
+                         "of the two")
     if not set(exits) & set(LEVEL_EXITS):
         raise ValueError(f"{where}: take_profit needs a stop (stop, trail or exit_at_level) on the same side")
     if "r" in tp:
         r = tp["r"]
         if isinstance(r, bool) or not isinstance(r, (int, float)) or not 0 < r <= MAX_TAKE_PROFIT_R:
-            raise ValueError(f"{where}.r is a number above 0, at most {MAX_TAKE_PROFIT_R}: a multiple of the stop's "
-                             "distance")
+            raise ValueError(f"{where}.r is a number above 0, at most {MAX_TAKE_PROFIT_R}: a multiple of R, the entry "
+                             "fill's distance to the stop")
     else:
         _check_operand(tp["level"], f"{where}.level", blocks, uses_prev)
 

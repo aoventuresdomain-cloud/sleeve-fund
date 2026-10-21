@@ -580,9 +580,16 @@ class Rules(LongFlatStrategy):
 
     def _fill_target(self) -> None:
         tp = self._take_profit(self._entry_side or 1)
-        if tp is None or tp[0] != "r" or self._r_stop is None or not self._entry_px:
+        if tp is None or tp[0] != "r" or not self._entry_px:
             return
         side = self._entry_side or 1
+        if self._r_stop is None and self._levels:  # a fill with no plan of its own (a resting entry): the levels now
+            self._r_stop = self._tightest(self._levels, side)
+        if self._r_stop is None:  # never R from a share of the price: no target rather than a wrong one
+            self._note("target_no_stop_level", "No take-profit on this entry: its stop level wasn't known at the fill, "
+                       "so R can't be measured from it")
+            self._tp_frac = self._tp_level = None
+            return
         self._tp_level = self._entry_px + side * tp[1] * abs(self._entry_px - self._r_stop)
         self._tp_frac = side * (self._tp_level / self._entry_px - 1)
 

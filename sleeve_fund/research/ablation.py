@@ -6,7 +6,9 @@ on PE1's plan and the Advisor's 7 Oct 18:20/18:25 UK rulings.
 
 Units, one variant each, in path order: every condition inside a side's entry rule (a {left, op, right} or a
 first_touch), each side's signal exit, a setup's cancel, and each of the definition's time_stop, stop, trail and
-exit_at_level. Costs, blocks, sizing and risk caps are never units.
+exit_at_level, and take_profit (Advisor, TP-EXIT 21 Oct: without the take-profit is a comparison the sheet should
+show). A target needs a stop, so removing a side's last stop removes its take_profit too: that variant is "no stop, no
+take-profit", run, never refused. Costs, blocks, sizing and risk caps are never units.
 
 Removing a condition gives it its parent's neutral value (Advisor 18:20 Q1): inside `any` the member is dropped; in
 every other place (all, only_when, event/confirm, setup/trigger) it becomes always true. Removing an exit, or a
@@ -44,7 +46,8 @@ from sleeve_fund.strategies.definitions import (
 
 # A condition that always holds: what a removed condition becomes outside an `any`.
 ALWAYS = {"left": 0.0, "op": ">=", "right": 0.0}
-EXITS = ("time_stop", *LEVEL_EXITS)
+EXITS = ("time_stop", *LEVEL_EXITS, "take_profit")
+NO_STOP_NO_TARGET = "no stop, no take-profit"
 NOT_JUDGED = "not judged"
 RANDOM_ENTRY = "not ablatable; see random-entry benchmark"
 # What a row's deltas compare: the figures a removed filter can move (Advisor 13 Oct Q3). Time in market is there
@@ -183,11 +186,11 @@ def remove(defn: dict, path: str) -> tuple[str, dict | None, str]:
     variant = copy.deepcopy(defn)
     if steps[0] == "exits":
         table = variant["exits"]
-        if len(steps) == 3:  # a side's own exit (G1)
-            del table[steps[1]][steps[2]]
-            if not table[steps[1]]:
-                del table[steps[1]]
-        else:
+        own = table[steps[1]] if len(steps) == 3 else table  # a side's own exits (G1), or the shared ones
+        del own[steps[-1]]
+        if _takes_the_target(defn, path):
+            del own["take_profit"]
+        if len(steps) == 3 and not own:
             del table[steps[1]]
         if not variant["exits"]:
             del variant["exits"]
@@ -226,9 +229,20 @@ def stopless(defn: dict) -> bool:
     return not any(k in exits or k in (exits.get(side) or {}) for k in LEVEL_EXITS for side in ("long", "short"))
 
 
+def _takes_the_target(defn: dict, path: str) -> bool:
+    """Whether removing the exit at `path` leaves its table a take_profit and no stop, so the take_profit goes too."""
+    steps = _steps(path)
+    if steps[0] != "exits" or steps[-1] not in LEVEL_EXITS:
+        return False
+    own = (defn["exits"][steps[1]] if len(steps) == 3 else defn["exits"])
+    return "take_profit" in own and not (set(own) - {steps[-1]}) & set(LEVEL_EXITS)
+
+
 def describe(defn: dict, path: str) -> str:
     """The removed unit in words, for the report."""
     steps = _steps(path)
+    if _takes_the_target(defn, path):
+        return NO_STOP_NO_TARGET if len(steps) == 2 else f"{steps[1]}: {NO_STOP_NO_TARGET}"
     if steps[0] == "exits":
         return " ".join(str(s).replace("_", " ") for s in steps[1:]) + " exit"
     if steps[-1] == "exit":
