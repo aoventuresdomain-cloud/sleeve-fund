@@ -24,7 +24,7 @@ COST = 0.001 + HALF_SPREAD  # the base-tier spot taker fee both venues publish, 
 def test_the_price_only_hold_pays_one_entry_and_one_exit():
     closes = pd.Series([100.0, 120.0, 90.0, 110.0], index=pd.date_range("2026-01-01", periods=4, freq="1D", tz="UTC"))
     eq = price_hold_equity(closes, 0.002, 1000.0)
-    assert eq.tolist() == pytest.approx([998.0, 1197.6, 898.2, 1097.8 * 0.998])
+    assert eq.tolist() == pytest.approx([1000.0, 1197.6, 898.2, 1097.8 * 0.998])  # the capital before the entry first
 
 
 def test_a_liquidation_is_read_from_the_order_the_engine_decided_as_one():
@@ -38,7 +38,7 @@ def test_a_liquidation_is_read_from_the_order_the_engine_decided_as_one():
     assert liquidated_at(run) == []
 
 
-def _study(tmp_path, binance, rate):
+def _study(tmp_path, binance, rate, **kw):
     """A trend study on the venue's perpetual, 800 daily bars, the venue's funding stored at `rate` every 8 hours."""
     from sleeve_fund.data import synthetic_ohlcv
     from sleeve_fund.research.ledger import IdeaLedger
@@ -51,8 +51,8 @@ def _study(tmp_path, binance, rate):
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps({"rates": [[int(t.timestamp() * 1000), rate] for t in times]}))
     r = run_study(SPEC, prices, binance.instrument("BTC", "USDT"), dataset="syn", ledger=IdeaLedger(tmp_path / "l.jsonl"),
-                  synthetic=True, holdout_days=0, train_days=300, test_days=200, half_spread=HALF_SPREAD,
-                  default_params={"fast": 20, "slow": 50})
+                  synthetic=True, train_days=300, test_days=200, half_spread=HALF_SPREAD,
+                  default_params={"fast": 20, "slow": 50}, **{"holdout_days": 0, **kw})
     return r, prices
 
 
@@ -80,16 +80,17 @@ def test_when_the_price_held_beats_the_drained_perp_hold_it_is_the_bar_on_every_
     # the full-period benchmark is the price held, its entry and exit paid
     closes = prices["close"].astype(float)
     want = 10_000.0 * (1 - COST) * closes / closes.iloc[0]
+    want.iloc[0] = 10_000.0
     want.iloc[-1] *= 1 - COST
     pd.testing.assert_series_equal(r.full_period_benchmark.equity, want, check_names=False, check_freq=False)
-    # each test window's benchmark is the price held over that window: it compounds to (1 - cost) x the price's move
+    # each test window's benchmark is the price held over that window: it compounds to (1 - cost)^2 x the price's move
     # from the close before the window to its last close, and the fold's own benchmark row is that same series
     assert len(r.folds) == 2
     for f in r.folds:
         days = r.oos_benchmark_returns[(r.oos_benchmark_returns.index > f.test_end - pd.Timedelta(days=200))
                                        & (r.oos_benchmark_returns.index <= f.test_end)]
         first = days.index[0] - pd.Timedelta(days=1)
-        assert math.prod(1 + v for v in days) == pytest.approx((1 - COST) * closes[f.test_end] / closes[first])
+        assert math.prod(1 + v for v in days) == pytest.approx((1 - COST) ** 2 * closes[f.test_end] / closes[first])
         assert f.benchmark_test["sharpe"] == pytest.approx(study_mod.summary(days)["sharpe"])
     # the strategy is compared on the days the bar covers, and nothing says the perp hold judged
     assert r.compare_returns.index.equals(r.oos_benchmark_returns.index)
@@ -125,3 +126,25 @@ def test_a_liquidated_perp_hold_is_said_on_the_sheet(tmp_path, offline_binance, 
     assert "16 May 2019 (the research period)" in r.hold_liquidated
     sheet = render(r, IdeaLedger(tmp_path / "l.jsonl"))
     assert "The perp hold was liquidated on 16 May 2019 (the research period)" in sheet
+
+
+def test_the_holdout_is_judged_against_the_same_bar(tmp_path, monkeypatch):
+    """Rule 3: every reader takes the one hold, the holdout too. Here the price held over the last 100 days, worked out
+    from the closes: its entry at the close before the holdout's first day, its exit on the last."""
+    from sleeve_fund.venues import binance_contract, venue
+    from test_binance import INFO
+
+    b = venue("binance")
+    monkeypatch.setattr(b, "contract", lambda pair: binance_contract(pair, get_json=lambda url: INFO))
+    monkeypatch.setattr(funding, "DEFAULT_ROOT", tmp_path / "funding")
+    # a perpetual's holdout needs 1-minute bars (its liquidation rests); that rule is pinned elsewhere, and this cell
+    # is only about which hold the holdout is compared with
+    monkeypatch.setattr(study_mod.StudyResult, "not_judged", property(lambda self: ""))
+    r, prices = _study(tmp_path, b, 0.003, holdout_days=100, use_holdout=True)
+    assert r.bar_hold == PRICE_HOLD and r.holdout is not None, (r.holdout_withheld, r.not_judged)
+    closes = prices["close"].astype(float).iloc[-101:]
+    eq = closes / closes.iloc[0] * (1 - COST)
+    eq.iloc[0] = 1.0  # the capital before the entry, so the first holdout day carries the entry fee
+    eq.iloc[-1] *= 1 - COST
+    want = eq.pct_change().iloc[1:]
+    assert r.holdout_benchmark["sharpe"] == pytest.approx(study_mod.summary(want)["sharpe"])

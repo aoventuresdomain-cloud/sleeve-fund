@@ -1636,8 +1636,11 @@ PRICE_HOLD_TAKER = 0.001
 def price_hold_equity(closes: pd.Series, cost: float, capital: float) -> pd.Series:
     """BH-102 rule 3 (Advisor, 21 Oct): on a venue with no spot market, the asset's own price held, bought at the
     first close and sold at the last, each paying `cost` (the base-tier spot taker fee plus half the spread): no
-    funding, nothing to liquidate. A free hold would be an easier bar the other way."""
+    funding, nothing to liquidate. A free hold would be an easier bar the other way. The first close shows the capital
+    before the entry, as the engine's hold does, so the entry fee falls in the first day's return and a window's
+    returns pay both fees."""
     eq = capital * (1 - cost) * closes.astype(float) / float(closes.iloc[0])
+    eq.iloc[0] = capital
     eq.iloc[-1] = eq.iloc[-1] * (1 - cost)
     return eq
 
