@@ -81,13 +81,15 @@ def test_the_spot_check_compares_each_sampled_rate_and_the_most_negative_with_th
     def raw(pair, start_ms):  # the venue's records from start_ms, as it sends them (stamped a few ms late)
         return [{"fundingTime": t + 8, "fundingRate": s} for t, s in sorted(venue_says.items()) if t + 8 >= start_ms]
 
-    profile = SimpleNamespace(name="BINANCE", label="Binance", funding_raw=raw)
-    out = history.funding_sample(profile, "BTC/USDT", count=2)
+    profile = SimpleNamespace(name="BINANCE", label="Binance", funding_raw=raw, request_interval=0.5)
+    paused = []
+    out = history.funding_sample(profile, "BTC/USDT", count=2, sleep=paused.append)
+    assert paused == [0.5, 0.5]  # the venue's pace between its 3 requests (CR F3)
     assert out["checked"] == 3 and out["matched"] == 3 and out["mismatches"] == []  # 2 drawn + the most negative
     assert out["most_negative"]["stored"] == -0.00025
     venue_says[t0 + step] = "0.00025000"  # the venue's sign is the other way: the most negative is always checked
     venue_says[t0] = "0.01000000"  # a percent kept as a fraction
-    out = history.funding_sample(profile, "BTC/USDT", count=4)
+    out = history.funding_sample(profile, "BTC/USDT", count=4, sleep=lambda s: None)
     assert out["checked"] == 4 and out["matched"] == 2
     assert sorted(m["venue"] for m in out["mismatches"]) == ["0.00025000", "0.01000000"]
 
@@ -126,7 +128,7 @@ def test_the_spot_check_always_samples_a_settlement_from_inside_a_4_hour_stretch
         return [{"fundingTime": int(t.timestamp() * 1000), "fundingRate": "0.00010000"}
                 for t in times if t.timestamp() * 1000 >= start_ms][:3]
 
-    profile = SimpleNamespace(name="BINANCE", label="Binance", funding_raw=raw)
+    profile = SimpleNamespace(name="BINANCE", label="Binance", funding_raw=raw, request_interval=0)
     for seed in range(5):
-        out = history.funding_sample(profile, "BTC/USDT", count=1, seed=seed)
+        out = history.funding_sample(profile, "BTC/USDT", count=1, seed=seed, sleep=lambda s: None)
         assert stretch & set(out["sampled"]) and out["mismatches"] == []

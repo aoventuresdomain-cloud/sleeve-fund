@@ -947,7 +947,7 @@ def funding_backfill(profile, pair: str, since: pd.Timestamp, root=None, pages: 
     return out
 
 
-def funding_sample(profile, pair: str, root=None, count: int = 10, seed: int = 20261021) -> dict:
+def funding_sample(profile, pair: str, root=None, count: int = 10, seed: int = 20261021, sleep=None) -> dict:
     """R-02 spot check (Advisor, 21 Oct), read-only: `count` stored settlements drawn at random (seeded) and the most
     negative stored rate, each compared with the venue's own record for that settlement as it sends it: the same time
     (within funding.MATCH), the same value exactly at the venue's precision, so the same sign. A scale or sign slip
@@ -971,7 +971,11 @@ def funding_sample(profile, pair: str, root=None, count: int = 10, seed: int = 2
         picks.add(int(rng.choice(short)))
     picks = sorted(picks)
     out["sampled"] = [kept.index[i].isoformat() for i in picks]
-    for i in picks:
+    import time
+
+    for n, i in enumerate(picks):
+        if n:  # the venue's pace between requests: it runs inside the live hub and shares its rate limit (CR F3)
+            (sleep or time.sleep)(getattr(profile, "request_interval", 1.0))
         ts, stored = kept.index[i], float(kept.iloc[i])
         rows = profile.funding_raw(pair, int((ts - funding.MATCH).timestamp() * 1000))
         near = [r for r in rows if abs(pd.Timestamp(int(r["fundingTime"]), unit="ms", tz="UTC") - ts) <= funding.MATCH]

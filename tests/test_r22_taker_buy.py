@@ -5,6 +5,7 @@ writes nothing. Expected values are written out from the fixtures, not read from
 from types import SimpleNamespace
 
 import pandas as pd
+import pytest
 
 from sleeve_fund import history
 from sleeve_fund.history import HistoryStore
@@ -91,3 +92,22 @@ def test_the_venue_reads_the_klines_taker_buy_base_volume_and_its_candles_are_un
     bars, nxt, caught_up = binance_taker_minutes("BTC/USDT", "0", get_json=lambda url: rows)
     assert bars["taker_buy"].tolist() == [1.5, 2.5, 3.5] and bars["volume"].tolist() == [4.0] * 3
     assert nxt == str(1_760_000_000_000 + 120_000) and caught_up
+
+
+def test_a_minute_that_may_still_be_forming_takes_no_figure(tmp_path):
+    """CR F1: a loader page's newest stored minute may still be forming; its taker figure waits until it is closed."""
+    from test_p1_1_canon import _venue
+
+    store = HistoryStore(tmp_path)
+    store.append(V, P, _venue(3, start=T0), cursor="c")  # 23:58, 23:59, 00:00: the page's newest may be forming
+    out = store.add_taker_buy(V, P, _offer([0.5, 0.5, 0.5], volume=[3.0] * 3))
+    assert (out["added"], out["not_stored"]) == (2, 1)
+    assert store.taker_buy(V, P).index.tolist() == [T0, T0 + MIN]
+
+
+def test_the_command_refuses_to_start_a_write_on_a_store_it_cannot_write(tmp_path, monkeypatch, capfd):
+    """CR F2: taker-backfill without --dry-run is a writer, so an unwritable store stops it before any venue call."""
+    monkeypatch.setattr(history, "unwritable", lambda path: "read-only")
+    monkeypatch.setattr(history, "taker_backfill", lambda *a, **k: pytest.fail("ran on an unwritable store"))
+    assert history.main(["--root", str(tmp_path), "taker-backfill", "--since", "2026-10-01", "BTC/USDT"]) == 2
+    assert "can't start" in capfd.readouterr().out
