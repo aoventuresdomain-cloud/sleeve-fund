@@ -151,11 +151,15 @@ def test_a_settlement_schedule_shorter_than_the_one_charged_is_a_mismatch(tmp_pa
     assert funding.schedule_mismatch("BINANCE", "BTC/USDT", (0, 8, 16), tmp_path, latest=True)
 
 
-def test_a_study_with_a_schedule_mismatch_is_not_judged():
+def test_a_study_across_a_shorter_settlement_spell_is_judged_on_its_funding_like_any_other():
+    # SOL-FUND (Advisor 21 Oct; TEC-SOLFUND-GUARD): each settlement is charged at its own time, so the spell is only
+    # said on the sheet (tests/test_solfund_guard.py), never a reason not to judge
+    clean = _study(dict(funding_held=100, funding_baseline=0))
     r = _study(dict(funding_held=100, funding_baseline=0))
-    r.full_period.funding_schedule = "funding schedule mismatch: BTC/USDT settled 1 hours apart"
-    verdict, words = StudyResult.funding_check.fget(r)
-    assert verdict == tearsheet.NOT_JUDGED and words.startswith("funding schedule mismatch")
+    r.full_period.funding_schedule = ("BTC/USDT settled every 1 hours for 16 steps from 2025-10-04 09:00 UTC; each "
+                                      "charged at its own time and rate")
+    assert StudyResult.funding_check.fget(r) == StudyResult.funding_check.fget(clean)
+    assert StudyResult.funding_check.fget(r)[0] == "PASS"
 
 
 def test_paper_refuses_to_start_a_perp_whose_latest_settlement_step_is_shorter(tmp_path, monkeypatch):

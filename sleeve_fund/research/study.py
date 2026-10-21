@@ -78,13 +78,11 @@ def _oos_funding(folds) -> tuple[int, int, pd.Timedelta]:
 def _funding_check(r) -> tuple[str, str]:
     """PASS, WARN or NOT JUDGED on a study's out-of-sample funding (funding.baseline_check; Advisor, 6 Oct 2026). A
     simulated perp has no venue's rates at all: every settlement is the baseline, and it is not judged until a
-    modelled rate series is in the trials register before the run (none can be registered yet). Nor is a run whose
-    venue's settlements don't fit the schedule charged (funding.schedule_mismatch)."""
+    modelled rate series is in the trials register before the run (none can be registered yet). A run across a
+    spell of shorter settlements is judged: each is charged at its own time (SOL-FUND, Advisor 21 Oct 2026)."""
     n, m, longest = _oos_funding(r.folds)  # read with defaults: a fold that never held a perp carries no funding
     verdict, words = funding.baseline_check(n, m, longest, "out-of-sample")
     full = getattr(r, "full_period", None)
-    if getattr(full, "funding_schedule", ""):
-        return "NOT JUDGED", f"{full.funding_schedule}; {words}"
     if getattr(full, "funding_simulated", False):
         return "NOT JUDGED", (f"a simulated perpetual, with no venue's funding rates: {words}; no modelled rate "
                               "series was in the trials register before the run")
