@@ -64,6 +64,7 @@ class StudyRequest:
     label: str | None = None
     # B-37: a study list's pinned dates (research.pinned.Pinned): the study reads those days only, whatever day it runs.
     pinned: object | None = None
+    starting_capital: float = 10_000.0  # R-15: the account every run starts from (the PM's $1,000 run)
 
     def exits(self) -> dict:
         """The exits every run of the study trades with, as the strategy takes them."""
@@ -84,6 +85,8 @@ class StudyRequest:
             raise ValueError("holdout days can't be negative")
         if "/" not in self.pair:
             raise ValueError(f"instrument {self.pair!r} should look like BTC/USD")
+        if not 0 < self.starting_capital < float("inf"):
+            raise ValueError("the starting capital must be above 0")
 
 
 def _bars(minutes: int) -> str:
@@ -172,7 +175,8 @@ def run_store_study(req: StudyRequest, store=None, progress=None, ledger_path: P
         exits=req.exits(),
         risk_profile=req.risk_profile, exec_prices=exec_prices, half_spread=spread, progress=progress,
         oos_exec_prices=oos_exec, minute_loader=minutes_between, register=register,
-        locks=HoldoutLocks(store) if store is not None else None, pinned=req.pinned)
+        locks=HoldoutLocks(store) if store is not None else None, pinned=req.pinned,
+        starting_capital=req.starting_capital)
     # The fees the strategy's runs paid: a perpetual market's own when it trades one, not the venue's spot rates (RE-COST).
     paid = result.fee_basis
     fee_words = fees.text if paid is None or paid == fees.fees else \
@@ -194,9 +198,25 @@ def run_store_study(req: StudyRequest, store=None, progress=None, ledger_path: P
     while out.exists():  # two runs in the same second
         n += 1
         out = out.with_name(f"{stem}-{n}.md")
-    out.write_text(render(result, ledger, register), encoding="utf-8")
+    out.write_text(render(result, ledger, register, files=out.stem), encoding="utf-8")
     write_results(result, out)
+    write_beside(result, out)
     return out
+
+
+BESIDE = ("trades.csv", "equity.csv", "equity.svg")  # R-15: what sits beside a sheet as <stem>-<kind>, all it may
+
+
+def write_beside(result, sheet: Path) -> None:
+    """R-15: the sheet's every trade, its daily equity and buy-and-hold's, and their curve, beside it, never trimmed."""
+    from sleeve_fund.research import periods
+
+    eq, hold = periods.scored(result)
+    files = {"trades.csv": periods.trades_csv(periods.trade_rows(result.full_period)),
+             "equity.csv": periods.equity_csv(eq, hold),
+             "equity.svg": periods.equity_svg(eq, hold, f"{sheet.stem}: equity, Strategy and buy and hold")}
+    for kind in BESIDE:
+        sheet.with_name(f"{sheet.stem}-{kind}").write_text(files[kind], encoding="utf-8")
 
 
 def results_path(sheet: Path) -> Path:

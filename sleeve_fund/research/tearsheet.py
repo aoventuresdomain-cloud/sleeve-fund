@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 
 from sleeve_fund import funding, markets
-from sleeve_fund.research import mintrl, regime_split
+from sleeve_fund.research import mintrl, periods, regime_split
 from sleeve_fund.research.guardrails import CANDIDATE_CHECK, G1_RULES, MIN_OOS_TRADES, nearby_scored
 from sleeve_fund.research.ledger import IdeaLedger
 from sleeve_fund.research.metrics import (
@@ -120,6 +120,86 @@ def _idea(r: StudyResult) -> str:
     from sleeve_fund.research.trials import legacy_idea_hash
 
     return getattr(r, "idea_hash", None) or legacy_idea_hash(r.spec.name)
+
+
+def _period_label(p) -> str:
+    return f"{p.label} ({p.partial})" if p.partial else p.label
+
+
+def _period_tables(r: StudyResult) -> list[str]:
+    """R-13: the scored window's returns by year and by month, the Strategy's against buy-and-hold's."""
+    eq, hold = periods.scored(r)
+    trips = [vars(t) for t in periods.trade_rows(r.full_period) if t.closed is not None]
+    years, hold_years = periods.periods(eq, "Y", trips), {p.label: p for p in periods.periods(hold, "Y")}
+    out = ["## Returns by year", "",
+           f"Over the scored window ({_scored_words(eq)}), after fees and funding; a partial year says which part. "
+           "Trades are counted in the year they closed.", "",
+           "| Year | Strategy | Buy and hold | Difference | Strategy Sharpe | Buy-and-hold Sharpe | Strategy max DD "
+           "| Buy-and-hold max DD | Trades |",
+           "| --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
+    for p in years:
+        b = hold_years.get(p.label)
+        out.append(f"| {_period_label(p)} | {_pct(p.ret)} | {_pct(b.ret if b else None)} "
+                   f"| {_pct(p.ret - b.ret if b else None)} | {_num(p.sharpe)} | {_num(b.sharpe if b else None)} "
+                   f"| {_pct(p.max_dd)} | {_pct(b.max_dd if b else None)} | {p.trades} |")
+    out += ["", "## Returns by month", "",
+            "Each month end on end, so the months compound to the window's total return; p marks a partial month.", ""]
+    months, hold_months = periods.periods(eq, "M"), {p.label: p for p in periods.periods(hold, "M")}
+    by = {p.label: p for p in months}
+    hold_by_year = hold_years
+    for title, cell, year_cell in (
+            ("Strategy", lambda m: m and m.ret, lambda y: y.ret),
+            ("Buy and hold", lambda m: hold_months.get(m.label).ret if m and m.label in hold_months else None,
+             lambda y: hold_by_year[y.label].ret if y.label in hold_by_year else None),
+            ("Difference", lambda m: m.ret - hold_months[m.label].ret if m and m.label in hold_months else None,
+             lambda y: y.ret - hold_by_year[y.label].ret if y.label in hold_by_year else None)):
+        out += [f"**{title}**", "", "| Year | " + " | ".join(periods.MONTHS) + " | Year |",
+                "| --- |" + " --- |" * 13]
+        for y in years:
+            cells = []
+            for i in range(1, 13):
+                m = by.get(f"{y.label}-{i:02d}")
+                cells.append("" if m is None else _pct(cell(m)) + (" p" if m.partial else ""))
+            out.append(f"| {y.label} | " + " | ".join(cells) + f" | {_pct(year_cell(y))}{' p' if y.partial else ''} |")
+        out.append("")
+    return out
+
+
+def _scored_words(eq) -> str:
+    first, last = periods.span(eq)
+    return f"the full research period, the closes of {first:%d %b %Y} to {last:%d %b %Y}"
+
+
+def _every_trade(r: StudyResult, files: str | None, shown: int) -> list[str]:
+    """R-15: every trade of the scored window with the equity after it; the sheet lists the first `shown`, the CSV
+    beside it all of them, and says so."""
+    rows = periods.trade_rows(r.full_period)
+    eq, _ = periods.scored(r)
+    out = ["## Every trade", "",
+           f"Starting capital: {float(eq.iloc[0]):,.0f}. Every trade of the scored window ({_scored_words(eq)}), after "
+           "fees and funding, with the equity after it and its drawdown from the equity's peak so far (marked to "
+           "market daily); P&L % is of the equity before the trade. Sizes round to the venue's lot, so a smaller "
+           "account's sizes and returns can differ slightly from a larger one's. A position still open at the end is "
+           "the last row, marked to market there, so the P&L column sums to the end equity less the start.", ""]
+    if files:
+        out += [f"Files: [{files}-trades.csv]({files}/file/trades.csv), "
+                f"[{files}-equity.csv]({files}/file/equity.csv) and the equity curve against buy-and-hold, "
+                f"[{files}-equity.svg]({files}/file/equity.svg).", ""]
+    if not rows:
+        return out + ["No trades.", ""]
+    out += ["| # | Side | Entry | Entry price | Exit | Exit price | Size | Notional | Held | Fees | Funding | P&L "
+            "| P&L % | Exit reason | Equity after | Drawdown |",
+            "| --- |" + " --- |" * 15]
+    for t in rows[:shown]:
+        out.append(f"| {t.n} | {t.side} | {t.opened:%d %b %Y %H:%M} | {t.entry_px:,.6g} "
+                   f"| {'open' if t.closed is None else f'{t.closed:%d %b %Y %H:%M}'} "
+                   f"| {'' if t.exit_px is None else f'{t.exit_px:,.6g}'} | {t.qty:,.6g} | {t.notional:,.2f} "
+                   f"| {t.held / pd.Timedelta(days=1):.1f} days | {t.fees:,.2f} | {t.funding:,.2f} | {t.pnl:,.2f} "
+                   f"| {_pct(t.pnl_pct)} | {t.reason} | {t.equity_after:,.2f} | {_pct(t.drawdown)} |")
+    if len(rows) > shown:
+        where = f"[{files}-trades.csv]({files}/file/trades.csv)" if files else "the trades CSV beside this sheet"
+        out += ["", f"{shown} of {len(rows)} trades shown; every trade is in {where}."]
+    return out + [""]
 
 
 def _asset_class(r: StudyResult, spec) -> str:
@@ -511,9 +591,11 @@ def _span(minutes: int) -> str:
 
 
 def render(r: StudyResult, ledger: IdeaLedger, register=None, liquidation_ack: str | dict | None = None,
-           flat: StudyResult | None = None) -> str:
+           flat: StudyResult | None = None, files: str | None = None, shown_trades: int = 50) -> str:
     """flat: for a strength-sized variant (G5), its flat version's study on the same windows, shown side by side
-    (strength_report); without it the flat version stays."""
+    (strength_report); without it the flat version stays. files: the sheet's stem, whose trade list, daily equity
+    and curve sit beside it (run.write_beside), linked from the sheet; shown_trades: the trades listed on the sheet
+    itself (R-15)."""
     spec = r.spec
     oos = summary(r.oos_returns)
     oos_b = _bench(r.oos_benchmark_returns)
@@ -637,6 +719,7 @@ def render(r: StudyResult, ledger: IdeaLedger, register=None, liquidation_ack: s
                    f"{stress['assumed']:.2%}, the strategy returns {_pct(s1)} (from {_pct(s0)}) and the perpetual buy "
                    f"and hold {_pct(h1)} (from {_pct(h0)}). The assumed rate is light in strong uptrends.")
         out.append("")
+    out.extend(_period_tables(r))
     out.append(f"## Trading and costs (full research period, {r.research_start:%d %b %Y} to {r.research_end:%d %b %Y}, "
                "default params)")  # R-16: the span the table's trips and funding cover
     out.append("")
@@ -657,6 +740,7 @@ def render(r: StudyResult, ledger: IdeaLedger, register=None, liquidation_ack: s
     out.append("")
     out.append(_double_fees_line(r))
     out.append("")
+    out.extend(_every_trade(r, files, shown_trades))
     if r.cost_ladder:
         chosen = getattr(r, "chosen_params", None) or r.default_params
         out.append(f"## Cost ladder (full research period, chosen settings {json.dumps(chosen)})")
