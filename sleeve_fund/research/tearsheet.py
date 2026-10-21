@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 
 from sleeve_fund import funding, markets
-from sleeve_fund.research import mintrl, regime_split
+from sleeve_fund.research import analysis_pack, mintrl, regime_split
 from sleeve_fund.research.guardrails import CANDIDATE_CHECK, G1_RULES, MIN_OOS_TRADES, nearby_scored
 from sleeve_fund.research.ledger import IdeaLedger
 from sleeve_fund.research.metrics import (
@@ -661,6 +661,7 @@ def render(r: StudyResult, ledger: IdeaLedger, register=None, liquidation_ack: s
     out.append("")
     out.append(_double_fees_line(r))
     out.append("")
+    out += analysis_pack.section(r)  # R-17/R-18/R-19: risk, trades and costs, before the cost ladder
     if r.cost_ladder:
         chosen = getattr(r, "chosen_params", None) or r.default_params
         out.append(f"## Cost ladder (full research period, chosen settings {json.dumps(chosen)})")
@@ -726,6 +727,10 @@ def render(r: StudyResult, ledger: IdeaLedger, register=None, liquidation_ack: s
         out.append(f"- {_n(counts['variants'], 'distinct variant')} of this idea tried so far, in studies, backtests and "
                    f"paper strategies ({counts['evaluations']} evaluations including walk-forward refits): the N its "
                    f"results are judged by.{uncertain}")
+        from sleeve_fund.research.candidates import BUDGET_PER_IDEA, configurations
+
+        out.append(f"- Budget: {len(configurations(register, _idea(r)))} of {BUDGET_PER_IDEA} configurations used "
+                   "for this idea family (the fund summary shows it beside the ranking, R-20).")
     out.append(f"- {_n(project['ideas'], 'idea')} and {_n(project['variants'], 'distinct variant')} tested so far "
                f"across the project ({project['evaluations']} evaluations), shown for awareness. By family: "
                + ", ".join(f"{k} {v}" for k, v in project["ideas_by_family"].items()))
