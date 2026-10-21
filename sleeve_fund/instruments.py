@@ -182,10 +182,13 @@ def target_reached(side: int, high: float, low: float, level: float) -> bool:
     return TARGET_REACHED(side * best, side * level)
 
 
-def target_level(entry: float, side: int, share: float, price_precision: int) -> float:
+def target_level(entry: float, side: int, share: float, price_precision: int | None) -> float:
     """The target's price: `share` past the entry on the position's side, on the instrument's tick (one level for
-    all three paths, so an exact touch of it is a touch in each)."""
-    return round(entry * (1 + side * share), price_precision)
+    all three paths, so an exact touch of it is a touch in each). A Price's value, as the bars' prices are: round()
+    differs from it by a float hair at two or more decimals, so an exact touch would miss. Exact with no precision
+    (no instrument)."""
+    level = entry * (1 + side * share)
+    return level if price_precision is None else Price(level, price_precision).as_double()
 
 
 def target_fill_px(level, long: bool, half_spread) -> Decimal:
