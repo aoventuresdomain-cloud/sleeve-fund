@@ -1,0 +1,28 @@
+# QR-B12 price-vs-average family, try 7 (21 Oct 2026, Quant Researcher). Decision candle: 1d.
+# Variant of qr21 (row 18), pre-registered before any run: the trend type's exit set (PM 14:42-14:44 UK: every strategy
+# carries stop-loss logic; values are the type's convention, Advisor 21 Oct). Trail-only comparison; its SL + TP 3R
+# version (try 8) waits for TP-EXIT.
+version = 1
+name = "qr21b-trend-sma200-trail-long"
+title = "200-Day Trend + 3 ATR Trail (daily) · Long"
+reason = """qr21 (long while the daily close is above its 200-day average) with the trend exit set: a 3 ATR(14) stop at
+entry and a 3 ATR(14) trail below the close that only tightens, so part of a long run is locked in before the close
+falls back under the average. After a stop or trail exit there is no re-entry until a close is back below the average:
+the entry is a cross above the SMA, the same as qr21's level entry except a window's first entry. 3 ATR is the stop
+already used on rows 1, 3 and 18, not tuned here. Held at 1x."""
+
+[blocks.sma]
+kind = "sma"
+period = 200
+
+[blocks.atr]
+kind = "atr"
+period = 14
+
+[long]
+entry = { left = "close", op = "crosses_above", right = "sma" }
+exit = { left = "close", op = "<", right = "sma" }
+
+[exits]
+stop = { level = { sub = ["close", { mul = [3.0, "atr"] }] } }
+trail = { level = { sub = ["close", { mul = [3.0, "atr"] }] }, ratchet = true }
