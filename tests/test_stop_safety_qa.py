@@ -415,12 +415,14 @@ def _restart(tmp_path, profile, side, legs, stop_params=None, start_px=ENTRY):
     return store, [o for o in orders if o["order_id"] != "carried"], [f for f in fills if f["order_id"] != "carried"]
 
 
-def _safety_level(side, lev, mark=ENTRY, share=0.5):
+def _safety_level(side, lev, mark=ENTRY, share=0.5, liq=None):
     """R-S3/R-S4: half the REMAINING distance from the mark to the isolated liquidation price, or the profile's
-    share of it if tighter (Advisor 19:15 UK, 13 Oct: a third, conservative); a 1x long has none: half way to zero."""
-    none = side > 0 and lev == 1
-    liq = 0.0 if none else ENTRY * (1 - side / lev) / (1 - side * MM)
-    level = mark + (0.5 if none else min(0.5, share)) * (liq - mark)
+    share of it if tighter (Advisor 19:15 UK, 13 Oct: a third, conservative). A 1x long's is at maintenance, read
+    from the engine (TEC-BH102-1X, HoE and Advisor 21 Oct: one rule; it used to go half way to zero)."""
+    if liq is None:
+        assert not (side > 0 and lev == 1), "a 1x long's liquidation is the engine's: pass it"
+        liq = ENTRY * (1 - side / lev) / (1 - side * MM)
+    level = mark + min(0.5, share) * (liq - mark)
     assert min(mark, liq) < level < max(mark, liq)  # always between the mark and liquidation
     return level
 
@@ -440,8 +442,12 @@ def test_a_restart_without_a_restorable_stop_places_a_safety_stop_half_way_to_li
                                                                                            move):
     # The move runs over 5 minutes, inside the 15 bars the ATR stop needs: only a safety stop can act.
     store, orders, fills = _restart(tmp_path, profile, side, [(3, 0.0), (5, move), (4, 0.0)])
-    _, exit_fill = _closes(orders, fills, side)
-    level = _safety_level(side, LEVERAGE[profile], share=SHARE[profile])
+    close, exit_fill = _closes(orders, fills, side)
+    one_x_long = side > 0 and LEVERAGE[profile] == 1
+    liq = close["signal"]["liquidation_px"] if one_x_long else None  # the engine's own, the function every path uses
+    if one_x_long:
+        assert 0 < liq < 0.01 * ENTRY, close["signal"]  # at maintenance, not zero
+    level = _safety_level(side, LEVERAGE[profile], share=SHARE[profile], liq=liq)
     assert exit_fill["price"] == pytest.approx(level, rel=0.01), (exit_fill["price"], level)
     assert not [o for o in orders if o["intent"] == "entry"]
 
