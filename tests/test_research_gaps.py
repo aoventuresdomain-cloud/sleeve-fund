@@ -116,6 +116,9 @@ QR_HASHES = {
     "qr10_capitulation_long": "62a1ee8da26544c1", "qr11_exhaustion_long": "8ad588bcd437b26a",
     "qr11_exhaustion_short": "daa1bea4ae612937", "qr12_overnight_breakout_long": "aa3a666c41d9381c",
     "qr13_level_continuation_long": "18e1ac88db4b05b8", "qr13_level_continuation_short": "8ee488792d38fdd4",
+    # R-27 (HoE TEC, 21 Oct 2026): three new pre-registered definitions, added; no existing hash changed.
+    "qr01d_trend_donchian20_long": "1b9b732b0d34ecf6", "qr20_volume_surge_breakout_long": "9038fc9ed7fdbfa9",
+    "qr21_trend_sma200_long": "171c64b27d8699d2",
 }
 
 
