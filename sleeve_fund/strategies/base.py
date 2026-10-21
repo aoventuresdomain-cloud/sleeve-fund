@@ -2111,11 +2111,13 @@ class LongFlatStrategy(Strategy):
     @staticmethod
     def _refused_to_trade(sleeve) -> str | None:
         """Why paper refuses to start this strategy's stored settings, or None (Supervisor._refused's checks)."""
-        from sleeve_fund.strategies import check_perp_sizing, check_perp_stop
+        from sleeve_fund.strategies import (check_perp_sizing, check_perp_stop,  # noqa: I001
+                                            check_target_restart)
 
         try:
             check_perp_sizing(sleeve.strategy, sleeve.params)
             check_perp_stop(sleeve.strategy, sleeve.params, sleeve.risk_profile)
+            check_target_restart(sleeve.strategy, sleeve.params)
         except ValueError as exc:
             return str(exc)
         return None
