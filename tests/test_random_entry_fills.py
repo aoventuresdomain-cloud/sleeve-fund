@@ -221,15 +221,21 @@ def test_the_sheet_says_how_each_side_books_a_stop_and_counts_each_sides_stop_ex
     assert f"{re_.draw_stops:.1f} per draw" in re_.words
 
 
-def test_the_gap_is_the_strategys_stop_exits_re_priced_at_their_levels(stop_heavy):
-    """The backtest books a long's stop at the bar's low less a slippage, below its level: each gap is a gain given
-    up to the draws, and the gap in total return is the realised trips compounded with them less without."""
+def test_the_gap_is_the_strategys_stop_exits_re_priced_at_the_draws_fill(stop_heavy):
+    """The backtest books a long's stop at the bar's low less a slippage, below its level; the draws at the level less
+    the taker's slippage (Advisor, PR E round 1). Each gap is what the Strategy gives up to the draws' fill, and the
+    gap in total return is the realised trips compounded with them less without."""
+    from sleeve_fund.instruments import taker_slippage
+
     re_ = stop_heavy.random_entry
+    slip = float(taker_slippage(venue(str(INSTRUMENT.id.venue)).assumed_half_spread))
     trips = [t for f in stop_heavy.folds for t in f.trip_returns]
-    gaps = np.array([t.get("stop_gap", 0.0) for t in trips])
+    at_level = np.array([t.get("stop_gap", 0.0) for t in trips])
+    gaps = at_level - np.array([t.get("stop_level", 0.0) for t in trips]) * slip
     realised = np.array([t["ret"] for t in trips])
     assert (gaps[[bool(t.get("stopped")) for t in trips]] > 0).all() and gaps.sum() > 0
     assert re_.gap_return == pytest.approx(float(np.prod(1 + realised + gaps) - np.prod(1 + realised)), abs=1e-12)
+    assert re_.gap_return < float(np.prod(1 + realised + at_level) - np.prod(1 + realised))  # not the bare level
     assert re_.gap_percentile >= re_.return_percentile
     assert "percentile points" in re_.words
 

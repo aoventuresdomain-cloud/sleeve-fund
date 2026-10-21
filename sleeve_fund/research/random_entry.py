@@ -35,8 +35,8 @@ REPLACED = "sizes drawn from the variant's own with replacement (a window's trad
 RECONCILE_PP = 0.005
 NOT_JUDGED = "NOT JUDGED"
 # STOP-FILL gap (Advisor ruling (A), HoE 21 Oct): the two sides book stops differently until STOP-FILL unifies them.
-STOP_FILL_LINE = ("random draws book stops at the level; the Strategy books the bar's low less 0.05%; the bias is "
-                  "against the Strategy")
+STOP_FILL_LINE = ("random draws book stops at the level less the slippage floor; the Strategy books the bar's low "
+                  "less it; the bias is against the Strategy")
 MARGINAL = "marginal FAIL, within fill-model gap; re-judge after STOP-FILL unification"
 # Draws the engine would have held back are priced flat, which pulls the draws towards zero; above this share of the
 # draw trips the comparison is NOT JUDGED (Advisor, PR E round 1; re-drawing them can come later).
