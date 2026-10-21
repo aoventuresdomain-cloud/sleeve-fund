@@ -110,9 +110,9 @@ def dataset_name(venue: str, pair: str, minutes: int) -> str:
 
 
 def run_store_study(req: StudyRequest, store=None, progress=None, ledger_path: Path | None = None,
-                    out_dir: Path | None = None, history=None) -> Path:
+                    out_dir: Path | None = None, history=None, notes: tuple[str, ...] = ()) -> Path:
     """Run the study and write its tear sheet; returns the tear sheet's path. store: the journal
-    (for the connected account's fees and the measured spread), if there is one."""
+    (for the connected account's fees and the measured spread), if there is one. notes: caveats the sheet adds."""
     from sleeve_fund import spreads
     from sleeve_fund.fees import resolve as resolve_fees
     from sleeve_fund.history import HistoryStore
@@ -185,6 +185,7 @@ def run_store_study(req: StudyRequest, store=None, progress=None, ledger_path: P
     if cov is not None and pd.Timestamp.now(tz="UTC") - cov.last > STALE_HISTORY:
         result.notes.append(f"The stored history ends {cov.last:%d %b %Y %H:%M} UTC: the collector is still catching "
                             "up on this instrument, so the study ends there.")
+    result.notes.extend(notes)
     # Every run keeps its own sheet: a re-run with other exits, profile or windows is new evidence, not a
     # replacement for the old (review round 8, R8-M3). The newest sheet per instrument and bars decides G1.
     stem = f"{req.label or spec.name}_{dataset}_{datetime.now(timezone.utc):%Y%m%d-%H%M%S}"
