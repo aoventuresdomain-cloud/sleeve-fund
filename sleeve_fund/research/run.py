@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from sleeve_fund import markets
 from sleeve_fund.instruments import pct
 
 ROOT = Path(__file__).resolve().parent.parent.parent
@@ -64,6 +65,9 @@ class StudyRequest:
     label: str | None = None
     # B-37: a study list's pinned dates (research.pinned.Pinned): the study reads those days only, whatever day it runs.
     pinned: object | None = None
+    # RESEARCH-SPOT-FEES (HoE, 21 Oct): the study's market, whatever its params or risk profile say: "spot-lowfee" for
+    # the research spot market, "perp" for the perpetual. None: as today (the params' market, else the venue's).
+    market: str | None = None
 
     def exits(self) -> dict:
         """The exits every run of the study trades with, as the strategy takes them."""
@@ -84,6 +88,17 @@ class StudyRequest:
             raise ValueError("holdout days can't be negative")
         if "/" not in self.pair:
             raise ValueError(f"instrument {self.pair!r} should look like BTC/USD")
+
+
+def study_market(req: StudyRequest) -> dict:
+    """RESEARCH-SPOT-FEES (HoE, 21 Oct): the params overlay for a study's own market setting, whatever its params or
+    risk profile say: {} for None (as today), {"market": "perp"} or {"market": "spot-lowfee"}; anything else refused.
+    The single and basket study paths both apply it."""
+    if req.market is None:
+        return {}
+    if req.market not in (markets.PERP, markets.SPOT_LOWFEE):
+        raise ValueError(f"a study's market is {markets.PERP} or {markets.SPOT_LOWFEE}, not {req.market!r}")
+    return {"market": req.market}
 
 
 def _bars(minutes: int) -> str:
@@ -125,6 +140,10 @@ def run_store_study(req: StudyRequest, store=None, progress=None, ledger_path: P
     from sleeve_fund.venues import venue as venue_profile
 
     req.validate()
+    if req.market is not None:  # the study's own market over the params' (a short side is refused on spot)
+        from dataclasses import replace as _replace
+
+        req = _replace(req, params={**(req.params or {}), **study_market(req)})
     spec = spec_of(req.strategy)
     profile = venue_profile(req.venue)
     history = history or HistoryStore()
@@ -176,6 +195,8 @@ def run_store_study(req: StudyRequest, store=None, progress=None, ledger_path: P
     # The fees the strategy's runs paid: a perpetual market's own when it trades one, not the venue's spot rates (RE-COST).
     paid = result.fee_basis
     fee_words = fees.text if paid is None or paid == fees.fees else \
+        f"{pct(paid.maker)} maker, {pct(paid.taker)} taker ({markets.SPOT_LOWFEE_WORDS})" \
+        if markets.market_of(req.params) == markets.SPOT_LOWFEE else \
         f"{pct(paid.maker)} maker, {pct(paid.taker)} taker (the perpetual market's)"
     span = int((prices.index[0] - pd.Timedelta(minutes=req.minutes)).value), int(prices.index[-1].value)
     result.fee_note = f"{fee_words}; the maker rate on post-only orders only; spread: {spread.text(*span)}"

@@ -22,7 +22,8 @@ from nautilus_trader.model import AccountType, Currency, CurrencyPair, Money, Om
 from sleeve_fund import bars as bar_rule
 from sleeve_fund import funding, markets, open_risk
 from sleeve_fund.data import bar_type_for, check_feed_precision, decision_bar_type, to_bars
-from sleeve_fund.instruments import BOOK_SHARE, BarOpens, ExecBars, FeeSchedule, ScheduleFeeModel, fill_model, pair_of
+from sleeve_fund.instruments import (BOOK_SHARE, BarOpens, ExecBars, FeeSchedule, ScheduleFeeModel, fill_model, pair_of,
+                                     spot_pair)
 from sleeve_fund.spreads import SpreadSeries
 from sleeve_fund.store import utcnow as _utcnow
 from sleeve_fund.strategies import REGISTRY, check_perp_sizing
@@ -279,6 +280,11 @@ def plan_run(strategy_name, prices, instrument, params=None, starting_capital=10
     if starting_capital <= 0:
         raise ValueError("starting_capital must be positive")
     params = dict(params or {})
+    if markets.market_of(params) == markets.SPOT_LOWFEE and not isinstance(instrument, CurrencyPair):
+        # RESEARCH-SPOT-FEES: the perp venue's prices traded as a spot pair at its precisions, in a cash account
+        instrument = spot_pair(pair_of(instrument).split("/")[0], pair_of(instrument).split("/")[1],
+                               fees=markets.SPOT_LOWFEE_FEES, venue=instrument.id.venue,
+                               price_precision=instrument.price_precision, size_precision=instrument.size_precision)
     strategy_cls, config_cls = REGISTRY[strategy_name]
     touches = bool(params.get("definition")) and uses_first_touch(params["definition"])
     minutes_in = touches and bar_minutes > 1 and exec_prices is not None and not exec_prices.empty \

@@ -4,7 +4,8 @@
 
 Each row of the list's studies table (| # | definition | idea family | decision candle |) runs one G1 study of the
 `rules` model with params = to_params(definition) plus market "perp" (allow_short on a definition with a short
-side), on the venue's stored history, as the Research page runs a rule-builder Strategy's. Rows with first_touch
+side; an optional fifth | market | column of perp or spot-lowfee sets the study's market instead), on the venue's
+stored history, as the Research page runs a rule-builder Strategy's. Rows with first_touch
 get the 1-minute loader through the store study. The holdout stays locked: --use-holdout is never passed, and a
 request that asks for it is refused. Each study writes only research records: its trials register row (the
 journal), its idea counter line and its tear sheet. No Strategy, order, fill or fund row is ever written.
@@ -26,7 +27,7 @@ from sleeve_fund.venues import RESEARCH_VENUE
 ROOT = Path(__file__).resolve().parents[2]
 DEFINITIONS = ROOT / "configs" / "definitions"
 CANDLES = {"15m": 15, "1h": 60, "4h": 240, "1d": 1440}
-ROW = re.compile(r"^\|\s*(\d+)\s*\|\s*([a-z0-9_]+)\s*\|[^|]*\|\s*(\w+)\s*\|\s*$")
+ROW = re.compile(r"^\|\s*(\d+)\s*\|\s*([a-z0-9_]+)\s*\|[^|]*\|\s*(\w+)\s*\|(?:\s*([a-z-]*)\s*\|)?\s*$")
 # The list's common settings (research/quant-researcher/qr-rescore-list.md, 20 Oct): walk-forward 730/365, the
 # holdout's 365 days locked, risk profile none (1x, uncapped, unguarded).
 TRAIN_DAYS, TEST_DAYS, HOLDOUT_DAYS = 730, 365, 365
@@ -50,6 +51,21 @@ def rows_of(text: str) -> list[tuple[int, str, int]]:
     return out
 
 
+def markets_of(text: str) -> dict[int, str]:
+    """RESEARCH-SPOT-FEES: row number -> the study's market, for rows whose optional fifth column (| market |) names
+    one; a row without it, or with it blank, runs as before (perp). Only perp or spot-lowfee."""
+    from sleeve_fund.research.run import StudyRequest, study_market
+
+    out = {}
+    for line in text.splitlines():
+        m = ROW.match(line.strip())
+        if m is None or not m[4]:
+            continue
+        study_market(StudyRequest(strategy="rules", pair="BTC/USDT", market=m[4]))  # refuses anything else
+        out[int(m[1])] = m[4]
+    return out
+
+
 def pick(rows: list, spec: str | None) -> list:
     """The rows named by '1-8', '9-16', '3' or '1,4,7'; all of them for None or ''."""
     if not spec:
@@ -66,9 +82,9 @@ def pick(rows: list, spec: str | None) -> list:
     return chosen
 
 
-def request(name: str, minutes: int, venue: str, pair: str, pinned=None):
-    """The store study one row runs: rules, its definition's params, perp, the locked holdout, on the list's pinned
-    dates (B-37)."""
+def request(name: str, minutes: int, venue: str, pair: str, pinned=None, market: str | None = None):
+    """The store study one row runs: rules, its definition's params, perp (or the row's market), the locked holdout,
+    on the list's pinned dates (B-37)."""
     from sleeve_fund.research.run import StudyRequest
     from sleeve_fund.strategies.definitions import load_definition_file, to_params
 
@@ -81,7 +97,7 @@ def request(name: str, minutes: int, venue: str, pair: str, pinned=None):
         params["allow_short"] = True
     return StudyRequest(strategy="rules", pair=pair, venue=venue, minutes=minutes, risk_profile=None,
                         train_days=TRAIN_DAYS, test_days=TEST_DAYS, holdout_days=HOLDOUT_DAYS, use_holdout=False,
-                        params=params, label=name, pinned=pinned)
+                        params=params, label=name, pinned=pinned, market=market)
 
 
 def main(argv: list[str] | None = None, run=None, journal=None) -> int:
@@ -101,7 +117,9 @@ def main(argv: list[str] | None = None, run=None, journal=None) -> int:
         if pinned.holdout_days != HOLDOUT_DAYS:
             raise ValueError(f"the list pins a {pinned.holdout_days}-day holdout, not {HOLDOUT_DAYS}")
         rows = pick(rows_of(text), args.rows)
-        reqs = [(n, name, request(name, minutes, args.venue, args.pair, pinned)) for n, name, minutes in rows]
+        market = markets_of(text)
+        reqs = [(n, name, request(name, minutes, args.venue, args.pair, pinned, market.get(n)))
+                for n, name, minutes in rows]
     except (OSError, ValueError) as exc:
         print(f"refused: {exc}")
         return 2

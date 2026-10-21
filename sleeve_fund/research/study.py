@@ -224,6 +224,11 @@ class StudyResult:
     hold_note: str = ""  # what the hold pays for funding, and how much of out-of-sample it covers
     hold_insufficient: bool = False  # covers under HOLD_COVERAGE_FLOOR of the out-of-sample days: no verdict
     hold_full_period: bool = True  # the hold covers the whole research period (the parameter-robustness check)
+    # RESEARCH-SPOT-FEES (Advisor, 21 Oct): a spot-lowfee sheet's chosen settings over the research period at our
+    # current entry-tier spot fee (0.40% maker, 0.80% taker), and beside it the same settings on the perpetual with its
+    # funding, on the same days: {"spot": {...}, "perp": {...}} of end value, cagr, sharpe, max_drawdown, funding_paid.
+    spot_entry_tier: LadderRung | None = None
+    spot_vs_perp: dict | None = None
     oos_compare_returns: pd.Series | None = None
     spot_hold_returns: pd.Series | None = None  # "holding spot instead", out-of-sample, shown beside a perp hold
     # BH-102 rule 3 (Advisor, 21 Oct): a perp study's bar is the higher-Sharpe of the perp hold and the spot (or
@@ -607,6 +612,9 @@ def run_study(
     from sleeve_fund.venues import VENUES
 
     perpetual = getattr(VENUES.get(str(instrument.id.venue)), "perpetual", False)
+    # RESEARCH-SPOT-FEES: asked for on the research spot market, a perp venue's study trades spot, its hold too
+    if markets.market_of(default_params or spec.default_params) == markets.SPOT_LOWFEE:
+        perpetual = False
     for combo in grid(spec.param_grid) or [{}]:  # refused up front, before any data is read or run
         check_perp_sizing(spec.name, {**(default_params or spec.default_params or {}), **combo,
                                       **({"market": PERP} if perpetual else {})})
@@ -644,7 +652,8 @@ def run_study(
 
     profile = VENUES.get(str(instrument.id.venue))
     # A venue that lists perpetuals only has no spot: every run, the benchmark too, holds its perpetual.
-    market = {"market": PERP} if profile is not None and profile.perpetual else {}
+    market = ({"market": markets.SPOT_LOWFEE} if markets.market_of(default_params) == markets.SPOT_LOWFEE else
+              {"market": PERP} if profile is not None and profile.perpetual else {})
     # PM, 21 Oct: a perp pair with no kept tiers is studied on BTC's, said on the sheet (markets.research_tiers_pair).
     assumed_tiers = markets.research_tiers_pair(market, str(instrument.id.venue), pair_of(instrument))
     strategy_cap = None
@@ -698,7 +707,7 @@ def run_study(
     def bt(name: str, df: pd.DataFrame, params: dict, benchmark: bool = False,
            fees: FeeSchedule | None = None, slippage: float = 0.0, oos: bool = False, trade_from=None,
            feed: pd.DataFrame | None = None, flip: bool = False,
-           count_from: pd.Timestamp | None = None, family: bool = False) -> BacktestResult:
+           count_from: pd.Timestamp | None = None, family: bool = False, market_over: dict | None = None) -> BacktestResult:
         """One run. oos: an out-of-sample window or the holdout, on oos_exec_prices, flat until trade_from (a bar's
         close time). feed: these execution bars instead. flip: a first_touch rule's ambiguous candles resolve the
         other way (R2-G1); count_from: its report counts only the candles closing from then on (a window's test
@@ -708,7 +717,7 @@ def run_study(
         if progress is not None:
             progress(min(done[0] / total, 0.99))
         guarded = risk_profile is not None and not benchmark
-        params = {**params, **market}
+        params = {**params, **(market if market_over is None else market_over)}  # market_over: the spot sheet's perp line
         if assumed_tiers:
             params = {**params, "assumed_tiers_pair": assumed_tiers}
         if not benchmark and not family:
@@ -764,9 +773,12 @@ def run_study(
     # same engine (Advisor, 7 Oct 2026), and only over windows whose funding is all known; holding spot is shown
     # beside it where the venue lists spot. A perp venue's own buy and hold above is already a perp.
     hold_market = markets.market_of({**default_params, **market})
-    perp_hold = hold_market != markets.SPOT
+    perp_hold = markets.is_perp({"market": hold_market})
+    # RESEARCH-SPOT-FEES (Advisor, 21 Oct): a spot-lowfee sheet's bar is the price held, paying the spot fee and half the
+    # spread once in and once out, with no funding; never mixed with the perp bar.
+    spot_lowfee = hold_market == markets.SPOT_LOWFEE
     hold_liquidated: list[str] = []
-    price_cost = PRICE_HOLD_TAKER + spread_used
+    price_cost = (float(markets.SPOT_LOWFEE_FEES.taker) if spot_lowfee else PRICE_HOLD_TAKER) + spread_used
 
     def hold_returns(first, last) -> pd.Series | None:
         """The perp hold's daily returns over the bars closing first..last, or None when a funding settlement in it
@@ -788,6 +800,9 @@ def run_study(
     if perp_hold and hold_full_period and not market:  # a spot venue: the research period's hold is the perp's too
         bench = bt("buy_and_hold", research, {"market": hold_market}, benchmark=True)
         bench_ret = daily_returns(bench.equity)
+    if spot_lowfee:
+        bench = HoldCurve(price_hold_equity(research["close"], price_cost, starting_capital))
+        bench_ret = daily_returns(bench.equity)
     hold_liquidated.extend(f"{t:%d %b %Y} (the research period)" for t in (liquidated_at(bench) if perp_hold else []))
     spot_bench = bt("buy_and_hold", research, {}, benchmark=True) \
         if perp_hold and not (profile is not None and profile.perpetual) else None
@@ -799,6 +814,8 @@ def run_study(
         hold covers, the spot hold's), kept per window so a first_touch re-run can replace them (R2-G1)."""
         spot = (price_hold_returns(first, last).reindex(test_ret.index).dropna() if price_only else
                 spot_ret.reindex(test_ret.index).dropna() if spot_ret is not None else None)
+        if spot_lowfee:  # each window's own hold, in and out at the spot fee, as a perp hold's window is
+            return price_hold_returns(first, last).reindex(test_ret.index).dropna(), (len(test_ret), test_ret, spot)
         if not perp_hold:
             return bench_ret.reindex(test_ret.index).dropna(), (len(test_ret), test_ret, spot)
         held = hold_returns(first, last)
@@ -1016,6 +1033,22 @@ def run_study(
     compare_parts = [part for _, part, _ in compare_by if part is not None]
     spot_parts = [spot for _, _, spot in compare_by if spot is not None]
     run_fees = paid(chosen)
+    spot_entry_tier = spot_vs_perp = None
+    if spot_lowfee:
+        tier = bt(spec.name, research, chosen, fees=SPOT_ENTRY_TIER_FEES, slippage=slip)
+        spot_entry_tier = LadderRung(fee=float(SPOT_ENTRY_TIER_FEES.taker),
+                                     total_return=float(tier.equity.iloc[-1] / starting_capital - 1)
+                                     if len(tier.equity) else 0.0,
+                                     sharpe=summary(daily_returns(tier.equity))["sharpe"],
+                                     round_trips=len(round_trips(tier.fills, tier.shorts)), fees_paid=tier.fees_paid)
+
+        def line(res) -> dict:
+            s = summary(daily_returns(res.equity))
+            return {"end": float(res.equity.iloc[-1]), "cagr": s["cagr"], "sharpe": s["sharpe"],
+                    "max_drawdown": s["max_drawdown"], "funding_paid": -sum(f["amount"] for f in res.funding)}
+
+        spot_vs_perp = {"spot": line(bt(spec.name, research, chosen)),
+                        "perp": line(bt(spec.name, research, chosen, market_over={"market": PERP}))}
     covered = len(pd.concat(compare_parts)) if compare_parts else 0
     hold_insufficient = perp_hold and not switched and covered < HOLD_COVERAGE_FLOOR * oos_days[0]
     if perp_hold:
@@ -1030,6 +1063,9 @@ def run_study(
         if hold_insufficient:
             hold_note += (f": insufficient funding history (under {HOLD_COVERAGE_FLOOR:.0%}), so it gives no verdict; "
                           "random entry still judges")
+    elif spot_lowfee:
+        hold_note = (f"buy and hold is the price held, paying the {markets.SPOT_LOWFEE_FEES.taker:.2%} spot fee and half "
+                     "the spread once in and once out, with no funding (research only)")
     else:
         hold_note = ""
     dists = [x for _, _, d in stress_parts for x in d]
@@ -1082,8 +1118,11 @@ def run_study(
         fill_labels=labels,
         margin_note=markets.assumed_tiers_words(assumed_tiers, pair_of(instrument)) if assumed_tiers else "",
         fee_note=(f"{pct(run_fees.maker)} maker on post-only orders, {pct(run_fees.taker)} taker "
-                  f"on every other order, plus {spread_words} on orders that take liquidity; break-even: {breakeven}"),
+                  f"on every other order, plus {spread_words} on orders that take liquidity; break-even: {breakeven}"
+                  + (f" ({markets.SPOT_LOWFEE_WORDS})" if market.get("market") == markets.SPOT_LOWFEE else "")),
         fee_basis=run_fees,
+        spot_entry_tier=spot_entry_tier,
+        spot_vs_perp=spot_vs_perp,
         double_fee_returns=double_fee_returns,
         double_fees=_double_fees(pd.concat(oos_parts) if oos_parts else pd.Series(dtype=float), double_fee_returns,
                                  twice_runs, doubled(run_fees)),
@@ -1128,7 +1167,7 @@ def run_study(
     if risk_profile is not None:
         result.notes.append(
             f"Every run trades under the {risk_profile} risk profile, as paper does: positions capped at "
-            f"{strategy_cap:.0%} of capital{' in notional' if market else ''}, the drawdown halt (flat for the rest of the run, as paper stays halted "
+            f"{strategy_cap:.0%} of capital{' in notional' if markets.is_perp(market) else ''}, the drawdown halt (flat for the rest of the run, as paper stays halted "
             "until you resume it) and the daily-loss pause. The buy-and-hold benchmark is held at "
             f"{'the same exposure' if position_cap == strategy_cap else f'{position_cap:.0%} of capital'} and never halted.")
     else:
@@ -1149,7 +1188,13 @@ def run_study(
         result.notes.append(
             f"Traded on {minutes}-minute bars; every figure here is on daily returns (closes at 00:00 UTC), "
             "so Sharpe is annualised as daily and the bootstrap resamples days, as for a daily strategy.")
-    if market:
+    if market.get("market") == markets.SPOT_LOWFEE:
+        result.notes.insert(0, f"Assumed spot fee {markets.SPOT_LOWFEE_FEES.taker:.2%} (research only); paper needs the "
+                               "account's own rate. Spot priced on perpetual prices, so the gap between the two prices is "
+                               "ignored (small for daily rules; it does not cover funding).")
+        result.notes.append(f"Every run, the buy and hold too, traded spot on the venue's prices: long only, in a cash "
+                            f"account with no margin and no funding, at the fees above ({markets.SPOT_LOWFEE_WORDS}).")
+    elif market:
         result.notes.append(f"The venue lists perpetuals only, so every run traded the perpetual, "
                             f"{_sides_words(full_default, default_params)}, paying the funding the venue settled.")
     if exits:
@@ -1240,6 +1285,8 @@ def run_study(
                 if hb_ret is None:
                     result.notes.append("The holdout has no buy-and-hold line: a funding settlement in it has no "
                                         "known rate, and a missing rate is never filled in.")
+            elif spot_lowfee:
+                result.holdout_benchmark = _summary_or_none(price_hold_returns(h_start, prices.index[-1]))
             else:
                 b_all = bt("buy_and_hold", prices, {}, benchmark=True)
                 result.holdout_benchmark = summary(whole_days(daily_returns(b_all.equity), h_start, bar))
@@ -1630,6 +1677,8 @@ HOLD_COVERAGE_FLOOR = 0.5  # the share of out-of-sample days a perp hold must co
 PRICE_HOLD = "price-only hold (no spot market at this venue)"
 # shortcut: the base-tier spot taker fee both venues publish (0.10%), not read from a fee schedule: no spot account.
 PRICE_HOLD_TAKER = 0.001
+# RESEARCH-SPOT-FEES (Advisor, 21 Oct): our current entry-tier spot fee, the extra line on every spot-lowfee sheet
+SPOT_ENTRY_TIER_FEES = FeeSchedule(maker=Decimal("0.004"), taker=Decimal("0.008"))
 
 
 def price_hold_equity(closes: pd.Series, cost: float, capital: float) -> pd.Series:

@@ -122,6 +122,29 @@ def _idea(r: StudyResult) -> str:
     return getattr(r, "idea_hash", None) or legacy_idea_hash(r.spec.name)
 
 
+def _spot_section(r: StudyResult) -> list[str]:
+    """RESEARCH-SPOT-FEES (Advisor, 21 Oct): a spot-lowfee sheet's entry-tier fee line and its perpetual comparison."""
+    tier, both = getattr(r, "spot_entry_tier", None), getattr(r, "spot_vs_perp", None)
+    if tier is None and both is None:
+        return []
+    out = ["## Spot against the perpetual (research only)", ""]
+    if tier is not None:
+        out += [f"Spot at our current entry-tier fee (0.40% maker, {tier.fee:.2%} taker): total return "
+                f"{_pct(tier.total_return)}, Sharpe {_num(tier.sharpe)}, {tier.round_trips} round trips, fees paid "
+                f"{tier.fees_paid:,.0f}.", ""]
+    if both is not None:
+        out += ["The chosen settings over the research period, the same days, on each market:", "",
+                "| Market | End value | CAGR | Sharpe | Worst drawdown | Funding paid |",
+                "| --- | --- | --- | --- | --- | --- |"]
+        for name, words in (("spot", "Spot at the assumed research fee, no funding"),
+                            ("perp", "The perpetual, with its funding")):
+            x = both[name]
+            out.append(f"| {words} | {x['end']:,.0f} | {_pct(x['cagr'])} | {_num(x['sharpe'])} "
+                       f"| {_pct(x['max_drawdown'])} | {x['funding_paid']:,.0f} |")
+        out.append("")
+    return out
+
+
 def _asset_class(r: StudyResult, spec) -> str:
     """R-04: what the study's runs traded, not the strategy's default: a perpetual when they traded one."""
     return "perpetual" if markets.is_perp(r.full_period.params) else spec.asset_class
@@ -679,6 +702,7 @@ def render(r: StudyResult, ledger: IdeaLedger, register=None, liquidation_ack: s
     out.append(_double_fees_line(r))
     out.append("")
     out += analysis_pack.section(r)  # R-17/R-18/R-19: risk, trades and costs, before the cost ladder
+    out += _spot_section(r)
     if r.cost_ladder:
         chosen = getattr(r, "chosen_params", None) or r.default_params
         out.append(f"## Cost ladder (full research period, chosen settings {json.dumps(chosen)})")
