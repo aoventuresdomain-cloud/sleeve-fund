@@ -591,6 +591,6 @@ def test_better_than_the_parent_needs_all_three_and_a_tight_paired_sharpe():
     assert not worse.drawdown_better and not worse.better
     from sleeve_fund.research.equal_exposure import section
 
-    line = next(x for x in section(yes) if x.startswith("**Variant better than parent: "))
-    assert line.startswith(f"**Variant better than parent: YES** (Sharpe ✓ p={yes.sharpe_share:.2f}, drawdown ✓, "
-                           "own edge ✓)")
+    line = next(x for x in section(yes) if x.startswith("**Variant against parent"))
+    assert yes.better and line.startswith(f"**Variant against parent, no verdict while close-priced** (Sharpe ✓ "
+                                          f"p={yes.sharpe_share:.2f}, drawdown ✓, own edge ✓)")

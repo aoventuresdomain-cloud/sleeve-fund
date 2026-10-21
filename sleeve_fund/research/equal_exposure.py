@@ -25,6 +25,7 @@ import numpy as np
 import pandas as pd
 
 from sleeve_fund.research.metrics import summary
+from sleeve_fund.research.random_entry import CLOSE_PRICED
 
 SHARPE_BLOCK_DAYS = 20
 SHARPE_RESAMPLES = 1000
@@ -133,7 +134,7 @@ def section(e: EqualExposure | None) -> list[str]:
     """The tear sheet's section for a volatility-sized variant; none for any other study."""
     if e is None:
         return []
-    out = ["## Sizing to a target volatility, against the parent at the same exposure", ""]
+    out = ["## Sizing to a target volatility, against the parent at the same exposure", "", f"{CLOSE_PRICED}.", ""]
     if not math.isfinite(e.k):
         return out + ["The parent held no position in the out-of-sample windows, so there is no exposure to match: "
                       "no comparison.", ""]
@@ -150,8 +151,9 @@ def section(e: EqualExposure | None) -> list[str]:
         return "✓" if ok else "✗"
 
     return out + [
-        f"**Variant better than parent: {'YES' if e.better else 'NO'}** (Sharpe {mark(e.sharpe_better)} "
-        f"p={e.sharpe_share:.2f}, drawdown {mark(e.drawdown_better)}, own edge {mark(e.own_edge)}). Better needs all "
+        # Close-priced: its checks, no verdict of its own; only the headline filled-draw verdict decides (Advisor).
+        f"**Variant against parent, no verdict while close-priced** (Sharpe {mark(e.sharpe_better)} "
+        f"p={e.sharpe_share:.2f}, drawdown {mark(e.drawdown_better)}, own edge {mark(e.own_edge)}). Better would need all "
         f"three: a higher Sharpe than the parent's, higher in at least {SHARPE_SHARE:.0%} of {SHARPE_RESAMPLES:,} "
         f"paired resamples (stationary bootstrap, mean block {SHARPE_BLOCK_DAYS} days); a largest drawdown no worse "
         "than the scaled parent's; and its own edge (95th percentile of random entries, profitable at twice the fees). "

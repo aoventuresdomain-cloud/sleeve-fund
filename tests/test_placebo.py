@@ -204,7 +204,7 @@ def test_the_fast_path_matches_the_full_engine_on_the_parent_the_variant_and_thr
     assert r.judged and not r.why_not and r.blocked >= len(every[::3]) and r.share < 1
     assert math.isclose(r.full_return, r.calibration[1].full_return)
     sheet = "\n".join(P.section(r))
-    assert "| draw 2 |" in sheet and ("Placebo: PASS" in sheet or "Placebo: FAIL" in sheet)
+    assert "| draw 2 |" in sheet and "no verdict while close-priced" in sheet
     assert f"blocked {r.blocked:,} of them" in sheet
 
 

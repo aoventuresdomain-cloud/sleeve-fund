@@ -35,7 +35,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
-from sleeve_fund.research.random_entry import BAR, DRAWS
+from sleeve_fund.research.random_entry import BAR, CLOSE_PRICED, DRAWS
 from sleeve_fund.strategies.base import MAX_STOP, MIN_STOP
 from sleeve_fund.strategies.definitions import (Compiled, Confirm, Env, FirstTouch, FundingDecile, Group, Setup,
                                                 check_definition)
@@ -396,9 +396,11 @@ def section(r: PlaceboResult | None) -> list[str]:
     if r.why_not:
         verdict = f"**Placebo: {NOT_JUDGED}**: {r.why_not}."
     else:
-        verdict = (f"**Placebo: {'PASS' if r.passed else 'FAIL'}**: the variant's return beats {r.percentile:.0f}% of "
-                   f"{r.draws:,} draws (the bar is the {BAR:.0f}th percentile).")
-    lines = head + [verdict, ""]
+        # Close-priced: its percentile, no verdict of its own; only the headline filled-draw verdict decides (Advisor).
+        verdict = (f"**Placebo: {r.percentile:.0f}th percentile, no verdict while close-priced**: the variant's return "
+                   f"beats {r.percentile:.0f}% of {r.draws:,} draws (the bar, once judged, is the {BAR:.0f}th "
+                   "percentile).")
+    lines = head + [verdict, "", f"{CLOSE_PRICED}.", ""]
     if r.signals:
         drawn = r.draw_blocked / r.signals if len(r.draw_blocked) else np.empty(0)
         lines += [f"The parent's entry rule held on {r.signals:,} scored candles; the filter blocked {r.blocked:,} of "

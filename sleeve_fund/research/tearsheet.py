@@ -21,6 +21,7 @@ from sleeve_fund.research.metrics import (
     years_covered,
 )
 from sleeve_fund.research.pbo import PBO_CHECK, g1_row
+from sleeve_fund.research.random_entry import CLOSE_PRICED
 from sleeve_fund.research.study import StudyResult
 
 ROBUST_SHARE = 0.6
@@ -609,6 +610,7 @@ def render(r: StudyResult, ledger: IdeaLedger, register=None, liquidation_ack: s
         out.append("> Random entry by test year (each year's trips, whole, against draws in that year): " + "; ".join(
             f"{y}: {re_.return_percentile:.0f}th percentile of {re_.draws:,} draws, {re_.trades} trades"
             if re_.trades else f"{y}: no trades" for y, re_ in by_year.items()) + ".")
+        out.append(f"> {CLOSE_PRICED}.")
         out.append("")
     if old is not None:
         out.append(f"> {SCREENING_DISCLOSURE}")
