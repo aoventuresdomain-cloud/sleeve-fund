@@ -18,7 +18,7 @@ import secrets
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import urlencode, urlparse
+from urllib.parse import quote, urlencode, urlparse
 from zoneinfo import ZoneInfo
 
 import markdown
@@ -1419,6 +1419,8 @@ def create_app(store: Store | None = None) -> FastAPI:
     def tearsheet(request: Request, sheet: str, _: str = Depends(require_pm)):
         path = _sheet_path(sheet)
         html = markdown.markdown(path.read_text(encoding="utf-8"), extensions=["tables"])
+        # R-15: the files beside the sheet, by their fixed names only, at this sheet's own route for them.
+        html = html.replace('href="beside:', f'href="/research/{quote(path.stem)}/file/')
         # Results as status chips, so a FAIL can't be missed in a wall of text.
         for word, tone, label in (("PASS", "running", "Pass"), ("FAIL", "halted", "Fail"), ("WARN", "paused", "Warn"),
                                   ("INFO", "stopped", "Info"), ("NOT JUDGED", "paused", "Not judged"),

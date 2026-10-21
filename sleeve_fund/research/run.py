@@ -198,7 +198,7 @@ def run_store_study(req: StudyRequest, store=None, progress=None, ledger_path: P
     while out.exists():  # two runs in the same second
         n += 1
         out = out.with_name(f"{stem}-{n}.md")
-    out.write_text(render(result, ledger, register, files=out.stem), encoding="utf-8")
+    out.write_text(render(result, ledger, register, files=True), encoding="utf-8")
     write_results(result, out)
     write_beside(result, out)
     return out

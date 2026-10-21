@@ -170,7 +170,7 @@ def _scored_words(eq) -> str:
     return f"the full research period, the closes of {first:%d %b %Y} to {last:%d %b %Y}"
 
 
-def _every_trade(r: StudyResult, files: str | None, shown: int) -> list[str]:
+def _every_trade(r: StudyResult, files: bool, shown: int) -> list[str]:
     """R-15: every trade of the scored window with the equity after it; the sheet lists the first `shown`, the CSV
     beside it all of them, and says so."""
     rows = periods.trade_rows(r.full_period)
@@ -184,9 +184,8 @@ def _every_trade(r: StudyResult, files: str | None, shown: int) -> list[str]:
            "account's sizes and returns can differ slightly from a larger one's. A position still open at the end is "
            "the last row, marked to market there, so the P&L column sums to the end equity less the start.", ""]
     if files:
-        out += [f"Files: [{files}-trades.csv]({files}/file/trades.csv), "
-                f"[{files}-equity.csv]({files}/file/equity.csv) and the equity curve against buy-and-hold, "
-                f"[{files}-equity.svg]({files}/file/equity.svg).", ""]
+        out += ["Beside this sheet: the [trade list (CSV)](beside:trades.csv), the [daily equity (CSV)](beside:equity.csv) "
+                "and the [equity curve against buy-and-hold (SVG)](beside:equity.svg).", ""]
     if not rows:
         return out + ["No trades.", ""]
     out += ["| # | Side | Entry | Entry price | Exit | Exit price | Size | Notional | Held | Fees | Funding | P&L "
@@ -199,7 +198,7 @@ def _every_trade(r: StudyResult, files: str | None, shown: int) -> list[str]:
                    f"| {t.held / pd.Timedelta(days=1):.1f} days | {t.fees:,.2f} | {t.funding:,.2f} | {t.pnl:,.2f} "
                    f"| {_pct(t.pnl_pct)} | {t.reason} | {t.equity_after:,.2f} | {_pct(t.drawdown)} |")
     if len(rows) > shown:
-        where = f"[{files}-trades.csv]({files}/file/trades.csv)" if files else "the trades CSV beside this sheet"
+        where = "the [trade list (CSV)](beside:trades.csv)" if files else "the trade list beside this sheet"
         out += ["", f"{shown} of {len(rows)} trades shown; every trade is in {where}."]
     return out + [""]
 
@@ -593,11 +592,12 @@ def _span(minutes: int) -> str:
 
 
 def render(r: StudyResult, ledger: IdeaLedger, register=None, liquidation_ack: str | dict | None = None,
-           flat: StudyResult | None = None, files: str | None = None, shown_trades: int = 50) -> str:
+           flat: StudyResult | None = None, files: bool = False, shown_trades: int = 50) -> str:
     """flat: for a strength-sized variant (G5), its flat version's study on the same windows, shown side by side
-    (strength_report); without it the flat version stays. files: the sheet's stem, whose trade list, daily equity
-    and curve sit beside it (run.write_beside), linked from the sheet; shown_trades: the trades listed on the sheet
-    itself (R-15)."""
+    (strength_report); without it the flat version stays. files: the sheet's trade list, daily equity and curve sit
+    beside it (run.write_beside), linked as beside:<kind>, which the dashboard points at its own route for them, so
+    the sheet itself names no run stamp and two runs of one study still render the same; shown_trades: the trades
+    listed on the sheet itself (R-15)."""
     spec = r.spec
     oos = summary(r.oos_returns)
     oos_b = _bench(r.oos_benchmark_returns)

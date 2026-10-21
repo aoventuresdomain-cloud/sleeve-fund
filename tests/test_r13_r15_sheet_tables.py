@@ -91,9 +91,9 @@ def test_a_long_trade_list_is_never_trimmed_silently(tmp_path, perp_venue):
 
     r, ledger, _ = _study(tmp_path, perp_venue, LONG)
     rows = periods.trade_rows(r.full_period)
-    sheet = tearsheet.render(r, ledger, files="qr_x", shown_trades=2)
-    assert f"2 of {len(rows)} trades shown; every trade is in [qr_x-trades.csv](qr_x/file/trades.csv)" in sheet
-    assert "[qr_x-equity.svg](qr_x/file/equity.svg)" in sheet and "[qr_x-equity.csv](qr_x/file/equity.csv)" in sheet
+    sheet = tearsheet.render(r, ledger, files=True, shown_trades=2)
+    assert f"2 of {len(rows)} trades shown; every trade is in the [trade list (CSV)](beside:trades.csv)." in sheet
+    assert "(beside:equity.svg)" in sheet and "(beside:equity.csv)" in sheet
     csv = periods.trades_csv(rows)
     assert csv.count("\n") == len(rows) + 1 and csv.startswith("trade,side,entry_time")
 
@@ -137,7 +137,7 @@ def test_the_dashboard_serves_exactly_the_three_files_beside_a_sheet_to_the_pm(t
     monkeypatch.setenv("TEARSHEET_DIR", str(tmp_path))
     sheets = tmp_path / "sheets"
     sheets.mkdir()
-    (sheets / "qr_x.md").write_text("# Tear sheet\n")
+    (sheets / "qr_x.md").write_text("# Tear sheet\n\nThe [trade list (CSV)](beside:trades.csv).\n")
     for name, body in (("qr_x-trades.csv", "trade\n1\n"), ("qr_x-equity.csv", "day\n"), ("qr_x-equity.svg", "<svg/>"),
                        ("qr_x-notes.txt", "secret")):
         (sheets / name).write_text(body)
@@ -153,6 +153,7 @@ def test_the_dashboard_serves_exactly_the_three_files_beside_a_sheet_to_the_pm(t
         assert c.get(f"/research/qr_x/file/{kind}").status_code == 401
         assert c.get(f"/research/qr_x/file/{kind}", auth=("pm", "nope")).status_code == 401
     assert c.get("/research/qr_x/file/trades.csv", auth=auth).text == "trade\n1\n"
+    assert 'href="/research/qr_x/file/trades.csv"' in c.get("/research/qr_x", auth=auth).text
     for bad in ("notes.txt", "..%2Foutside-trades.csv", "trades.csv%00", "TRADES.CSV", "equity.svg.bak"):
         assert c.get(f"/research/qr_x/file/{bad}", auth=auth).status_code == 404, bad
     for sheet in ("..%2Foutside", "..%2F..%2Fetc%2Fpasswd", "nope"):
