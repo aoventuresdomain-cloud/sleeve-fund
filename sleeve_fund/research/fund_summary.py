@@ -172,6 +172,8 @@ def btc_returns(history, venue: str, pair: str, days: pd.DatetimeIndex) -> tuple
     history store; None and the reason when the store doesn't cover every one of them."""
     if history is None:
         return None, "no stored history given"
+    if not len(days):
+        return None, "the out-of-sample files hold no days"
     try:
         bars = history.read(venue, pair, 1440, start=days[0] - pd.Timedelta(days=2), end=days[-1] + pd.Timedelta(days=1))
     except KeyError:

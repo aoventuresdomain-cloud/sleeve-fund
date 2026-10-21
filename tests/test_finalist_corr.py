@@ -196,3 +196,35 @@ def test_a_real_study_writes_its_test_windows_with_a_price_on_every_day(tmp_path
     close.index = close.index.tz_localize(None) if close.index.tz is not None else close.index
     want = (close / close.shift(1) - 1).reindex(got.index)
     assert got["price"].notna().all() and got["price"].tolist() == pytest.approx(want.tolist())
+
+
+def test_sheets_naming_two_venues_read_n_a_unless_one_is_given(tmp_path, stored):
+    hist, want = stored
+    days = want.index[-80:]
+    a = _sheet(tmp_path, "trend_btc", "binance-btcusdt-store", pd.Series(_walk(80, seed=10), index=days))
+    b = _sheet(tmp_path, "trend_eth", "kraken-ethusd-store", pd.Series(_walk(80, seed=11), index=days))
+    text = "\n".join(fs.oos_section([a, b], hist))
+    assert "BTC column: n/a, the sheets don't name one venue's stored history" in text
+    text = "\n".join(fs.oos_section([a, b], hist, "BINANCE"))
+    assert "BTC: BTC/USDT on BINANCE" in text and "| n/a |" not in text
+
+
+def test_empty_out_of_sample_files_read_n_a_not_an_error(tmp_path, stored):
+    hist, _ = stored
+    got, why = fs.btc_returns(hist, "BINANCE", "BTC/USDT", pd.DatetimeIndex([]))
+    assert got is None and "no days" in why
+
+
+def test_a_store_study_writes_its_out_of_sample_file_beside_the_sheet(tmp_path):
+    from sleeve_fund.history import HistoryStore
+    from sleeve_fund.research.run import StudyRequest, run_store_study
+
+    idx = pd.date_range("2020-01-01", periods=191 * 24, freq="60min", tz="UTC")
+    c = 100 * np.exp(np.cumsum(np.random.default_rng(1).normal(0, 0.004, len(idx))))
+    hourly = pd.DataFrame({"open": c, "high": c, "low": c, "close": c, "volume": 1.0}, index=idx)
+    hist = HistoryStore(tmp_path / "hist")
+    hist.append("KRAKEN", "BTC/USD", hourly.resample("1min").ffill(), cursor="x")
+    sheet = run_store_study(StudyRequest("buy_and_hold", "BTC/USD", venue="KRAKEN", holdout_days=100, train_days=60,
+                                         test_days=30), ledger_path=tmp_path / "l.jsonl", out_dir=tmp_path, history=hist)
+    got = pd.read_csv(oos_returns_path(sheet), index_col="date", parse_dates=["date"])
+    assert len(got) >= 20 and got["price"].notna().all()  # set-up: a 30-day test window inside 90 research days
