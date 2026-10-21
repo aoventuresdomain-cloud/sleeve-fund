@@ -29,6 +29,9 @@ import pandas as pd
 from sleeve_fund import bars as bar_rule
 
 OHLCV = ["open", "high", "low", "close", "volume"]
+# R-22: the base volume bought by orders that took liquidity, kept beside the minutes in taker_buy/YYYY-MM.npz (the
+# OHLCV month files are never rewritten for it), where the venue's candles carry it
+TAKER, TAKER_DIR = "taker_buy", "taker_buy"
 DEFAULT_ROOT = Path(os.environ.get("HISTORY_DIR", Path(__file__).resolve().parent.parent / "data" / "history"))
 _lock = threading.Lock()
 
@@ -233,6 +236,58 @@ class HistoryStore:
         if not path.exists():
             return []
         return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+    def taker_buy(self, venue: str, pair: str, start=None, end=None) -> pd.Series:
+        """R-22: the taker-buy base volume kept beside the stored minutes, by open time in [start, end), oldest first;
+        minutes without one are absent (none kept yet, or refused). Read-only; the minutes' OHLCV is not read."""
+        d = self._dir(venue, pair) / TAKER_DIR
+        parts = [_load_taker(p) for p in _month_files(d)]
+        s = pd.concat(parts) if parts else pd.Series(dtype=float, index=pd.DatetimeIndex([], tz="UTC"))
+        if start is not None:
+            s = s[s.index >= pd.Timestamp(start)]
+        if end is not None:
+            s = s[s.index < pd.Timestamp(end)]
+        return s.rename(TAKER)
+
+    def add_taker_buy(self, venue: str, pair: str, page: pd.DataFrame, dry_run: bool = False) -> dict:
+        """R-22: keep each offered minute's taker-buy volume (page: volume and taker_buy by open time) beside the
+        stored minute, in a file of its own per month (taker_buy/YYYY-MM.npz), so no OHLCV file is ever rewritten.
+        Only for a closed minute the store holds whose stored volume the offer matches (to 12 significant figures):
+        another volume is a different candle, so its taker figure is not kept (mismatched). A figure below 0 or
+        above its volume is refused. A kept figure is never changed (held). dry_run: count only."""
+        out = {"added": 0, "held": 0, "not_stored": 0, "mismatched": 0, "refused": 0}
+        d = self._dir(venue, pair)
+        with _writing(d):
+            cov = self.coverage(venue, pair)
+            for month, chunk in page.groupby(page.index.strftime("%Y-%m")):
+                path = d / f"{month}.npz"
+                ohlcv = _load(path) if path.exists() and cov is not None else None
+                if ohlcv is not None:
+                    ohlcv = ohlcv[~ohlcv.index.duplicated(keep="last")]
+                    ohlcv = ohlcv[(ohlcv.index <= cov.last) & ~_forming(ohlcv.index, cov)]
+                stored = chunk.index.isin(ohlcv.index) if ohlcv is not None else np.zeros(len(chunk), bool)
+                out["not_stored"] += int((~stored).sum())
+                chunk = chunk[stored]
+                if chunk.empty:
+                    continue
+                vol, offer = ohlcv.loc[chunk.index, "volume"].to_numpy(float), chunk["volume"].to_numpy(float)
+                same = np.isclose(vol, offer, rtol=1e-12, atol=0.0)
+                out["mismatched"] += int((~same).sum())
+                chunk = chunk[same]
+                taker = chunk["taker_buy"].to_numpy(float)
+                ok = np.isfinite(taker) & (taker >= 0) & (taker <= chunk["volume"].to_numpy(float))
+                out["refused"] += int((~ok).sum())
+                chunk = chunk[ok]
+                tpath = d / TAKER_DIR / f"{month}.npz"
+                kept = _load_taker(tpath) if tpath.exists() else pd.Series(dtype=float)
+                new = chunk.loc[~chunk.index.isin(kept.index), "taker_buy"]
+                out["held"] += len(chunk) - len(new)
+                out["added"] += len(new)
+                if dry_run or new.empty:
+                    continue
+                tpath.parent.mkdir(exist_ok=True)
+                _save_taker(tpath, pd.concat([kept, new]).sort_index())
+        return out
 
     def _month(self, d: Path, ts: pd.Timestamp) -> pd.DataFrame:
         return _load(d / f"{ts.strftime('%Y-%m')}.npz")
@@ -545,6 +600,21 @@ def _save(path: Path, df: pd.DataFrame) -> None:
         tmp.unlink(missing_ok=True)
 
 
+def _save_taker(path: Path, s: pd.Series) -> None:
+    """R-22: one month's taker-buy volume, written as _save writes a month (a unique temporary file renamed in)."""
+    tmp = path.with_name(f".{path.stem}.{uuid.uuid4().hex}.tmp.npz")
+    try:
+        np.savez_compressed(tmp, t=(s.index.as_unit("s").asi8).astype(np.int64), **{TAKER: s.to_numpy(float)})
+        _durable_replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _load_taker(path: Path) -> pd.Series:
+    with np.load(path) as z:
+        return pd.Series(z[TAKER], index=pd.to_datetime(z["t"], unit="s", utc=True), name=TAKER, dtype=float)
+
+
 def _resample(df: pd.DataFrame, minutes: int, first: pd.Timestamp | None = None,
               end: pd.Timestamp | None = None) -> pd.DataFrame:
     """1-minute bars by open time -> `minutes` bars by open time, by the one bar-build rule (sleeve_fund.bars,
@@ -719,6 +789,49 @@ def canon(store: HistoryStore, profile, pair: str, since: pd.Timestamp, max_page
     return out
 
 
+
+
+def taker_backfill(store: HistoryStore, profile, pair: str, since: pd.Timestamp, until: pd.Timestamp | None = None,
+                   max_pages: int = 10_000, sleep=None, dry_run: bool = False) -> dict:
+    """R-22: keep the venue's taker-buy volume for the minutes stored from `since` up to `until` (default: the newest
+    closed minute stored), beside them (HistoryStore.add_taker_buy). Reads the venue, writes only the taker files;
+    no OHLCV file and no cursor is touched. dry_run: count only. The result gives the window and the counts, so a
+    dry run and the real run over the same window can be compared."""
+    import time
+
+    if profile.taker_loader is None or profile.minute_cursor_at is None:
+        raise ValueError(f"{profile.label}'s candles carry no taker-buy volume")
+    since = pd.Timestamp(since)
+    out = {"pair": pair, "dry_run": dry_run, "since": since.isoformat(), "top": None, "pages": 0, "offered": 0,
+           "added": 0, "held": 0, "not_stored": 0, "mismatched": 0, "refused": 0, "complete": False}
+    cov = store.coverage(profile.name, pair)
+    if cov is None:
+        return out
+    top = _canon_top(cov)
+    if until is not None:
+        bound = pd.Timestamp(until) - pd.Timedelta(minutes=1)
+        if bound > top:
+            raise ValueError(f"until ({until}) is past the newest closed minute stored ({top.isoformat()})")
+        top = bound
+    out["top"] = top.isoformat()
+    cursor, pages = profile.minute_cursor_at(since), 0
+    while pages < max_pages:
+        bars, nxt, caught_up = profile.taker_loader(pair, cursor)
+        pages += 1
+        page = bars.iloc[:-1]  # the page's newest may still be forming: the next page starts on it
+        page = page[(page.index >= since) & (page.index <= top)]
+        if len(page):
+            res = store.add_taker_buy(profile.name, pair, page, dry_run=dry_run)
+            out["offered"] += len(page)
+            for k, v in res.items():
+                out[k] += v
+        if caught_up or bars.empty or nxt == cursor or bars.index[-1] > top:
+            out["complete"] = True
+            break
+        cursor = nxt
+        (sleep or time.sleep)(profile.request_interval)
+    out["pages"] = pages
+    return out
 
 
 # Where the backfill starts for an instrument the PM asks Research for: enough for the default study
@@ -1193,6 +1306,13 @@ def main(argv: list[str] | None = None) -> int:
     fb.add_argument("--since", required=True, help="UTC time to start from, e.g. 2024-01-01")
     fb.add_argument("--pages", type=int, default=50, help="most venue pages per instrument")
     fb.add_argument("--dry-run", action="store_true", help="count the settlements it would add; write nothing")
+    tb = sub.add_parser("taker-backfill", help="keep the venue's taker-buy volume beside the stored minutes (R-22)")
+    tb.add_argument("pairs", nargs="*", help="instruments (default: core list plus sleeves')")
+    tb.add_argument("--venue", default=None)
+    tb.add_argument("--since", required=True, help="UTC time to start from, e.g. 2020-10-21")
+    tb.add_argument("--until", default=None,
+                    help="UTC minute to stop before (default: the newest closed minute stored)")
+    tb.add_argument("--dry-run", action="store_true", help="count the minutes it would add; write nothing")
     exp = sub.add_parser("export", help="one instrument's stored 1-minute candles in a window, as CSV (read-only)")
     exp.add_argument("pair", help="instrument, e.g. BTC/USDT")
     exp.add_argument("--venue", default=None)
@@ -1206,7 +1326,8 @@ def main(argv: list[str] | None = None) -> int:
 
     store = HistoryStore(args.root)
     profile = venue_profile(args.venue)
-    writes = args.cmd in ("refresh", "run", "canon") or (args.cmd == "funding-backfill" and not args.dry_run)
+    writes = args.cmd in ("refresh", "run", "canon") or (args.cmd in ("funding-backfill", "taker-backfill")
+                                                          and not args.dry_run)
     if writes and (problem := unwritable(store.root / profile.name.upper())):
         print(f"{profile.name}: history store can't start: {problem}")
         return 2
@@ -1233,6 +1354,15 @@ def main(argv: list[str] | None = None) -> int:
         failed = False
         for pair in args.pairs or [p for p, _ in _pairs_in_use(profile.name)]:
             out = funding_backfill(profile, pair, since, args.root, args.pages, args.dry_run)
+            print(out)
+            failed |= not out["complete"]
+        return 2 if failed else 0
+    if args.cmd == "taker-backfill":  # only adds taker figures the store lacks; no candle is touched
+        since = pd.Timestamp(args.since, tz="UTC")
+        until = pd.Timestamp(args.until, tz="UTC") if args.until else None
+        failed = False
+        for pair in args.pairs or [p for p, _ in _pairs_in_use(profile.name)]:
+            out = taker_backfill(store, profile, pair, since, until, dry_run=args.dry_run)
             print(out)
             failed |= not out["complete"]
         return 2 if failed else 0
