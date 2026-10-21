@@ -111,3 +111,49 @@ def test_above_1x_a_payment_still_comes_off_the_margin_and_a_credit_never_moves_
     fund_margin(owner, pd.Timestamp(1, unit="s", tz="UTC"), -100.0)
     fund_margin(owner, pd.Timestamp(2, unit="s", tz="UTC"), 30.0)
     assert owner._liq_funded == pytest.approx(-100.0)
+
+
+def test_the_zero_floor_is_each_isolated_positions_never_the_funds(monkeypatch):
+    """Advisor (BH-102 addition): equity is floored at 0 per isolated position, its loss capped at its own margin,
+    never on the fund's equity. Two Strategies in one run: A's 3x long gaps far past its bankruptcy price, B's long
+    rides on. A loses its margin and fees and no more; B trades and marks exactly as
+    it does alone; and the fund's book is the two summed, nothing floored or netted at the fund. The gap past A's
+    bankruptcy price is the venue's (its insurance fund's): A's own equity never went below zero to need a credit."""
+    from test_portfolio_run import LOOSE, _daily, _hourly
+
+    from nautilus_trader.model import Venue
+
+    from sleeve_fund.instruments import FeeSchedule, spot_pair
+    from sleeve_fund.research.portfolio_run import LegSpec, run_portfolio
+
+    fees = FeeSchedule(0.0002, 0.00055)
+
+    def leg(name, seed, crash: bool, profile: str) -> LegSpec:
+        h = _hourly(60, seed, vol=0.002)
+        if crash:  # a 60% gap down at one hour's open, held there
+            at = h.index[len(h) // 2]
+            h.loc[h.index >= at, ["open", "high", "low", "close"]] *= 0.4
+            h.loc[at, "open"] = h.loc[at, "close"]
+        d = _daily(h)
+        w, window = d.iloc[:20], d.iloc[20:]
+        inst = spot_pair("BTC", "USD", fees, Venue("KRAKEN"))
+        return LegSpec(name, "buy_and_hold", inst, window, h[h.index > w.index[-1]], w, params={"market": "perp"},
+                       risk_profile=profile)
+
+    a, b = leg("a", 3, True, "aggressive"), leg("b", 4, False, "balanced")
+    run = run_portfolio([a, b], LOOSE)
+    ra, rb = run.legs["a"], run.legs["b"]
+    assert [ra.decisions.get(i, {}).get("intent") for i in ra.fills.index] == ["entry", "liquidation"]
+    (entry, qty), (booked, _) = [(float(p), float(q)) for p, q in ra.fills[["avg_px", "filled_qty"]].values]
+    market = float(a.exec_prices["close"].min())
+    assert booked > market, "booked at the bankruptcy price: the gap past it is the venue's insurance fund's"
+    margin = qty * entry / 3
+    lost = float(ra.equity.iloc[0]) - float(ra.equity.iloc[-1])
+    assert lost == pytest.approx(margin + qty * (entry + booked) * 0.00055, abs=0.5), "its margin and fees, no more"
+    assert float(ra.equity.min()) > 0.0
+    alone = run_portfolio([b], LOOSE).legs["b"]  # B by itself, under the same gate and profile
+    assert rb.fills[["avg_px", "filled_qty"]].values.tolist() == alone.fills[["avg_px", "filled_qty"]].values.tolist()
+    assert rb.equity.equals(alone.equity)
+    end = run.book.index[-1]
+    assert float(run.book.iloc[-1]) == pytest.approx(
+        float(ra.equity.asof(end)) + float(rb.equity.asof(end)), rel=1e-6)
