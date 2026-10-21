@@ -78,6 +78,9 @@ CASES = {
     "a variant definition": (_write("configs/definitions/variants/qr01_trend_ema_long_v2_funding.toml"), True),
     "a variant and a study list": (_both(_write("configs/definitions/variants/qr01b_v1.toml"),
                                          _write("configs/studies/qr-rescore-list.md")), True),
+    "a new definition and its pin": (_both(_write("configs/definitions/qr24_x_long.toml"),
+                                           _write("configs/definition_pins.toml", "[qr24_x_long]\n")), True),
+    "a pin alone": (_write("configs/definition_pins.toml", "[qr01_a]\n"), True),
     "a nested directory": (_write("configs/definitions/sub/qr22.toml"), False),
     "a directory under the variants": (_write("configs/definitions/variants/sub/qr22.toml"), False),
     "an upper-case variant": (_write("configs/definitions/variants/QR22.toml"), False),
@@ -275,3 +278,18 @@ def test_the_definitions_merge_rule_is_written_down():
     for must in ("pre-registration", "family", "Advisor", "tries so far", "R-25", "Strategy tab",
                  "configs_from=image"):
         assert must in doc, must
+
+
+def test_the_definition_pins_live_in_one_config_file_both_hash_checks_read():
+    """HoE (R-29 v2): a rule PR touches only its definition, configs/definition_pins.toml and a study list, so its
+    pins are data under configs, not tests/ code; both pin checks read that one file, exactly as strictly."""
+    import tomllib
+
+    import test_b16_definition_titles as b16
+    import test_research_gaps as gaps
+
+    pins = tomllib.loads((ROOT / "configs" / "definition_pins.toml").read_text())
+    assert sorted(pins) == sorted(p.stem for p in (ROOT / "configs" / "definitions").glob("qr*.toml"))
+    assert all(set(v) == {"definition_hash", "idea_hash"} for v in pins.values())
+    assert b16.BEFORE == {k: (v["definition_hash"], v["idea_hash"]) for k, v in pins.items()}
+    assert gaps.QR_HASHES == {k: v["definition_hash"] for k, v in pins.items()}
