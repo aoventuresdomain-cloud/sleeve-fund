@@ -31,7 +31,25 @@ def test_months_and_years_on_a_curve_with_known_returns():
     (year,) = periods.periods(_known(), "Y", trips=[{"closed": pd.Timestamp("2021-02-03")}, {"closed": None}])
     assert (year.label, round(year.ret, 10), year.partial, year.trades) == ("2021", 0.0395, "from 16 Jan, to 10 Mar", 1)
     assert year.max_dd == pytest.approx(990 / 1100 - 1)
+    assert year.sharpe is None, "a partial year under 60 days has no Sharpe (Advisor (f))"
     assert round(1000 * (1 + periods.compounded(rows)), 2) == 1039.50
+
+
+def test_trade_rows_and_the_trading_table_book_the_insurance_funds_cover(monkeypatch):
+    """Advisor (g): every flow the equity carries is booked to the trade it fell in, the insurance fund's cover of
+    a liquidation's shortfall too, so the trades still sum to the equity."""
+    import types
+
+    from sleeve_fund.research import study
+
+    seen = []
+    monkeypatch.setattr(periods, "trades", lambda rows, shorts, funding, insurance, open_trip: seen.append(insurance) or [])
+    monkeypatch.setattr(study, "trades", lambda rows, shorts, funding, insurance: seen.append(insurance) or [])
+    cover = [{"ts": pd.Timestamp("2021-01-02"), "amount": 12.5}]
+    run = types.SimpleNamespace(equity=_known(), fills=None, shorts=True, funding=[], insurance=cover, decisions={})
+    periods.trade_rows(run)
+    study.StudyResult.trade_stats.fget(types.SimpleNamespace(full_period=run))
+    assert seen == [cover, cover]
 
 
 def test_a_curve_that_starts_on_the_first_of_a_month_has_that_month_whole():
