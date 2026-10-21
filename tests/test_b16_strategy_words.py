@@ -19,7 +19,7 @@ QR = sorted(p for p in DEFS.glob("qr*.toml"))
 
 
 def test_sixteen_qr_files():
-    assert len(QR) == 16
+    assert len(QR) == 19
 
 
 @pytest.mark.parametrize("path", sorted(DEFS.glob("*.toml")), ids=lambda p: p.stem)
