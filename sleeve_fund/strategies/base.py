@@ -4785,6 +4785,9 @@ class LongFlatStrategy(Strategy):
             self._stop_clamped(asked, held, liq)
         return True
 
+    def _fill_target(self) -> None:
+        """After an opening fill: a target worked from the fill (Rules' {r = N}, TP-EXIT). The plan's share here."""
+
     def _fill_stop(self) -> float | None:
         """The stop after an opening fill, as a share of the (re-averaged) entry: the plan's share, which follows the
         average entry by definition. Rules override it to keep their level where it is (STOP-AVG-1)."""
@@ -6979,6 +6982,7 @@ class LongFlatStrategy(Strategy):
                 plan = self._plan_exits(px, self._entry_side or sign)
                 if plan is not None:
                     self._stop_frac, self._tp_frac, self._stop_basis = plan
+            self._fill_target()
             self._gated_fill(coid, qty, px)
         self._sync_watched_stop()  # an add or a partial close resizes the journal's stop in the same step (QA)
         filled_type = getattr(self.cache.order(event.client_order_id), "order_type", None)

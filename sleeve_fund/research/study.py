@@ -1069,7 +1069,7 @@ def run_study(
         venue=str(instrument.id.venue),
         risk_profile=risk_profile,
         settings=(f"{risk_profile + ' risk profile' if risk_profile else 'no risk profile'} · "
-                  f"exits: {_exit_words(exits) if exits else 'the signal only'} · "
+                  f"exits: {_exit_words(exits) if exits else 'the signal only'}{_definition_target_words(default_params)} · "
                   f"walk-forward {train_days} days training, {test_days} days testing"),
         errors=errors,
         error_count=error_count[0],
@@ -1712,6 +1712,16 @@ def _halt_words(events: list[dict], test_start: pd.Timestamp, test_end: pd.Times
         where = "in the training stretch the run traded through first" if ts < _utc(test_start) else "in the test window"
         return f"{ts:%d %b %Y} ({_halt_reason(e)}), {where}"
     return ""
+
+
+def _definition_target_words(params: dict | None) -> str:
+    """A rule-builder definition's own take-profit (TP-EXIT), beside the study's exits: {r} is R in price, never the
+    study-wide take_profit_r's R after costs (HoE 21 Oct), so the sheet says which."""
+    exits = ((params or {}).get("definition") or {}).get("exits") or {}
+    found = [(side, e["take_profit"]) for side, e in (("", exits), *((f" ({s})", exits.get(s) or {})
+                                                             for s in ("long", "short"))) if "take_profit" in e]
+    return "".join(f", take-profit at {tp['r']:g}R (price){side}" if "r" in tp
+                   else f", take-profit at the level {tp['level']}{side}" for side, tp in found)
 
 
 def _exit_words(exits: dict) -> str:
