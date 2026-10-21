@@ -144,6 +144,13 @@ def test_a_cost_ladder_rung_draws_no_random_side_test(monkeypatch):
     calls = []
     monkeypatch.setattr(study, "random_side", lambda *a, **k: calls.append(1))
     monkeypatch.setattr(study, "random_entry", lambda *a, **k: "entry")
-    prices = pd.DataFrame({"close": [1.0, 2.0]}, index=pd.date_range("2021-01-01", periods=2, freq="D", tz="UTC"))
-    assert study._benchmarks(prices, [], 1, 0.001, 0.0, True, side=False) == ("entry", None) and calls == []
-    assert study._benchmarks(prices, [], 1, 0.001, 0.0, True)[1] is None and calls == [1]
+    import types
+
+    days = pd.date_range("2021-01-01", periods=8, freq="D", tz="UTC")
+    prices = pd.DataFrame({"close": [1.0 + i for i in range(8)]}, index=days)
+    # A fold with a short trip in it: its side (-1) must not stand in for the rung's flag (CR M1).
+    fold = types.SimpleNamespace(test_end=days[-1], trips=[(days[1], days[4], -1)], chosen={}, window_bars=8,
+                                 in_market_bars=3)
+    assert study._benchmarks(prices, [fold], 8, 0.001, 0.0, True, random_side_test=False) == ("entry", None)
+    assert calls == []
+    assert study._benchmarks(prices, [fold], 8, 0.001, 0.0, True)[1] is None and calls == [1]
