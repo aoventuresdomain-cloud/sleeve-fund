@@ -350,7 +350,8 @@ class StudyResult:
 
     @property
     def trade_stats(self) -> dict:
-        return trade_stats(trades(fills_to_rows(self.full_period.fills)))
+        return trade_stats(trades(fills_to_rows(self.full_period.fills), self.full_period.shorts,
+                                  self.full_period.funding))  # R-04 short legs; R-16 funding
 
     @property
     def turnover(self) -> float:
@@ -1042,7 +1043,8 @@ def run_study(
             full_default.shorts, leverage, market.get("market"), charged=False)
     for rung in ladder:  # the benchmark at each rung's own cost, as the rung's runs pay it (RE-COST)
         at_rung, _ = _benchmarks(research, folds, test_bars, rung.fee + slip,
-                                 series if series is not None else spread_used, False, leverage, market.get("market"))
+                                 series if series is not None else spread_used, full_default.shorts, leverage,
+                                 market.get("market"))
         if at_rung.trades:
             rung.oos_timing_return, rung.random_return = at_rung.strategy_return, at_rung.median_random_return
     if hold_market == markets.PERP and not market:
@@ -1083,8 +1085,8 @@ def run_study(
             f"Traded on {minutes}-minute bars; every figure here is on daily returns (closes at 00:00 UTC), "
             "so Sharpe is annualised as daily and the bootstrap resamples days, as for a daily strategy.")
     if market:
-        result.notes.append("The venue lists perpetuals only, so every run traded the perpetual, long only, "
-                            "paying the funding the venue settled.")
+        result.notes.append(f"The venue lists perpetuals only, so every run traded the perpetual, "
+                            f"{_sides_words(full_default, default_params)}, paying the funding the venue settled.")
     if exits:
         result.notes.append(
             "Exits on top of the signal: " + _exit_words(exits)
@@ -1492,6 +1494,14 @@ def _gross_exposure(exposure: pd.Series, first, last) -> float:
         return 0.0
     idx = exposure.index
     return float(exposure[(idx >= first) & (idx <= last)].abs().sum())
+
+
+def _sides_words(run, params: dict) -> str:
+    """R-04: the sides the research period's default run traded, in words; with no trades, the sides it may take."""
+    sides = {t["side"] for t in trades(fills_to_rows(run.fills), run.shorts)}
+    if not sides:
+        sides = {1, -1} if (params or {}).get("allow_short") else {1}
+    return {frozenset({1}): "long only", frozenset({-1}): "short only"}.get(frozenset(sides), "long and short")
 
 
 def _in_market_bars(exposure: pd.Series, first, last) -> int:
