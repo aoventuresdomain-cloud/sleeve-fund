@@ -35,8 +35,8 @@ REPLACED = "sizes drawn from the variant's own with replacement (a window's trad
 RECONCILE_PP = 0.005
 NOT_JUDGED = "NOT JUDGED"
 # STOP-FILL gap (Advisor ruling (A), HoE 21 Oct): the two sides book stops differently until STOP-FILL unifies them.
-STOP_FILL_LINE = ("random draws book stops at the level; the Strategy books the bar's low less 0.05%; the bias is "
-                  "against the Strategy")
+STOP_FILL_LINE = ("random draws book stops at the level less the slippage floor; the Strategy books the bar's low "
+                  "less it; the bias is against the Strategy")
 # The per-year (R-14), equal-exposure (R-07) and placebo (R-24) blocks still call the close-priced benchmark (HoE 21 Oct;
 # wiring them to the filled draws is a follow-up after Deploy 2), so each says so.
 CLOSE_PRICED = "random entry: close-priced (headline and cost ladder use filled draws)"

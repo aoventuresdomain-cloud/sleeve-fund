@@ -22,7 +22,7 @@ import pandas as pd
 from nautilus_trader.model import CurrencyPair
 
 from sleeve_fund import funding
-from sleeve_fund.instruments import FeeSchedule, pair_of, pct
+from sleeve_fund.instruments import FeeSchedule, pair_of, pct, taker_slippage
 from sleeve_fund import markets, risk
 from sleeve_fund.markets import PERP
 from sleeve_fund.research import equal_exposure, placebo, regime_split
@@ -1834,8 +1834,8 @@ def _trip_reconcile(trips: list[dict], equity: pd.Series, test_start, last, char
 
 def _stop_gap(trip: dict, decision: dict | None) -> dict:
     """A trip's stop exit, if its stop closed it: {"stopped": True, "stop_gap": side x (the stop's level - the
-    price it filled at) over the entry price}; else {}. The backtest books a stop at the bar's low less a slippage
-    (a short's high plus), the draws' replay at the level, so the gap is what the strategy gives up to the draws."""
+    price it filled at) over the entry price, "stop_level": the level over the entry price}; else {}. The draws book
+    a stop at its level less the taker's slippage (_filled_benchmarks takes that off the gap, Advisor PR E round 1)."""
     if not decision or decision.get("intent") != "stop_loss":
         return {}
     sig, side, entry = decision.get("signal") or {}, int(trip["side"]), trip["entry_px"]
@@ -1843,7 +1843,7 @@ def _stop_gap(trip: dict, decision: dict | None) -> dict:
     if level is None and sig.get("stop_loss") is not None:
         level = entry * (1 - side * float(sig["stop_loss"]))
     gap = side * (float(level) - trip["exit_px"]) / entry if level is not None and entry else 0.0
-    return {"stopped": True, "stop_gap": gap}
+    return {"stopped": True, "stop_gap": gap, "stop_level": float(level) / entry if level is not None and entry else 0.0}
 
 
 def _in_market_bars(exposure: pd.Series, first, last) -> int:
@@ -1953,7 +1953,9 @@ def _filled_benchmarks(prices, folds, test_bars, taker, half, cost_per_side, sho
             r = t["ret"] + (fill.run_taker - taker) * (1 + t["exit_ratio"])  # a rung's fee in place of the run's
             uncharged = dict(getattr(f, "trip_charges", []) or []).get(t["opened"], 0.0) if not charged else 0.0
             realised.append(r + uncharged)
-            gaps.append(t.get("stop_gap", 0.0))
+            # The STOP-FILL gap at the draws' fill: the level less the taker's slippage, not the bare level.
+            slip = float(taker_slippage(half[out] if np.ndim(half) else half))
+            gaps.append(t.get("stop_gap", 0.0) - t.get("stop_level", 0.0) * slip)
             stops.append(bool(t.get("stopped")))
         if f.trip_reconcile is not None:
             pnl, moved, base = f.trip_reconcile

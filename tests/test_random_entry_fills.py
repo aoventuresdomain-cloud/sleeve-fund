@@ -221,15 +221,21 @@ def test_the_sheet_says_how_each_side_books_a_stop_and_counts_each_sides_stop_ex
     assert f"{re_.draw_stops:.1f} per draw" in re_.words
 
 
-def test_the_gap_is_the_strategys_stop_exits_re_priced_at_their_levels(stop_heavy):
-    """The backtest books a long's stop at the bar's low less a slippage, below its level: each gap is a gain given
-    up to the draws, and the gap in total return is the realised trips compounded with them less without."""
+def test_the_gap_is_the_strategys_stop_exits_re_priced_at_the_draws_fill(stop_heavy):
+    """The backtest books a long's stop at the bar's low less a slippage, below its level; the draws at the level less
+    the taker's slippage (Advisor, PR E round 1). Each gap is what the Strategy gives up to the draws' fill, and the
+    gap in total return is the realised trips compounded with them less without."""
+    from sleeve_fund.instruments import taker_slippage
+
     re_ = stop_heavy.random_entry
+    slip = float(taker_slippage(venue(str(INSTRUMENT.id.venue)).assumed_half_spread))
     trips = [t for f in stop_heavy.folds for t in f.trip_returns]
-    gaps = np.array([t.get("stop_gap", 0.0) for t in trips])
+    at_level = np.array([t.get("stop_gap", 0.0) for t in trips])
+    gaps = at_level - np.array([t.get("stop_level", 0.0) for t in trips]) * slip
     realised = np.array([t["ret"] for t in trips])
     assert (gaps[[bool(t.get("stopped")) for t in trips]] > 0).all() and gaps.sum() > 0
     assert re_.gap_return == pytest.approx(float(np.prod(1 + realised + gaps) - np.prod(1 + realised)), abs=1e-12)
+    assert re_.gap_return < float(np.prod(1 + realised + at_level) - np.prod(1 + realised))  # not the bare level
     assert re_.gap_percentile >= re_.return_percentile
     assert "percentile points" in re_.words
 
@@ -314,3 +320,47 @@ def test_too_many_held_back_draws_are_not_judged():
     ok = RandomEntryResult(99.0, 99.0, 0.5, 0.0, 10, 0.3, 1000, False, False, reconciled=(0.0, 0.0), held_back=2,
                            held_back_share=0.02)
     assert ok.verdict == "PASS" and "(2.0%) priced flat" in ok.words
+
+
+# ---- CR, PR E early findings (4363afb4) -----------------------------------------------------------------------------
+
+class _Flat:
+    """A stub pricer: every draw makes nothing, so only the strategy's side moves."""
+
+    def draws(self, entries, holds, sides, levs):
+        return DrawFills(np.zeros(len(entries)), 0, 0)
+
+
+def _one_trip_benchmark(taker, charged=True, charge=0.0):
+    from types import SimpleNamespace
+
+    idx = pd.date_range("2024-01-01 04:00", periods=40, freq="4h", tz="UTC")
+    prices = pd.DataFrame({"open": 100.0, "high": 100.0, "low": 100.0, "close": 100.0, "volume": 1.0}, index=idx)
+    trip = {"opened": idx[15], "closed": idx[18], "side": 1, "ret": 0.05, "exit_ratio": 1.1}
+    fold = SimpleNamespace(test_end=idx[-1], trip_returns=[trip], trip_sizes=[], chosen={},
+                           trip_charges=[(idx[15], charge)] if charge else [], trip_reconcile=None, window_bars=30,
+                           in_market_bars=3)
+    fill = SimpleNamespace(refused="", definition={"stub": True}, run_taker=0.001,
+                           pricer=lambda prices, cost, half=0.0: _Flat())
+    return st._benchmarks(prices, [fold], 30, taker, 0.0, False, None, None, charged, fill)[0]
+
+
+def test_a_rungs_fee_takes_the_place_of_the_runs_on_both_legs_of_each_realised_trip():
+    """RE-COST at a cost-ladder rung: a trip that paid the run's 0.1% a side pays the rung's 0.3% instead, on its entry
+    notional and on its exit's (1.1 times it here): 0.05 - 0.002 x (1 + 1.1)."""
+    assert _one_trip_benchmark(0.001).strategy_return == pytest.approx(0.05)
+    assert _one_trip_benchmark(0.003).strategy_return == pytest.approx(0.05 - 0.002 * 2.1)
+
+
+def test_the_uncharged_comparison_adds_back_the_absorb_gap_charge():
+    assert _one_trip_benchmark(0.001, charged=False, charge=0.01).strategy_return == pytest.approx(0.06)
+    assert _one_trip_benchmark(0.001, charged=True, charge=0.01).strategy_return == pytest.approx(0.05)
+
+
+def test_a_draw_whose_level_isnt_known_yet_is_held_back_and_counted():
+    p = _candles([FLAT, FLAT, (100, 100, 97, 100), FLAT])
+    pr = Pricer(_defn(stop={"prev": {"mul": ["close", 0.98]}}), p, 60, 0.001)
+    assert pr.trip(0, 2, 1) == (0.0, "held back")  # no close before the first: no level yet
+    assert pr.trip(1, 2, 1)[1] == "stopped"
+    fills_ = pr.draws(np.array([0, 1, 0]), np.array([2, 2, 1]), np.array([1, 1, 1]))
+    assert (fills_.held_back, fills_.stopped) == (2, 1)
