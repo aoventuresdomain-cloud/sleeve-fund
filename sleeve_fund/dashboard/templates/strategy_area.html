@@ -1,0 +1,291 @@
+{% extends "base.html" %}
+{# B-16: the Strategy area (was Development). Look: ui-v2/strategy-area-mockup.html v5; rules: fe-plans/b16-strategy-tab-spec.md.
+   Read only, apart from Archive and Restore (the archive row and the decision log). Nothing here acts on the fund. #}
+{% block title %}Strategy · Multi-Strategy Fund{% endblock %}
+{% macro status_chip(e) %}{% set w, tone = e.chip %}<span class="chip {{ tone }}"{% if e.refused %} title="{{ e.refused }}"{% endif %}>{{ w }}</span>{% endmacro %}
+{% macro tries(e) %}{{ e.tries }} / {{ budget }} tries{% endmacro %}
+{% macro holdout_words(e) %}{% if e.holdouts %}used on {{ e.holdouts|map(attribute='underlying')|join(', ') }}{% else %}unused{% endif %}{% endmacro %}
+{% block content %}
+<link rel="stylesheet" href="/static/strategy.css">
+<div class="page-head">
+  <h1>Strategy</h1>
+  <p class="lede">Every Strategy that has been built, what it does, and how it tests.{% if on_hold %} {{ on_hold_words }}.{% endif %}</p>
+</div>
+
+<nav class="tabs" aria-label="Strategy views">
+  <a href="/strategy"{% if view == 'strategies' %} aria-current="page"{% endif %}>Strategies<span class="n">{{ counts.strategies }}</span></a>
+  <a href="/strategy/results"{% if view == 'results' %} aria-current="page"{% endif %}>Results{% if counts.results is not none %}<span class="n">{{ counts.results }}</span>{% endif %}</a>
+  <a href="/strategy/coverage"{% if view == 'coverage' %} aria-current="page"{% endif %}>Data coverage{% if view == 'coverage' %}<span class="n">{{ rows|length }}</span>{% endif %}</a>
+  <a href="/strategy/archived"{% if view == 'archived' %} aria-current="page"{% endif %}>Archived<span class="n">{{ counts.archived }}</span></a>
+</nav>
+{% if notice == 'restored' %}<div class="notice-box" role="status">Restored: it is back in the Strategies list as it was, with its tries and test history.</div>{% endif %}
+
+{% if view == 'strategies' %}
+<div class="dev sa">
+  <div class="plan-col sa-list">
+    <input type="search" class="plan-search" id="sa-search" placeholder="Search Strategies" aria-label="Search Strategies" autocomplete="off">
+    <div class="plan-filters" role="group" aria-label="Show Strategies by status">
+      <button type="button" data-status="all" aria-pressed="true">All <span class="n">{{ shown|length }}</span></button>
+      {% for key in ('untested', 'tested', 'passed', 'killed', 'on_paper', 'refused') %}{% set n = shown|selectattr('status', 'equalto', key)|list|length %}{% if n or key in ('untested', 'tested', 'on_paper') %}
+      <button type="button" data-status="{{ key }}" aria-pressed="false">{{ statuses[key][0] }} <span class="n">{{ n }}</span></button>{% endif %}{% endfor %}
+    </div>
+    <div class="plan-filters" role="group" aria-label="Show Strategies by side">
+      <button type="button" data-side="long" aria-pressed="false">Long</button>
+      <button type="button" data-side="short" aria-pressed="false">Short</button>
+    </div>
+    <div class="sa-rows">
+      {% for g in groups %}
+      <div class="sa-group" data-group="{{ g.key }}">
+        <div class="sa-ghead">{{ g.label }}</div>
+        {% for p in g.pairs %}
+        {% if g.key == 'built' %}<div class="sa-pair">{{ p.name }}</div>{% endif %}
+        {% for e in p.rows %}
+        <a class="sa-row{% if g.key == 'built' %} in-pair{% endif %}" href="/strategy?s={{ e.key|urlencode }}{% if tab != 'overview' %}&tab={{ tab }}{% endif %}"{% if chosen and e.key == chosen.key %} aria-current="true"{% endif %}
+           data-status="{{ e.status }}" data-sides="{{ e.sides|join(' ') }}" data-search="{{ (e.title ~ ' ' ~ e.file_id ~ ' ' ~ e.family)|lower }}">
+          <span class="sa-top"><b>{{ e.side_label if g.key == 'built' else e.title }}</b>{{ status_chip(e) }}</span>
+          <span class="sa-meta">{{ e.file_id }} · {{ e.family }} · {{ tries(e) }}</span>
+        </a>
+        {% endfor %}{% endfor %}
+      </div>
+      {% endfor %}
+      <p class="empty" data-none hidden>No Strategy matches.</p>
+    </div>
+  </div>
+
+  {% if chosen %}{% set e = chosen %}
+  <section class="panel sa-detail" aria-labelledby="sa-h">
+    <div class="sa-head">
+      <div>
+        <h2 id="sa-h">{{ e.title }} {{ status_chip(e) }}{% if e.archived %} <span class="chip">Archived</span>{% endif %}</h2>
+        <div class="sa-sub"><span class="faint">{{ e.file_id }}</span> · {{ e.family }}{% if e.sides %} · {{ e.sides|map('capitalize')|join(' & ') }}{% endif %}{% if e.decision %} · decision candle {{ e.decision }}{% endif %}{% if e.version %} · version {{ e.version }}{% endif %}{% if e.hash %} · <span title="Definition hash {{ e.hash }}">{{ e.hash[:7] }}</span>{% endif %}</div>
+      </div>
+      <div class="sa-actions">
+        {% if e.archived %}
+          <a class="button secondary" href="/strategy/archived">Archived: restore it there</a>
+        {% elif e.runs_on %}
+          <button type="button" class="secondary" disabled>Archive</button>
+          <span class="muted sa-why">Archive is off: this Strategy has a copy on the fund. Stop and archive it on the fund first.</span>
+        {% else %}
+          <details class="sa-confirm">
+            <summary class="button secondary">Archive</summary>
+            <form method="post" action="/strategy/archive" class="panel sa-confirm-box">
+              <input type="hidden" name="key" value="{{ e.key }}">
+              <p><b>Archive {{ e.title }}?</b></p>
+              <p class="muted">It leaves the Strategies list and moves to Archived. Nothing is deleted: the rules file, tries used ({{ e.tries }} of {{ budget }}), test history, tear sheets and holdout state all stay, and you can restore it at any time.</p>
+              <label>Why? <select name="reason" required><option value="" disabled selected>Pick a reason</option>{% for k, w in reasons.items() %}<option value="{{ k }}">{{ w }}</option>{% endfor %}</select></label>
+              <label>Note (optional) <input type="text" name="note" maxlength="300" placeholder="Anything the log should say"></label>
+              {% if other and not other.archived and not other.runs_on %}<label class="check"><input type="checkbox" name="other" checked> Also archive the other side: {{ other.title }}</label>{% endif %}
+              <div class="sa-btns"><button type="button" class="quiet" data-close-details>Cancel</button><button type="submit">Archive Strategy</button></div>
+            </form>
+          </details>
+        {% endif %}
+      </div>
+    </div>
+
+    <nav class="tabs sa-tabs" aria-label="{{ e.title }}">
+      {% for t, w in (('overview', 'Overview'), ('test', 'Test'), ('history', 'Test history'), ('runs', 'Where it runs')) %}
+      {% if not (e.archived and t in ('test', 'runs')) %}<a href="/strategy?s={{ e.key|urlencode }}&tab={{ t }}"{% if tab == t %} aria-current="page"{% endif %}>{{ w }}</a>{% endif %}
+      {% endfor %}
+    </nav>
+
+    {% if tab == 'overview' %}
+      <h3>Why it should work</h3>
+      <p class="sa-reason">{{ e.reason or 'The file gives no reason.' }}</p>
+      {% if e.refused %}
+        <div class="error-box" role="alert">This file fails its check, so it can't be tested or run: {{ e.refused }}</div>
+      {% elif e.model %}
+        <h3>Rules</h3>
+        <p class="muted">A hand-coded Model: its rules are written in code, not a rules file. <a href="/strategies/{{ e.model }}">Model details</a> · <a href="/research?strategy={{ e.model }}#development">Study form</a> · <a href="/backtest?strategy={{ e.model }}">Backtest</a></p>
+      {% else %}
+        <h3>Rules in plain English</h3>
+        {% if e.words_error %}
+          <div class="error-box" role="alert">These rules couldn't be put into words ({{ e.words_error }}). The file is below.</div>
+        {% else %}
+          <dl class="sa-rules">{% for s in e.rules %}
+            <div><dt>{{ 'Long' if s.side == 'long' else 'Short' }} entry</dt><dd>{{ s.entry }}</dd></div>
+            <div><dt>{{ 'Long' if s.side == 'long' else 'Short' }} exit</dt><dd>{{ s.exit }}</dd></div>
+            {% for k, v in s.levels %}<div><dt>{{ k }}</dt><dd>{{ v }}</dd></div>{% endfor %}
+            {% if not s.levels %}<div><dt>Take profit</dt><dd>None: the exits above close the trade.</dd></div>{% endif %}
+            <div><dt>Leverage</dt><dd>{{ stop_note(e, s) }}</dd></div>
+          {% endfor %}</dl>
+        {% endif %}
+        {% if e.indicators %}
+        <h3>Indicators used</h3>
+        {# QD 10: the "Reads" column only when some block reads something other than the price #}
+        {% set reads = e.indicators|selectattr("input", "ne", "price")|list|length > 0 %}
+        <table class="tight"><thead><tr><th>Name</th><th>Kind</th><th class="num">Period</th><th>Other settings</th><th>Candle</th>{% if reads %}<th>Reads</th>{% endif %}</tr></thead><tbody>
+        {% for b in e.indicators %}<tr><td>{{ b.name }}</td><td>{{ b.kind }}</td><td class="num">{{ b.period }}</td><td>{{ b.settings }}</td><td>{{ b.candle }}</td>{% if reads %}<td>{{ b.input }}</td>{% endif %}</tr>{% endfor %}
+        </tbody></table>
+        {% endif %}
+        <h3>Settings to test <span class="muted">· {{ 1 + e.secondaries|length }} of {{ budget }} tries planned</span></h3>
+        <table class="tight"><thead><tr><th>Setting</th><th class="num">Tries</th></tr></thead><tbody>
+          <tr><td>As written</td><td class="num">1</td></tr>
+          {% for x in e.secondaries %}<tr><td class="wrap">{{ x }}</td><td class="num">1</td></tr>{% endfor %}
+        </tbody></table>
+        {% if not e.secondaries %}<p class="muted">The file names no other settings to test.</p>{% endif %}
+      {% endif %}
+      {% if e.text %}<details class="sa-file"><summary>Show the file</summary><pre>{{ e.text }}</pre></details>{% endif %}
+
+    {% elif tab == 'test' %}
+      <form method="post" action="/strategy/test" class="study sa-test">
+        <input type="hidden" name="key" value="{{ e.key }}">
+        <div class="step"><span class="sn">1</span><div>
+          <h3>What to test on · pick one or more assets</h3>
+          <div class="sa-basket-tools"><button type="button" class="quiet" data-basket="all">Select all</button> <button type="button" class="quiet" data-basket="none">Clear</button></div>
+          {% if basket %}
+          <ul class="sa-basket">{% for h in basket %}
+            <li><label><input type="checkbox" name="assets" value="{{ h.venue_key }}:{{ h.pair }}"{% if h.chip.state != 'stored' %} data-waits{% endif %}> {{ h.pair }} <span class="muted">{{ h.market }}</span> <span class="chip {{ h.chip.tone }}"{% if h.chip.title %} title="{{ h.chip.title }}"{% endif %}>{{ h.chip.text }}</span></label></li>
+          {% endfor %}</ul>
+          {% else %}<p class="muted">No history is stored yet; assets appear here as the collector stores them.</p>{% endif %}
+          <p class="warn">These assets are tested together as one basket. Changing the asset list uses a new try.</p>
+        </div></div>
+        <div class="step"><span class="sn">2</span><div><h3>How to test it</h3>
+          <p class="muted">{% if e.decision %}{{ e.decision }} candles · {% endif %}learn, test, and keep the newest period sealed, sized to the stored history · cost ladder up to double fees</p></div></div>
+        <div class="step"><span class="sn">3</span><div><h3>Exits and sizing</h3>
+          <p class="muted">{% if e.rules %}{% for s in e.rules %}{% for k, v in s.levels %}{{ k }}: {{ v }}. {% endfor %}{% if s.stopless %}No stop: held to 1×. {% endif %}{% endfor %}{% else %}As the Model sets them.{% endif %}</p></div></div>
+        <div class="sa-run">
+          <span>Tries used: {{ e.tries }} of {{ budget }} · holdout {{ holdout_words(e) }}</span>
+          <button type="submit" disabled title="{{ on_hold_words }}">Run test</button>
+          {% if on_hold %}<span class="muted">{{ on_hold_words }}</span>{% endif %}
+        </div>
+      </form>
+
+    {% elif tab == 'history' %}
+      {% if e.trials or e.sheets %}
+        <table class="tight"><thead><tr><th>Date</th><th>Stage</th><th>Data</th><th class="num">Trades</th><th class="num">Out-of-sample trades</th><th class="num">Sharpe</th><th>Run</th></tr></thead><tbody>
+        {% for t in e.trials|reverse %}<tr><td>{{ uk(t.created_at) }}</td><td>{{ t.stage|replace('_', ' ') }}</td><td>{{ t.dataset }}</td><td class="num">{{ t.trades if t.trades is not none else '–' }}</td><td class="num">{{ t.oos_trades if t.oos_trades is not none else '–' }}</td><td class="num">{{ '%.2f'|format(t.sharpe) if t.sharpe is not none else '–' }}</td><td>{{ t.kind }}{% if t.status == 'failed' %} <span class="warn">count failed</span>{% endif %}</td></tr>{% endfor %}
+        </tbody></table>
+        <p class="muted">Tries used {{ e.tries }} of {{ budget }} · holdout {{ holdout_words(e) }}</p>
+        {% if e.sheets %}<h3>Tear sheets</h3><ul class="feed">{% for s in e.sheets %}<li><span class="what"><a href="/results/{{ s.name }}">{{ s.name }}</a> <span class="chip {{ s.tone }}">{{ s.word }}</span></span></li>{% endfor %}</ul>{% endif %}
+      {% else %}
+        <p class="empty">Not tested yet.{% if on_hold %} {{ on_hold_words }}.{% endif %}</p>
+        <p class="muted">Tries used {{ e.tries }} of {{ budget }} · holdout {{ holdout_words(e) }}</p>
+      {% endif %}
+
+    {% elif tab == 'runs' %}
+      {% if e.runs_on %}
+        <table class="tight"><thead><tr><th>On the fund as</th><th>Instrument</th><th>State</th><th>Since</th></tr></thead><tbody>
+        {% for s in e.runs_on %}<tr><td><a href="/sleeves/{{ s.name }}">{{ s.name }}</a></td><td>{{ s.instrument }}</td><td><span class="chip {{ s.status }}">{{ s.status|capitalize }}</span></td><td>{{ uk(s.created_at) }}</td></tr>{% endfor %}
+        </tbody></table>
+        {% if not e.model %}<p class="muted">The same rules file ({% if e.version %}version {{ e.version }} · {% endif %}{{ e.hash[:7] }}). If the file changes, the running copy keeps its version.</p>{% endif %}
+      {% else %}
+        <p class="empty">Not on the fund. A Strategy goes on paper only after it passes G1 and you say so.</p>
+      {% endif %}
+    {% endif %}
+  </section>
+  {% else %}
+  <section class="panel"><p class="empty">No Strategies to show.</p></section>
+  {% endif %}
+</div>
+
+{% elif view == 'results' %}
+<section class="panel flush">
+  <div class="panel-head"><div class="plan-filters" role="group" aria-label="Show results">
+    <button type="button" data-verdict="all" aria-pressed="true">All <span class="n">{{ rows|length }}</span></button>
+    {% for w in ('Pass', 'Kill', 'Not judged') %}<button type="button" data-verdict="{{ w }}" aria-pressed="false">{{ {'Pass': 'Passed G1', 'Kill': 'Killed', 'Not judged': 'Not judged'}[w] }} <span class="n">{{ rows|selectattr('word', 'equalto', w)|list|length }}</span></button>{% endfor %}
+  </div></div>
+  {% if rows %}
+  <table><thead><tr><th>Strategy</th><th>Tested on</th><th>Verdict</th><th class="num">Break-even fee</th><th>Without best asset</th><th>Holdout</th><th class="num">Tries</th><th>Date</th><th></th></tr></thead><tbody>
+  {% for r in rows %}<tr data-verdict="{{ r.word }}">
+    <td>{% if r.entry %}<a href="/strategy?s={{ r.entry.key|urlencode }}">{{ r.entry.title }}</a> <span class="faint">{{ r.entry.file_id }}</span>{% else %}{{ r.label }}{% endif %}</td>
+    <td>{{ r.instrument or '–' }}{% if r.minutes %} · {{ r.minutes }}m{% endif %}</td>
+    <td><span class="chip {{ r.tone }}">{{ r.word }}</span></td>
+    <td class="num">{{ r.breakeven_text }}</td>
+    <td class="muted">one asset</td>
+    <td>{{ r.holdout or 'unused' }}</td>
+    <td class="num">{% if r.entry %}{{ r.entry.tries }} / {{ budget }}{% else %}–{% endif %}</td>
+    <td>{{ uk(r.when) }}</td>
+    <td><a href="/results/{{ r.name }}">Open</a></td>
+  </tr>{% endfor %}
+  </tbody></table>
+  {% else %}<p class="empty" style="padding:16px 18px">No results yet.{% if on_hold %} {{ on_hold_words }}.{% endif %}</p>{% endif %}
+</section>
+
+{% elif view == 'coverage' %}
+<section class="panel flush">
+  <div class="panel-head"><span class="hint">Read only · history is collected for you</span></div>
+  {% if rows %}
+  <table><thead><tr><th>Asset</th><th>Market</th><th>Stored from</th><th>Last candle</th><th class="num">Gaps</th><th>History</th><th>Used by</th></tr></thead><tbody>
+  {% for r in rows %}<tr>
+    <td>{{ r.pair }}</td><td>{{ r.market or '–' }}</td>
+    <td>{{ r.first.strftime('%d %b %Y') if r.first else '–' }}</td>
+    <td>{{ uk(r.last) if r.last else '–' }}</td>
+    <td class="num">{{ r.gaps|length if r.first else '–' }}</td>
+    <td><span class="chip {{ r.chip.tone }}"{% if r.chip.title %} title="{{ r.chip.title }}"{% endif %}>{{ r.chip.text }}</span></td>
+    <td class="wrap">{% for e in r.used_by %}<a href="/strategy?s={{ e.key|urlencode }}">{{ e.title }}</a>{% if not loop.last %}, {% endif %}{% else %}–{% endfor %}</td>
+  </tr>{% endfor %}
+  </tbody></table>
+  {% else %}<p class="empty" style="padding:16px 18px">No history is stored yet.</p>{% endif %}
+</section>
+
+{% elif view == 'archived' %}
+{% if notice %}<div class="notice-box" role="status">Archived {{ notice|replace('+', ' and ') }}. Nothing is deleted; restore it here at any time.</div>{% endif %}
+<section class="panel flush">
+  <div class="panel-head"><b>Archived Strategies</b> <span class="hint">nothing here is deleted · <a href="/history">the old Strategies from the fund are in History</a></span></div>
+  {% if rows %}
+  <table><thead><tr><th>Strategy</th><th>Status when archived</th><th class="num">Tries used</th><th>Reason</th><th>By</th><th>When</th><th></th></tr></thead><tbody>
+  {% for e in rows %}{% set a = e.archived %}<tr>
+    <td><a href="/strategy?s={{ e.key|urlencode }}">{{ e.title }}</a> <span class="faint">{{ e.file_id }}</span></td>
+    <td>{{ statuses[a.status_at_archive][0] if a.status_at_archive in statuses else a.status_at_archive }}</td>
+    <td class="num">{{ e.tries }} / {{ budget }}</td>
+    <td class="wrap">{{ reasons.get(a.reason, a.reason) }}{% if a.note %} <span class="muted">{{ a.note }}</span>{% endif %}</td>
+    <td>{{ a.actor }}</td><td>{{ uk(a.archived_at) }}</td>
+    <td><details class="sa-confirm"><summary class="button secondary">Restore</summary>
+      <form method="post" action="/strategy/restore" class="panel sa-confirm-box">
+        <input type="hidden" name="key" value="{{ e.key }}">
+        <p><b>Restore {{ e.title }}?</b></p>
+        <p class="muted">It goes back to the Strategies list as it was, with its tries ({{ e.tries }} of {{ budget }}) and test history.</p>
+        <label>Why? <input type="text" name="reason" required maxlength="300" list="restore-reasons" placeholder="Worth another look"></label>
+        <div class="sa-btns"><button type="button" class="quiet" data-close-details>Cancel</button><button type="submit">Restore Strategy</button></div>
+      </form></details></td>
+  </tr>{% endfor %}
+  </tbody></table>
+  <datalist id="restore-reasons"><option value="Worth another look"><option value="Archived by mistake"><option value="New evidence"></datalist>
+  {% else %}<p class="empty" style="padding:16px 18px">Nothing archived.</p>{% endif %}
+</section>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+(() => {
+  // The list's search and filters (status, side), on the page as it is: nothing is fetched.
+  const rows = [...document.querySelectorAll(".sa-row")];
+  if (rows.length) {
+    const q = document.getElementById("sa-search");
+    const state = {status: "all", side: null};
+    const apply = () => {
+      const text = (q.value || "").trim().toLowerCase();
+      let shown = 0;
+      rows.forEach((r) => {
+        const ok = (state.status === "all" || r.dataset.status === state.status)
+          && (!state.side || r.dataset.sides.split(" ").includes(state.side))
+          && (!text || r.dataset.search.includes(text));
+        r.hidden = !ok; shown += ok;
+      });
+      document.querySelectorAll(".sa-group").forEach((g) => { g.hidden = !g.querySelector(".sa-row:not([hidden])"); });
+      document.querySelector("[data-none]").hidden = shown > 0;
+    };
+    q.addEventListener("input", apply);
+    document.querySelectorAll("[data-status]").forEach((b) => b.tagName === "BUTTON" && b.addEventListener("click", () => {
+      state.status = b.dataset.status;
+      document.querySelectorAll("button[data-status]").forEach((x) => x.setAttribute("aria-pressed", x === b));
+      apply();
+    }));
+    document.querySelectorAll("button[data-side]").forEach((b) => b.addEventListener("click", () => {
+      state.side = state.side === b.dataset.side ? null : b.dataset.side;
+      document.querySelectorAll("button[data-side]").forEach((x) => x.setAttribute("aria-pressed", x.dataset.side === state.side));
+      apply();
+    }));
+  }
+  document.querySelectorAll("button[data-verdict]").forEach((b) => b.addEventListener("click", () => {
+    document.querySelectorAll("button[data-verdict]").forEach((x) => x.setAttribute("aria-pressed", x === b));
+    document.querySelectorAll("tr[data-verdict]").forEach((r) => { r.hidden = b.dataset.verdict !== "all" && r.dataset.verdict !== b.dataset.verdict; });
+  }));
+  document.querySelectorAll("[data-basket]").forEach((b) => b.addEventListener("click", () => {
+    document.querySelectorAll(".sa-basket input").forEach((i) => { i.checked = b.dataset.basket === "all"; });
+  }));
+  document.querySelectorAll("[data-close-details]").forEach((b) => b.addEventListener("click", () => b.closest("details").open = false));
+})();
+</script>
+{% endblock %}

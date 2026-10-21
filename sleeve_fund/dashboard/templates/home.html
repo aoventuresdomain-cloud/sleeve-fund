@@ -16,7 +16,7 @@
   </p>
 </div>
 
-{% if archived_now %}<div class="banner" role="status">Archived {{ archived_now }}{% if archived_words %}, {{ archived_words }}{% endif %}.{{ limits_after(put_away_now) }}</div>{% endif %}
+{% if archived_now %}<div class="banner" role="status">Archived {{ archived_now }}{% if archived_words %}, {{ archived_words }}{% endif %}. <a href="/history#archived">See it on History</a>{{ limits_after(put_away_now) }}</div>{% endif %}
 
 {% if summaries or archived %}
 {# Shown only when an alert is waiting to be acknowledged: the newest one, and a link to the rest. #}
@@ -50,6 +50,7 @@
   {% else %}<div class="kpi" title="Worst {{ book.max_drawdown|pct1 }}{% if closest and not closest.in_fund %} · closest to halt: {{ closest.sleeve.name }}, {{ closest.dd_used|pct0 }} of its limit used{% endif %}"><div class="k">Drawdown</div><div class="v {{ 'loss' if book.drawdown >= 0.05 }}">{{ book.drawdown|pct1 }}</div></div>{% endif %}
   <div class="kpi" title="Fees {{ book.fees|money }} · funding {{ 'paid' if book.funding_paid >= 0 else 'received' }} {{ book.funding_paid|abs|money }}{{ cost_share(book) }}"><div class="k">Fees and funding</div><div class="v">{{ book.fees_funding|money }}</div></div>
 </section>
+{% if acct is defined %}{% include "_account.html" %}{% endif %}
 
 <div class="grid">
   <section class="panel span-8" aria-labelledby="curve-h" data-live="off">
@@ -79,7 +80,7 @@
       {# Archived strategies still count in the book's figures, so they get one row and the rows add up to Book (QA U1). #}
       {% set arch = archived|sum(attribute=field) if archived else 0 %}
       {% if arch|abs >= 0.005 %}{% set w = [arch|abs / scale * 50, 50]|min|round(1) %}
-        <tr class="archived-row"><td title="{{ archived|map(attribute='sleeve.name')|join(', ') }}"><a href="#archived" class="muted">Archived</a> <span class="faint">{{ archived|length }}</span></td>
+        <tr class="archived-row"><td title="{{ archived|map(attribute='sleeve.name')|join(', ') }}"><a href="/history#archived" class="muted">Archived</a> <span class="faint">{{ archived|length }}</span></td>
           <td class="bar-col" aria-hidden="true"><span class="mv"><i class="{{ 'gain' if arch >= 0 else 'loss' }}" style="{{ 'left:50%' if arch >= 0 else 'right:50%' }};width:{{ w }}%"></i></span></td>
           <td class="num">{{ money_signed(arch) }}</td><td class="num muted">{% if total|abs >= 0.005 %}{{ (arch / total)|pct0 }}{% else %}–{% endif %}</td></tr>{% endif %}
         <tr class="tot"><th scope="row">Book</th><td class="bar-col"></td><td class="num">{{ money_signed(total) }}</td><td class="num muted">{% if total|abs >= 0.005 %}100%{% else %}–{% endif %}</td></tr>
@@ -144,7 +145,7 @@
       {% else %}<th data-sort="num">Drawdown of limit</th><th class="num" data-sort="num" title="How much the strategy can still lose before its drawdown limit halts it">Room to halt</th>{% endif %}<th>Health</th>
     </tr></thead>
     <tbody>
-    {% if not summaries %}<tr><td colspan="12" class="empty">Every strategy is archived. <a href="/sleeves/new">Start a new strategy</a> or restore one below.</td></tr>{% endif %}
+    {% if not summaries %}<tr><td colspan="12" class="empty">No Strategies on the fund. Built Strategies are under <a href="/strategy">Research, Strategies</a>.</td></tr>{% endif %}
     {% for x in summaries %}{% set s = x.sleeve %}{% set room = x.room %}
     <tr>
       <td class="cell-name" data-v="{{ s.name }}"><a href="/sleeves/{{ s.name }}">{{ s.name }}</a>{% if x.legs %} {{ leg_flag(leg_flags.get(s.name)) }}{% endif %}<span class="sub2">{% if x.legs %}Two legs, {{ x.pair.words|lower }}{% else %}{{ s.instrument }}{% endif %} · {{ s.strategy|replace('_', ' ') }} · {{ bar_short(s.bar_spec) }}</span>{{ legs_list(x) }}</td>
@@ -178,6 +179,9 @@
     {% endfor %}
     </tbody>
   </table>
+  {# B-16 part 2: the old Strategies' panels moved to History; one quiet line here, counted live. #}
+  {% set old = (archived|length) + (tests|length) + (earlier|length) %}
+  {% if old %}<p class="muted" style="padding:8px 18px 12px;margin:0">{{ old }} old Strateg{{ 'y is' if old == 1 else 'ies are' }} kept in <a href="/history">History</a>{% if tests %}, {{ tests|length }} of them on a test account outside the fund's book{% endif %}.</p>{% endif %}
 </section>
 
 {# F-A1-FUNDLINE: each Strategy's contribution to the fund's return, and the fund line for what no Strategy's closed
@@ -202,32 +206,6 @@
 </section>
 {% endif %}
 
-{% if archived %}
-<details class="panel archived" id="archived">
-  <summary><strong>Archived strategies ({{ archived|length }})</strong> <span class="muted">stopped and put away; none of the fund's book is theirs any more{% set kept = (still_counted|length) + (waiting_flat|length) + (nothing_out|length) %}{% if kept %}, apart from {{ kept }} still in it{% if waiting_flat %} ({{ waiting_flat|length }} waiting to go flat){% endif %}{% endif %}</span></summary>
-  <ul class="feed" style="margin-top:10px">{% for x in archived %}{% set s = x.sleeve %}
-    <li><span class="when">{{ x.equity|money }}</span><span class="what"><a href="/sleeves/{{ s.name }}">{{ s.name }}</a>{% if s.name in waiting_flat %} <span class="warn">waiting to go flat: {{ waiting_flat[s.name] }}</span>{% elif s.name in leaving %} <span class="{{ 'warn' if leaving[s.name] else 'muted' }}">{{ leaving[s.name] or 'leaving the fund\'s book at the supervisor\'s next mark' }}</span>{% elif s.name in nothing_out %} <span class="muted">nothing to withdraw (equity {{ nothing_out[s.name]|money }})</span>{% endif %} <span class="muted">{{ s.instrument }} · {{ s.strategy|replace('_', ' ') }} · {{ signed(x.ret) }} since start</span></span></li>{% endfor %}
-  </ul>
-</details>
-{% endif %}
-
-{% if tests %}
-<details class="panel archived" id="test-accounts" open>
-  <summary><strong>Test accounts ({{ tests|length }})</strong> <span class="muted">strategies on a test account, outside the fund's book: left out of its equity, P&amp;L and open risk, as the limits leave them out, and never Strategy evidence. Their positions show under Positions, marked as not counted.</span></summary>
-  <ul class="feed" style="margin-top:10px">{% for x in tests %}{% set s = x.sleeve %}
-    <li><span class="when">{{ x.equity|money }}</span><span class="what"><a href="/sleeves/{{ s.name }}">{{ s.name }}</a> {{ chip(s.status) }} {{ test_chip() }} <span class="muted">{{ s.instrument }} · {{ s.strategy|replace('_', ' ') }} · {{ signed(x.ret) }} since start</span></span></li>{% endfor %}
-  </ul>
-</details>
-{% endif %}
-
-{% if earlier %}
-<details class="panel archived" id="archived">
-  <summary><strong>Previous book ({{ earlier|length }})</strong> <span class="muted">put away {% if book_start %}when a new book began on {{ book_start.strftime('%d %b %Y') }}{% if earlier_resets %} or by a strategy reset{% endif %}{% else %}by a strategy reset{% endif %}; kept with their history, and left out of this book's figures</span></summary>
-  <ul class="feed" style="margin-top:10px">{% for s in earlier %}
-    <li><span class="what"><a href="/sleeves/{{ s.name }}">{{ s.name }}</a> <span class="muted">{{ s.instrument }} · {{ s.strategy|replace('_', ' ') }}</span></span></li>{% endfor %}
-  </ul>
-</details>
-{% endif %}
 </div>
 
 <div class="tab-panel" id="tab-orders" role="tabpanel" data-panel="orders">
@@ -319,7 +297,7 @@
     <li><span class="n">2</span><div><strong>Start it on paper</strong><p>Live prices, simulated money.</p><a class="button" href="/sleeves/new">+ New strategy</a></div></li>
     <li><span class="n">3</span><div><strong>Watch and judge</strong><p>Live trading unlocks after G2.</p><a class="button secondary" href="/accounts">Set up accounts</a></div></li>
   </ol>
-  <p class="muted" style="margin:14px 0 0">Earlier books' trades and orders stay in <a href="/trades">Positions and trades</a> and <a href="/orders">Orders</a>.</p>
+  <p class="muted" style="margin:14px 0 0">Earlier books' trades and orders stay in <a href="/trades">Positions and trades</a> and <a href="/orders">Orders</a>.{% if earlier or tests %} Old Strategies are in <a href="/history">History</a>.{% endif %}</p>
 </section>
 {% endif %}
 {% endblock %}

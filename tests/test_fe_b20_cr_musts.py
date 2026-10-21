@@ -117,8 +117,8 @@ def test_must2ef_the_benchmark_and_the_cash_row_count_the_funds_cash(store):  # 
     _, book, summaries, _ = _views(store)
     base = bookm.fund_cash(store)
     assert base == pytest.approx(100_000)
-    assert book["bench_ret"] == pytest.approx((sum(x["benchmark"] for x in summaries) + base) / book["start"] - 1)
-    assert book["bench_ret"] == pytest.approx(0.0, abs=1e-12)  # (e): not -100%
+    # (e): not -100%. TEC-B34-NA (HoE, 20 Oct): inside the fund with no stored closes there is no hold: n/a (None)
+    assert book["bench_ret"] is None
     cash = next(r for r in book["allocation"] if r["name"] == "Cash")
     assert cash["value"] == pytest.approx(summaries[0]["cash"] + base)  # (f)
 

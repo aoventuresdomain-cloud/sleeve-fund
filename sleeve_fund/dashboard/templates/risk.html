@@ -107,6 +107,7 @@
   <div title="{{ open_risk_hint(risk) }}"><div class="k">Open risk</div><div class="v {{ open_risk_warn(risk) }}">{{ open_risk_text(risk) }}</div>{% if open_risk_room(risk, book.equity)|trim %}<div class="s">{{ open_risk_room(risk, book.equity) }}</div>{% endif %}{% if risk.spot %}<div class="s{{ ' warn' if risk.spot_left_out }}">{{ spot_risk_text(risk) }}</div>{% endif %}</div>
   <div><div class="k">Market down 20%</div><div class="v {{ 'loss' if risk.down20.loss >= 0.5 else ('gain' if risk.down20.loss <= -0.5) }}">{{ risk.down20.pnl|smoney0 }}</div><div class="s">up 20%: {{ risk.up20.pnl|smoney0 }}</div></div>
 </section>
+{% if acct is defined %}{% include "_account.html" %}{% endif %}
 
 <section class="panel flush" style="margin:14px 0" aria-labelledby="lim-h">
   <div class="panel-head"><h2 id="lim-h">Limits by strategy</h2></div>

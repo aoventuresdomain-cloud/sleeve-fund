@@ -58,6 +58,16 @@ LOCKING_INTENTS = (*EXIT_LEGS, "liquidation", "liquidation_cut")
 # The resting stops a backtest keeps: the model's own, and the risk guard's (_rest_risk_stop).
 STOP_INTENTS = ("stop_loss", "risk_halt", "risk_pause", "liquidation_cut", "liquidation")
 MINUTE_NS = 60_000_000_000
+# B43-PRECISION 3(b) (Advisor 20 Oct): an exit still open this many of the Strategy's bars after the first that traded
+# through its price, and at least EXIT_UNFILLED_FLOOR_NS after that bar opened, raises an ERROR alert once
+# (_exit_backstop): a precision mismatch or a venue that never fills it, never silent. Stops and the other protective
+# exits wait 2 bars; targets and the signal's own exits 3.
+EXIT_UNFILLED = "exit_not_filled"
+EXIT_BACKSTOP_FAILED = "exit_backstop_failed"  # the check itself failed: alerted once, the bar trades on
+EXIT_UNFILLED_BARS = 2
+TARGET_UNFILLED_BARS = 3
+PATIENT_EXITS = ("take_profit", "exit")  # TARGET_UNFILLED_BARS; every other closing intent EXIT_UNFILLED_BARS
+EXIT_UNFILLED_FLOOR_NS = 2 * MINUTE_NS
 # GAP-DOWN (F-GD-DEADLINE): the longest a restart replay waits for a stop's trigger minute of trades, every page of it
 # together. It runs on the first trade after the restart, ahead of every stop and tick behind it, so past this the
 # minute's extreme books the stop instead.
@@ -366,6 +376,7 @@ class LongFlatConfig(StrategyConfig):
         rebalance_band: float | None = None,
         maker_wait_minutes: int | None = None,
         resting_stops: bool = False,
+        exec_on: bool = False,
         backstop_grace_ms: int = 1000,
         max_leverage: float | None = None,
         raced_fill_window_ms: int | None = None,
@@ -523,6 +534,9 @@ class LongFlatConfig(StrategyConfig):
         # a number of at least 1x, refused here otherwise, so a bad value never saves or starts
         risk.check_own_leverage(max_leverage)
         self.max_leverage = None if max_leverage is None else float(max_leverage)
+        # B-05: the exchange order client is ON for this node (paper.exec_client): every order id is in the fund's
+        # namespace and fits the venue's 36 characters, and each fill's venue fee is checked against FEE-LIVE's.
+        self.exec_on = bool(exec_on)
         # A1 (Advisor b): with a stop resting, the watched level waits this long for the venue's stop to fill before it
         # closes at market itself (none past half the way to liquidation, or for a stop the venue refused).
         if int(backstop_grace_ms) != backstop_grace_ms or not 0 <= backstop_grace_ms <= 3_000:  # Advisor: 3 s at most
@@ -592,6 +606,37 @@ def funding_snap_note(settled, ts) -> str:
     from sleeve_fund import funding
 
     return funding.snap_note(settled, ts)
+
+
+def _exec_on(s) -> bool:
+    """The exchange client is ON for this Strategy (B-05): paper only, never a backtest. Module functions, not methods,
+    so a cell's stand-in Strategy (a SimpleNamespace with only what _submit reads) stays on the simulated client."""
+    return not s._backtest and getattr(s._cfg, "exec_on", False)
+
+
+def _ids(s) -> dict:
+    """The order factory's id argument: none on the simulated client (its own ids, unchanged), the fund's own id with
+    the exchange client ON (exec_client.order_id, MUST 6)."""
+    if not _exec_on(s):
+        return {}
+    from sleeve_fund.paper.exec_client import order_id
+
+    return {"client_order_id": ClientOrderId(order_id())}
+
+
+def _rate_refused(s, side, intent: str) -> str | None:
+    """ON (B-05 M4; spec section 4): every order passes the production rate limiter (runtime.exec_limiter). An
+    exit, a reduction or a stop is never held back. An entry or add over the limit is refused now, not queued:
+    it is decided again on a later candle, through T1-T5 on the book then (so drill-prep line 7 holds with no
+    queue at all; the 5 s queue of EXEC-SPEC Q1 is not built). Its reservation is released by the caller."""
+    limiter = getattr(s.runtime, "exec_limiter", None) if _exec_on(s) else None
+    if limiter is None:
+        return None
+    opening = intent == "entry" or (intent == "rebalance" and s._adds(side))  # as _gated tells an add
+    verdict = limiter.take("order/create", opening=opening, since=s.clock.utc_now())
+    if verdict == "send":
+        return None
+    return "over the venue's order rate limit: not sent, decided again on a later candle"
 
 
 class LongFlatStrategy(Strategy):
@@ -727,6 +772,8 @@ class LongFlatStrategy(Strategy):
         self._sent: list = []  # client order ids of orders sent, until the venue has them (see _unsent)
         self._cancel_on_accept: set[str] = set()  # orders to cancel as soon as the venue has them
         self._backstop_since: int | None = None  # A1: when the price first went through a resting stop's level
+        self._unfilled: dict[str, dict] = {}  # B43-PRECISION: exit order id -> its count since the first print through
+        self._backstop_failed = False  # B43-PRECISION: the check's own failure has been alerted
         self._gate_pushed: threading.Event | None = None  # A3: set by the journal's push (_listen_gate)
         self._gate_done = threading.Event()
         self._exec_type = None  # backtest: the shorter bars the decision bars are built from
@@ -1310,6 +1357,54 @@ class LongFlatStrategy(Strategy):
         self._bar_target(bar)
         self._rest_risk_stop()
 
+    def _exit_backstop(self, bar: Bar) -> None:
+        """B43-PRECISION 3(b): an exit (any closing intent) still open at the close of its EXIT_UNFILLED_BARS-th bar
+        (TARGET_UNFILLED_BARS for PATIENT_EXITS), counting from the first of the Strategy's bars that traded through
+        its price, and at least EXIT_UNFILLED_FLOOR_NS after that bar opened, raises one ERROR event, which the alerts
+        send (never a reject, so outside F-RX-2). Through: a stop's trigger at or through on the bar's last-trade range
+        (A1's LAST_PRICE trigger), a limit strictly through its price (paper's fill rule), a market order any bar
+        after it was sent. An alert only: no order is changed and nothing is blocked."""
+        if self.runtime is None or str(bar.bar_type) != str(self._cfg.bar_type).split("@")[0]:
+            return
+        ts = int(bar.ts_event)
+        lo, hi = bar.low.as_double(), bar.high.as_double()
+        seen = set()
+        for order in (*self.cache.orders_open(strategy_id=self.strategy_id),
+                      *self.cache.orders_inflight(strategy_id=self.strategy_id)):
+            coid = str(order.client_order_id)
+            intent = self.decisions.get(coid, {}).get("intent")
+            if coid in seen or intent is None or intent in OPENING_INTENTS:
+                continue
+            seen.add(coid)
+            sell = order.side == OrderSide.SELL
+            if order.order_type == OrderType.STOP_MARKET:
+                level = order.trigger_price.as_double()
+                through = lo <= level if sell else hi >= level
+            elif order.order_type == OrderType.LIMIT:
+                level = order.price.as_double()
+                through = hi > level if sell else lo < level
+            else:
+                level, through = None, int(order.ts_init) < ts
+            n = self._unfilled.setdefault(coid, {"bars": 0, "last": None, "since": None, "told": False})
+            if n["last"] == ts or not (through or n["bars"]):
+                continue  # a bar delivered twice counts once; bars before the first through don't count
+            n["bars"], n["last"] = n["bars"] + 1, ts
+            if n["since"] is None:  # the first bar through: the clock starts when it opened
+                n["since"] = ts - int(bar.bar_type.spec.timedelta.total_seconds() * 1_000_000_000)
+            due = TARGET_UNFILLED_BARS if intent in PATIENT_EXITS else EXIT_UNFILLED_BARS
+            if n["told"] or n["bars"] < due or ts - n["since"] < EXIT_UNFILLED_FLOOR_NS:
+                continue
+            from sleeve_fund.venue_terms import uk
+
+            n["told"] = True
+            at = "at market" if level is None else f"at {level:,.6g}"
+            self.runtime.store.event(
+                self.runtime.name, "error", EXIT_UNFILLED,
+                f"{intent} order {coid} ({at}) is still open {n['bars']} bars after the price first traded through it "
+                f"(the bar from {uk(datetime.fromtimestamp(n['since'] / 1e9, tz=timezone.utc))}; last bar "
+                f"{lo:,.6g}-{hi:,.6g}): check the instrument's price precision and the venue", ts=self.runtime.now())
+        self._unfilled = {k: v for k, v in self._unfilled.items() if k in seen}
+
     def _maybe_tick(self) -> None:
         if self.runtime is None:
             return
@@ -1866,6 +1961,36 @@ class LongFlatStrategy(Strategy):
         # drift, not benign, and counts and alerts as any refused close (HoQA F-RX-1B-WRITER).
         rt = self.runtime
         return abs(float(rt.store.journal_book(rt.name, rt.starting_balance)["qty"])) < 1e-12
+
+    def _new_coid(self) -> ClientOrderId:
+        return _ids(self).get("client_order_id") or self.order_factory.generate_client_order_id()
+
+    def _check_venue_fee(self, event, qty: float, px: float, fee: float) -> None:
+        """EXEC-SPEC MUST 3: ON, a fill books the venue's own fee (the client's commission); one more than a cent off
+        FEE-LIVE's taker rate is an error event. A maker fill has no rate here to compare: not judged."""
+        from nautilus_trader.model import LiquiditySide
+
+        from sleeve_fund.paper.exec_client import fee_gap
+
+        taker = event.liquidity_side != LiquiditySide.MAKER
+        why = fee_gap(qty=qty, price=px, fee=fee, rate=self._cfg.assumed_taker_fee if taker else None)
+        if why is not None:
+            self.runtime.store.event(self.runtime.name, "error", "venue_fee_gap",
+                                     f"{event.client_order_id}: {why}", ts=self.runtime.now())
+
+    def _check_lost_key(self, event) -> None:
+        """MUST 8: ON, a trade request refused for the key (an auth code in the venue's words) is journaled as a
+        failed order client check: CRITICAL "cannot protect" while we hold a position or an order, and no new entries
+        until a check passes."""
+        import re
+
+        from sleeve_fund.paper.exec_client import lost_permission, record_connect
+
+        m = re.search(r"\b(\d{5})\b", str(getattr(event, "reason", "") or ""))
+        holds = bool(self.cache.orders_open(strategy_id=self.strategy_id)) or self._signed_qty() != 0
+        why = lost_permission(int(m.group(1)) if m else None, venue_holds=holds)
+        if why is not None:
+            record_connect(self.runtime.store, self.runtime.name, [("FAIL", why)], self.runtime.now())
 
     def _resting_stops(self) -> bool:
         """A1: paper with resting stops on (off by default, and refused by the supervisor until the drills pass)."""
@@ -2636,6 +2761,7 @@ class LongFlatStrategy(Strategy):
                          on_sent=lambda sent_qty: self.entry_sent(sent_qty, values))
 
     def on_bar(self, bar: Bar) -> None:
+        self._recheck_claims()  # ON only: the orders held by the OwnershipGate past their grace (MUST 21)
         self._deciding = self._deciding_bar = None
         try:
             self._on_bar(bar)
@@ -3114,6 +3240,18 @@ class LongFlatStrategy(Strategy):
 
     def _on_bar(self, bar: Bar) -> None:
         self._snap_settlements(bar.ts_event, bar.close.as_double())
+        try:
+            self._exit_backstop(bar)
+        except Exception as exc:  # noqa: BLE001 - an alert never holds up the bar's stops, targets or decision
+            self.log.error(f"exit backstop failed on the bar at {int(bar.ts_event)}\n{traceback.format_exc()}")
+            if not self._backstop_failed:  # one alert, not one a bar; the log keeps each
+                self._backstop_failed = True
+                try:
+                    self.runtime.store.event(self.runtime.name, "error", EXIT_BACKSTOP_FAILED,
+                                             f"the unfilled-exit check failed, so it watches nothing: {exc!r}",
+                                             ts=self.runtime.now())
+                except Exception:  # noqa: BLE001 - the store itself may be what failed: the log above has it
+                    pass
         self._finish_resume()  # warm-up bars asked of the venue that never came: resume without them
         self._resize_if_due()
         if self._exec_type is not None and bar.bar_type == self._exec_type:
@@ -3252,7 +3390,10 @@ class LongFlatStrategy(Strategy):
             self._held_w = 0.0
         elif w > 0 and is_long and self._cfg.rebalance_band is not None:
             if self._held_w is None:  # e.g. after a restart: start from what is actually held
-                equity, _, qty, _ = self._mark()
+                own, _, qty, _ = self._mark()
+                equity = self._weight_equity(own)  # B-34 row 3: the fund's, inside it
+                if equity is None:
+                    return  # the fund's mark is stale: no rebalance off an old figure; exits still run
                 self._held_w = qty * close / equity if equity > 0 else w
             if abs(w - self._held_w) > self._cfg.rebalance_band * self._held_w:
                 if w > self._held_w and (self._entry_blocked(bar, "an addition") or self._entry_held(bar, "addition")):
@@ -3295,7 +3436,13 @@ class LongFlatStrategy(Strategy):
 
     def _rebalance(self, bar: Bar, w: float, reason: str, values: dict) -> bool:
         """Trade part of the position so it is worth `w` of the sleeve's equity at this close."""
-        equity, _, qty, _ = self._mark()
+        own, _, qty, _ = self._mark()
+        equity = self._weight_equity(own)  # B-34 row 2: inside the fund, w of the fund's marked equity
+        if equity is None:
+            self._note("rebalance_skipped_fund_equity", "Rebalance skipped: fund equity stale: the last portfolio mark "
+                       "is older than its interval allows, so nothing is traded off an old figure")
+            return False
+        self._noted.discard("rebalance_skipped_fund_equity")
         price = bar.close.as_decimal()
         diff = Decimal(str(equity * w)) - Decimal(str(qty)) * price
         step = self._lot()
@@ -3571,17 +3718,21 @@ class LongFlatStrategy(Strategy):
         # the other limits are sizes in their own right, and their fee comes out of the spare cash.
         room = Decimal(1) - Decimal(str(self._cfg.cash_buffer)) - Decimal(str(self._cfg.assumed_taker_fee))
         # Never more than the journal's cash either, when an exit booked at a replayed price left it lower.
-        limits = {"free cash": (free.as_decimal() + Decimal(str(min(self._cash_adj, 0.0)))) * room}
-        if weight < 1:
-            limits["target weight"] = Decimal(str((self._mark()[0] or float(free.as_decimal())) * weight))
-        if self._cfg.max_notional is not None:
-            limits["largest order cap"] = Decimal(str(self._cfg.max_notional))
-        base = self._sizing_base(self._mark()[0] or float(free.as_decimal()))
+        own = self._mark()[0] or float(free.as_decimal())
+        base = self._sizing_base(own)
         if base is None:
             self._note("entry_refused_fund_equity", "Buy refused: fund equity stale: the last portfolio mark is older "
                        "than its interval allows, so nothing is sized off an old figure")
             return
         self._noted.discard("entry_refused_fund_equity")
+        limits = {"free cash": (free.as_decimal() + Decimal(str(min(self._cash_adj, 0.0)))) * room}
+        if weight < 1:
+            # B-34 row 1: inside the fund a new entry's weight is of the fund's sizing base (Advisor
+            # B34-CAPITAL-PREDICATE (b)), never the Strategy's own P&L from 0; outside it its own equity, as before.
+            of = base if LongFlatStrategy._fund_held(self) else own
+            limits["target weight"] = Decimal(str(of * weight))
+        if self._cfg.max_notional is not None:
+            limits["largest order cap"] = Decimal(str(self._cfg.max_notional))
         if self.runtime is not None:
             limits[f"{self.runtime.profile.name} risk profile cap"] = Decimal(str(self.runtime.position_budget(base)))
         elif self._cfg.position_cap_pct is not None:
@@ -3831,6 +3982,8 @@ class LongFlatStrategy(Strategy):
         intent = {"side": s, "qty": qty, "close": close, "price": fill_price(close, s, self._half_spread()),
                   "stop_frac": self._stop_frac, "tp_frac": self._tp_frac, "what": what, "step": self._lot(), "min_qty": self._min_qty(),
                   "instrument": self._base_code(), "opens": self._position_qty() < self._min_qty(),
+                  # B-24: what is held before it (signed), so the gate journals the resulting position's figures
+                  "held": self._signed_qty() if self._margin else self._position_qty(),
                   "leverage": LongFlatStrategy._max_leverage(self)
                   if self._margin else None,
                   "atr_pct": None if self._stop_frac else self._entry_atr_pct(),
@@ -4052,6 +4205,9 @@ class LongFlatStrategy(Strategy):
         if (why := self._gated(side, intent)) is not None:
             self.runtime.refused(why, f"{intent} {side.name.lower()} {qty} would open or add to the position")
             return False
+        if (why := _rate_refused(self, side, intent)) is not None:
+            self.runtime.refused(why, f"{intent} {side.name.lower()} {qty} would open or add to the position")
+            return False
         decided = self.clock.timestamp_ns()
         quantity = Quantity.from_decimal_dp(qty, self.instrument.size_precision)
         wait = self._cfg.maker_wait_minutes
@@ -4079,11 +4235,12 @@ class LongFlatStrategy(Strategy):
             order = self.order_factory.limit(instrument_id=self._cfg.instrument_id, order_side=side, quantity=quantity,
                                              price=px, time_in_force=tif, post_only=True,
                                              expire_time=None if expires is None else _ns(expires),
-                                             reduce_only=reduce)
+                                             reduce_only=reduce, **_ids(self))
             signal.update(order_type="maker", limit_px=px.as_double(), maker_wait_minutes=wait)
         else:
             order = self.order_factory.market(instrument_id=self._cfg.instrument_id, order_side=side,
-                                              quantity=quantity, time_in_force=TimeInForce.GTC, reduce_only=reduce)
+                                              quantity=quantity, time_in_force=TimeInForce.GTC, reduce_only=reduce,
+                                              **_ids(self))
             if wait:
                 signal["order_type"] = "market"
         coid = str(order.client_order_id)
@@ -4302,7 +4459,7 @@ class LongFlatStrategy(Strategy):
             return
         piece = self.order_factory.market(instrument_id=self._cfg.instrument_id, order_side=order.side,
                                           quantity=Quantity.from_decimal_dp(qty, self.instrument.size_precision),
-                                          time_in_force=TimeInForce.GTC)
+                                          time_in_force=TimeInForce.GTC, **_ids(self))
         pid = str(piece.client_order_id)
         self._slices[pid] = coid
         self.decisions[pid] = kept["info"]
@@ -4682,7 +4839,7 @@ class LongFlatStrategy(Strategy):
         order = self.order_factory.market(instrument_id=self._cfg.instrument_id,
                                           order_side=OrderSide.BUY if r["qty"] > 0 else OrderSide.SELL,
                                           quantity=Quantity.from_decimal_dp(qty, self.instrument.size_precision),
-                                          time_in_force=TimeInForce.GTC, tags=["restore"])
+                                          time_in_force=TimeInForce.GTC, tags=["restore"], **_ids(self))
         self._restore_id = str(order.client_order_id)
         if self.fee_model is not None:
             self.fee_model.free_orders.add(self._restore_id)
@@ -5416,7 +5573,7 @@ class LongFlatStrategy(Strategy):
                 "liquidation_cut": "the cut before liquidation"}[intent]
         if side == 0:
             return
-        coid = self.order_factory.generate_client_order_id()
+        coid = self._new_coid()
         stop = StopMarketOrder(self.trader_id, self.strategy_id, self._cfg.instrument_id, coid, exit_side, quantity,
                                px, TriggerType.DEFAULT, TimeInForce.GTC, True, False, UUID4(), self.clock.timestamp_ns())
         self._risk_stop_id = str(coid)
@@ -5864,7 +6021,10 @@ class LongFlatStrategy(Strategy):
         Strategy's own equity (its P&L, from a starting balance of 0) never sizes, halts or pauses it (Advisor CUT-A
         (d)). A test Strategy outside the book (F229-6) is its own fund."""
         rt = self.runtime
-        return rt is not None and not rt.backtest and self._paper_gated() is not None
+        # B34-CAPITAL-PREDICATE (Advisor, 20 Oct): one predicate, the runtime's fund_held (the PM's re-base deposit has
+        # landed, supervisor.bridge_start); before it the Strategy keeps its own sizing and halts.
+        return (rt is not None and not rt.backtest and self._paper_gated() is not None
+                and bool(getattr(rt, "fund_held", False)))
 
     def _paper_fund_equity(self) -> float | None:
         """Paper's fund equity: the supervisor's last portfolio mark, or None when it is stale by the book's own rule
@@ -5883,6 +6043,16 @@ class LongFlatStrategy(Strategy):
                 self.log.warning(f"fund equity unreadable: {type(exc).__name__}: {exc}")
                 return None
             return None if fund is None else float(fund)
+        return self._fund_marked_equity()
+
+    def _fund_marked_equity(self) -> float | None:
+        """B-34 (Advisor B34-CAPITAL-PREDICATE (b)): the fund's equity at the supervisor's last portfolio mark, gains
+        not yet taken included, or None when that mark is stale or can't be read. A weight model's rebalance target
+        and its held weight both read this one figure, so a winner's own gain never reads as overweight."""
+        from sleeve_fund.gate_ledger import DbLedger
+        from sleeve_fund.paper.runtime import _no_positions
+        from sleeve_fund.portfolio import gate
+
         try:
             st = DbLedger(self.runtime.store, _no_positions).state()
         except Exception as exc:  # noqa: BLE001 - fail closed: an unread book sizes nothing
@@ -5893,6 +6063,11 @@ class LongFlatStrategy(Strategy):
         if self.runtime.now() - st.mark_ts > gate.MARK_STALE:
             return None
         return float(st.equity)
+
+    def _weight_equity(self, own: float) -> float | None:
+        """B-34 rows 2 and 3: the equity a target weight is a share of. Inside the fund (_fund_held) the fund's marked
+        equity (None when stale: nothing is traded off an old figure); outside it the Strategy's own, as before."""
+        return self._fund_marked_equity() if LongFlatStrategy._fund_held(self) else own
 
     def _strength_limit(self, limits: dict, values: dict, base: float) -> str | None | bool:
         """G5: with the Model's signal_strength set, the signal strength limit: f(strength) x its configured size, the
@@ -6332,7 +6507,34 @@ class LongFlatStrategy(Strategy):
                 # og6: the venue ended it, so the cancel journalled for it (if any) is settled, never left blocking
                 order_ended(self.runtime.store, str(event.client_order_id), status, _utc(int(event.ts_event)))
 
+    def _claimed(self, event) -> bool:
+        """MUST 21: ON, an order event for an order this Strategy didn't send in this process goes through its
+        OwnershipGate (exec_start.claim): only its own journal's is booked; a sibling's is ignored, one of ours in no
+        journal is held and re-checked each bar, a foreign one holds the instrument fund-wide. True: not booked."""
+        if not _exec_on(self) or self.runtime is None or str(event.client_order_id) in self.decisions:
+            return False
+        from sleeve_fund.paper import exec_start
+
+        rt = self.runtime
+        if getattr(self, "_ownership", None) is None:
+            self._ownership = exec_start.gate(rt.store, rt.name)
+        return exec_start.claim(self._ownership, rt.store, rt.name, str(event.client_order_id), rt.now()) != "book"
+
+    def _recheck_claims(self) -> None:
+        """Each bar ON: a held order past its grace that is still in no journal is an orphan, cancelled by its id."""
+        if getattr(self, "_ownership", None) is None or not self._ownership.held:
+            return
+        from sleeve_fund.paper import exec_start
+
+        rt = self.runtime
+        for oid in exec_start.recheck(self._ownership, rt.store, rt.name, rt.now()):
+            rt.store.event(rt.name, "warning", "orphan_order", f"Order {oid} is the fund's but in no journal: "
+                           "cancelled", ts=rt.now())
+            self.cancel_order(ClientOrderId(oid))
+
     def on_order_accepted(self, event) -> None:
+        if self._claimed(event):
+            return
         self._order_status(event, "accepted")
         coid = str(event.client_order_id)
         if self.runtime is not None:
@@ -6360,6 +6562,8 @@ class LongFlatStrategy(Strategy):
             self.pair.order_closed(self, coid)
 
     def on_order_rejected(self, event) -> None:
+        if _exec_on(self) and self.runtime is not None:
+            self._check_lost_key(event)
         if self._benign_reject(event):
             self.runtime.on_benign_reject(str(event.client_order_id), str(getattr(event, "reason", "") or ""))
         else:
@@ -6466,6 +6670,8 @@ class LongFlatStrategy(Strategy):
         self._resume_exit(str(event.client_order_id))
 
     def on_order_filled(self, event) -> None:
+        if self._claimed(event):
+            return
         intrabar = self._intrabar_fill(event)  # a bars-only backtest's resting order filled inside a bar, or None
         held = (self._entry_qty, self._entry_px)  # the position before this fill
         if self._margin:  # a fill just after the hour, with no trade, bar or tick between: held before it
@@ -6516,6 +6722,8 @@ class LongFlatStrategy(Strategy):
         # Paper: a slice of a kept post-only order is the order's own fill, at its limit and the maker fee
         # (the fee model charged it so; ScheduleFeeModel.maker_slices).
         journal_id, fee = coid, (event.commission.as_double() if event.commission is not None else 0.0)
+        if _exec_on(self) and self.runtime is not None:
+            self._check_venue_fee(event, qty, px, fee)
         kept_id = self._slices.get(coid)
         if kept_id is not None:
             px = float(self.fee_model.maker_slices[coid][0]) if self.fee_model is not None else px
@@ -6751,7 +6959,7 @@ class LongFlatStrategy(Strategy):
             stop = plan["stop_loss"]
             level = self._entry_px * (1 - side * stop)
             orders.append((StopMarketOrder(
-                self.trader_id, self.strategy_id, cfg.instrument_id, self.order_factory.generate_client_order_id(),
+                self.trader_id, self.strategy_id, cfg.instrument_id, self._new_coid(),
                 exit_side, quantity, Price(level, self.instrument.price_precision),
                 TriggerType.LAST_PRICE if self._resting_stops() else TriggerType.DEFAULT,  # A1: as the watched stop
                 TimeInForce.GTC, self._margin, False, UUID4(), now), "stop_loss", "STOP",

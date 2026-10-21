@@ -4,6 +4,7 @@
 # tried so far counts against the 20-per-idea budget, and it is judged only on data it has not seen (Advisor 14 Oct).
 version = 1
 name = "qr13-level-continuation-long"
+title = "Stop-Run Continuation (weekly level, 1h) · Long"
 reason = """Stops cluster just beyond last week's high. When price breaks it and reaches 1 ATR(14) beyond it before
 coming back to the level, those stops have fired and the move tends to continue. Out on a close back below the level,
 after 48 hours, or on a stop 1 ATR below the level."""

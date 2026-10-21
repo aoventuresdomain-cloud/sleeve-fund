@@ -31,7 +31,8 @@ def _client(tmp_path, monkeypatch):
 def test_a_test_account_strategy_is_marked_and_listed_apart_on_home(tmp_path, monkeypatch):
     c, _ = _client(tmp_path, monkeypatch)
     home = c.get("/", auth=AUTH).text
-    group = home[home.index('id="test-accounts"'):].split("</details>")[0]
+    history = c.get("/history", auth=AUTH).text  # B-16 part 2 (TEC): the panel moved from Home to History
+    group = history[history.index('id="test-accounts"'):].split("</details>")[0]
     assert "Test accounts (1)" in group and 'href="/sleeves/tst"' in group and "Test account</span>" in group
     assert 'href="/sleeves/real"' not in group
     assert "test</span>" in home.split('data-live="nav-strategies"')[1].split("</div>")[0]  # marked in the rail too

@@ -27,5 +27,5 @@ def test_a_strategy_put_away_under_fund_held_cash_reads_as_leaving_with_nothing_
     page = unescape(c.get("/sleeves/y", auth=AUTH).text)
     assert "Archived, it left with nothing to move: its P&L stays in the fund's cash, which isn't a loss." in page
     assert "its equity left the fund's book" not in page
-    home = unescape(c.get("/", auth=AUTH).text)
+    home = unescape(c.get("/history", auth=AUTH).text)  # TEC-B16-HISTORY
     assert "stopped and put away; none of the fund's book is theirs any more</span>" in home

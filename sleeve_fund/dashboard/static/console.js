@@ -1017,9 +1017,13 @@ window.Console = (() => {
       const why = refusal();
       const note = document.getElementById("model-refused");
       if (note) { note.hidden = !why; note.textContent = why; }
+      // Its own mark only (CR): another check's data-blocked is never cleared here, and a button stays off while any holds.
       form.querySelectorAll("button[data-label]").forEach((b) => {
-        if (why && !b.hasAttribute("data-model-refused")) { b.toggleAttribute("data-model-refused", true); b.toggleAttribute("data-blocked", true); b.disabled = true; }
-        if (!why && b.hasAttribute("data-model-refused")) { b.removeAttribute("data-model-refused"); b.removeAttribute("data-blocked"); b.disabled = false; form.dispatchEvent(new Event("change")); }
+        if (why && !b.hasAttribute("data-model-refused")) { b.setAttribute("data-model-refused", ""); b.disabled = true; }
+        if (!why && b.hasAttribute("data-model-refused")) {
+          b.removeAttribute("data-model-refused");
+          if (!b.hasAttribute("data-blocked")) { b.disabled = false; form.dispatchEvent(new Event("change")); }
+        }
       });
       return why;
     };
@@ -1049,7 +1053,9 @@ window.Console = (() => {
     form.querySelector("[data-pl-venue]")?.addEventListener("change", recheck);
     recheck();
     form.addEventListener("submit", (e) => {
-      if (!guard()) return;
+      // A check's mark holds the submit off whatever turned its disabled flag back off (HoE on guard()).
+      const held = e.submitter && (e.submitter.hasAttribute("data-blocked") || e.submitter.hasAttribute("data-model-refused"));
+      if (!guard() && !held) return;
       e.preventDefault();
       document.getElementById("model-refused")?.scrollIntoView({block: "center"});
     });
@@ -1537,7 +1543,7 @@ window.Console = (() => {
       const pick = fs.querySelector("input[name=reason_pick]:checked")?.value || "";
       const note = (fs.querySelector("textarea[name=reason_note]")?.value || "").trim().replace(/\s+/g, " ");
       const ok = Boolean(pick) && (pick !== "Other" || note.length >= min);
-      form.querySelectorAll("[data-needs-reason]").forEach((b) => { b.disabled = !ok || b.hasAttribute("data-blocked"); });
+      form.querySelectorAll("[data-needs-reason]").forEach((b) => { b.disabled = !ok || b.hasAttribute("data-blocked") || b.hasAttribute("data-model-refused"); });
       fs.querySelectorAll("label.opt").forEach((l) => l.classList.toggle("sel", Boolean(l.querySelector("input")?.checked)));
       const hint = fs.querySelector("[data-note-hint]");
       if (hint) hint.textContent = pick === "Other" ? `(needed, at least ${min} characters)` : "(optional)";

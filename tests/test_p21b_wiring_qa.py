@@ -84,6 +84,16 @@ def portfolio_pass(store, now: datetime, equity) -> None:
         sup.mark_portfolio(now)
 
 
+def bridge(store, equity, at: datetime | None = None) -> None:
+    """The PM's re-base deposit of `equity` lands (at `at`, a minute ago by default): the Strategies are inside the fund
+    from here (B34-CAPITAL-PREDICATE: the bridge decides; TEC-B34). Strategies made before it keep their balances."""
+    from datetime import timedelta, timezone
+
+    at = at or datetime.now(timezone.utc) - timedelta(minutes=1)
+    store.settle_flow(store.fund_flow("deposit", float(equity), actor="pm", reason="the fund's capital", rebase=True,
+                                      now=at), at)
+
+
 def paper_gate(store):
     """The paper GateFn over DbLedger: gate(strategy, intent: dict, ts_ns) -> Gated, as research.portfolio's."""
     from sleeve_fund.paper import portfolio_gate  # W2's module

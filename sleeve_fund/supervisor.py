@@ -1350,6 +1350,36 @@ class Supervisor:
         except Exception as exc:  # noqa: BLE001 - said; the last good rows stay and age by the 24/72 h rules
             self.store.event(None, "warning", "venue_terms_fetch_failed", f"fees and tiers: {type(exc).__name__}: {exc}")
 
+    def check_account_capital(self, environ=None, now=None) -> None:
+        """B-23: the paper account's marked equity from the demo account (its read-only wallet call, on the demo host
+        only) every 5 minutes, kept beside the book at that moment (account_capital.fetch_account). A live account
+        holding a Strategy is never read before G2: each attempt is kept as failed, saying so. Display and alerts only:
+        sizing reads the book unless "Size from the account figure" takes effect (account_capital.entry_capital). A
+        pass that can't run is one warning, and the next minute tries again."""
+        from sleeve_fund import account_capital, mirror
+
+        env = os.environ if environ is None else environ
+        now = now or utcnow()
+        try:
+            book, why = None, ""
+            for a in self.store.accounts():
+                live = a["kind"] == "live"
+                if live and not a["sleeves"]:
+                    continue
+                if not live and a["name"] != accounts.PAPER:
+                    continue
+                if not account_capital.due(self.store, a["name"], now, live):
+                    continue
+                if book is None and not why:
+                    try:  # unmarked (after a restart or a fill): a failed read, said once per spell, not every pass
+                        book = fund_equity(self.store)
+                    except Exception as exc:  # noqa: BLE001 - kept as the read's reason
+                        why = f"the book can't be marked yet ({type(exc).__name__}: {exc})"
+                account_capital.fetch_account(self.store, a["name"], client=None if live else mirror.fee_client(env),
+                                              live=live, book=book, book_why=why, now=now)
+        except Exception as exc:  # noqa: BLE001 - said; display only, the next pass tries again
+            self.store.event(None, "warning", "account_capital_pass_failed", f"account capital: {type(exc).__name__}: {exc}")
+
     def _send_alerts(self, alerts: Forwarder) -> None:
         try:
             alerts.step()
@@ -1374,6 +1404,7 @@ class Supervisor:
                     sender.start()
                 if loops % KEY_CHECK_EVERY == 0:
                     self.check_keys()
+                    self.check_account_capital()
                 if loops % FEE_CHECK_EVERY == 0:
                     self.check_fees()
                 if loops % TRUE_UP_EVERY == 0:

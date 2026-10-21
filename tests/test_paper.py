@@ -13,6 +13,10 @@ from sleeve_fund.strategies import TrendFilter, TrendFilterConfig
 ROOT = Path(__file__).resolve().parent.parent
 PAPER_SRC = ROOT / "sleeve_fund" / "paper"
 SLEEVES = sorted((ROOT / "configs" / "sleeves").glob("*.toml"))
+# TEC-B05-KEYS (HoE and Advisor, 20 Oct; CR K1): the connect check's reads (B-05), by exact path, are the only paper
+# code that passes keys by name, and only into its read-only VenueStops (test_b05_keys_guard pins both). It ships OFF
+# and a node start never imports it. Adding a path needs the HoE's and the Advisor's sign-off, recorded on the board.
+ORDER_CLIENT = {"sleeve_fund/paper/venue_reads.py"}
 
 
 def test_paper_code_cannot_build_a_real_execution_client():
@@ -21,7 +25,8 @@ def test_paper_code_cannot_build_a_real_execution_client():
         src = path.read_text()
         assert "ExecutionClientFactory" not in src.replace("SandboxExecutionClientFactory", ""), path
         assert not re.search(r"\.add_exec_client\(", src), path
-        assert "api_key=" not in src and "api_secret=" not in src, path
+        if str(path.relative_to(ROOT)) not in ORDER_CLIENT:
+            assert "api_key=" not in src and "api_secret=" not in src, path
 
 
 @pytest.mark.parametrize("var", ["KRAKEN_SPOT_API_KEY", "KRAKEN_SPOT_API_SECRET", "binance_api_key",

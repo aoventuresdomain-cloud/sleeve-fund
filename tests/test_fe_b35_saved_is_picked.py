@@ -188,3 +188,64 @@ def test_the_instrument_list_greys_by_the_markets_own_candles_and_only_perps_by_
     assert not greyed, text
     assert errors == []
     page.context.close()
+
+
+def test_clearing_a_model_refusal_keeps_another_checks_block(held_site, browser):  # noqa: F811
+    """CR's follow-up on 3934040: guard() clears only the block it set. A submit another check holds off (data-blocked)
+    stays off when the picked model stops being refused."""
+    base, _ = held_site
+    page, errors = _open(browser, f"{base}/sleeves/new?{WHERE['perp'][0]}&strategy=donchian")
+    _step(page, "Model")
+    assert page.locator("#model-refused").is_visible()
+    page.evaluate("""() => document.querySelectorAll("#sleeve-form button[data-label]").forEach((b) => {
+        b.setAttribute("data-blocked", ""); b.disabled = true; })""")  # another check holds it off too
+    page.select_option("#strategy", "ping_pong")
+    assert not page.locator("#model-refused").is_visible()
+    state = page.eval_on_selector_all("#sleeve-form button[data-label]",
+                                      "bs => bs.map(b => [b.hasAttribute('data-blocked'), b.disabled])")
+    assert state and all(s == [True, True] for s in state), state
+    assert errors == []
+    page.context.close()
+
+
+@pytest.mark.parametrize("mark", ["data-blocked", "data-model-refused"])
+def test_a_submit_held_off_by_a_check_never_saves_even_if_something_re_enables_it(held_site, browser, mark):  # noqa: F811
+    """HoE on console.js guard(): a block is the check's word, not only the button's disabled flag. A submit button still
+    marked held off saves nothing, whatever else turned disabled back off."""
+    base, store = held_site
+    before = _saved(store)
+    page, errors = _open(browser, f"{base}/sleeves/new?{WHERE['spot'][0]}&strategy=donchian")
+    _step(page, "Model")
+    assert not page.locator("#model-refused").is_visible()  # a model the form would save
+    page.evaluate("""([spec, mark]) => { const f = document.getElementById("sleeve-form");
+        const r = f.querySelector(`input[name=bar_spec][value='${spec}']`); r.checked = true;
+        f.querySelector("input[name=reason_pick]").checked = true;
+        const b = f.querySelector("button[data-label]"); b.setAttribute(mark, ""); b.disabled = false;
+        f.requestSubmit(b); }""", [MODEL_BAR["donchian"], mark])
+    page.wait_for_timeout(1500)
+    assert page.url.endswith(f"/sleeves/new?{WHERE['spot'][0]}&strategy=donchian"), page.url
+    assert _saved(store) == before and errors == []
+    page.context.close()
+
+
+def test_enter_in_a_field_never_saves_while_the_submit_is_held_off(held_site, browser):  # noqa: F811
+    """CR F2: Enter in a field of the last step submits with the form's button as its submitter (earlier steps move on);
+    held off, nothing saves."""
+    base, store = held_site
+    before = _saved(store)
+    page, errors = _open(browser, f"{base}/sleeves/new?{WHERE['spot'][0]}&strategy=donchian")
+    _step(page, "Model")
+    page.evaluate("""spec => { const f = document.getElementById("sleeve-form");
+        f.querySelector(`input[name=bar_spec][value='${spec}']`).checked = true;
+        f.querySelector("input[name=reason_pick]").checked = true; }""", MODEL_BAR["donchian"])
+    page.locator(".wiz-nav button").last.click()
+    field = page.evaluate("""() => { const f = document.getElementById("sleeve-form");
+        const b = f.querySelector("button[data-label]"); b.setAttribute("data-blocked", ""); b.disabled = false;
+        const i = [...f.querySelectorAll("input")].find((e) => e.offsetParent && /^(text|number|)$/.test(e.type));
+        if (i) i.focus(); return i && i.name; }""")
+    assert field, "no text field on the last step"
+    page.keyboard.press("Enter")
+    page.wait_for_timeout(1500)
+    assert "/sleeves/new" in page.url, (field, page.url)
+    assert _saved(store) == before and errors == []
+    page.context.close()

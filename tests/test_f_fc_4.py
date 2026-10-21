@@ -28,7 +28,7 @@ def _journal(store, fills):
 
 def _strategy(store, in_fund):
     rt = SimpleNamespace(store=store, name="s1", starting_balance=0.0, taker_fee=0.0005, backtest=False,
-                         _last_equity=0.0, peak=0.0)
+                         _last_equity=0.0, peak=0.0, fund_held=in_fund)  # TEC-FFC4: B-34 reads rt.fund_held
     return SimpleNamespace(runtime=rt, _paper_gated=lambda: object() if in_fund else None)
 
 

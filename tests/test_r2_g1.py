@@ -73,7 +73,10 @@ def test_over_5_percent_g1_shows_both_results_and_judges_the_worse(tmp_path, ins
     assert ft["opposite"]["sharpe"] < ft["as_ruled"]["sharpe"]
     assert ft["judged_on"] == "opposite"
     assert summary(r.oos_returns)["sharpe"] == pytest.approx(ft["opposite"]["sharpe"])  # G1 reads the worse
-    assert sum(flips) == len([f for f in r.folds if not f.unscored])  # each window once more, flipped
+    # each window G1 judged flipped runs flipped twice: once more for G1, and once at double fees on the resolution G1
+    # judged (B-22, TEC-B22-FLIPS; each pair differs only in its fees: test_b22_study_double_fees.py b22m)
+    judged_flipped = [f for f in r.folds if not f.unscored] if ft["judged_on"] == "opposite" else []
+    assert judged_flipped and sum(flips) == 2 * len(judged_flipped)
     row = next(c for c in g1_checks(r, IdeaLedger(tmp_path / "l.jsonl")) if c[0] == FIRST_TOUCH_CHECK)
     assert row[1] == "INFO"
     assert "As ruled (long.entry false when ambiguous): Sharpe" in row[2]

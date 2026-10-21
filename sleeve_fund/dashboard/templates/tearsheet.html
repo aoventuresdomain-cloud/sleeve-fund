@@ -19,7 +19,8 @@
 <section class="ledger result-figures" aria-label="Key figures">
   <div><div class="k">Break-even fee</div>
     <div class="v{% if s.breakeven is not none and s.fee is not none %} {{ 'loss' if s.breakeven < s.fee else 'gain' }}{% endif %}">{{ breakeven }}</div>
-    <div class="s">{% if s.fee is not none %}kill line {{ '%.2f'|format(s.fee * 100) }}%, the venue's fee{% else %}per side{% endif %}</div></div>
+    <div class="s">{% if s.fee is not none %}kill line {{ '%.2f'|format(s.fee * 100) }}%, the venue's fee{% else %}per side{% endif %}</div>
+    <div class="s">{% include "_double_fees.html" %}</div></div>
   <div><div class="k">Return, out of sample</div>
     {% set r = s.get('oos_cagr') %}<div class="v{% if r %} {{ 'loss' if r.startswith('-') else 'gain' if r.startswith('+') and r != '+0.0%' }}{% endif %}">{{ r or '–' }}</div>
     <div class="s">a year{% if s.fee is not none %}, at the {{ '%.2f'|format(s.fee * 100) }}% fee{% endif %}{% if s.get('bench_cagr') %}; buy-and-hold {{ s.bench_cagr }}{% endif %}</div></div>

@@ -37,6 +37,15 @@ def _store(tmp_path, gate: bool) -> Store:
     return Store(f"sqlite:///{tmp_path}/c.db", portfolio_gate=gate)
 
 
+def _bridge(store) -> None:
+    """The PM's re-base deposit lands: inside the fund from here (B34-CAPITAL-PREDICATE: the bridge decides; TEC-B34,
+    before it a Strategy still carries its own capital and keeps its own halts). A Strategy made before it keeps its
+    starting balance, as the live fund's were before the PM's re-base."""
+    before = T0 - timedelta(hours=1)
+    store.settle_flow(store.fund_flow("deposit", 100_000, actor="pm", reason="the fund's capital", rebase=True,
+                                      now=before), before)
+
+
 def _runtime(store, t, balance=10_000):
     if "s1" not in {s.name for s in store.sleeves()}:
         store.create_sleeve(name="s1", strategy="buy_and_hold", instrument="BTC/USDT", bar_spec="1-DAY-LAST-EXTERNAL",
@@ -52,6 +61,8 @@ def test_a_strategy_down_20_percent_keeps_trading_inside_the_fund_and_halts_outs
     t = [T0]
     store = _store(tmp_path, gate)
     rt = _runtime(store, t)
+    if gate:
+        _bridge(store)
     rt.tick(equity=10_000, price=10_000, **HELD)
     t[0] += timedelta(days=1, hours=1)  # a new day: the daily pause is not what acts
     rt.tick(equity=10_000, price=10_000, **HELD)
@@ -67,6 +78,7 @@ def test_a_days_loss_past_the_profiles_limit_never_pauses_a_strategy_inside_the_
     t = [T0]
     store = _store(tmp_path, True)
     rt = _runtime(store, t)
+    _bridge(store)
     rt.tick(equity=10_000, price=10_000, **HELD)
     t[0] += timedelta(hours=10)
     assert rt.tick(equity=9_450, price=9_450, **HELD) is None  # down 5.5% on the day
@@ -78,6 +90,7 @@ def test_a_strategy_marked_at_zero_inside_the_fund_is_never_halted_as_invalid_eq
     t = [T0]
     store = _store(tmp_path, True)
     rt = _runtime(store, t, balance=0)
+    _bridge(store)
     assert rt.tick(equity=0.0, price=60_000, cash=0.0, qty=0.0) is None
     assert store.sleeve("s1").status == "running"
 

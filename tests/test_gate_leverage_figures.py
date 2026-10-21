@@ -195,7 +195,8 @@ def test_0032_adds_the_figures_from_0031_with_the_migrations_own_rules_and_refus
         command.upgrade(schema._config(c), "0031")
     store = Store(engine=mig_engine)
     old = _decision(store)  # a row from before 0032
-    schema.migrate(mig_engine, log=lambda _: None)
+    with mig_engine.begin() as c:  # to 0032 itself: a downgrade from head runs the later ones first (TEC, DA 0034)
+        command.upgrade(schema._config(c), "0032")
     assert _figures(store, old) == dict.fromkeys(DECISION)
     for f in DECISION:  # the migration's own triggers, not create_all's: four of five is refused, whichever is missing
         with pytest.raises(DatabaseError):

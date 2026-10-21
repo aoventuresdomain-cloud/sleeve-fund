@@ -3,6 +3,7 @@
 # (Z < -2); a close back above the 12 EMA after the dip.
 version = 1
 name = "qr02-dip-long"
+title = "Trend Pullback (buy the dip, 4h) · Long"
 reason = """Inside an uptrend (close above the daily 200-day SMA), a sharp short pullback (RSI(2) below 10 on 4h) is
 usually forced or emotional selling, and the buyer who steps in is paid for providing liquidity. Out when RSI(2) is
 back above 70, the close is back above its 5-period SMA, or after 10 candles; 2.5 ATR(14) stop."""
