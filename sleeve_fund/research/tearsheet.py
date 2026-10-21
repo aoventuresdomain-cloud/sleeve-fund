@@ -624,8 +624,21 @@ def render(r: StudyResult, ledger: IdeaLedger, register=None, liquidation_ack: s
     if getattr(r, "hold_note", ""):
         out.append(f"Benchmark: {r.hold_note}.")
         out.append("")
+    if getattr(r, "bar_note", ""):  # BH-102 rule 3: which hold set the bar, both Sharpes beside it
+        out.append(f"G1 {r.bar_note}.")
+        out.append("")
+    if getattr(r, "hold_liquidated", None):  # BH-102: a 1x perp hold whose funding took its margin is liquidated
+        out.append("The perp hold was liquidated on " + "; ".join(r.hold_liquidated) + ", and held nothing after.")
+        out.append("")
     spot = getattr(r, "spot_hold_returns", None)
-    if spot is not None and len(spot.dropna()) >= 2:
+    perp = getattr(r, "perp_hold_returns", None)
+    if perp is not None and len(perp.dropna()) >= 2 and getattr(r, "bar_hold", "") not in ("", "perp hold"):
+        # BH-102 rule 3: the bar is another hold; the perp's beside it
+        p_ = summary(perp)
+        out.append(f"Holding the 1x perpetual instead, out-of-sample: CAGR {_pct(p_['cagr'])}, Sharpe "
+                   f"{_num(p_['sharpe'])}, max drawdown {_pct(p_['max_drawdown'])} (shown, not the G1 benchmark).")
+        out.append("")
+    elif spot is not None and len(spot.dropna()) >= 2:
         s_ = summary(spot)
         out.append(f"Holding spot instead, out-of-sample: CAGR {_pct(s_['cagr'])}, Sharpe {_num(s_['sharpe'])}, "
                    f"max drawdown {_pct(s_['max_drawdown'])} (shown, not the G1 benchmark).")

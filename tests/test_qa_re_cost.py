@@ -228,8 +228,10 @@ def test_hold1_the_headline_hold_on_a_perp_study_pays_perp_funding(tmp_path, ins
     """
     prices = synthetic_ohlcv(days=1100, seed=3)
     r = _study(tmp_path, instrument, "perp", prices=prices)
-    bench = r.oos_benchmark_returns
-    assert len(bench) > 300, "set-up: a benchmark over the out-of-sample days"
+    # BH-102 rule 3 (Advisor 21 Oct; TEC-BH102-HOLD 1): the perp hold is always shown, but the headline is whichever
+    # hold has the higher Sharpe over the days both cover, so the perp arithmetic is checked on the perp line itself
+    bench = r.perp_hold_returns
+    assert bench is not None and len(bench) > 300, "set-up: a perp hold over the out-of-sample days"
     days = len(bench)
     perp_hold = float((1 + bench).prod() - 1)
     day_close = prices["close"].resample("1D").last()
@@ -243,6 +245,11 @@ def test_hold1_the_headline_hold_on_a_perp_study_pays_perp_funding(tmp_path, ins
                                                                     "spot_like": spot_like, "move": move}
     # the engine sizes the hold slightly under full equity, so allow 5% on the growth factor (spot would be 19% off)
     assert abs((1 + perp_hold) / (1 + perp_like) - 1) < 0.05, {"perp_hold": perp_hold, "perp_like": perp_like}
+    spot = r.spot_hold_returns
+    both = bench.index.intersection(spot.index)
+    sharpe = lambda x: x.mean() / x.std(ddof=1)  # noqa: E731 - the choice needs only the order, not the scale
+    headline = spot if sharpe(spot.reindex(both)) > sharpe(bench.reindex(both)) else bench
+    assert np.allclose(r.oos_benchmark_returns.to_numpy(), headline.reindex(r.oos_benchmark_returns.index).to_numpy())
 
 
 def test_hold2_spot_is_a_secondary_line_labelled_holding_spot_instead(tmp_path, instrument):
@@ -252,9 +259,14 @@ def test_hold2_spot_is_a_secondary_line_labelled_holding_spot_instead(tmp_path, 
     spot = _need(r, "spot_hold_returns", "StudyResult.spot_hold_returns (the out-of-sample spot hold)")
     assert spot is not None and len(spot) == len(r.oos_returns), "not built: a spot line over the same days"
     text = render(r, IdeaLedger(tmp_path / "l"))
-    assert "holding spot instead" in text.lower(), "not built: the label"
-    # the headline numbers must stay the perp hold, not be replaced by the spot one
-    assert not np.allclose(r.oos_benchmark_returns.to_numpy(), spot.to_numpy())
+    # BH-102 rule 3 (Advisor 21 Oct; TEC-BH102-HOLD 2): the headline is the hold bar_note names, the other beside it,
+    # labelled
+    perp = r.perp_hold_returns
+    headline, other = (spot, "holding the 1x perpetual instead") if r.bar_hold == "spot hold" else \
+        (perp, "holding spot instead")
+    assert r.bar_note.startswith(f"bar: the {r.bar_hold}, ")
+    assert np.allclose(r.oos_benchmark_returns.to_numpy(), headline.reindex(r.oos_benchmark_returns.index).to_numpy())
+    assert other in text.lower() and f"G1 {r.bar_note}." in text
 
 
 def _native(tmp_path, monkeypatch, kept_from, days=1100):

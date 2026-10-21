@@ -92,6 +92,13 @@ def _funding_check(r) -> tuple[str, str]:
 
 
 @dataclass
+class HoldCurve:
+    """A hold priced outside the engine (the price-only hold, BH-102 rule 3): its equity is all a sheet reads of the
+    full-period benchmark."""
+    equity: pd.Series
+
+
+@dataclass
 class Fold:
     train_start: pd.Timestamp
     train_end: pd.Timestamp
@@ -221,6 +228,12 @@ class StudyResult:
     hold_full_period: bool = True  # the hold covers the whole research period (the parameter-robustness check)
     oos_compare_returns: pd.Series | None = None
     spot_hold_returns: pd.Series | None = None  # "holding spot instead", out-of-sample, shown beside a perp hold
+    # BH-102 rule 3 (Advisor, 21 Oct): a perp study's bar is the higher-Sharpe of the perp hold and the spot (or
+    # price-only) hold over the compared out-of-sample days, chosen once; every benchmark reader takes that one.
+    bar_hold: str = ""  # "perp hold", "spot hold" or PRICE_HOLD; "" on a spot study (its one hold)
+    bar_note: str = ""  # which set the bar, with both holds' Sharpe, as the sheet prints it
+    perp_hold_returns: pd.Series | None = None  # the perp hold, out-of-sample, the bar or shown beside it
+    hold_liquidated: list = field(default_factory=list)  # when the perp hold was liquidated, as "<date> (<where>)"
     funding_stress: dict | None = None  # a simulated perp's research period at FUNDING_STRESS_RATE
     # D13-INTRAMINUTE-JUMP (3), GAP-DOWN: out-of-sample again with STOP_STRESS more on each stop exit. charge: the
     # daily returns that costs, by day; stops: the stop exits; median_stop: the entries' median stop distance.
@@ -754,6 +767,8 @@ def run_study(
     # beside it where the venue lists spot. A perp venue's own buy and hold above is already a perp.
     hold_market = markets.market_of({**default_params, **market})
     perp_hold = hold_market != markets.SPOT
+    hold_liquidated: list[str] = []
+    price_cost = PRICE_HOLD_TAKER + spread_used
 
     def hold_returns(first, last) -> pd.Series | None:
         """The perp hold's daily returns over the bars closing first..last, or None when a funding settlement in it
@@ -762,19 +777,30 @@ def run_study(
             return None
         window = prices[(prices.index >= first - bar) & (prices.index <= last)]
         run = bt("buy_and_hold", window, {"market": hold_market}, benchmark=True)
+        hold_liquidated.extend(f"{t:%d %b %Y} (the window to {last:%b %Y})" for t in liquidated_at(run))
         return whole_days(daily_returns(run.equity), first, bar)
+
+    def price_hold_returns(first, last) -> pd.Series:
+        """The price-only hold over the bars closing first..last, paying its entry and exit (as hold_returns)."""
+        window = prices[(prices.index >= first - bar) & (prices.index <= last)]["close"]
+        return whole_days(daily_returns(price_hold_equity(window, price_cost, starting_capital)), first, bar)
 
     hold_full_period = not perp_hold or not missing_funding({"market": hold_market}, instrument, research.index[0],
                                                            research.index[-1])
     if perp_hold and hold_full_period and not market:  # a spot venue: the research period's hold is the perp's too
         bench = bt("buy_and_hold", research, {"market": hold_market}, benchmark=True)
         bench_ret = daily_returns(bench.equity)
-    spot_ret = daily_returns(bt("buy_and_hold", research, {}, benchmark=True).equity) \
+    hold_liquidated.extend(f"{t:%d %b %Y} (the research period)" for t in (liquidated_at(bench) if perp_hold else []))
+    spot_bench = bt("buy_and_hold", research, {}, benchmark=True) \
         if perp_hold and not (profile is not None and profile.perpetual) else None
+    spot_ret = daily_returns(spot_bench.equity) if spot_bench is not None else None
+    price_only = perp_hold and spot_ret is None  # a perp-only venue: the price held stands for spot (BH-102 rule 3)
+    alt_label = PRICE_HOLD if price_only else "spot hold" if spot_ret is not None else ""
     def fold_benchmark(test_ret: pd.Series, first, last) -> tuple[pd.Series, tuple]:
         """A test window's benchmark, and what the window adds to the comparison (its days, the strategy's days the
         hold covers, the spot hold's), kept per window so a first_touch re-run can replace them (R2-G1)."""
-        spot = spot_ret.reindex(test_ret.index).dropna() if spot_ret is not None else None
+        spot = (price_hold_returns(first, last).reindex(test_ret.index).dropna() if price_only else
+                spot_ret.reindex(test_ret.index).dropna() if spot_ret is not None else None)
         if not perp_hold:
             return bench_ret.reindex(test_ret.index).dropna(), (len(test_ret), test_ret, spot)
         held = hold_returns(first, last)
@@ -954,18 +980,54 @@ def run_study(
         twice_parts[k] = scored(k, *window, rerun)[1]
         twice_runs.append((run, rerun))
     double_fee_returns = pd.concat(twice_parts) if twice_parts else pd.Series(dtype=float)
+    # BH-102 rule 3 (Advisor, 21 Oct): a long-only perp study must beat the HIGHER of the perp hold and the spot (or
+    # price-only) hold, by Sharpe over the out-of-sample days both cover, chosen once for the whole sheet: every reader
+    # of the benchmark (G1's Sharpe test, stop stress, the parameter checks, the full-period and holdout rows) then
+    # takes that hold, never one here and the other there. A perp hold without enough known funding still gives no
+    # verdict, as before, and so does one missing any window (TEC-BH102-HOLD 4, pending the Advisor).
+    bar_hold, bar_note, switched = ("perp hold" if perp_hold else ""), "", False
+    spots = [spot for _, _, spot in compare_by]
+    if perp_hold and alt_label and any(s is not None and len(s) for s in spots):
+        perp_cmp = pd.concat([b for b in bench_parts if len(b)]) if any(len(b) for b in bench_parts) else \
+            pd.Series(dtype=float)
+        alt_cmp = pd.concat([s for s in spots if s is not None])
+        both = perp_cmp.index.intersection(alt_cmp.index)
+        ps, ss = _sharpe_or_floor(perp_cmp.reindex(both)), _sharpe_or_floor(alt_cmp.reindex(both))
+        # TEC-BH102-HOLD item 4, held for the Advisor: a perp hold that misses any window (a settlement there has no
+        # known rate) keeps today's rule, its windows unjudged, and the other hold never stands in
+        misses = any(part is None for _, part, _ in compare_by)
+        switched = ss > ps and not misses
+        bar_hold = alt_label if switched else "perp hold"
+        words = lambda s: "n/a" if s == float("-inf") else f"{s:.2f}"  # noqa: E731
+        bar_note = (f"bar: {'the ' + alt_label if switched else 'the perp hold'}, the higher Sharpe over the "
+                    f"{len(both)} out-of-sample days both cover (perp hold {words(ps)}, {alt_label} {words(ss)})")
+    perp_shown = (pd.concat([b for b in bench_parts if len(b)]) if perp_hold and any(len(b) for b in bench_parts)
+                  else None)
+    if switched:
+        import dataclasses
+
+        for k, spot in enumerate(spots):
+            spot = spot if spot is not None else pd.Series(dtype=float)
+            bench_parts[k] = spot
+            compare_by[k] = (compare_by[k][0], oos_parts[k].reindex(spot.index).dropna(), spot)
+            folds[k] = dataclasses.replace(folds[k], benchmark_test=_summary_or_none(spot))
+        bench = (spot_bench if spot_bench is not None else
+                 HoldCurve(price_hold_equity(research["close"], price_cost, starting_capital)))
     oos_days = [sum(days for days, _, _ in compare_by)]
     compare_parts = [part for _, part, _ in compare_by if part is not None]
     spot_parts = [spot for _, _, spot in compare_by if spot is not None]
     run_fees = paid(chosen)
     covered = len(pd.concat(compare_parts)) if compare_parts else 0
-    hold_insufficient = perp_hold and covered < HOLD_COVERAGE_FLOOR * oos_days[0]
+    hold_insufficient = perp_hold and not switched and covered < HOLD_COVERAGE_FLOOR * oos_days[0]
     if perp_hold:
         terms = markets.terms({"market": hold_market}, str(instrument.id.venue))
         paying = (f"assumed funding of {terms.funding_rate:.2%} every settlement, as the strategy's runs pay"
                   if terms.funding_venue is None else "the venue's settled funding")
         hold_note = (f"buy and hold is a 1x long perpetual paying its fees and {paying}; it covers {covered} of "
                      f"{oos_days[0]} out-of-sample days, the windows whose funding is all known")
+        if switched:
+            hold_note = (f"the {alt_label} set the bar, so it is the benchmark on every line of this sheet; the 1x long "
+                         f"perpetual paying its fees and {paying} is shown beside it")
         if hold_insufficient:
             hold_note += (f": insufficient funding history (under {HOLD_COVERAGE_FLOOR:.0%}), so it gives no verdict; "
                           "random entry still judges")
@@ -994,7 +1056,11 @@ def run_study(
         oos_returns=pd.concat(oos_parts),
         oos_benchmark_returns=pd.concat(bench_parts),
         oos_compare_returns=pd.concat(compare_parts) if compare_parts else pd.Series(dtype=float),
-        spot_hold_returns=pd.concat(spot_parts) if spot_parts else None,
+        spot_hold_returns=pd.concat(spot_parts) if spot_parts and not price_only else None,
+        perp_hold_returns=perp_shown,
+        bar_hold=bar_hold,
+        bar_note=bar_note,
+        hold_liquidated=hold_liquidated,
         hold_market=hold_market,
         hold_full_period=hold_full_period,
         hold_note=hold_note,
@@ -1164,7 +1230,12 @@ def run_study(
                 if worse:
                     h_ret, run = other, flipped  # its liquidations too are the judged run's
             result.holdout = summary(h_ret)
-            if perp_hold:
+            if switched and price_only:  # the bar's hold, as on every other line (BH-102 rule 3)
+                result.holdout_benchmark = _summary_or_none(price_hold_returns(h_start, prices.index[-1]))
+            elif switched:
+                b_all = bt("buy_and_hold", prices, {}, benchmark=True)
+                result.holdout_benchmark = summary(whole_days(daily_returns(b_all.equity), h_start, bar))
+            elif perp_hold:
                 hb_ret = hold_returns(h_start, prices.index[-1])
                 result.holdout_benchmark = None if hb_ret is None else _summary_or_none(hb_ret)
                 if hb_ret is None:
@@ -1555,6 +1626,31 @@ def _benchmarks(prices: pd.DataFrame, folds: list[Fold], test_bars: int, taker: 
 
 
 HOLD_COVERAGE_FLOOR = 0.5  # the share of out-of-sample days a perp hold must cover to judge (Advisor, 7 Oct 2026)
+
+
+PRICE_HOLD = "price-only hold (no spot market at this venue)"
+# shortcut: the base-tier spot taker fee both venues publish (0.10%), not read from a fee schedule: no spot account.
+PRICE_HOLD_TAKER = 0.001
+
+
+def price_hold_equity(closes: pd.Series, cost: float, capital: float) -> pd.Series:
+    """BH-102 rule 3 (Advisor, 21 Oct): on a venue with no spot market, the asset's own price held, bought at the
+    first close and sold at the last, each paying `cost` (the base-tier spot taker fee plus half the spread): no
+    funding, nothing to liquidate. A free hold would be an easier bar the other way."""
+    eq = capital * (1 - cost) * closes.astype(float) / float(closes.iloc[0])
+    eq.iloc[-1] = eq.iloc[-1] * (1 - cost)
+    return eq
+
+
+def liquidated_at(run) -> list[pd.Timestamp]:
+    """When a run's position was liquidated: each fill of an order the engine decided as a liquidation."""
+    return [pd.Timestamp(f["ts"]) for f in fills_to_rows(run.fills)
+            if (run.decisions.get(f["order_id"]) or {}).get("intent") == "liquidation"]
+
+
+def _sharpe_or_floor(returns: pd.Series) -> float:
+    s = summary(returns)["sharpe"] if len(returns.dropna()) >= 2 else float("nan")
+    return float("-inf") if s is None or math.isnan(s) else float(s)
 
 
 def _summary_or_none(returns: pd.Series) -> dict | None:
