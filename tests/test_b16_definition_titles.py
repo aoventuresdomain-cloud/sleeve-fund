@@ -15,7 +15,36 @@ DEFS = Path(__file__).resolve().parent.parent / "configs" / "definitions"
 
 # file id: (definition_hash, idea_hash) on main, before the titles, and every definition since (R-29: one data file)
 PINS = tomllib.loads((DEFS.parent / "definition_pins.toml").read_text())
+# HoE R-29 v3 (CR M1): the pins as they stood when they moved to that file, frozen here, so changing one (a new trials
+# key for an existing definition) is a test edit and a TEC, never a config-only change. New pins are added there only.
+FROZEN = {
+    "qr01_trend_ema_long": ("db887a6fa3a01f1b", "4a7eb5ddd831d115"),
+    "qr01_trend_ema_short": ("8ff28a74df7b0372", "ae95f6b39c909bfd"),
+    "qr01b_trend_multispeed_long": ("e122ddf1851edf73", "de5a829d3c0285d2"),
+    "qr01b_trend_multispeed_short": ("ebeb628bca57ab35", "130dd41dd09d7583"),
+    "qr01c_trend_donchian_long": ("a64268b388237a66", "755f51c7b13eea57"),
+    "qr01c_trend_donchian_short": ("170c176d9440913e", "c467a46247a2def8"),
+    "qr02_dip_long": ("ce126dc7f0c4275c", "0e13cf32e1775235"),
+    "qr02_dip_short": ("d6a770a1cc522b77", "11201be8f25dd86e"),
+    "qr03_squeeze_long": ("95545de0d400e19f", "7c296e19aa018b1c"),
+    "qr03_squeeze_short": ("8bb0e50ac6fd3c0f", "da6a2f9869be5fdd"),
+    "qr10_capitulation_long": ("62a1ee8da26544c1", "6115b1bf66edcbc1"),
+    "qr11_exhaustion_long": ("8ad588bcd437b26a", "32783815f699c062"),
+    "qr11_exhaustion_short": ("daa1bea4ae612937", "d7f2ac6ecd8cd817"),
+    "qr12_overnight_breakout_long": ("aa3a666c41d9381c", "4a60499278cd6443"),
+    "qr13_level_continuation_long": ("18e1ac88db4b05b8", "f1f453cf366a222e"),
+    "qr13_level_continuation_short": ("8ee488792d38fdd4", "cd26d663530515cb"),
+    "qr01d_trend_donchian20_long": ("1b9b732b0d34ecf6", "755f51c7b13eea57"),
+    "qr20_volume_surge_breakout_long": ("9038fc9ed7fdbfa9", "55a2204ee8f98c60"),
+    "qr21_trend_sma200_long": ("171c64b27d8699d2", "e8c08e48083953b3"),
+    "qr22_price_above_sma20_long": ("eb41579629a697ab", "703feb3d33753b1c"),
+    "qr23_vma_band_sma50_long": ("532b63bfc5402bf8", "ea3b0412d58f1c7f"),
+}
 BEFORE = {fid: (pin["definition_hash"], pin["idea_hash"]) for fid, pin in PINS.items()}
+
+
+def test_the_frozen_pins_are_unchanged_in_the_pins_file():
+    assert FROZEN.items() <= BEFORE.items()
 
 
 def test_every_qr_file_is_pinned():

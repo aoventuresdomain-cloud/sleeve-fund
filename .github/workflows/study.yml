@@ -47,7 +47,7 @@ jobs:
   study:
     runs-on: ubuntu-24.04
     timeout-minutes: 360
-    permissions: { contents: read }
+    permissions: { contents: read, actions: read }
     if: ${{ vars.DEPLOY_ENABLED == 'true' && github.ref == 'refs/heads/main' }}
     env:
       USER_AT: ${{ vars.DEPLOY_USER || 'root' }}
@@ -58,6 +58,15 @@ jobs:
           ref: ${{ github.sha }}  # main at the dispatch commit, by SHA: main moving after dispatch changes nothing
           fetch-depth: 0
           persist-credentials: false
+      - name: Require green tests for this commit
+        if: inputs.configs_from == 'main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # As deploy.yml: the push run of tests.yml on main at this commit passed (HoE R-29 v3, HoQA F2).
+          ok=$(gh run list --workflow tests.yml --commit "$GITHUB_SHA" --branch main --event push --status success \
+               --json databaseId --jq length)
+          [ "$ok" -gt 0 ] || { echo "FAIL: the tests have not passed on main at $GITHUB_SHA; wait for the tests workflow"; exit 1; }
       - name: Check the commit is on main
         if: inputs.configs_from == 'main'
         env:

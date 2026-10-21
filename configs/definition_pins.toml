@@ -1,7 +1,8 @@
 # R-29 (HoE 21 Oct 2026): every QR definition's pinned hashes, read by tests/test_b16_definition_titles.py and
 # tests/test_research_gaps.py. A definition_hash or idea_hash keys the trials register and the idea counter, so a
-# change to a pinned file's content fails both. A new definition adds its own table here, in the same PR: data under
-# configs, so a rule PR stays a research-config-only change (deploy/research_config_only.sh) and needs no deploy.
+# change to a pinned file's content fails both. A new definition ADDS its own table here, in the same PR: data under
+# configs, so a rule PR stays a research-config-only change (deploy/research_config_only.sh) and needs no deploy. A
+# changed or removed line is not: those pins are frozen in tests/test_b16_definition_titles.py too (a TEC to change).
 # Not under configs/definitions, where every .toml is read as a definition.
 
 [qr01_trend_ema_long]

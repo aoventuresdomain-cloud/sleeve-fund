@@ -15,9 +15,12 @@ the count is kept by hand, and every such sheet says "Tries counted by hand unti
 3. **The family's tries so far, written in the PR.** Every file in a family counts, new files too (a qr01e is a try
    of qr01's family, not a fresh idea), against the family's budget of 20.
 
-The PR touches only `configs/definitions/<name>.toml` (or `variants/<name>.toml`), its pinned hashes in
-`configs/definition_pins.toml`, and a study list in `configs/studies/`. Anything else, tests included, makes it a code
-change and a full deploy.
+The PR only ADDS: a new `configs/definitions/<name>.toml` (or `variants/<name>.toml`), its pinned hashes appended
+to `configs/definition_pins.toml`, and a study list in `configs/studies/`. Anything else makes it a code change and a
+full deploy: tests, an edited or deleted definition, or a changed or removed pin. An edited definition is a new trials
+key, which resets its tries, so it needs a TEC; the pins as they stood on 21 Oct are also frozen in
+tests/test_b16_definition_titles.py, so changing one fails CI until a test is edited. A study from main also needs
+its commit's tests to have passed on main.
 
 No new family until R-25 lands, unless the pre-registration file listed it before the merge. The HoE refuses any
 definitions PR without all three.
