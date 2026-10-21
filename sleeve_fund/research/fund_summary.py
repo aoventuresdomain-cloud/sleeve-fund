@@ -13,7 +13,9 @@ Every row shows its idea family's tries against the budget and the 2x-fee result
 
 Under the tables, the correlation of the strategies' daily returns (each sheet's .returns.csv, run.write_returns) over
 the days they all share. A sheet without its returns file, or a returns file without its sheet, is refused: the page
-never mixes a figure with a series from another run.
+never mixes a figure with a series from another run. Then (d) FINALIST-CORR (Advisor, 21 Oct): the out-of-sample
+daily returns (.oos-returns.csv, run.write_oos_returns) pair by pair over the days both have, each with its count,
+blank under MIN_PAIR_DAYS, and each strategy against the plain BTC price return.
 
 python -m sleeve_fund.research.fund_summary SHEET.md ... --out summary.md [--holdout-status FILE.json]
 FILE.json, kept under research/quant-researcher/: {"strategy name": {"status": "spent" | "leaked", "date": "YYYY-MM-DD",
@@ -31,7 +33,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from sleeve_fund.research.run import returns_path
+from sleeve_fund.research.run import oos_returns_path, returns_path
 
 _TOTAL = re.compile(r"^Total return over the window: ([+-][\d.]+%) \(", re.M)
 _DSR = re.compile(r"^- Deflated Sharpe: (\d+)% probability", re.M)
@@ -42,6 +44,7 @@ _WORSE = {"clean": 0, "spent": 1, "leaked": 2}
 POOLED = "Pooled (one try)"
 SHORT_DAYS = 90  # fewer shared days than this: the matrix is shown greyed, "too short to read" (Advisor, 21 Oct)
 UNSTATED = "Asset not stated"
+MIN_PAIR_DAYS = 60  # (d): a pair sharing fewer out-of-sample days is left blank, its count shown (Advisor, 21 Oct)
 
 
 class Unmatched(ValueError):
@@ -137,6 +140,60 @@ def correlation(sheets: list[Path]) -> tuple[pd.DataFrame, pd.DatetimeIndex]:
     return both.corr(), both.index
 
 
+def _paired(a: pd.Series, b: pd.Series) -> tuple[float, int]:
+    """The correlation of two daily series over the calendar days both have, and that count; NaN under
+    MIN_PAIR_DAYS."""
+    both = pd.concat([a, b], axis=1, join="inner").dropna()
+    return (float(both.iloc[:, 0].corr(both.iloc[:, 1])) if len(both) >= MIN_PAIR_DAYS else float("nan")), len(both)
+
+
+def pairwise(series: dict[str, pd.Series]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """(d) FINALIST-CORR: each pair's correlation over the days both have, and those days' count."""
+    names = list(series)
+    corr = pd.DataFrame(float("nan"), index=names, columns=names)
+    days = pd.DataFrame(0, index=names, columns=names)
+    for a in names:
+        for b in names:
+            corr.loc[a, b], days.loc[a, b] = _paired(series[a], series[b])
+    return corr, days
+
+
+def to_price(series: dict[str, pd.Series], price: pd.Series) -> tuple[pd.Series, pd.Series]:
+    """Each series' correlation to a price's daily return over the days both have, and the count."""
+    out = {name: _paired(s, price) for name, s in series.items()}
+    return pd.Series({k: v[0] for k, v in out.items()}), pd.Series({k: v[1] for k, v in out.items()})
+
+
+def oos_section(sheets: list[Path], assets: dict[str, str]) -> list[str]:
+    """(d) The finalists' out-of-sample daily returns correlated pair by pair, with BTC's price return beside them.
+    `assets`: each sheet's stem to its instrument (a BTC one's price column is BTC's price)."""
+    out = ["## Correlation of out-of-sample daily returns, pair by pair", ""]
+    missing = [s.name for s in sheets if not oos_returns_path(s).exists()]
+    if missing:
+        return out + [f"Not shown: {', '.join(missing)} {'has' if len(missing) == 1 else 'have'} no out-of-sample "
+                      "returns file. Re-run the study: it writes one beside the sheet.", ""]
+    read = {s.stem: pd.read_csv(oos_returns_path(s), index_col="date", parse_dates=["date"]) for s in sheets}
+    series = {k: f["return"] for k, f in read.items()}
+    btc = [f["price"] for k, f in read.items() if str(assets.get(k, "")).split("/")[0] == "BTC"]
+    price = pd.concat(btc).groupby(level=0).first() if btc else None
+    corr, days = pairwise(series)
+    to_btc, btc_days = to_price(series, price) if price is not None else (None, None)
+    out += ["Out of sample only (the walk-forward test windows), net of costs; a day out of the market counts as 0. "
+            "Each pair is over the calendar days both have, the count beside it, blank under "
+            f"{MIN_PAIR_DAYS} days. The last column is each strategy against the plain BTC price return: a set all "
+            "close to it is mostly long BTC."
+            + ("" if price is not None else " No BTC sheet in the set, so that column reads n/a."), ""]
+    cell = lambda c, n: f"({n} d)" if pd.isna(c) else f"{c:.2f} ({n} d)"  # noqa: E731
+    names = list(series)
+    out.append("| | " + " | ".join(str(i) for i in range(1, len(names) + 1)) + " | BTC price |")
+    out.append("| --- |" + " --- |" * (len(names) + 1))
+    for i, a in enumerate(names, 1):
+        last = "n/a" if to_btc is None else cell(to_btc[a], int(btc_days[a]))
+        out.append(f"| {i} {a} | " + " | ".join(cell(corr.loc[a, b], int(days.loc[a, b])) for b in names)
+                   + f" | {last} |")
+    return out + [""]
+
+
 def _cells(r: dict) -> list[str]:
     figures = [r["oos_sharpe"], r["bench_sharpe"], r["oos_cagr"], r["total"], r["dsr"], r["double"], r["tries"],
                r["trades"]]
@@ -169,22 +226,24 @@ def page(sheets: list[Path], holdout_status: dict | None = None, status_source: 
                 "| --- " * 13 + "|"]
         out += [f"| {i} | " + " | ".join(_cells(r)) + " |" for i, r in enumerate(section, 1)]
         out.append("")
+    names = [r["name"] for section in ranked.values() for r in section]
+    finalists = oos_section(sorted(sheets, key=lambda s: names.index(s.stem)),
+                            {r["name"]: r["instrument"] for section in ranked.values() for r in section})
     corr, common = correlation(sheets)
     out += ["## Correlation of daily returns", ""]
     if len(common) < 2:
         out.append("Not shown: the returns files share fewer than 2 days.")
-        return "\n".join(out) + "\n"
+        return "\n".join(out + [""] + finalists) + "\n"
     short = len(common) < SHORT_DAYS
     out += [f"Over the {len(common)} common days, {common[0]:%Y-%m-%d} to {common[-1]:%Y-%m-%d}: the days every "
             "file has, so a short history narrows it for all."
             + (f" **Too short to read:** under {SHORT_DAYS} days, shown greyed." if short else ""), ""]
     fmt = (lambda x: f"*{x:.2f}*") if short else (lambda x: f"{x:.2f}")  # noqa: E731
-    names = [r["name"] for section in ranked.values() for r in section]
     out.append("| | " + " | ".join(str(i) for i in range(1, len(names) + 1)) + " |")
     out.append("| --- |" + " --- |" * len(names))
     for i, a in enumerate(names, 1):
         out.append(f"| {i} {a} | " + " | ".join(fmt(corr.loc[a, b]) for b in names) + " |")
-    return "\n".join(out) + "\n"
+    return "\n".join(out + [""] + finalists) + "\n"
 
 
 def main(argv: list[str] | None = None) -> int:
