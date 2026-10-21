@@ -50,7 +50,7 @@ def test_nav_says_strategy(client):
 def test_list_holds_every_built_strategy(client):
     c, _ = client
     html = c.get("/strategy", auth=AUTH).text
-    assert len(QR_IDS) == 16
+    assert len(QR_IDS) == 21
     for fid in QR_IDS + ["rsi-bands", "rsi-pullback"]:
         assert f"/strategy?s={fid}" in html
     for model in sa.MODELS:
