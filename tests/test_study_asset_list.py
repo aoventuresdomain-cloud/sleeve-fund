@@ -396,7 +396,9 @@ def test_the_basket_passes_the_studys_market_to_every_leg(monkeypatch):
     assert seen and seen[0]["market"] == "perp" and seen[0]["probe"] == "perp" and seen[0]["rsi_period"] == 4
 
 
-def test_an_unwired_market_is_refused_in_words():
-    with pytest.raises(ValueError, match="isn't wired yet"):
-        run_mod.study_market(_req(market="spot-lowfee"))
+def test_a_basket_takes_the_study_market_and_refuses_an_unknown_one_in_words():
+    # RESEARCH-SPOT-FEES wired the market QD's stub refused (HoE, Deploy 3 merge)
+    assert run_mod.study_market(_req(market="spot-lowfee")) == {"market": "spot-lowfee"}
+    with pytest.raises(ValueError, match="perp or spot-lowfee"):
+        run_mod.study_market(_req(market="spot"))
     assert run_mod.study_market(_req()) == {}
