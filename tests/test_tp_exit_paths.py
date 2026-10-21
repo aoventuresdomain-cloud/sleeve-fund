@@ -241,7 +241,11 @@ def test_the_target_form_and_the_exit_kind_are_journaled(instrument):
 def test_qr01b_with_its_3_atr_stop_and_a_3r_target_reconciles(instrument):
     """The HoE's reconcile: qr01b's own definition with take_profit = {r = 3} beside its 3 ATR(14) stop, daily bars.
     Each target is 3R in price from its entry's fill (HoE 21 Oct); every take-profit fills on a touch of it, booked at the level
-    less the taker's slippage, never better; and the journal's cash is the run's end equity."""
+    less the taker's slippage, never better; and the journal's cash is the run's end equity.
+    TEC-TPEXIT-QR01B-TICK (HoE 21 Oct), target exits only: (1) the target may sit up to one instrument tick past the
+    exact 3R, the tick past it on the position's worse side (TP-EXIT rule 2, instruments.target_on_tick); (2) the
+    journal's fill is the level less the floor exactly, and the report's price, which folds the exit fee's cent
+    rounding into it, is held to D13 pin e (1.5 cents over the quantity). Entries, stops, fees and P&L stay exact."""
     import tomllib
     from pathlib import Path
 
@@ -276,6 +280,13 @@ def test_qr01b_with_its_3_atr_stop_and_a_3r_target_reconciles(instrument):
         assert px < s["target_px"], (px, s)  # never better than the level (rule 3)
         # the level less the floor; the report carries the fee's cent rounding into the price (D13 pin e)
         assert px == pytest.approx(s["target_px"] * (1 - 0.0005), abs=1.5 * 0.0100001 / qty + 1e-9), (px, qty, s)
+    orders = res.journal.orders_ if isinstance(res.journal.orders_, dict) else {
+        o["order_id"]: o for o in res.journal.orders_}
+    exits = [(orders[f["order_id"]]["signal"]["target_px"], f["price"]) for f in res.journal.fills_
+             if orders[f["order_id"]]["intent"] == "take_profit"]
+    assert len(exits) == len(targets)
+    for level, fill in exits:  # the journal's fill: the level less the taker's floor, exactly
+        assert fill == pytest.approx(level * (1 - 0.0005), rel=1e-12, abs=1e-9), (fill, level)
     book = replay_book(res.journal.fills_, 10_000.0, res.journal.funding_total("backtest"),
                        res.journal.insurance_total("backtest"))
     marked = book["cash"] + book["qty"] * float(df["close"].iloc[-1])
