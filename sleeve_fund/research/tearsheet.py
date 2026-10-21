@@ -9,7 +9,7 @@ import math
 import numpy as np
 import pandas as pd
 
-from sleeve_fund import funding
+from sleeve_fund import funding, markets
 from sleeve_fund.research import mintrl, regime_split
 from sleeve_fund.research.guardrails import CANDIDATE_CHECK, G1_RULES, MIN_OOS_TRADES, nearby_scored
 from sleeve_fund.research.ledger import IdeaLedger
@@ -120,6 +120,11 @@ def _idea(r: StudyResult) -> str:
     from sleeve_fund.research.trials import legacy_idea_hash
 
     return getattr(r, "idea_hash", None) or legacy_idea_hash(r.spec.name)
+
+
+def _asset_class(r: StudyResult, spec) -> str:
+    """R-04: what the study's runs traded, not the strategy's default: a perpetual when they traded one."""
+    return "perpetual" if markets.is_perp(r.full_period.params) else spec.asset_class
 
 
 def _counts(r: StudyResult, ledger: IdeaLedger, register) -> dict:
@@ -549,7 +554,7 @@ def render(r: StudyResult, ledger: IdeaLedger, register=None, liquidation_ack: s
         out.append("")
     out.append("## Idea")
     out.append("")
-    out.append(f"**Family:** {spec.family} · **Asset class:** {spec.asset_class} · **Benchmark:** {spec.benchmark} · "
+    out.append(f"**Family:** {spec.family} · **Asset class:** {_asset_class(r, spec)} · **Benchmark:** {spec.benchmark} · "
                f"**Default risk profile:** {spec.default_risk_profile}")
     out.append("")
     out.append(f"**In plain English:** {spec.idea}")
@@ -640,7 +645,7 @@ def render(r: StudyResult, ledger: IdeaLedger, register=None, liquidation_ack: s
     out.append(f"- Turnover: {r.turnover:.1f}x average equity a year")
     out.append(f"- Fees paid: {r.full_period.fees_paid:,.0f} on {r.full_period.starting_capital:,.0f} starting capital; "
                f"fee drag {fee_drag:.2%} of average equity a year")
-    out.append(f"- Time in the market: {r.full_period.exposure.gt(0.001).mean():.0%} of bars hold a position")
+    out.append(f"- Time in the market: {r.full_period.exposure.abs().gt(0.001).mean():.0%} of bars hold a position")
     out.append(f"- Stops clamped: {_n(getattr(r.full_period, 'stops_clamped', 0), 'trade')}, held at half the way to "
                "the liquidation price when the level loosened past it or funding moved it nearer")
     out.append("")
