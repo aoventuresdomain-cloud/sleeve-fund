@@ -632,7 +632,8 @@ def render(r: StudyResult, ledger: IdeaLedger, register=None, liquidation_ack: s
                    f"{stress['assumed']:.2%}, the strategy returns {_pct(s1)} (from {_pct(s0)}) and the perpetual buy "
                    f"and hold {_pct(h1)} (from {_pct(h0)}). The assumed rate is light in strong uptrends.")
         out.append("")
-    out.append("## Trading and costs (full research period, default params)")
+    out.append(f"## Trading and costs (full research period, {r.research_start:%d %b %Y} to {r.research_end:%d %b %Y}, "
+               "default params)")  # R-16: the span the table's trips and funding cover
     out.append("")
     out.append("| Closed trades | Win rate | Net P&L | Avg win | Avg loss | Expectancy per trade | Profit factor | Best | Worst |")
     out.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- |")

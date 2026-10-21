@@ -348,7 +348,8 @@ class StudyResult:
 
     @property
     def trade_stats(self) -> dict:
-        return trade_stats(trades(fills_to_rows(self.full_period.fills), self.full_period.shorts))  # R-04: short legs too
+        return trade_stats(trades(fills_to_rows(self.full_period.fills), self.full_period.shorts,
+                                  self.full_period.funding))  # R-04 short legs; R-16 funding
 
     @property
     def turnover(self) -> float:
