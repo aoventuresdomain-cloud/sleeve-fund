@@ -95,6 +95,23 @@ def test_a_short_legs_cost_ladder_benchmark_is_the_oos_benchmark_taken_short(tmp
     assert rung.random_return == pytest.approx(oos.median_random_return)
 
 
+@pytest.mark.parametrize("defn", [LONG, SHORT], ids=["long", "short"])
+def test_the_trading_tables_net_pnl_is_the_funded_equitys_to_the_cent(tmp_path, perp_venue, defn):
+    """R-16: the trading table's net P&L books each trip's funding, as the equity does: the closed trips' P&L is
+    the equity's gain from the start to the bar the last of them closed, to the cent."""
+    from sleeve_fund.research.metrics import fills_to_rows, trades
+
+    r, _, sheet = _study(tmp_path, perp_venue, defn)
+    run = r.full_period
+    assert run.funding, "set-up: the perpetual settles funding"
+    last = trades(fills_to_rows(run.fills), run.shorts)[-1]["closed"]
+    eq = run.equity
+    gain = float(eq[eq.index >= pd.Timestamp(last)].iloc[0] - eq.iloc[0])
+    assert round(r.trade_stats["pnl"], 2) == round(gain, 2)
+    assert _line(sheet, "## Trading and costs") == (f"## Trading and costs (full research period, "
+                                                    f"{r.research_start:%d %b %Y} to {r.research_end:%d %b %Y}, default params)")
+
+
 def test_a_spot_study_keeps_its_asset_class(tmp_path, instrument):
     from sleeve_fund.strategies.trend_filter import SPEC as TREND
 
