@@ -381,3 +381,21 @@ def test_start_refuses_an_r_take_profit_until_its_target_survives_a_restart(tmp_
     assert TARGET_RESTART_REFUSAL.format(n="3") == ("take-profit at 3×R can't run on paper until its target "
                                                     "survives a restart (TP-RESTART)")
     check_target_restart("buy_and_hold", {"market": "spot"})  # no definition, nothing to refuse
+
+
+@pytest.mark.parametrize("precision", [1, 2, 4])
+@pytest.mark.parametrize("side", [1, -1], ids=["long", "short"])
+def test_the_target_level_is_a_prices_value_so_a_bar_at_it_touches_it(side, precision):
+    """Advisor (v4): round() differs from a Price's value by a float hair in about a fifth of cases (60,060.06 x 1.03
+    at 2 decimals: 61,861.86 against 61,861.859999...), so a bar built from Prices exactly at the level missed it. The
+    level is the Price's value, and a bar's extreme at it reaches it, for either side, at every precision."""
+    from nautilus_trader.model import Price
+
+    rng = np.random.default_rng(precision)
+    entries = [60_060.06, 58_858.8, *rng.uniform(1.0, 100_000.0, 200)]
+    for entry in entries:
+        level = target_level(float(entry), side, 0.03, precision)
+        assert level == Price(float(entry) * (1 + side * 0.03), precision).as_double()
+        bar = Price(level, precision).as_double()  # the bar's high (long) or low (short), exactly at the level
+        assert target_reached(side, bar, bar, level)
+    assert round(60_060.06 * 1.03, 2) != Price(60_060.06 * 1.03, 2).as_double()  # the hair this pins
