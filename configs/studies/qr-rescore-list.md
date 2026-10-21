@@ -58,6 +58,11 @@ the decision candles close on them. Minute data for the 15m and 1h rows and the 
 | 14 | qr12_overnight_breakout_long | QR-B8 overnight breakout | 1h |
 | 15 | qr13_level_continuation_long | QR-B9 level continuation | 1h |
 | 16 | qr13_level_continuation_short | QR-B9 level continuation | 1h |
+| 17 | qr20_volume_surge_breakout_long | QR-B11 volume-surge breakout | 4h |
+| 18 | qr21_trend_sma200_long | QR-B12 200-day trend | 1d |
+| 19 | qr01d_trend_donchian20_long | QR-B3 Donchian trend | 1d |
+| 20 | qr22_price_above_sma20_long | QR-B12 price vs average | 1d |
+| 21 | qr23_vma_band_sma50_long | QR-B12 price vs average | 1d |
 
 Run order: 1 to 8 first, because they make the first ranked table the PM wants for tomorrow morning; then 9 to 16.
 
