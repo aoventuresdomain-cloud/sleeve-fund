@@ -17,19 +17,19 @@ LIST = ROOT / "configs" / "studies" / "qr-rescore-list.md"
 WORKFLOW = ROOT / ".github" / "workflows" / "study.yml"
 
 
-def test_the_list_parses_to_its_nineteen_rows_with_their_candles():
+def test_the_list_parses_to_its_twenty_one_rows_with_their_candles():
     rows = rescore.rows_of(LIST.read_text())
-    assert [n for n, _, _ in rows] == list(range(1, 20))
+    assert [n for n, _, _ in rows] == list(range(1, 22))
     assert rows[0] == (1, "qr01_trend_ema_long", 240) and rows[4][2] == 1440 and rows[11][2] == 15
     assert all((rescore.DEFINITIONS / f"{name}.toml").is_file() for _, name, _ in rows)
 
 
-@pytest.mark.parametrize("spec, want", [("", 19), ("1-8", 8), ("9-16", 8), ("3", 1), ("1,4,7", 3)])
+@pytest.mark.parametrize("spec, want", [("", 21), ("1-8", 8), ("9-16", 8), ("3", 1), ("1,4,7", 3)])
 def test_rows_pick(spec, want):
     assert len(rescore.pick(rescore.rows_of(LIST.read_text()), spec)) == want
 
 
-@pytest.mark.parametrize("spec", ["0", "20", "1-21", "a", "1;rm -rf /", "1-"])
+@pytest.mark.parametrize("spec", ["0", "22", "1-23", "a", "1;rm -rf /", "1-"])
 def test_bad_rows_are_refused(spec):
     with pytest.raises(ValueError):
         rescore.pick(rescore.rows_of(LIST.read_text()), spec)
@@ -69,7 +69,7 @@ def test_the_log_prints_counts_and_ran_or_failed_only(capfd, tmp_path):
 def test_a_dry_run_runs_nothing(capfd):
     called = []
     assert rescore.main([str(LIST), "--dry-run"], run=lambda *a, **k: called.append(1), journal=lambda: None) == 0
-    assert called == [] and "dry run: 19 checked, 0 run" in capfd.readouterr().out
+    assert called == [] and "dry run: 21 checked, 0 run" in capfd.readouterr().out
 
 
 @pytest.mark.parametrize("argv", [["--venue", "Binance;x"], ["--pair", "btc/usdt"], ["--rows", "99"]])

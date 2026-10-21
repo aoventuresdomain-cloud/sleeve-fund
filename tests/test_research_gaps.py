@@ -119,6 +119,7 @@ QR_HASHES = {
     # R-27 (HoE TEC, 21 Oct 2026): three new pre-registered definitions, added; no existing hash changed.
     "qr01d_trend_donchian20_long": "1b9b732b0d34ecf6", "qr20_volume_surge_breakout_long": "9038fc9ed7fdbfa9",
     "qr21_trend_sma200_long": "171c64b27d8699d2",
+    "qr22_price_above_sma20_long": "eb41579629a697ab", "qr23_vma_band_sma50_long": "532b63bfc5402bf8",
 }
 
 

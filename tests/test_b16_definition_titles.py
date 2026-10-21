@@ -33,6 +33,8 @@ BEFORE = {
     "qr01d_trend_donchian20_long": ("1b9b732b0d34ecf6", "755f51c7b13eea57"),
     "qr20_volume_surge_breakout_long": ("9038fc9ed7fdbfa9", "55a2204ee8f98c60"),
     "qr21_trend_sma200_long": ("171c64b27d8699d2", "e8c08e48083953b3"),
+    "qr22_price_above_sma20_long": ("eb41579629a697ab", "703feb3d33753b1c"),
+    "qr23_vma_band_sma50_long": ("532b63bfc5402bf8", "ea3b0412d58f1c7f"),
 }
 
 
