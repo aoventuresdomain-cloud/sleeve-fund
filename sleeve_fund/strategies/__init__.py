@@ -38,6 +38,28 @@ def check_perp_sizing(strategy: str, params: dict | None) -> None:
         raise ValueError(f"{strategy.replace('_', ' ').capitalize()} is {PERP_WEIGHT_REFUSAL}")
 
 
+def study_only_uses(params: dict | None) -> list[str]:
+    """What in these settings a study may run but paper and live may not (R-06, R-07), in words; empty when none."""
+    from sleeve_fund.strategies.definitions import STUDY_ONLY_BLOCKS
+
+    params = params or {}
+    blocks = (params.get("definition") or {}).get("blocks") or {}
+    found = sorted({STUDY_ONLY_BLOCKS[b["kind"]] for b in blocks.values()
+                    if isinstance(b, dict) and b.get("kind") in STUDY_ONLY_BLOCKS})
+    if params.get("vol_target_size") is not None:
+        found.append("sizing to a target volatility (vol_target_size)")
+    return found
+
+
+def check_study_only(strategy: str, params: dict | None) -> None:
+    """Refuse, on Start and wherever paper or live would build it, a Strategy using something only studies may run until
+    the PM approves it for paper (R-06 funding rate decile, R-07 volatility-targeted sizing). Backtests and studies never
+    call this."""
+    found = study_only_uses(params)
+    if found:
+        raise ValueError(f"it uses {' and '.join(found)}, which runs in studies only until the PM approves it for paper")
+
+
 STOP_KEYS = ("stop_loss", "stop_atr", "stop_swing_bars")  # the exits that place a stop at the venue on every entry
 STOPLESS_MAX_LEVERAGE = 1.0  # the Independent Quant Advisor's interim minimum (6 Oct) for a perp with no placed stop
 

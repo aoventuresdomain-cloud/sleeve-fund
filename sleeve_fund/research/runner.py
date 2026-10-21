@@ -58,6 +58,8 @@ class BacktestResult:
     reentries_on_exit_candle: int = 0
     # A perpetual's funding payments as {"ts", "amount"} (+ received, - paid), oldest first.
     funding: list = field(default_factory=list)
+    # A rule-builder run's studies-only counts (Rules.rule_counts): funding_no_rate (R-06), vol_skipped (R-07).
+    rule_counts: dict = field(default_factory=dict)
     # A perpetual's settlements as (ts, the venue's rate missing, a position held), and from them N of M held
     # settlements charged the baseline and the longest stretch of held time without the rate (QA P1-O17).
     funding_marks: list = field(default_factory=list)
@@ -140,6 +142,26 @@ def _book_volume(feed: pd.DataFrame, instrument) -> pd.DataFrame:
 
 
 PAPER_REFUSED = "would be refused on paper (stopless above 1x)"
+
+
+FUNDING_BLOCK_NEEDS = ("the funding rate decile block reads the venue's stored settled funding rates, so it needs a "
+                       "perpetual on a venue that publishes them")
+
+
+def funding_decile_source(strategy, instrument) -> tuple:
+    """R-06: the stored settled rates a funding rate decile reads, as (times ns, rates, interval ns), sorted; a rate
+    the store holds but can't be believed (funding.believable) is left out, as the charge leaves it out."""
+    terms = strategy._cfg.perp
+    if terms is None or terms.funding_venue is None:
+        raise ValueError(FUNDING_BLOCK_NEEDS)
+    pair = pair_of(instrument)
+    cap = funding.cap_of(terms.funding_venue, pair)
+    s = funding.rates(terms.funding_venue, pair)
+    interval = int(pd.Timedelta(markets.funding_interval(terms.funding_hours)).value)
+    if not len(s):  # none stored (funding.rates gives an empty series): no value on any candle, never an assumed one
+        return np.array([], dtype=np.int64), np.array([], dtype=float), interval
+    s = s[[funding.believable(r, cap) for r in s.to_numpy()]]
+    return s.index.as_unit("ns").asi8.copy(), s.to_numpy(dtype=float).copy(), interval
 
 
 def paper_refusal(strategy: str, params: dict | None, risk_profile: str | None) -> str | None:
@@ -385,6 +407,10 @@ def add_leg(engine: BacktestEngine, plan: RunPlan, instrument: CurrencyPair | No
         **params,
     )
     strategy = plan.strategy_cls(cfg).attach_runtime(runtime)
+    if getattr(strategy, "funding_blocks", None) and strategy.funding_blocks():
+        source = funding_decile_source(strategy, instrument)
+        for block in strategy.funding_blocks():
+            block.source = source
     if plan.minutes_in:
         strategy.minute_source, strategy.range_source = minutes_from(exec_prices), ranges_from(prices)
     for node in getattr(getattr(strategy, "rules", None), "touches", ()):
@@ -521,6 +547,7 @@ def leg_result(engine: BacktestEngine, leg: Leg) -> BacktestResult:
         handler_error_count=strategy.handler_error_count,
         labels=fills_label(leg.exec_minutes, fee_model.intrabar) if leg.coarse else [],
         first_touch=touched,
+        rule_counts=strategy.rule_counts() if hasattr(strategy, "rule_counts") else {},
         reentries_on_exit_candle=reentries_on_exit_candle(fills, strategy.decisions, plan.bar_minutes),
         open_risk_binds=strategy.open_risk_binds,
         stops_clamped=strategy.stops_clamped,

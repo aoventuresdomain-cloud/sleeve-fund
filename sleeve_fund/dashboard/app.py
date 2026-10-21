@@ -74,6 +74,7 @@ from sleeve_fund.strategies import (
     STOPLESS_MAX_LEVERAGE,
     check_perp_sizing,
     check_perp_stop,
+    check_study_only,
     places_stop,
 )
 from sleeve_fund.strategies.base import exit_warmup, maker_orders_enabled
@@ -920,6 +921,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                     s = st().sleeve(name)
                     check_perp_sizing(s.strategy, s.params)
                     check_perp_stop(s.strategy, s.params, s.risk_profile)
+                    check_study_only(s.strategy, s.params)  # R-06/R-07: studies only
                     try:
                         defaults = _defaults(s.strategy)
                     except ModuleNotFoundError as exc:
@@ -3164,6 +3166,7 @@ def _check_strategy_params(cfg: SleeveConfig, half_spread: float = 0.0) -> None:
 
     check_perp_sizing(cfg.strategy, cfg.params)
     check_perp_stop(cfg.strategy, cfg.params, cfg.risk_profile)
+    check_study_only(cfg.strategy, cfg.params)  # R-06/R-07: studies only until the PM approves
     _, config_cls = REGISTRY[cfg.strategy]
     params = dict(cfg.params)
     params.pop("max_notional", None)

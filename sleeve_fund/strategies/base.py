@@ -2069,11 +2069,12 @@ class LongFlatStrategy(Strategy):
     @staticmethod
     def _refused_to_trade(sleeve) -> str | None:
         """Why paper refuses to start this strategy's stored settings, or None (Supervisor._refused's checks)."""
-        from sleeve_fund.strategies import check_perp_sizing, check_perp_stop
+        from sleeve_fund.strategies import check_perp_sizing, check_perp_stop, check_study_only
 
         try:
             check_perp_sizing(sleeve.strategy, sleeve.params)
             check_perp_stop(sleeve.strategy, sleeve.params, sleeve.risk_profile)
+            check_study_only(sleeve.strategy, sleeve.params)
         except ValueError as exc:
             return str(exc)
         return None
@@ -2755,6 +2756,10 @@ class LongFlatStrategy(Strategy):
             limits["the step's size"] = Decimal(str(step)) * bar.close.as_decimal()
         if (strength_words := LongFlatStrategy._strength_limit(self, limits, values, base)) is False:
             return
+        today = min(limits.values())  # the size before the extra limit: it can only shrink it
+        if (vol_words := self._extra_size_limit(limits, base)) is False:
+            return
+        vol_factor = round(float(min(limits.values()) / today), 6) if vol_words and today > 0 else 1.0
         ramp_gate = LongFlatStrategy._ramp_limit(  # A9, off by default: only ever shrinks an entry or add
             self, limits, side, lambda: self._signed_qty() if held_qty else Decimal(0), bar.close.as_decimal())
         size_by = min(limits, key=limits.get)
@@ -2776,6 +2781,9 @@ class LongFlatStrategy(Strategy):
             signal["strength"] = strength_words
             if self._strength_f is not None:  # G5 research side: the size factor, the same field in every engine
                 signal["size_factor"] = self._strength_f
+        if vol_words:
+            signal["vol_target"] = vol_words
+            signal["vol_factor"] = vol_factor  # R-07: its share of today's size, which random entry sizes it by
         if ramp_gate is not None and size_by == ramp.LIMIT:  # with the size it would have had, for its track
             signal["ramp"] = ramp_gate.words
             signal[ramp.UNRAMPED] = round(float(min(v for k, v in limits.items() if k != ramp.LIMIT)), 2)
@@ -3813,6 +3821,10 @@ class LongFlatStrategy(Strategy):
             limits["share of the bar's volume"] = cap
         if (strength_words := LongFlatStrategy._strength_limit(self, limits, values or {}, base)) is False:
             return
+        today = min(limits.values())  # the size before the extra limit: it can only shrink it
+        if (vol_words := self._extra_size_limit(limits, base)) is False:
+            return
+        vol_factor = round(float(min(limits.values()) / today), 6) if vol_words and today > 0 else 1.0
         ramp_gate = LongFlatStrategy._ramp_limit(self, limits, 1, self._signed_qty, bar.close.as_decimal())  # A9
         size_by = min(limits, key=limits.get)
         budget = limits[size_by]
@@ -3835,6 +3847,9 @@ class LongFlatStrategy(Strategy):
             signal["strength"] = strength_words
             if self._strength_f is not None:  # G5 research side: the size factor, the same field in every engine
                 signal["size_factor"] = self._strength_f
+        if vol_words:
+            signal["vol_target"] = vol_words
+            signal["vol_factor"] = vol_factor  # R-07: its share of today's size, which random entry sizes it by
         if ramp_gate is not None and size_by == ramp.LIMIT:  # with the size it would have had, for its track
             signal["ramp"] = ramp_gate.words
             signal[ramp.UNRAMPED] = round(float(min(v for k, v in limits.items() if k != ramp.LIMIT)), 2)
@@ -6166,6 +6181,11 @@ class LongFlatStrategy(Strategy):
         """B-34 rows 2 and 3: the equity a target weight is a share of. Inside the fund (_fund_held) the fund's marked
         equity (None when stale: nothing is traded off an old figure); outside it the Strategy's own, as before."""
         return self._fund_marked_equity() if LongFlatStrategy._fund_held(self) else own
+
+    def _extra_size_limit(self, limits: dict, base: float) -> str | None | bool:
+        """A Model's own extra sizing limit, added to `limits` (smallest wins): its words, None when it has none, or
+        False when the entry is skipped (journaled by the Model). The rule builder's vol_target_size (R-07) is one."""
+        return None
 
     def _strength_limit(self, limits: dict, values: dict, base: float) -> str | None | bool:
         """G5: with the Model's signal_strength set, the signal strength limit: f(strength) x its configured size, the

@@ -72,11 +72,14 @@ def request(name: str, minutes: int, venue: str, pair: str, pinned=None):
     from sleeve_fund.research.run import StudyRequest
     from sleeve_fund.strategies.definitions import load_definition_file, to_params
 
-    path = DEFINITIONS / f"{name}.toml"
+    from sleeve_fund.research.variants import PREREGISTERED, definition_path
+
+    variant = PREREGISTERED.get(name.upper())  # a pre-registered variant's row names it: v1 to v4
+    path = definition_path(variant["definition"]) if variant else DEFINITIONS / f"{name}.toml"
     if not path.is_file():
-        raise ValueError(f"no definition file {name}.toml")
+        raise ValueError(f"no definition file {path.name}")
     defn = load_definition_file(path)
-    params = {**to_params(defn, venue.upper()), "market": "perp"}
+    params = {**to_params(defn, venue.upper()), "market": "perp", **(variant["params"] if variant else {})}
     if "short" in defn:
         params["allow_short"] = True
     return StudyRequest(strategy="rules", pair=pair, venue=venue, minutes=minutes, risk_profile=None,

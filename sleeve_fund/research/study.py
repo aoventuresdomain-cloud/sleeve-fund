@@ -14,7 +14,7 @@ import itertools
 import logging
 import math
 from decimal import Decimal
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import pandas as pd
 from nautilus_trader.model import CurrencyPair
@@ -23,7 +23,7 @@ from sleeve_fund import funding
 from sleeve_fund.instruments import FeeSchedule, pair_of, pct
 from sleeve_fund import markets, risk
 from sleeve_fund.markets import PERP
-from sleeve_fund.research import regime_split
+from sleeve_fund.research import equal_exposure, regime_split
 from sleeve_fund.research.ledger import GAP_STAGE, IdeaLedger, opened_words
 from sleeve_fund.research.random_entry import RandomEntryResult, RandomSideResult, Trade, random_entry, random_side
 from sleeve_fund.research.metrics import (
@@ -204,6 +204,8 @@ class StudyResult:
     # The falsifier (Advisor 18:16): the 1-minute run's end equity less the coarse run's, over starting capital, for the
     # research period at the default settings; None when the study's own runs were on 1-minute bars or none were stored.
     bars_only_gap: float | None = None
+    # R-07: a volatility-sized variant against its parent at the same average gross exposure (equal_exposure)
+    equal_exposure: equal_exposure.EqualExposure | None = None
     # Runs of this idea whose trials-register count failed (QA P1-T8): they count in N, but their Sharpes are
     # missing from the spread the bar is set by, so G1 can't judge until they are re-counted (Advisor, 6 Oct 2026).
     failed_counts: int = 0
@@ -1033,6 +1035,12 @@ def run_study(
         result.random_entry_uncharged, result.random_side_uncharged = _benchmarks(
             research, folds, test_bars, float(run_fees.taker), series if series is not None else spread_used,
             full_default.shorts, leverage, market.get("market"), charged=False)
+    if (default_params or {}).get("vol_target_size") is not None:  # R-07: against the parent at equal exposure
+        result.equal_exposure = _equal_exposure(
+            result, research, folds, windows, oos_parts, bt, scored, bar,
+            lambda fs: _benchmarks(research, fs, test_bars, float(run_fees.taker),
+                                   series if series is not None else spread_used, full_default.shorts, leverage,
+                                   market.get("market"))[0])
     for rung in ladder:  # the benchmark at each rung's own cost, as the rung's runs pay it (RE-COST)
         at_rung, _ = _benchmarks(research, folds, test_bars, rung.fee + slip,
                                  series if series is not None else spread_used, False, leverage, market.get("market"))
@@ -1087,6 +1095,24 @@ def run_study(
             "than a minute, where what traded first inside a bar is unknown, a stop the bar traded through fills at "
             "the bar's worst price. Paper watches both on every trade."
         )
+    counts = full_default.rule_counts or {}
+    if "funding_no_rate" in counts:  # R-06
+        result.notes.append(
+            f"Funding rate decile: {counts['funding_no_rate']:,} of {len(research):,} decision candles had no usable "
+            "stored funding rate (the latest due settlement missing, or too few in its window), so no entry gated on "
+            "it could open on them: a missing rate is never assumed. Apart from those, "
+            f"{counts.get('funding_top_decile', 0):,} read the top decile (90% or more of the trailing window's rates "
+            "strictly below the latest). Only rates settled strictly before each candle's close are read.")
+    if "vol_skipped" in counts:  # R-07
+        vol = default_params.get("vol_target_size") or {}
+        result.notes.append(
+            f"Entries are sized to {vol.get('annual', 0):.0%} a year of volatility, read over "
+            f"{vol.get('lookback_days', 0)} days of daily closes at each entry: never above the size or caps it would "
+            f"otherwise have, set at entry and not rebalanced. {counts['vol_skipped']:,} entries were skipped for "
+            "want of the daily closes to read it.")
+    if spec.name == "rules" and len(full_default.exposure):  # R-07: what V3/V4 are judged against the parent at
+        result.notes.append(f"Average gross exposure over the research period: "
+                            f"{float(full_default.exposure.abs().mean()):.1%} of equity.")
     result.resting_exits = resting[0]
     if result.resting_exits and oos_minutes is not None and 1 < oos_minutes <= ONE_WAY_MINUTES and not result.not_judged:
         _one_way(result, ledger, fold_runs, bt, minute_loader, bar)
@@ -1462,7 +1488,8 @@ def _trip_charges(trips: list[dict], test_start, absorbed: list[dict]) -> list[t
 
 def _trip_sizes(trips: list[dict], test_start, fills: pd.DataFrame, decisions: dict) -> list[tuple]:
     """G5: each counted trip's size factor f, from the signal of the order whose fill opened it, as (opened, f); a
-    trip whose entry carried none (a flat version) is left out, so it sizes at 1."""
+    trip whose entry carried none (a flat version) is left out, so it sizes at 1. R-07: a volatility-sized entry's
+    share of the size it would otherwise have had is its f the same way (with signal strength too, the product)."""
     if fills is None or fills.empty:
         return []
     start = _utc(test_start)
@@ -1473,10 +1500,51 @@ def _trip_sizes(trips: list[dict], test_start, fills: pd.DataFrame, decisions: d
     for t in trips:
         if t["opened"] is None or t["closed"] is None or _utc(t["opened"]) < start:
             continue
-        f = ((decisions.get(at.get(_utc(t["opened"])), {}) or {}).get("signal") or {}).get("size_factor")
-        if f is not None:
-            out.append((_utc(t["opened"]), float(f)))
+        sig = (decisions.get(at.get(_utc(t["opened"])), {}) or {}).get("signal") or {}
+        f, v = sig.get("size_factor"), sig.get("vol_factor")
+        if f is not None or v is not None:
+            out.append((_utc(t["opened"]), float(1.0 if f is None else f) * float(1.0 if v is None else v)))
     return out
+
+
+def _test_exposure(run: BacktestResult | None, test_idx) -> pd.Series:
+    """|exposure| at each of a test window's bars, 0 where flat or never run (a window that chose nothing)."""
+    if run is None or run.exposure is None or run.exposure.empty:
+        return pd.Series(0.0, index=test_idx)
+    return run.exposure.abs().reindex(test_idx).fillna(0.0)
+
+
+def _equal_exposure(result: StudyResult, research: pd.DataFrame, folds: list[Fold], windows: list, oos_parts: list,
+                    bt, scored, bar: pd.Timedelta, benchmark) -> equal_exposure.EqualExposure:
+    """R-07: the parent (the variant's settings without vol_target_size) re-run on every window that chose a setting,
+    as the variant ran it, never logged as a try; a window that chose nothing sat flat for both. Then k and the
+    comparison (equal_exposure), with the parent's random entry at every trip sized k (so costed at k x notional).
+    benchmark: the study's random entry for a list of folds."""
+    idx = research.index
+    variant_runs = {k: run for k, _, run in windows}
+    parent_folds, parent_parts, parent_runs = list(folds), list(oos_parts), {}
+    for k, window, _ in windows:
+        params = {p: v for p, v in window[3].items() if p != "vol_target_size"}
+        test_idx = window[2]
+        run = bt(result.spec.name, window[1], params, oos=True, trade_from=test_idx[0] - bar, count_from=test_idx[0])
+        parent_folds[k], parent_parts[k] = scored(k, *window[:3], params, *window[4:], run)[:2]
+        parent_runs[k] = run
+    bars = [idx[(idx > f.train_end) & (idx <= f.test_end)] for f in folds]
+    v_exp = pd.concat([_test_exposure(variant_runs.get(k), b) for k, b in enumerate(bars)])
+    p_exp = pd.concat([_test_exposure(parent_runs.get(k), b) for k, b in enumerate(bars)])
+    k, _ = equal_exposure.exposure_ratio(v_exp, p_exp)
+    scale = k if math.isfinite(k) else 0.0
+    scaled_folds = []
+    for f in parent_folds:
+        sizes = dict(f.trip_sizes)
+        scaled_folds.append(replace(f, trip_sizes=[(o, scale * sizes.get(o, 1.0)) for o, _, _ in f.trips]))
+    scaled_pct = benchmark(scaled_folds).return_percentile if scale > 0 else math.nan
+    from sleeve_fund.research.random_entry import BAR
+
+    own = (result.random_entry.trades > 0 and result.random_entry.return_percentile >= BAR
+           and bool((result.double_fees or {}).get("passed")))  # (iii): its own edge, before any comparison
+    return equal_exposure.compare(v_exp, p_exp, result.oos_returns, pd.concat(parent_parts),
+                                  result.random_entry.return_percentile, scaled_pct, own_edge=own)
 
 
 def _gross_exposure(exposure: pd.Series, first, last) -> float:

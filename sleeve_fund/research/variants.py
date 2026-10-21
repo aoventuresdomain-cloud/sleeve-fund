@@ -1,0 +1,29 @@
+"""The pre-registered trend-long variants (research/quant-researcher/trend-variants-preregistration.md; the PM approved
+the round on 21 Oct): each one's definition file and the settings it runs with, fixed before any run. A study of a
+variant runs exactly these; neighbouring settings are robustness only, never picked from. Studies only (R-06, R-07):
+paper and live refuse them on Start until the PM approves (strategies.check_study_only)."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+DEFINITIONS = Path(__file__).resolve().parents[2] / "configs" / "definitions"
+# The variants' own definition files sit apart from the Strategy tab's (configs/definitions/*.toml): studies only.
+VARIANTS = DEFINITIONS / "variants"
+
+VOL_TARGET = {"annual": 0.40, "lookback_days": 30}  # V3, V4: 40% a year, 30 days of daily returns
+
+PREREGISTERED = {
+    "V1": {"parent": "qr01b_trend_multispeed_long", "definition": "qr01b_trend_multispeed_long_v1_funding",
+           "params": {}},
+    "V2": {"parent": "qr01_trend_ema_long", "definition": "qr01_trend_ema_long_v2_funding", "params": {}},
+    "V3": {"parent": "qr01b_trend_multispeed_long", "definition": "qr01b_trend_multispeed_long",
+           "params": {"vol_target_size": VOL_TARGET}},
+    "V4": {"parent": "qr01_trend_ema_long", "definition": "qr01_trend_ema_long", "params": {"vol_target_size": VOL_TARGET}},
+}
+
+
+def definition_path(name: str) -> Path:
+    """A variant's definition file, or its parent's (the Strategy tab's)."""
+    own = VARIANTS / f"{name}.toml"
+    return own if own.is_file() else DEFINITIONS / f"{name}.toml"

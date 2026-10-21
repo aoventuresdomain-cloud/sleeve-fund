@@ -725,6 +725,9 @@ def render(r: StudyResult, ledger: IdeaLedger, register=None, liquidation_ack: s
     from sleeve_fund.research.strength_report import section as strength_section
 
     out += strength_section(r, flat)
+    from sleeve_fund.research.equal_exposure import section as equal_exposure_section
+
+    out += equal_exposure_section(getattr(r, "equal_exposure", None))
     out.append("## Caveats")
     out.append("")
     out.append("- Signal orders go to the venue as the bar that triggered them closes: at market, paying the taker fee "
