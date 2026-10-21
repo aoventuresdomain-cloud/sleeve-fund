@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import copy
 import os
+import re
 
 os.environ.setdefault("BACKTEST_ISOLATE", "0")
 
@@ -511,3 +512,66 @@ def test_the_paper_tick_the_backtest_and_the_replay_take_a_definitions_target_on
     hit = replay_missed([(minute.value, row["open"], row["high"], row["low"])], 1, {}, {}, level,
                         float(target_fill_px(level, True, half)))
     assert hit is not None and hit[0] == "take_profit" and hit[2] == level
+
+
+# --- CR M1 on 3081ab76: the paper tick, a fill with no stop level, a short-only {r}, the snap ------------------------
+
+def test_the_paper_tick_takes_an_r_target_a_float_hair_above_its_tick_at_that_tick_and_not_before(tmp_path):
+    """CR M1 (1): paper's tick path judges the target on the tick (target_on_tick), not the gain against the exact
+    share. From paper's 60,006 fill, a 1,200.4 stop puts 3R at 63,625.200000000004, a float hair above the 63,625.2
+    tick: a trade at 63,625.2 takes it (the share would miss it by the hair); a trade at 63,625.1, a tick before it,
+    does not."""
+    import test_tick_bar_parity as tbp
+
+    qd = _qd()
+    params = to_params(qd._defn({"r": 3}, stop=1_200.4))
+
+    def paper(touch, name):
+        prices = np.full(40 * 60, 60_000.0)
+        prices[25 * 60 + 30] = touch
+        path = tmp_path / f"{name}.jsonl.gz"
+        tbp._record(path, prices, "rules", params, "aggressive")
+        orders, _ = tbp.replay(path, with_fills=True)
+        return orders
+
+    (entry,) = [o for o in paper(60_000.0, "flat") if o["intent"] == "entry"]
+    exact = entry["avg_px"] + 3 * abs(entry["avg_px"] - (60_000.0 - 1_200.4))
+    assert 0 < exact - 63_625.2 < 1e-7 and target_on_tick(exact, 1, 1) == 63_625.2, exact  # the hair this cell needs
+    assert 63_625.2 / entry["avg_px"] - 1 < exact / entry["avg_px"] - 1  # where the share would miss it
+    assert [o for o in paper(63_625.1, "before") if o["intent"] == "take_profit"] == []
+    (hit,) = [o for o in paper(63_625.2, "at") if o["intent"] == "take_profit"]
+    assert hit["signal"]["target_px"] == pytest.approx(63_625.2, abs=1e-9)
+
+
+def test_an_r_fill_with_no_stop_level_notes_it_and_sets_no_target():
+    """CR M1 (2): R is measured from the stop level known at the fill; with none (no plan and no levels yet), the
+    fill notes target_no_stop_level and sets no target, never R from a share of the price nor an error in the
+    fill handler."""
+    from types import SimpleNamespace
+
+    from sleeve_fund.strategies.rules import Rules
+
+    notes = []
+    s = SimpleNamespace(_take_profit=lambda side: ("r", 3.0, "3R"), _entry_px=60_000.0, _entry_side=1, _r_stop=None,
+                        _levels={}, _tp_frac=0.05, _tp_level=63_000.0, _note=lambda kind, words: notes.append(kind))
+    Rules._fill_target(s)
+    assert notes == ["target_no_stop_level"] and s._tp_level is None and s._tp_frac is None
+
+
+def test_start_refuses_a_short_only_r_take_profit_too():
+    """CR M1 (3): TP-RESTART's refusal reads both sides; a definition whose only {r} target is on its short side
+    is refused as a long one is."""
+    from sleeve_fund.strategies import TARGET_RESTART_REFUSAL, check_target_restart
+
+    defn = copy.deepcopy(BASE)
+    defn["exits"] = {"short": {"stop": BASE["exits"]["stop"], "take_profit": {"r": 2}}}
+    with pytest.raises(ValueError, match=re.escape(TARGET_RESTART_REFUSAL.format(n="2"))):
+        check_target_restart("rules", {"definition": defn})
+
+
+def test_a_level_a_float_hair_past_a_tick_snaps_to_it_rather_than_a_tick_further():
+    """CR M1 (4): within 1e-6 of a tick the level is on it (as margin.to_tick): float noise above a long's tick, or
+    below a short's, never moves the target a whole tick past the level."""
+    assert target_on_tick(100.00000000001, 1, 2) == 100.0
+    assert target_on_tick(99.99999999999, -1, 2) == 100.0
+    assert target_on_tick(63_625.200000000004, 1, 1) == 63_625.2
