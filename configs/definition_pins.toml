@@ -1,0 +1,89 @@
+# R-29 (HoE 21 Oct 2026): every QR definition's pinned hashes, read by tests/test_b16_definition_titles.py and
+# tests/test_research_gaps.py. A definition_hash or idea_hash keys the trials register and the idea counter, so a
+# change to a pinned file's content fails both. A new definition adds its own table here, in the same PR: data under
+# configs, so a rule PR stays a research-config-only change (deploy/research_config_only.sh) and needs no deploy.
+# Not under configs/definitions, where every .toml is read as a definition.
+
+[qr01_trend_ema_long]
+definition_hash = "db887a6fa3a01f1b"
+idea_hash = "4a7eb5ddd831d115"
+
+[qr01_trend_ema_short]
+definition_hash = "8ff28a74df7b0372"
+idea_hash = "ae95f6b39c909bfd"
+
+[qr01b_trend_multispeed_long]
+definition_hash = "e122ddf1851edf73"
+idea_hash = "de5a829d3c0285d2"
+
+[qr01b_trend_multispeed_short]
+definition_hash = "ebeb628bca57ab35"
+idea_hash = "130dd41dd09d7583"
+
+[qr01c_trend_donchian_long]
+definition_hash = "a64268b388237a66"
+idea_hash = "755f51c7b13eea57"
+
+[qr01c_trend_donchian_short]
+definition_hash = "170c176d9440913e"
+idea_hash = "c467a46247a2def8"
+
+[qr02_dip_long]
+definition_hash = "ce126dc7f0c4275c"
+idea_hash = "0e13cf32e1775235"
+
+[qr02_dip_short]
+definition_hash = "d6a770a1cc522b77"
+idea_hash = "11201be8f25dd86e"
+
+[qr03_squeeze_long]
+definition_hash = "95545de0d400e19f"
+idea_hash = "7c296e19aa018b1c"
+
+[qr03_squeeze_short]
+definition_hash = "8bb0e50ac6fd3c0f"
+idea_hash = "da6a2f9869be5fdd"
+
+[qr10_capitulation_long]
+definition_hash = "62a1ee8da26544c1"
+idea_hash = "6115b1bf66edcbc1"
+
+[qr11_exhaustion_long]
+definition_hash = "8ad588bcd437b26a"
+idea_hash = "32783815f699c062"
+
+[qr11_exhaustion_short]
+definition_hash = "daa1bea4ae612937"
+idea_hash = "d7f2ac6ecd8cd817"
+
+[qr12_overnight_breakout_long]
+definition_hash = "aa3a666c41d9381c"
+idea_hash = "4a60499278cd6443"
+
+[qr13_level_continuation_long]
+definition_hash = "18e1ac88db4b05b8"
+idea_hash = "f1f453cf366a222e"
+
+[qr13_level_continuation_short]
+definition_hash = "8ee488792d38fdd4"
+idea_hash = "cd26d663530515cb"
+
+[qr01d_trend_donchian20_long]
+definition_hash = "1b9b732b0d34ecf6"
+idea_hash = "755f51c7b13eea57"
+
+[qr20_volume_surge_breakout_long]
+definition_hash = "9038fc9ed7fdbfa9"
+idea_hash = "55a2204ee8f98c60"
+
+[qr21_trend_sma200_long]
+definition_hash = "171c64b27d8699d2"
+idea_hash = "e8c08e48083953b3"
+
+[qr22_price_above_sma20_long]
+definition_hash = "eb41579629a697ab"
+idea_hash = "703feb3d33753b1c"
+
+[qr23_vma_band_sma50_long]
+definition_hash = "532b63bfc5402bf8"
+idea_hash = "ea3b0412d58f1c7f"

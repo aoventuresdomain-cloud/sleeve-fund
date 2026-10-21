@@ -15,6 +15,10 @@ the count is kept by hand, and every such sheet says "Tries counted by hand unti
 3. **The family's tries so far, written in the PR.** Every file in a family counts, new files too (a qr01e is a try
    of qr01's family, not a fresh idea), against the family's budget of 20.
 
+The PR touches only `configs/definitions/<name>.toml` (or `variants/<name>.toml`), its pinned hashes in
+`configs/definition_pins.toml`, and a study list in `configs/studies/`. Anything else, tests included, makes it a code
+change and a full deploy.
+
 No new family until R-25 lands, unless the pre-registration file listed it before the merge. The HoE refuses any
 definitions PR without all three.
 
