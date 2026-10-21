@@ -1044,7 +1044,7 @@ def run_study(
     for rung in ladder:  # the benchmark at each rung's own cost, as the rung's runs pay it (RE-COST)
         at_rung, _ = _benchmarks(research, folds, test_bars, rung.fee + slip,
                                  series if series is not None else spread_used, full_default.shorts, leverage,
-                                 market.get("market"))
+                                 market.get("market"), side=False)  # the rung reads random entry only (CR F1)
         if at_rung.trades:
             rung.oos_timing_return, rung.random_return = at_rung.strategy_return, at_rung.median_random_return
     if hold_market == markets.PERP and not market:
@@ -1514,7 +1514,7 @@ def _in_market_bars(exposure: pd.Series, first, last) -> int:
 
 
 def _benchmarks(prices: pd.DataFrame, folds: list[Fold], test_bars: int, taker: float, spread, shorts: bool,
-                leverage: float | None = None, market: str | None = None, charged: bool = True):
+                leverage: float | None = None, market: str | None = None, charged: bool = True, side: bool = True):
     """The random-entry benchmark, and the random-side test when the strategy can go short, on the folds'
     counted trips. Each trip is placed on the bars it was opened and closed in, and both sides of the comparison
     are priced on those bars' closes, so the benchmark compares timing, not fills. spread: a half spread, or a
@@ -1522,7 +1522,8 @@ def _benchmarks(prices: pd.DataFrame, folds: list[Fold], test_bars: int, taker: 
     alike (SPREAD-PIT). leverage: the risk profile's cap, for a fold that traded the perpetual (its chosen market,
     else `market`): its trips and their draws are liquidated as the engine books one, losing the margin and fees,
     never the move past it (Independent Quant Advisor 7 Oct 00:19 (4)); and, charged, a liquidated trip of the
-    strategy's pays the gap the venue absorbed past it, its draws never (ABSORB-GAP, Advisor ~02:55 UK, option A)."""
+    strategy's pays the gap the venue absorbed past it, its draws never (ABSORB-GAP, Advisor ~02:55 UK, option A).
+    side: False skips the random-side test for a caller that reads random entry only (the cost ladder's rungs)."""
     index = prices.index.tz_localize("UTC") if prices.index.tz is None else prices.index
     cost_per_side = taker + (spread.at_many(index.as_unit("ns").asi8) if isinstance(spread, SpreadSeries) else spread)
 
@@ -1550,8 +1551,7 @@ def _benchmarks(prices: pd.DataFrame, folds: list[Fold], test_bars: int, taker: 
     bars = sum(f.window_bars for f in folds)
     in_market = sum(f.in_market_bars for f in folds) / bars if bars else None
     entry = random_entry(closes, placed, windows, cost_per_side, in_market=in_market)
-    side = random_side(closes, placed, windows, cost_per_side) if shorts else None
-    return entry, side
+    return entry, random_side(closes, placed, windows, cost_per_side) if shorts and side else None
 
 
 HOLD_COVERAGE_FLOOR = 0.5  # the share of out-of-sample days a perp hold must cover to judge (Advisor, 7 Oct 2026)
