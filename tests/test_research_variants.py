@@ -18,6 +18,7 @@ from sleeve_fund.strategies.definitions import (DAY_NS, FUNDING_COVERAGE, Fundin
                                                 funding_decile_of, to_params)
 from sleeve_fund.strategies.rules import VOL_SIZE_LIMIT, realised_vol
 from sleeve_fund.venues import venue
+from test_dashboard import client  # noqa: F401 - a fixture
 
 H = 3_600_000_000_000
 EIGHT = 8 * H
@@ -349,6 +350,70 @@ def test_the_start_check_names_a_strategy_using_either(tmp_path):
                         starting_balance=1_000, params={**to_params(TREND), "vol_target_size": VOL_TARGET})
     [(status, words)] = section(store).lines
     assert status == FAIL and words.startswith("v3: uses sizing to a target volatility")
+
+
+# CR M1 (11:48 UK): every place paper or live would build one refuses it, each pinned.
+def _vol_sleeve(name="v3"):
+    from sleeve_fund.paper.config import SleeveConfig
+
+    return SleeveConfig(name=name, strategy="rules", instrument="BTC/USD", bar_spec="1-HOUR-LAST-INTERNAL",
+                        starting_balance=1_000, params={**to_params(TREND), "vol_target_size": VOL_TARGET})
+
+
+def test_a_holder_with_study_only_settings_runs_for_its_exits_only_and_says_why():
+    """base: a Strategy the supervisor let through because it holds a position (node.py) is put on exits only by the
+    model itself (_refused_to_trade), never trades in full."""
+    from types import SimpleNamespace
+
+    from sleeve_fund.strategies.base import LongFlatStrategy
+
+    held = SimpleNamespace(strategy="rules", params={**to_params(TREND), "vol_target_size": VOL_TARGET},
+                           risk_profile="balanced")
+    assert "sizing to a target volatility" in LongFlatStrategy._refused_to_trade(held)
+    assert "funding rate decile" in LongFlatStrategy._refused_to_trade(
+        SimpleNamespace(strategy="rules", params=to_params(GATED), risk_profile="balanced"))
+    assert LongFlatStrategy._refused_to_trade(
+        SimpleNamespace(strategy="rules", params=to_params(TREND), risk_profile="balanced")) is None
+
+
+def test_the_whole_start_check_fails_on_a_study_only_strategy_and_names_it(tmp_path):
+    from sleeve_fund import start_check
+    from sleeve_fund.store import Store
+
+    url = f"sqlite:///{tmp_path}/j.db"
+    store = Store(url)
+    store.create_sleeve(name="v3", strategy="rules", instrument="BTC/USD", bar_spec="1-HOUR-LAST-INTERNAL",
+                        starting_balance=1_000, params={**to_params(TREND), "vol_target_size": VOL_TARGET})
+    store.engine.dispose()
+    _, page = start_check.run(url, environ={})
+    assert "Studies-only settings: FAIL" in page and "Start check: FAIL" in page
+    assert "v3: uses sizing to a target volatility" in page and "its Start is refused" in page
+
+
+def test_the_dashboards_start_and_its_form_refuse_one_in_words(client):  # noqa: F811
+    from test_dashboard import AUTH, SAME
+
+    from sleeve_fund.dashboard.app import _check_strategy_params
+
+    c, store = client
+    store.create_sleeve(name="v3", strategy="rules", instrument="BTC/USD", bar_spec="1-HOUR-LAST-INTERNAL",
+                        starting_balance=1_000, params={**to_params(TREND), "vol_target_size": VOL_TARGET},
+                        desired_state="stopped")
+    r = c.post("/sleeves/v3/command", data={"command": "start", "reason": "try it"}, auth=AUTH, headers=SAME,
+               follow_redirects=False)
+    assert "command_error" in r.headers["location"] and "studies+only" in r.headers["location"], r.headers["location"]
+    assert store.sleeve("v3").desired_state == "stopped"
+    with pytest.raises(ValueError, match="runs in studies only until the PM approves it for paper"):
+        _check_strategy_params(_vol_sleeve())  # create, clone and a settings edit all build through it
+
+
+def test_a_file_config_node_refuses_one_before_it_connects(monkeypatch):
+    from sleeve_fund.paper import node
+
+    monkeypatch.setattr(node, "load_sleeve", lambda path: _vol_sleeve())
+    monkeypatch.setattr(node, "build_node", lambda *a, **k: pytest.fail("built a node for a study-only Strategy"))
+    with pytest.raises(ValueError, match="sizing to a target volatility"):
+        node.main(["configs/x.toml"])
 
 
 # ---- the pre-registered variants run exactly their registered settings ------------------------------------------------
