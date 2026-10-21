@@ -1096,9 +1096,11 @@ def run_study(
     # B-35 (a): lowered by the Strategy's own leverage cap (max_leverage), as the engine's margin and liquidation are
     leverage = (risk.capped_leverage(risk_profile_of(risk_profile), default_params)
                 if risk_profile is not None else None)
+    # The regime table's hold column is "price only, no fees": the closes themselves, never the funded hold's equity,
+    # which a funding drain can take below zero (REGIME-BH, 21 Oct).
     result.by_regime = regime_split.split(
         trades(fills_to_rows(full_default.fills), full_default.shorts, full_default.funding),
-        research, bench.equity, full_default.equity)
+        research, research["close"].astype(float), full_default.equity)
     result.random_entry, result.random_side = _benchmarks(
         research, folds, test_bars, float(run_fees.taker), series if series is not None else spread_used,
         full_default.shorts, leverage, market.get("market"))
