@@ -1,0 +1,38 @@
+# QR new family B11 (21 Oct 2026, Quant Researcher): volume-surge breakout, long leg. Decision candle: 4h.
+version = 1
+name = "qr20-volume-surge-breakout-long"
+title = "Volume Surge Breakout (4h) · Long"
+reason = """Raw volume shows participation: a breakout on a surge of volume is real demand, while one on thin volume
+usually fails. Buy a 4h close above the last 20 candles' high only when that candle trades at least 2 x the average
+volume of the 20 before it. Out when a close falls to the last 10 candles' low (a stop that only tightens), with a
+2 ATR(14) initial stop."""
+
+[blocks.entry_dc]
+kind = "donchian"
+period = 20
+
+[blocks.exit_dc]
+kind = "donchian"
+period = 10
+
+[blocks.rvol]
+kind = "relative_volume"
+period = 20
+
+[blocks.atr]
+kind = "atr"
+period = 14
+
+[long]
+entry = { all = [
+    { left = "close", op = ">", right = { prev = "entry_dc.upper" } },
+    { left = "rvol", op = ">=", right = 2.0 },
+] }
+breakout = true
+
+[exits]
+stop = { level = { sub = ["close", { mul = [2.0, "atr"] }] } }
+trail = { level = "exit_dc.lower", ratchet = true }
+
+[costs]
+breakout_slippage_bp = 5
