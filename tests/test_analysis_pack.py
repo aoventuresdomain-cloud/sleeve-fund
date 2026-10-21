@@ -179,7 +179,8 @@ def test_a_studys_sheet_carries_the_section_with_its_caveats_and_the_modelled_sp
     assert "not measured" in sheet and "Survivorship" in sheet and "R-01" in sheet
     assert "Trade-order luck test" in sheet and "Five worst drawdowns" in sheet
     # the cost line's sign convention, beside it (Advisor, 21 Oct), and buy and hold against itself said so (CR F2)
-    assert "+ received, - paid" in sheet and "funding is + when received and - when paid" in sheet
+    assert "| Funding (+ received, - paid) |" in sheet and "funding is + when received and - when paid" in sheet
+    assert "the insurance fund's share is +" in sheet
     assert "1.00 / 1.00 (itself)" in sheet
     # the sheet's own costs reconcile: gross less fees and spread, plus funding and insurance, is the equity's change
     c = ap.costs(r.full_period)

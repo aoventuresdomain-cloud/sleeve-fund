@@ -366,14 +366,15 @@ def section(r) -> list[str]:
     out.append(f"| Fees | {_m(-c['fees'])} | {pa(-c['fees'])} |")
     out.append(f"| Spread and slippage (modelled at half the spread plus {getattr(r, 'ladder_slippage', 0.0):.2%} on "
                f"orders that take liquidity, not measured) | {_m(-c['spread_slippage'])} | {pa(-c['spread_slippage'])} |")
-    out.append(f"| Funding ({'received' if c['funding'] >= 0 else 'paid'}; + received, - paid) | {_m(c['funding'])} | "
-               f"{pa(c['funding'])} |")
+    out.append(f"| Funding (+ received, - paid) | {_m(c['funding'])} | {pa(c['funding'])} |")
     if c["insurance"]:
-        out.append(f"| Liquidation shortfall the venue's insurance fund took | {_m(c['insurance'])} | |")
+        out.append(f"| Liquidation shortfall the venue's insurance fund took (+ taken off the loss) | "
+                   f"{_m(c['insurance'])} | |")
     out.append(f"| Net P&L (the equity's change, an open position marked) | {_m(c['net'])} | {pa(c['net'])} |")
     out.append("")
     out.append("Net = gross - fees - spread and slippage + funding + the insurance fund's share; funding is + when "
-               "received and - when paid.")
+               "received and - when paid, and the insurance fund's share is + (the part of a liquidation's loss the "
+               "fund took, never charged to the account).")
     out.append("")
     out += caveats(r)
     out.append("")
