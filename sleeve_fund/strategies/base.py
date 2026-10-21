@@ -455,11 +455,11 @@ class LongFlatConfig(StrategyConfig):
             raise ValueError(f"volume_scale {volume_scale} outside (0, 1]")
         if risk_per_trade is not None and not stops:
             raise ValueError("risk_per_trade needs a stop_loss (size = equity x risk / loss at the stop)")
-        if market not in markets.MARKETS and market != markets.PERP_FUNDING_STRESS:  # research only
+        if market not in markets.MARKETS and market not in markets.RESEARCH_ONLY:
             raise ValueError(f"unknown market {market!r}; choose one of {', '.join(markets.MARKETS)}")
-        if allow_short and market == markets.SPOT:
+        if allow_short and not markets.is_perp({"market": market}):
             raise ValueError("short positions need a perpetual: set market to perp (or perp-venue-fees)")
-        if market != markets.SPOT:
+        if markets.is_perp({"market": market}):
             if maker_wait_minutes is not None:
                 raise ValueError("maker-first orders aren't available on a perpetual yet: every order goes at market")
             if rebalance_band is not None:

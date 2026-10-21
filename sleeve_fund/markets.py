@@ -31,6 +31,15 @@ MARKETS = (SPOT, PERP, PERP_VENUE_FEES)
 # funding-stress line (Advisor, 7 Oct 2026: the 0.01% baseline is light in strong uptrends).
 PERP_FUNDING_STRESS = "perp-funding-stress"
 FUNDING_STRESS_RATE = 0.0003
+# Research only, never offered as a choice (RESEARCH-SPOT-FEES, PM 21 Oct 2026): spot on a perp venue's stored prices,
+# in a cash account (no margin, no funding, long or flat), at a low-fee spot schedule the Advisor sets, so a strategy
+# can be compared on the perpetual and on spot. The venue lists no spot, so paper can't trade it (check_venue).
+SPOT_LOWFEE = "spot-lowfee"
+# The Advisor's research spot rate (21 Oct): 0.10% maker and taker, no maker discount.
+SPOT_LOWFEE_FEES = FeeSchedule(maker=Decimal("0.001"), taker=Decimal("0.001"))
+RESEARCH_ONLY = (PERP_FUNDING_STRESS, SPOT_LOWFEE)
+SPOT_LOWFEE_WORDS = ("research only: a low-fee spot schedule the Advisor set, with no funding; this venue lists no "
+                     "spot, so paper can't trade it")
 # The simulated venue's leverage for a perp account: above every risk profile's cap (sleeve_fund.risk), so
 # our own leverage and liquidation guards, not the simulated venue's margin check, decide.
 VENUE_LEVERAGE = 10
@@ -65,13 +74,13 @@ VENUE_FEE_PERP = PerpTerms("Perpetual at the venue's spot fees (stress)", None, 
 
 def market_of(params: dict | None) -> str:
     m = (params or {}).get("market") or SPOT
-    if m not in MARKETS and m != PERP_FUNDING_STRESS:
+    if m not in MARKETS and m not in RESEARCH_ONLY:
         raise ValueError(f"unknown market {m!r}; choose one of {', '.join(MARKETS)}")
     return m
 
 
 def is_perp(params: dict | None) -> bool:
-    return market_of(params) != SPOT
+    return market_of(params) not in (SPOT, SPOT_LOWFEE)
 
 
 def terms(params: dict | None, venue: str | None = None, pair: str | None = None,
@@ -83,7 +92,7 @@ def terms(params: dict | None, venue: str | None = None, pair: str | None = None
     low-fee perp venue's published rates. assume_from: research only (research_tiers_pair), the kept pair whose
     tiers stand in for a pair with none."""
     m = market_of(params)
-    if m == SPOT:
+    if not is_perp(params):
         return None
     if venue is not None:
         from sleeve_fund.venues import venue as venue_profile
@@ -225,13 +234,18 @@ def check_venue(params: dict | None, venue: str) -> None:
     """Raises ValueError when the market can't trade on the venue: a perpetual venue has no spot."""
     from sleeve_fund.venues import venue as venue_profile
 
+    m = market_of(params)
+    if m in RESEARCH_ONLY:
+        raise ValueError(f"the {m} market is research only: paper can't trade it")
     profile = venue_profile(venue)
-    if profile.perpetual and market_of(params) != PERP:
+    if profile.perpetual and m != PERP:
         raise ValueError("this venue lists perpetuals only: set market = \"perp\"")
 
 
 def fees_for(params: dict | None, venue_fees: FeeSchedule, venue: str | None = None) -> FeeSchedule:
     """The fee schedule a strategy pays: its market's, or the venue's."""
+    if market_of(params) == SPOT_LOWFEE:
+        return SPOT_LOWFEE_FEES
     t = terms(params, venue)
     return t.fees if t is not None and t.fees is not None else venue_fees
 

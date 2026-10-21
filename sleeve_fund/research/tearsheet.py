@@ -22,7 +22,7 @@ from sleeve_fund.research.metrics import (
 )
 from sleeve_fund.research.pbo import PBO_CHECK, g1_row
 from sleeve_fund.research.random_entry import CLOSE_PRICED
-from sleeve_fund.research.study import StudyResult
+from sleeve_fund.research.study import SPOT_ENTRY_TIER_FEES, StudyResult
 
 ROBUST_SHARE = 0.6
 # G1's bar: at least this probability that the out-of-sample Sharpe beats the benchmark's by more
@@ -202,6 +202,32 @@ def _every_trade(r: StudyResult, files: bool, shown: int) -> list[str]:
         where = "the [trade list (CSV)](beside:trades.csv)" if files else "the trade list beside this sheet"
         out += ["", f"{shown} of {len(rows)} trades shown; every trade is in {where}."]
     return out + [""]
+
+
+def _spot_section(r: StudyResult) -> list[str]:
+    """RESEARCH-SPOT-FEES (Advisor, 21 Oct): a spot-lowfee sheet's entry-tier fee line and its perpetual comparison."""
+    tier, both = getattr(r, "spot_entry_tier", None), getattr(r, "spot_vs_perp", None)
+    if tier is None and both is None:
+        return []
+    out = ["## Spot against the perpetual (research only)", ""]
+    if tier is not None:
+        out += [f"Spot at our current entry-tier fee ({float(SPOT_ENTRY_TIER_FEES.maker):.2%} maker, "
+                f"{float(SPOT_ENTRY_TIER_FEES.taker):.2%} taker): total return "
+                f"{_pct(tier.total_return)}, Sharpe {_num(tier.sharpe)}, {tier.round_trips} round trips, fees paid "
+                f"{tier.fees_paid:,.0f}.", ""]
+    if both is not None:
+        out += ["The chosen settings over the research period, the same days, on each market:", "",
+                "| Market | End value | CAGR | Sharpe | Worst drawdown | Funding paid |",
+                "| --- | --- | --- | --- | --- | --- |"]
+        for name, words in (("spot", "Spot at the assumed research fee, no funding"),
+                            ("perp", "The perpetual, with its funding")):
+            x = both[name]
+            out.append(f"| {words} | {x['end']:,.0f} | {_pct(x['cagr'])} | {_num(x['sharpe'])} "
+                       f"| {_pct(x['max_drawdown'])} | {x['funding_paid']:,.0f} |")
+        out.append("")
+        if both.get("margin_note"):
+            out += [f"{both['margin_note']}, on the perpetual line only.", ""]
+    return out
 
 
 def _asset_class(r: StudyResult, spec) -> str:
@@ -797,6 +823,7 @@ def render(r: StudyResult, ledger: IdeaLedger, register=None, liquidation_ack: s
     out.append(_double_fees_line(r))
     out.append("")
     out += analysis_pack.section(r)  # R-17/R-18/R-19: risk, trades and costs, before the cost ladder
+    out += _spot_section(r)
     out.extend(_every_trade(r, files, shown_trades))
     if r.cost_ladder:
         chosen = getattr(r, "chosen_params", None) or r.default_params
