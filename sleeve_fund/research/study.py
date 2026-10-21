@@ -23,7 +23,7 @@ from sleeve_fund import funding
 from sleeve_fund.instruments import FeeSchedule, pair_of, pct
 from sleeve_fund import markets, risk
 from sleeve_fund.markets import PERP
-from sleeve_fund.research import equal_exposure, regime_split
+from sleeve_fund.research import equal_exposure, placebo, regime_split
 from sleeve_fund.research.ledger import GAP_STAGE, IdeaLedger, opened_words
 from sleeve_fund.research.random_entry import RandomEntryResult, RandomSideResult, Trade, random_entry, random_side
 from sleeve_fund.research.metrics import (
@@ -211,6 +211,8 @@ class StudyResult:
     random_entry_by_year: dict = field(default_factory=dict)
     # R-07: a volatility-sized variant against its parent at the same average gross exposure (equal_exposure)
     equal_exposure: equal_exposure.EqualExposure | None = None
+    # R-24: a filtered variant's filter against a placebo of its parent (placebo); None for any other study
+    placebo: placebo.PlaceboResult | None = None
     # Runs of this idea whose trials-register count failed (QA P1-T8): they count in N, but their Sharpes are
     # missing from the spread the bar is set by, so G1 can't judge until they are re-counted (Advisor, 6 Oct 2026).
     failed_counts: int = 0
@@ -632,6 +634,7 @@ def run_study(
     idea_hash: str | None = None,
     pinned=None,
     score_window: str = "walk_forward",
+    placebo_parent: dict | None = None,
 ) -> StudyResult:
     """prices: bars of any length that divides a day (daily, hourly, 15-minute, 1-minute...). The holdout,
     train and test windows are in days whatever the bar, and every statistic is on daily returns.
@@ -1130,6 +1133,10 @@ def run_study(
             lambda fs: _benchmarks(research, fs, test_bars, float(run_fees.taker),
                                    series if series is not None else spread_used, full_default.shorts, leverage,
                                    market.get("market"))[0])
+    if placebo_parent is not None:  # R-24: a filtered variant, its filter against a placebo of its parent
+        result.placebo = _placebo(result, placebo_parent, windows, bt, bar, float(run_fees.taker),
+                                  series if series is not None else spread_used, oos_exec_prices, minutes,
+                                  f"{pair_of(instrument)} {(default_params or {}).get('market') or market.get('market') or 'spot'}")
     for rung in ladder:  # the benchmark at each rung's own cost, as the rung's runs pay it (RE-COST)
         at_rung, _ = _benchmarks(research, folds, test_bars, rung.fee + slip,
                                  series if series is not None else spread_used, False, leverage, market.get("market"))
@@ -1657,6 +1664,63 @@ def _equal_exposure(result: StudyResult, research: pd.DataFrame, folds: list[Fol
            and bool((result.double_fees or {}).get("passed")))  # (iii): its own edge, before any comparison
     return equal_exposure.compare(v_exp, p_exp, result.oos_returns, pd.concat(parent_parts),
                                   result.random_entry.return_percentile, scaled_pct, own_edge=own)
+
+
+def _placebo(result: StudyResult, parent: dict, windows: list, bt, bar: pd.Timedelta, taker: float, spread,
+             exec_prices: pd.DataFrame | None, minutes: int, where: str) -> placebo.PlaceboResult:
+    """R-24: the variant's one continuous window again, the parent and the placebo's draws on the fast path, and the
+    calibration runs (parent, variant, the first draws) on the full engine as the window ran, never logged as a try.
+    Costs as random entry charges them (the taker fee and the half spread in force each side), a stop's slippage and
+    the share of equity a trip holds as the variant's own run had them."""
+    import numpy as np
+
+    from sleeve_fund.portfolio.sizing import DEFAULT_STOP_SLIPPAGE
+
+    if result.score_window != CONTINUOUS or len(windows) != 1:
+        return placebo.PlaceboResult(why_not="the placebo runs on a continuous scoring window only")
+    _, window, run = windows[0]
+    df, test_idx, params = window[1], window[2], window[3]
+    variant = params["definition"]
+    first = test_idx[0] - bar  # trade_from: the last warm-up close may open the window's first trip
+    ns = df.index.as_unit("ns").asi8 if df.index.tz is not None else df.index.tz_localize("UTC").as_unit("ns").asi8
+    half = spread.at_many(ns) if isinstance(spread, SpreadSeries) else np.full(len(df), float(spread or 0.0))
+    fine = None
+    if exec_prices is not None and len(exec_prices):
+        fine = exec_prices[(exec_prices.index > df.index[0] - bar) & (exec_prices.index <= df.index[-1])]
+
+    def trips_of(r: BacktestResult) -> list:
+        return _window_trips(trades(fills_to_rows(r.fills), r.shorts, open_trip=True), first)["trips"]
+
+    def net_of(r: BacktestResult) -> float:
+        days = whole_days(daily_returns(_flat_until(r, first)), test_idx[0], bar)
+        return float((1 + days).prod() - 1)
+
+    own = [t for t in trades(fills_to_rows(run.fills), run.shorts, open_trip=True) if t["opened"] is not None]
+    held = [t["cost"] / float(run.equity[run.equity.index <= t["opened"]].iloc[-1]) for t in own
+            if len(run.equity[run.equity.index <= t["opened"]])]
+    size = float(np.median(held)) if held else 1.0
+
+    def full(defn: dict, blocked) -> tuple[list, float]:
+        if defn is variant and not blocked:
+            return trips_of(run), net_of(run)
+        p = {**{k: v for k, v in params.items() if k != "definition_hash"}, "definition": defn}  # hashed on the run
+        if blocked:
+            p["blocked_entries"] = [int(ns[b]) for b in sorted(blocked)]
+        r = bt(result.spec.name, df, p, oos=True, trade_from=first, count_from=test_idx[0])
+        return trips_of(r), net_of(r)
+
+    step = (int((fine.index[1] - fine.index[0]) / pd.Timedelta(minutes=1)) if fine is not None and len(fine) > 1
+            else None)
+    bars_words = f"{step}-minute execution bar" if step else "candle (bars only, no execution bars)"
+    out = placebo.placebo(parent, variant, df, minutes, int(np.searchsorted(ns, first.value, side="left")),
+                          taker + half, funding=run.funding_source, full=full, exec_prices=fine,
+                          stop_slippage=np.maximum(half, DEFAULT_STOP_SLIPPAGE) - half, size=size)
+    out.size, out.where = size, where
+    out.stop_words = (f"A stop fills as the engine fills a resting stop: on the first {bars_words} to trade through "
+                      f"its level, at that bar's open where it opened through, else at that bar's low (the engine's "
+                      f"pessimistic fill inside the bar), worse by the larger of half the spread and "
+                      f"{DEFAULT_STOP_SLIPPAGE:.2%}; the variant and every draw alike.")
+    return out
 
 
 def _gross_exposure(exposure: pd.Series, first, last) -> float:

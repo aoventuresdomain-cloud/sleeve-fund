@@ -60,6 +60,8 @@ class BacktestResult:
     funding: list = field(default_factory=list)
     # A rule-builder run's studies-only counts (Rules.rule_counts): funding_no_rate (R-06), vol_skipped (R-07).
     rule_counts: dict = field(default_factory=dict)
+    # R-24: the stored settled rates its funding rate deciles read (funding_decile_source), for a placebo's fast path
+    funding_source: tuple | None = None
     # A perpetual's settlements as (ts, the venue's rate missing, a position held), and from them N of M held
     # settlements charged the baseline and the longest stretch of held time without the rate (QA P1-O17).
     funding_marks: list = field(default_factory=list)
@@ -548,6 +550,8 @@ def leg_result(engine: BacktestEngine, leg: Leg) -> BacktestResult:
         labels=fills_label(leg.exec_minutes, fee_model.intrabar) if leg.coarse else [],
         first_touch=touched,
         rule_counts=strategy.rule_counts() if hasattr(strategy, "rule_counts") else {},
+        funding_source=next((b.source for b in strategy.funding_blocks()), None)
+        if getattr(strategy, "funding_blocks", None) else None,
         reentries_on_exit_candle=reentries_on_exit_candle(fills, strategy.decisions, plan.bar_minutes),
         open_risk_binds=strategy.open_risk_binds,
         stops_clamped=strategy.stops_clamped,

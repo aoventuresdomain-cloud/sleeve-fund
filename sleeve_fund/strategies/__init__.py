@@ -48,6 +48,8 @@ def study_only_uses(params: dict | None) -> list[str]:
                     if isinstance(b, dict) and b.get("kind") in STUDY_ONLY_BLOCKS})
     if params.get("vol_target_size") is not None:
         found.append("sizing to a target volatility (vol_target_size)")
+    if params.get("blocked_entries"):
+        found.append("a placebo's blocked entries (blocked_entries)")
     return found
 
 

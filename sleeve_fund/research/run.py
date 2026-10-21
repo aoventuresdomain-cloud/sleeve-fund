@@ -69,6 +69,9 @@ class StudyRequest:
     # R-12, this round only: also run the old walk-forward on the same settings (never counted as a try), and pass
     # only when both windows pass
     old_window_too: bool = False
+    # R-24: a filtered variant's parent definition (a rule-builder definition), whose entries a placebo blocks at
+    # random in the share the variant's filter blocked; None: no placebo
+    placebo_parent: dict | None = None
 
     def exits(self) -> dict:
         """The exits every run of the study trades with, as the strategy takes them."""
@@ -91,6 +94,8 @@ class StudyRequest:
             raise ValueError(f"instrument {self.pair!r} should look like BTC/USD")
         if self.old_window_too and self.score_window != "continuous":
             raise ValueError("the old walk-forward verdict is shown beside a continuous window's only")
+        if self.placebo_parent is not None and self.score_window != "continuous":
+            raise ValueError("the placebo runs on a continuous scoring window only")
 
 
 def _bars(minutes: int) -> str:
@@ -180,7 +185,8 @@ def run_store_study(req: StudyRequest, store=None, progress=None, ledger_path: P
             exits=req.exits(),
             risk_profile=req.risk_profile, exec_prices=exec_prices, half_spread=spread, progress=progress,
             oos_exec_prices=oos_exec, minute_loader=minutes_between, register=register,
-            locks=HoldoutLocks(store) if store is not None else None, pinned=req.pinned, score_window=window)
+            locks=HoldoutLocks(store) if store is not None else None, pinned=req.pinned, score_window=window,
+            placebo_parent=req.placebo_parent if window == req.score_window else None)
 
     result = study(req.score_window, ledger, register, progress)
     old = None

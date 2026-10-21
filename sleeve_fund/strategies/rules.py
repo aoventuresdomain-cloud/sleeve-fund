@@ -84,9 +84,12 @@ __all__ = ["CATALOGUE", "SPEC", "Rules", "RulesConfig", "check_definition", "def
 
 class RulesConfig(LongFlatConfig):
     def __init__(self, *, definition: dict | None = None, definition_version: int | None = None,
-                 definition_hash: str | None = None, vol_target_size: dict | None = None, **kwargs) -> None:
+                 definition_hash: str | None = None, vol_target_size: dict | None = None,
+                 blocked_entries=None, **kwargs) -> None:
         super().__init__(**kwargs)
         self.vol_target_size = check_vol_target_size(vol_target_size)  # R-07, studies only (check_study_only)
+        # R-24, a study's placebo calibration only: the decision candles (close ns) on which no entry opens
+        self.blocked_entries = frozenset(int(x) for x in blocked_entries or ())
         if not definition:
             raise ValueError("a rules strategy needs its definition (a file in configs/definitions/)")
         checked = check_definition(definition, bar_minutes=bar_minutes(self.bar_type))
@@ -378,7 +381,7 @@ class Rules(LongFlatStrategy):
             side = self.rules.sides.get(sign)
             if side is not None and ended and (sign == ended or not side["reverse"]):
                 continue
-            if side is not None and side["entry"].test(env):
+            if side is not None and side["entry"].test(env) and env.ts not in self.c.blocked_entries:
                 armed = [s.armed_at for s in self.rules.setups if s.armed_at is not None]
                 side["entry"].consume()
                 self._leg, self._held, self._leg_ts = sign, 0, env.ts

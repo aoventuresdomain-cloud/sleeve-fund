@@ -13,10 +13,12 @@ VARIANTS = DEFINITIONS / "variants"
 
 VOL_TARGET = {"annual": 0.40, "lookback_days": 30}  # V3, V4: 40% a year, 30 days of daily returns
 
+# placebo: a filter on its parent's entries, judged against a placebo of the parent too (R-24)
 PREREGISTERED = {
     "V1": {"parent": "qr01b_trend_multispeed_long", "definition": "qr01b_trend_multispeed_long_v1_funding",
-           "params": {}},
-    "V2": {"parent": "qr01_trend_ema_long", "definition": "qr01_trend_ema_long_v2_funding", "params": {}},
+           "params": {}, "placebo": True},
+    "V2": {"parent": "qr01_trend_ema_long", "definition": "qr01_trend_ema_long_v2_funding", "params": {},
+           "placebo": True},
     "V3": {"parent": "qr01b_trend_multispeed_long", "definition": "qr01b_trend_multispeed_long",
            "params": {"vol_target_size": VOL_TARGET}},
     "V4": {"parent": "qr01_trend_ema_long", "definition": "qr01_trend_ema_long", "params": {"vol_target_size": VOL_TARGET}},

@@ -89,9 +89,11 @@ def request(name: str, minutes: int, venue: str, pair: str, pinned=None, continu
     params = {**to_params(defn, venue.upper()), "market": "perp", **(variant["params"] if variant else {})}
     if "short" in defn:
         params["allow_short"] = True
+    parent = (load_definition_file(definition_path(variant["parent"]))
+              if continuous and variant and variant.get("placebo") else None)  # R-24
     return StudyRequest(strategy="rules", pair=pair, venue=venue, minutes=minutes, risk_profile=None,
                         train_days=TRAIN_DAYS, test_days=TEST_DAYS, holdout_days=HOLDOUT_DAYS, use_holdout=False,
-                        params=params, label=name, pinned=pinned,
+                        params=params, label=name, pinned=pinned, placebo_parent=parent,
                         **({"score_window": "continuous", "old_window_too": name in OLD_WINDOW_TOO} if continuous else {}))
 
 
