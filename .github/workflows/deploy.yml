@@ -69,8 +69,14 @@ jobs:
           # A run that waited behind another deploy ships main's newest green commit, not nothing; never an
           # in-flight commit, nor one older than the server's (deploy/pick_commit.sh). An unreachable server fails here.
           deployed=$(ssh -i ~/.ssh/id_deploy "$USER_AT@$HOST" 'if sudo test -f /opt/sleeve-fund/.deployed_sha; then sudo cat /opt/sleeve-fund/.deployed_sha; fi')
-          pick=$(bash deploy/pick_commit.sh "$SHIP" "$(printf '%s' "$deployed" | tr -d '[:space:]')")
-          if [ -n "$pick" ]; then
+          deployed=$(printf '%s' "$deployed" | tr -d '[:space:]')
+          pick=$(bash deploy/pick_commit.sh "$SHIP" "$deployed")
+          # R-29: main moved only in the research configs the study job reads from main itself (study.yml): nothing
+          # ships or restarts, and the record stays at what the server runs, so the next code change ships them all.
+          if [ -n "$pick" ] && [ -n "$deployed" ] && bash deploy/research_config_only.sh "$deployed" "$pick"; then
+            echo "::notice::research-config-only change, no restart: $deployed to $pick changes configs/definitions/*.toml and configs/studies/*.md only; the server keeps $deployed."
+            echo "current=false" >> "$GITHUB_OUTPUT"
+          elif [ -n "$pick" ]; then
             git checkout -q --detach "$pick"
             echo "sha=$pick" >> "$GITHUB_OUTPUT"
             echo "current=true" >> "$GITHUB_OUTPUT"

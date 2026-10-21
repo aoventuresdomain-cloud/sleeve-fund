@@ -1,7 +1,8 @@
 """B-16 (HoE 20 Oct): each QR definition carries a display `title`, which the dashboard shows, and adding it changes
-no definition_hash or idea_hash, so no built Strategy's trials count or history resets. The hashes below are main's
-(274ecd88) before any title existed."""
+no definition_hash or idea_hash, so no built Strategy's trials count or history resets. The hashes pinned in
+configs/definition_pins.toml are main's (274ecd88) before any title existed, and each later definition's own."""
 
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -12,8 +13,11 @@ from sleeve_fund.venues import VENUES
 
 DEFS = Path(__file__).resolve().parent.parent / "configs" / "definitions"
 
-# file id: (definition_hash, idea_hash) on main, before the titles
-BEFORE = {
+# file id: (definition_hash, idea_hash) on main, before the titles, and every definition since (R-29: one data file)
+PINS = tomllib.loads((DEFS.parent / "definition_pins.toml").read_text())
+# HoE R-29 v3 (CR M1): the pins as they stood when they moved to that file, frozen here, so changing one (a new trials
+# key for an existing definition) is a test edit and a TEC, never a config-only change. New pins are added there only.
+FROZEN = {
     "qr01_trend_ema_long": ("db887a6fa3a01f1b", "4a7eb5ddd831d115"),
     "qr01_trend_ema_short": ("8ff28a74df7b0372", "ae95f6b39c909bfd"),
     "qr01b_trend_multispeed_long": ("e122ddf1851edf73", "de5a829d3c0285d2"),
@@ -36,6 +40,11 @@ BEFORE = {
     "qr22_price_above_sma20_long": ("eb41579629a697ab", "703feb3d33753b1c"),
     "qr23_vma_band_sma50_long": ("532b63bfc5402bf8", "ea3b0412d58f1c7f"),
 }
+BEFORE = {fid: (pin["definition_hash"], pin["idea_hash"]) for fid, pin in PINS.items()}
+
+
+def test_the_frozen_pins_are_unchanged_in_the_pins_file():
+    assert FROZEN.items() <= BEFORE.items()
 
 
 def test_every_qr_file_is_pinned():

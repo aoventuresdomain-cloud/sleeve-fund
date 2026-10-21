@@ -39,7 +39,7 @@ from sleeve_fund.paper.config import SleeveConfig, from_store, load_sleeve
 from sleeve_fund.paper.runtime import EXITS_ONLY, SleeveRuntime
 from sleeve_fund.paper.safety import assert_keyless, assert_portfolio_gate
 from sleeve_fund.store import model_params
-from sleeve_fund.strategies import REGISTRY, check_perp_sizing, check_perp_stop, check_target_restart
+from sleeve_fund.strategies import REGISTRY, check_perp_sizing, check_perp_stop, check_study_only, check_target_restart
 from sleeve_fund.venues import VENUES
 from sleeve_fund.venues import venue as venue_profile
 
@@ -597,6 +597,12 @@ def main(argv: list[str] | None = None) -> int:
             if not store.holds_any(row.name):  # a holder still runs for its exits (venue_start, the safety stop)
                 store.event(row.name, "error", "start_refused", f"Not started: {exc}")
                 return 1
+        try:  # R-06/R-07: studies only until the PM approves; the supervisor refuses it too (_refused)
+            check_study_only(row.strategy, row.params)
+        except ValueError as exc:
+            if not store.holds_any(row.name):  # a holder still runs for its exits only (_refused_to_trade)
+                store.event(row.name, "error", "start_refused", f"Not started: {exc}")
+                return 1
         row = venue_start(store, row)
         if row is None:
             return 1
@@ -643,6 +649,7 @@ def main(argv: list[str] | None = None) -> int:
         sleeve = load_sleeve(args.sleeve)
         check_perp_sizing(sleeve.strategy, sleeve.params)  # a strategy in the store is refused by the supervisor
         check_perp_stop(sleeve.strategy, sleeve.params, sleeve.risk_profile)  # QA P1-S6
+        check_study_only(sleeve.strategy, sleeve.params)  # R-06/R-07
         check_target_restart(sleeve.strategy, sleeve.params)  # TP-RESTART
     recorder = None
     if args.record:

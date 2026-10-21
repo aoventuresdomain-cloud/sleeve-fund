@@ -5,6 +5,12 @@ name: study
 # holdout stays locked: nothing here can open it. Writes research records only, never a Strategy, order, fill or
 # fund row. The log is public, so it shows counts and per-row ran/failed only; the results are read on the Research
 # page. Run it by hand from main: first with dry_run (the default), which checks every row and runs nothing.
+# R-29: by default the run reads the research configs (configs/definitions/*.toml, the R-06/R-07 variants in
+# configs/definitions/variants/*.toml, configs/studies/*.md, nothing else) from main at the commit it was dispatched
+# on, not from the deployed image, so a merged definition runs without
+# a deploy. They are copied to /opt/sleeve-research/<sha>/ on the server, root-owned and outside the deployed tree,
+# and mounted read-only into this one-off container only: the dashboard, supervisor and mirror keep the image's own.
+# configs_from=image runs on the image's configs, as before.
 on:
   workflow_dispatch:
     inputs:
@@ -29,17 +35,65 @@ on:
         type: boolean
         required: true
         default: true
+      configs_from:
+        description: Research configs from main at this commit (main), or the deployed image's (image)
+        type: choice
+        options: [main, image]
+        required: true
+        default: main
 # One study list at a time: a queued run waits for the running one (each study is a full backtest).
 concurrency: { group: study, cancel-in-progress: false }
 jobs:
   study:
     runs-on: ubuntu-24.04
     timeout-minutes: 360
-    permissions: { contents: read }
+    permissions: { contents: read, actions: read }
     if: ${{ vars.DEPLOY_ENABLED == 'true' && github.ref == 'refs/heads/main' }}
     env:
       USER_AT: ${{ vars.DEPLOY_USER || 'root' }}
     steps:
+      - uses: actions/checkout@v4
+        if: inputs.configs_from == 'main'
+        with:
+          ref: ${{ github.sha }}  # main at the dispatch commit, by SHA: main moving after dispatch changes nothing
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require green tests for this commit
+        if: inputs.configs_from == 'main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # As deploy.yml: the push run of tests.yml on main at this commit passed (HoE R-29 v3, HoQA F2).
+          ok=$(gh run list --workflow tests.yml --commit "$GITHUB_SHA" --branch main --event push --status success \
+               --json databaseId --jq length)
+          [ "$ok" -gt 0 ] || { echo "FAIL: the tests have not passed on main at $GITHUB_SHA; wait for the tests workflow"; exit 1; }
+      - name: Check the commit is on main
+        if: inputs.configs_from == 'main'
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          # Advisor R-29 (1): only a commit on main is read, never a branch's configs.
+          git fetch --quiet origin main
+          git merge-base --is-ancestor "$SHA" origin/main || { echo "::error::$SHA is not on main"; exit 1; }
+      - name: Stage the research configs
+        if: inputs.configs_from == 'main'
+        run: |
+          # An allowlist read from git itself: regular files (100644 blob) named exactly as below. A symlink or any
+          # other type there fails the run, and so does a file with any other name, named (Advisor R-29 (4)).
+          set -euo pipefail
+          mkdir -p staged/definitions/variants staged/studies
+          while IFS=$'\t' read -r meta path; do
+            read -r mode type _ <<<"$meta"
+            if [[ "$mode $type" != "100644 blob" ]]; then
+              echo "::error::$path is not a regular file (mode $mode, $type): a symlink or other type is refused"; exit 1
+            fi
+            if [[ $path =~ ^configs/definitions/[a-z0-9_]+\.toml$ ]]; then cp -- "$path" staged/definitions/
+            # The mount replaces the image's configs/definitions, so the variants a list names go with it (CR M1).
+            elif [[ $path =~ ^configs/definitions/variants/[a-z0-9_]+\.toml$ ]]; then cp -- "$path" staged/definitions/variants/
+            elif [[ $path =~ ^configs/studies/[a-z0-9_-]+\.md$ ]]; then cp -- "$path" staged/studies/
+            else echo "::error::not a research config by name: $path"; exit 1; fi
+          done < <(git ls-tree -r HEAD -- configs/definitions configs/studies)
+          echo "staged $(ls staged/definitions/*.toml 2>/dev/null | wc -l) definitions, $(ls staged/definitions/variants | wc -l) variants and $(ls staged/studies | wc -l) study lists"
       - name: Check the inputs
         env:
           LIST: ${{ inputs.list }}
@@ -59,6 +113,19 @@ jobs:
           install -m 700 -d ~/.ssh
           printf '%s\n' "$KEY" > ~/.ssh/id_deploy && chmod 600 ~/.ssh/id_deploy
           ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts
+      - name: Ship the research configs
+        if: inputs.configs_from == 'main'
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          SHA: ${{ github.sha }}
+        run: |
+          # Root-owned (rsync as root, no owner kept), links never copied, outside /opt/sleeve-fund; the newest 5
+          # commits' copies are kept, older ones pruned.
+          ssh -i ~/.ssh/id_deploy "$USER_AT@$HOST" "sudo mkdir -p /opt/sleeve-research/$SHA && sudo chmod 755 /opt/sleeve-research"
+          rsync -r --delete --no-links --chmod=D755,F644 --rsync-path="sudo rsync" -e "ssh -i ~/.ssh/id_deploy" \
+            staged/ "$USER_AT@$HOST":/opt/sleeve-research/$SHA/
+          ssh -i ~/.ssh/id_deploy "$USER_AT@$HOST" \
+            "sudo touch /opt/sleeve-research/$SHA && cd /opt/sleeve-research && ls -1t | grep -E '^[0-9a-f]{40}\$' | tail -n +6 | xargs -r sudo rm -rf --"
       - name: Refuse to stack a second study list
         # A one-off container can outlive its job (an SSH drop, a cancelled run), so a run still going is shown and
         # this job stops rather than start another beside it.
@@ -76,6 +143,16 @@ jobs:
           VENUE: ${{ inputs.venue }}
           PAIR: ${{ inputs.pair }}
           DRY: ${{ inputs.dry_run && '--dry-run' || '' }}
+          FROM: ${{ inputs.configs_from }}
+          SHA: ${{ github.sha }}
         run: |
+          MOUNTS= TRIES=
+          if [ "$FROM" = main ]; then
+            MOUNTS="-v /opt/sleeve-research/$SHA/definitions:/app/configs/definitions:ro -v /opt/sleeve-research/$SHA/studies:/app/configs/studies:ro"
+            TRIES="--tries-by-hand"  # each sheet says so until R-25 counts tries by family (docs/research-definitions.md)
+            echo "research configs from main at $SHA"
+          else
+            echo "research configs from the deployed image"
+          fi
           ssh -i ~/.ssh/id_deploy -o ServerAliveInterval=30 -o ServerAliveCountMax=10 "$USER_AT@$HOST" \
-            "cd /opt/sleeve-fund && sudo docker compose run --rm -T --no-deps --name study-$RUN_ID dashboard python -u -m sleeve_fund.research.rescore configs/studies/$LIST $ROWS --venue $VENUE --pair $PAIR $DRY"
+            "cd /opt/sleeve-fund && sudo docker compose run --rm -T --no-deps --name study-$RUN_ID $MOUNTS dashboard python -u -m sleeve_fund.research.rescore configs/studies/$LIST $ROWS --venue $VENUE --pair $PAIR $DRY $TRIES"

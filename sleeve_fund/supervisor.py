@@ -39,7 +39,7 @@ from sleeve_fund.paper.single_lock import EXIT_DUPLICATE
 from sleeve_fund.paper.config import check_hub_bar_spec, load_sleeve, to_store_kwargs
 from sleeve_fund.store import (DUST_NOTIONAL, OPEN_ORDER_STATUSES, TWO_LEG_FENCE, Sleeve, Store, check_own_capital,
                                is_backtest, is_dust, utcnow)
-from sleeve_fund.strategies import check_perp_sizing, check_perp_stop, check_target_restart
+from sleeve_fund.strategies import check_perp_sizing, check_perp_stop, check_study_only, check_target_restart
 from sleeve_fund.paper.runtime import entry_blocked, liquidation_head, said_since_last_fill
 from sleeve_fund.strategies.base import EXITS_ONLY
 
@@ -736,6 +736,7 @@ class Supervisor:
             check_own_capital(self.store, s.name, s.starting_balance)  # F-ZS-1
             check_perp_sizing(s.strategy, s.params)
             check_perp_stop(s.strategy, s.params, s.risk_profile)
+            check_study_only(s.strategy, s.params)  # R-06/R-07: studies only until the PM approves
             check_target_restart(s.strategy, s.params)
             check_funding_schedule(s)
             check_resting_entries(s)

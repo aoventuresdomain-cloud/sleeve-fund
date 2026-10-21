@@ -120,3 +120,37 @@ def test_a_spot_study_keeps_its_asset_class(tmp_path, instrument):
                   holdout_days=0, train_days=730, test_days=365)
     sheet = tearsheet.render(r, ledger)
     assert re.search(r"\*\*Asset class:\*\* spot ", sheet) and "traded the perpetual" not in sheet
+
+
+@pytest.mark.parametrize("sides, allow_short, words", [
+    ({1}, False, "long only"), ({-1}, True, "short only"), ({1, -1}, True, "long and short"),
+    (set(), True, "long and short"), (set(), False, "long only")])
+def test_the_caveat_names_the_sides_the_run_traded_or_may_take(monkeypatch, sides, allow_short, words):
+    """CR F2: a long and short idea's caveat, and a run with no trades, which names the sides it may take."""
+    import types
+
+    from sleeve_fund.research import study
+
+    monkeypatch.setattr(study, "trades", lambda rows, shorts: [{"side": s} for s in sorted(sides)])
+    monkeypatch.setattr(study, "fills_to_rows", lambda fills: [])
+    run = types.SimpleNamespace(fills=None, shorts=True)
+    assert study._sides_words(run, {"allow_short": allow_short}) == words
+
+
+def test_a_cost_ladder_rung_draws_no_random_side_test(monkeypatch):
+    """CR F1: the rung reads random entry only, so its random-side test, which it would throw away, is never drawn."""
+    from sleeve_fund.research import study
+
+    calls = []
+    monkeypatch.setattr(study, "random_side", lambda *a, **k: calls.append(1))
+    monkeypatch.setattr(study, "random_entry", lambda *a, **k: "entry")
+    import types
+
+    days = pd.date_range("2021-01-01", periods=8, freq="D", tz="UTC")
+    prices = pd.DataFrame({"close": [1.0 + i for i in range(8)]}, index=days)
+    # A fold with a short trip in it: its side (-1) must not stand in for the rung's flag (CR M1).
+    fold = types.SimpleNamespace(test_end=days[-1], trips=[(days[1], days[4], -1)], chosen={}, window_bars=8,
+                                 in_market_bars=3)
+    assert study._benchmarks(prices, [fold], 8, 0.001, 0.0, True, random_side_test=False) == ("entry", None)
+    assert calls == []
+    assert study._benchmarks(prices, [fold], 8, 0.001, 0.0, True)[1] is None and calls == [1]

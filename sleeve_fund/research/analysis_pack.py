@@ -30,7 +30,7 @@ from itertools import permutations
 import numpy as np
 import pandas as pd
 
-from sleeve_fund.research.metrics import PERIODS_PER_YEAR, daily_closes, fills_to_rows, trades
+from sleeve_fund.research.metrics import PERIODS_PER_YEAR, daily_closes, daily_returns, fills_to_rows, trades
 
 SEED = 20261021  # the luck test's draws, fixed so a sheet always reads the same
 DRAWS = 10_000
@@ -38,6 +38,8 @@ EXACT_UP_TO = 7  # 7! = 5,040 orders: every one, under DRAWS
 VAR_LEVEL = 0.95
 WORST_DRAWDOWNS = 5
 BEST_TRADES = 5
+IN_MARKET = 0.001  # |exposure| above this holds a position, as the sheet's time in the market reads it
+BEST_FEW = (1, 3)  # the best trade's and the best 3's share too, beside the best 5's (HoE 21 Oct)
 
 
 # R-17: returns and risk
@@ -170,8 +172,8 @@ def _longest_loss_run(rets) -> int:
 
 def trade_figures(trips: list[dict], start: float) -> dict:
     """Payoff ratio, largest win and loss, streaks (each losing streak with the fall it caused in trade-by-trade
-    equity) and the best 5 trades' share of the total profit. `trips`: closed trades oldest first, as metrics.trades;
-    `start`: the equity before the first."""
+    equity) and the best 1, 3 and 5 trades' share of the total profit (None unless the total is a profit).
+    `trips`: closed trades oldest first, as metrics.trades; `start`: the equity before the first."""
     pnl = [t["pnl"] for t in trips]
     wins = [p > 0 for p in pnl]
     won = [t for t in trips if t["pnl"] > 0]
@@ -186,7 +188,8 @@ def trade_figures(trips: list[dict], start: float) -> dict:
         peak = equity[: i + 1].max()
         falls.append((n, float(equity[i + 1: i + n + 1].min() / peak - 1)))
     total = sum(pnl)
-    top = sorted(pnl, reverse=True)[:BEST_TRADES]
+    ranked = sorted(pnl, reverse=True)
+    share = lambda n: sum(ranked[:n]) / total if total > 0 else None  # noqa: E731
     largest_win = max(trips, key=lambda t: t["pnl"]) if won else None
     largest_loss = min(trips, key=lambda t: t["pnl"]) if lost else None
     return {
@@ -199,7 +202,7 @@ def trade_figures(trips: list[dict], start: float) -> dict:
         "longest_loss_streak": max((n for w, _, n in runs if not w), default=0),
         # the losing streaks, longest first (then the deeper fall): (length, fall from the peak before it)
         "loss_streaks": sorted(falls, key=lambda x: (-x[0], x[1])),
-        "best5_share": sum(top) / total if total > 0 else None,
+        **{f"best{n}_share": share(n) for n in (*BEST_FEW, BEST_TRADES)},
     }
 
 
@@ -281,6 +284,28 @@ def caveats(r) -> list[str]:
     return out
 
 
+def price_only_hold(closes: pd.Series) -> float:
+    """The price itself held over the window, first to last daily close: no fees, no funding, nothing liquidated."""
+    return window_total(daily_closes(closes.astype(float)))
+
+
+def in_and_out(equity: pd.Series, exposure: pd.Series, closes: pd.Series) -> dict:
+    """The Strategy's return and the price's, compounded over the days it was in the market and the days it was out.
+    A day is the move into its daily close; it is in the market when any bar from the close before it (included) to
+    its own (excluded) held a position, so a position held over a close counts in the next day. {"days_in",
+    "days_out", "strategy_in", "price_in", "strategy_out", "price_out"}; a return over no days is None."""
+    own = daily_returns(equity)
+    price = daily_returns(closes.astype(float)).reindex(own.index)
+    held = exposure.abs() > IN_MARKET
+    day = held.index.floor("1D") + pd.Timedelta("1D")  # the daily close whose move each bar sits in
+    in_days = set(day[held.to_numpy()])
+    mask = own.index.isin(list(in_days))
+    over = lambda r, m: float((1 + r[m].dropna()).prod() - 1) if m.any() else None  # noqa: E731
+    return {"days_in": int(mask.sum()), "days_out": int((~mask).sum()),
+            "strategy_in": over(own, mask), "price_in": over(price, mask),
+            "strategy_out": over(own, ~mask), "price_out": over(price, ~mask)}
+
+
 def window_total(eq: pd.Series) -> float:
     """The total return of daily closes, first to last: what compounding the sheet's returns file gives (R-20)."""
     return float(eq.iloc[-1] / eq.iloc[0] - 1)
@@ -301,6 +326,19 @@ def section(r) -> list[str]:
     if len(eq) >= 2:  # the figure the returns file beside the sheet compounds to (R-20)
         out += [f"Total return over the window: {window_total(eq):+.2%} ({_d(eq.index[0])} to "
                 f"{_d(eq.index[-1])}), from the daily closes.", ""]
+    closes = getattr(r, "research_closes", None)
+    if closes is not None and len(daily_closes(closes)) >= 2:
+        out += [f"Price-only hold over the window (price only, no fees): {price_only_hold(closes):+.2%}, the price "
+                "itself held from the first daily close to the last, no funding. Context only: the G1 checks above "
+                "are the judge.", ""]
+        io = in_and_out(run.equity, run.exposure, closes)
+        days = io["days_in"] + io["days_out"]
+        out += ["Where the return came from: each day is the move into its daily close, in the market when a position "
+                "was held during it.", "",
+                "| | Days | Strategy | Price |", "|---|---|---|---|",
+                f"| In the market | {io['days_in']} ({io['days_in'] / days if days else 0:.0%}) | "
+                f"{_p(io['strategy_in'])} | {_p(io['price_in'])} |",
+                f"| Out of the market | {io['days_out']} | {_p(io['strategy_out'])} | {_p(io['price_out'])} |", ""]
 
     roll, broll = rolling_12m(ret), rolling_12m(bret)
     out.append("| Figure | Strategy | Buy and hold |")
@@ -348,6 +386,11 @@ def section(r) -> list[str]:
     worst = tf["loss_streaks"][:3]
     out.append("| Losing streaks, longest first, with the fall each caused | "
                + ("none" if not worst else "; ".join(f"{n} in a row: {f:.2%}" for n, f in worst)) + " |")
+    for n in BEST_FEW:
+        v = tf[f"best{n}_share"]
+        whose = "Best trade's" if n == 1 else f"Best {n} trades'"
+        out.append(f"| {whose} share of total profit | "
+                   + ("n/a (no total profit)" if v is None else f"{v:.0%}") + " |")
     out.append(f"| Best {BEST_TRADES} trades' share of total profit | "
                + ("n/a (no total profit)" if tf["best5_share"] is None else f"{tf['best5_share']:.0%}") + " |")
     out.append("")

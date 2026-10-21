@@ -11,21 +11,24 @@
 from __future__ import annotations
 
 import itertools
+import json
 import logging
 import math
 from decimal import Decimal
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
+import numpy as np
 import pandas as pd
 from nautilus_trader.model import CurrencyPair
 
 from sleeve_fund import funding
-from sleeve_fund.instruments import FeeSchedule, pair_of, pct
+from sleeve_fund.instruments import FeeSchedule, pair_of, pct, taker_slippage
 from sleeve_fund import markets, risk
 from sleeve_fund.markets import PERP
-from sleeve_fund.research import regime_split
+from sleeve_fund.research import equal_exposure, placebo, regime_split
 from sleeve_fund.research.ledger import GAP_STAGE, IdeaLedger, opened_words
-from sleeve_fund.research.random_entry import RandomEntryResult, RandomSideResult, Trade, random_entry, random_side
+from sleeve_fund.research.random_entry import (RandomEntryResult, RandomSideResult, Trade, random_entry,
+                                               random_entry_filled, random_side, random_side_filled)
 from sleeve_fund.research.metrics import (
     daily_returns,
     fills_to_rows,
@@ -145,6 +148,12 @@ class Fold:
     # The sum over the test window's bars of |position notional / equity| (flat bars 0): its time-weighted gross
     # exposure is this over window_bars (strength_report, Advisor G5-DW5 Q2).
     gross_exposure: float = 0.0
+    # RANDOM-ENTRY: each counted trip as the engine booked it, {"opened", "closed", "side", "ret" (pnl after fees,
+    # fills and funding over its entry notional), "exit_ratio" (exit over entry notional)}, for the strategy's side
+    # of random entry; and (the counted trips' pnl, the window's equity change less its carried trips', the
+    # window's opening equity), reconciling the two (_trip_reconcile).
+    trip_returns: list = field(default_factory=list)
+    trip_reconcile: tuple | None = None
 
     @property
     def closed_in_window(self) -> int:
@@ -211,6 +220,15 @@ class StudyResult:
     # The falsifier (Advisor 18:16): the 1-minute run's end equity less the coarse run's, over starting capital, for the
     # research period at the default settings; None when the study's own runs were on 1-minute bars or none were stored.
     bars_only_gap: float | None = None
+    # R-11: how the study was scored (walk_forward or continuous), and a continuous window's warm-up in bars
+    score_window: str = "walk_forward"
+    warmup_bars: int | None = None
+    # R-14: a continuous window's random-entry benchmark per test year (calendar year of the scored window)
+    random_entry_by_year: dict = field(default_factory=dict)
+    # R-07: a volatility-sized variant against its parent at the same average gross exposure (equal_exposure)
+    equal_exposure: equal_exposure.EqualExposure | None = None
+    # R-24: a filtered variant's filter against a placebo of its parent (placebo); None for any other study
+    placebo: placebo.PlaceboResult | None = None
     # Runs of this idea whose trials-register count failed (QA P1-T8): they count in N, but their Sharpes are
     # missing from the spread the bar is set by, so G1 can't judge until they are re-counted (Advisor, 6 Oct 2026).
     failed_counts: int = 0
@@ -270,6 +288,8 @@ class StudyResult:
     # FIRST_TOUCH_FLIP_SHARE, both resolutions' out-of-sample summaries and which one G1 judged ("as ruled" or
     # "opposite"). Empty for a model without one.
     first_touch: dict = field(default_factory=dict)
+    # The research period's closes, for the analysis pack's price-only lines (pack (a) and (c), 21 Oct).
+    research_closes: pd.Series | None = None
 
     @property
     def not_judged(self) -> str:
@@ -362,7 +382,7 @@ class StudyResult:
     @property
     def trade_stats(self) -> dict:
         return trade_stats(trades(fills_to_rows(self.full_period.fills), self.full_period.shorts,
-                                  self.full_period.funding))  # R-04 short legs; R-16 funding
+                                  self.full_period.funding, self.full_period.insurance))  # R-04 shorts; R-16 flows
 
     @property
     def turnover(self) -> float:
@@ -557,6 +577,99 @@ def _bar_words(minutes: int) -> str:
     return "day" if minutes == 1440 else f"{minutes // 60}-hour bar" if minutes % 60 == 0 else f"{minutes}-minute bar"
 
 
+# R-11 (PM chose "Five years" 21 Oct 10:13 UK; Advisor SCORE-WINDOW addendum, warm-up rule as amended 21 Oct): a
+# pinned-setting study fits nothing on its training folds, so it may instead warm up, then score continuously to the
+# research end (the holdout stays locked). The warm-up is the longest any block needs: an exact rolling block (SMA,
+# Donchian, rolling volume...) its N bars, as the library counts them; a recursive one (EMA, Wilder's ATR and RSI)
+# WARMUP_MULTIPLE x N. A study that tunes settings keeps the walk-forward.
+WALK_FORWARD, CONTINUOUS = "walk_forward", "continuous"
+SCORE_WINDOWS = (WALK_FORWARD, CONTINUOUS)
+WARMUP_MULTIPLE = 10
+MIN_SCORED_DAYS = 365
+# Recursive blocks, by kind: the settings whose length decays recursively (an RSI divergence adds its swing room).
+RECURSIVE_LENGTHS = {"ema": ("period",), "atr": ("period",), "rsi": ("period",), "keltner": ("period", "atr_period"),
+                     "rsi_divergence": ("rsi_period",)}
+
+
+def time_warmup_minutes(kind: str, settings: dict) -> int | None:
+    """The minutes a block warms up over when its warm-up is in time rather than candles (Advisor 21 Oct): a calendar
+    period or session (warmup_minutes), a day-anchored VWAP's one day, the funding decile's trailing window_days of
+    settlements. None for a block that warms up over candles."""
+    from sleeve_fund.strategies.definitions import BUILDER_BLOCKS
+    from sleeve_fund.strategies.timeframes import DAY_MINUTES
+
+    cls = BUILDER_BLOCKS[kind]
+    if hasattr(cls, "warmup_minutes"):
+        return int(cls.warmup_minutes(settings))
+    if kind == "vwap" and settings["anchor"] == "day":
+        return DAY_MINUTES
+    if kind == "funding_decile":
+        return int(settings["window_days"]) * DAY_MINUTES
+    return None
+
+
+def block_warmup(kind: str, settings: dict, candle_minutes: int | None = None) -> int:
+    """R-11: the candles of `candle_minutes` (the block's own size) one block needs before a continuous window scores:
+    WARMUP_MULTIPLE x N for a recursive block; a block that warms up over time, its minutes in candles as the builder
+    counts a calendar period, ceil(minutes / candle) + 1; otherwise its own warm-up as warmup_for reads it (N, or N + 1
+    where its first value needs the bar before)."""
+    from sleeve_fund.strategies.definitions import BUILDER_BLOCKS
+
+    cls = BUILDER_BLOCKS[kind]
+    s = cls.check_settings({k: v for k, v in settings.items() if k not in ("kind", "timeframe", "input")})
+    if kind in RECURSIVE_LENGTHS:
+        bars = WARMUP_MULTIPLE * max(int(s[k]) for k in RECURSIVE_LENGTHS[kind])
+        return bars + (s["left"] + s["right"] + s["max_gap"] if kind == "rsi_divergence" else 0)
+    minutes = time_warmup_minutes(kind, s)
+    if minutes is not None:
+        if not candle_minutes:
+            raise ValueError(f"a {kind} block warms up over time: its warm-up in candles needs the candle's minutes")
+        return -(-minutes // candle_minutes) + 1
+    return int(cls.warmup_bars(**s))  # what warmup_for reads for the block
+
+
+def continuous_warmup(strategy: str, params: dict, bar_minutes: int) -> int:
+    """R-11: the warm-up bars of a continuous window, from the rule itself: the most any of its blocks needs
+    (block_warmup, in candles of the block's size, after the warm-up of a block it is fed from, as the builder adds
+    them), a slower-timeframe block's counted in decision candles, with one more of its candles for the part candle a
+    run starts in (as Rules.warmup_needed counts it)."""
+    from sleeve_fund.strategies.definitions import FIELDS, check_definition, timeframe_minutes
+
+    if strategy != "rules" or not params.get("definition"):
+        raise ValueError("a continuous scoring window reads its warm-up from a rule-builder definition's indicators")
+    definition = params["definition"]
+    check_definition(definition, bar_minutes=bar_minutes)
+    blocks = definition.get("blocks") or {}
+    own: dict = {}
+
+    def settle(bid: str) -> int:  # candles of the block's size until it and every block it is fed from have settled
+        if bid not in own:
+            block = blocks[bid]
+            candle = timeframe_minutes(block["timeframe"]) if block.get("timeframe") else bar_minutes
+            src = block.get("input")
+            fed = settle(src.partition(".")[0]) if src and src not in FIELDS else 0  # chained blocks share a timeframe
+            own[bid] = block_warmup(block["kind"], block, candle) + fed
+        return own[bid]
+
+    need = 0
+    for bid, block in blocks.items():
+        bars = settle(bid)
+        if block.get("timeframe"):
+            tf = timeframe_minutes(block["timeframe"])
+            bars = (bars + 1) * tf // bar_minutes if tf > bar_minutes else bars
+        need = max(need, bars)
+    if need <= 0:
+        raise ValueError("the definition names no indicator to set a continuous window's warm-up from")
+    return need
+
+
+def _day_words(ts: pd.Timestamp, bar: pd.Timedelta) -> str:
+    """'19 Oct 2025': the UTC day a bar belongs to (the day its open falls on)."""
+    from sleeve_fund.research.pinned import day_of
+
+    return f"{day_of(ts, bar):%d %b %Y}"
+
+
 def run_study(
     spec: IdeaSpec,
     prices: pd.DataFrame,
@@ -582,6 +695,8 @@ def run_study(
     locks=None,
     idea_hash: str | None = None,
     pinned=None,
+    score_window: str = "walk_forward",
+    placebo_parent: dict | None = None,
 ) -> StudyResult:
     """prices: bars of any length that divides a day (daily, hourly, 15-minute, 1-minute...). The holdout,
     train and test windows are in days whatever the bar, and every statistic is on daily returns.
@@ -638,6 +753,18 @@ def run_study(
         combos = [dict(default_params)]
     default_params = default_params or spec.default_params or (combos[0] if combos else {})
     idea_hash = idea_of(default_params, idea_hash)
+    if score_window not in SCORE_WINDOWS:
+        raise ValueError(f"score_window must be one of {', '.join(SCORE_WINDOWS)}, not {score_window!r}")
+    warmup_bars = None
+    if score_window == CONTINUOUS:  # R-11: one window, the warm-up then scored continuously to the research end
+        if len(combos) != 1:
+            raise ValueError(f"a continuous scoring window is for pinned settings only: this study tunes "
+                             f"{len(combos)} settings, so it keeps the walk-forward")
+        warmup_bars = continuous_warmup(spec.name, combos[0], minutes)
+        if warmup_bars + MIN_SCORED_DAYS * per_day > len(research):
+            raise ValueError(f"the warm-up of {warmup_bars:,} bars leaves under {MIN_SCORED_DAYS} days to score "
+                             f"in the {len(research) / per_day:,.0f}-day research period")
+        train_bars, test_bars = warmup_bars, len(research) - warmup_bars
 
     exits = {k: v for k, v in (exits or {}).items() if v is not None}
     from sleeve_fund.venues import VENUES
@@ -868,6 +995,7 @@ def run_study(
         b_ret, parts = fold_benchmark(test_ret, test_idx[0], test_idx[-1])
         absorbed = _absorbed_in(run, test_idx[0] - bar, test_idx[-1])
         window_trips = trades(fills_to_rows(run.fills), run.shorts, open_trip=True)
+        booked = trades(fills_to_rows(run.fills), run.shorts, run.funding, open_trip=True)  # R-16: with funding
         return (
             Fold(
                 train_start=train.index[0],
@@ -890,6 +1018,8 @@ def run_study(
                 trip_charges=_trip_charges(window_trips, test_idx[0] - bar, absorbed),
                 trip_sizes=_trip_sizes(window_trips, test_idx[0] - bar, run.fills, run.decisions),
                 gross_exposure=_gross_exposure(run.exposure, test_idx[0], test_idx[-1]),
+                **_trip_reconcile(booked, _flat_until(run, test_idx[0] - bar), test_idx[0] - bar, test_idx[-1],
+                                  _trip_charges(window_trips, test_idx[0] - bar, absorbed), run.decisions),
             ),
             test_ret, b_ret, parts, run,
         )
@@ -906,7 +1036,11 @@ def run_study(
         test_idx = through_test.index[train_bars:]
         best, best_sharpe = None, float("-inf")
         surface = []
-        for params in combos:
+        if warmup_bars is not None:  # continuous: the one pinned setting, nothing fitted on the warm-up
+            best, best_sharpe, combos_fit = combos[0], float("nan"), []
+        else:
+            combos_fit = combos
+        for params in combos_fit:
             fit = bt(spec.name, train, params)
             m = summary(daily_returns(fit.equity))
             log(params, "wf_train", m["sharpe"], train)
@@ -1049,6 +1183,7 @@ def run_study(
         default_params=default_params,
         full_period=full_default,
         full_period_benchmark=bench,
+        research_closes=research["close"].astype(float),
         sensitivity=sensitivity,
         pbo=overfit,
         folds=folds,
@@ -1070,7 +1205,10 @@ def run_study(
         risk_profile=risk_profile,
         settings=(f"{risk_profile + ' risk profile' if risk_profile else 'no risk profile'} · "
                   f"exits: {_exit_words(exits) if exits else 'the signal only'}{_definition_target_words(default_params)} · "
-                  f"walk-forward {train_days} days training, {test_days} days testing"),
+                  + (f"walk-forward {train_days} days training, {test_days} days testing" if warmup_bars is None
+                     else f"continuous: a warm-up of {warmup_bars:,} bars ({warmup_bars / per_day:,.0f} days), then "
+                          f"scored {_day_words(research.index[warmup_bars], bar)} to "
+                          f"{_day_words(research.index[-1], bar)}")),
         errors=errors,
         error_count=error_count[0],
         cost_ladder=ladder,
@@ -1096,20 +1234,42 @@ def run_study(
     # B-35 (a): lowered by the Strategy's own leverage cap (max_leverage), as the engine's margin and liquidation are
     leverage = (risk.capped_leverage(risk_profile_of(risk_profile), default_params)
                 if risk_profile is not None else None)
+    # The regime table's hold column is "price only, no fees": the closes themselves, never the funded hold's equity,
+    # which a funding drain can take below zero (REGIME-BH, 21 Oct).
     result.by_regime = regime_split.split(
         trades(fills_to_rows(full_default.fills), full_default.shorts, full_default.funding),
-        research, bench.equity, full_default.equity)
+        research, research["close"].astype(float), full_default.equity)
+    fill = _draw_fill(spec, folds, minutes, oos_exec_prices, instrument, research, float(run_fees.taker))
     result.random_entry, result.random_side = _benchmarks(
         research, folds, test_bars, float(run_fees.taker), series if series is not None else spread_used,
-        full_default.shorts, leverage, market.get("market"))
+        full_default.shorts, leverage, market.get("market"), True, fill)
     if any(f.trip_charges for f in folds):  # the strategy's trips uncharged, for information only (ABSORB-GAP)
         result.random_entry_uncharged, result.random_side_uncharged = _benchmarks(
             research, folds, test_bars, float(run_fees.taker), series if series is not None else spread_used,
-            full_default.shorts, leverage, market.get("market"), charged=False)
+            full_default.shorts, leverage, market.get("market"), False, fill)
+    result.score_window, result.warmup_bars = score_window, warmup_bars
+    if warmup_bars is not None and windows:  # R-14: the percentile per test year too
+        _k, (_, _, test_idx, *_), run = windows[0]
+        result.random_entry_by_year = {
+            year: _benchmarks(research, [fold], window_bars, float(run_fees.taker),
+                              series if series is not None else spread_used, full_default.shorts, leverage,
+                              market.get("market"))[0]
+            for year, fold, window_bars in _years(folds[0], run, test_idx)}
+    if (default_params or {}).get("vol_target_size") is not None:  # R-07: against the parent at equal exposure
+        result.equal_exposure = _equal_exposure(
+            result, research, folds, windows, oos_parts, bt, scored, bar,
+            lambda fs: _benchmarks(research, fs, test_bars, float(run_fees.taker),
+                                   series if series is not None else spread_used, full_default.shorts, leverage,
+                                   market.get("market"))[0])
+    if placebo_parent is not None:  # R-24: a filtered variant, its filter against a placebo of its parent
+        result.placebo = _placebo(result, placebo_parent, windows, bt, bar, float(run_fees.taker),
+                                  series if series is not None else spread_used, oos_exec_prices, minutes,
+                                  f"{pair_of(instrument)} {(default_params or {}).get('market') or market.get('market') or 'spot'}")
     for rung in ladder:  # the benchmark at each rung's own cost, as the rung's runs pay it (RE-COST)
         at_rung, _ = _benchmarks(research, folds, test_bars, rung.fee + slip,
                                  series if series is not None else spread_used, full_default.shorts, leverage,
-                                 market.get("market"))
+                                 market.get("market"), True, fill,
+                                 random_side_test=False)  # the rung: random entry only (CR F1)
         if at_rung.trades:
             rung.oos_timing_return, rung.random_return = at_rung.strategy_return, at_rung.median_random_return
     if hold_market == markets.PERP and not market:
@@ -1161,6 +1321,24 @@ def run_study(
             "than a minute, where what traded first inside a bar is unknown, a stop the bar traded through fills at "
             "the bar's worst price. Paper watches both on every trade."
         )
+    counts = full_default.rule_counts or {}
+    if "funding_no_rate" in counts:  # R-06
+        result.notes.append(
+            f"Funding rate decile: {counts['funding_no_rate']:,} of {len(research):,} decision candles had no usable "
+            "stored funding rate (the latest due settlement missing, or too few in its window), so no entry gated on "
+            "it could open on them: a missing rate is never assumed. Apart from those, "
+            f"{counts.get('funding_top_decile', 0):,} read the top decile (90% or more of the trailing window's rates "
+            "strictly below the latest). Only rates settled strictly before each candle's close are read.")
+    if "vol_skipped" in counts:  # R-07
+        vol = default_params.get("vol_target_size") or {}
+        result.notes.append(
+            f"Entries are sized to {vol.get('annual', 0):.0%} a year of volatility, read over "
+            f"{vol.get('lookback_days', 0)} days of daily closes at each entry: never above the size or caps it would "
+            f"otherwise have, set at entry and not rebalanced. {counts['vol_skipped']:,} entries were skipped for "
+            "want of the daily closes to read it.")
+    if spec.name == "rules" and len(full_default.exposure):  # R-07: what V3/V4 are judged against the parent at
+        result.notes.append(f"Average gross exposure over the research period: "
+                            f"{float(full_default.exposure.abs().mean()):.1%} of equity.")
     result.resting_exits = resting[0]
     if result.resting_exits and oos_minutes is not None and 1 < oos_minutes <= ONE_WAY_MINUTES and not result.not_judged:
         _one_way(result, ledger, fold_runs, bt, minute_loader, bar)
@@ -1541,7 +1719,8 @@ def _trip_charges(trips: list[dict], test_start, absorbed: list[dict]) -> list[t
 
 def _trip_sizes(trips: list[dict], test_start, fills: pd.DataFrame, decisions: dict) -> list[tuple]:
     """G5: each counted trip's size factor f, from the signal of the order whose fill opened it, as (opened, f); a
-    trip whose entry carried none (a flat version) is left out, so it sizes at 1."""
+    trip whose entry carried none (a flat version) is left out, so it sizes at 1. R-07: a volatility-sized entry's
+    share of the size it would otherwise have had is its f the same way (with signal strength too, the product)."""
     if fills is None or fills.empty:
         return []
     start = _utc(test_start)
@@ -1552,9 +1731,130 @@ def _trip_sizes(trips: list[dict], test_start, fills: pd.DataFrame, decisions: d
     for t in trips:
         if t["opened"] is None or t["closed"] is None or _utc(t["opened"]) < start:
             continue
-        f = ((decisions.get(at.get(_utc(t["opened"])), {}) or {}).get("signal") or {}).get("size_factor")
-        if f is not None:
-            out.append((_utc(t["opened"]), float(f)))
+        sig = (decisions.get(at.get(_utc(t["opened"])), {}) or {}).get("signal") or {}
+        f, v = sig.get("size_factor"), sig.get("vol_factor")
+        if f is not None or v is not None:
+            out.append((_utc(t["opened"]), float(1.0 if f is None else f) * float(1.0 if v is None else v)))
+    return out
+
+
+def _years(fold: Fold, run: BacktestResult, test_idx) -> list[tuple[int, Fold, int]]:
+    """R-14: a continuous window cut into its test years, each as (year, a fold of it, its bars). A year holds the
+    trips opened in it, whole: its window runs from its first bar to the later of the year's last bar and the close
+    of its last trip, and the next year starts after that, so no trip is split and no bar is in two years."""
+    out, at, taken = [], 0, 0
+    trips = sorted(fold.trips)
+    for year in sorted(set(test_idx.year)):
+        if at >= len(test_idx):
+            break
+        last = max(int(test_idx.searchsorted(pd.Timestamp(f"{year + 1}-01-01", tz="UTC"), side="right")) - 1, at)
+        # the trips opened on this year's bars (a bar is the year its close falls in, 00:00 1 Jan the old year's)
+        mine = [t for t in trips[taken:] if _utc(t[0]) <= test_idx[last]]
+        taken += len(mine)
+        if mine:
+            last = max(last, int(test_idx.searchsorted(max(_utc(t[1]) for t in mine), side="left")))
+        last = min(last, len(test_idx) - 1)
+        first_ts, last_ts = test_idx[at], test_idx[last]
+        out.append((year, replace(fold, test_end=last_ts, trips=mine, window_bars=last - at + 1,
+                                  in_market_bars=_in_market_bars(run.exposure, first_ts, last_ts)), last - at + 1))
+        at = last + 1
+    return out
+
+
+def _test_exposure(run: BacktestResult | None, test_idx) -> pd.Series:
+    """|exposure| at each of a test window's bars, 0 where flat or never run (a window that chose nothing)."""
+    if run is None or run.exposure is None or run.exposure.empty:
+        return pd.Series(0.0, index=test_idx)
+    return run.exposure.abs().reindex(test_idx).fillna(0.0)
+
+
+def _equal_exposure(result: StudyResult, research: pd.DataFrame, folds: list[Fold], windows: list, oos_parts: list,
+                    bt, scored, bar: pd.Timedelta, benchmark) -> equal_exposure.EqualExposure:
+    """R-07: the parent (the variant's settings without vol_target_size) re-run on every window that chose a setting,
+    as the variant ran it, never logged as a try; a window that chose nothing sat flat for both. Then k and the
+    comparison (equal_exposure), with the parent's random entry at every trip sized k (so costed at k x notional).
+    benchmark: the study's random entry for a list of folds."""
+    idx = research.index
+    variant_runs = {k: run for k, _, run in windows}
+    parent_folds, parent_parts, parent_runs = list(folds), list(oos_parts), {}
+    for k, window, _ in windows:
+        params = {p: v for p, v in window[3].items() if p != "vol_target_size"}
+        test_idx = window[2]
+        run = bt(result.spec.name, window[1], params, oos=True, trade_from=test_idx[0] - bar, count_from=test_idx[0])
+        parent_folds[k], parent_parts[k] = scored(k, *window[:3], params, *window[4:], run)[:2]
+        parent_runs[k] = run
+    bars = [idx[(idx > f.train_end) & (idx <= f.test_end)] for f in folds]
+    v_exp = pd.concat([_test_exposure(variant_runs.get(k), b) for k, b in enumerate(bars)])
+    p_exp = pd.concat([_test_exposure(parent_runs.get(k), b) for k, b in enumerate(bars)])
+    k, _ = equal_exposure.exposure_ratio(v_exp, p_exp)
+    scale = k if math.isfinite(k) else 0.0
+    scaled_folds = []
+    for f in parent_folds:
+        sizes = dict(f.trip_sizes)
+        scaled_folds.append(replace(f, trip_sizes=[(o, scale * sizes.get(o, 1.0)) for o, _, _ in f.trips]))
+    scaled_pct = benchmark(scaled_folds).return_percentile if scale > 0 else math.nan
+    from sleeve_fund.research.random_entry import BAR
+
+    own = (result.random_entry.trades > 0 and result.random_entry.return_percentile >= BAR
+           and bool((result.double_fees or {}).get("passed")))  # (iii): its own edge, before any comparison
+    return equal_exposure.compare(v_exp, p_exp, result.oos_returns, pd.concat(parent_parts),
+                                  result.random_entry.return_percentile, scaled_pct, own_edge=own)
+
+
+def _placebo(result: StudyResult, parent: dict, windows: list, bt, bar: pd.Timedelta, taker: float, spread,
+             exec_prices: pd.DataFrame | None, minutes: int, where: str) -> placebo.PlaceboResult:
+    """R-24: the variant's one continuous window again, the parent and the placebo's draws on the fast path, and the
+    calibration runs (parent, variant, the first draws) on the full engine as the window ran, never logged as a try.
+    Costs as random entry charges them (the taker fee and the half spread in force each side), a stop's slippage and
+    the share of equity a trip holds as the variant's own run had them."""
+    import numpy as np
+
+    from sleeve_fund.portfolio.sizing import DEFAULT_STOP_SLIPPAGE
+
+    if result.score_window != CONTINUOUS or len(windows) != 1:
+        return placebo.PlaceboResult(why_not="the placebo runs on a continuous scoring window only")
+    _, window, run = windows[0]
+    df, test_idx, params = window[1], window[2], window[3]
+    variant = params["definition"]
+    first = test_idx[0] - bar  # trade_from: the last warm-up close may open the window's first trip
+    ns = df.index.as_unit("ns").asi8 if df.index.tz is not None else df.index.tz_localize("UTC").as_unit("ns").asi8
+    half = spread.at_many(ns) if isinstance(spread, SpreadSeries) else np.full(len(df), float(spread or 0.0))
+    fine = None
+    if exec_prices is not None and len(exec_prices):
+        fine = exec_prices[(exec_prices.index > df.index[0] - bar) & (exec_prices.index <= df.index[-1])]
+
+    def trips_of(r: BacktestResult) -> list:
+        return _window_trips(trades(fills_to_rows(r.fills), r.shorts, open_trip=True), first)["trips"]
+
+    def net_of(r: BacktestResult) -> float:
+        days = whole_days(daily_returns(_flat_until(r, first)), test_idx[0], bar)
+        return float((1 + days).prod() - 1)
+
+    own = [t for t in trades(fills_to_rows(run.fills), run.shorts, open_trip=True) if t["opened"] is not None]
+    held = [t["cost"] / float(run.equity[run.equity.index <= t["opened"]].iloc[-1]) for t in own
+            if len(run.equity[run.equity.index <= t["opened"]])]
+    size = float(np.median(held)) if held else 1.0
+
+    def full(defn: dict, blocked) -> tuple[list, float]:
+        if defn is variant and not blocked:
+            return trips_of(run), net_of(run)
+        p = {**{k: v for k, v in params.items() if k != "definition_hash"}, "definition": defn}  # hashed on the run
+        if blocked:
+            p["blocked_entries"] = [int(ns[b]) for b in sorted(blocked)]
+        r = bt(result.spec.name, df, p, oos=True, trade_from=first, count_from=test_idx[0])
+        return trips_of(r), net_of(r)
+
+    step = (int((fine.index[1] - fine.index[0]) / pd.Timedelta(minutes=1)) if fine is not None and len(fine) > 1
+            else None)
+    bars_words = f"{step}-minute execution bar" if step else "candle (bars only, no execution bars)"
+    out = placebo.placebo(parent, variant, df, minutes, int(np.searchsorted(ns, first.value, side="left")),
+                          taker + half, funding=run.funding_source, full=full, exec_prices=fine,
+                          stop_slippage=np.maximum(half, DEFAULT_STOP_SLIPPAGE) - half, size=size)
+    out.size, out.where = size, where
+    out.stop_words = (f"A stop fills as the engine fills a resting stop: on the first {bars_words} to trade through "
+                      f"its level, at that bar's open where it opened through, else at that bar's low (the engine's "
+                      f"pessimistic fill inside the bar), worse by the larger of half the spread and "
+                      f"{DEFAULT_STOP_SLIPPAGE:.2%}; the variant and every draw alike.")
     return out
 
 
@@ -1574,6 +1874,54 @@ def _sides_words(run, params: dict) -> str:
     return {frozenset({1}): "long only", frozenset({-1}): "short only"}.get(frozenset(sides), "long and short")
 
 
+def _trip_reconcile(trips: list[dict], equity: pd.Series, test_start, last, charges: list[tuple],
+                    decisions: dict | None = None) -> dict:
+    """RANDOM-ENTRY: a window's counted trips as the engine booked them (pnl after fees, fills and funding over
+    entry notional, less any ABSORB-GAP charge), and their pnl against what the window's equity did less its carried
+    trips': a trip still open at the end from the close before it opened, one carried in to the close it ended at.
+    equity: the window's (flat at the starting capital up to and at test_start). decisions: the run's, by order id;
+    a trip its stop closed carries stop_gap, what filling that exit at the stop's level, as the draws' are, adds to
+    its return (STOP-FILL gap; Advisor ruling (A), HoE 21 Oct)."""
+    start = _utc(test_start)
+    charge = dict(charges)
+    idx = equity.index if equity.index.tz is not None else equity.index.tz_localize("UTC")
+
+    def at(ts, side: str) -> float:  # equity at the last close before ts ("before"), or the first at or after it
+        i = int(idx.searchsorted(_utc(ts), side="left"))
+        return float(equity.iloc[max(i - 1, 0)] if side == "before" else equity.iloc[min(i, len(equity) - 1)])
+
+    base, end = float(equity.iloc[idx.searchsorted(start, side="right") - 1]), at(last, "after")
+    counted, pnl, carried = [], 0.0, 0.0
+    for t in trips:
+        if t["closed"] is None:
+            carried += end - at(t["opened"], "before") if _utc(t["opened"]) >= start else end - base
+        elif t["opened"] is None or _utc(t["opened"]) < start:
+            if _utc(t["closed"]) >= start:
+                carried += at(t["closed"], "after") - base
+        else:
+            c = charge.get(_utc(t["opened"]), 0.0)
+            counted.append({"opened": _utc(t["opened"]), "closed": _utc(t["closed"]), "side": int(t["side"]),
+                            "ret": (t["pnl"] / t["cost"] if t["cost"] else 0.0) - c,
+                            "exit_ratio": t["exit_px"] / t["entry_px"] if t["entry_px"] else 1.0,
+                            **_stop_gap(t, (decisions or {}).get(str(t.get("exit_order"))))})
+            pnl += t["pnl"] - c * t["cost"]
+    return {"trip_returns": counted, "trip_reconcile": (pnl, end - base - carried, base)}
+
+
+def _stop_gap(trip: dict, decision: dict | None) -> dict:
+    """A trip's stop exit, if its stop closed it: {"stopped": True, "stop_gap": side x (the stop's level - the
+    price it filled at) over the entry price, "stop_level": the level over the entry price}; else {}. The draws book
+    a stop at its level less the taker's slippage (_filled_benchmarks takes that off the gap, Advisor PR E round 1)."""
+    if not decision or decision.get("intent") != "stop_loss":
+        return {}
+    sig, side, entry = decision.get("signal") or {}, int(trip["side"]), trip["entry_px"]
+    level = sig.get("trigger", sig.get("stop_px"))
+    if level is None and sig.get("stop_loss") is not None:
+        level = entry * (1 - side * float(sig["stop_loss"]))
+    gap = side * (float(level) - trip["exit_px"]) / entry if level is not None and entry else 0.0
+    return {"stopped": True, "stop_gap": gap, "stop_level": float(level) / entry if level is not None and entry else 0.0}
+
+
 def _in_market_bars(exposure: pd.Series, first, last) -> int:
     """The bars from first to last, inclusive, that closed holding a position of any size or side."""
     if exposure is None or exposure.empty:
@@ -1583,8 +1931,33 @@ def _in_market_bars(exposure: pd.Series, first, last) -> int:
     return int((inside.abs() > 1e-9).sum())
 
 
+@dataclass
+class DrawFill:
+    """RANDOM-ENTRY: what filled draws need beyond the prices: the definition the strategy traded (a rule-builder
+    one; None keeps the close-priced comparison), the execution bars stops are matched on, each settlement's rate as
+    the engine charges it (_settlement_rates; None: spot) and the taker fee the strategy's own runs paid."""
+
+    definition: dict | None
+    bar_minutes: int
+    exec_prices: pd.DataFrame | None
+    funding: tuple | None
+    run_taker: float
+    refused: str = ""  # why a rule definition's exits can't be filled as the engine fills them: NOT JUDGED
+    pricers: dict = field(default_factory=dict)
+
+    def pricer(self, prices: pd.DataFrame, cost_per_side, half_spread=0.0):
+        from sleeve_fund.research.fills import Pricer
+
+        key = id(prices)
+        if key not in self.pricers:
+            self.pricers[key] = Pricer(self.definition, prices, self.bar_minutes, cost_per_side, self.exec_prices,
+                                       self.funding, half_spread)
+        return self.pricers[key].at_cost(cost_per_side, half_spread)
+
+
 def _benchmarks(prices: pd.DataFrame, folds: list[Fold], test_bars: int, taker: float, spread, shorts: bool,
-                leverage: float | None = None, market: str | None = None, charged: bool = True):
+                leverage: float | None = None, market: str | None = None, charged: bool = True,
+                fill: DrawFill | None = None, random_side_test: bool = True):
     """The random-entry benchmark, and the random-side test when the strategy can go short, on the folds'
     counted trips. Each trip is placed on the bars it was opened and closed in, and both sides of the comparison
     are priced on those bars' closes, so the benchmark compares timing, not fills. spread: a half spread, or a
@@ -1592,13 +1965,24 @@ def _benchmarks(prices: pd.DataFrame, folds: list[Fold], test_bars: int, taker: 
     alike (SPREAD-PIT). leverage: the risk profile's cap, for a fold that traded the perpetual (its chosen market,
     else `market`): its trips and their draws are liquidated as the engine books one, losing the margin and fees,
     never the move past it (Independent Quant Advisor 7 Oct 00:19 (4)); and, charged, a liquidated trip of the
-    strategy's pays the gap the venue absorbed past it, its draws never (ABSORB-GAP, Advisor ~02:55 UK, option A)."""
+    strategy's pays the gap the venue absorbed past it, its draws never (ABSORB-GAP, Advisor ~02:55 UK, option A).
+    random_side_test: False skips the random-side test for a caller that reads random entry only (the cost ladder's
+    rungs). Not `side`: the trip loop below binds that name (CR M1)."""
     index = prices.index.tz_localize("UTC") if prices.index.tz is None else prices.index
-    cost_per_side = taker + (spread.at_many(index.as_unit("ns").asi8) if isinstance(spread, SpreadSeries) else spread)
+    half = spread.at_many(index.as_unit("ns").asi8) if isinstance(spread, SpreadSeries) else spread
+    cost_per_side = taker + half
 
     def bar(ts) -> int:
         return max(int(index.searchsorted(ts, side="right")) - 1, 0)
 
+    if fill is not None and fill.refused:
+        entry, side = _benchmarks(prices, folds, test_bars, taker, spread, shorts, leverage, market, charged,
+                                  random_side_test=random_side_test)
+        entry.why_not = fill.refused
+        return entry, side
+    if fill is not None and fill.definition is not None:
+        return _filled_benchmarks(prices, folds, test_bars, taker, half, cost_per_side, shorts and random_side_test,
+                                  leverage, market, charged, fill, bar)
     windows, placed = [], []
     for f in folds:
         end = bar(f.test_end)
@@ -1620,8 +2004,98 @@ def _benchmarks(prices: pd.DataFrame, folds: list[Fold], test_bars: int, taker: 
     bars = sum(f.window_bars for f in folds)
     in_market = sum(f.in_market_bars for f in folds) / bars if bars else None
     entry = random_entry(closes, placed, windows, cost_per_side, in_market=in_market)
-    side = random_side(closes, placed, windows, cost_per_side) if shorts else None
+    return entry, random_side(closes, placed, windows, cost_per_side) if shorts and random_side_test else None
+
+
+def _filled_benchmarks(prices, folds, test_bars, taker, half, cost_per_side, shorts, leverage, market, charged,
+                       fill: DrawFill, bar):
+    """RANDOM-ENTRY (HoE 14:08 and 14:43 UK 21 Oct; Advisor): the strategy's side is its realised trips as the engine
+    booked them (fees, fills, funding; less an ABSORB-GAP charge, charged), a same-candle trip kept, at `taker` in
+    place of the fee its runs paid (a cost-ladder rung); each draw keeps a trip's side and holding period, as a cap,
+    and is filled as the engine fills the definition's own exits (fills.Pricer). The trips must reconcile to the
+    windows' equity within RECONCILE_PP, else the comparison is NOT JUDGED."""
+    index = prices.index.tz_localize("UTC") if prices.index.tz is None else prices.index
+    pricer = fill.pricer(prices, cost_per_side, half)
+    windows, placed, realised, gaps, stops = [], [], [], [], []
+    trips_total = equity_total = 1.0
+    for f in folds:
+        end = bar(f.test_end)
+        start = end - test_bars  # the close before the window: a counted trip may open on it (_window_trips)
+        windows.append((start, end))
+        sizes = dict(getattr(f, "trip_sizes", []) or [])
+        perp = f.chosen.get("market", market) == PERP
+        for t in f.trip_returns:
+            entry, out = _trip_bars(index, t["opened"], t["closed"], end)
+            placed.append(Trade(entry, out, t["side"], leverage=leverage if perp else None,
+                                size=sizes.get(t["opened"], 1.0)))
+            r = t["ret"] + (fill.run_taker - taker) * (1 + t["exit_ratio"])  # a rung's fee in place of the run's
+            uncharged = dict(getattr(f, "trip_charges", []) or []).get(t["opened"], 0.0) if not charged else 0.0
+            realised.append(r + uncharged)
+            # The STOP-FILL gap at the draws' fill: the level less the taker's slippage, not the bare level.
+            slip = float(taker_slippage(half[out] if np.ndim(half) else half))
+            gaps.append(t.get("stop_gap", 0.0) - t.get("stop_level", 0.0) * slip)
+            stops.append(bool(t.get("stopped")))
+        if f.trip_reconcile is not None:
+            pnl, moved, base = f.trip_reconcile
+            if base:
+                trips_total *= 1 + pnl / base
+                equity_total *= 1 + moved / base
+    bars = sum(f.window_bars for f in folds)
+    in_market = sum(f.in_market_bars for f in folds) / bars if bars else None
+    realised = np.asarray(realised, dtype=float)
+    entry = random_entry_filled(placed, realised, windows, pricer, (trips_total - 1, equity_total - 1),
+                                in_market=in_market, gaps=np.asarray(gaps, dtype=float),
+                                stops=np.asarray(stops, dtype=bool))
+    side = random_side_filled(placed, realised, windows, pricer) if shorts else None
     return entry, side
+
+
+def _draw_fill(spec, folds: list[Fold], bar_minutes: int, exec_prices, instrument, prices: pd.DataFrame,
+               run_taker: float) -> DrawFill | None:
+    """RANDOM-ENTRY: how this study's draws are filled: from the one rule definition its windows traded, or None (a
+    hand-coded model: the close-priced comparison, said on the sheet)."""
+    from sleeve_fund.research.fills import unmodelled
+
+    if spec.name != "rules":
+        return None
+    chosen = [f.chosen for f in folds if f.trip_returns]
+    defs = {json.dumps(c.get("definition"), sort_keys=True) for c in chosen}
+    if len(defs) != 1 or not chosen or not chosen[0].get("definition"):
+        return None
+    definition = chosen[0]["definition"]
+    why = unmodelled(definition, bar_minutes)
+    return DrawFill(None if why else definition, bar_minutes, exec_prices,
+                    _settlement_rates(chosen[0], instrument, prices), run_taker,
+                    refused=f"its draws can't be filled as the engine fills its exits: {why}" if why else "")
+
+
+def _trip_bars(index: pd.DatetimeIndex, opened, closed, end: int) -> tuple[int, int]:
+    """A realised trip on the candle grid: entered at the last close at or before it opened, out at the first close
+    at or after it closed (a stop inside a candle is out at that candle), no later than `end`; a trip opened and
+    closed on one candle keeps a hold of 0, never pushed out a candle."""
+    entry = max(int(index.searchsorted(opened, side="right")) - 1, 0)
+    return entry, min(max(int(index.searchsorted(closed, side="left")), entry), end)
+
+
+def _settlement_rates(params: dict, instrument, prices: pd.DataFrame, root=None) -> tuple | None:
+    """RANDOM-ENTRY: each funding settlement over `prices` as the engine charges it, (times ns, rates, baseline):
+    the venue's stored rate, else the baseline both sides pay (a missing one, or every one of a simulated perp's);
+    None on spot."""
+    terms = markets.terms(params, str(instrument.id.venue))
+    if terms is None or not len(prices):
+        return None
+    idx = prices.index if prices.index.tz is not None else prices.index.tz_localize("UTC")
+    times = markets.funding_times(idx[0].to_pydatetime(), idx[-1].to_pydatetime(), terms.funding_hours)
+    baseline = markets.baseline_rate(terms)
+    if terms.funding_venue is None:
+        rates, base = [baseline] * len(times), [True] * len(times)
+    else:
+        pair = pair_of(instrument)
+        series, cap = funding.rates(terms.funding_venue, pair, root), funding.cap_of(terms.funding_venue, pair)
+        found = [funding.rate_at(series, pd.Timestamp(t), cap) for t in times]
+        rates, base = [baseline if r is None else r for r in found], [r is None for r in found]
+    return (np.array([pd.Timestamp(t).value for t in times], dtype=np.int64), np.array(rates, dtype=float),
+            np.array(base, dtype=bool))
 
 
 HOLD_COVERAGE_FLOOR = 0.5  # the share of out-of-sample days a perp hold must cover to judge (Advisor, 7 Oct 2026)

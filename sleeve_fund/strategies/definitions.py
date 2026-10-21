@@ -50,7 +50,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from sleeve_fund.strategies.indicators import BLOCKS, Donchian
-from sleeve_fund.strategies.indicators._common import warmup
+from sleeve_fund.strategies.indicators._common import Block, Setting, warmup
 from sleeve_fund.strategies.timeframes import DAY_MINUTES, MINUTE_NS, span
 
 VERSION = 1
@@ -102,8 +102,96 @@ class ClosedChannel(Donchian):
         return s["period"]
 
 
+# R-06 (pre-registered trend-long variants V1/V2, PM approved the round 21 Oct): the funding-rate decile, as the Advisor
+# ruled (21 Oct ~10:20 UK). Only settlements STRICTLY BEFORE the decision candle's close are read: one stamped at the
+# close (within funding.MATCH of it, as a stored stamp may sit either side) is not, so an 08:00 decision reads the 00:00
+# settlement. A window holding less than FUNDING_COVERAGE of its scheduled settlements gives no value. The top decile is
+# FUNDING_TOP: the latest rate with 90% or more of its window strictly below it (ties count as not below).
+FUNDING_AT_CLOSE = False
+FUNDING_COVERAGE = 0.8
+FUNDING_TOP = 10
+DAY_NS = DAY_MINUTES * MINUTE_NS
+
+
+def funding_decile_of(window: list | tuple, latest: float) -> int:
+    """The decile, 1 to 10, of `latest` among `window` (the rates it sits in, itself included): one more than ten times
+    the share strictly below it, so the highest rate of the window reads 10 and ties take the lower decile."""
+    below = sum(1 for r in window if r < latest)
+    return min(10, math.floor(10 * below / len(window)) + 1)
+
+
+class FundingDecile(Block):
+    """R-06, studies only: the decile of the latest settled funding rate among the settlements of the trailing
+    `window_days` days, read at each decision candle's close from the venue's stored settled rates settled strictly
+    before it (FUNDING_AT_CLOSE; no look-ahead: the decile is of the trailing window only, never the full sample). The
+    runner hands it `source` = (settlement times ns, rates, interval ns), sorted; paper never does, so it never reads a
+    value there.
+
+    No value, and so no rule reading it holds (an entry gated on it never opens), when the latest scheduled settlement
+    before the close has no stored rate or the window holds under FUNDING_COVERAGE of its settlements: a missing rate is
+    never assumed. For the sheet, `no_rate` counts those candles and `top_decile` the candles it read FUNDING_TOP on."""
+
+    SETTINGS = (Setting("window_days", int, 90, min=7, max=365),)
+    OUTPUTS = ("value",)
+
+    def __init__(self, window_days: int = 90) -> None:
+        self.window_days = int(window_days)
+        self.source = None
+        self.reset()
+
+    def reset(self) -> None:
+        self._value, self._ready, self.no_rate, self.top_decile = 0.0, False, 0, 0
+
+    def update_raw(self, close: float, ts_ns: int) -> None:
+        import numpy as np
+
+        self._ready = False
+        if self.source is None:
+            self.no_rate += 1
+            return
+        times, rates, interval = self.source
+        from sleeve_fund.funding import MATCH
+
+        until = int(ts_ns)
+        if FUNDING_AT_CLOSE:
+            j, due = int(np.searchsorted(times, until, side="right")), interval - MATCH.value
+        else:  # a stamp within MATCH of the close is the close's own settlement: not read
+            j, due = int(np.searchsorted(times, until - MATCH.value, side="left")), interval + MATCH.value
+        # The last settlement read must be the latest one due: one further back than an interval (give or take the
+        # MATCH a stored stamp may sit either side of its settlement) means the latest one is missing.
+        if j == 0 or until - int(times[j - 1]) > due:
+            self.no_rate += 1
+            return
+        i = int(np.searchsorted(times, until - self.window_days * DAY_NS, side="right"))
+        window = rates[i:j]
+        if len(window) < FUNDING_COVERAGE * self.window_days * DAY_NS / interval:
+            self.no_rate += 1
+            return
+        self._value, self._ready = float(funding_decile_of(window, float(window[-1]))), True
+        self.top_decile += self._value >= FUNDING_TOP
+
+    def update_ohlcv(self, open_, high, low, close, volume, ts_ns=None) -> None:
+        if ts_ns is None:
+            raise ValueError("the funding rate decile needs each candle's close time")
+        self.update_raw(close, ts_ns)
+
+    @property
+    def initialized(self) -> bool:
+        return self._ready
+
+    def _outputs(self) -> dict:
+        return {"value": self._value}
+
+    @warmup
+    def warmup_bars(cls, s) -> int:
+        return 0  # its window is of settlements, not candles: it reads as soon as they are stored
+
+
+# Blocks a study may run but paper and live refuse on Start until the PM approves them (R-06).
+STUDY_ONLY_BLOCKS = {"funding_decile": "the funding rate decile block"}
+
 # The blocks a definition builds, by name: the library's, with channels counted as the rule builder defines them.
-BUILDER_BLOCKS = {**BLOCKS, "donchian": ClosedChannel}
+BUILDER_BLOCKS = {**BLOCKS, "donchian": ClosedChannel, "funding_decile": FundingDecile}
 
 
 # What the builder offers for each block, by its name in BLOCKS. ATR is Wilder's; the simple average of true ranges
@@ -115,6 +203,7 @@ CATALOGUE = {
     "stochastic": "Stochastic", "keltner": "Keltner channel", "rolling_max": "Rolling high", "rolling_min": "Rolling low",
     "prior_period": "Previous day or week",
     "session_levels": "Asia or London session high/low",
+    "funding_decile": "Funding rate decile (studies only)",
 }
 _ID = re.compile(r"^[a-z_][a-z0-9_]*$")
 _TIMEFRAME = re.compile(r"^(\d+)(m|h|d)$")
@@ -299,8 +388,12 @@ def _check_blocks(spec: dict, bar_minutes: int | None) -> dict:
         if not isinstance(b, dict) or "kind" not in b:
             raise ValueError(f"block {bid} needs a kind, e.g. kind = \"rsi\"")
         kind = b["kind"]
-        if kind not in BLOCKS:
-            raise ValueError(f"block {bid}: no indicator block called {kind!r}; known: {', '.join(sorted(BLOCKS))}")
+        if kind not in BUILDER_BLOCKS:
+            raise ValueError(f"block {bid}: no indicator block called {kind!r}; known: "
+                             f"{', '.join(sorted(BUILDER_BLOCKS))}")
+        if kind in STUDY_ONLY_BLOCKS and "timeframe" in b:
+            raise ValueError(f"block {bid}: {STUDY_ONLY_BLOCKS[kind]} reads at each decision candle's close, so it "
+                             "takes no timeframe")
         settings = {k: v for k, v in b.items() if k not in ("kind", "timeframe", "input")}
         try:
             settings = {k: v for k, v in BUILDER_BLOCKS[kind].check_settings(settings).items() if v is not None}

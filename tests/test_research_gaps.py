@@ -5,6 +5,7 @@ G3 the day of the month in a rule, G4 the previous calendar week's (or day's) hi
 import copy
 import hashlib
 import json
+import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -106,21 +107,10 @@ def test_g1_a_side_table_needs_its_side():
                          bar_minutes=1)
 
 
-# The Researcher's definitions' content hashes on main 14ed240, before G1-G4: the trials register's keys.
-QR_HASHES = {
-    "qr01_trend_ema_long": "db887a6fa3a01f1b", "qr01_trend_ema_short": "8ff28a74df7b0372",
-    "qr01b_trend_multispeed_long": "e122ddf1851edf73", "qr01b_trend_multispeed_short": "ebeb628bca57ab35",
-    "qr01c_trend_donchian_long": "a64268b388237a66", "qr01c_trend_donchian_short": "170c176d9440913e",
-    "qr02_dip_long": "ce126dc7f0c4275c", "qr02_dip_short": "d6a770a1cc522b77",
-    "qr03_squeeze_long": "95545de0d400e19f", "qr03_squeeze_short": "8bb0e50ac6fd3c0f",
-    "qr10_capitulation_long": "62a1ee8da26544c1", "qr11_exhaustion_long": "8ad588bcd437b26a",
-    "qr11_exhaustion_short": "daa1bea4ae612937", "qr12_overnight_breakout_long": "aa3a666c41d9381c",
-    "qr13_level_continuation_long": "18e1ac88db4b05b8", "qr13_level_continuation_short": "8ee488792d38fdd4",
-    # R-27 (HoE TEC, 21 Oct 2026): three new pre-registered definitions, added; no existing hash changed.
-    "qr01d_trend_donchian20_long": "1b9b732b0d34ecf6", "qr20_volume_surge_breakout_long": "9038fc9ed7fdbfa9",
-    "qr21_trend_sma200_long": "171c64b27d8699d2",
-    "qr22_price_above_sma20_long": "eb41579629a697ab", "qr23_vma_band_sma50_long": "532b63bfc5402bf8",
-}
+# The Researcher's definitions' content hashes on main 14ed240, before G1-G4, and every definition added since: the
+# trials register's keys, pinned in configs/definition_pins.toml (R-29: a rule PR touches no test).
+QR_HASHES = {fid: pin["definition_hash"] for fid, pin in tomllib.loads(
+    (DEFINITIONS.parent / "definition_pins.toml").read_text()).items()}
 
 
 def test_g1_existing_definitions_keep_their_hashes():

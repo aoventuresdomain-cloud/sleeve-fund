@@ -1,0 +1,26 @@
+# QR-B12 price-vs-average family, try 4 (21 Oct 2026, Quant Researcher). Decision candle: 1d.
+# Variant of qr23 (row 21), pre-registered before any run after the PM asked about its -58% drawdown (21 Oct 14:40 UK).
+# Only change: a 3 ATR(14) trailing stop that only tightens. Entry and band exit unchanged from the paper.
+version = 1
+name = "qr23b-vma-band-sma50-trail-long"
+title = "BLL VMA(1,50,1%) Band + 3 ATR Trail (daily) · Long"
+reason = """qr23 (Brock, Lakonishok and LeBaron VMA(1,50,1%), hold-inside-band) gives back much of a big run before the
+close falls 1% below its 50-day average. Add one trailing stop, 3 ATR(14) below the close, that only tightens, so part
+of a large run is locked in. After a trail exit there is no re-entry until a close is back inside the band: the entry
+is a cross above 1.01 x SMA, the same as qr23's level entry except a window's first entry. 3 ATR is the stop already
+used on rows 1, 3 and 18, not tuned here. Held at 1x."""
+
+[blocks.sma]
+kind = "sma"
+period = 50
+
+[blocks.atr]
+kind = "atr"
+period = 14
+
+[long]
+entry = { left = "close", op = "crosses_above", right = { mul = [1.01, "sma"] } }
+exit = { left = "close", op = "<", right = { mul = [0.99, "sma"] } }
+
+[exits]
+trail = { level = { sub = ["close", { mul = [3.0, "atr"] }] }, ratchet = true }
