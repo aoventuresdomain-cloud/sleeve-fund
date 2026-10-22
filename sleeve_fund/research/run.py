@@ -34,9 +34,11 @@ STUDY_MINUTES = (1440, 240, 60, 15, 5)
 EXEC_BAR_BUDGET = 150_000
 EXEC_STEPS = (1, 5, 15, 60)
 # The out-of-sample windows and the holdout (with the training bars that warm each window up) run on 1-minute bars for
-# G1 (P1-D13): a few runs, not one per setting and fee, so their cap is higher. About five and a half years of minutes;
-# past it they run on 5-minute bars, a one-way test (study.ONE_WAY_MINUTES).
-OOS_EXEC_BUDGET = 3_000_000
+# G1 (P1-D13): a few runs, not one per setting and fee, so their cap is higher. About six and a half years of minutes
+# (a study's research period plus holdout reached 6 years on 22 Oct); past it they run on 5-minute bars, a one-way
+# test (study.ONE_WAY_MINUTES). When they fit, every run of the study is matched on them (PM 22 Oct: 15-minute
+# decisions, 1-minute execution); a 6-year 1-minute run took about 75 s and 0.5 GB (HoE, 22 Oct).
+OOS_EXEC_BUDGET = 3_500_000
 # Stored history ending longer ago than this is still being backfilled; a study says so.
 STALE_HISTORY = pd.Timedelta(days=1)
 BASKET_POOL = ("BTC", "ETH", "SOL", "XRP")  # STUDY-ASSET-LIST: the research pool an asset list draws from (PM 21 Oct)
@@ -234,6 +236,8 @@ def run_store_study(req: StudyRequest, store=None, progress=None, ledger_path: P
         if oos_step < req.minutes and (prices.index[-1] - start) / pd.Timedelta(minutes=oos_step) <= OOS_EXEC_BUDGET:
             oos_exec = exec_prices if step == oos_step else history.read(profile.name, req.pair, oos_step, start=start)
             break
+    if oos_exec is not None and len(oos_exec) and oos_step == 1:
+        exec_prices = oos_exec
 
     def minutes_between(lo, hi):
         return history.read(profile.name, req.pair, 1, start=lo, end=hi)

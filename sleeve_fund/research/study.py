@@ -984,9 +984,16 @@ def run_study(
     # The research period shown (trade list, costs, regimes) on the out-of-sample windows' 1-minute bars, as paper
     # fills; the settings sweep stays on the coarse bars, which the falsifier below measures against.
     coarse_default = full_default
-    one_minute = minutes > 1 and (exec_minutes or minutes) > 1 and oos_minutes == 1
-    if one_minute:
+    one_minute = minutes > 1 and oos_minutes == 1
+    if one_minute and (exec_minutes or minutes) > 1:
         full_default = bt(spec.name, research, default_params, feed=oos_exec_prices)
+    elif one_minute:  # every run already on 1-minute bars: the falsifier's coarse side is the bars alone
+        kept = list(labels)  # its fills are the falsifier's, not this study's
+        try:
+            coarse_default = bt(spec.name, research, default_params, feed=oos_exec_prices.iloc[:0])
+        except ValueError:  # a first_touch rule can't run on bars alone, so there is nothing to falsify against
+            coarse_default = None
+        labels[:] = kept
     sensitivity = pd.DataFrame(rows)
     overfit = _overfit(grid_returns, [{**p, **exits} for p in combos], register, spec, research, bt, idea_hash)
     # The settings tuning on the whole period would pick; the ladder and its verified break-even are theirs.
@@ -1393,8 +1400,12 @@ def run_study(
         _one_way(result, ledger, fold_runs, bt, minute_loader, bar)
     if one_minute:
         # The falsifier: the research period at the default settings on 1-minute bars against the coarse run.
-        if len(full_default.equity) and len(coarse_default.equity):
+        if coarse_default is not None and len(full_default.equity) and len(coarse_default.equity):
             result.bars_only_gap = float(full_default.equity.iloc[-1] - coarse_default.equity.iloc[-1]) / starting_capital
+            net = float(full_default.equity.iloc[-1]) / starting_capital - 1
+            if abs(result.bars_only_gap) > 0.2 * abs(net):  # Advisor 22 Oct: only when it would change the reading
+                by = f" by {abs(result.bars_only_gap) / abs(net):.0%}" if net else ""
+                result.notes.append(f"1-minute and bar-only results differ{by}; read with care.")
             ledger.record(idea=spec.name, family=spec.family, params={**default_params, **exits}, dataset=dataset,
                           stage=GAP_STAGE, sharpe=summary(daily_returns(coarse_default.equity))["sharpe"],
                           extra={"bars_only_gap": round(result.bars_only_gap, 8)})
