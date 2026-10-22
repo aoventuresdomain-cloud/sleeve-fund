@@ -1,0 +1,94 @@
+name: sheet-export
+# SHEET-EXPORT (PM yes 22 Oct 21:37 UTC): brings one finished study tear sheet, and the files the sheet writer puts
+# beside it under the same stem (sleeve_fund/research/run.py), from the paper server's TEARSHEET_DIR to the project.
+# Read-only: a one-off container of the dashboard's image tars the named files to stdout; nothing is written on the
+# server or in the database. The results are encrypted on the runner to a key only the project holds
+# (deploy/keys/sheet-export.pub.pem; the private key never sees GitHub), and only the two ciphertext files are kept,
+# as a 3-day artifact. The repository is public, so the log shows file names and byte counts only, never contents.
+# Decrypt with scripts/decrypt_sheet_export.sh. Run it by hand from main.
+on:
+  workflow_dispatch:
+    inputs:
+      sheet:
+        description: Tear-sheet file stem, the sheet's name without .md (letters, digits, _ - . only)
+        required: true
+# One export at a time.
+concurrency: { group: sheet-export, cancel-in-progress: false }
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions: { contents: read }
+    if: ${{ vars.DEPLOY_ENABLED == 'true' && github.ref == 'refs/heads/main' }}
+    env:
+      USER_AT: ${{ vars.DEPLOY_USER || 'root' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Check the input
+        env:
+          SHEET: ${{ inputs.sheet }}
+        run: |
+          # A bare file stem: no path, no "..", nothing a shell would read as more than a word.
+          [[ "$SHEET" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,199}$ && "$SHEET" != *..* ]] \
+            || { echo "sheet must be a tear-sheet file stem: letters, digits, _ - . only, no / or .., at most 200"; exit 1; }
+      - name: Configure SSH
+        env:
+          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/id_deploy && chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts
+      - name: Read the sheet
+        env:
+          RUN_ID: ${{ github.run_id }}
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          SHEET: ${{ inputs.sheet }}
+        run: |
+          # The sheet and what run.py writes beside it (write_results, write_returns, write_oos_returns,
+          # write_beside), those that exist; regular files only, never a link. Read only: tar to stdout.
+          set -euo pipefail
+          umask 077
+          mkdir -p "$RUNNER_TEMP/plain"
+          ssh -i ~/.ssh/id_deploy -o ServerAliveInterval=30 -o ServerAliveCountMax=10 "$USER_AT@$HOST" \
+            "cd /opt/sleeve-fund && sudo docker compose run --rm -T --no-deps --name sheet-export-$RUN_ID -e SHEET=$SHEET dashboard sh -c '
+              cd \"\$TEARSHEET_DIR\" || exit 2
+              [ -f \"\$SHEET.md\" ] && [ ! -L \"\$SHEET.md\" ] || { echo \"no such sheet\" >&2; exit 3; }
+              set --
+              for f in \"\$SHEET.md\" \"\$SHEET.results.json\" \"\$SHEET.returns.csv\" \"\$SHEET.oos-returns.csv\" \
+                       \"\$SHEET-trades.csv\" \"\$SHEET-equity.csv\" \"\$SHEET-equity.svg\"; do
+                [ -f \"\$f\" ] && [ ! -L \"\$f\" ] && set -- \"\$@\" \"\$f\"
+              done
+              tar -czf - -- \"\$@\"'" > "$RUNNER_TEMP/plain/sheet.tar.gz"
+          # Names and sizes only. Every member must be one of the expected names, a plain file at the top level.
+          tar -tvzf "$RUNNER_TEMP/plain/sheet.tar.gz" | while read -r mode _ size _ _ name; do
+            case "$mode" in -*) ;; *) echo "::error::not a regular file in the archive"; exit 1;; esac
+            case "$name" in
+              "$SHEET.md"|"$SHEET.results.json"|"$SHEET.returns.csv"|"$SHEET.oos-returns.csv"|"$SHEET-trades.csv"|"$SHEET-equity.csv"|"$SHEET-equity.svg") ;;
+              *) echo "::error::unexpected name in the archive"; exit 1;;
+            esac
+            echo "$name $size bytes"
+          done
+      - name: Encrypt
+        run: |
+          # Hybrid: a fresh random key encrypts the archive; the project's public key (RSA-OAEP, SHA-256) wraps it.
+          set -euo pipefail
+          umask 077
+          mkdir -p "$RUNNER_TEMP/out"
+          openssl rand -hex 32 > "$RUNNER_TEMP/plain/key.hex"
+          openssl enc -aes-256-cbc -pbkdf2 -salt -in "$RUNNER_TEMP/plain/sheet.tar.gz" -out "$RUNNER_TEMP/out/sheet.tar.gz.enc" -pass "file:$RUNNER_TEMP/plain/key.hex"
+          openssl pkeyutl -encrypt -pubin -inkey deploy/keys/sheet-export.pub.pem -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 -in "$RUNNER_TEMP/plain/key.hex" -out "$RUNNER_TEMP/out/key.bin.enc"
+          rm -rf -- "$RUNNER_TEMP/plain"
+          for f in "$RUNNER_TEMP"/out/*; do echo "$(basename "$f") $(stat -c %s "$f") bytes"; done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sheet-export-${{ github.run_id }}
+          path: ${{ runner.temp }}/out/
+          retention-days: 3
+          if-no-files-found: error
+      - name: Clean up
+        if: always()
+        run: rm -rf -- "$RUNNER_TEMP/plain" "$RUNNER_TEMP/out" ~/.ssh/id_deploy
