@@ -981,6 +981,12 @@ def run_study(
             full_default = res
     if full_default is None:
         full_default = bt(spec.name, research, default_params)
+    # The research period shown (trade list, costs, regimes) on the out-of-sample windows' 1-minute bars, as paper
+    # fills; the settings sweep stays on the coarse bars, which the falsifier below measures against.
+    coarse_default = full_default
+    one_minute = minutes > 1 and (exec_minutes or minutes) > 1 and oos_minutes == 1
+    if one_minute:
+        full_default = bt(spec.name, research, default_params, feed=oos_exec_prices)
     sensitivity = pd.DataFrame(rows)
     overfit = _overfit(grid_returns, [{**p, **exits} for p in combos], register, spec, research, bt, idea_hash)
     # The settings tuning on the whole period would pick; the ladder and its verified break-even are theirs.
@@ -1336,7 +1342,10 @@ def run_study(
             f"Resting orders (stops, targets, post-only orders) are matched on {exec_minutes}-minute bars between "
             f"decisions, and the risk guard values the book on each, as the backtest page does.")
     if oos_minutes is not None and oos_minutes != exec_minutes:
-        result.notes.append(f"The out-of-sample windows and the holdout are matched on {oos_minutes}-minute bars.")
+        result.notes.append(f"The out-of-sample windows and the holdout are matched on {oos_minutes}-minute bars"
+                            + (", and so are the research period's trades, costs and regime table. The settings "
+                               "sweep, the overfitting check (PBO) and the cost ladder, including the break-even fee, "
+                               f"stay on the coarser {exec_minutes or minutes}-minute bars." if one_minute else "."))
     elif risk_profile is not None:
         result.notes.append(f"The risk guard values the book once a {_bar_words(minutes)}; paper does every 30 seconds.")
     if minutes < 1440:
@@ -1382,13 +1391,12 @@ def run_study(
     result.resting_exits = resting[0]
     if result.resting_exits and oos_minutes is not None and 1 < oos_minutes <= ONE_WAY_MINUTES and not result.not_judged:
         _one_way(result, ledger, fold_runs, bt, minute_loader, bar)
-    if minutes > 1 and (exec_minutes or minutes) > 1 and oos_minutes == 1:
+    if one_minute:
         # The falsifier: the research period at the default settings on 1-minute bars against the coarse run.
-        ref = bt(spec.name, research, default_params, feed=oos_exec_prices)
-        if len(ref.equity) and len(full_default.equity):
-            result.bars_only_gap = float(ref.equity.iloc[-1] - full_default.equity.iloc[-1]) / starting_capital
+        if len(full_default.equity) and len(coarse_default.equity):
+            result.bars_only_gap = float(full_default.equity.iloc[-1] - coarse_default.equity.iloc[-1]) / starting_capital
             ledger.record(idea=spec.name, family=spec.family, params={**default_params, **exits}, dataset=dataset,
-                          stage=GAP_STAGE, sharpe=summary(daily_returns(full_default.equity))["sharpe"],
+                          stage=GAP_STAGE, sharpe=summary(daily_returns(coarse_default.equity))["sharpe"],
                           extra={"bars_only_gap": round(result.bars_only_gap, 8)})
 
     if register is not None:
