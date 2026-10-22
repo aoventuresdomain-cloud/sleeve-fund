@@ -269,7 +269,7 @@ def test_a_store_study_runs_under_paper_rules(tmp_path):
     sheet = run_store_study(req, progress=done.append, ledger_path=tmp_path / "l.jsonl", out_dir=tmp_path / "ts",
                             history=hist).read_text()
     assert "trades under the conservative risk profile" in sheet and "drawdown halt" in sheet
-    assert "matched on 5-minute bars" in sheet  # 130 days fit the budget at 5 minutes
+    assert "matched on 1-minute bars" in sheet  # 130 days fit the 1-minute budget, so every run uses it (PM 22 Oct)
     assert "Tested on `ETH/USD` at 240-minute bars" in sheet
     assert done and done == sorted(done) and done[-1] <= 1
     with pytest.raises(ValueError, match="would take hours"):

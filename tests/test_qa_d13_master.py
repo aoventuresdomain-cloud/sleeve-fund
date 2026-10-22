@@ -1436,9 +1436,19 @@ def test_bars_only_end_equity_is_never_above_the_1_minute_run(case):
     assert gap <= tolerance, f"bars-only ends {gap:,.2f} better than the 1-minute run (tolerance {tolerance:,.2f})"
 
 
-def test_the_research_period_shown_is_on_1_minute_bars_when_the_windows_are():
-    """PM 22 Oct ("15 minute decisions, 1 minute execution"): the research period's trade list, costs and regime
-    table come from the 1-minute run the falsifier already makes; the settings sweep stays on the coarse bars."""
+def test_every_run_is_on_1_minute_bars_when_the_minutes_fit():
+    """PM 22 Oct ("15 minute decisions, 1 minute execution"): when the span's minutes fit, every run of the study
+    (settings, cost ladder, research period) is matched on 1-minute bars, so no fill label says pessimistic; the
+    falsifier's bars-only run is measured but labels nothing."""
     r = _store_study()["result"]
-    assert any("so are the research period's trades" in n for n in r.notes), r.notes
+    assert any("matched on 1-minute bars" in n for n in r.notes), r.notes
+    assert not r.fill_labels, r.fill_labels
     assert r.bars_only_gap is not None and r.bars_only_gap >= -0.001, r.bars_only_gap
+
+
+def test_a_large_bars_only_gap_says_read_with_care():
+    """Advisor 22 Oct: the falsifier gap stays off the sheet unless it is over 20% of the net result."""
+    r = _store_study()["result"]
+    net = float(r.full_period.equity.iloc[-1]) / float(r.full_period.equity.iloc[0]) - 1
+    shown = any("bar-only results differ" in n for n in r.notes)
+    assert shown == (abs(r.bars_only_gap) > 0.2 * abs(net)), (r.bars_only_gap, net, r.notes)
