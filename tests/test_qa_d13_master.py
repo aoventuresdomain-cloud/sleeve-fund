@@ -1434,3 +1434,11 @@ def test_bars_only_end_equity_is_never_above_the_1_minute_run(case):
     tolerance = abs(bo.fees_paid - rf.fees_paid) + 0.01
     gap = float(bo.equity.iloc[-1]) - float(rf.equity.iloc[-1])
     assert gap <= tolerance, f"bars-only ends {gap:,.2f} better than the 1-minute run (tolerance {tolerance:,.2f})"
+
+
+def test_the_research_period_shown_is_on_1_minute_bars_when_the_windows_are():
+    """PM 22 Oct ("15 minute decisions, 1 minute execution"): the research period's trade list, costs and regime
+    table come from the 1-minute run the falsifier already makes; the settings sweep stays on the coarse bars."""
+    r = _store_study()["result"]
+    assert any("so are the research period's trades" in n for n in r.notes), r.notes
+    assert r.bars_only_gap is not None and r.bars_only_gap >= -0.001, r.bars_only_gap
