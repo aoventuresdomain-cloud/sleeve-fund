@@ -1,0 +1,86 @@
+name: fill-audit-export
+# ONE-OFF (PM yes, 22 Oct 20:42 UTC): a read-only copy of the stored BTC/USDT perp 1-minute prices (public prices
+# only) around six hard-coded trade windows, for the fill audit. Reads the history files (HistoryStore.read, venue
+# binance, mounted read-only into the dashboard image) in a one-off container (docker compose run --rm --no-deps) on
+# the paper server; the CSV goes over SSH stdout straight to this runner, so nothing is written on the server beyond
+# that container's own temp, and nothing to the journal or DB. Each window starts 6 hours before the listed time so
+# ATR(14)/SMA(20) on 15-minute bars can be warmed. The log prints row counts per window only, never prices; the CSV
+# is this run's artifact (3 days). No inputs: the windows are fixed below. Run it by hand from main, once.
+on:
+  workflow_dispatch:
+concurrency: { group: fill-audit-export, cancel-in-progress: false }
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions: { contents: read, actions: read }
+    if: ${{ vars.DEPLOY_ENABLED == 'true' && github.ref == 'refs/heads/main' }}
+    env:
+      USER_AT: ${{ vars.DEPLOY_USER || 'root' }}
+    steps:
+      - name: Require green tests for this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # As study.yml: the push run of tests.yml on main at this commit passed.
+          ok=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow tests.yml --commit "$GITHUB_SHA" --branch main \
+               --event push --status success --json databaseId --jq length)
+          [ "$ok" -gt 0 ] || { echo "FAIL: the tests have not passed on main at $GITHUB_SHA; wait for the tests workflow"; exit 1; }
+      - name: Configure SSH
+        env:
+          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/id_deploy && chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts
+      - name: Export the windows
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          cat > export.py <<'PY'
+          # One-off, PM yes 22 Oct 20:42 UTC, read-only, public prices. CSV to stdout; row counts only to stderr.
+          import sys
+          import pandas as pd
+          from sleeve_fund.history import HistoryStore
+
+          WARM = pd.Timedelta(hours=6)
+          # (label, listed start, listed end), UTC; each read starts WARM earlier. Index is the bar CLOSE time.
+          WINDOWS = [
+              ("2020-11-07", "2020-11-07 19:00", "2020-11-07 20:30"),
+              ("2020-11-26", "2020-11-26 03:00", "2020-11-26 04:00"),
+              ("2020-12-17", "2020-12-17 08:45", "2020-12-17 10:00"),
+              ("2021-01-04", "2021-01-04 09:45", "2021-01-04 10:45"),
+              ("2021-01-10", "2021-01-10 17:15", "2021-01-10 20:45"),
+              ("2021-02-22", "2021-02-22 13:45", "2021-02-22 14:45"),
+          ]
+          store = HistoryStore()  # HISTORY_DIR=/data/history, mounted read-only
+          parts = []
+          for label, start, end in WINDOWS:
+              lo, hi = pd.Timestamp(start, tz="UTC") - WARM, pd.Timestamp(end, tz="UTC")
+              bars = store.read("binance", "BTC/USDT", 1, start=lo, end=hi)  # close times in (lo, hi]
+              df = bars[["open", "high", "low", "close", "volume"]].copy()
+              df.insert(0, "close_time_utc", df.index.strftime("%Y-%m-%dT%H:%M:%SZ"))
+              df.insert(0, "window", label)
+              expected = int((hi - lo) / pd.Timedelta(minutes=1))
+              print(f"{label}: {len(df)} rows (expected {expected})", file=sys.stderr)
+              parts.append(df)
+          pd.concat(parts).to_csv(sys.stdout, index=False)
+          PY
+          ssh -i ~/.ssh/id_deploy -o ServerAliveInterval=30 -o ServerAliveCountMax=10 "$USER_AT@$HOST" \
+            "cd /opt/sleeve-fund && sudo docker compose run --rm -T --no-deps --name fill-audit-$RUN_ID dashboard python -u -" \
+            < export.py > out/btc-usdt-perp-1m-fill-audit.csv
+          # Check the shape without printing any price: the header line and a row count only.
+          [ "$(head -n 1 out/btc-usdt-perp-1m-fill-audit.csv)" = "window,close_time_utc,open,high,low,close,volume" ] \
+            || { echo "::error::unexpected first line in the export (not printed)"; exit 1; }
+          echo "total: $(($(wc -l < out/btc-usdt-perp-1m-fill-audit.csv) - 1)) rows"
+      - name: Upload the CSV
+        uses: actions/upload-artifact@v4
+        with:
+          name: fill-audit-btc-usdt-1m-${{ github.run_id }}
+          path: out/btc-usdt-perp-1m-fill-audit.csv
+          if-no-files-found: error
+          retention-days: 3
