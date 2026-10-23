@@ -179,6 +179,42 @@ def dataset_name(venue: str, pair: str, minutes: int) -> str:
     return f"{venue}-{base}{quote}-store".lower() + (f"-{minutes}m" if minutes != 1440 else "")
 
 
+def execution_bars(req: StudyRequest, prices: pd.DataFrame, profile, history):
+    """The bars a store study matches its resting orders on: (exec_prices, oos_exec, oos_step). A pinned list's study
+    deciding on intraday bars gets 1-minute bars for its whole window or is refused (rescore's dry run calls this too,
+    to prove it before a run)."""
+    # The execution bars are sized on the days the study reads: a list's pinned window, not the whole store, which
+    # can reach back years before a list's data start (the 22 Oct 23:52 BTC run was sized on the whole store, went
+    # over the budget and fell back to 5-minute bars).
+    if req.pinned is not None:
+        from sleeve_fund.research import pinned as pinning
+
+        window = pinning.cut(prices, req.pinned)
+    else:
+        window = prices
+    first, last = window.index[0], window.index[-1]
+    start = first - pd.Timedelta(minutes=req.minutes)
+    exec_prices = None
+    step = exec_step(last - first, req.minutes)
+    if step is not None:
+        exec_prices = history.read(profile.name, req.pair, step, start=start, end=last)
+    oos_exec = None
+    for oos_step in (1, 5):
+        if oos_step < req.minutes and (last - start) / pd.Timedelta(minutes=oos_step) <= OOS_EXEC_BUDGET:
+            oos_exec = exec_prices if step == oos_step else history.read(profile.name, req.pair, oos_step,
+                                                                          start=start, end=last)
+            break
+    if req.pinned is not None and 1 < req.minutes < 1440:
+        # A list's intraday study runs on 1-minute bars or not at all (PM 23 Oct): no quiet fall back to coarser
+        # fills. A daily row still falls back, and its sheet says on which bars.
+        if oos_exec is None or oos_step != 1:
+            raise ValueError(f"the pinned window's {_bars(1)} bars don't fit the study's budget: no 1-minute run")
+        if not len(oos_exec) or oos_exec.index[0] > start + pd.Timedelta(days=1):
+            raise ValueError(f"the stored {_bars(1)} bars don't cover the pinned window from {first:%d %b %Y}: "
+                             "no 1-minute run")
+    return exec_prices, oos_exec, oos_step
+
+
 def run_store_study(req: StudyRequest, store=None, progress=None, ledger_path: Path | None = None,
                     out_dir: Path | None = None, history=None, notes: tuple[str, ...] = ()) -> Path:
     """Run the study and write its tear sheet; returns the tear sheet's path. store: the journal
@@ -227,15 +263,7 @@ def run_store_study(req: StudyRequest, store=None, progress=None, ledger_path: P
     # sub-$10 instrument to the cent (review round 9, B9-2).
     instrument = profile.instrument(base, quote, fees=fees.fees,
                                     price_precision=history_price_decimals(prices["close"]))
-    exec_prices = None
-    step = exec_step(prices.index[-1] - prices.index[0], req.minutes)
-    if step is not None:
-        exec_prices = history.read(profile.name, req.pair, step, start=prices.index[0] - pd.Timedelta(minutes=req.minutes))
-    oos_exec, start = None, prices.index[0] - pd.Timedelta(minutes=req.minutes)
-    for oos_step in (1, 5):
-        if oos_step < req.minutes and (prices.index[-1] - start) / pd.Timedelta(minutes=oos_step) <= OOS_EXEC_BUDGET:
-            oos_exec = exec_prices if step == oos_step else history.read(profile.name, req.pair, oos_step, start=start)
-            break
+    exec_prices, oos_exec, oos_step = execution_bars(req, prices, profile, history)
     if oos_exec is not None and len(oos_exec) and oos_step == 1:
         exec_prices = oos_exec
 
