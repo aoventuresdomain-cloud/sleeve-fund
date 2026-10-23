@@ -120,6 +120,28 @@ def request(name: str, minutes: int, venue: str, pair: str, pinned=None, continu
                            if continuous else {}))
 
 
+def _minute_check(req, history=None) -> str:
+    """For the dry run: whether a row would trade on 1-minute bars over its pinned window, read from the stored history
+    without running anything (PM 23 Oct: prove it on the real store first). Dates and bar lengths only (public log)."""
+    if req.minutes <= 1 or "," in req.pair:
+        return ""
+    from sleeve_fund.history import HistoryStore
+    from sleeve_fund.research.run import execution_bars
+    from sleeve_fund.venues import venue as venue_profile
+
+    profile = venue_profile(req.venue)
+    history = history or HistoryStore()
+    try:
+        prices = history.read(profile.name, req.pair, req.minutes)
+        _, oos_exec, oos_step = execution_bars(req, prices, profile, history)
+    except (KeyError, ValueError) as exc:
+        return f"; execution bars: REFUSED ({exc})"
+    if oos_exec is None or not len(oos_exec):
+        return "; execution bars: none"
+    return (f"; execution bars: {oos_step}-minute, {oos_exec.index[0]:%d %b %Y} to {oos_exec.index[-1]:%d %b %Y}, "
+            f"{len(oos_exec):,} bars")
+
+
 def main(argv: list[str] | None = None, run=None, journal=None) -> int:
     ap = argparse.ArgumentParser(prog="python -m sleeve_fund.research.rescore")
     ap.add_argument("list", help="the study list (markdown with a studies table)")
@@ -151,8 +173,8 @@ def main(argv: list[str] | None = None, run=None, journal=None) -> int:
         req.validate()
     print(f"{len(reqs)} studies on the list's settings (holdout locked)")
     if args.dry_run:
-        for n, name, _ in reqs:
-            print(f"row {n:>2} {name}: checked")
+        for n, name, req in reqs:
+            print(f"row {n:>2} {name}: checked{_minute_check(req)}")
         print(f"dry run: {len(reqs)} checked, 0 run")
         return 0
     if run is None:
