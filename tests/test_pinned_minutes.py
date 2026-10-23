@@ -54,7 +54,7 @@ def test_the_pinned_window_fits_on_1_minute_bars_though_the_store_does_not(monke
     _, oos_exec, oos_step = _bars(_req(pins), hs)
     assert oos_step == 1
     assert oos_exec.index[0] <= pd.Timestamp(pins.data_start, tz="UTC") + pd.Timedelta(minutes=1)
-    assert oos_exec.index[-1] <= pd.Timestamp(pins.end, tz="UTC") + pd.Timedelta(days=1)
+    assert pinning.upto(oos_exec, pins.end).index[-1] == pd.Timestamp(pins.end, tz="UTC") + pd.Timedelta(days=1)
     assert (oos_exec.index.to_series().diff().dropna() == pd.Timedelta(minutes=1)).all()
 
 

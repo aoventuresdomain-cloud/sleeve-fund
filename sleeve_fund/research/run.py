@@ -197,12 +197,11 @@ def execution_bars(req: StudyRequest, prices: pd.DataFrame, profile, history):
     exec_prices = None
     step = exec_step(last - first, req.minutes)
     if step is not None:
-        exec_prices = history.read(profile.name, req.pair, step, start=start, end=last)
+        exec_prices = history.read(profile.name, req.pair, step, start=start)
     oos_exec = None
     for oos_step in (1, 5):
         if oos_step < req.minutes and (last - start) / pd.Timedelta(minutes=oos_step) <= OOS_EXEC_BUDGET:
-            oos_exec = exec_prices if step == oos_step else history.read(profile.name, req.pair, oos_step,
-                                                                          start=start, end=last)
+            oos_exec = exec_prices if step == oos_step else history.read(profile.name, req.pair, oos_step, start=start)
             break
     if req.pinned is not None and 1 < req.minutes < 1440:
         # A list's intraday study runs on 1-minute bars or not at all (PM 23 Oct): no quiet fall back to coarser
