@@ -1,0 +1,41 @@
+# Improve-loop round 1 (24 Oct 2026, Quant Researcher, Advisor cleared): an exact copy of qr21_trend_sma200_ls with
+# one change, each entry also needs the 200-day average moving its way: long only while it is above where it stood 20
+# daily candles ago, short only while below. Decision candle: 1d. Entries are states, not crosses: a cross taken while
+# the slope disagrees is entered later, once it agrees, if the close is still on the right side. On a reversal the
+# other leg passes its own slope check or the Strategy goes flat. Exits and stops are unchanged.
+version = 1
+name = "qr21-trend-sma200-ls-r1-slope"
+title = "200-Day Trend (daily) · Long and Short · SMA200 slope"
+reason = """The 200-day trend rule traded both ways: long while the daily close is above its 200-day average, short
+while it is below. Each side carries a 3 ATR(14) stop against a sudden break.
+Round 0 lost on whipsaws while the 200-day average was flat; trade only in the direction the average itself is
+moving."""
+
+[blocks.sma]
+kind = "sma"
+period = 200
+
+[blocks.sma_ago]  # the 200-day average as it stood 20 daily candles ago
+kind = "lag"
+period = 20
+input = "sma"
+
+[blocks.atr]
+kind = "atr"
+period = 14
+
+[long]
+reverse = true  # flip on the signal candle: a close and an open, each with its fee and half spread (Advisor 24 Oct)
+entry = { all = [{ left = "close", op = ">", right = "sma" }, { left = "sma", op = ">", right = "sma_ago" }] }
+exit = { left = "close", op = "<", right = "sma" }
+
+[short]
+reverse = true
+entry = { all = [{ left = "close", op = "<", right = "sma" }, { left = "sma", op = "<", right = "sma_ago" }] }
+exit = { left = "close", op = ">", right = "sma" }
+
+[exits.long]
+stop = { level = { sub = ["close", { mul = [3.0, "atr"] }] } }
+
+[exits.short]
+stop = { level = { add = ["close", { mul = [3.0, "atr"] }] } }

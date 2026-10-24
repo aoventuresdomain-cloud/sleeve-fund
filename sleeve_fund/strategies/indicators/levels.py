@@ -1,5 +1,6 @@
-"""Levels: the highest or lowest of a series over a window (tool gap G2), the previous calendar period's high, low
-and close (G4), and the last Asia or London session's high and low (R1)."""
+"""Levels: the highest or lowest of a series over a window (tool gap G2), a series' value a set number of candles
+back (the lag), the previous calendar period's high, low and close (G4), and the last Asia or London session's high
+and low (R1)."""
 
 from __future__ import annotations
 
@@ -66,6 +67,43 @@ class RollingMin(_Rolling):
     """The lowest of the last `period` values of its input (tool gap G2)."""
 
     _keep = staticmethod(lambda last, x: last >= x)
+
+
+class Lag(Block):
+    """Its input's value `period` values back: fed the 200-day SMA on daily candles with period 20, it reads that
+    average as it stood 20 completed days ago, so "the SMA200 is rising" is sma > lag (qr21 round 1, 24 Oct). It
+    takes one input, so a definition feeds it another block's output; unfed, it reads the close. Until it has been
+    fed period + 1 values it has no value."""
+
+    SETTINGS = (Setting("period", int, 1, 1, PERIOD_MAX),)
+
+    def __init__(self, period: int = 1) -> None:
+        self.period = whole("period", period, 1)
+        self.reset()
+
+    def reset(self) -> None:
+        self._window: deque[float] = deque(maxlen=self.period + 1)
+        self.count = 0
+        self._value = 0.0
+
+    def update_raw(self, value: float) -> None:
+        self._window.append(float(value))
+        self.count += 1
+        self._value = self._window[0]
+
+    def update_ohlcv(self, open_, high, low, close, volume, ts_ns=None) -> None:
+        self.update_raw(close)
+
+    @property
+    def initialized(self) -> bool:
+        return self.count > self.period
+
+    def _outputs(self) -> dict:
+        return {"value": self._value}
+
+    @warmup
+    def warmup_bars(cls, s) -> int:
+        return s["period"] + 1
 
 
 class PriorPeriod(Block):

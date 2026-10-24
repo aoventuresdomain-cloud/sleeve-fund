@@ -34,6 +34,9 @@ PREREGISTERED = {
     # one Strategy): each parent long exactly, plus its mirror short leg.
     "QR23_LS": {"parent": "qr23_vma_band_sma50_long", "definition": "qr23_vma_band_sma50_ls", "params": {}},
     "QR21_LS": {"parent": "qr21_trend_sma200_long", "definition": "qr21_trend_sma200_ls", "params": {}},
+    # Improve-loop round 1 (Researcher 24 Oct, Advisor cleared): one change each to round 0's long and short.
+    "QR23_R1": {"parent": "qr23_vma_band_sma50_ls", "definition": "qr23_vma_band_sma50_ls_r1_short_sma200", "params": {}},
+    "QR21_R1": {"parent": "qr21_trend_sma200_ls", "definition": "qr21_trend_sma200_ls_r1_slope", "params": {}},
 }
 
 

@@ -23,7 +23,7 @@ from sleeve_fund.strategies.indicators.averages import Atr, Ema, Vwap, Wma
 from sleeve_fund.strategies.indicators.bands import Bollinger, Donchian
 from sleeve_fund.strategies.indicators.classic import AtrSma, Rsi, Sma
 from sleeve_fund.strategies.indicators.filters import Adx, EfficiencyRatio, RelativeVolume
-from sleeve_fund.strategies.indicators.levels import PriorPeriod, RollingMax, RollingMin, SessionLevels
+from sleeve_fund.strategies.indicators.levels import Lag, PriorPeriod, RollingMax, RollingMin, SessionLevels
 from sleeve_fund.strategies.indicators.oscillators import Stochastic
 
 CAP = 1_000  # the most bars a check seeds from (Advisor): 2N above it compares CAP/2 with CAP
@@ -37,7 +37,7 @@ TOLERANCE: dict[type, tuple[str, float]] = {
 }
 # Read the same from any start once their window is full: nothing to check.
 WINDOW: tuple[type, ...] = (Sma, AtrSma, Wma, Vwap, Bollinger, Donchian, EfficiencyRatio, RelativeVolume, Stochastic,
-                            RollingMax, RollingMin, PriorPeriod, SessionLevels)
+                            RollingMax, RollingMin, Lag, PriorPeriod, SessionLevels)
 
 Candle = tuple  # (open, high, low, close, volume, ts_ns)
 

@@ -13,7 +13,7 @@ import pytest
 from nautilus_trader.indicators import ExponentialMovingAverage
 
 from sleeve_fund.strategies.indicators import (
-    BLOCKS, DAY_OF_MINUTE_BARS, FLAT_BAND, NS_PER_DAY, Adx, Atr, AtrSma, Bollinger, Donchian, EfficiencyRatio, Ema, Keltner, PriorPeriod, RelativeVolume, RollingMax, RollingMin, Rsi, RsiDivergence, SessionLevels, Sma, Stochastic, Vwap,
+    BLOCKS, DAY_OF_MINUTE_BARS, FLAT_BAND, NS_PER_DAY, Adx, Atr, AtrSma, Bollinger, Donchian, EfficiencyRatio, Ema, Keltner, Lag, PriorPeriod, RelativeVolume, RollingMax, RollingMin, Rsi, RsiDivergence, SessionLevels, Sma, Stochastic, Vwap,
     Wma, make_block, settle_bars, warmup_for,
 )
 
@@ -353,14 +353,15 @@ def _all_blocks():
             (Vwap("rolling", 30), _ohlcv), (Rsi(14), _close), (Bollinger(20), _close), (AtrSma(14), _hlc), (Atr(14), _hlc),
             (RelativeVolume(20), _vol), (EfficiencyRatio(10), _close), (Donchian(20), _hlc),
             (RsiDivergence(), _hlc), (Stochastic(), _hlc), (Keltner(), _hlc), (RollingMax(30), _close), (RollingMin(30), _close),
-            (PriorPeriod("day"), _hlct), (SessionLevels("london"), _hlt), (Adx(14), _hlc)]
+            (PriorPeriod("day"), _hlct), (SessionLevels("london"), _hlt), (Adx(14), _hlc),
+            (Lag(20), _close)]
 
 
 def test_every_named_block_is_tested_here():
     assert {type(b) for b, _ in _all_blocks()} == set(BLOCKS.values())
 
 
-@pytest.mark.parametrize("i", range(20))
+@pytest.mark.parametrize("i", range(21))
 def test_no_look_ahead(i):
     """A value at a bar is the same whether or not later bars exist: each prefix reads as the full run did."""
     block, feed = _all_blocks()[i]
@@ -371,7 +372,7 @@ def test_no_look_ahead(i):
         np.testing.assert_array_equal(part, full[:cut])
 
 
-@pytest.mark.parametrize("i", range(20))
+@pytest.mark.parametrize("i", range(21))
 def test_reset_gives_a_fresh_block(i):
     block, feed = _all_blocks()[i]
     fresh = copy.deepcopy(block)
@@ -384,7 +385,7 @@ def test_reset_gives_a_fresh_block(i):
     assert block.values == fresh.values and block.initialized == fresh.initialized
 
 
-@pytest.mark.parametrize("i", range(20))
+@pytest.mark.parametrize("i", range(21))
 def test_settled_after_its_warmup(i):
     """Fed warmup_bars bars, every block is initialized: warm-up from warmup_bars is always enough."""
     block, feed = _all_blocks()[i]
@@ -446,7 +447,7 @@ def test_bad_settings_are_refused(kind, settings):
         make_block(kind, **settings)
 
 
-@pytest.mark.parametrize("i", range(20))
+@pytest.mark.parametrize("i", range(21))
 def test_update_ohlcv_and_handle_bar_match_update_raw(i):
     """Any block can be fed whole bars, ignoring what it doesn't use, and reads as update_raw fed it."""
     block, feed = _all_blocks()[i]
@@ -474,7 +475,7 @@ def test_update_ohlcv_and_handle_bar_match_update_raw(i):
         assert from_bar.values == raw.values
 
 
-@pytest.mark.parametrize("i", range(20))
+@pytest.mark.parametrize("i", range(21))
 def test_values_are_none_until_initialized_and_never_nan(i):
     block, feed = _all_blocks()[i]
     assert set(block.values) == set(type(block).OUTPUTS) and all(v is None for v in block.values.values())
@@ -489,7 +490,7 @@ def test_values_are_none_until_initialized_and_never_nan(i):
                 assert block.value is None
 
 
-@pytest.mark.parametrize("i", range(20))
+@pytest.mark.parametrize("i", range(21))
 def test_warmup_from_the_class_matches_the_block(i):
     block, _ = _all_blocks()[i]
     assert type(block).warmup_bars(**block.settings) == block.warmup_bars
@@ -515,7 +516,7 @@ def test_day_vwap_needs_close_times():
 
 # ---- QA round on P1-3 (quant-review/v2-p1/indicators.md) ----------------------------------------------------
 
-@pytest.mark.parametrize("i", range(20))
+@pytest.mark.parametrize("i", range(21))
 def test_settled_exactly_at_its_warmup(i):
     """F1: every block reads as settled from its warm-up on, and not before; library blocks are not initialized
     before it either. Sma, AtrSma and Rsi keep the `initialized` the hand-coded models trade on."""
@@ -535,7 +536,7 @@ def test_settled_exactly_at_its_warmup(i):
 
 
 @pytest.mark.parametrize("bad", [float("nan"), float("inf"), -float("inf")])
-@pytest.mark.parametrize("i", range(20))
+@pytest.mark.parametrize("i", range(21))
 def test_non_finite_input_is_refused(i, bad):
     """F5: a NaN or infinite input raises rather than poisoning every later value."""
     block, feed = _all_blocks()[i]
