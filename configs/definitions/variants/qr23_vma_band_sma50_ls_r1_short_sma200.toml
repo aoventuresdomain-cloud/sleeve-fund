@@ -1,0 +1,38 @@
+# Improve-loop round 1 (24 Oct 2026, Quant Researcher, Advisor cleared): an exact copy of qr23_vma_band_sma50_ls with
+# one change, qr01b V4's rule: no new short unless the last completed daily close is below its 200-day average (no
+# short while the average has no value). Decision candle: 1d. A long that exits above the average now goes flat.
+version = 1
+name = "qr23-vma-band-sma50-ls-r1-short-sma200"
+title = "BLL VMA(1,50,1%) with Hold-Inside-Band (daily) · Long and Short · shorts below SMA200"
+reason = """The variable-length moving-average rule of Brock, Lakonishok and LeBaron with a 1% band around the 50-day
+average, traded both ways: long when the close is more than 1% above the average, out when it is more than 1% below;
+short when the close is more than 1% below, covered when it is more than 1% above. Inside the band the previous state
+is kept. (1, 50, 1%) is the paper's standard setting, fixed before any run. No stop, as in the papers (held at 1x).
+Round 0 shorts lost money in the 2023 to 2025 uptrend; shorts only in a down market, the same rule as qr01b V4."""
+
+[blocks.sma]
+kind = "sma"
+period = 50
+
+[blocks.close1d]  # the last completed daily close, as qr01b V4 reads it
+kind = "sma"
+period = 1
+timeframe = "1d"
+
+[blocks.sma200d]
+kind = "sma"
+period = 200
+timeframe = "1d"
+
+[long]
+reverse = true  # flip on the signal candle: a close and an open, each with its fee and half spread (Advisor 24 Oct)
+entry = { left = "close", op = ">", right = { mul = [1.01, "sma"] } }
+exit = { left = "close", op = "<", right = { mul = [0.99, "sma"] } }
+
+[short]
+reverse = true
+entry = { all = [
+    { left = "close", op = "<", right = { mul = [0.99, "sma"] } },
+    { left = "close1d", op = "<", right = "sma200d" },  # no value yet: fails, so no short
+] }
+exit = { left = "close", op = ">", right = { mul = [1.01, "sma"] } }

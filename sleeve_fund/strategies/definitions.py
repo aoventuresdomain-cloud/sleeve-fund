@@ -203,7 +203,7 @@ CATALOGUE = {
     "atr": "ATR", "atr_sma": "ATR (simple average)", "relative_volume": "Relative volume",
     "efficiency_ratio": "Efficiency ratio", "adx": "ADX", "donchian": "Donchian channel", "rsi_divergence": "RSI divergence",
     "stochastic": "Stochastic", "keltner": "Keltner channel", "rolling_max": "Rolling high", "rolling_min": "Rolling low",
-    "prior_period": "Previous day or week",
+    "lag": "Value N candles back", "prior_period": "Previous day or week",
     "session_levels": "Asia or London session high/low",
     "funding_decile": "Funding rate decile (studies only)",
 }

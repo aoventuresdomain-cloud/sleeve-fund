@@ -163,6 +163,8 @@ class Words:
         if kind in ("rolling_max", "rolling_min"):
             word = "highest" if kind == "rolling_max" else "lowest"
             return f"the {word} value{fed or ' of the close'} over the last {candles(p, tf)}"
+        if kind == "lag":
+            return f"{(fed or ' the close').strip().removeprefix('of ')} as it was {candles(p, tf)} ago"
         if kind == "prior_period":
             return f"the previous {s.get('period', 'week')}'s {output or 'close'}"
         if kind == "session_levels":
