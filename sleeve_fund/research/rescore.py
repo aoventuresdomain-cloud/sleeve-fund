@@ -11,7 +11,8 @@ request that asks for it is refused. Each study writes only research records: it
 journal), its idea counter line and its tear sheet. No Strategy, order, fill or fund row is ever written.
 
 The job log is public, so this prints counts and per-row ran/failed with the error's class only: never a figure,
-a verdict or a tear sheet. The results are read on the Research page.
+a verdict or a tear sheet. A row that ran prints its sheet's file stem (name, dataset and time: no result), so the
+sheet export (.github/workflows/sheet-export.yml) can be run on it. The results are read on the Research page.
 """
 
 from __future__ import annotations
@@ -186,13 +187,13 @@ def main(argv: list[str] | None = None, run=None, journal=None) -> int:
     extra = {"notes": (TRIES_BY_HAND,)} if args.tries_by_hand else {}
     for n, name, req in reqs:
         try:
-            run(req, store=store, **extra)
+            sheet = run(req, store=store, **extra)
         except Exception as exc:  # noqa: BLE001 - one row's failure never stops the rest; its class only (public log)
             failed += 1
             print(f"row {n:>2} {name}: FAILED ({type(exc).__name__})")
             continue
         ok += 1
-        print(f"row {n:>2} {name}: ran")
+        print(f"row {n:>2} {name}: ran" + (f", sheet {sheet.stem}" if isinstance(sheet, Path) else ""))
     print(f"done: {ok} ran, {failed} failed; results on the Research page")
     return 1 if failed else 0
 
