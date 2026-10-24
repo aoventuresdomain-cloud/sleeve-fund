@@ -103,7 +103,7 @@ def request(name: str, minutes: int, venue: str, pair: str, pinned=None, continu
 
     from sleeve_fund.research.variants import PREREGISTERED, definition_path
 
-    variant = PREREGISTERED.get(name.upper())  # a pre-registered variant's row names it: v1 to v4
+    variant = PREREGISTERED.get(name.upper())  # a pre-registered variant's row names it: v1 to v4, v3_adx
     path = definition_path(variant["definition"]) if variant else DEFINITIONS / f"{name}.toml"
     if not path.is_file():
         raise ValueError(f"no definition file {path.name}")

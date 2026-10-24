@@ -1,0 +1,77 @@
+# Pre-registered variant V3 of qr01b, "skip strong-trend entries". Decision candle: 4h.
+# (research/quant-researcher/qr01b-v3-adx-preregistration.md, Advisor cleared 24 Oct; long and short in one Strategy
+# by the PM's change of 24 Oct): the long leg is qr01b_trend_multispeed_long and the short leg
+# qr01b_trend_multispeed_short, each with one change, no new entry while Wilder's ADX(14) on daily candles is above
+# 25. The ADX is read from the last completed daily close (a 1d block), gates entries only and never forces an exit;
+# while it has no value (its warm-up) it imposes nothing (no_value = "pass"). Exits, stops and candles are the parents'.
+version = 1
+name = "qr01b-trend-multispeed-ls-v3-adx"
+title = "Trend Consensus (3 speeds, 4h) · Long and Short · ADX filter"
+reason = """Three EMA pairs (8/32, 16/64, 32/128) each vote on the trend, so no single setting decides. Go long when
+all three agree up, short when all three agree down, leave when two of the three turn; 3 ATR(14) stop. No new entry
+while daily ADX(14) is above 25: the in-sample regime split found the strong-trend entries lost money."""
+
+[blocks.f1]
+kind = "ema"
+period = 8
+
+[blocks.s1]
+kind = "ema"
+period = 32
+
+[blocks.f2]
+kind = "ema"
+period = 16
+
+[blocks.s2]
+kind = "ema"
+period = 64
+
+[blocks.f3]
+kind = "ema"
+period = 32
+
+[blocks.s3]
+kind = "ema"
+period = 128
+
+[blocks.atr]
+kind = "atr"
+period = 14
+
+[blocks.adx]
+kind = "adx"
+period = 14
+timeframe = "1d"
+
+[long]
+entry = { all = [
+    { left = "f1", op = ">", right = "s1" },
+    { left = "f2", op = ">", right = "s2" },
+    { left = "f3", op = ">", right = "s3" },
+    { left = "adx", op = "<=", right = 25, no_value = "pass" },
+] }
+exit = { any = [
+    { all = [{ left = "f1", op = "<", right = "s1" }, { left = "f2", op = "<", right = "s2" }] },
+    { all = [{ left = "f1", op = "<", right = "s1" }, { left = "f3", op = "<", right = "s3" }] },
+    { all = [{ left = "f2", op = "<", right = "s2" }, { left = "f3", op = "<", right = "s3" }] },
+] }
+
+[short]
+entry = { all = [
+    { left = "f1", op = "<", right = "s1" },
+    { left = "f2", op = "<", right = "s2" },
+    { left = "f3", op = "<", right = "s3" },
+    { left = "adx", op = "<=", right = 25, no_value = "pass" },
+] }
+exit = { any = [
+    { all = [{ left = "f1", op = ">", right = "s1" }, { left = "f2", op = ">", right = "s2" }] },
+    { all = [{ left = "f1", op = ">", right = "s1" }, { left = "f3", op = ">", right = "s3" }] },
+    { all = [{ left = "f2", op = ">", right = "s2" }, { left = "f3", op = ">", right = "s3" }] },
+] }
+
+[exits.long]
+stop = { level = { sub = ["close", { mul = [3.0, "atr"] }] } }
+
+[exits.short]
+stop = { level = { add = ["close", { mul = [3.0, "atr"] }] } }

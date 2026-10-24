@@ -18,7 +18,7 @@ from sleeve_fund.strategies.indicators._common import PERIOD_MAX, SETTLE_LENGTHS
 from sleeve_fund.strategies.indicators.averages import DAY_OF_MINUTE_BARS, NS_PER_DAY, Atr, Ema, Vwap, Wma
 from sleeve_fund.strategies.indicators.bands import FLAT_BAND, Bollinger, Donchian, Keltner
 from sleeve_fund.strategies.indicators.classic import AtrSma, Rsi, Sma
-from sleeve_fund.strategies.indicators.filters import EfficiencyRatio, RelativeVolume
+from sleeve_fund.strategies.indicators.filters import Adx, EfficiencyRatio, RelativeVolume
 from sleeve_fund.strategies.indicators.levels import PriorPeriod, RollingMax, RollingMin, SessionLevels
 from sleeve_fund.strategies.indicators.oscillators import Stochastic
 from sleeve_fund.strategies.indicators.swings import RsiDivergence
@@ -34,6 +34,7 @@ BLOCKS: dict[str, type] = {
     "atr_sma": AtrSma,  # the simple average the hand-coded models size stops on
     "relative_volume": RelativeVolume,
     "efficiency_ratio": EfficiencyRatio,
+    "adx": Adx,  # Wilder's, the formula regime_split labels trend and range by
     "donchian": Donchian,
     "rsi_divergence": RsiDivergence,
     "stochastic": Stochastic,
@@ -74,7 +75,7 @@ def warmup_for(specs) -> int:
 
 
 __all__ = [
-    "BLOCKS", "DAY_OF_MINUTE_BARS", "FLAT_BAND", "NS_PER_DAY", "PERIOD_MAX", "SETTLE_LENGTHS", "Atr", "AtrSma", "Bollinger",
+    "BLOCKS", "DAY_OF_MINUTE_BARS", "FLAT_BAND", "NS_PER_DAY", "PERIOD_MAX", "SETTLE_LENGTHS", "Adx", "Atr", "AtrSma", "Bollinger",
     "Donchian", "EfficiencyRatio", "Ema", "Keltner", "PriorPeriod", "RelativeVolume", "RollingMax", "RollingMin", "Rsi", "RsiDivergence", "SessionLevels", "Setting", "Sma", "Stochastic",
     "Vwap", "Wma", "make_block", "settle_bars",
     "warmup_for",

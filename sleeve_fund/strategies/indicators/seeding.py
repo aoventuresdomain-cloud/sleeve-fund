@@ -22,7 +22,7 @@ from sleeve_fund.strategies.indicators._common import BlockBase, settle_bars
 from sleeve_fund.strategies.indicators.averages import Atr, Ema, Vwap, Wma
 from sleeve_fund.strategies.indicators.bands import Bollinger, Donchian
 from sleeve_fund.strategies.indicators.classic import AtrSma, Rsi, Sma
-from sleeve_fund.strategies.indicators.filters import EfficiencyRatio, RelativeVolume
+from sleeve_fund.strategies.indicators.filters import Adx, EfficiencyRatio, RelativeVolume
 from sleeve_fund.strategies.indicators.levels import PriorPeriod, RollingMax, RollingMin, SessionLevels
 from sleeve_fund.strategies.indicators.oscillators import Stochastic
 
@@ -33,6 +33,7 @@ TOLERANCE: dict[type, tuple[str, float]] = {
     Ema: (RELATIVE, 1e-4),
     ExponentialMovingAverage: (RELATIVE, 1e-4),
     Atr: (RELATIVE, 5e-3),
+    Adx: (POINTS, 0.1),  # RSI's 0 to 100 scale, so RSI's tolerance
 }
 # Read the same from any start once their window is full: nothing to check.
 WINDOW: tuple[type, ...] = (Sma, AtrSma, Wma, Vwap, Bollinger, Donchian, EfficiencyRatio, RelativeVolume, Stochastic,
@@ -46,10 +47,11 @@ def _engine(x) -> bool:
     return type(x).__module__.startswith("nautilus_trader.indicators")
 
 
-NAMES: dict[type, str] = {Rsi: "RSI", Ema: "EMA", ExponentialMovingAverage: "EMA", Atr: "ATR"}
+NAMES: dict[type, str] = {Rsi: "RSI", Ema: "EMA", ExponentialMovingAverage: "EMA", Atr: "ATR", Adx: "ADX"}
 # How each forgets its start: an EMA by 1 - 2 / (N + 1) a bar, Wilder's smoothing (RSI, ATR) by 1 - 1 / N.
 EXPONENTIAL, WILDER = "exponential", "wilder"
-SMOOTHING: dict[type, str] = {Rsi: WILDER, Atr: WILDER, Ema: EXPONENTIAL, ExponentialMovingAverage: EXPONENTIAL}
+SMOOTHING: dict[type, str] = {Rsi: WILDER, Atr: WILDER, Adx: WILDER, Ema: EXPONENTIAL,
+                              ExponentialMovingAverage: EXPONENTIAL}
 
 
 def register(cls: type, label: str, kind: str, tolerance: float, smoothing: str = EXPONENTIAL) -> None:

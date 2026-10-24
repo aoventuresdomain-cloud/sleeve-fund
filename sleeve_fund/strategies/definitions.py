@@ -16,7 +16,9 @@ A condition is {left, op, right}. An operand is a number, a price field (open, h
 candle before), {add|sub|mul|div = [a, b]}, {time = "hour"|"weekday"|"day_of_month"|"days_to_month_end", tz = "Europe/London"} (at the candle's
 close, Monday 0, the day of the month from 1, days_to_month_end 0 on its last day (G3); UTC unless tz names a zone,
 whose summer time it follows), or {max_since_entry = x} / {min_since_entry = x}
-(since the leg's entry candle, that candle included). Conditions combine with {all = [...]},
+(since the leg's entry candle, that candle included). A side with no value fails a condition; in an entry rule,
+{left, op, right, no_value = "pass"} holds then instead, so a filter imposes nothing while it warms up (QR01b V3's
+daily ADX). Conditions combine with {all = [...]},
 {any = [...]}, {only_when = gate, then = rule}, {event = rule, confirm = rule, within = N} (the event, confirmed on
 its candle or one of the next N) and {setup = rule, trigger = rule, expire_after = {bars, timeframe}, cancel = rule}
 (the setup is checked as its slower candle closes and arms the trigger until N candles of that timeframe have
@@ -199,7 +201,7 @@ BUILDER_BLOCKS = {**BLOCKS, "donchian": ClosedChannel, "funding_decile": Funding
 CATALOGUE = {
     "sma": "SMA", "ema": "EMA", "wma": "WMA", "vwap": "VWAP", "rsi": "RSI", "bollinger": "Bollinger bands",
     "atr": "ATR", "atr_sma": "ATR (simple average)", "relative_volume": "Relative volume",
-    "efficiency_ratio": "Efficiency ratio", "donchian": "Donchian channel", "rsi_divergence": "RSI divergence",
+    "efficiency_ratio": "Efficiency ratio", "adx": "ADX", "donchian": "Donchian channel", "rsi_divergence": "RSI divergence",
     "stochastic": "Stochastic", "keltner": "Keltner channel", "rolling_max": "Rolling high", "rolling_min": "Rolling low",
     "prior_period": "Previous day or week",
     "session_levels": "Asia or London session high/low",
@@ -485,6 +487,17 @@ def _check_rule(rule, where: str, blocks: dict, bar_minutes, uses_prev: list, en
     if not isinstance(rule, dict):
         raise ValueError(f"{where}: a rule is a condition {{left, op, right}} or all/any/only_when/event/setup")
     keys = set(rule)
+    if keys == {"left", "op", "right", "no_value"}:
+        if rule["no_value"] != "pass":
+            raise ValueError(f"{where}: no_value is \"pass\" (the condition holds while a side has no value, as in a "
+                             "warm-up), or left out, when it never holds then")
+        if not entry:
+            raise ValueError(f"{where}: no_value = \"pass\" lets an entry through while its filter has no value, so it "
+                             "belongs in an entry rule (directly, or inside all, any or then); an exit or a setup "
+                             "would fire on it")
+        if rule["op"] not in COMPARE:
+            raise ValueError(f"{where}: no_value = \"pass\" takes a comparison ({', '.join(COMPARE)}), not a cross")
+        keys = {"left", "op", "right"}
     if keys == {"left", "op", "right"}:
         if rule["op"] not in COMPARE and rule["op"] not in CROSSES:
             raise ValueError(f"{where}: no comparison {rule['op']!r}; use {', '.join([*COMPARE, *CROSSES])}")
@@ -866,7 +879,7 @@ class Compiled:
             (fl, kl, tl), (fr, kr, tr) = self.operand(r["left"]), self.operand(r["right"])
             if r["op"] in CROSSES:
                 self.tracked[kl], self.tracked[kr] = fl, fr
-            return Cond(r, fl, fr, kl, kr, _slowest(tl, tr))
+            return Cond(r, fl, fr, kl, kr, _slowest(tl, tr), r.get("no_value") == "pass")
         if "all" in r or "any" in r:
             items = [self.rule(x, exit_rule, f"{path}[{i}]") for i, x in enumerate(r["all"] if "all" in r else r["any"])]
             return Group(items, "all" in r)
@@ -925,9 +938,13 @@ class Node:
 
 
 class Cond(Node):
-    def __init__(self, r: dict, fl, fr, kl: str, kr: str, timeframe) -> None:
+    """A comparison. A side with no value (a block not settled) fails it, unless no_value = "pass" (an entry
+    filter only, checked so) lets it hold then."""
+
+    def __init__(self, r: dict, fl, fr, kl: str, kr: str, timeframe, no_value_passes: bool = False) -> None:
         self.op, self.fl, self.fr, self.kl, self.kr, self.timeframe = r["op"], fl, fr, kl, kr, timeframe
-        self.text = f"{kl} {r['op'].replace('_', ' ')} {kr}"
+        self.no_value_passes = no_value_passes
+        self.text = f"{kl} {r['op'].replace('_', ' ')} {kr}" + (" (holds with no value)" if no_value_passes else "")
 
     def values(self, env: Env) -> tuple:
         return self.fl(env), self.fr(env)
@@ -935,7 +952,7 @@ class Cond(Node):
     def test(self, env: Env) -> bool:
         a, b = self.values(env)
         if a is None or b is None:
-            return False
+            return self.no_value_passes
         if self.op in COMPARE:
             return COMPARE[self.op](a, b)
         pa, pb = env.prev.get(self.kl), env.prev.get(self.kr)
