@@ -15,10 +15,12 @@ kind = "atr"
 period = 14
 
 [long]
+reverse = true  # flip on the signal candle: a close and an open, each with its fee and half spread (Advisor 24 Oct)
 entry = { left = "close", op = ">", right = "sma" }
 exit = { left = "close", op = "<", right = "sma" }
 
 [short]
+reverse = true
 entry = { left = "close", op = "<", right = "sma" }
 exit = { left = "close", op = ">", right = "sma" }
 

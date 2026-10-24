@@ -13,9 +13,11 @@ kind = "sma"
 period = 50
 
 [long]
+reverse = true  # flip on the signal candle: a close and an open, each with its fee and half spread (Advisor 24 Oct)
 entry = { left = "close", op = ">", right = { mul = [1.01, "sma"] } }
 exit = { left = "close", op = "<", right = { mul = [0.99, "sma"] } }
 
 [short]
+reverse = true
 entry = { left = "close", op = "<", right = { mul = [0.99, "sma"] } }
 exit = { left = "close", op = ">", right = { mul = [1.01, "sma"] } }

@@ -45,6 +45,7 @@ period = 14
 timeframe = "1d"
 
 [long]
+reverse = true  # flip on the signal candle: a close and an open, each with its fee and half spread (Advisor 24 Oct)
 entry = { all = [
     { left = "f1", op = ">", right = "s1" },
     { left = "f2", op = ">", right = "s2" },
@@ -58,6 +59,7 @@ exit = { any = [
 ] }
 
 [short]
+reverse = true
 entry = { all = [
     { left = "f1", op = "<", right = "s1" },
     { left = "f2", op = "<", right = "s2" },
