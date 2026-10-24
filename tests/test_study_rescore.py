@@ -57,12 +57,16 @@ def test_the_log_prints_counts_and_ran_or_failed_only(capfd, tmp_path):
         seen.append(req)
         if req.label == "qr02_dip_short":
             raise ValueError("Sharpe 1.234 at 0.055% fees, host api.example.com")  # nothing of this may print
-        return tmp_path / "sheet.md"
+        return tmp_path / f"{req.label}_binance-btcusdt-store-15m_20261024-153413.md"
 
     code = rescore.main([str(LIST), "--rows", "1-8"], run=run, journal=lambda: None)
     out = capfd.readouterr().out
     assert code == 1 and len(seen) == 8 and all(not r.use_holdout for r in seen)
     assert "row  8 qr02_dip_short: FAILED (ValueError)" in out and "done: 7 ran, 1 failed" in out
+    # A row that ran names its sheet's stem, the sheet export's input; a failed row names none.
+    stem = "qr01_trend_ema_long_binance-btcusdt-store-15m_20261024-153413"
+    assert f"row  1 qr01_trend_ema_long: ran, sheet {stem}\n" in out
+    assert "qr02_dip_short_binance" not in out
     assert "1.234" not in out and "0.055" not in out and "example.com" not in out and "Sharpe" not in out
 
 
