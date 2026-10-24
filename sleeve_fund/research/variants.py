@@ -27,6 +27,10 @@ PREREGISTERED = {
     # placebo: the fast path runs neither slower candles nor a short leg.
     "V3_ADX": {"parent": "qr01b_trend_multispeed_long", "short_parent": "qr01b_trend_multispeed_short",
                "definition": "qr01b_trend_multispeed_ls_v3_adx", "params": {}},
+    # Improve-loop round 0 (research/quant-researcher/improve-loop-plan-24oct.md; PM 24 Oct: the top 3, long and short in
+    # one Strategy): each parent long exactly, plus its mirror short leg.
+    "QR23_LS": {"parent": "qr23_vma_band_sma50_long", "definition": "qr23_vma_band_sma50_ls", "params": {}},
+    "QR21_LS": {"parent": "qr21_trend_sma200_long", "definition": "qr21_trend_sma200_ls", "params": {}},
 }
 
 
