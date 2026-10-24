@@ -1,11 +1,12 @@
 name: fill-audit-export
-# ONE-OFF (PM yes, 22 Oct 20:42 UTC): a read-only copy of the stored BTC/USDT perp 1-minute prices (public prices
-# only) around six hard-coded trade windows, for the fill audit. Reads the history files (HistoryStore.read, venue
-# binance, mounted read-only into the dashboard image) in a one-off container (docker compose run --rm --no-deps) on
-# the paper server; the CSV goes over SSH stdout straight to this runner, so nothing is written on the server beyond
-# that container's own temp, and nothing to the journal or DB. Each window starts 6 hours before the listed time so
-# ATR(14)/SMA(20) on 15-minute bars can be warmed. The log prints row counts per window only, never prices; the CSV
-# is this run's artifact (3 days). No inputs: the windows are fixed below. Run it by hand from main, once.
+# ONE-OFF (PM yes, 22 Oct 20:42 UTC; window replaced on PM yes 24 Oct 13:20 UTC): a read-only copy of the stored
+# BTC/USDT perp 1-minute prices (public prices only) for the hard-coded window below, for the fill audit. Reads the
+# history files (HistoryStore.read, venue binance, mounted read-only into the dashboard image) in a one-off container
+# (docker compose run --rm --no-deps) on the paper server; the CSV goes over SSH stdout straight to this runner, so
+# nothing is written on the server beyond that container's own temp, and nothing to the journal or DB. Each window
+# starts 6 hours before the listed time so ATR(14)/SMA(20) on 15-minute bars can be warmed. The log prints row counts
+# per window only, never prices; the CSV is this run's artifact (3 days). No inputs: the windows are fixed below. Run
+# it by hand from main, once.
 on:
   workflow_dispatch:
 concurrency: { group: fill-audit-export, cancel-in-progress: false }
@@ -42,7 +43,7 @@ jobs:
           set -euo pipefail
           mkdir -p out
           cat > export.py <<'PY'
-          # One-off, PM yes 22 Oct 20:42 UTC, read-only, public prices. CSV to stdout; row counts only to stderr.
+          # One-off, PM yes 22 Oct and 24 Oct, read-only, public prices. CSV to stdout; row counts only to stderr.
           import sys
           import pandas as pd
           from sleeve_fund.history import HistoryStore
@@ -50,12 +51,9 @@ jobs:
           WARM = pd.Timedelta(hours=6)
           # (label, listed start, listed end), UTC; each read starts WARM earlier. Index is the bar CLOSE time.
           WINDOWS = [
-              ("2020-11-07", "2020-11-07 19:00", "2020-11-07 20:30"),
-              ("2020-11-26", "2020-11-26 03:00", "2020-11-26 04:00"),
-              ("2020-12-17", "2020-12-17 08:45", "2020-12-17 10:00"),
-              ("2021-01-04", "2021-01-04 09:45", "2021-01-04 10:45"),
-              ("2021-01-10", "2021-01-10 17:15", "2021-01-10 20:45"),
-              ("2021-02-22", "2021-02-22 13:45", "2021-02-22 14:45"),
+              # PM yes 24 Oct: one more window, the BTC run's last trades of the research period (Researcher's
+              # 25-trade table); the read starts WARM earlier, at 1 Jul 2025 00:00.
+              ("2025q3", "2025-07-01 06:00", "2025-10-20 00:00"),
           ]
           store = HistoryStore()  # HISTORY_DIR=/data/history, mounted read-only
           parts = []
