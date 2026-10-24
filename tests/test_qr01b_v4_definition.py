@@ -9,11 +9,15 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import pytest
 
 from sleeve_fund.research import rescore
 from sleeve_fund.research.variants import PREREGISTERED, definition_path
-from sleeve_fund.strategies.definitions import check_definition, definition_hash, load_definition_file, to_params
+from sleeve_fund.strategies.definitions import (
+    check_definition,
+    definition_hash,
+    load_definition_file,
+    to_params,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 LIST = ROOT / "configs" / "studies" / "qr01b-r2-list.md"
