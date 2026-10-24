@@ -1,0 +1,31 @@
+# Improve-loop round 0 (24 Oct 2026, Quant Researcher; PM 24 Oct: the top 3, long and short in one Strategy). Decision
+# candle: 1d. The long leg is qr21_trend_sma200_long exactly; the short leg is its mirror.
+version = 1
+name = "qr21-trend-sma200-ls"
+title = "200-Day Trend (daily) · Long and Short"
+reason = """The 200-day trend rule traded both ways: long while the daily close is above its 200-day average, short
+while it is below. Each side carries a 3 ATR(14) stop against a sudden break."""
+
+[blocks.sma]
+kind = "sma"
+period = 200
+
+[blocks.atr]
+kind = "atr"
+period = 14
+
+[long]
+reverse = true  # flip on the signal candle: a close and an open, each with its fee and half spread (Advisor 24 Oct)
+entry = { left = "close", op = ">", right = "sma" }
+exit = { left = "close", op = "<", right = "sma" }
+
+[short]
+reverse = true
+entry = { left = "close", op = "<", right = "sma" }
+exit = { left = "close", op = ">", right = "sma" }
+
+[exits.long]
+stop = { level = { sub = ["close", { mul = [3.0, "atr"] }] } }
+
+[exits.short]
+stop = { level = { add = ["close", { mul = [3.0, "atr"] }] } }

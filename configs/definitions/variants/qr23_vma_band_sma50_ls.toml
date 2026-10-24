@@ -1,0 +1,23 @@
+# Improve-loop round 0 (24 Oct 2026, Quant Researcher; PM 24 Oct: the top 3, long and short in one Strategy). Decision
+# candle: 1d. The long leg is qr23_vma_band_sma50_long exactly; the short leg is its mirror. No stop, as the parent.
+version = 1
+name = "qr23-vma-band-sma50-ls"
+title = "BLL VMA(1,50,1%) with Hold-Inside-Band (daily) · Long and Short"
+reason = """The variable-length moving-average rule of Brock, Lakonishok and LeBaron with a 1% band around the 50-day
+average, traded both ways: long when the close is more than 1% above the average, out when it is more than 1% below;
+short when the close is more than 1% below, covered when it is more than 1% above. Inside the band the previous state
+is kept. (1, 50, 1%) is the paper's standard setting, fixed before any run. No stop, as in the papers (held at 1x)."""
+
+[blocks.sma]
+kind = "sma"
+period = 50
+
+[long]
+reverse = true  # flip on the signal candle: a close and an open, each with its fee and half spread (Advisor 24 Oct)
+entry = { left = "close", op = ">", right = { mul = [1.01, "sma"] } }
+exit = { left = "close", op = "<", right = { mul = [0.99, "sma"] } }
+
+[short]
+reverse = true
+entry = { left = "close", op = "<", right = { mul = [0.99, "sma"] } }
+exit = { left = "close", op = ">", right = { mul = [1.01, "sma"] } }

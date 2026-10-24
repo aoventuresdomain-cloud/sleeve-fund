@@ -83,7 +83,7 @@ PAST = {"is above": "was above", "is below": "was below", "is at or above": "was
 # Comparisons of relative volume read as "volume is at least 1.5 × its 20-candle average".
 VOLUME = {">=": "is at least", ">": "is more than", "<=": "is at most", "<": "is less than"}
 # Kinds whose words carry their candle ("RSI(14) on 15m"), so two on different candles need it said.
-LABELLED = ("rsi", "atr", "atr_sma", "efficiency_ratio", "bollinger", "keltner", "stochastic", "vwap")
+LABELLED = ("rsi", "atr", "atr_sma", "efficiency_ratio", "adx", "bollinger", "keltner", "stochastic", "vwap")
 
 
 def _is_prev(x) -> bool:
@@ -140,8 +140,9 @@ class Words:
         p = s.get("period")
         if kind in AVERAGES:
             return f"the {_per(p, tf)} {AVERAGES[kind]}{fed}"
-        if kind in ("rsi", "atr", "atr_sma", "efficiency_ratio"):
-            name = {"rsi": "RSI", "atr": "ATR", "atr_sma": "ATR", "efficiency_ratio": "efficiency ratio"}[kind]
+        if kind in ("rsi", "atr", "atr_sma", "efficiency_ratio", "adx"):
+            name = {"rsi": "RSI", "atr": "ATR", "atr_sma": "ATR", "efficiency_ratio": "efficiency ratio",
+                    "adx": "ADX"}[kind]
             simple = ", simple average" if kind == "atr_sma" else ""
             return f"{name}({int(p)}{simple}){fed}{_on(lab)}"
         if kind == "relative_volume":
@@ -273,6 +274,8 @@ class Words:
         keys = set(r)
         if keys == {"left", "op", "right"}:
             return self.cond(r)
+        if keys == {"left", "op", "right", "no_value"}:
+            return f"{self.cond(r)} (or it has no value yet)"
         if keys in ({"all"}, {"any"}):
             joint = " and " if "all" in r else " or "
             items = r["all"] if "all" in r else r["any"]

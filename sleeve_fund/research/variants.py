@@ -22,6 +22,15 @@ PREREGISTERED = {
     "V3": {"parent": "qr01b_trend_multispeed_long", "definition": "qr01b_trend_multispeed_long",
            "params": {"vol_target_size": VOL_TARGET}},
     "V4": {"parent": "qr01_trend_ema_long", "definition": "qr01_trend_ema_long", "params": {"vol_target_size": VOL_TARGET}},
+    # qr01b's V3 (research/quant-researcher/qr01b-v3-adx-preregistration.md, Advisor cleared 24 Oct), long and short in
+    # one definition by the PM's change of 24 Oct: each leg its parent's with a daily ADX(14) <= 25 entry filter. No
+    # placebo: the fast path runs neither slower candles nor a short leg.
+    "V3_ADX": {"parent": "qr01b_trend_multispeed_long", "short_parent": "qr01b_trend_multispeed_short",
+               "definition": "qr01b_trend_multispeed_ls_v3_adx", "params": {}},
+    # Improve-loop round 0 (research/quant-researcher/improve-loop-plan-24oct.md; PM 24 Oct: the top 3, long and short in
+    # one Strategy): each parent long exactly, plus its mirror short leg.
+    "QR23_LS": {"parent": "qr23_vma_band_sma50_long", "definition": "qr23_vma_band_sma50_ls", "params": {}},
+    "QR21_LS": {"parent": "qr21_trend_sma200_long", "definition": "qr21_trend_sma200_ls", "params": {}},
 }
 
 

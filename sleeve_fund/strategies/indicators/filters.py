@@ -1,10 +1,10 @@
-"""Filters on activity and trend quality: relative volume and the efficiency ratio."""
+"""Filters on activity and trend quality: relative volume, the efficiency ratio and Wilder's ADX."""
 
 from __future__ import annotations
 
 from collections import deque
 
-from sleeve_fund.strategies.indicators._common import PERIOD_MAX, Block, Setting, peek, warmup, whole
+from sleeve_fund.strategies.indicators._common import PERIOD_MAX, Block, Setting, peek, settle_bars, warmup, whole
 from sleeve_fund.strategies.indicators.classic import Sma
 
 
@@ -98,3 +98,71 @@ class EfficiencyRatio(Block):
 
     def peek(self, close: float) -> float | None:
         return peek(self, close)
+
+
+def _ewm(prev: float | None, x: float, alpha: float) -> float:
+    """One step of pandas' ewm(alpha=..., adjust=False).mean() on a series without gaps, in its own arithmetic, so
+    the Adx block reads regime_split.adx to the last bit (tests/test_adx_block.py)."""
+    if prev is None:
+        return x
+    if prev == x:
+        return prev
+    old = 1.0 - alpha
+    return (old * prev + alpha * x) / (old + alpha)
+
+
+class Adx(Block):
+    """Wilder's ADX(period), the formula of sleeve_fund.research.regime_split.adx worked bar by bar: true range and
+    the directional moves (+DM, -DM) smoothed with Wilder's 1/period average started at the first bar's, DX from
+    them (0 where +DI and -DI are both 0), and ADX the same average of DX. regime_split reads it from bar 2 x period
+    on; like every Wilder average here the block is initialized only after ten lengths, once its start no longer
+    shows."""
+
+    SETTINGS = (Setting("period", int, 14, 1, PERIOD_MAX),)
+
+    def __init__(self, period: int = 14) -> None:
+        self.period = whole("period", period, 1)
+        com = (1.0 - 1.0 / self.period) / (1.0 / self.period)  # pandas turns alpha into a centre of mass and back
+        self.alpha = 1.0 / (1.0 + com)
+        self.reset()
+
+    def reset(self) -> None:
+        self._prev: tuple[float, float, float] | None = None  # the bar before's high, low and close
+        self._tr = self._plus = self._minus = self._adx = None
+        self.count = 0
+        self._value = 0.0
+
+    def update_raw(self, high: float, low: float, close: float) -> None:
+        high, low, close = float(high), float(low), float(close)
+        if self._prev is None:
+            tr, plus, minus = high - low, 0.0, 0.0
+        else:
+            ph, pl, pc = self._prev
+            tr = max(high - low, abs(high - pc), abs(low - pc))
+            up, down = high - ph, -(low - pl)
+            plus = up if up > down and up > 0 else 0.0
+            minus = down if down > up and down > 0 else 0.0
+        self._prev = (high, low, close)
+        a = self.alpha
+        self._tr, self._plus, self._minus = _ewm(self._tr, tr, a), _ewm(self._plus, plus, a), _ewm(self._minus, minus, a)
+        dx = 0.0
+        if self._tr > 0:
+            pdi, mdi = 100 * self._plus / self._tr, 100 * self._minus / self._tr
+            if pdi + mdi > 0:
+                dx = 100 * abs(pdi - mdi) / (pdi + mdi)
+        self._adx = self._value = _ewm(self._adx, dx, a)
+        self.count += 1
+
+    def update_ohlcv(self, open_, high, low, close, volume, ts_ns=None) -> None:
+        self.update_raw(high, low, close)
+
+    @property
+    def initialized(self) -> bool:
+        return self.count >= settle_bars(self.period)
+
+    def _outputs(self) -> dict:
+        return {"value": self._value}
+
+    @warmup
+    def warmup_bars(cls, s) -> int:
+        return settle_bars(s["period"])

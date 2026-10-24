@@ -593,7 +593,7 @@ WARMUP_MULTIPLE = 10
 MIN_SCORED_DAYS = 365
 # Recursive blocks, by kind: the settings whose length decays recursively (an RSI divergence adds its swing room).
 RECURSIVE_LENGTHS = {"ema": ("period",), "atr": ("period",), "rsi": ("period",), "keltner": ("period", "atr_period"),
-                     "rsi_divergence": ("rsi_period",)}
+                     "rsi_divergence": ("rsi_period",), "adx": ("period",)}
 
 
 def time_warmup_minutes(kind: str, settings: dict) -> int | None:
