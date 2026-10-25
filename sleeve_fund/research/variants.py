@@ -37,6 +37,8 @@ PREREGISTERED = {
     # Improve-loop round 1 (Researcher 24 Oct, Advisor cleared): one change each to round 0's long and short.
     "QR23_R1": {"parent": "qr23_vma_band_sma50_ls", "definition": "qr23_vma_band_sma50_ls_r1_short_sma200", "params": {}},
     "QR21_R1": {"parent": "qr21_trend_sma200_ls", "definition": "qr21_trend_sma200_ls_r1_slope", "params": {}},
+    # Round 2 (Researcher 24 Oct, Advisor cleared): qr23 round 0 plus qr21 round 1's slope rule on its 50-day average.
+    "QR23_R2": {"parent": "qr23_vma_band_sma50_ls", "definition": "qr23_vma_band_sma50_ls_r2_slope", "params": {}},
 }
 
 

@@ -1,0 +1,32 @@
+# Improve-loop round 2 (24 Oct 2026, Quant Researcher, Advisor cleared): an exact copy of qr23_vma_band_sma50_ls (round
+# 0; round 1 was reverted) with one change, qr21 round 1's slope rule: each entry also needs the 50-day average moving
+# its way, above (long) or below (short) where it stood 20 daily candles ago. Decision candle: 1d. Entries are states;
+# on a reversal the other leg passes its own slope check or the Strategy goes flat. Exits unchanged; no stop.
+version = 1
+name = "qr23-vma-band-sma50-ls-r2-slope"
+title = "BLL VMA(1,50,1%) with Hold-Inside-Band (daily) · Long and Short · SMA50 slope"
+reason = """The variable-length moving-average rule of Brock, Lakonishok and LeBaron with a 1% band around the 50-day
+average, traded both ways: long when the close is more than 1% above the average, out when it is more than 1% below;
+short when the close is more than 1% below, covered when it is more than 1% above. Inside the band the previous state
+is kept. (1, 50, 1%) is the paper's standard setting, fixed before any run. No stop, as in the papers (held at 1x).
+Round 0 and r1 lost on trades held under 20 days (whipsaw around a flat average). Borrowed from qr21 r1, where the same
+20-day slope rule helped: trade only in the direction the 50-day average is moving."""
+
+[blocks.sma]
+kind = "sma"
+period = 50
+
+[blocks.sma50_ago]  # the 50-day average as it stood 20 daily candles ago
+kind = "lag"
+period = 20
+input = "sma"
+
+[long]
+reverse = true  # flip on the signal candle: a close and an open, each with its fee and half spread (Advisor 24 Oct)
+entry = { all = [{ left = "close", op = ">", right = { mul = [1.01, "sma"] } }, { left = "sma", op = ">", right = "sma50_ago" }] }
+exit = { left = "close", op = "<", right = { mul = [0.99, "sma"] } }
+
+[short]
+reverse = true
+entry = { all = [{ left = "close", op = "<", right = { mul = [0.99, "sma"] } }, { left = "sma", op = "<", right = "sma50_ago" }] }
+exit = { left = "close", op = ">", right = { mul = [1.01, "sma"] } }
