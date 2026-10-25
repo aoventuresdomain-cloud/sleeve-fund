@@ -30,6 +30,8 @@ PREREGISTERED = {
     # Improve-loop round 2 (Researcher 24 Oct, Advisor cleared): V3 plus one rule, shorts only below the daily SMA200.
     "V4_SHORT_SMA200": {"parent": "qr01b_trend_multispeed_long", "short_parent": "qr01b_trend_multispeed_short",
                         "definition": "qr01b_trend_multispeed_ls_v4_short_sma200", "params": {}},
+    # One long-only test (Researcher 25 Oct, Advisor cleared as try 28; PM chose it 25 Oct): V4 without its short leg.
+    "V5_LO_ADX": {"parent": "qr01b_trend_multispeed_long", "definition": "qr01b_trend_multispeed_lo_v5_adx", "params": {}},
     # Improve-loop round 0 (research/quant-researcher/improve-loop-plan-24oct.md; PM 24 Oct: the top 3, long and short in
     # one Strategy): each parent long exactly, plus its mirror short leg.
     "QR23_LS": {"parent": "qr23_vma_band_sma50_long", "definition": "qr23_vma_band_sma50_ls", "params": {}},

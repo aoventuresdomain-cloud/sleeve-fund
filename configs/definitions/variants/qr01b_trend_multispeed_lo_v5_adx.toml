@@ -1,0 +1,62 @@
+# Pre-registered variant V5 of qr01b, "long-only with the ADX gate" (Researcher 25 Oct, Advisor cleared as try 28; the
+# PM chose one long-only test on 25 Oct): an exact copy of V4 (qr01b_trend_multispeed_ls_v4_short_sma200) with the
+# short leg deleted, so the long-only parent (qr01b_trend_multispeed_long) plus the daily ADX(14) <= 25 entry gate. The
+# daily close and 200-day average blocks only fed the short leg, so they go too; with no short there is nothing to
+# flip into, so the long leg does not reverse. Long entry, long exit, the 3 ATR(14) stop and the 4h candle are V4's.
+version = 1
+name = "qr01b-trend-multispeed-lo-v5-adx"
+title = "Trend Consensus (3 speeds, 4h) · Long · ADX filter"
+reason = """Three EMA pairs (8/32, 16/64, 32/128) each vote on the trend, so no single setting decides. Go long when
+all three agree up, leave when two of the three turn; 3 ATR(14) stop. No new entry while daily ADX(14) is above 25:
+the in-sample regime split found the strong-trend entries lost money.
+V4's short leg lost on BTC, ETH and SOL in the test years while the long leg held; PM chose one long-only test
+(25 Oct). The idea comes from these results."""
+
+[blocks.f1]
+kind = "ema"
+period = 8
+
+[blocks.s1]
+kind = "ema"
+period = 32
+
+[blocks.f2]
+kind = "ema"
+period = 16
+
+[blocks.s2]
+kind = "ema"
+period = 64
+
+[blocks.f3]
+kind = "ema"
+period = 32
+
+[blocks.s3]
+kind = "ema"
+period = 128
+
+[blocks.atr]
+kind = "atr"
+period = 14
+
+[blocks.adx]
+kind = "adx"
+period = 14
+timeframe = "1d"
+
+[long]
+entry = { all = [
+    { left = "f1", op = ">", right = "s1" },
+    { left = "f2", op = ">", right = "s2" },
+    { left = "f3", op = ">", right = "s3" },
+    { left = "adx", op = "<=", right = 25, no_value = "pass" },
+] }
+exit = { any = [
+    { all = [{ left = "f1", op = "<", right = "s1" }, { left = "f2", op = "<", right = "s2" }] },
+    { all = [{ left = "f1", op = "<", right = "s1" }, { left = "f3", op = "<", right = "s3" }] },
+    { all = [{ left = "f2", op = "<", right = "s2" }, { left = "f3", op = "<", right = "s3" }] },
+] }
+
+[exits.long]
+stop = { level = { sub = ["close", { mul = [3.0, "atr"] }] } }
