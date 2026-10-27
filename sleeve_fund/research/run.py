@@ -29,6 +29,7 @@ TEARSHEETS = Path(os.environ.get("TEARSHEET_DIR", ROOT / "research" / "tearsheet
 # memory than a job has (review round 7: a 2-year study ran past 90 minutes and 1.9 GB), so 1-minute
 # settings are tried on the backtest page; a study still matches resting orders on shorter bars.
 STUDY_MINUTES = (1440, 240, 60, 15, 5)
+BASKET_MINUTES = (1440, 240)  # an asset list's decision bars (4-hour: PM 27 Oct, research only)
 # The most execution bars one backtest in a study replays: resting orders and the risk guard are
 # matched on the shortest bars that keep each run within this (as the backtest page does).
 EXEC_BAR_BUDGET = 150_000
@@ -132,8 +133,11 @@ class StudyRequest:
             raise ValueError("the listed assets are quoted in different currencies")
         if self.pair != self.pairs[0]:
             raise ValueError(f"the request's pair {self.pair} is not its list's first asset {self.pairs[0]}")
-        if self.minutes != 1440:
-            raise ValueError("an asset list is studied on daily bars only")
+        if self.minutes not in BASKET_MINUTES:
+            raise ValueError("an asset list is studied on daily or 4-hour bars only")
+        if self.minutes != 1440 and self.pinned is None:
+            # As a single pinned intraday study: 1-minute fills for the whole window or no run (PM 23 Oct).
+            raise ValueError("a 4-hour asset list runs on a pinned list's dates only, so it fills on 1-minute bars")
         if self.placebo_parent is not None or self.old_window_too:
             raise ValueError("an asset list runs without the placebo or the old window beside it")
 

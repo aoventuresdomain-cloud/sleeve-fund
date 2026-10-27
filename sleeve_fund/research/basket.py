@@ -25,6 +25,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from datetime import date, timedelta
+from functools import partial
 from typing import Any
 
 import numpy as np
@@ -50,12 +51,15 @@ DAY = pd.Timedelta(days=1)
 
 @dataclass(frozen=True)
 class BasketAsset:
-    """One asset's whole history: daily decision bars and the hourly bars the engine fills against, each stamped at
-    its close. The study cuts each run's window (and its warm-up before it) from these."""
+    """One asset's whole history: decision bars of bar_minutes (daily, or 4-hour on a pinned list) and the bars of
+    exec_minutes the engine fills against (hourly; 1-minute under a 4-hour list, as its single sheets fill), each
+    stamped at its close. The study cuts each run's window (and its warm-up before it) from these."""
 
     instrument: Any
     prices: pd.DataFrame
     exec_prices: pd.DataFrame
+    bar_minutes: int = 1440
+    exec_minutes: int = 60
 
 
 @dataclass(frozen=True)
@@ -185,14 +189,15 @@ def _half_spread(instrument, params: dict) -> float:
 
 
 def _cut(a: BasketAsset, first: date, last: date, warm_days: int) -> AssetData:
-    """The bars of the days `first` to `last` (a daily bar closing at 00:00 is the day before's), and the `warm_days`
-    daily bars before them; nothing after `last`."""
+    """The bars of the days `first` to `last` (a bar closing at 00:00 is the day before's), and the `warm_days`
+    decision bars before them (bars, not days, on a 4-hour list); nothing after `last`."""
     start, end = pd.Timestamp(first, tz="UTC"), pd.Timestamp(last + timedelta(days=1), tz="UTC")
     p, h = a.prices, a.exec_prices
     warm = p[p.index <= start].iloc[-warm_days:]
     if len(warm) < warm_days:
-        raise ValueError(f"{underlying(a.instrument)} has {len(warm)} days of history before {first}, not the "
-                         f"{warm_days} days of warm-up the run needs")
+        unit = "days" if a.bar_minutes == 1440 else f"{a.bar_minutes}-minute bars"
+        raise ValueError(f"{underlying(a.instrument)} has {len(warm)} {unit} of history before {first}, not the "
+                         f"{warm_days} {unit} of warm-up the run needs")
     window = p[(p.index > start) & (p.index <= end)]
     if not len(window) or window.index[-1] != end:
         raise ValueError(f"{underlying(a.instrument)}'s history doesn't reach {last}")
@@ -208,8 +213,9 @@ def _run(basket: Basket, assets: list[BasketAsset], first: date, last: date, fee
         check_assets(data)
     names = leg_names(basket.name, [d.instrument for d in data])
     specs = [LegSpec(n, basket.strategy, d.instrument, d.prices, d.exec_prices, d.warmup_prices,
-                     params=dict(basket.params), capital=capital / len(data), fees=fees)
-             for n, d in zip(names, data)]
+                     exec_minutes=a.exec_minutes, bar_minutes=a.bar_minutes, params=dict(basket.params),
+                     capital=capital / len(data), fees=fees)
+             for n, d, a in zip(names, data, assets)]
     return run_portfolio(specs, profile, fund_sized=True), names, specs
 
 
@@ -235,8 +241,13 @@ def _daily_pnl(run: PortfolioResult, names: list[str], specs: list[LegSpec], ass
     return pd.DataFrame(cols).fillna(0.0)
 
 
-def _oos(index: pd.DatetimeIndex, windows) -> np.ndarray:
-    days = [(t - DAY).date() for t in index]
+def _bar(spec: LegSpec) -> pd.Timedelta:
+    return pd.Timedelta(minutes=spec.bar_minutes)
+
+
+def _oos(index: pd.DatetimeIndex, windows, bar: pd.Timedelta = DAY) -> np.ndarray:
+    """Which of these bars (each of length `bar`, stamped at its close) close on a test day."""
+    days = [(t - bar).date() for t in index]
     return np.array([any(a <= d <= b for a, b in windows) for d in days], dtype=bool)
 
 
@@ -365,10 +376,10 @@ def clip(trips: list[TradeAt], ranges: list[tuple[int, int]]) -> list[TradeAt]:
     return out
 
 
-def _ranges(index: pd.DatetimeIndex, windows) -> list[tuple[int, int]]:
+def _ranges(index: pd.DatetimeIndex, windows, bar: pd.Timedelta = DAY) -> list[tuple[int, int]]:
     """The out-of-sample days as runs of bar positions, (first, last) inclusive: windows that abut are one run, so a
     trade across a fold's edge is drawn with the rest."""
-    inside = _oos(index, windows)
+    inside = _oos(index, windows, bar)
     out, start = [], None
     for i, on in enumerate(inside):
         if on and start is None:
@@ -399,8 +410,13 @@ def random_beat(m: Measured, names, specs, params: dict, windows, capital: float
     if share >= GATE_TOUCH_CAP:
         return RandomBeat(False, math.nan, False, draws, share, seed=seed)
     clock = specs[0].prices.index
-    keep = _oos(clock, windows)
-    ranges = _ranges(clock, windows)
+    ranges = _ranges(clock, windows, _bar(specs[0]))
+    # Each bar's P&L is summed into its day (the day a fund book's daily close labels it with: the bar's close rounded
+    # up to midnight), so a 4-hour basket is judged on daily returns as a daily one is.
+    days = clock.ceil("D")
+    day_index = pd.DatetimeIndex(days.unique())
+    of_day = day_index.get_indexer(days)
+    keep = _oos(day_index, windows)
     legs = []
     for n, s in zip(names, specs):
         closes = s.prices["close"].to_numpy(dtype=float)
@@ -409,10 +425,11 @@ def random_beat(m: Measured, names, specs, params: dict, windows, capital: float
     if not any(t for _, t, _ in legs):
         return RandomBeat(False, math.nan, False, draws, share, seed=seed)
     book = daily_closes(m.run.book)
-    equity = equity_before(book, clock, capital).to_numpy(dtype=float)
+    equity = equity_before(book, day_index, capital).to_numpy(dtype=float)
 
     def pooled(trips_by_leg) -> float:
-        return _sharpe(pooled_trade_returns([(c, t, cps) for (c, _, cps), t in zip(legs, trips_by_leg)], equity)[keep])
+        pnl = sum(trade_pnl(c, t, cps) for (c, _, cps), t in zip(legs, trips_by_leg))
+        return _sharpe((np.bincount(of_day, weights=pnl, minlength=len(day_index)) / equity)[keep])
 
     actual = pooled([t for _, t, _ in legs])
     rng = np.random.default_rng(seed)
@@ -441,8 +458,11 @@ def random_words(r: RandomBeat) -> str:
 def basket_key(basket: Basket) -> str:
     """One try: the fixed basket (its assets, in order: leg order can change reservations and fills) and its
     settings; a rule-builder definition's title renames it on screen only (B-16), so a retitle is the same try."""
-    return trials.content_hash({"strategy": basket.strategy, "params": trials._untitled(basket.params),
-                                "assets": basket.names})
+    key = {"strategy": basket.strategy, "params": trials._untitled(basket.params), "assets": basket.names}
+    minutes = basket.assets[0].bar_minutes if basket.assets else 1440
+    if minutes != 1440:  # a daily basket's key is as it always was
+        key["minutes"] = minutes
+    return trials.content_hash(key)
 
 
 def idea_hash(basket: Basket) -> str:
@@ -760,8 +780,9 @@ def pooled_legs(m: Measured, names, specs, params: dict, windows, capital: float
     from sleeve_fund.instruments import taker_slippage
 
     definition = params.get("definition")
+    minutes = specs[0].bar_minutes
     why = "a hand-coded model has no rule definition to fill its draws from" if not definition else \
-        unmodelled(definition, 1440) or ""
+        unmodelled(definition, minutes) or ""
     clock = specs[0].prices.index
     legs, pnl, moved = [], 0.0, 0.0
     for n, s in zip(names, specs):
@@ -769,12 +790,13 @@ def pooled_legs(m: Measured, names, specs, params: dict, windows, capital: float
         # The draws' levels read the warm-up too, as the leg's own did: positions count from the warm-up's first bar.
         bars, off = pd.concat([s.warmup_prices, s.prices]), len(s.warmup_prices)
         idx = bars.index
-        ranges = [(off + s0 - 1, off + e) for s0, e in _ranges(clock, windows)]  # a trip may open on the close before
+        # a trip may open on the close before
+        ranges = [(off + s0 - 1, off + e) for s0, e in _ranges(clock, windows, _bar(s))]
         taker = float(base_fees(s.instrument, params).taker) if s.fees is None else float(s.fees.taker)
         half = _half_spread(s.instrument, params)
         pricer = None
         if not why:
-            fill = DrawFill(definition, 1440, s.exec_prices, _settlement_rates(params, s.instrument, bars), taker)
+            fill = DrawFill(definition, minutes, s.exec_prices, _settlement_rates(params, s.instrument, bars), taker)
             pricer = fill.pricer(bars, taker + half, half)
         rows = trades(fills_to_rows(leg.fills), leg.shorts, leg.funding, open_trip=True) \
             if leg.fills is not None and not leg.fills.empty else []
@@ -887,13 +909,15 @@ def hold_bar(base: Measured, specs, params: dict, windows, capital: float, hold=
     for s in specs:
         bars = pd.concat([s.warmup_prices.iloc[-1:], s.prices])  # from the warm-up's last close
         closes = bars["close"]
+        if s.bar_minutes != 1440:  # held from a day's close to a day's close, as the daily hold
+            closes = closes.resample("1D", closed="right", label="right").last().dropna()
         closes = closes[(closes.index >= first) & (closes.index <= keep[-1])]
         c = float(base_fees(s.instrument, {}).taker) + _half_spread(s.instrument, {})
         value = each * (1 - c) * closes / float(closes.iloc[0])
         value.iloc[-1] *= 1 - c  # out at the last test day's close
         price_parts.append(value)
         if perp:
-            run = (hold or _funded_hold)(bars, s.instrument, params, each)
+            run = (hold or partial(_funded_hold, bar_minutes=s.bar_minutes))(bars, s.instrument, params, each)
             eq = run.equity if hasattr(run, "equity") else run
             daily = eq.resample("1D", closed="right", label="right").last().dropna()
             daily = daily[(daily.index >= first) & (daily.index <= keep[-1])]
@@ -918,13 +942,13 @@ def hold_bar(base: Measured, specs, params: dict, windows, capital: float, hold=
                    _sharpe(mine.to_numpy()), _net(mine), _cagr(_net(mine), len(mine)), liquidated)
 
 
-def _funded_hold(bars: pd.DataFrame, instrument, params: dict, capital: float):
+def _funded_hold(bars: pd.DataFrame, instrument, params: dict, capital: float, bar_minutes: int = 1440):
     """One asset's funded 1x perp buy-and-hold through the engine, on its decision bars from the warm-up's last
     close."""
     from sleeve_fund.research.runner import run_backtest
 
     return run_backtest("buy_and_hold", bars, instrument, {"market": markets.market_of(params)},
-                        starting_capital=capital)
+                        starting_capital=capital, bar_minutes=bar_minutes)
 
 
 def hold_words(h: HoldBar | None) -> str:

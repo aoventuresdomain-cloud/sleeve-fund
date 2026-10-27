@@ -126,21 +126,28 @@ def _minute_check(req, history=None) -> str:
     without running anything (PM 23 Oct: prove it on the real store first). Dates and bar lengths only (public log)."""
     if req.minutes <= 1 or "," in req.pair:
         return ""
+    from dataclasses import replace
+
     from sleeve_fund.history import HistoryStore
     from sleeve_fund.research.run import execution_bars
     from sleeve_fund.venues import venue as venue_profile
 
     profile = venue_profile(req.venue)
     history = history or HistoryStore()
-    try:
-        prices = history.read(profile.name, req.pair, req.minutes)
-        _, oos_exec, oos_step = execution_bars(req, prices, profile, history)
-    except (KeyError, ValueError) as exc:
-        return f"; execution bars: REFUSED ({exc})"
-    if oos_exec is None or not len(oos_exec):
-        return "; execution bars: none"
-    return (f"; execution bars: {oos_step}-minute, {oos_exec.index[0]:%d %b %Y} to {oos_exec.index[-1]:%d %b %Y}, "
-            f"{len(oos_exec):,} bars")
+    out, each = [], req.pairs is not None and req.minutes != 1440
+    for pair in req.pairs if each else (req.pair,):  # a 4-hour asset list: each asset's, as its basket reads them
+        label = f" {pair}" if each else ""
+        try:
+            prices = history.read(profile.name, pair, req.minutes)
+            _, oos_exec, oos_step = execution_bars(replace(req, pair=pair, pairs=None), prices, profile, history)
+        except (KeyError, ValueError) as exc:
+            return f"; execution bars{label}: REFUSED ({exc})"
+        if oos_exec is None or not len(oos_exec):
+            out.append(f"; execution bars{label}: none")
+            continue
+        out.append(f"; execution bars{label}: {oos_step}-minute, {oos_exec.index[0]:%d %b %Y} to "
+                   f"{oos_exec.index[-1]:%d %b %Y}, {len(oos_exec):,} bars")
+    return "".join(out)
 
 
 def main(argv: list[str] | None = None, run=None, journal=None) -> int:
