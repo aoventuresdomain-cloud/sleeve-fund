@@ -2,21 +2,23 @@
 
 1. an asset list can run with the fund guards off: no fund limit trims, pauses or halts it, so its joint random
    draws are judged; the default is guarded, and paper and live never take the switch;
-2. an asset list can run guarded at a fixed size scale k: every leg's entries at k of its size (k x the fund's
-   equity / the legs; unscaled, a leg sizes at its own account's free cash, that same share), its sheet headed
-   fitness only;
-3. neither run is a new try: it records no trials row, and its sheet says so;
+2. an asset list can run guarded at a fixed size scale k: every leg's account holds k of its even share, so each
+   entry is k x the leg's current equity, compounding as the unscaled leg does, and the book is (1 - k) x capital
+   + k x the unscaled book (Advisor check 2a); its sheet headed fitness only;
+3. the unguarded run counts once, as any basket; the scaled run records no trials row, and its sheet says so;
+   a pooled sheet says its legs are never rebalanced (Advisor check 2b);
 4. a study list sets both by two lines of its common settings, refused on a single-asset row or an opened holdout."""
 
 from __future__ import annotations
 
 import re
 from dataclasses import fields, replace
+from datetime import date
 from pathlib import Path
 
 import pandas as pd
 import pytest
-from test_basket_4h import PAIRS, _History, _req
+from test_basket_4h import DEFINITION, PAIRS, _History, _req
 
 from sleeve_fund.research import basket as bk
 from sleeve_fund.research import rescore, trials
@@ -71,13 +73,32 @@ def test_the_switch_and_the_scale_are_an_asset_lists_only_and_keep_the_holdout_l
     replace(_req(), size_scale=0.55).validate()
 
 
-def test_a_scale_refuses_settings_that_already_cap_or_lever_a_leg():
-    basket = bk.Basket("b", "rules", {"position_cap_pct": 0.2}, (), "2025-01-02")
-    with pytest.raises(ValueError, match="already cap"):
-        bk._run(basket, [], None, None, None, 10_000.0, PORTFOLIO, 0, scale=0.5)
-    basket = bk.Basket("b", "rules", {"max_leverage": 2.0}, (), "2025-01-02")
-    with pytest.raises(ValueError, match="1x legs only"):
-        bk._run(basket, [], None, None, None, 10_000.0, PORTFOLIO, 0, scale=0.5)
+def test_a_scaled_entry_is_k_of_the_legs_current_equity_and_the_book_is_linear_in_k():
+    """At k = 0.5, unguarded on both: every entry is half the unscaled run's, after the leg's gains and losses too
+    (so k scales the leg's current equity, never the starting fund), and the book is 0.5 x capital + 0.5 x the
+    unscaled book at every mark."""
+    from qa155_lib import resample
+
+    from sleeve_fund.venues import venue
+
+    h = _History()
+    assets = [bk.BasketAsset(venue("KRAKEN").instrument(p.split("/")[0], "USD", price_precision=1),
+                             resample(h.minute[p], 240), h.minute[p], bar_minutes=240, exec_minutes=1) for p in PAIRS]
+    basket = bk.Basket("k", "rules", {"definition": DEFINITION}, tuple(assets), "2025-01-02")
+    first, last = date(2025, 2, 1), date(2025, 3, 2)
+    full, _, _ = bk._run(basket, assets, first, last, None, 10_000.0, bk.UNGUARDED, 180)
+    half, _, specs = bk._run(basket, assets, first, last, None, 10_000.0, bk.UNGUARDED, 180, scale=0.5)
+    assert [s.capital for s in specs] == [2_500.0, 2_500.0] and half.unallocated == 5_000.0
+
+    def entries(run):
+        return [(d["strategy"], d["ts"], float(d["requested"]))
+                for d in run.decisions if d.get("kind", "entry") == "entry"]
+
+    a, b = entries(full), entries(half)
+    assert len(a) > 4 and [x[:2] for x in a] == [x[:2] for x in b]
+    ratios = [y[2] / x[2] for x, y in zip(a, b)]
+    assert max(abs(r - 0.5) for r in ratios) < 2e-3  # lot rounding apart
+    assert ((half.book - (5_000.0 + 0.5 * full.book)).abs() / full.book).max() < 2e-3
 
 
 # ---- 4. the study list's lines ----------------------------------------------------------------------------------
@@ -160,17 +181,26 @@ def test_with_the_guards_off_nothing_is_trimmed_paused_or_halted_and_the_draws_a
 def test_at_a_size_scale_every_entry_is_k_of_the_fund_and_the_sheet_is_fitness_only(scaled, unguarded):
     sheet, _, study, runs = scaled
     assert runs and all(profile is PORTFOLIO for _, profile in runs)  # guarded, as paper
-    assert all(leg.params["position_cap_pct"] == 0.3 / len(legs) for legs, _ in runs for leg in legs)
+    assert all(leg.capital == 10_000.0 * 0.3 / len(legs) for legs, _ in runs for leg in legs)
     shares = _shares(study.base.run)
-    # 0.3 of each leg's half, against the last hourly mark (the leg sizes off the fund at its decision)
-    assert shares and 0.145 < min(shares) and max(shares) < 0.155
+    # at most 0.3 of each leg's half, less as the leg has lost (the k = 0.5 test above pins the scaling itself)
+    assert shares and 0.1 < min(shares) and max(shares) < 0.153
     assert "**Basket verdict:** FITNESS ONLY" in sheet and "fitness only" in sheet
     assert "position_cap_pct" not in study.basket.params  # the scale stays out of the basket and its key
     assert study.key == unguarded[2].key == bk.basket_key(study.basket)
 
 
-def test_neither_run_is_a_new_try(unguarded, scaled):
-    for sheet, store, study, _ in (unguarded, scaled):
-        assert not study.counted and study.tries == 0
-        assert trials.TrialsRegister(store)._counted(trials.legacy_idea_hash("rules")) == []
-        assert "**Tries:** not a new try" in sheet
+def test_the_unguarded_run_counts_once_and_the_scaled_run_never(unguarded, scaled):
+    sheet, store, study, _ = unguarded
+    rows = trials.TrialsRegister(store)._counted(trials.legacy_idea_hash("rules"))
+    assert study.counted and study.tries == 1 and len(rows) == 1 and rows[0]["definition_hash"] == study.key
+    assert "**Tries:** 1 " in sheet
+    sheet, store, study, _ = scaled
+    assert not study.counted and study.tries == 0
+    assert trials.TrialsRegister(store)._counted(trials.legacy_idea_hash("rules")) == []
+    assert "**Tries:** not a new try" in sheet
+
+
+def test_a_pooled_sheet_says_its_legs_are_never_rebalanced(unguarded, scaled):
+    for sheet, *_ in (unguarded, scaled):
+        assert bk.LEGS_NOT_REBALANCED in sheet

@@ -156,8 +156,8 @@ class BasketStudy:
     pooled: Any = None
     hold: Any = None
     without_sol: dict | None = None
-    # Advisor 27 Oct: a confirming run (never a new try): with the fund guards off, or every leg at size_scale of its
-    # unscaled size (the guarded run, fitness only)
+    # Advisor 27 Oct: with the fund guards off (the edge verdict's run, counted once), or every leg at size_scale of
+    # its unscaled size (the guarded run, fitness only, never a try)
     unguarded: bool = False
     size_scale: float | None = None
     counted: bool = True
@@ -219,24 +219,20 @@ def _run(basket: Basket, assets: list[BasketAsset], first: date, last: date, fee
          scale: float | None = None) -> tuple[PortfolioResult, list[str], list[LegSpec]]:
     """One fund run of `assets` over the days `first` to `last`. fees: a schedule for every leg, or None for each
     leg's venue fees. The fund's capital is split evenly across the legs' accounts; every leg sizes off the fund.
-    scale: every leg's position capped at scale x the fund's equity / the legs, its even share scaled (unscaled, a
-    research leg at 1x sizes at its own account's free cash, that same even share); None: as before."""
-    params = dict(basket.params)
-    if scale is not None:
-        if params.get("position_cap_pct") is not None:
-            raise ValueError("the basket's settings already cap each position, so a size scale can't be applied")
-        if float(params.get("max_leverage") or 1.0) != 1.0:
-            raise ValueError("a size scale scales 1x legs only")
-        params["position_cap_pct"] = scale / len(assets)
+    scale: every leg's account holds scale of its even share and the fund keeps the rest as cash no Strategy holds.
+    A research leg sizes at its own account's free cash, so each entry is scale x the leg's current equity (it
+    compounds as the unscaled leg does) and the book is (1 - scale) x capital + scale x the unscaled one (Advisor 27
+    Oct, check 2a); None: as before."""
+    share = 1.0 if scale is None else scale
     data = [_cut(a, first, last, warm_days) for a in assets]
     if len(data) > 1:
         check_assets(data)
     names = leg_names(basket.name, [d.instrument for d in data])
     specs = [LegSpec(n, basket.strategy, d.instrument, d.prices, d.exec_prices, d.warmup_prices,
-                     exec_minutes=a.exec_minutes, bar_minutes=a.bar_minutes, params=dict(params),
-                     capital=capital / len(data), fees=fees)
+                     exec_minutes=a.exec_minutes, bar_minutes=a.bar_minutes, params=dict(basket.params),
+                     capital=capital * share / len(data), fees=fees)
              for n, d, a in zip(names, data, assets)]
-    return run_portfolio(specs, profile, fund_sized=True), names, specs
+    return run_portfolio(specs, profile, unallocated=capital * (1 - share), fund_sized=True), names, specs
 
 
 def equity_before(book: pd.Series, index: pd.DatetimeIndex, capital: float) -> pd.Series:
@@ -524,8 +520,8 @@ def basket_study(basket: Basket, windows, research_end: date, *, register: trial
     """The basket's study over the walk-forward's test windows ((first day, last day), in order), never reading a bar
     after research_end. Its holdout stays sealed: open_holdout is the separate final step. filled: a study request's
     asset list (STUDY-ASSET-LIST): random entry judged filled on the pooled book, the hold bar, and without SOL.
-    scale: every leg at that share of its unscaled size (_run). counted False: a confirming run (Advisor 27 Oct),
-    whose settings are already counted where they were tried, so it records no try."""
+    scale: every leg at that share of its unscaled size (_run). counted False: a confirming run (Advisor 27 Oct, the
+    guarded run at a size scale), whose settings are counted by their unguarded run, so it records no try."""
     windows = tuple(tuple(w) for w in windows)
     if not windows or windows[-1][1] > research_end:
         raise ValueError(f"the test windows must end by the research end {research_end}")
@@ -694,6 +690,7 @@ def render(study: BasketStudy, holdout: Holdout | None = None) -> str:
         (f"**Tries:** {study.tries} (one per fixed basket and settings); this basket is try {study.configuration} of "
          f"{BUDGET_PER_IDEA} for {b.strategy}'s family" if study.counted else
          "**Tries:** not a new try: a confirming run of settings already counted (Advisor 27 Oct)"), "",
+        *([LEGS_NOT_REBALANCED, ""] if pooled is not None else []),
         f"Out-of-sample: {study.windows[0][0]} to {study.windows[-1][1]}, {days} days, one fund run of the whole "
         f"basket at the venue's fees: net {_pct(base.net)}.", "",
         "| Condition | Result |", "| --- | --- |",
@@ -724,14 +721,19 @@ def render(study: BasketStudy, holdout: Holdout | None = None) -> str:
     return "\n".join(lines)
 
 
+# Advisor 27 Oct (check 2b): the basket's convention, beside a pool worked by hand
+LEGS_NOT_REBALANCED = ("_Each asset's leg compounds on its own even share of the fund, never rebalanced; a pool "
+                       "rebalanced daily differs, and part of any gap from one is that._")
+
+
 def _run_lines(study: BasketStudy) -> list[str]:
     """What kind of run the sheet is, for a confirming run (Advisor 27 Oct); nothing for an ordinary one."""
     if study.unguarded:
         words = ("**Run:** fund guards OFF, research only: no fund limit trimmed, paused or halted anything, so the "
                  "edge verdict and joint draws are judged here; its drawdown is not the fund's")
     elif study.size_scale is not None:
-        words = (f"**Run:** fund guards on, as paper, every leg at {study.size_scale:g} of its size ({study.size_scale:g} "
-                 "x the fund's equity / the legs): fitness only")
+        words = (f"**Run:** fund guards on, as paper, every leg at {study.size_scale:g} of its size (its account "
+                 f"holds {study.size_scale:g} of its even share, the rest the fund's idle cash): fitness only")
     else:
         return []
     return [words + (f"; every leg at {study.size_scale:g} of its size" if study.unguarded

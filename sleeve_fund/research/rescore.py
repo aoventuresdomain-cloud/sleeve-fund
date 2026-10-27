@@ -38,8 +38,8 @@ TRAIN_DAYS, TEST_DAYS, HOLDOUT_DAYS = 730, 365, 365
 # pinned row continuously after its warm-up; without the line it keeps the walk-forward. This round only, the rows
 # scored on the old window before (QR-B1, QR-B2, QR-B3) also show that window's verdict and pass only if both pass.
 CONTINUOUS_LINE = re.compile(r"^-\s*\*\*Scoring window:\*\*\s*continuous\b", re.M | re.I)
-# Advisor 27 Oct (fast lane): an asset list's confirming runs, never a new try. "Fund guards: off" runs the basket
-# with every fund limit off (its edge verdict); "Size scale: 0.55" sizes every leg at that share of its size.
+# Advisor 27 Oct (fast lane): an asset list's two runs. "Fund guards: off" runs the basket with every fund limit off
+# (its edge verdict, counted once); "Size scale: 0.55" sizes every leg at that share of its size (never a try).
 FUND_GUARDS_LINE = re.compile(r"^-\s*\*\*Fund guards:\*\*\s*(on|off)\b", re.M | re.I)
 SIZE_SCALE_LINE = re.compile(r"^-\s*\*\*Size scale:\*\*\s*(\d*\.?\d+)\s*$", re.M | re.I)
 PAIRS = r"[A-Z0-9]{1,16}/[A-Z0-9]{1,16}(,[A-Z0-9]{1,16}/[A-Z0-9]{1,16}){0,3}"  # one instrument, or a list of up to 4
@@ -199,7 +199,7 @@ def main(argv: list[str] | None = None, run=None, journal=None) -> int:
         req.validate()
     print(f"{len(reqs)} studies on the list's settings (holdout locked)")
     if confirming:
-        print("confirming runs, not new tries: fund guards " + ("on" if confirming.get("fund_guards", True) else
+        print(("one try per basket" if "size_scale" not in confirming else "not new tries") + ": fund guards " + ("on" if confirming.get("fund_guards", True) else
               "OFF (research only)") + (f", size scale {confirming['size_scale']:g}" if "size_scale" in confirming
                                          else ""))
     if args.dry_run:

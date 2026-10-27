@@ -86,7 +86,8 @@ class StudyRequest:
     pairs: tuple[str, ...] | None = None
     # Advisor 27 Oct (fast lane), an asset list only, research only: fund_guards False runs the basket with every fund
     # limit switched off (the run its edge verdict and joint draws are judged on); size_scale k sizes every leg at k of
-    # its size, k x the fund's equity / the legs (the guarded run, fitness only). Either makes it a confirming run, never a new try. Paper and
+    # its size, k x the fund's equity / the legs (the guarded run, fitness only). The unguarded run is counted once, as any basket;
+    # the scaled one never. Paper and
     # live never read these: their limits are the runtime's profile.
     fund_guards: bool = True
     size_scale: float | None = None

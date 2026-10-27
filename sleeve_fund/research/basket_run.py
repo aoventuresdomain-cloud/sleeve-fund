@@ -141,10 +141,10 @@ def run_store_basket(req, store=None, out_dir: Path | None = None, history=None)
     universe = f"{datetime.now(timezone.utc):%Y-%m-%d}" if req.pinned is None else str(req.pinned.data_start)
     basket = bk.Basket(label, req.strategy, params, tuple(assets), universe)
     dataset = dataset_name(profile.name, req.pairs, req.minutes)
-    # Advisor 27 Oct: guards off or a size scale is a confirming run, never a new try
+    # Advisor 27 Oct: the unguarded run is the try (counted once, as any basket); a size scale's run is never one
     study = bk.basket_study(basket, tests, research_end, register=TrialsRegister(store), dataset=dataset,
                             warm_days=warm, filled=True, profile=bk.PORTFOLIO if req.fund_guards else bk.UNGUARDED,
-                            scale=req.size_scale, counted=req.fund_guards and req.size_scale is None)
+                            scale=req.size_scale, counted=req.size_scale is None)
     opened = None
     if req.use_holdout:
         opened = bk.open_holdout(study, holdout, HoldoutLocks(store), warm_days=warm)
