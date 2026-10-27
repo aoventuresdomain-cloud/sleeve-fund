@@ -9,7 +9,7 @@ definition's warm-up to the research end), and the holdout locked unless the req
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -68,6 +68,16 @@ def windows(clock: pd.DatetimeIndex, holdout_days: int, train_days: int, test_da
     return tuple(out), train, _day(research[-1], bar), held
 
 
+def _minutes(history, venue: str, pair: str, first: date, last: date) -> pd.DataFrame:
+    """The stored 1-minute bars closing on the days `first` to `last`, or a refusal naming the asset when they don't
+    cover them."""
+    lo, hi = pd.Timestamp(first, tz="UTC"), pd.Timestamp(last + timedelta(days=1), tz="UTC")
+    minute = history.read(venue, pair, 1, start=lo, end=hi)
+    if not len(minute) or minute.index[0] > lo + pd.Timedelta(hours=1) or minute.index[-1] != hi:
+        raise ValueError(f"{pair}: the stored 1-minute bars don't cover {first} to {last}: no 1-minute run")
+    return minute
+
+
 def run_store_basket(req, store=None, out_dir: Path | None = None, history=None) -> Path:
     """The request's asset list as one basket study (research.basket.basket_study) on the venue's stored history;
     writes its sheet and returns its path. Needs the journal: the basket's try is counted in its trials register."""
@@ -76,7 +86,7 @@ def run_store_basket(req, store=None, out_dir: Path | None = None, history=None)
     from sleeve_fund.instruments import history_price_decimals
     from sleeve_fund.research import pinned as pinning
     from sleeve_fund.research.holdout import HoldoutLocks
-    from sleeve_fund.research.run import TEARSHEETS, execution_bars, spec_of, study_market
+    from sleeve_fund.research.run import TEARSHEETS, spec_of, study_market
     from sleeve_fund.research.study import CONTINUOUS, continuous_warmup
     from sleeve_fund.research.trials import TrialsRegister
     from sleeve_fund.venues import venue as venue_profile
@@ -129,13 +139,11 @@ def run_store_basket(req, store=None, out_dir: Path | None = None, history=None)
             hourly = history.read(profile.name, pair, 60, start=prices.index[0] - DAY, end=prices.index[-1])
             assets.append(bk.BasketAsset(instrument, prices, hourly))
             continue
-        # A 4-hour list fills each asset on 1-minute bars over its whole pinned window, as its single sheets do, or
-        # is refused naming the asset (run.execution_bars: PM 23 Oct, no quiet fall back to coarser fills).
-        try:
-            _, minute, _ = execution_bars(replace(req, pair=pair, pairs=None), prices, profile, history)
-        except ValueError as exc:
-            raise ValueError(f"{pair}: {exc}") from None
-        minute = minute[minute.index <= prices.index[-1]]
+        # A 4-hour list fills each asset on 1-minute bars on every day a run trades (the test days, and the holdout
+        # when it is opened), or is refused naming the asset (PM 23 Oct: no quiet fall back to coarser fills). Only
+        # those days are read: three assets' whole pinned windows of minutes went past the study container's
+        # memory (27 Oct), and a run's warm-up reads its decision bars only.
+        minute = _minutes(history, profile.name, pair, tests[0][0], holdout[1] if req.use_holdout else research_end)
         assets.append(bk.BasketAsset(instrument, prices, minute, bar_minutes=req.minutes, exec_minutes=1))
     label = req.label or spec.name
     universe = f"{datetime.now(timezone.utc):%Y-%m-%d}" if req.pinned is None else str(req.pinned.data_start)

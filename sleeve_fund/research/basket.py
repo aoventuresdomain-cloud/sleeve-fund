@@ -211,7 +211,9 @@ def _cut(a: BasketAsset, first: date, last: date, warm_days: int) -> AssetData:
     window = p[(p.index > start) & (p.index <= end)]
     if not len(window) or window.index[-1] != end:
         raise ValueError(f"{underlying(a.instrument)}'s history doesn't reach {last}")
-    return AssetData(a.instrument, window, h[(h.index > start) & (h.index <= end)], warm)
+    # Positional slices: views, never copies of a run's 1-minute bars (27 Oct: three assets' went past memory)
+    lo, hi = h.index.searchsorted(start, "right"), h.index.searchsorted(end, "right")
+    return AssetData(a.instrument, window, h.iloc[lo:hi], warm)
 
 
 def _run(basket: Basket, assets: list[BasketAsset], first: date, last: date, fees, capital: float,
