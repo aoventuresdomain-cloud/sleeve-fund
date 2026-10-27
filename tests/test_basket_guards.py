@@ -201,6 +201,19 @@ def test_the_unguarded_run_counts_once_and_the_scaled_run_never(unguarded, scale
     assert "**Tries:** not a new try" in sheet
 
 
+def test_each_run_shows_its_drawdown_and_the_scaled_run_its_largest_share(unguarded, scaled):
+    sheet, _, study, _ = unguarded
+    dd = bk.worst_drawdown(study.base.returns)
+    assert 0 < dd < 1 and f"**Pooled worst drawdown:** {dd:.2%}" in sheet
+    sheet, _, study, _ = scaled
+    share = bk.largest_share(study.base.run, study.windows)
+    assert f"**Worst drawdown in fund terms:** {bk.worst_drawdown(study.base.returns):.2%}" in sheet
+    assert f"**Largest Strategy share of the book:** {share:.1%}" in sheet
+    assert 0 < share < 0.4  # 0.3 of the fund at the start, drifting with the Strategy's P&L
+    assert bk.worst_drawdown(pd.Series([0.1, -0.5, 0.2])) == pytest.approx(0.5)
+    assert bk.worst_drawdown(pd.Series([-0.1, 0.05])) == pytest.approx(0.1)  # from the start, before any gain
+
+
 def test_a_pooled_sheet_says_its_legs_are_never_rebalanced(unguarded, scaled):
     for sheet, *_ in (unguarded, scaled):
         assert bk.LEGS_NOT_REBALANCED in sheet

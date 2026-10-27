@@ -726,8 +726,26 @@ LEGS_NOT_REBALANCED = ("_Each asset's leg compounds on its own even share of the
                        "rebalanced daily differs, and part of any gap from one is that._")
 
 
+def worst_drawdown(returns: pd.Series) -> float:
+    """The pooled book's deepest fall from its high, on its out-of-sample daily returns compounded (0 when flat)."""
+    if not len(returns):
+        return 0.0
+    equity = np.concatenate([[1.0], (1 + returns.to_numpy()).cumprod()])
+    return float((1 - equity / np.maximum.accumulate(equity)).max())
+
+
+def largest_share(run: PortfolioResult, windows) -> float:
+    """The Strategy's largest share of the fund's book at any mark on the test days: the book less the cash no
+    Strategy holds, over the book (a scaled run's share drifts above k as it makes money: Advisor 27 Oct)."""
+    book = run.book[_oos(run.book.index, windows, pd.Timedelta(hours=1))]
+    return float(((book - run.unallocated) / book).max()) if len(book) else math.nan
+
+
 def _run_lines(study: BasketStudy) -> list[str]:
-    """What kind of run the sheet is, for a confirming run (Advisor 27 Oct); nothing for an ordinary one."""
+    """What kind of run the sheet is, for a confirming run (Advisor 27 Oct), with the drawdown its k is set from (the
+    unguarded run) or the drawdown in fund terms and the Strategy's largest share of the book (the scaled run);
+    nothing for an ordinary one."""
+    dd = worst_drawdown(study.base.returns)
     if study.unguarded:
         words = ("**Run:** fund guards OFF, research only: no fund limit trimmed, paused or halted anything, so the "
                  "edge verdict and joint draws are judged here; its drawdown is not the fund's")
@@ -736,8 +754,16 @@ def _run_lines(study: BasketStudy) -> list[str]:
                  f"holds {study.size_scale:g} of its even share, the rest the fund's idle cash): fitness only")
     else:
         return []
-    return [words + (f"; every leg at {study.size_scale:g} of its size" if study.unguarded
-                     and study.size_scale is not None else "") + ".", ""]
+    words += (f"; every leg at {study.size_scale:g} of its size" if study.unguarded
+              and study.size_scale is not None else "") + "."
+    if study.size_scale is None:
+        figures = (f"**Pooled worst drawdown:** {dd:.2%} (daily closes, out of sample); a size scale k = 10% / this "
+                   "sets the guarded run")
+    else:
+        figures = (f"**Worst drawdown in fund terms:** {dd:.2%} (daily closes, out of sample; never rebalanced to k, so "
+                   f"it can pass k x the unscaled one). **Largest Strategy share of the book:** "
+                   f"{largest_share(study.base.run, study.windows):.1%}")
+    return [words, "", figures, ""]
 
 
 # ---- STUDY-ASSET-LIST (Advisor ruling 21 Oct): random entry on the pooled book, filled as the engine fills ---------
