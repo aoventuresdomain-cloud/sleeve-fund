@@ -283,3 +283,27 @@ def test_a_daily_baskets_key_and_dataset_are_as_they_were_and_a_4h_ones_differ()
     assert bk.basket_key(four) != bk.basket_key(daily)
     assert basket_run.dataset_name("kraken", PAIRS) == "kraken-basket-btc-eth-usd-store"
     assert basket_run.dataset_name("kraken", PAIRS, 240) == "kraken-basket-btc-eth-usd-store-240m"
+
+
+# ---- memory (27 Oct: three assets' whole pinned windows of minutes went past the study container's 1.5 GB) ------
+
+def test_a_4h_list_reads_only_the_minutes_its_runs_fill_on_and_refuses_a_gap():
+    h = _History()
+    got = basket_run._minutes(h, "kraken", "BTC/USD", date(2025, 2, 1), date(2025, 3, 2))
+    assert got.index[0] == pd.Timestamp("2025-02-01 00:01", tz="UTC")
+    assert got.index[-1] == pd.Timestamp("2025-03-03", tz="UTC")
+    with pytest.raises(ValueError, match="BTC/USD: the stored 1-minute bars don't cover"):
+        basket_run._minutes(h, "kraken", "BTC/USD", date(2025, 2, 1), date(2025, 6, 1))  # past the store's end
+
+
+def test_a_runs_cut_of_its_minutes_is_a_view_never_a_copy():
+    from sleeve_fund.venues import venue
+
+    h = _History()
+    m = h.minute["BTC/USD"]
+    a = bk.BasketAsset(venue("KRAKEN").instrument("BTC", "USD", price_precision=1), resample(m, 240), m,
+                       bar_minutes=240, exec_minutes=1)
+    cut = bk._cut(a, date(2025, 2, 1), date(2025, 3, 2), 30)
+    assert cut.exec_prices.index[0] == pd.Timestamp("2025-02-01 00:01", tz="UTC")
+    assert cut.exec_prices.index[-1] == pd.Timestamp("2025-03-03", tz="UTC")
+    assert np.shares_memory(cut.exec_prices["close"].to_numpy(), m["close"].to_numpy())
