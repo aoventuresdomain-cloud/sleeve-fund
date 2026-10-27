@@ -8,6 +8,7 @@ definition's warm-up to the research end), and the holdout locked unless the req
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -18,15 +19,17 @@ from sleeve_fund.research import basket as bk
 DAY = pd.Timedelta(days=1)
 
 
-def dataset_name(venue: str, pairs) -> str:
-    """The basket's dataset, as the trials register and its sheet name it: its assets in list order."""
+def dataset_name(venue: str, pairs, minutes: int = 1440) -> str:
+    """The basket's dataset, as the trials register and its sheet name it: its assets in list order, and its bar
+    length when not daily (as a single study's)."""
     quote = pairs[0].split("/")[1]
-    return f"{venue}-basket-{'-'.join(p.split('/')[0] for p in pairs)}-{quote}-store".lower()
+    return (f"{venue}-basket-{'-'.join(p.split('/')[0] for p in pairs)}-{quote}-store".lower()
+            + (f"-{minutes}m" if minutes != 1440 else ""))
 
 
-def _day(ts: pd.Timestamp) -> date:
-    """The UTC day a daily bar closing at `ts` holds (a bar closing at 00:00 is the day before's)."""
-    return (ts - DAY).date()
+def _day(ts: pd.Timestamp, bar: pd.Timedelta = DAY) -> date:
+    """The UTC day a bar of length `bar` closing at `ts` holds (a bar closing at 00:00 is the day before's)."""
+    return (ts - bar).date()
 
 
 def common_clock(prices: list[pd.DataFrame], names: list[str]) -> list[pd.DataFrame]:
@@ -40,26 +43,29 @@ def common_clock(prices: list[pd.DataFrame], names: list[str]) -> list[pd.DataFr
 
 
 def windows(clock: pd.DatetimeIndex, holdout_days: int, train_days: int, test_days: int,
-            warmup_bars: int | None = None) -> tuple[tuple, int, date, tuple | None]:
-    """The study's days on daily bars: (test windows as (first day, last day), warm-up bars before the first, the
-    research end, the holdout as (first day, last day) or None). Walk-forward: run_study's test windows, each
-    train_days after the last's start, the training bars warming the first; continuous (warmup_bars): one window
-    from the bar after the warm-up to the research end."""
-    research = clock[:-holdout_days] if holdout_days else clock
-    if len(clock) < holdout_days + train_days + test_days:
-        raise ValueError(f"{len(clock):,} days the listed assets share is too short for holdout {holdout_days} + "
-                         f"train {train_days} + test {test_days} days")
-    holdout = (_day(clock[-holdout_days]), _day(clock[-1])) if holdout_days else None
+            warmup_bars: int | None = None, minutes: int = 1440) -> tuple[tuple, int, date, tuple | None]:
+    """The study's days on bars of `minutes` (daily, or 4-hour: each day `1440 // minutes` bars): (test windows as
+    (first day, last day), warm-up bars before the first, the research end, the holdout as (first day, last day) or
+    None). Walk-forward: run_study's test windows, each train_days after the last's start, the training bars warming
+    the first; continuous (warmup_bars): one window from the bar after the warm-up to the research end."""
+    per_day, bar = 1440 // minutes, pd.Timedelta(minutes=minutes)
+    holdout, train, test_n = holdout_days * per_day, train_days * per_day, test_days * per_day
+    research = clock[:-holdout] if holdout else clock
+    if len(clock) < holdout + train + test_n:
+        raise ValueError(f"{len(clock) // per_day:,} days the listed assets share is too short for holdout "
+                         f"{holdout_days} + train {train_days} + test {test_days} days")
+    held = (_day(clock[-holdout], bar), _day(clock[-1], bar)) if holdout else None
     if warmup_bars is not None:
         if warmup_bars >= len(research):
             raise ValueError(f"the warm-up of {warmup_bars:,} bars leaves nothing to score")
-        return ((_day(research[warmup_bars]), _day(research[-1])),), warmup_bars, _day(research[-1]), holdout
+        return ((_day(research[warmup_bars], bar), _day(research[-1], bar)),), warmup_bars, \
+            _day(research[-1], bar), held
     out, start = [], 0
-    while start + train_days + test_days <= len(research):
-        test = research[start + train_days: start + train_days + test_days]
-        out.append((_day(test[0]), _day(test[-1])))
-        start += test_days
-    return tuple(out), train_days, _day(research[-1]), holdout
+    while start + train + test_n <= len(research):
+        test = research[start + train: start + train + test_n]
+        out.append((_day(test[0], bar), _day(test[-1], bar)))
+        start += test_n
+    return tuple(out), train, _day(research[-1], bar), held
 
 
 def run_store_basket(req, store=None, out_dir: Path | None = None, history=None) -> Path:
@@ -70,7 +76,7 @@ def run_store_basket(req, store=None, out_dir: Path | None = None, history=None)
     from sleeve_fund.instruments import history_price_decimals
     from sleeve_fund.research import pinned as pinning
     from sleeve_fund.research.holdout import HoldoutLocks
-    from sleeve_fund.research.run import TEARSHEETS, spec_of, study_market
+    from sleeve_fund.research.run import TEARSHEETS, execution_bars, spec_of, study_market
     from sleeve_fund.research.study import CONTINUOUS, continuous_warmup
     from sleeve_fund.research.trials import TrialsRegister
     from sleeve_fund.venues import venue as venue_profile
@@ -90,7 +96,8 @@ def run_store_basket(req, store=None, out_dir: Path | None = None, history=None)
             raise ValueError(f"no stored history for {pair} on this venue; ask for it under Stored history on the "
                              "Research page") from None
         if prices.empty:
-            raise ValueError(f"the stored history for {pair} has no daily bars yet")
+            raise ValueError(f"the stored history for {pair} has no {'daily' if req.minutes == 1440 else '4-hour'} "
+                             "bars yet")
         if req.pinned is not None:
             try:
                 prices = pinning.cut(prices, req.pinned)
@@ -98,8 +105,6 @@ def run_store_basket(req, store=None, out_dir: Path | None = None, history=None)
                 raise ValueError(f"{pair}: {exc}") from None
         floor = fees
         if profile.fee_bounds:  # FEE-LIVE: never below the published VIP 0, as the single study pays
-            from dataclasses import replace
-
             from sleeve_fund import venue_terms
 
             got = venue_terms.research_fees(store, profile, pair)
@@ -114,20 +119,32 @@ def run_store_basket(req, store=None, out_dir: Path | None = None, history=None)
     if req.pinned is not None and req.holdout_days != req.pinned.holdout_days:
         raise ValueError(f"pinned dates: the holdout is {req.pinned.holdout_days} days, not {req.holdout_days}")
     tests, warm, research_end, holdout = windows(daily[0].index, req.holdout_days, req.train_days, req.test_days,
-                                                 warmup)
+                                                 warmup, req.minutes)
     if req.pinned is not None and research_end != req.pinned.research_end:
         raise ValueError(f"pinned dates: the research period the listed assets share ends {research_end}, not the "
                          f"pinned {req.pinned.research_end}")
     assets = []
     for pair, instrument, prices in zip(req.pairs, instruments, daily):
-        hourly = history.read(profile.name, pair, 60, start=prices.index[0] - DAY, end=prices.index[-1])
-        assets.append(bk.BasketAsset(instrument, prices, hourly))
+        if req.minutes == 1440:
+            hourly = history.read(profile.name, pair, 60, start=prices.index[0] - DAY, end=prices.index[-1])
+            assets.append(bk.BasketAsset(instrument, prices, hourly))
+            continue
+        # A 4-hour list fills each asset on 1-minute bars over its whole pinned window, as its single sheets do, or
+        # is refused naming the asset (run.execution_bars: PM 23 Oct, no quiet fall back to coarser fills).
+        try:
+            _, minute, _ = execution_bars(replace(req, pair=pair, pairs=None), prices, profile, history)
+        except ValueError as exc:
+            raise ValueError(f"{pair}: {exc}") from None
+        minute = minute[minute.index <= prices.index[-1]]
+        assets.append(bk.BasketAsset(instrument, prices, minute, bar_minutes=req.minutes, exec_minutes=1))
     label = req.label or spec.name
     universe = f"{datetime.now(timezone.utc):%Y-%m-%d}" if req.pinned is None else str(req.pinned.data_start)
     basket = bk.Basket(label, req.strategy, params, tuple(assets), universe)
-    dataset = dataset_name(profile.name, req.pairs)
+    dataset = dataset_name(profile.name, req.pairs, req.minutes)
+    # Advisor 27 Oct: the unguarded run is the try (counted once, as any basket); a size scale's run is never one
     study = bk.basket_study(basket, tests, research_end, register=TrialsRegister(store), dataset=dataset,
-                            warm_days=warm, filled=True)
+                            warm_days=warm, filled=True, profile=bk.PORTFOLIO if req.fund_guards else bk.UNGUARDED,
+                            scale=req.size_scale, counted=req.size_scale is None)
     opened = None
     if req.use_holdout:
         opened = bk.open_holdout(study, holdout, HoldoutLocks(store), warm_days=warm)

@@ -1,9 +1,9 @@
 """STUDY-ASSET-LIST (PM 21 Oct; Deploy 3): a study request's asset list runs one definition as one B-38 basket.
 
-StudyRequest(pairs=[...]) takes 2-4 assets of the research pool (BTC, ETH, SOL, XRP) on one quote, daily bars, its
-pair the list's first; a request without pairs runs exactly as before. The basket's days are the single study's (the
-walk-forward's test windows, or one continuous window after the warm-up), its sheet shows each asset and the pooled
-book, and it counts as one try."""
+StudyRequest(pairs=[...]) takes 2-4 assets of the research pool (BTC, ETH, SOL, XRP) on one quote, daily bars (or
+4-hour on a pinned list: tests/test_basket_4h.py), its pair the list's first; a request without pairs runs exactly as
+before. The basket's days are the single study's (the walk-forward's test windows, or one continuous window after the
+warm-up), its sheet shows each asset and the pooled book, and it counts as one try."""
 
 from __future__ import annotations
 
@@ -46,7 +46,8 @@ def test_a_single_pair_request_is_unchanged():
     ({"pairs": ["BTC/USD", "ETH/USDT"]}, "different currencies"),
     ({"pairs": ["BTC/USD", "ETHUSD"]}, "should look like BTC/USDT"),
     ({"pair": "ETH/USD"}, "is not its list's first asset BTC/USD"),
-    ({"minutes": 240}, "daily bars only"),
+    ({"minutes": 60}, "daily or 4-hour bars only"),
+    ({"minutes": 240}, "a 4-hour asset list runs on a pinned list's dates only"),
     ({"old_window_too": True, "score_window": "continuous"}, "without the placebo or the old window"),
 ])
 def test_an_asset_list_is_refused_in_words(kw, words):
@@ -267,8 +268,8 @@ def _spec(prices: list[float], start="2018-03-02"):
 
     idx = pd.date_range(pd.Timestamp(start, tz="UTC"), periods=len(prices), freq="1D")
     bars = pd.DataFrame({"close": prices}, index=idx)
-    return NS(prices=bars.iloc[1:], warmup_prices=bars.iloc[:1], instrument=spot_pair("BTC", "USD", FEES,
-                                                                                        Venue("KRAKEN")))
+    return NS(prices=bars.iloc[1:], warmup_prices=bars.iloc[:1], bar_minutes=1440,
+              instrument=spot_pair("BTC", "USD", FEES, Venue("KRAKEN")))
 
 
 def test_a_long_short_basket_prints_no_hold_bar():
