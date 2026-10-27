@@ -43,6 +43,11 @@ from sleeve_fund.research.candidates import BUDGET_PER_IDEA, configurations
 from sleeve_fund.research.study import COST_LADDER, _between, doubled
 from sleeve_fund.risk import PORTFOLIO, PortfolioProfile
 
+# Advisor 27 Oct (fast lane), research only: the run a basket's edge verdict and joint draws are judged on, every
+# fund limit switched off as B-32 switches one off (None), so nothing trims, pauses or halts it. Paper and live never
+# take it: their limits are the runtime's profile (tests/test_basket_guards.py pins that).
+UNGUARDED = PortfolioProfile(gross=None, net_instrument=None, margin=None, open_risk=None, drawdown=None,
+                             daily_loss=None)
 GATE_TOUCH_CAP = 0.05  # Advisor fork 3: the ungated random benchmark is like-with-like only below this
 CONCENTRATED = 0.5  # the top asset's share of the pooled out-of-sample net P&L above which the basket is flagged
 NEXT = "next: 4-6 weeks paper"
@@ -151,6 +156,11 @@ class BasketStudy:
     pooled: Any = None
     hold: Any = None
     without_sol: dict | None = None
+    # Advisor 27 Oct: a confirming run (never a new try): with the fund guards off, or every leg at size_scale of its
+    # unscaled size (the guarded run, fitness only)
+    unguarded: bool = False
+    size_scale: float | None = None
+    counted: bool = True
 
     @property
     def gate_touched(self) -> float:
@@ -205,15 +215,25 @@ def _cut(a: BasketAsset, first: date, last: date, warm_days: int) -> AssetData:
 
 
 def _run(basket: Basket, assets: list[BasketAsset], first: date, last: date, fees, capital: float,
-         profile: PortfolioProfile, warm_days: int) -> tuple[PortfolioResult, list[str], list[LegSpec]]:
+         profile: PortfolioProfile, warm_days: int,
+         scale: float | None = None) -> tuple[PortfolioResult, list[str], list[LegSpec]]:
     """One fund run of `assets` over the days `first` to `last`. fees: a schedule for every leg, or None for each
-    leg's venue fees. The fund's capital is split evenly across the legs' accounts; every leg sizes off the fund."""
+    leg's venue fees. The fund's capital is split evenly across the legs' accounts; every leg sizes off the fund.
+    scale: every leg's position capped at scale x the fund's equity / the legs, its even share scaled (unscaled, a
+    research leg at 1x sizes at its own account's free cash, that same even share); None: as before."""
+    params = dict(basket.params)
+    if scale is not None:
+        if params.get("position_cap_pct") is not None:
+            raise ValueError("the basket's settings already cap each position, so a size scale can't be applied")
+        if float(params.get("max_leverage") or 1.0) != 1.0:
+            raise ValueError("a size scale scales 1x legs only")
+        params["position_cap_pct"] = scale / len(assets)
     data = [_cut(a, first, last, warm_days) for a in assets]
     if len(data) > 1:
         check_assets(data)
     names = leg_names(basket.name, [d.instrument for d in data])
     specs = [LegSpec(n, basket.strategy, d.instrument, d.prices, d.exec_prices, d.warmup_prices,
-                     exec_minutes=a.exec_minutes, bar_minutes=a.bar_minutes, params=dict(basket.params),
+                     exec_minutes=a.exec_minutes, bar_minutes=a.bar_minutes, params=dict(params),
                      capital=capital / len(data), fees=fees)
              for n, d, a in zip(names, data, assets)]
     return run_portfolio(specs, profile, fund_sized=True), names, specs
@@ -499,10 +519,13 @@ def _created(t: dict) -> pd.Timestamp:
 
 def basket_study(basket: Basket, windows, research_end: date, *, register: trials.TrialsRegister, dataset: str,
                  capital: float = 10_000.0, profile: PortfolioProfile = PORTFOLIO, warm_days: int = 200,
-                 ladder: bool = True, draws: int = DRAWS, seed: int = 0, filled: bool = False) -> BasketStudy:
+                 ladder: bool = True, draws: int = DRAWS, seed: int = 0, filled: bool = False,
+                 scale: float | None = None, counted: bool = True) -> BasketStudy:
     """The basket's study over the walk-forward's test windows ((first day, last day), in order), never reading a bar
     after research_end. Its holdout stays sealed: open_holdout is the separate final step. filled: a study request's
-    asset list (STUDY-ASSET-LIST): random entry judged filled on the pooled book, the hold bar, and without SOL."""
+    asset list (STUDY-ASSET-LIST): random entry judged filled on the pooled book, the hold bar, and without SOL.
+    scale: every leg at that share of its unscaled size (_run). counted False: a confirming run (Advisor 27 Oct),
+    whose settings are already counted where they were tried, so it records no try."""
     windows = tuple(tuple(w) for w in windows)
     if not windows or windows[-1][1] > research_end:
         raise ValueError(f"the test windows must end by the research end {research_end}")
@@ -511,7 +534,7 @@ def basket_study(basket: Basket, windows, research_end: date, *, register: trial
     names_of = basket.names
 
     def measured(subset, fees):
-        run, names, specs = _run(basket, subset, first, last, fees, capital, profile, warm_days)
+        run, names, specs = _run(basket, subset, first, last, fees, capital, profile, warm_days, scale)
         return _measure(run, names, specs, [underlying(a.instrument) for a in subset], windows, capital), names, specs
 
     base, names, specs = measured(assets, None)
@@ -541,6 +564,7 @@ def basket_study(basket: Basket, windows, research_end: date, *, register: trial
         ladder=rungs, breakeven=ladder_breakeven(rungs) if rungs else (None, "not tested"),
         asset_breakeven={a: ladder_breakeven(r) for a, r in per_asset.items() if r})
     study.key = basket_key(basket)
+    study.unguarded, study.size_scale, study.counted = profile == UNGUARDED, scale, counted
     if filled:
         study.pooled = pooled_random(base, names, specs, basket.params, windows, capital, touched, draws, seed)
         study.hold = hold_bar(base, specs, basket.params, windows, capital)
@@ -551,9 +575,11 @@ def basket_study(basket: Basket, windows, research_end: date, *, register: trial
                                  "sharpe": _sharpe(m.returns.to_numpy()),
                                  "random": pooled_random(m, rn, rs, basket.params, windows, capital,
                                                          gate_touched(m.run, windows), draws, seed)}
-    study.tries, study.configuration = record_try(
-        register, basket, dataset, _since(first, warm_days, basket), pd.Timestamp(last + timedelta(days=1), tz="UTC"),
-        None if math.isnan(study.random.sharpe) else study.random.sharpe)
+    if counted:
+        study.tries, study.configuration = record_try(
+            register, basket, dataset, _since(first, warm_days, basket),
+            pd.Timestamp(last + timedelta(days=1), tz="UTC"),
+            None if math.isnan(study.random.sharpe) else study.random.sharpe)
     return study
 
 
@@ -644,6 +670,9 @@ def render(study: BasketStudy, holdout: Holdout | None = None) -> str:
         not_judged = f"NOT JUDGED: the hold bar is {UNPROVEN}, so the basket can't pass yet"
     head = {"NOT YET": "NOT YET: the locked holdout is sealed until its own final step",
             "NOT JUDGED": not_judged, "PASS": "PASS", "FAIL": "FAIL"}[v]
+    if study.size_scale is not None and not study.unguarded:
+        head = (f"FITNESS ONLY: a guarded run with every leg at {study.size_scale:g} of its size; the edge "
+                f"verdict is the unguarded run's (this run's own would read {v})")
     lo = study.left_out
     if pooled is None:
         random_rows = [f"| Beats random entries (95th percentile) | {random_words(study.random)} |"]
@@ -661,8 +690,10 @@ def render(study: BasketStudy, holdout: Holdout | None = None) -> str:
         f"# Basket study: {b.name} ({b.strategy} on {', '.join(b.names)})", "",
         f"**Basket verdict:** {head}", "",
         f"_{FIXED_LIST.format(date=b.universe_date)}_", "",
-        f"**Tries:** {study.tries} (one per fixed basket and settings); this basket is try {study.configuration} of "
-        f"{BUDGET_PER_IDEA} for {b.strategy}'s family", "",
+        *_run_lines(study),
+        (f"**Tries:** {study.tries} (one per fixed basket and settings); this basket is try {study.configuration} of "
+         f"{BUDGET_PER_IDEA} for {b.strategy}'s family" if study.counted else
+         "**Tries:** not a new try: a confirming run of settings already counted (Advisor 27 Oct)"), "",
         f"Out-of-sample: {study.windows[0][0]} to {study.windows[-1][1]}, {days} days, one fund run of the whole "
         f"basket at the venue's fees: net {_pct(base.net)}.", "",
         "| Condition | Result |", "| --- | --- |",
@@ -691,6 +722,20 @@ def render(study: BasketStudy, holdout: Holdout | None = None) -> str:
         lines.append(f"| {a} | {totals[a]:,.2f} | {totals[a] / whole if whole else math.nan:.0%} | {be} |")
     lines += ["", f"On a PASS, {NEXT}." if v != "PASS" else f"PASS, so {NEXT}.", ""]
     return "\n".join(lines)
+
+
+def _run_lines(study: BasketStudy) -> list[str]:
+    """What kind of run the sheet is, for a confirming run (Advisor 27 Oct); nothing for an ordinary one."""
+    if study.unguarded:
+        words = ("**Run:** fund guards OFF, research only: no fund limit trimmed, paused or halted anything, so the "
+                 "edge verdict and joint draws are judged here; its drawdown is not the fund's")
+    elif study.size_scale is not None:
+        words = (f"**Run:** fund guards on, as paper, every leg at {study.size_scale:g} of its size ({study.size_scale:g} "
+                 "x the fund's equity / the legs): fitness only")
+    else:
+        return []
+    return [words + (f"; every leg at {study.size_scale:g} of its size" if study.unguarded
+                     and study.size_scale is not None else "") + ".", ""]
 
 
 # ---- STUDY-ASSET-LIST (Advisor ruling 21 Oct): random entry on the pooled book, filled as the engine fills ---------

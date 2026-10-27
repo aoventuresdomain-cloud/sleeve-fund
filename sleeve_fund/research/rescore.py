@@ -38,6 +38,10 @@ TRAIN_DAYS, TEST_DAYS, HOLDOUT_DAYS = 730, 365, 365
 # pinned row continuously after its warm-up; without the line it keeps the walk-forward. This round only, the rows
 # scored on the old window before (QR-B1, QR-B2, QR-B3) also show that window's verdict and pass only if both pass.
 CONTINUOUS_LINE = re.compile(r"^-\s*\*\*Scoring window:\*\*\s*continuous\b", re.M | re.I)
+# Advisor 27 Oct (fast lane): an asset list's confirming runs, never a new try. "Fund guards: off" runs the basket
+# with every fund limit off (its edge verdict); "Size scale: 0.55" sizes every leg at that share of its size.
+FUND_GUARDS_LINE = re.compile(r"^-\s*\*\*Fund guards:\*\*\s*(on|off)\b", re.M | re.I)
+SIZE_SCALE_LINE = re.compile(r"^-\s*\*\*Size scale:\*\*\s*(\d*\.?\d+)\s*$", re.M | re.I)
 PAIRS = r"[A-Z0-9]{1,16}/[A-Z0-9]{1,16}(,[A-Z0-9]{1,16}/[A-Z0-9]{1,16}){0,3}"  # one instrument, or a list of up to 4
 OLD_WINDOW_TOO = frozenset({
     "qr01_trend_ema_long", "qr01_trend_ema_short", "qr01b_trend_multispeed_long", "qr01b_trend_multispeed_short",
@@ -93,8 +97,18 @@ def pick(rows: list, spec: str | None) -> list:
     return chosen
 
 
+def confirming_of(text: str) -> dict:
+    """The list's confirming-run settings (Advisor 27 Oct) as StudyRequest fields: {} when it names neither."""
+    out = {}
+    if (m := FUND_GUARDS_LINE.search(text)) is not None:
+        out["fund_guards"] = m[1].lower() == "on"
+    if (m := SIZE_SCALE_LINE.search(text)) is not None:
+        out["size_scale"] = float(m[1])
+    return out
+
+
 def request(name: str, minutes: int, venue: str, pair: str, pinned=None, continuous: bool = False,
-            market: str | None = None):
+            market: str | None = None, confirming: dict | None = None):
     """The store study one row runs: rules, its definition's params, perp (or the row's market), the locked holdout,
     on the list's pinned dates (B-37), scored continuously after a warm-up when the list says so (R-11). pair: one
     instrument, or several joined by commas (STUDY-ASSET-LIST), run as one basket."""
@@ -117,6 +131,7 @@ def request(name: str, minutes: int, venue: str, pair: str, pinned=None, continu
     return StudyRequest(strategy="rules", pair=pairs[0] if pairs else pair, pairs=pairs, venue=venue, minutes=minutes,
                         risk_profile=None, train_days=TRAIN_DAYS, test_days=TEST_DAYS, holdout_days=HOLDOUT_DAYS, use_holdout=False,
                         params=params, label=name, pinned=pinned, placebo_parent=parent, market=market,
+                        **(confirming or {}),
                         **({"score_window": "continuous", "old_window_too": name in OLD_WINDOW_TOO and not pairs}
                            if continuous else {}))
 
@@ -171,8 +186,11 @@ def main(argv: list[str] | None = None, run=None, journal=None) -> int:
         rows = pick(rows_of(text), args.rows)
         continuous = CONTINUOUS_LINE.search(text) is not None
         market = markets_of(text)
-        reqs = [(n, name, request(name, minutes, args.venue, args.pair, pinned, continuous, market.get(n)))
-                for n, name, minutes in rows]
+        confirming = confirming_of(text)
+        reqs = [(n, name, request(name, minutes, args.venue, args.pair, pinned, continuous, market.get(n),
+                                  confirming)) for n, name, minutes in rows]
+        for _, _, req in reqs:
+            req.validate()
     except (OSError, ValueError) as exc:
         print(f"refused: {exc}")
         return 2
@@ -180,6 +198,10 @@ def main(argv: list[str] | None = None, run=None, journal=None) -> int:
         assert req.use_holdout is False  # never opened from here
         req.validate()
     print(f"{len(reqs)} studies on the list's settings (holdout locked)")
+    if confirming:
+        print("confirming runs, not new tries: fund guards " + ("on" if confirming.get("fund_guards", True) else
+              "OFF (research only)") + (f", size scale {confirming['size_scale']:g}" if "size_scale" in confirming
+                                         else ""))
     if args.dry_run:
         for n, name, req in reqs:
             print(f"row {n:>2} {name}: checked{_minute_check(req)}")

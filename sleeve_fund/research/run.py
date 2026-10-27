@@ -84,6 +84,12 @@ class StudyRequest:
     # STUDY-ASSET-LIST (PM 21 Oct): the assets one definition runs on as one basket (research.basket_run), `pair`
     # their first; None: `pair` alone, as before
     pairs: tuple[str, ...] | None = None
+    # Advisor 27 Oct (fast lane), an asset list only, research only: fund_guards False runs the basket with every fund
+    # limit switched off (the run its edge verdict and joint draws are judged on); size_scale k sizes every leg at k of
+    # its size, k x the fund's equity / the legs (the guarded run, fitness only). Either makes it a confirming run, never a new try. Paper and
+    # live never read these: their limits are the runtime's profile.
+    fund_guards: bool = True
+    size_scale: float | None = None
 
     def __post_init__(self) -> None:
         if self.pairs is not None:
@@ -118,6 +124,17 @@ class StudyRequest:
             raise ValueError(f"a study's market is a name, not {self.market!r}")
         if self.pairs is not None:
             self._validate_pairs()
+        if not isinstance(self.fund_guards, bool):
+            raise ValueError(f"fund guards are on or off, not {self.fund_guards!r}")
+        if not self.fund_guards or self.size_scale is not None:
+            if self.pairs is None:
+                raise ValueError("the fund guards switch and a size scale are an asset list's settings only")
+            if self.use_holdout:
+                raise ValueError("a confirming run keeps the holdout locked")
+        if self.size_scale is not None and (isinstance(self.size_scale, bool)
+                                            or not isinstance(self.size_scale, (int, float))
+                                            or not 0 < self.size_scale <= 1):
+            raise ValueError(f"a size scale is above 0 and at most 1, not {self.size_scale!r}")
 
     def _validate_pairs(self) -> None:
         bases = [p.split("/")[0] if "/" in p else None for p in self.pairs]
