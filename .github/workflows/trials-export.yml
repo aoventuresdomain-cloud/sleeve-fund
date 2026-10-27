@@ -1,0 +1,71 @@
+name: trials-export
+# TRIALS-EXPORT (PM yes 25 Oct 03:25 UTC, again 27 Oct; a one-off read-only lookup): brings the trials register
+# (every counted and uncounted row of the database's trials table, research.trials) from the paper server to the
+# project, so the Advisor's deflated Sharpe can use the register's exact N and Sharpe spread for an idea family.
+# Read-only: the session runs with default_transaction_read_only on, and its one COPY sends the table to stdout as
+# CSV; nothing is written on the server or in the database. The CSV is encrypted on the runner to the sheet-export
+# key, which only the project holds (deploy/keys/sheet-export.pub.pem), in sheet-export's layout, so
+# scripts/decrypt_sheet_export.sh opens it. The repository is public, so the log shows a row count and byte counts
+# only, never contents. Run it by hand from main.
+on:
+  workflow_dispatch:
+concurrency: { group: trials-export, cancel-in-progress: false }
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions: { contents: read }
+    if: ${{ vars.DEPLOY_ENABLED == 'true' && github.ref == 'refs/heads/main' }}
+    env:
+      USER_AT: ${{ vars.DEPLOY_USER || 'root' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Configure SSH
+        env:
+          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/id_deploy && chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts
+      - name: Read the register
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$RUNNER_TEMP/plain"
+          ssh -i ~/.ssh/id_deploy -o ServerAliveInterval=30 -o ServerAliveCountMax=10 "$USER_AT@$HOST" \
+            'cd /opt/sleeve-fund && sudo docker compose exec -T -e PGOPTIONS="-c default_transaction_read_only=on" db \
+              psql -U sleeve -d sleeve_fund -v ON_ERROR_STOP=1 -q -c "COPY (SELECT id, definition_hash, idea_hash,
+                code_version, definition_name, family, dataset, stage, source, kind, status, sharpe, trades, oos_trades,
+                backtest_id, data_start, data_end, created_at, settings FROM trials ORDER BY created_at, id)
+                TO STDOUT WITH (FORMAT csv, HEADER true)"' > "$RUNNER_TEMP/plain/trials.csv"
+          # A header and at least one row, or the read failed.
+          rows=$(( $(wc -l < "$RUNNER_TEMP/plain/trials.csv") - 1 ))
+          [ "$rows" -ge 1 ] || { echo "::error::the register came back empty"; exit 1; }
+          echo "trials.csv $(stat -c %s "$RUNNER_TEMP/plain/trials.csv") bytes, $rows lines after the header"
+          tar -czf "$RUNNER_TEMP/plain/sheet.tar.gz" -C "$RUNNER_TEMP/plain" trials.csv
+      - name: Encrypt
+        run: |
+          # As sheet-export: a fresh random key encrypts the archive; the project's public key (RSA-OAEP, SHA-256) wraps it.
+          set -euo pipefail
+          umask 077
+          mkdir -p "$RUNNER_TEMP/out"
+          openssl rand -hex 32 > "$RUNNER_TEMP/plain/key.hex"
+          openssl enc -aes-256-cbc -pbkdf2 -salt -in "$RUNNER_TEMP/plain/sheet.tar.gz" -out "$RUNNER_TEMP/out/sheet.tar.gz.enc" -pass "file:$RUNNER_TEMP/plain/key.hex"
+          openssl pkeyutl -encrypt -pubin -inkey deploy/keys/sheet-export.pub.pem -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 -in "$RUNNER_TEMP/plain/key.hex" -out "$RUNNER_TEMP/out/key.bin.enc"
+          rm -rf -- "$RUNNER_TEMP/plain"
+          for f in "$RUNNER_TEMP"/out/*; do echo "$(basename "$f") $(stat -c %s "$f") bytes"; done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: trials-export-${{ github.run_id }}
+          path: ${{ runner.temp }}/out/
+          retention-days: 3
+          if-no-files-found: error
+      - name: Clean up
+        if: always()
+        run: rm -rf -- "$RUNNER_TEMP/plain" "$RUNNER_TEMP/out" ~/.ssh/id_deploy
