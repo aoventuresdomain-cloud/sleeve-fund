@@ -136,7 +136,8 @@ def test_a_position_held_across_pays_rate_times_notional_once_longs_pay_shorts_r
         # A simulated perp (no venue rates) pays the baseline whichever side is held (Advisor, 6 Oct 2026; HoE OK 7 Oct)
         assert amount == pytest.approx(-abs(qty) * price * RATE)
         assert amount < 0
-    assert [r[1:] for r in pfund] == pytest.approx([r[1:] for r in bfund])  # paper and backtest alike
+    assert len(pfund) == len(bfund)  # paper and backtest alike (pytest 9.2 refuses a nested approx)
+    assert all(p[1:] == pytest.approx(b[1:]) for p, b in zip(pfund, bfund))
 
 
 def test_paper_charges_a_long_held_at_settlement_and_stopped_out_five_seconds_later(tmp_path):
@@ -152,7 +153,8 @@ def test_paper_charges_a_long_held_at_settlement_and_stopped_out_five_seconds_la
     assert pf[-1][0] == utc("2025-10-03 08:00:05")  # held at 08:00:00, closed after it
     assert [r[0] for r in bfund] == [utc("2025-10-03 08:00")]  # the backtest charges it
     assert [r[0] for r in pfund] == [utc("2025-10-03 08:00")]  # paper charges it too (P1-O2 fixed)
-    assert [r[1:] for r in pfund] == pytest.approx([r[1:] for r in bfund])  # the same position, price and amount
+    assert len(pfund) == len(bfund)  # the same position, price and amount
+    assert all(p[1:] == pytest.approx(b[1:]) for p, b in zip(pfund, bfund))
 
 
 @pytest.fixture

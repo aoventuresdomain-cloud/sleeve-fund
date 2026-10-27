@@ -748,7 +748,8 @@ def test_each_legacy_model_rebuilt_as_a_definition_makes_exactly_its_trades(mode
         port = _fills(_run(defn, df, instrument, **kw))
         assert len(legacy) >= 10, "the case needs trades to compare"
         assert [x[:3] for x in port] == [x[:3] for x in legacy]  # intent, side and bar: exactly
-        assert [x[3:] for x in port] == pytest.approx([x[3:] for x in legacy], rel=1e-12)  # qty and price
+        assert len(port) == len(legacy)  # qty and price
+        assert all(p[3:] == pytest.approx(q[3:], rel=1e-12) for p, q in zip(port, legacy))
     else:  # replay() takes no warm-up, so the window opens on 2,100 neutral bars instead [R 5.1]
         df = _neutral_start(_minutes(n=3600))
         legacy = _replayed(tmp_path / "legacy", df, model, {})
