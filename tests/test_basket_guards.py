@@ -368,6 +368,11 @@ def test_a_guarded_scaled_sheet_shows_each_assets_intents_beside_its_unguarded_e
     assert study.unguarded_entries == {"BTC": 10, "ETH": 11}
     assert "**Compliance tests, each intent once**" in sheet and "| ETH | 11 | 11 | 10 | 0 | 1 |" in sheet
     assert "Touched by: T3 Whole fund" in sheet
+    # T1 and T2 named apart from T3, as the gate records them
+    from sleeve_fund.compliance_rules import name
+    from sleeve_fund.portfolio.compliance import test_key
+    assert [name(test_key(h)) for h in ("asset_open_risk", "group_open_risk", "open_risk", "pause")] == [
+        "T1 Per asset", "T2 Per asset group", "T3 Whole fund", "T5 Daily loss pause"]
 
 
 def test_a_sheet_the_tests_never_touched_shows_no_compliance_table(unguarded):

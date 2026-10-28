@@ -908,7 +908,12 @@ def _gate_lines(study: BasketStudy) -> list[str]:
     """What the compliance tests did to the base run's entry and add intents on the test days (Advisor 28 Oct): per
     asset, intents taken, refused, trimmed and delayed, the notional each test touched, and the drawdown halt's and the
     day pauses' dates; nothing when they touched none."""
-    from sleeve_fund.compliance_rules import refused_by
+    from sleeve_fund.compliance_rules import name, refused_by
+    from sleeve_fund.portfolio.compliance import test_key
+
+    def test_of(hit):  # the gate names T1 to T3 apart (asset_open_risk, group_open_risk, open_risk)
+        key = test_key(hit)
+        return name(key) if key else refused_by(hit)
 
     found = study.intents
     if not any(i.outcome != "taken" for i in found):
@@ -926,7 +931,7 @@ def _gate_lines(study: BasketStudy) -> list[str]:
     per_test: dict[str, list[float]] = {}
     for i in found:
         if i.outcome != "taken":
-            per_test.setdefault(refused_by(i.limit), []).append(i.touched)
+            per_test.setdefault(test_of(i.limit), []).append(i.touched)
     tests = "; ".join(f"{k} {sum(v):,.2f} ({len(v):,} intents)"
                       for k, v in sorted(per_test.items(), key=lambda kv: -sum(kv[1])))
     run, brakes = study.base.run, []
