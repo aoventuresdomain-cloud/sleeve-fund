@@ -163,6 +163,9 @@ class BasketStudy:
     size_scale: float | None = None
     counted: bool = True
     held: dict = field(default_factory=dict)  # own-sized runs: held_peaks by asset, information only (Advisor 28 Oct)
+    intents: list = field(default_factory=list)  # the base run's Intents on the test days (Advisor 28 Oct)
+    legs: dict = field(default_factory=dict)  # leg name -> (asset, bar length)
+    unguarded_entries: dict = field(default_factory=dict)  # a guarded scaled run: its legs' intents, guards off
 
     @property
     def gate_touched(self) -> float:
@@ -381,17 +384,68 @@ def _decided_on(d: dict) -> date:
     return (pd.Timestamp(d["ts"]) - pd.Timedelta(1, "ns")).date()
 
 
-def gate_touched(run: PortfolioResult, windows) -> tuple[float, float]:
-    """On the test days: the entry notional the compliance tests trimmed or refused, and the intended entry notional
-    asked of them (each decision's requested quantity at its expected fill); B38-PLAN a."""
-    asked = cut = 0.0
+@dataclass
+class Intent:
+    """A leg's first ask for a position it doesn't fully hold, with its top-ups on the leg's following bars, until it
+    is fully filled, the signal drops (a bar with no ask) or the side changes (Advisor 28 Oct)."""
+    leg: str
+    first: pd.Timestamp  # the first ask's bar
+    side: str
+    asked: float  # the first ask's notional, counted once
+    last: pd.Timestamp
+    filled: float = 0.0  # notional approved over the intent's asks
+    filled_at: pd.Timestamp | None = None  # the bar of its first approval
+    limit: str | None = None  # what first trimmed or refused it
+
+    @property
+    def full(self) -> bool:
+        return self.filled >= self.asked * (1 - 1e-6)
+
+    @property
+    def outcome(self) -> str:
+        if self.filled <= 0:
+            return "refused"
+        if self.filled_at > self.first:
+            return "delayed"
+        return "taken" if self.full else "trimmed"
+
+    @property
+    def touched(self) -> float:
+        """Its notional the like-for-like gate counts: all of it when refused or delayed (filled later, it is another
+        trade than the one the random draws copy), the shortfall still unfilled when trimmed."""
+        if self.outcome in ("refused", "delayed"):
+            return self.asked
+        return max(self.asked - self.filled, 0.0)
+
+
+def intents(run: PortfolioResult, windows, bars: dict) -> list[Intent]:
+    """The run's entry and add intents whose first ask was decided on a test day. A refused entry whose signal still
+    stands asks again on the leg's next bar: gate_touched once counted every such ask on both sides of its share
+    (28 Oct, 89.3% on the guarded basket). bars: each leg's bar length."""
+    out: list[Intent] = []
+    current: dict[str, Intent] = {}
     for d in run.decisions:
-        if not any(a <= _decided_on(d) <= b for a, b in windows):
-            continue
+        name, bar = d["strategy"], pd.Timestamp(d["bar_ts"])
         px, req, ok = float(d["price"]), float(d["requested"]), float(d["approved"])
-        asked += req * px
-        cut += (req - ok) * px
-    return cut, asked
+        cur = current.get(name)
+        if cur is None or cur.full or cur.side != d["side"] or bar - cur.last != bars[name]:
+            cur = current[name] = Intent(name, bar, d["side"], req * px, bar)
+            if any(a <= _decided_on(d) <= b for a, b in windows):
+                out.append(cur)
+        cur.last = bar
+        if ok > 0:
+            cur.filled += ok * px
+            cur.filled_at = bar if cur.filled_at is None else cur.filled_at
+        if ok < req and cur.limit is None:
+            cur.limit = d.get("limit") or ""
+    return out
+
+
+def gate_touched(run: PortfolioResult, windows, bars: dict) -> tuple[float, float]:
+    """On the test days: the intended entry notional the compliance tests touched, each intent once (Intent.touched),
+    and the intended entry notional, each intent's first ask; B38-PLAN a, Advisor 28 Oct."""
+    found = intents(run, windows, bars)
+    return sum(i.touched for i in found), sum(i.asked for i in found)
 
 
 def top_contributor(totals: pd.Series) -> tuple[str, float, bool]:
@@ -642,7 +696,8 @@ def basket_study(basket: Basket, windows, research_end: date, *, register: trial
 
     base, names, specs = measured(assets, None)
     base.passed = base.net > 0
-    touched = gate_touched(base.run, windows)
+    bars = {n: _bar(sp) for n, sp in zip(names, specs)}
+    touched = gate_touched(base.run, windows, bars)
     twice_fees = {str(a.instrument.id): doubled(base_fees(a.instrument, basket.params)) for a in assets}
     if len({(f.maker, f.taker) for f in twice_fees.values()}) != 1:
         raise ValueError("the basket's assets pay different fees: a leg's own doubled fees aren't supported yet")
@@ -653,7 +708,8 @@ def basket_study(basket: Basket, windows, research_end: date, *, register: trial
     out, out_names, out_specs = measured(rest, None)
     left = LeftOut(top, share, concentrated, out)
     left.random = random_beat(out, out_names, out_specs, basket.params, windows, capital,
-                              gate_touched(out.run, windows), draws, seed)
+                              gate_touched(out.run, windows, {n: _bar(sp) for n, sp in zip(out_names, out_specs)}),
+                              draws, seed)
     rungs, per_asset = [], {a: [] for a in names_of}
     if ladder:
         for f in COST_LADDER:
@@ -671,6 +727,13 @@ def basket_study(basket: Basket, windows, research_end: date, *, register: trial
     if own:
         by_leg = held_peaks(base.run)
         study.held = {a: by_leg[n] for a, n in zip(names_of, names) if n in by_leg}
+    study.legs = {n: (a, bars[n]) for n, a in zip(names, names_of)}
+    study.intents = intents(base.run, windows, bars)
+    if scale is not None and profile != UNGUARDED:  # Advisor 28 Oct: the same legs' entries with the guards off
+        free, _, _ = _run(basket, assets, first, last, None, capital, UNGUARDED, warm_days, scale)
+        for i in intents(free, windows, bars):
+            asset = study.legs[i.leg][0]
+            study.unguarded_entries[asset] = study.unguarded_entries.get(asset, 0) + 1
     if filled:
         study.pooled = pooled_random(base, names, specs, basket.params, windows, capital, touched, draws, seed)
         study.hold = hold_bar(base, specs, basket.params, windows, capital)
@@ -680,7 +743,8 @@ def basket_study(basket: Basket, windows, research_end: date, *, register: trial
             study.without_sol = {"assets": [n for n in names_of if n != "SOL"], "net": m.net,
                                  "sharpe": _sharpe(m.returns.to_numpy()),
                                  "random": pooled_random(m, rn, rs, basket.params, windows, capital,
-                                                         gate_touched(m.run, windows), draws, seed)}
+                                                         gate_touched(m.run, windows, {n: _bar(sp) for n, sp in zip(rn, rs)}),
+                                                         draws, seed)}
     if own and filled:  # Advisor 27 Oct (a): trips that don't add up to the book stop the whole sheet
         for name, r in (("the basket", study.pooled), ("without SOL", (study.without_sol or {}).get("random"))):
             if r is not None and r.unreconciled:
@@ -822,7 +886,8 @@ def render(study: BasketStudy, holdout: Holdout | None = None) -> str:
             f"{'PASS' if holdout.passed else 'FAIL'}, net {_pct(holdout.net)} ({holdout.period[0]} to "
             f"{holdout.period[1]})") + viewed + " |", "",
         f"The compliance tests trimmed or refused {study.gate[0]:,.2f} of {study.gate[1]:,.2f} intended entry notional "
-        f"on the test days ({study.gate_touched:.1%} of entry notional).", "",
+        f"on the test days ({study.gate_touched:.1%} of entry notional, each intent once).", "",
+        *_gate_lines(study),
         f"**Pooled break-even fee:** {study.breakeven[1]} (one fee per side on every fill, real runs on the cost "
         "ladder)", "",
         *_without_sol_lines(study),
@@ -839,6 +904,51 @@ def render(study: BasketStudy, holdout: Holdout | None = None) -> str:
 
 
 # Advisor 27 Oct (check 2b): the basket's convention, beside a pool worked by hand
+def _gate_lines(study: BasketStudy) -> list[str]:
+    """What the compliance tests did to the base run's entry and add intents on the test days (Advisor 28 Oct): per
+    asset, intents taken, refused, trimmed and delayed, the notional each test touched, and the drawdown halt's and the
+    day pauses' dates; nothing when they touched none."""
+    from sleeve_fund.compliance_rules import refused_by
+
+    found = study.intents
+    if not any(i.outcome != "taken" for i in found):
+        return []
+    rows = []
+    for leg, (asset, bar) in study.legs.items():
+        mine = [i for i in found if i.leg == leg]
+        by = {k: [i for i in mine if i.outcome == k] for k in ("taken", "refused", "trimmed", "delayed")}
+        kept = f"{float(np.median([i.filled / i.asked for i in by['trimmed']])):.0%}" if by["trimmed"] else "-"
+        late = (f"{float(np.median([(i.filled_at - i.first) / bar for i in by['delayed']])):g}"
+                if by["delayed"] else "-")
+        free = study.unguarded_entries.get(asset)
+        rows.append(f"| {asset} | {len(mine):,} | {'-' if free is None else f'{free:,}'} | {len(by['taken']):,} "
+                    f"| {len(by['refused']):,} | {len(by['trimmed']):,} | {kept} | {len(by['delayed']):,} | {late} |")
+    per_test: dict[str, list[float]] = {}
+    for i in found:
+        if i.outcome != "taken":
+            per_test.setdefault(refused_by(i.limit), []).append(i.touched)
+    tests = "; ".join(f"{k} {sum(v):,.2f} ({len(v):,} intents)"
+                      for k, v in sorted(per_test.items(), key=lambda kv: -sum(kv[1])))
+    run, brakes = study.base.run, []
+    if run.halt is not None:
+        at = run.halt["ts"]
+        after = [pd.Timestamp(d["ts"]) for d in run.decisions
+                 if pd.Timestamp(d["ts"]) > at and float(d["approved"]) > 0]
+        end = min(after) if after else run.book.index[-1]
+        brakes.append(f"the drawdown halt fired on {at:%d %b %Y} and lasted {(end - at) / pd.Timedelta(1, 'D'):.0f} "
+                      f"days{'' if after else ', to the run end'}")
+    if run.pauses:
+        days = {p["ts"].normalize() for p in run.pauses}
+        brakes.append(f"a day pause first fired on {min(days):%d %b %Y}, on {len(days):,} days in all")
+    return ["**Compliance tests, each intent once** (an intent is a leg's first ask for a position it doesn't fully "
+            "hold, with its top-ups on the following bars, until filled, the signal drops or the side changes; the "
+            "share above counts all of it when refused or delayed, the shortfall when trimmed):", "",
+            "| Asset | Intents | Unguarded entries | Taken in full | Refused | Trimmed | Median filled / asked "
+            "| Delayed | Median delay (bars) |", "| --- | --- | --- | --- | --- | --- | --- | --- | --- |", *rows, "",
+            f"Touched by: {tests}." + (f" {'; '.join(brakes)[0].upper()}{'; '.join(brakes)[1:]}." if brakes else ""),
+            ""]
+
+
 LEGS_NOT_REBALANCED = ("_Each asset's leg compounds on its own even share of the fund, never rebalanced; a pool "
                        "rebalanced daily differs, and part of any gap from one is that._")
 
