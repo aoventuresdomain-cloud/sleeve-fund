@@ -178,6 +178,41 @@ def test_with_the_guards_off_nothing_is_trimmed_paused_or_halted_and_the_draws_a
     assert 0.4 < min(_shares(run)) and max(_shares(run)) < 0.6  # each leg at its own account's free cash: half
 
 
+def test_guards_off_on_a_perp_each_leg_sizes_off_its_own_share_never_the_whole_fund(tmp_path):
+    """27 Oct: on margin, a leg sized off the fund asked the whole fund's size on half its cash (2x gross here, 3x on
+    three assets; SOL lost its whole account), and the pooled trips no longer added up to the book."""
+    _, _, study, runs = _ran(tmp_path, fund_guards=False, market="perp")
+    assert runs and all(profile is bk.UNGUARDED for _, profile in runs)
+    shares = _shares(study.base.run)
+    assert shares and max(shares) < 0.6  # half the fund each, less as a leg has lost
+    trips, book = study.pooled.reconciled
+    assert not study.pooled.unreconciled and abs(trips - book) < 1e-6
+    assert 0.9 < bk.gross_peak(study.base.run) <= bk.GROSS_CAP  # fully invested, never more than the fund
+
+
+def test_a_leg_sized_off_the_whole_fund_with_the_guards_off_stops_the_run(tmp_path, monkeypatch):
+    """Advisor 27 Oct (b): the legs never hold more than the fund at once; the old sizing (each leg off the fund,
+    about 2x gross on two perps) is refused, never a sheet."""
+    real = bk.run_portfolio
+    monkeypatch.setattr(bk, "run_portfolio", lambda *a, **k: real(*a, **{**k, "fund_sized": True}))
+    with pytest.raises(ValueError, match=r"the legs held [12]\.\d\dx the fund's equity at once"):
+        _ran(tmp_path, fund_guards=False, market="perp")
+
+
+def test_pooled_trips_that_dont_add_up_to_the_book_stop_the_sheet_and_record_no_try(tmp_path, monkeypatch):
+    """Advisor 27 Oct (a): with the guards off, a pooled reconcile more than 0.5 points out refuses the whole sheet."""
+    real = bk.pooled_legs
+
+    def off(*a, **k):
+        legs, (trips, book), why = real(*a, **k)
+        return legs, (trips + 0.01, book), why
+
+    monkeypatch.setattr(bk, "pooled_legs", off)
+    with pytest.raises(ValueError, match="the trades and the book disagree, so no sheet and no try"):
+        _ran(tmp_path, fund_guards=False)
+    assert trials.TrialsRegister(Store(f"sqlite:///{tmp_path}/t.db"))._counted(trials.legacy_idea_hash("rules")) == []
+
+
 def test_at_a_size_scale_every_entry_is_k_of_the_fund_and_the_sheet_is_fitness_only(scaled, unguarded):
     sheet, _, study, runs = scaled
     assert runs and all(profile is PORTFOLIO for _, profile in runs)  # guarded, as paper

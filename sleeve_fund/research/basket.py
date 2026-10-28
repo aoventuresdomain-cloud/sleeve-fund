@@ -50,6 +50,7 @@ UNGUARDED = PortfolioProfile(gross=None, net_instrument=None, margin=None, open_
                              daily_loss=None)
 GATE_TOUCH_CAP = 0.05  # Advisor fork 3: the ungated random benchmark is like-with-like only below this
 CONCENTRATED = 0.5  # the top asset's share of the pooled out-of-sample net P&L above which the basket is flagged
+GROSS_CAP = 1.01  # guards off or scaled: the legs' summed notional over the fund's equity, lot rounding apart
 NEXT = "next: 4-6 weeks paper"
 DAY = pd.Timedelta(days=1)
 
@@ -220,9 +221,11 @@ def _run(basket: Basket, assets: list[BasketAsset], first: date, last: date, fee
          profile: PortfolioProfile, warm_days: int,
          scale: float | None = None) -> tuple[PortfolioResult, list[str], list[LegSpec]]:
     """One fund run of `assets` over the days `first` to `last`. fees: a schedule for every leg, or None for each
-    leg's venue fees. The fund's capital is split evenly across the legs' accounts; every leg sizes off the fund.
-    scale: every leg's account holds scale of its even share and the fund keeps the rest as cash no Strategy holds.
-    A research leg sizes at its own account's free cash, so each entry is scale x the leg's current equity (it
+    leg's venue fees. The fund's capital is split evenly across the legs' accounts; under the fund guards every leg
+    sizes off the fund (B-38, as before). Guards off or at a size scale, every leg sizes off its own account instead:
+    off the fund, each leg asked the whole fund's size on its share of the cash, so a 3-asset basket ran at 3x gross
+    and a leg could lose its whole account (27 Oct, SOL). scale: every leg's account holds scale of its even share
+    and the fund keeps the rest as cash no Strategy holds, so each entry is scale x the leg's current equity (it
     compounds as the unscaled leg does) and the book is (1 - scale) x capital + scale x the unscaled one (Advisor 27
     Oct, check 2a); None: as before."""
     share = 1.0 if scale is None else scale
@@ -234,7 +237,31 @@ def _run(basket: Basket, assets: list[BasketAsset], first: date, last: date, fee
                      exec_minutes=a.exec_minutes, bar_minutes=a.bar_minutes, params=dict(basket.params),
                      capital=capital * share / len(data), fees=fees)
              for n, d, a in zip(names, data, assets)]
-    return run_portfolio(specs, profile, unallocated=capital * (1 - share), fund_sized=True), names, specs
+    return run_portfolio(specs, profile, unallocated=capital * (1 - share),
+                         fund_sized=not own_sized(profile, scale)), names, specs
+
+
+def own_sized(profile: PortfolioProfile, scale: float | None) -> bool:
+    """Guards off or at a size scale, every leg sizes off its own account (_run), never the fund."""
+    return scale is not None or profile == UNGUARDED
+
+
+def gross_peak(run: PortfolioResult) -> float:
+    """The most the legs held at once, every position's notional summed over the fund's equity, at the legs' marks."""
+    held = [(r.exposure * r.equity).abs() for r in run.legs.values() if r.exposure is not None and len(r.exposure)]
+    if not held:
+        return 0.0
+    gross = pd.concat(held, axis=1).sort_index().ffill().fillna(0.0).sum(axis=1)
+    book = run.book.reindex(gross.index, method="ffill")
+    return float((gross / book).max())
+
+
+def _own_sized_checks(run: PortfolioResult) -> None:
+    """Advisor 27 Oct (b): a run whose legs size off their own accounts never holds more than the fund, or it stops."""
+    peak = gross_peak(run)
+    if peak > GROSS_CAP:
+        raise ValueError(f"refused: the legs held {peak:.2f}x the fund's equity at once (at most {GROSS_CAP:.2f}x "
+                         "with each leg sized off its own account): no sheet")
 
 
 def equity_before(book: pd.Series, index: pd.DatetimeIndex, capital: float) -> pd.Series:
@@ -531,8 +558,12 @@ def basket_study(basket: Basket, windows, research_end: date, *, register: trial
     assets = list(basket.assets)
     names_of = basket.names
 
+    own = own_sized(profile, scale)
+
     def measured(subset, fees):
         run, names, specs = _run(basket, subset, first, last, fees, capital, profile, warm_days, scale)
+        if own:
+            _own_sized_checks(run)
         return _measure(run, names, specs, [underlying(a.instrument) for a in subset], windows, capital), names, specs
 
     base, names, specs = measured(assets, None)
@@ -573,6 +604,12 @@ def basket_study(basket: Basket, windows, research_end: date, *, register: trial
                                  "sharpe": _sharpe(m.returns.to_numpy()),
                                  "random": pooled_random(m, rn, rs, basket.params, windows, capital,
                                                          gate_touched(m.run, windows), draws, seed)}
+    if own and filled:  # Advisor 27 Oct (a): trips that don't add up to the book stop the whole sheet
+        for name, r in (("the basket", study.pooled), ("without SOL", (study.without_sol or {}).get("random"))):
+            if r is not None and r.unreconciled:
+                trips, book = r.reconciled
+                raise ValueError(f"refused: {name}'s pooled trips add to {trips:+.1%} against the book's {book:+.1%} "
+                                 "over them: the trades and the book disagree, so no sheet and no try")
     if counted:
         study.tries, study.configuration = record_try(
             register, basket, dataset, _since(first, warm_days, basket),
