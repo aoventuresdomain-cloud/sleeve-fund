@@ -188,8 +188,11 @@ def test_guards_off_on_a_perp_each_leg_sizes_off_its_own_share_never_the_whole_f
     trips, book = study.pooled.reconciled
     assert not study.pooled.unreconciled and abs(trips - book) < 1e-6
     assert 0.9 < bk.gross_peak(study.base.run) <= bk.GROSS_CAP  # fully invested, never more than the fund
-    opened = bk.entry_peaks(study.base.run)
-    assert opened and all(0.9 < x <= bk.GROSS_CAP for x, _ in opened.values())  # each leg opens at 1x of its own
+    grown = bk.fill_peaks(study.base.run)
+    assert grown and all(0.9 < x <= bk.GROSS_CAP for x, _ in grown.values())  # each fill leaves a leg at 1x of its own
+    assert set(study.held) == set(study.basket.names)
+    assert all(0.9 < x0 <= x + 0.01 and 0 <= c < 0.05 for x, _, x0, c in study.held.values())
+    assert "**Highest held exposure per leg (x own account):**" in bk.render(study)
 
 
 def test_a_leg_sized_off_the_whole_fund_with_the_guards_off_stops_the_run(tmp_path, monkeypatch):
@@ -197,13 +200,14 @@ def test_a_leg_sized_off_the_whole_fund_with_the_guards_off_stops_the_run(tmp_pa
     own account on two perps) is refused, never a sheet."""
     real = bk.run_portfolio
     monkeypatch.setattr(bk, "run_portfolio", lambda *a, **k: real(*a, **{**k, "fund_sized": True}))
-    with pytest.raises(ValueError, match=r"a leg opened at [12]\.\d\dx its own account's equity"):
+    with pytest.raises(ValueError, match=r"a fill left a leg at [12]\.\d\dx its own account's equity"):
         _ran(tmp_path, fund_guards=False, market="perp")
 
 
 def test_a_leg_held_past_1x_by_funding_and_fees_is_drift_not_sizing_and_runs(tmp_path, monkeypatch):
     """28 Oct: on the real run all three legs were long for weeks and read about 1.02x of their accounts as funding
-    came off their cash. That is the run, not a sizing fault, so it is not refused; opening above 1x is."""
+    came off their cash. That is the run, not a sizing fault, so it is not refused (the sheet shows it); a fill that
+    grows a leg above 1x is."""
     real = bk.run_portfolio
 
     def drifted(*a, **k):
@@ -216,7 +220,26 @@ def test_a_leg_held_past_1x_by_funding_and_fees_is_drift_not_sizing_and_runs(tmp
 
     monkeypatch.setattr(bk, "run_portfolio", drifted)
     _, _, study, _ = _ran(tmp_path, fund_guards=False, market="perp")
-    assert bk.gross_peak(study.base.run) > bk.GROSS_CAP >= max(x for x, _ in bk.entry_peaks(study.base.run).values())
+    assert bk.gross_peak(study.base.run) > bk.GROSS_CAP >= max(x for x, _ in bk.fill_peaks(study.base.run).values())
+    assert max(x for x, *_ in study.held.values()) > bk.GROSS_CAP  # shown on the sheet, never a stop
+
+
+def test_an_add_sized_off_the_whole_fund_stops_the_run_like_an_open(tmp_path, monkeypatch):
+    """Advisor 28 Oct (1): every fill that grows a leg is checked, opens and adds alike."""
+    real = bk.run_portfolio
+
+    def added(*a, **k):
+        run = real(*a, **k)
+        r = next(iter(run.legs.values()))
+        f = r.fills.sort_values("ts_last", kind="stable")
+        first = f.iloc[[0]].copy()  # a second buy on the open's own fill: the leg doubles, as an add off the fund would
+        first.index = [str(first.index[0]) + "-add"]
+        r.fills = pd.concat([f, first])
+        return run
+
+    monkeypatch.setattr(bk, "run_portfolio", added)
+    with pytest.raises(ValueError, match=r"a fill left a leg at [12]\.\d\dx its own account's equity"):
+        _ran(tmp_path, fund_guards=False, market="perp")
 
 
 def test_pooled_trips_that_dont_add_up_to_the_book_stop_the_sheet_and_record_no_try(tmp_path, monkeypatch):

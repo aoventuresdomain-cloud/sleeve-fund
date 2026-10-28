@@ -162,6 +162,7 @@ class BasketStudy:
     unguarded: bool = False
     size_scale: float | None = None
     counted: bool = True
+    held: dict = field(default_factory=dict)  # own-sized runs: held_peaks by asset, information only (Advisor 28 Oct)
 
     @property
     def gate_touched(self) -> float:
@@ -261,32 +262,80 @@ def gross_peak(run: PortfolioResult) -> float:
     return 0.0 if ratio is None else float(ratio.max())
 
 
-def entry_peaks(run: PortfolioResult) -> dict[str, tuple[float, pd.Timestamp]]:
-    """Each leg's largest exposure (notional over its own account's equity) at the first mark of a position it opened,
-    and when. Sized off its own account a leg opens at 1x of it (k at a size scale); off the whole fund, at about
-    N times that. Held, it may drift: funding and fees come off its cash, and nothing is rebalanced."""
+def fill_peaks(run: PortfolioResult) -> dict[str, tuple[float, pd.Timestamp]]:
+    """Each leg's largest exposure (notional over its own account's equity before the fill) left by a fill that grew
+    its position, an open or an add, and when (Advisor 28 Oct). Sized off its own account a leg's fills leave it at
+    1x of it (its account holds k of its share at a size scale, so 1x of that); off the whole fund, about N times."""
     out = {}
     for n, r in run.legs.items():
-        if r.exposure is None or not len(r.exposure):
+        pos, worst = 0.0, None
+        for f in fills_to_rows(r.fills):
+            after = pos + (f["qty"] if f["side"] == "BUY" else -f["qty"])
+            if abs(after) > abs(pos) + 1e-12:
+                ts = pd.Timestamp(f["ts"])
+                ts = ts.tz_localize("UTC") if ts.tzinfo is None else ts
+                before = r.equity[r.equity.index < ts]
+                equity = float(before.iloc[-1]) if len(before) else float(r.starting_capital)
+                x = abs(after) * f["price"] / equity if equity > 0 else math.inf
+                if worst is None or x > worst[0]:
+                    worst = (x, ts)
+            pos = after
+        if worst is not None:
+            out[n] = worst
+    return out
+
+
+def held_peaks(run: PortfolioResult) -> dict[str, tuple[float, pd.Timestamp, float, float]]:
+    """Each leg's highest exposure (x its own account) at a mark while held, when, what that position opened at, and
+    the fees and funding it paid since it opened as a share of its notional then: a long drifts to about its opening
+    exposure / (1 - that) as they come off its cash (Advisor 28 Oct); information only, never a stop."""
+    out = {}
+    for n, r in run.legs.items():
+        if r.exposure is None or not len(r.exposure) or not (r.exposure.abs() > 0).any():
             continue
         e = r.exposure.abs()
-        opened = e[(e > 0) & (e.shift(1, fill_value=0.0) == 0)]
-        if len(opened):
-            out[n] = (float(opened.max()), opened.idxmax())
+        at = e.idxmax()
+        rows = [f for f in fills_to_rows(r.fills) if pd.Timestamp(f["ts"]).tz_localize(None) <= at.tz_localize(None)]
+        pos, opened, at_open = 0.0, None, math.nan
+        for f in rows:
+            after = pos + (f["qty"] if f["side"] == "BUY" else -f["qty"])
+            if pos == 0 and after != 0:
+                opened = pd.Timestamp(f["ts"]).tz_localize(None)
+                before = r.equity[r.equity.index.tz_localize(None) < opened]
+                equity = float(before.iloc[-1]) if len(before) else float(r.starting_capital)
+                at_open = abs(after) * f["price"] / equity if equity > 0 else math.nan
+            pos = after
+        if opened is None:
+            continue
+        fees = sum(f["fee"] for f in rows if pd.Timestamp(f["ts"]).tz_localize(None) >= opened)
+        paid = -sum(x["amount"] for x in (r.funding or [])
+                    if opened <= pd.Timestamp(x["ts"]).tz_localize(None) <= at.tz_localize(None))
+        notional = float(e[at]) * float(r.equity[at])
+        out[n] = (float(e[at]), at, at_open, (float(fees) + paid) / notional if notional else math.nan)
     return out
 
 
 def _own_sized_checks(run: PortfolioResult) -> None:
-    """Advisor 27 Oct (b): a run whose legs size off their own accounts opens no leg above its own account (so the
-    legs together never open above the fund), or it stops. Drift while held is not sizing: 28 Oct, all three legs
-    long at once for weeks paid enough funding to read 1.02x, and that is the run, not a fault. The message says
-    which leg, when and by how much; it reaches the refusal note, never the log."""
-    over = {n: v for n, v in entry_peaks(run).items() if v[0] > GROSS_CAP}
+    """Advisor 27-28 Oct (b): a run whose legs size off their own accounts grows no leg's position above 1x of its own
+    account, open or add (so the legs together never open above the fund), or it stops. Drift while held is not
+    sizing and is never stopped (held_peaks prints it): 28 Oct, all three legs long at once for weeks paid enough
+    funding to read 1.02x, and a 5% move against a 1x short reads 1.105x. The message says which leg, when and by how
+    much; it reaches the refusal note, never the log."""
+    over = {n: v for n, v in fill_peaks(run).items() if v[0] > GROSS_CAP}
     if over:
         legs = "; ".join(f"{n} at {x:.4f} at {t}" for n, (x, t) in over.items())
         worst = max(x for x, _ in over.values())
-        raise ValueError(f"refused: a leg opened at {worst:.2f}x its own account's equity (at most {GROSS_CAP:.2f}x "
-                         f"with each leg sized off its own account): no sheet. {legs}")
+        raise ValueError(f"refused: a fill left a leg at {worst:.2f}x its own account's equity (at most "
+                         f"{GROSS_CAP:.2f}x with each leg sized off its own account): no sheet. {legs}")
+
+
+def _held_lines(study: "BasketStudy") -> list[str]:
+    if not study.held:
+        return []
+    legs = "; ".join(f"{a} {x:.4f}x on {t:%d %b %Y %H:%M} (opened at {x0:.4f}x; fees and funding since then "
+                     f"{c:.2%} of its notional)" for a, (x, t, x0, c) in study.held.items())
+    return [f"**Highest held exposure per leg (x own account):** {legs}. Information only: held drift is costs or a "
+            "move against a short, never sizing.", ""]
 
 
 def equity_before(book: pd.Series, index: pd.DatetimeIndex, capital: float) -> pd.Series:
@@ -619,6 +668,9 @@ def basket_study(basket: Basket, windows, research_end: date, *, register: trial
         asset_breakeven={a: ladder_breakeven(r) for a, r in per_asset.items() if r})
     study.key = basket_key(basket)
     study.unguarded, study.size_scale, study.counted = profile == UNGUARDED, scale, counted
+    if own:
+        by_leg = held_peaks(base.run)
+        study.held = {a: by_leg[n] for a, n in zip(names_of, names) if n in by_leg}
     if filled:
         study.pooled = pooled_random(base, names, specs, basket.params, windows, capital, touched, draws, seed)
         study.hold = hold_bar(base, specs, basket.params, windows, capital)
@@ -755,6 +807,7 @@ def render(study: BasketStudy, holdout: Holdout | None = None) -> str:
          f"{BUDGET_PER_IDEA} for {b.strategy}'s family" if study.counted else
          "**Tries:** not a new try: a confirming run of settings already counted (Advisor 27 Oct)"), "",
         *([LEGS_NOT_REBALANCED, ""] if pooled is not None else []),
+        *_held_lines(study),
         f"Out-of-sample: {study.windows[0][0]} to {study.windows[-1][1]}, {days} days, one fund run of the whole "
         f"basket at the venue's fees: net {_pct(base.net)}.", "",
         "| Condition | Result |", "| --- | --- |",
