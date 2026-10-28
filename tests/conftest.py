@@ -57,6 +57,14 @@ def full_margin(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _refusal_notes_in_tmp(monkeypatch, tmp_path_factory):
+    """A study row that fails writes a note beside the tear sheets (rescore.refusal_note); never the repository's."""
+    from sleeve_fund.research import rescore
+
+    monkeypatch.setattr(rescore, "REFUSED", tmp_path_factory.mktemp("refused"))
+
+
+@pytest.fixture(autouse=True)
 def _open_risk_setup(monkeypatch, request):
     """Paper measures a stopless perp position's open risk from its pair's daily ATR in the history store
     (sleeve_fund.open_risk), which tests don't fill: a calm 2% day unless a test sets its own. A test of the paper

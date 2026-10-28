@@ -62,7 +62,7 @@ def test_the_log_prints_counts_and_ran_or_failed_only(capfd, tmp_path):
     code = rescore.main([str(LIST), "--rows", "1-8"], run=run, journal=lambda: None)
     out = capfd.readouterr().out
     assert code == 1 and len(seen) == 8 and all(not r.use_holdout for r in seen)
-    assert "row  8 qr02_dip_short: FAILED (ValueError)" in out and "done: 7 ran, 1 failed" in out
+    assert "row  8 qr02_dip_short: FAILED (ValueError), note refused-" in out and "done: 7 ran, 1 failed" in out
     # A row that ran names its sheet's stem, the sheet export's input; a failed row names none.
     stem = "qr01_trend_ema_long_binance-btcusdt-store-15m_20261024-153413"
     assert f"row  1 qr01_trend_ema_long: ran, sheet {stem}\n" in out
@@ -140,3 +140,31 @@ def test_the_default_venue_is_the_research_venue_as_before(monkeypatch):
         name, minutes, venue, pair, *a))
     rescore.main([str(LIST), "--rows", "1", "--dry-run"], run=lambda *a, **k: None, journal=lambda: None)
     assert seen == ["binance"]
+
+
+def test_a_failed_rows_message_and_traceback_go_to_a_note_the_sheet_export_reads_never_the_log(capfd, tmp_path,
+                                                                                                monkeypatch):
+    monkeypatch.setattr(rescore, "REFUSED", tmp_path / "refused")
+
+    def run(req, store=None):
+        raise ValueError("refused: the legs held 1.37x the fund's equity at once")
+
+    assert rescore.main([str(LIST), "--rows", "1"], run=run, journal=lambda: None) == 1
+    out = capfd.readouterr().out
+    (note,) = (tmp_path / "refused").glob("refused-*-row1.md")
+    assert f"row  1 qr01_trend_ema_long: FAILED (ValueError), note {note.stem}\n" in out
+    assert "1.37" not in out and "legs held" not in out
+    text = note.read_text()
+    assert "ValueError: refused: the legs held 1.37x the fund's equity at once" in text and "Traceback" in text
+    assert "qr-rescore-list.md" in text and "BTC/USDT" in text
+    export = (ROOT / ".github" / "workflows" / "sheet-export.yml").read_text()
+    assert "refused-*) cd refused" in export
+
+
+def test_a_note_that_cant_be_written_never_hides_the_rows_failure(capfd, tmp_path, monkeypatch):
+    blocked = tmp_path / "file"
+    blocked.write_text("")
+    monkeypatch.setattr(rescore, "REFUSED", blocked / "refused")  # under a file: mkdir fails
+    assert rescore.main([str(LIST), "--rows", "1"], run=lambda *a, **k: (_ for _ in ()).throw(ValueError("x")),
+                        journal=lambda: None) == 1
+    assert "row  1 qr01_trend_ema_long: FAILED (ValueError)\n" in capfd.readouterr().out
