@@ -246,22 +246,33 @@ def own_sized(profile: PortfolioProfile, scale: float | None) -> bool:
     return scale is not None or profile == UNGUARDED
 
 
+def _gross(run: PortfolioResult) -> pd.Series | None:
+    """The legs' summed notional over the fund's equity at every leg mark, None when nothing was held."""
+    held = {n: (r.exposure * r.equity).abs() for n, r in run.legs.items() if r.exposure is not None and len(r.exposure)}
+    if not held:
+        return None
+    gross = pd.concat(held, axis=1).sort_index().ffill().fillna(0.0).sum(axis=1)
+    return gross / run.book.reindex(gross.index, method="ffill")
+
+
 def gross_peak(run: PortfolioResult) -> float:
     """The most the legs held at once, every position's notional summed over the fund's equity, at the legs' marks."""
-    held = [(r.exposure * r.equity).abs() for r in run.legs.values() if r.exposure is not None and len(r.exposure)]
-    if not held:
-        return 0.0
-    gross = pd.concat(held, axis=1).sort_index().ffill().fillna(0.0).sum(axis=1)
-    book = run.book.reindex(gross.index, method="ffill")
-    return float((gross / book).max())
+    ratio = _gross(run)
+    return 0.0 if ratio is None else float(ratio.max())
 
 
 def _own_sized_checks(run: PortfolioResult) -> None:
-    """Advisor 27 Oct (b): a run whose legs size off their own accounts never holds more than the fund, or it stops."""
-    peak = gross_peak(run)
-    if peak > GROSS_CAP:
-        raise ValueError(f"refused: the legs held {peak:.2f}x the fund's equity at once (at most {GROSS_CAP:.2f}x "
-                         "with each leg sized off its own account): no sheet")
+    """Advisor 27 Oct (b): a run whose legs size off their own accounts never holds more than the fund, or it stops.
+    The message says when and each leg's exposure and equity then; it reaches the refusal note, never the log."""
+    ratio = _gross(run)
+    if ratio is None or (peak := float(ratio.max())) <= GROSS_CAP:
+        return
+    at = ratio.idxmax()
+    legs = "; ".join(f"{n} exposure {float(r.exposure.asof(at)):.4f} on equity {float(r.equity.asof(at)):,.2f}"
+                     for n, r in run.legs.items() if r.exposure is not None and len(r.exposure))
+    raise ValueError(f"refused: the legs held {peak:.2f}x the fund's equity at once (at most {GROSS_CAP:.2f}x "
+                     f"with each leg sized off its own account): no sheet. At {at} the fund's equity was "
+                     f"{float(run.book.asof(at)):,.2f}; {legs}")
 
 
 def equity_before(book: pd.Series, index: pd.DatetimeIndex, capital: float) -> pd.Series:

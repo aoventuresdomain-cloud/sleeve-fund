@@ -56,6 +56,7 @@ jobs:
           ssh -i ~/.ssh/id_deploy -o ServerAliveInterval=30 -o ServerAliveCountMax=10 "$USER_AT@$HOST" \
             "cd /opt/sleeve-fund && sudo docker compose run --rm -T --no-deps --name sheet-export-$RUN_ID -e SHEET=$SHEET dashboard sh -c '
               cd \"\$TEARSHEET_DIR\" || exit 2
+              case \"\$SHEET\" in refused-*) cd refused || exit 3;; esac
               [ -f \"\$SHEET.md\" ] && [ ! -L \"\$SHEET.md\" ] || { echo \"no such sheet\" >&2; exit 3; }
               set --
               for f in \"\$SHEET.md\" \"\$SHEET.results.json\" \"\$SHEET.returns.csv\" \"\$SHEET.oos-returns.csv\" \

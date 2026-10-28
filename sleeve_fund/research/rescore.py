@@ -12,7 +12,9 @@ journal), its idea counter line and its tear sheet. No Strategy, order, fill or 
 
 The job log is public, so this prints counts and per-row ran/failed with the error's class only: never a figure,
 a verdict or a tear sheet. A row that ran prints its sheet's file stem (name, dataset and time: no result), so the
-sheet export (.github/workflows/sheet-export.yml) can be run on it. The results are read on the Research page.
+sheet export (.github/workflows/sheet-export.yml) can be run on it. A row that failed prints the stem of a note
+holding its message and traceback (refused/ beside the sheets), which the same export reads. The results are read on
+the Research page.
 """
 
 from __future__ import annotations
@@ -30,6 +32,8 @@ DEFINITIONS = ROOT / "configs" / "definitions"
 CANDLES = {"15m": 15, "1h": 60, "4h": 240, "1d": 1440}
 # R-29: on a study whose configs came from main, until R-25 counts tries by idea family (docs/research-definitions.md)
 TRIES_BY_HAND = "Tries counted by hand until R-25."
+# Where a failed row's note goes; None is refused/ beside the tear sheets (tests point it elsewhere)
+REFUSED: Path | None = None
 ROW = re.compile(r"^\|\s*(\d+)\s*\|\s*([a-z0-9_]+)\s*\|[^|]*\|\s*(\w+)\s*\|(?:\s*([a-z-]*)\s*\|)?\s*$")
 # The list's common settings (research/quant-researcher/qr-rescore-list.md, 20 Oct): walk-forward 730/365, the
 # holdout's 365 days locked, risk profile none (1x, uncapped, unguarded).
@@ -165,6 +169,30 @@ def _minute_check(req, history=None) -> str:
     return "".join(out)
 
 
+def refusal_note(n: int, name: str, args, exc: BaseException, out_dir: Path | None = None) -> str | None:
+    """A failed row's message and traceback, kept on the server beside the tear sheets (in refused/), never in the
+    public log: the log prints the note's stem only, and the sheet export reads it like a sheet, encrypted. None when
+    it can't be written (the row has failed already; the note is a help, never a second failure)."""
+    import traceback
+    from datetime import datetime, timezone
+
+    try:
+        out_dir = out_dir or REFUSED
+        if out_dir is None:
+            from sleeve_fund.research.run import TEARSHEETS
+            out_dir = TEARSHEETS / "refused"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        stem = f"refused-{datetime.now(timezone.utc):%Y%m%d-%H%M%S}-row{n}"
+        trace = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        (out_dir / f"{stem}.md").write_text(
+            f"# Row {n} {name} failed\n\n- **List:** {Path(args.list).name}\n- **Venue:** {args.venue}\n"
+            f"- **Pair:** {args.pair}\n- **Error:** {type(exc).__name__}: {exc}\n\n```\n{trace}```\n",
+            encoding="utf-8")
+        return stem
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def main(argv: list[str] | None = None, run=None, journal=None) -> int:
     ap = argparse.ArgumentParser(prog="python -m sleeve_fund.research.rescore")
     ap.add_argument("list", help="the study list (markdown with a studies table)")
@@ -219,7 +247,8 @@ def main(argv: list[str] | None = None, run=None, journal=None) -> int:
             sheet = run(req, store=store, **extra)
         except Exception as exc:  # noqa: BLE001 - one row's failure never stops the rest; its class only (public log)
             failed += 1
-            print(f"row {n:>2} {name}: FAILED ({type(exc).__name__})")
+            note = refusal_note(n, name, args, exc)
+            print(f"row {n:>2} {name}: FAILED ({type(exc).__name__})" + (f", note {note}" if note else ""))
             continue
         ok += 1
         print(f"row {n:>2} {name}: ran" + (f", sheet {sheet.stem}" if isinstance(sheet, Path) else ""))
