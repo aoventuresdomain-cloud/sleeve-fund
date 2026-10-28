@@ -467,10 +467,13 @@ def test_b38zb_a_refused_entry_counts_in_the_trim_share_so_4_trimmed_and_2_refus
 
     ts = pd.Timestamp("2018-03-10", tz="UTC")
     run = SimpleNamespace(decisions=[
-        {"ts": ts, "price": 100.0, "requested": 0.98, "approved": 0.94, "strategy": "a"},  # trimmed 4
-        {"ts": ts, "price": 100.0, "requested": 0.02, "approved": 0.0, "strategy": "b"},  # refused 2
+        {"ts": ts, "bar_ts": ts, "side": "buy", "price": 100.0, "requested": 0.98, "approved": 0.94,
+         "strategy": "a"},  # trimmed 4
+        {"ts": ts, "bar_ts": ts, "side": "buy", "price": 100.0, "requested": 0.02, "approved": 0.0,
+         "strategy": "b"},  # refused 2
     ])
-    touched = bk.gate_touched(run, [(date(2018, 3, 2), date(2018, 4, 5))])
+    bars = {"a": pd.Timedelta(hours=4), "b": pd.Timedelta(hours=4)}
+    touched = bk.gate_touched(run, [(date(2018, 3, 2), date(2018, 4, 5))], bars)
     assert touched == pytest.approx((6.0, 100.0))
     r = bk.random_beat(None, [], [], PARAMS, WINDOWS, CAPITAL, touched)
     assert not r.judged and r.gate_touched == pytest.approx(0.06)

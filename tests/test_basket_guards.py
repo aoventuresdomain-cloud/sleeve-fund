@@ -258,7 +258,9 @@ def test_pooled_trips_that_dont_add_up_to_the_book_stop_the_sheet_and_record_no_
 
 def test_at_a_size_scale_every_entry_is_k_of_the_fund_and_the_sheet_is_fitness_only(scaled, unguarded):
     sheet, _, study, runs = scaled
-    assert runs and all(profile is PORTFOLIO for _, profile in runs)  # guarded, as paper
+    # guarded, as paper; one run with the guards off counts the legs' unguarded entries for the sheet (Advisor 28 Oct)
+    assert runs and [profile is PORTFOLIO for _, profile in runs].count(False) == 1
+    assert all(profile is PORTFOLIO or profile is bk.UNGUARDED for _, profile in runs)
     assert all(leg.capital == 10_000.0 * 0.3 / len(legs) for legs, _ in runs for leg in legs)
     shares = _shares(study.base.run)
     # at most 0.3 of each leg's half, less as the leg has lost (the k = 0.5 test above pins the scaling itself)
@@ -295,3 +297,85 @@ def test_each_run_shows_its_drawdown_and_the_scaled_run_its_largest_share(unguar
 def test_a_pooled_sheet_says_its_legs_are_never_rebalanced(unguarded, scaled):
     for sheet, *_ in (unguarded, scaled):
         assert bk.LEGS_NOT_REBALANCED in sheet
+
+
+
+
+def _asks(*rows):
+    """Decisions for intents(): (leg, hours after the first bar, side, requested, approved), price 100."""
+    from types import SimpleNamespace
+
+    t0 = pd.Timestamp("2025-02-03", tz="UTC")
+    return SimpleNamespace(decisions=[
+        {"strategy": leg, "ts": t0 + pd.Timedelta(hours=h, seconds=1), "bar_ts": t0 + pd.Timedelta(hours=h),
+         "side": side, "price": 100.0, "requested": req, "approved": ok, "limit": None if ok >= req else "pause"}
+        for leg, h, side, req, ok in rows])
+
+
+WINDOW = [(date(2025, 2, 1), date(2025, 3, 2))]
+FOUR = {"a": pd.Timedelta(hours=4), "b": pd.Timedelta(hours=4)}
+
+
+def test_an_entry_refused_on_every_bar_while_its_signal_stands_is_one_intent():
+    """Advisor 28 Oct: the halt's 20 refusals, every 4 hours, are one idea, not 20 on both sides of the share."""
+    run = _asks(*[("a", 4 * k, "buy", 1.0, 0.0) for k in range(20)], ("b", 0, "buy", 1.0, 1.0))
+    found = bk.intents(run, WINDOW, FOUR)
+    assert [(i.leg, i.outcome) for i in found] == [("a", "refused"), ("b", "taken")]
+    assert bk.gate_touched(run, WINDOW, FOUR) == pytest.approx((100.0, 200.0))  # 50%, not 2,000 of 2,100
+    # a bar with no ask ends it: the signal dropped, so the next ask is a new intent
+    assert len(bk.intents(_asks(("a", 0, "buy", 1.0, 0.0), ("a", 8, "buy", 1.0, 0.0)), WINDOW, FOUR)) == 2
+    assert len(bk.intents(_asks(("a", 0, "buy", 1.0, 0.0), ("a", 4, "sell", 1.0, 0.0)), WINDOW, FOUR)) == 2
+
+
+def test_an_entry_filled_on_a_later_bar_is_delayed_and_counts_whole_in_the_share():
+    """Refused on its first bar (a day pause), filled in full two bars later: another trade than the one the random
+    draws copy, so all of its notional is touched, though none of its size was cut."""
+    run = _asks(("a", 0, "buy", 1.0, 0.0), ("a", 4, "buy", 1.0, 0.0), ("a", 8, "buy", 1.0, 1.0))
+    (i,) = bk.intents(run, WINDOW, FOUR)
+    assert i.outcome == "delayed" and (i.filled_at - i.first) / FOUR["a"] == 2 and i.limit == "pause"
+    assert bk.gate_touched(run, WINDOW, FOUR) == pytest.approx((100.0, 100.0))
+
+
+def test_a_trim_then_a_top_up_is_one_intent_touched_by_the_shortfall_left():
+    """Trimmed to 0.6 of its ask, topped up by 0.3 on the next bar: one intent of 100 asked, 10 still unfilled; the
+    top-up's own ask never counts again."""
+    run = _asks(("a", 0, "buy", 1.0, 0.6), ("a", 4, "buy", 0.4, 0.3))
+    (i,) = bk.intents(run, WINDOW, FOUR)
+    assert i.outcome == "trimmed" and i.filled == pytest.approx(90.0)
+    assert bk.gate_touched(run, WINDOW, FOUR) == pytest.approx((10.0, 100.0))
+    # topped up in full, nothing is left unfilled and the next ask starts a new intent
+    run = _asks(("a", 0, "buy", 1.0, 0.6), ("a", 4, "buy", 0.4, 0.4), ("a", 8, "buy", 0.5, 0.5))
+    assert [i.outcome for i in bk.intents(run, WINDOW, FOUR)] == ["taken", "taken"]
+
+
+def test_a_guarded_scaled_sheet_shows_each_assets_intents_beside_its_unguarded_entries(scaled):
+    from qa155_lib import resample
+
+    from sleeve_fund.venues import venue
+
+    h = _History()
+    assets = [bk.BasketAsset(venue("KRAKEN").instrument(p.split("/")[0], "USD", price_precision=1),
+                             resample(h.minute[p], 240), h.minute[p], bar_minutes=240, exec_minutes=1) for p in PAIRS]
+    basket = bk.Basket("k", "rules", {"definition": DEFINITION}, tuple(assets), "2025-01-02")
+    first, last = date(2025, 2, 1), date(2025, 3, 2)
+    run, names, specs = bk._run(basket, assets, first, last, None, 10_000.0, PORTFOLIO, 180, scale=0.5)
+    found = bk.intents(run, [(first, last)], {n: bk._bar(s) for n, s in zip(names, specs)})
+    asks = [d for d in run.decisions if first <= bk._decided_on(d) <= last]
+    assert len(asks) == 40 and len(found) == 22  # the halt's 20 repeat refusals are 2 intents, one per leg
+    cut, asked = bk.gate_touched(run, [(first, last)], {n: bk._bar(s) for n, s in zip(names, specs)})
+    assert cut / asked < 0.25  # every ask counted: 48%
+    sheet, _, study, _ = scaled
+    assert study.unguarded_entries == {"BTC": 10, "ETH": 11}
+    assert "**Compliance tests, each intent once**" in sheet and "| ETH | 11 | 11 | 10 | 0 | 1 |" in sheet
+    assert "Touched by: T3 Whole fund" in sheet
+    # T1 and T2 named apart from T3, as the gate records them
+    from sleeve_fund.compliance_rules import name
+    from sleeve_fund.portfolio.compliance import test_key
+    assert [name(test_key(h)) for h in ("asset_open_risk", "group_open_risk", "open_risk", "pause")] == [
+        "T1 Per asset", "T2 Per asset group", "T3 Whole fund", "T5 Daily loss pause"]
+
+
+def test_a_sheet_the_tests_never_touched_shows_no_compliance_table(unguarded):
+    sheet, _, study, _ = unguarded
+    assert study.intents and all(i.outcome == "taken" for i in study.intents) and not study.unguarded_entries
+    assert "Compliance tests, each intent once" not in sheet
