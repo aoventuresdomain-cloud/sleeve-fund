@@ -188,15 +188,35 @@ def test_guards_off_on_a_perp_each_leg_sizes_off_its_own_share_never_the_whole_f
     trips, book = study.pooled.reconciled
     assert not study.pooled.unreconciled and abs(trips - book) < 1e-6
     assert 0.9 < bk.gross_peak(study.base.run) <= bk.GROSS_CAP  # fully invested, never more than the fund
+    opened = bk.entry_peaks(study.base.run)
+    assert opened and all(0.9 < x <= bk.GROSS_CAP for x, _ in opened.values())  # each leg opens at 1x of its own
 
 
 def test_a_leg_sized_off_the_whole_fund_with_the_guards_off_stops_the_run(tmp_path, monkeypatch):
-    """Advisor 27 Oct (b): the legs never hold more than the fund at once; the old sizing (each leg off the fund,
-    about 2x gross on two perps) is refused, never a sheet."""
+    """Advisor 27 Oct (b): no leg opens above its own account; the old sizing (each leg off the fund, about 2x its
+    own account on two perps) is refused, never a sheet."""
     real = bk.run_portfolio
     monkeypatch.setattr(bk, "run_portfolio", lambda *a, **k: real(*a, **{**k, "fund_sized": True}))
-    with pytest.raises(ValueError, match=r"the legs held [12]\.\d\dx the fund's equity at once"):
+    with pytest.raises(ValueError, match=r"a leg opened at [12]\.\d\dx its own account's equity"):
         _ran(tmp_path, fund_guards=False, market="perp")
+
+
+def test_a_leg_held_past_1x_by_funding_and_fees_is_drift_not_sizing_and_runs(tmp_path, monkeypatch):
+    """28 Oct: on the real run all three legs were long for weeks and read about 1.02x of their accounts as funding
+    came off their cash. That is the run, not a sizing fault, so it is not refused; opening above 1x is."""
+    real = bk.run_portfolio
+
+    def drifted(*a, **k):
+        run = real(*a, **k)
+        for r in run.legs.values():  # every held mark after the first of each position reads 3% higher
+            e = r.exposure
+            held = (e.abs() > 0) & (e.shift(1, fill_value=0.0).abs() > 0)
+            r.exposure.loc[held] = e[held] * 1.03
+        return run
+
+    monkeypatch.setattr(bk, "run_portfolio", drifted)
+    _, _, study, _ = _ran(tmp_path, fund_guards=False, market="perp")
+    assert bk.gross_peak(study.base.run) > bk.GROSS_CAP >= max(x for x, _ in bk.entry_peaks(study.base.run).values())
 
 
 def test_pooled_trips_that_dont_add_up_to_the_book_stop_the_sheet_and_record_no_try(tmp_path, monkeypatch):

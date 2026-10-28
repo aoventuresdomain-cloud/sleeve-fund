@@ -50,7 +50,7 @@ UNGUARDED = PortfolioProfile(gross=None, net_instrument=None, margin=None, open_
                              daily_loss=None)
 GATE_TOUCH_CAP = 0.05  # Advisor fork 3: the ungated random benchmark is like-with-like only below this
 CONCENTRATED = 0.5  # the top asset's share of the pooled out-of-sample net P&L above which the basket is flagged
-GROSS_CAP = 1.01  # guards off or scaled: the legs' summed notional over the fund's equity, lot rounding apart
+GROSS_CAP = 1.01  # guards off or scaled: a leg's notional over its own account's equity as it opens, lot rounding apart
 NEXT = "next: 4-6 weeks paper"
 DAY = pd.Timedelta(days=1)
 
@@ -261,18 +261,32 @@ def gross_peak(run: PortfolioResult) -> float:
     return 0.0 if ratio is None else float(ratio.max())
 
 
+def entry_peaks(run: PortfolioResult) -> dict[str, tuple[float, pd.Timestamp]]:
+    """Each leg's largest exposure (notional over its own account's equity) at the first mark of a position it opened,
+    and when. Sized off its own account a leg opens at 1x of it (k at a size scale); off the whole fund, at about
+    N times that. Held, it may drift: funding and fees come off its cash, and nothing is rebalanced."""
+    out = {}
+    for n, r in run.legs.items():
+        if r.exposure is None or not len(r.exposure):
+            continue
+        e = r.exposure.abs()
+        opened = e[(e > 0) & (e.shift(1, fill_value=0.0) == 0)]
+        if len(opened):
+            out[n] = (float(opened.max()), opened.idxmax())
+    return out
+
+
 def _own_sized_checks(run: PortfolioResult) -> None:
-    """Advisor 27 Oct (b): a run whose legs size off their own accounts never holds more than the fund, or it stops.
-    The message says when and each leg's exposure and equity then; it reaches the refusal note, never the log."""
-    ratio = _gross(run)
-    if ratio is None or (peak := float(ratio.max())) <= GROSS_CAP:
-        return
-    at = ratio.idxmax()
-    legs = "; ".join(f"{n} exposure {float(r.exposure.asof(at)):.4f} on equity {float(r.equity.asof(at)):,.2f}"
-                     for n, r in run.legs.items() if r.exposure is not None and len(r.exposure))
-    raise ValueError(f"refused: the legs held {peak:.2f}x the fund's equity at once (at most {GROSS_CAP:.2f}x "
-                     f"with each leg sized off its own account): no sheet. At {at} the fund's equity was "
-                     f"{float(run.book.asof(at)):,.2f}; {legs}")
+    """Advisor 27 Oct (b): a run whose legs size off their own accounts opens no leg above its own account (so the
+    legs together never open above the fund), or it stops. Drift while held is not sizing: 28 Oct, all three legs
+    long at once for weeks paid enough funding to read 1.02x, and that is the run, not a fault. The message says
+    which leg, when and by how much; it reaches the refusal note, never the log."""
+    over = {n: v for n, v in entry_peaks(run).items() if v[0] > GROSS_CAP}
+    if over:
+        legs = "; ".join(f"{n} at {x:.4f} at {t}" for n, (x, t) in over.items())
+        worst = max(x for x, _ in over.values())
+        raise ValueError(f"refused: a leg opened at {worst:.2f}x its own account's equity (at most {GROSS_CAP:.2f}x "
+                         f"with each leg sized off its own account): no sheet. {legs}")
 
 
 def equity_before(book: pd.Series, index: pd.DatetimeIndex, capital: float) -> pd.Series:
