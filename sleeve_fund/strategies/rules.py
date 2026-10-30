@@ -24,8 +24,8 @@ from sleeve_fund.data import bar_minutes
 from sleeve_fund.instruments import target_on_tick
 from sleeve_fund.strategies.base import MAX_STOP, MIN_STOP, IdeaSpec, LongFlatConfig, LongFlatStrategy
 from sleeve_fund.strategies.definitions import (CATALOGUE, DAY_NS, LEVEL_EXITS, Checked, Compiled, Env, FundingDecile,
-                                                FundingZScore, block_value, check_definition, definition_hash, load_definition_file,
-                                                side_exits, timeframe_label, to_params)
+                                                FundingZScore, block_value, check_definition, definition_hash,
+                                                load_definition_file, side_exits, timeframe_label, to_params)
 from sleeve_fund.strategies.timeframes import MINUTE_NS
 
 _hash_of = definition_hash  # RulesConfig takes a parameter of that name
