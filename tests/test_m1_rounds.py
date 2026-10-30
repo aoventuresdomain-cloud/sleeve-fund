@@ -134,3 +134,14 @@ def test_a_basket_sheet_carries_the_lists_notes(monkeypatch, tmp_path):
     out = run_mod.run_store_study(_req(), store=Store(f"sqlite:///{tmp_path}/t.db"), out_dir=tmp_path / "sheets",
                                   history=_History(), notes=("Round next-1: registered try 1 of 2.",))
     assert out.read_text().rstrip().endswith("## Notes\n\n- Round next-1: registered try 1 of 2.")
+
+
+def test_a_lists_pinned_dates_set_its_walk_forward_and_holdout_lengths():
+    from sleeve_fund.research.pinned import parse
+
+    seal = parse("- **Data start:** 2024-01-01\n- **Research end:** 2026-04-30\n"
+                 "- **Holdout:** 2026-05-01 to 2026-10-30\n| 1 | 2024-01-01 | 2025-01-01 | 2026-04-30 |\n")
+    assert rescore.fold_days(seal) == (366, 485, 183)  # the next round's (PM 30 Oct, "seal May to Oct 2026")
+    req = rescore.request("qr01_trend_ema_long", 240, "binance", "BTC/USDT", seal)
+    assert (req.train_days, req.test_days, req.holdout_days) == (366, 485, 183)
+    assert rescore.fold_days(parse(BASE)) == (rescore.TRAIN_DAYS, rescore.TEST_DAYS, rescore.HOLDOUT_DAYS)

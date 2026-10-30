@@ -37,8 +37,16 @@ TRIES_BY_HAND = "Tries counted by hand until R-25."
 REFUSED: Path | None = None
 ROW = re.compile(r"^\|\s*(\d+)\s*\|\s*([a-z0-9_]+)\s*\|[^|]*\|\s*(\w+)\s*\|(?:\s*([a-z-]*)\s*\|)?\s*$")
 # The list's common settings (research/quant-researcher/qr-rescore-list.md, 20 Oct): walk-forward 730/365, the
-# holdout's 365 days locked, risk profile none (1x, uncapped, unguarded).
+# holdout's 365 days locked, risk profile none (1x, uncapped, unguarded). A list's pinned dates set its own (fold_days):
+# the next round's (PM 30 Oct, "seal May to Oct 2026") is 366/485 with a 183-day holdout.
 TRAIN_DAYS, TEST_DAYS, HOLDOUT_DAYS = 730, 365, 365
+
+
+def fold_days(pinned) -> tuple[int, int, int]:
+    """(train, test, holdout) days as the list pins them: fold 1's train start to test start, its test start to test
+    end (both included), and the holdout's days. The study then checks every fold against the pinned ones."""
+    f = pinned.folds[0]
+    return (f.test_start - f.train_start).days, (f.test_end - f.test_start).days + 1, pinned.holdout_days
 # R-11/R-12 (Advisor SCORE-WINDOW, 21 Oct): a list whose common settings say "Scoring window: continuous" scores each
 # pinned row continuously after its warm-up; without the line it keeps the walk-forward. This round only, the rows
 # scored on the old window before (QR-B1, QR-B2, QR-B3) also show that window's verdict and pass only if both pass.
@@ -133,8 +141,9 @@ def request(name: str, minutes: int, venue: str, pair: str, pinned=None, continu
     parent = (load_definition_file(definition_path(variant["parent"]))
               if continuous and variant and variant.get("placebo") else None)  # R-24
     pairs = pair.split(",") if "," in pair else None
+    train, test, holdout = fold_days(pinned) if pinned is not None else (TRAIN_DAYS, TEST_DAYS, HOLDOUT_DAYS)
     return StudyRequest(strategy="rules", pair=pairs[0] if pairs else pair, pairs=pairs, venue=venue, minutes=minutes,
-                        risk_profile=None, train_days=TRAIN_DAYS, test_days=TEST_DAYS, holdout_days=HOLDOUT_DAYS, use_holdout=False,
+                        risk_profile=None, train_days=train, test_days=test, holdout_days=holdout, use_holdout=False,
                         params=params, label=name, pinned=pinned, placebo_parent=parent, market=market,
                         **(confirming or {}),
                         **({"score_window": "continuous", "old_window_too": name in OLD_WINDOW_TOO and not pairs}
@@ -210,8 +219,6 @@ def main(argv: list[str] | None = None, run=None, journal=None) -> int:
     try:
         text = Path(args.list).read_text(encoding="utf-8")
         pinned = parse_pinned(text)  # B-37: a list that pins no dates is refused before anything runs
-        if pinned.holdout_days != HOLDOUT_DAYS:
-            raise ValueError(f"the list pins a {pinned.holdout_days}-day holdout, not {HOLDOUT_DAYS}")
         listed = rows_of(text)
         rnd = rounds.round_of(text, [n for n, _, _ in listed])  # M1 items 4-6: None for a list that names no round
         rows = pick(listed, args.rows)
