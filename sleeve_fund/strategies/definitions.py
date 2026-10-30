@@ -169,8 +169,12 @@ class FundingDecile(Block):
         if len(window) < FUNDING_COVERAGE * self.window_days * DAY_NS / interval:
             self.no_rate += 1
             return
-        self._value, self._ready = float(funding_decile_of(window, float(window[-1]))), True
+        self._value, self._ready = self._of(window), True
         self.top_decile += self._value >= FUNDING_TOP
+
+    def _of(self, window) -> float:
+        """The value the block reads off its trailing window of settled rates, the latest last."""
+        return float(funding_decile_of(window, float(window[-1])))
 
     def update_ohlcv(self, open_, high, low, close, volume, ts_ns=None) -> None:
         if ts_ns is None:
@@ -189,11 +193,80 @@ class FundingDecile(Block):
         return 0  # its window is of settlements, not candles: it reads as soon as they are stored
 
 
-# Blocks a study may run but paper and live refuse on Start until the PM approves them (R-06).
-STUDY_ONLY_BLOCKS = {"funding_decile": "the funding rate decile block"}
+def funding_zscore_of(window, latest: float) -> float | None:
+    """How many sample standard deviations `latest` sits from the mean of `window` (the rates it sits in, itself
+    included); None when they don't vary."""
+    n = len(window)
+    hi, lo = max(window), min(window)
+    if n < 2 or hi - lo <= 1e-9 * max(abs(hi), abs(lo)):  # one repeated rate, up to float noise: no value
+        return None
+    mean = sum(float(r) for r in window) / n
+    sd = math.sqrt(sum((float(r) - mean) ** 2 for r in window) / (n - 1))
+    return (latest - mean) / sd
+
+
+def funding_percentile_of(window, latest: float) -> float:
+    """The share of `window` (itself included) strictly below `latest`, as a percentage, 0 to 100: the decile's
+    measure before it is cut into tenths, ties counted as not below, as the decile counts them."""
+    return 100.0 * sum(1 for r in window if r < latest) / len(window)
+
+
+class FundingZScore(FundingDecile):
+    """M1 item 1 (PM 30 Oct, studies only): the latest settled funding rate's z-score in its trailing `window_days`
+    days (funding_zscore_of), read as the decile reads its window: settled strictly before the decision candle's close,
+    no value when the latest due settlement is missing or the window is under FUNDING_COVERAGE, or when the window's
+    rates don't vary. `top_decile` counts nothing here."""
+
+    def update_raw(self, close: float, ts_ns: int) -> None:
+        top = self.top_decile
+        super().update_raw(close, ts_ns)
+        self.top_decile = top
+        if self._ready and self._z is None:  # a window of one repeated rate: no z-score, never an assumed 0
+            self._ready, self.no_rate = False, self.no_rate + 1
+
+    def _of(self, window) -> float:
+        self._z = funding_zscore_of(window, float(window[-1]))
+        return math.nan if self._z is None else self._z
+
+    def reset(self) -> None:
+        super().reset()
+        self._z = None
+
+
+class FundingPercentile(FundingDecile):
+    """M1 item 1 (PM 30 Oct, studies only): the latest settled funding rate's percentile rank, 0 to 100, in its trailing
+    `window_days` days (funding_percentile_of), read as the decile reads its window. `pct` (its value) is that rank,
+    `rate` the latest settled rate itself, per settlement interval, so a rule can gate an extreme rank on the rate's
+    sign or size. `top_decile` counts its readings at or above 90."""
+
+    OUTPUTS = ("pct", "rate")
+
+    def _of(self, window) -> float:
+        self._rate = float(window[-1])
+        return funding_percentile_of(window, self._rate)
+
+    def _outputs(self) -> dict:
+        return {"pct": self._value, "rate": self._rate}
+
+    def reset(self) -> None:
+        super().reset()
+        self._rate = 0.0
+
+    def update_raw(self, close: float, ts_ns: int) -> None:
+        top = self.top_decile
+        super().update_raw(close, ts_ns)
+        self.top_decile = top + (self._ready and self._value >= 90.0)
+
+
+# Blocks a study may run but paper and live refuse on Start until the PM approves them (R-06, M1 item 1).
+STUDY_ONLY_BLOCKS = {"funding_decile": "the funding rate decile block",
+                     "funding_zscore": "the funding rate z-score block",
+                     "funding_percentile": "the funding rate percentile block"}
+FUNDING_BLOCKS = ("funding_decile", "funding_zscore", "funding_percentile")  # each reads the stored settled rates
 
 # The blocks a definition builds, by name: the library's, with channels counted as the rule builder defines them.
-BUILDER_BLOCKS = {**BLOCKS, "donchian": ClosedChannel, "funding_decile": FundingDecile}
+BUILDER_BLOCKS = {**BLOCKS, "donchian": ClosedChannel, "funding_decile": FundingDecile,
+                  "funding_zscore": FundingZScore, "funding_percentile": FundingPercentile}
 
 
 # What the builder offers for each block, by its name in BLOCKS. ATR is Wilder's; the simple average of true ranges
@@ -206,6 +279,8 @@ CATALOGUE = {
     "lag": "Value N candles back", "prior_period": "Previous day or week",
     "session_levels": "Asia or London session high/low",
     "funding_decile": "Funding rate decile (studies only)",
+    "funding_zscore": "Funding rate z-score (studies only)",
+    "funding_percentile": "Funding rate percentile (studies only)",
 }
 _ID = re.compile(r"^[a-z_][a-z0-9_]*$")
 _TIMEFRAME = re.compile(r"^(\d+)(m|h|d)$")

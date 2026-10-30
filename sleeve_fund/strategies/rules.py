@@ -24,8 +24,8 @@ from sleeve_fund.data import bar_minutes
 from sleeve_fund.instruments import target_on_tick
 from sleeve_fund.strategies.base import MAX_STOP, MIN_STOP, IdeaSpec, LongFlatConfig, LongFlatStrategy
 from sleeve_fund.strategies.definitions import (CATALOGUE, DAY_NS, LEVEL_EXITS, Checked, Compiled, Env, FundingDecile,
-                                                block_value, check_definition, definition_hash, load_definition_file,
-                                                side_exits, timeframe_label, to_params)
+                                                FundingZScore, block_value, check_definition, definition_hash,
+                                                load_definition_file, side_exits, timeframe_label, to_params)
 from sleeve_fund.strategies.timeframes import MINUTE_NS
 
 _hash_of = definition_hash  # RulesConfig takes a parameter of that name
@@ -238,7 +238,9 @@ class Rules(LongFlatStrategy):
         out = {}
         if self.funding_blocks():
             out["funding_no_rate"] = max(b.no_rate for b in self.funding_blocks())
-            out["funding_top_decile"] = max(b.top_decile for b in self.funding_blocks())
+            tops = [b.top_decile for b in self.funding_blocks() if not isinstance(b, FundingZScore)]
+            if tops:  # a z-score has no top decile to count (CR on #336, F4)
+                out["funding_top_decile"] = max(tops)
         if self.c.vol_target_size:
             out["vol_skipped"] = self.vol_skipped
         return out

@@ -1,0 +1,63 @@
+name: funding-counts
+# FUNDING-COUNTS (the PM's yes is needed before its first run): the funding table of the next round's pre-registration
+# (family A, section 3; Advisor check 7), from the paper server's stored rates. scripts/funding_counts.py is fed on
+# stdin to a one-off container of the dashboard's image, where the history is mounted read-only. Read-only: it reads
+# the stored funding files and nothing else (no venue, no database), and writes nothing. BTC, ETH and SOL only (PM
+# 30 Oct). The repository is public, so the log shows counts and the times of holes only, never a rate or a price.
+# Run it by hand from main. Same secrets and variable as sheet-export.
+on:
+  workflow_dispatch:
+    inputs:
+      start:
+        description: First UTC day, YYYY-MM-DD
+        required: true
+        default: "2024-01-01"
+      end:
+        description: Last UTC day, included, YYYY-MM-DD
+        required: true
+        default: "2026-10-30"
+concurrency: { group: funding-counts, cancel-in-progress: false }
+jobs:
+  counts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions: { contents: read }
+    if: ${{ vars.DEPLOY_ENABLED == 'true' && github.ref == 'refs/heads/main' }}
+    env:
+      USER_AT: ${{ vars.DEPLOY_USER || 'root' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Check the inputs
+        env:
+          START: ${{ inputs.start }}
+          END: ${{ inputs.end }}
+        run: |
+          for d in "$START" "$END"; do
+            [[ "$d" =~ ^20[0-9]{2}-[01][0-9]-[0-3][0-9]$ ]] || { echo "start and end must be days, YYYY-MM-DD"; exit 1; }
+          done
+      - name: Configure SSH
+        env:
+          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/id_deploy && chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts
+      - name: Count the settlements
+        env:
+          RUN_ID: ${{ github.run_id }}
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          START: ${{ inputs.start }}
+          END: ${{ inputs.end }}
+        run: |
+          # The script from this commit, on stdin: the image carries the package, not scripts/.
+          set -euo pipefail
+          ssh -i ~/.ssh/id_deploy -o ServerAliveInterval=30 -o ServerAliveCountMax=10 "$USER_AT@$HOST" \
+            "cd /opt/sleeve-fund && sudo docker compose run --rm -T --no-deps --name funding-counts-$RUN_ID dashboard python - --venue BINANCE --pairs BTC/USDT,ETH/USDT,SOL/USDT --start $START --end $END" \
+            < scripts/funding_counts.py
+      - name: Clean up
+        if: always()
+        run: rm -f -- ~/.ssh/id_deploy

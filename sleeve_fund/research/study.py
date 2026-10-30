@@ -604,7 +604,7 @@ def time_warmup_minutes(kind: str, settings: dict) -> int | None:
     """The minutes a block warms up over when its warm-up is in time rather than candles (Advisor 21 Oct): a calendar
     period or session (warmup_minutes), a day-anchored VWAP's one day, the funding decile's trailing window_days of
     settlements. None for a block that warms up over candles."""
-    from sleeve_fund.strategies.definitions import BUILDER_BLOCKS
+    from sleeve_fund.strategies.definitions import BUILDER_BLOCKS, FUNDING_BLOCKS
     from sleeve_fund.strategies.timeframes import DAY_MINUTES
 
     cls = BUILDER_BLOCKS[kind]
@@ -612,7 +612,7 @@ def time_warmup_minutes(kind: str, settings: dict) -> int | None:
         return int(cls.warmup_minutes(settings))
     if kind == "vwap" and settings["anchor"] == "day":
         return DAY_MINUTES
-    if kind == "funding_decile":
+    if kind in FUNDING_BLOCKS:
         return int(settings["window_days"]) * DAY_MINUTES
     return None
 
@@ -1388,9 +1388,10 @@ def run_study(
         result.notes.append(
             f"Funding rate decile: {counts['funding_no_rate']:,} of {len(research):,} decision candles had no usable "
             "stored funding rate (the latest due settlement missing, or too few in its window), so no entry gated on "
-            "it could open on them: a missing rate is never assumed. Apart from those, "
-            f"{counts.get('funding_top_decile', 0):,} read the top decile (90% or more of the trailing window's rates "
-            "strictly below the latest). Only rates settled strictly before each candle's close are read.")
+            "it could open on them: a missing rate is never assumed. "
+            + (f"Apart from those, {counts['funding_top_decile']:,} read the top decile (90% or more of the trailing "
+               "window's rates strictly below the latest). " if "funding_top_decile" in counts else "")
+            + "Only rates settled strictly before each candle's close are read.")
     if "vol_skipped" in counts:  # R-07
         vol = default_params.get("vol_target_size") or {}
         result.notes.append(
