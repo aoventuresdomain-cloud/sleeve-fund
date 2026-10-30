@@ -948,7 +948,7 @@ def test_c10_a_saved_binance_strategy_on_venue_candles_is_refused_at_start_with_
     size = "-".join(spec.split("-")[:2]).lower()
     assert s.status_reason == (f"not started: bar_spec: strategies on this market decide on bars built from the market "
                                f"data hub's minutes, so the venue's own {size} candles aren't available there; choose "
-                               "1, 5 or 15-minute or 1-hour bars")
+                               "1, 5 or 15-minute, 1-hour or 4-hour bars")
     kinds = [e["kind"] for e in store.events("old", limit=100)]
     assert kinds.count("start_refused") == 1 and "process_crash" not in kinds  # once, no crash loop
     assert not [e for e in store.events(None, limit=100) if e["kind"] == "supervisor_error"]

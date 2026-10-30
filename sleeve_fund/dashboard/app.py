@@ -2877,6 +2877,14 @@ def _form_params(form, strategy: str) -> dict:
             params[key] = True
     if str(form.get("max_notional", "")).strip():
         params["max_notional"] = float(form["max_notional"])
+    if raw := str(form.get("own_capital", "")).strip():  # PM, 30 Oct 2026: a leg sized as a backtest's account
+        try:
+            own = float(raw)
+        except ValueError:
+            raise ValueError("own capital per asset: an amount in the quote currency") from None
+        if not (math.isfinite(own) and own >= 100):
+            raise ValueError("own capital per asset: at least 100 of the quote currency, or leave it empty")
+        params["own_capital"] = own
     for key in ("stop_loss", "take_profit", "risk_per_trade"):  # entered as %, stored as fractions
         raw = str(form.get(f"{key}_pct", "")).strip()
         if raw:

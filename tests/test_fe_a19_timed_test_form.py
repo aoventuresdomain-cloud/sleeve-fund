@@ -181,7 +181,10 @@ def test_fund_held_the_form_asks_no_capital_and_names_no_own_drawdown_halt(c, st
     _hold(store)
     html = c.get("/sleeves/new", auth=AUTH).text
     assert re.search(r'<input type="hidden" id="starting_balance" name="starting_balance" value="0">', html)
-    assert 'type="number" min="100"' not in html and HELD_WORDS in html
+    assert 'name="starting_balance" type="number"' not in html and HELD_WORDS in html
+    # The one capital-like field is the optional own capital per asset (PM, 30 Oct 2026), never required.
+    own = re.search(r'<input id="own_capital"[^>]*>', html)
+    assert own and "required" not in own.group(0)
     labels = re.findall(r'<option value="(?:conservative|balanced|aggressive)"[^>]*>([^<]+)</option>', html)
     assert labels and not any("halt at" in w for w in labels)
     assert "Balanced: leverage up to 2x" in labels

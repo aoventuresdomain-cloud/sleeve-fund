@@ -268,3 +268,51 @@ def test_f_ge_2_a_two_leg_perp_leg_past_half_its_entry_distance_acts_on_the_trad
     assert LongFlatStrategy._guard_breached(s, 36_000.0) is True
     pair.state = "flat"  # a pair not legging or hedged has no entry distance to keep
     assert LongFlatStrategy._guard_breached(s, 36_000.0) is False
+
+
+# ---- Own capital (PM, 30 Oct 2026): a leg inside the fund sized as a research leg's own account ---------------------
+def _own(own_pnl, fund=99_831.66, entry=None, price=100.0, own_capital=17_271.0):
+    return SimpleNamespace(fund_equity=None, _fund_held=lambda: True, _paper_fund_equity=lambda: fund,
+                           _cfg=SimpleNamespace(own_capital=own_capital), _mark=lambda: (own_pnl, 0.0, 0.0, price),
+                           _entry_px=entry, _entry_qty=1.0 if entry else 0.0, _entry_side=1, _price=lambda: price)
+
+
+def test_own_capital_sizes_off_itself_plus_its_own_pnl_not_the_fund():
+    """A leg at 0.173 of a 99,831.66 fund sizes off 17,271 and compounds on its own P&L, gains or losses, as the
+    basket's own-account leg does; the fund's figure stays the one journaled for a liquidation's share."""
+    s = _own(0.0)
+    assert LongFlatStrategy._sizing_base(s, 0.0) == pytest.approx(17_271.0)
+    assert LongFlatStrategy._fund_at_entry(SimpleNamespace(**vars(s), _in_fund=lambda: True), 17_271.0) == {
+        "fund_equity": 99_831.66, "own_capital_base": 17_271.0}
+    assert LongFlatStrategy._sizing_base(_own(1_200.0), 0.0) == pytest.approx(18_471.0)
+    assert LongFlatStrategy._sizing_base(_own(-2_000.0), 0.0) == pytest.approx(15_271.0)
+
+
+def test_own_capital_leaves_out_a_gain_not_yet_taken_and_never_passes_the_fund():
+    held = _own(10.0, entry=100.0, price=110.0)  # 1 unit from 100 marked at 110: the 10 gain is left out
+    assert LongFlatStrategy._sizing_base(held, 0.0) == pytest.approx(17_271.0)
+    assert LongFlatStrategy._sizing_base(_own(0.0, fund=12_000.0), 0.0) == pytest.approx(12_000.0)
+
+
+def test_own_capital_still_fails_closed_on_a_stale_fund_mark():
+    assert LongFlatStrategy._sizing_base(_own(0.0, fund=None), 0.0) is None
+
+
+def test_without_own_capital_a_leg_sizes_off_the_fund_as_before():
+    s = _own(500.0, own_capital=None)
+    assert LongFlatStrategy._sizing_base(s, 500.0) == pytest.approx(99_831.66)
+    assert LongFlatStrategy._fund_at_entry(SimpleNamespace(**vars(s), _in_fund=lambda: True), 99_831.66) == {
+        "fund_equity": 99_831.66}
+
+
+def test_own_capital_must_be_a_positive_amount():
+    from nautilus_trader.model import BarType, InstrumentId
+
+    from sleeve_fund.strategies.base import LongFlatConfig
+
+    kw = dict(instrument_id=InstrumentId.from_str("BTCUSDT-PERP.BINANCE"), assumed_taker_fee=0.0005,
+              bar_type=BarType.from_str("BTCUSDT-PERP.BINANCE-4-HOUR-LAST-EXTERNAL"))
+    assert LongFlatConfig(**kw, own_capital=17_271.0).own_capital == 17_271.0
+    for bad in (0.0, -1.0, float("inf"), float("nan")):
+        with pytest.raises(ValueError, match="own_capital"):
+            LongFlatConfig(**kw, own_capital=bad)
