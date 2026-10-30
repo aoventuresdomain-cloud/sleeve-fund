@@ -24,6 +24,7 @@ import re
 import sys
 from pathlib import Path
 
+from sleeve_fund.research import rounds
 from sleeve_fund.research.pinned import parse as parse_pinned
 from sleeve_fund.venues import RESEARCH_VENUE
 
@@ -36,8 +37,16 @@ TRIES_BY_HAND = "Tries counted by hand until R-25."
 REFUSED: Path | None = None
 ROW = re.compile(r"^\|\s*(\d+)\s*\|\s*([a-z0-9_]+)\s*\|[^|]*\|\s*(\w+)\s*\|(?:\s*([a-z-]*)\s*\|)?\s*$")
 # The list's common settings (research/quant-researcher/qr-rescore-list.md, 20 Oct): walk-forward 730/365, the
-# holdout's 365 days locked, risk profile none (1x, uncapped, unguarded).
+# holdout's 365 days locked, risk profile none (1x, uncapped, unguarded). A list's pinned dates set its own (fold_days):
+# the next round's (PM 30 Oct, "seal May to Oct 2026") is 366/485 with a 183-day holdout.
 TRAIN_DAYS, TEST_DAYS, HOLDOUT_DAYS = 730, 365, 365
+
+
+def fold_days(pinned) -> tuple[int, int, int]:
+    """(train, test, holdout) days as the list pins them: fold 1's train start to test start, its test start to test
+    end (both included), and the holdout's days. The study then checks every fold against the pinned ones."""
+    f = pinned.folds[0]
+    return (f.test_start - f.train_start).days, (f.test_end - f.test_start).days + 1, pinned.holdout_days
 # R-11/R-12 (Advisor SCORE-WINDOW, 21 Oct): a list whose common settings say "Scoring window: continuous" scores each
 # pinned row continuously after its warm-up; without the line it keeps the walk-forward. This round only, the rows
 # scored on the old window before (QR-B1, QR-B2, QR-B3) also show that window's verdict and pass only if both pass.
@@ -132,8 +141,9 @@ def request(name: str, minutes: int, venue: str, pair: str, pinned=None, continu
     parent = (load_definition_file(definition_path(variant["parent"]))
               if continuous and variant and variant.get("placebo") else None)  # R-24
     pairs = pair.split(",") if "," in pair else None
+    train, test, holdout = fold_days(pinned) if pinned is not None else (TRAIN_DAYS, TEST_DAYS, HOLDOUT_DAYS)
     return StudyRequest(strategy="rules", pair=pairs[0] if pairs else pair, pairs=pairs, venue=venue, minutes=minutes,
-                        risk_profile=None, train_days=TRAIN_DAYS, test_days=TEST_DAYS, holdout_days=HOLDOUT_DAYS, use_holdout=False,
+                        risk_profile=None, train_days=train, test_days=test, holdout_days=holdout, use_holdout=False,
                         params=params, label=name, pinned=pinned, placebo_parent=parent, market=market,
                         **(confirming or {}),
                         **({"score_window": "continuous", "old_window_too": name in OLD_WINDOW_TOO and not pairs}
@@ -209,9 +219,9 @@ def main(argv: list[str] | None = None, run=None, journal=None) -> int:
     try:
         text = Path(args.list).read_text(encoding="utf-8")
         pinned = parse_pinned(text)  # B-37: a list that pins no dates is refused before anything runs
-        if pinned.holdout_days != HOLDOUT_DAYS:
-            raise ValueError(f"the list pins a {pinned.holdout_days}-day holdout, not {HOLDOUT_DAYS}")
-        rows = pick(rows_of(text), args.rows)
+        listed = rows_of(text)
+        rnd = rounds.round_of(text, [n for n, _, _ in listed])  # M1 items 4-6: None for a list that names no round
+        rows = pick(listed, args.rows)
         continuous = CONTINUOUS_LINE.search(text) is not None
         market = markets_of(text)
         confirming = confirming_of(text)
@@ -219,6 +229,15 @@ def main(argv: list[str] | None = None, run=None, journal=None) -> int:
                                   confirming)) for n, name, minutes in rows]
         for _, _, req in reqs:
             req.validate()
+        ideas = {}  # family -> the ideas its rows count under, every row of the list's, not only those picked
+        if rnd is not None:
+            from sleeve_fund.research.study import idea_of
+            from sleeve_fund.research.trials import legacy_idea_hash
+
+            for n, name, minutes in listed:
+                r = request(name, minutes, args.venue, args.pair, pinned, continuous, market.get(n))
+                # a hand-coded model counts under its name, as its studies and baskets record it
+                ideas.setdefault(rnd.family_of(n), set()).add(idea_of(r.params, None) or legacy_idea_hash(r.strategy))
     except (OSError, ValueError) as exc:
         print(f"refused: {exc}")
         return 2
@@ -230,9 +249,13 @@ def main(argv: list[str] | None = None, run=None, journal=None) -> int:
         print(("one try per basket" if "size_scale" not in confirming else "not new tries") + ": fund guards " + ("on" if confirming.get("fund_guards", True) else
               "OFF (research only)") + (f", size scale {confirming['size_scale']:g}" if "size_scale" in confirming
                                          else ""))
+    if rnd is not None:
+        print(f"round {rnd.name}, study list SHA-256 {rnd.sha256}: {len(rnd.rows)} registered tries, a budget of "
+              f"{rnd.budget} tries per family")
     if args.dry_run:
         for n, name, req in reqs:
-            print(f"row {n:>2} {name}: checked{_minute_check(req)}")
+            place = f", registered try {rnd.place(n)[0]} of {len(rnd.rows)} in family {rnd.family_of(n)}" if rnd else ""
+            print(f"row {n:>2} {name}: checked{_minute_check(req)}{place}")
         print(f"dry run: {len(reqs)} checked, 0 run")
         return 0
     if run is None:
@@ -241,8 +264,21 @@ def main(argv: list[str] | None = None, run=None, journal=None) -> int:
         from sleeve_fund.__main__ import _journal as journal
     store = journal()
     ok = failed = 0
-    extra = {"notes": (TRIES_BY_HAND,)} if args.tries_by_hand else {}
+    extra = {"notes": (TRIES_BY_HAND,)} if args.tries_by_hand and rnd is None else {}
+    register = None
+    if rnd is not None:
+        from sleeve_fund.research.trials import TrialsRegister
+
+        register = TrialsRegister(store)
     for n, name, req in reqs:
+        if rnd is not None:
+            family = rnd.family_of(n)
+            so_far = rounds.used(register, ideas[family])
+            if so_far >= rnd.budget:  # M1 item 5: refused before it runs, and counted as a failed row
+                failed += 1
+                print(f"row {n:>2} {name}: REFUSED, family {family} has used {so_far} of its {rnd.budget} tries")
+                continue
+            extra = {"notes": (rounds.try_line(rnd, n, so_far),)}
         try:
             sheet = run(req, store=store, **extra)
         except Exception as exc:  # noqa: BLE001 - one row's failure never stops the rest; its class only (public log)
@@ -253,6 +289,8 @@ def main(argv: list[str] | None = None, run=None, journal=None) -> int:
         ok += 1
         print(f"row {n:>2} {name}: ran" + (f", sheet {sheet.stem}" if isinstance(sheet, Path) else ""))
     print(f"done: {ok} ran, {failed} failed; results on the Research page")
+    if rnd is not None:  # M1 item 6: the round in one line, off the register
+        print(rounds.summary(rnd, {f: rounds.used(register, i) for f, i in ideas.items()}))
     return 1 if failed else 0
 
 

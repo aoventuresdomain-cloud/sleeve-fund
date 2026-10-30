@@ -259,7 +259,7 @@ def run_store_study(req: StudyRequest, store=None, progress=None, ledger_path: P
     if req.pairs is not None:  # STUDY-ASSET-LIST: one basket of the listed assets
         from sleeve_fund.research.basket_run import run_store_basket
 
-        return run_store_basket(req, store, out_dir=out_dir, history=history)
+        return run_store_basket(req, store, out_dir=out_dir, history=history, notes=notes)
     spec = spec_of(req.strategy)
     profile = venue_profile(req.venue)
     history = history or HistoryStore()
