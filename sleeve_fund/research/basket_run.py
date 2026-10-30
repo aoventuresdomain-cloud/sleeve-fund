@@ -44,7 +44,7 @@ def common_clock(prices: list[pd.DataFrame], names: list[str]) -> list[pd.DataFr
 
 def windows(clock: pd.DatetimeIndex, holdout_days: int, train_days: int, test_days: int,
             warmup_bars: int | None = None, minutes: int = 1440) -> tuple[tuple, int, date, tuple | None]:
-    """The study's days on bars of `minutes` (daily, or 4-hour: each day `1440 // minutes` bars): (test windows as
+    """The study's days on bars of `minutes` (daily, 4-hour or 1-hour: each day `1440 // minutes` bars): (test windows as
     (first day, last day), warm-up bars before the first, the research end, the holdout as (first day, last day) or
     None). Walk-forward: run_study's test windows, each train_days after the last's start, the training bars warming
     the first; continuous (warmup_bars): one window from the bar after the warm-up to the research end."""
@@ -89,6 +89,7 @@ def run_store_basket(req, store=None, out_dir: Path | None = None, history=None,
     from sleeve_fund.research.run import TEARSHEETS, spec_of, study_market
     from sleeve_fund.research.study import CONTINUOUS, continuous_warmup
     from sleeve_fund.research.trials import TrialsRegister
+    from sleeve_fund.strategies.timeframes import span as candle_span
     from sleeve_fund.venues import venue as venue_profile
 
     if store is None:
@@ -106,7 +107,7 @@ def run_store_basket(req, store=None, out_dir: Path | None = None, history=None,
             raise ValueError(f"no stored history for {pair} on this venue; ask for it under Stored history on the "
                              "Research page") from None
         if prices.empty:
-            raise ValueError(f"the stored history for {pair} has no {'daily' if req.minutes == 1440 else '4-hour'} "
+            raise ValueError(f"the stored history for {pair} has no {'daily' if req.minutes == 1440 else candle_span(req.minutes)} "
                              "bars yet")
         if req.pinned is not None:
             try:
@@ -139,7 +140,7 @@ def run_store_basket(req, store=None, out_dir: Path | None = None, history=None,
             hourly = history.read(profile.name, pair, 60, start=prices.index[0] - DAY, end=prices.index[-1])
             assets.append(bk.BasketAsset(instrument, prices, hourly))
             continue
-        # A 4-hour list fills each asset on 1-minute bars on every day a run trades (the test days, and the holdout
+        # An intraday (4-hour or 1-hour) list fills each asset on 1-minute bars on every day a run trades (the test days, and the holdout
         # when it is opened), or is refused naming the asset (PM 23 Oct: no quiet fall back to coarser fills). Only
         # those days are read: three assets' whole pinned windows of minutes went past the study container's
         # memory (27 Oct), and a run's warm-up reads its decision bars only.

@@ -60,6 +60,7 @@ def test_the_list_is_two_basket_rows_on_the_sealed_dates_with_the_holdout_locked
         req = rescore.request(name, minutes, "binance", "BTC/USDT,ETH/USDT,SOL/USDT", p)
         assert tuple(req.pairs) == ("BTC/USDT", "ETH/USDT", "SOL/USDT") and req.params["market"] == "perp"
         assert (req.use_holdout, req.train_days, req.test_days, req.holdout_days) == (False, 366, 485, 183)
+        req.validate()  # row 2's 1-hour basket too: the floor is 1-hour (PM 30 Oct)
 
 
 def test_the_list_is_round_next_0_with_a_budget_of_6_and_bs_13_prior_tries():
@@ -71,11 +72,7 @@ def test_the_list_is_round_next_0_with_a_budget_of_6_and_bs_13_prior_tries():
     assert "family A try 1 " in rounds.try_line(r, 1, 0) and "family B try 14 " in rounds.try_line(r, 2, 0)
 
 
-def test_row_1_dry_runs_and_row_2_waits_for_hourly_baskets(capfd):
-    assert rescore.main([str(LIST), "--pair", "BTC/USDT,ETH/USDT,SOL/USDT", "--rows", "1", "--dry-run"],
-                        run=lambda *a, **k: None, journal=lambda: None) == 0
-    assert "dry run: 1 checked, 0 run" in capfd.readouterr().out
-    # An asset list runs on daily or 4-hour decisions only (PM 27 Oct): family B's 1-hour basket needs that widened.
-    assert rescore.main([str(LIST), "--pair", "BTC/USDT,ETH/USDT,SOL/USDT", "--rows", "2", "--dry-run"],
-                        run=lambda *a, **k: None, journal=lambda: None) == 2
-    assert "daily or 4-hour bars only" in capfd.readouterr().out
+def test_the_list_dry_runs(capfd):
+    assert rescore.main([str(LIST), "--pair", "BTC/USDT,ETH/USDT,SOL/USDT", "--dry-run"], run=lambda *a, **k: None,
+                        journal=lambda: None) == 0
+    assert "dry run: 2 checked, 0 run" in capfd.readouterr().out
