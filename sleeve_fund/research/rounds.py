@@ -7,24 +7,31 @@ A study list (configs/studies/) becomes a round with a block of common settings 
     - **Budget per family:** 20 tries
     - **Family A:** rows 1-8
     - **Family B:** rows 9-16, 18
+    - **Prior tries, family B:** 13
 
 Its rows are the round's registered tries, fixed before anything runs, and the list's SHA-256 names exactly that list:
 any edit to it (a row added, a setting changed, a date moved) is a new hash on every sheet after it. Every row is in
 exactly one family. A try is one evaluation in the register (one study of one definition on one asset, or one basket),
 counted under its definition's idea (study.idea_of), so a family's tries are every counted evaluation of its rows'
 ideas, ever, earlier rounds' included: never fewer than were really tried. A row is refused before it runs once its
-family has used its budget."""
+family has used its budget.
+
+A family's earlier tries under other definitions (different ideas, so not under its rows' in the register) can be stated
+once on a "Prior tries" line, as the Advisor counts them (30 Oct: family B's 13 earlier reversal studies count in its
+N). They add to the family's try number on each sheet ("family B try 14"), never to the budget: the budget is the
+round's own tries, round 0 and its improve rounds, counted off the register."""
 
 from __future__ import annotations
 
 import hashlib
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 ROUND_LINE = re.compile(r"^-\s*\*\*Round:\*\*\s*([A-Za-z0-9][A-Za-z0-9 ._-]{0,63}?)\s*$", re.M)
 BUDGET_LINE = re.compile(r"^-\s*\*\*Budget per family:\*\*\s*(\d{1,4})\s*tries\s*$", re.M | re.I)
 FAMILY_LINE = re.compile(r"^-\s*\*\*Family ([A-Za-z0-9]{1,16}):\*\*\s*rows\s+(.+?)\s*$", re.M)
-ANY_LINE = re.compile(r"^-\s*\*\*(Round|Budget per family|Family [^*]*):\*\*", re.M | re.I)
+PRIOR_LINE = re.compile(r"^-\s*\*\*Prior tries, family ([A-Za-z0-9]{1,16}):\*\*\s*(\d{1,4})\s*$", re.M)
+ANY_LINE = re.compile(r"^-\s*\*\*(Round|Budget per family|Family [^*]*|Prior tries[^*]*):\*\*", re.M | re.I)
 
 
 @dataclass(frozen=True)
@@ -34,6 +41,7 @@ class Round:
     budget: int  # tries per family
     families: dict  # family -> its rows, sorted
     rows: tuple  # every row of the list, in its order
+    prior: dict = field(default_factory=dict)  # family -> its stated earlier tries under other ideas
 
     def family_of(self, row: int) -> str:
         return next(f for f, rows in self.families.items() if row in rows)
@@ -83,7 +91,17 @@ def round_of(text: str, rows: list[int]) -> Round | None:
     homeless = [r for r in rows if r not in listed]
     if homeless:
         raise ValueError(f"every row of a round is in a family; not {', '.join(map(str, homeless))}")
-    return Round(name[0], hashlib.sha256(text.encode("utf-8")).hexdigest(), int(budget[0]), families, tuple(rows))
+    prior: dict = {}
+    for f, n in PRIOR_LINE.findall(text):
+        if f in prior:
+            raise ValueError(f"family {f}'s prior tries are stated twice")
+        if f not in families:
+            raise ValueError(f"prior tries are stated for family {f}, which the round doesn't have")
+        prior[f] = int(n)
+    if len(PRIOR_LINE.findall(text)) != len(re.findall(r"^-\s*\*\*Prior tries", text, re.M | re.I)):
+        raise ValueError("a prior tries line reads - **Prior tries, family B:** <N>")
+    return Round(name[0], hashlib.sha256(text.encode("utf-8")).hexdigest(), int(budget[0]), families, tuple(rows),
+                 prior)
 
 
 def used(register, ideas) -> int:
@@ -95,11 +113,15 @@ def try_line(r: Round, row: int, family_used: int) -> str:
     """The sheet's line for one of the round's registered tries."""
     k, n = r.place(row)
     f = r.family_of(row)
-    return (f"Round {r.name} (study list SHA-256 {r.sha256[:12]}): registered try {k} of {n}, family {f}; the family "
-            f"had used {family_used} of its {r.budget} tries before this one (trials register).")
+    prior = r.prior.get(f, 0)
+    stated = f"{prior} stated before the round, " if prior else ""
+    return (f"Round {r.name} (study list SHA-256 {r.sha256[:12]}): registered try {k} of {n}, family {f} try "
+            f"{prior + family_used + 1} ({stated}{family_used} in the trials register before this one); the family had "
+            f"used {family_used} of its {r.budget} tries before this one (trials register).")
 
 
 def summary(r: Round, used_by_family: dict) -> str:
     """The round in one line: each family's tries used of its budget, from the trials register."""
-    parts = [f"family {f} {used_by_family.get(f, 0)} of {r.budget} tries" for f in r.families]
+    parts = [f"family {f} {used_by_family.get(f, 0)} of {r.budget} tries"
+             + (f" (and {r.prior[f]} stated before the round)" if r.prior.get(f) else "") for f in r.families]
     return f"Round {r.name} (study list SHA-256 {r.sha256[:12]}), {len(r.rows)} registered tries: " + ", ".join(parts)

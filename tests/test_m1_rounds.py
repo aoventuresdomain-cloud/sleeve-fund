@@ -53,6 +53,10 @@ def test_a_list_names_its_round_and_puts_every_row_in_one_family(tmp_path):
     ("- **Round:** x\n- **Budget per family:** 3 tries\n- **Family A:** rows 1-22\n", "doesn't have: 22"),
     ("- **Round:** x\n- **Budget per family:** 3 tries\n- **Family A:** rows 9-1\n", "runs backwards"),
     ("- **Budget per family:** 3 tries\n- **Family A:** rows 1-21\n", "names itself once"),
+    ("- **Round:** x\n- **Budget per family:** 3 tries\n- **Family A:** rows 1-21\n- **Prior tries, family C:** 2\n",
+     "which the round doesn't have"),
+    ("- **Round:** x\n- **Budget per family:** 3 tries\n- **Family A:** rows 1-21\n- **Prior tries, family A:** many\n",
+     "a prior tries line reads"),
 ])
 def test_a_half_written_round_is_refused_in_words(tmp_path, block, words):
     text = _list(tmp_path, block).read_text()
@@ -95,10 +99,11 @@ def test_each_sheet_says_which_registered_try_it_is_and_a_spent_family_is_refuse
     assert [label for label, _ in seen] == ["qr01_trend_ema_long", rescore.rows_of(text)[10][1]]
     note = seen[0][1][0]
     sha = hashlib.sha256(text.encode()).hexdigest()
-    assert note == (f"Round next-1 (study list SHA-256 {sha[:12]}): registered try 1 of 21, family A; the family had "
-                    "used 2 of its 3 tries before this one (trials register).")
+    assert note == (f"Round next-1 (study list SHA-256 {sha[:12]}): registered try 1 of 21, family A try 3 (2 in the "
+                    "trials register before this one); the family had used 2 of its 3 tries before this one (trials "
+                    "register).")
     assert "row  2 " in out and "REFUSED, family A has used 3 of its 3 tries" in out
-    assert "registered try 11 of 21, family B; the family had used 0 of its 3 tries" in seen[1][1][0]
+    assert "registered try 11 of 21, family B try 1 (0 in the trials register before this one); the family had used 0 of its 3 tries" in seen[1][1][0]
     assert f"round next-1, study list SHA-256 {sha}: 21 registered tries, a budget of 3 tries per family" in out
     assert out.rstrip().splitlines()[-1] == (f"Round next-1 (study list SHA-256 {sha[:12]}), 21 registered tries: "
                                             "family A 3 of 3 tries, family B 1 of 3 tries")
@@ -145,3 +150,14 @@ def test_a_lists_pinned_dates_set_its_walk_forward_and_holdout_lengths():
     req = rescore.request("qr01_trend_ema_long", 240, "binance", "BTC/USDT", seal)
     assert (req.train_days, req.test_days, req.holdout_days) == (366, 485, 183)
     assert rescore.fold_days(parse(BASE)) == (rescore.TRAIN_DAYS, rescore.TEST_DAYS, rescore.HOLDOUT_DAYS)
+
+
+def test_a_familys_stated_prior_tries_number_its_tries_but_not_its_budget(tmp_path):
+    text = _list(tmp_path, BLOCK + "- **Prior tries, family B:** 13\n").read_text()
+    r = rounds.round_of(text, [n for n, _, _ in rescore.rows_of(text)])
+    assert r.prior == {"B": 13}
+    line = rounds.try_line(r, 11, 0)
+    assert "family B try 14 (13 stated before the round, 0 in the trials register before this one)" in line
+    assert "used 0 of its 3 tries" in line  # the budget is the round's own tries
+    assert rounds.summary(r, {"A": 1, "B": 0}).endswith(
+        "family A 1 of 3 tries, family B 0 of 3 tries (and 13 stated before the round)")
