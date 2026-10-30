@@ -62,6 +62,15 @@ def test_the_list_is_two_basket_rows_on_the_sealed_dates_with_the_holdout_locked
         assert (req.use_holdout, req.train_days, req.test_days, req.holdout_days) == (False, 366, 485, 183)
 
 
+def test_the_list_is_round_next_0_with_a_budget_of_6_and_bs_13_prior_tries():
+    from sleeve_fund.research import rounds
+
+    text = LIST.read_text()
+    r = rounds.round_of(text, [n for n, _, _ in rescore.rows_of(text)])
+    assert (r.name, r.budget, r.families, r.prior) == ("next-0", 6, {"A": (1,), "B": (2,)}, {"B": 13})
+    assert "family A try 1 " in rounds.try_line(r, 1, 0) and "family B try 14 " in rounds.try_line(r, 2, 0)
+
+
 def test_row_1_dry_runs_and_row_2_waits_for_hourly_baskets(capfd):
     assert rescore.main([str(LIST), "--pair", "BTC/USDT,ETH/USDT,SOL/USDT", "--rows", "1", "--dry-run"],
                         run=lambda *a, **k: None, journal=lambda: None) == 0

@@ -20,6 +20,11 @@ Backtest studies only: no fund, Strategy, demo or paper change. Dispatched with 
 - **Risk:** risk profile "none" (research: 1x, uncapped and unguarded).
 - **Fund guards:** off
 - **Count:** A0 is family A try 1; B0 is family B try 14 (13 prior reversal studies).
+- **Round:** next-0
+- **Budget per family:** 6 tries
+- **Family A:** rows 1
+- **Family B:** rows 2
+- **Prior tries, family B:** 13
 
 ## Pinned dates
 
