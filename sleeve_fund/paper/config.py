@@ -24,6 +24,9 @@ ALLOWED_BAR_SPECS = {
     "5-MINUTE-LAST-INTERNAL",
     "15-MINUTE-LAST-INTERNAL",
     "1-HOUR-LAST-INTERNAL",
+    # 4-hour bars from minutes, closing at 00, 04, 08 ... UTC as the history store builds them, so a 4-hour Strategy
+    # decides on paper on the same closes as its backtest (PM, 30 Oct 2026).
+    "4-HOUR-LAST-INTERNAL",
     # The venue's own OHLC; needed for daily strategies so warm-up can come from REST history.
     "1-HOUR-LAST-EXTERNAL",
     "4-HOUR-LAST-EXTERNAL",
@@ -62,7 +65,7 @@ def check_hub_bar_spec(venue: str, bar_spec: str) -> None:
         # No venue name: this is shown on the dashboard when a strategy is created.
         raise ValueError(f"bar_spec: strategies on this market decide on bars built from the market data hub's "
                          f"minutes, so the venue's own {size} candles aren't available "
-                         "there; choose 1, 5 or 15-minute or 1-hour bars")
+                         "there; choose 1, 5 or 15-minute, 1-hour or 4-hour bars")
 
 
 @dataclass(frozen=True)

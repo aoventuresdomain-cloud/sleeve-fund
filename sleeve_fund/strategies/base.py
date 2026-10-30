@@ -365,6 +365,7 @@ class LongFlatConfig(StrategyConfig):
         bar_type: BarType,
         cash_buffer: float = 0.01,
         max_notional: float | None = None,
+        own_capital: float | None = None,
         assumed_taker_fee: float | None = None,
         assumed_half_spread: float = 0.0,
         warmup_bars: int = 0,
@@ -413,6 +414,8 @@ class LongFlatConfig(StrategyConfig):
             raise ValueError(f"cash_buffer {cash_buffer} outside [0, 0.5)")
         if max_notional is not None and max_notional <= 0:
             raise ValueError("max_notional must be positive")
+        if own_capital is not None and not (math.isfinite(own_capital) and own_capital > 0):
+            raise ValueError("own_capital must be a positive amount of the quote currency")
         for label, v, hi in (("stop_loss", stop_loss, 0.5), ("take_profit", take_profit, 10.0),
                              ("risk_per_trade", risk_per_trade, 0.2)):
             if v is not None and not 0 < v <= hi:
@@ -497,6 +500,10 @@ class LongFlatConfig(StrategyConfig):
         self.cash_buffer = cash_buffer
         # Hard cap on the quote-currency value of any single buy (sleeve budget).
         self.max_notional = max_notional
+        # Paper inside the fund only: size off this capital plus the Strategy's own P&L, not the whole fund's equity,
+        # as a research leg sizes off its own account and compounds without rebalancing (PM, 30 Oct 2026). None: the
+        # fund's equity, as before.
+        self.own_capital = own_capital
         # Venue instruments may not carry fee rates (some venues leave them out), so sizing uses this.
         self.assumed_taker_fee = assumed_taker_fee
         # Half the bid-ask spread a market order pays, for sizing to a loss at the stop. Paper uses the
@@ -6215,7 +6222,13 @@ class LongFlatStrategy(Strategy):
         """F-FC-4: inside the fund, the fund equity an entry was sized off (_sizing_base: net deposits + realised +
         min(0, unrealised), at its mark), journaled with it: a liquidation's Y is its X over this, the position's first
         entry's, through adds and partial reductions (Advisor 15 Oct ~02:35 UK). Nothing outside the fund."""
-        return {"fund_equity": round(float(base), 2)} if self._in_fund() else {}
+        if not self._in_fund():
+            return {}
+        if getattr(getattr(self, "_cfg", None), "own_capital", None) is None:
+            return {"fund_equity": round(float(base), 2)}
+        # Sized off its own capital: the fund's figure stays the one a liquidation is judged against.
+        return {"fund_equity": round(float(getattr(self, "_sized_fund", None) or base), 2),
+                "own_capital_base": round(float(base), 2)}
 
     def _in_fund(self) -> bool:
         """Paper inside the fund (_fund_held), where the fund holds the cash and the Strategy's own equity starts at 0.
@@ -6364,12 +6377,23 @@ class LongFlatStrategy(Strategy):
         """BRIDGE-3: the equity an entry's size is a share of: the fund's when the fund holds the cash (fund_equity),
         else this Strategy's own, which is then the whole fund; in both without a gain not yet taken (+ min(0,
         unrealised)), so a winning position never sizes the next order up. The leverage cap reads it too (SIZE-FUND Q3);
-        free cash stays the margin account's, an order-validity rule."""
+        free cash stays the margin account's, an order-validity rule. With own_capital set, a Strategy inside the fund sizes
+        from that plus its own P&L instead, never above the fund's figure (PM, 30 Oct 2026)."""
         if self.fund_equity is not None:
             fund = self.fund_equity()  # None: the last portfolio mark is stale (Advisor SIZE-FUND Q5, fail closed)
             return None if fund is None else float(fund)
         if self._fund_held():
-            return self._paper_fund_equity()  # never the Strategy's own, nor its unrealised gain
+            fund = self._paper_fund_equity()  # never the Strategy's own, nor its unrealised gain
+            own = getattr(getattr(self, "_cfg", None), "own_capital", None)
+            self._sized_fund = fund
+            if fund is None or own is None:
+                return fund
+            # Its own capital plus its own P&L (its equity inside the fund, from 0), never more than the fund holds.
+            return min(fund, own + LongFlatStrategy._untaken(self, self._mark()[0]))
+        return LongFlatStrategy._untaken(self, equity)
+
+    def _untaken(self, equity: float) -> float:
+        """equity without the open position's gain not yet taken (+ min(0, unrealised))."""
         if self._entry_px is None or not self._entry_qty:
             return equity
         gain = (self._entry_side or 1) * self._entry_qty * (self._price() - self._entry_px)

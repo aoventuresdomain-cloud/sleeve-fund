@@ -135,3 +135,14 @@ def test_b35_no_offered_candle_chip_is_refused(held_site, browser, market):  # n
         assert errors == [], (spec, errors)
         page.context.close()
     assert refused == {}, refused
+
+
+def test_own_capital_per_asset_is_stored_as_entered_and_refused_when_not_an_amount():
+    """PM, 30 Oct 2026: a fund-held Strategy's leg can size off its own capital plus its own P&L."""
+    import pytest
+
+    assert _form_params({"own_capital": "17271"}, "buy_and_hold")["own_capital"] == 17_271.0
+    assert "own_capital" not in _form_params({"own_capital": ""}, "buy_and_hold")
+    for bad in ("abc", "50", "-1", "inf"):
+        with pytest.raises(ValueError, match="own capital per asset"):
+            _form_params({"own_capital": bad}, "buy_and_hold")

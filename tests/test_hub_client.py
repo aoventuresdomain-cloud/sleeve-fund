@@ -14,6 +14,7 @@ T0 = 1_791_223_020_000_000_000
     ("1-MINUTE-LAST-INTERNAL", "1-MINUTE-LAST-EXTERNAL"),  # the hub's own minutes, as they come
     ("15-MINUTE-LAST-INTERNAL", "15-MINUTE-LAST-EXTERNAL"),  # built by the hub client from them
     ("1-HOUR-LAST-INTERNAL", "1-HOUR-LAST-EXTERNAL"),
+    ("4-HOUR-LAST-INTERNAL", "4-HOUR-LAST-EXTERNAL"),
 ])
 def test_a_strategys_bars_are_the_hubs_minutes_or_built_from_them(spec, fed):
     assert hub_bar_spec(spec) == fed
@@ -71,6 +72,37 @@ def test_longer_bars_are_the_minutes_closing_in_them_sent_with_their_last_minute
     assert str(b.bar_type) == f"{BTC}-5-MINUTE-LAST-EXTERNAL" and b.ts_event == E + 5 * M
     assert (str(b.open), str(b.high), str(b.low), str(b.close), str(b.volume)) == (
         "60001.00", "60050.00", "59900.00", "60005.50", "7.000")
+
+
+def test_four_hour_bars_from_the_hubs_minutes_are_the_history_stores_four_hour_bars():
+    """A 4-hour Strategy on paper decides on the same bars as its backtest: closing at 00, 04, 08 ... UTC, each the
+    minutes closing in it, equal to what the store's build_bars makes of the same minutes (PM, 30 Oct 2026)."""
+    import random
+
+    import pandas as pd
+
+    from sleeve_fund.bars import build_bars
+
+    four, rng = 240 * M, random.Random(7)
+    start = 1_792_022_400_000_000_000  # 00:00 UTC on 15 Oct 2026
+    assert start % four == 0
+    d, rows, sent, px = Decoder("4-HOUR-LAST-EXTERNAL"), [], [], 60_000.0
+    for k in range(1, 3 * 240 + 1):  # three whole 4-hour bars of minutes, stamped at their close
+        o, px = px, px + rng.uniform(-30, 30)
+        h, lo, v = max(o, px) + rng.uniform(0, 10), min(o, px) - rng.uniform(0, 10), rng.uniform(0.1, 3)
+        m = _bar(start + k * M, o=f"{o:.2f}", h=f"{h:.2f}", l=f"{lo:.2f}", c=f"{px:.2f}", v=f"{v:.3f}")
+        rows.append((pd.Timestamp(start + (k - 1) * M, tz="UTC"), *(float(m[x]) for x in "ohlcv")))
+        if (b := d(m, start + k * M + 5)) is not None:
+            sent.append(b)
+    frame = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"]).set_index("ts")
+    stored = build_bars(frame, 240)
+    assert [b.ts_event for b in sent] == [start + n * four for n in (1, 2, 3)]
+    assert [pd.Timestamp(b.ts_event - four, tz="UTC") for b in sent] == list(stored.index)
+    for b, (_, row) in zip(sent, stored.iterrows()):
+        assert str(b.bar_type) == f"{BTC}-4-HOUR-LAST-EXTERNAL" and row["missing"] == 0
+        assert [round(float(str(x)), 2) for x in (b.open, b.high, b.low, b.close)] == \
+            [round(row[k], 2) for k in ("open", "high", "low", "close")]
+        assert abs(float(str(b.volume)) - row["volume"]) < 1e-6
 
 
 def test_a_bar_whose_last_minute_never_came_is_sent_with_the_next_minute_while_current():

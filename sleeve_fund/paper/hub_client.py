@@ -54,7 +54,7 @@ def hub_bar_spec(spec: str) -> str:
     """A strategy's bar spec as fed by the hub: 15-MINUTE-LAST-INTERNAL -> 15-MINUTE-LAST-EXTERNAL."""
     if not spec.endswith("-LAST-INTERNAL"):
         raise ValueError(f"bar spec {spec!r} is the venue's own candles, which the hub doesn't relay: a hub-fed "
-                         "strategy decides on 1, 5 or 15-minute or 1-hour bars built from its minutes")
+                         "strategy decides on 1, 5 or 15-minute, 1-hour or 4-hour bars built from its minutes")
     return spec.replace("-INTERNAL", "-EXTERNAL")
 
 
