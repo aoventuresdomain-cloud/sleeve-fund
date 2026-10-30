@@ -113,6 +113,11 @@ class TradeRow:
     reason: str
     equity_after: float
     drawdown: float  # at the trade's close: the equity after against its daily marked-to-market peak so far
+    # M1 item 11 (PM's trade book, 30 Oct): why the trade opened and closed, and the indicator values the rule read then
+    entry_rule: str = ""
+    entry_signal: str = ""
+    exit_rule: str = ""
+    exit_signal: str = ""
 
 
 def _naive(ts) -> pd.Timestamp:
@@ -134,6 +139,18 @@ def exit_reason(decision: dict | None) -> str:
     if "time stop" in words or "time_stop" in words:
         return "time stop"
     return "signal"
+
+
+def signal_values(decision: dict | None) -> str:
+    """The indicator values a rule-builder order's rule read at its decision ("fast=101.2; slow=100.9", by name), from
+    its lineage payload; "" for an order that carries none (a hand-coded model's, a stop resting at the venue)."""
+    blocks = ((decision or {}).get("signal") or {}).get("blocks") or {}
+    return "; ".join(f"{k}={v!r}" for k, v in sorted(blocks.items()))
+
+
+def _rule(decision: dict | None) -> str:
+    d = decision or {}
+    return str((d.get("signal") or {}).get("rule") or d.get("reason") or "")
 
 
 def trade_rows(run) -> list[TradeRow]:
@@ -167,30 +184,55 @@ def trade_rows(run) -> list[TradeRow]:
             fees=float(t["fees"]), funding=float(t.get("funding", 0.0)), pnl=pnl,
             pnl_pct=pnl / before if before else 0.0, ret=pnl / float(t["cost"]) if t["cost"] else 0.0,
             reason="open at end, marked to market" if closed is None else exit_reason(decisions.get(t["exit_order"])),
-            equity_after=after, drawdown=after / peak - 1 if peak > 0 else 0.0))
+            equity_after=after, drawdown=after / peak - 1 if peak > 0 else 0.0,
+            entry_rule=_rule(decisions.get(t.get("entry_order"))),
+            entry_signal=signal_values(decisions.get(t.get("entry_order"))),
+            exit_rule="" if closed is None else _rule(decisions.get(t["exit_order"])),
+            exit_signal="" if closed is None else signal_values(decisions.get(t["exit_order"]))))
     return rows
 
 
 CSV_COLUMNS = ("trade", "side", "entry_time", "entry_price", "exit_time", "exit_price", "size", "notional",
                "holding_hours", "fees", "funding", "pnl", "pnl_pct_of_equity", "return_on_notional", "exit_reason",
-               "equity_after", "drawdown_at_trade_close")
+               "equity_after", "drawdown_at_trade_close", "entry_rule", "entry_signal_values", "exit_rule",
+               "exit_signal_values")
+# The test-window trade list (M1 item 9): each window's trades, as its own run booked them, and whether the sheet's
+# out-of-sample trade count counts it (opened and closed inside the window; one still open at its end is marked there).
+OOS_COLUMNS = ("window", "window_start", "window_end", "counted", *CSV_COLUMNS)
+
+
+def _cell(x) -> str:
+    if x is None:
+        return ""
+    if isinstance(x, pd.Timestamp):
+        return x.isoformat()
+    if isinstance(x, float):
+        return repr(x)
+    return '"' + str(x).replace('"', '""') + '"' if any(c in str(x) for c in ',"\n') else str(x)
+
+
+def _fields(r: TradeRow) -> tuple:
+    return (r.n, r.side, r.opened, r.entry_px, r.closed, r.exit_px, r.qty, r.notional, r.held / pd.Timedelta(hours=1),
+            r.fees, r.funding, r.pnl, r.pnl_pct, r.ret, r.reason, r.equity_after, r.drawdown, r.entry_rule,
+            r.entry_signal, r.exit_rule, r.exit_signal)
 
 
 def trades_csv(rows: list[TradeRow]) -> str:
-    def cell(x) -> str:
-        if x is None:
-            return ""
-        if isinstance(x, pd.Timestamp):
-            return x.isoformat()
-        if isinstance(x, float):
-            return repr(x)
-        return '"' + str(x).replace('"', '""') + '"' if "," in str(x) or '"' in str(x) else str(x)
-
     lines = [",".join(CSV_COLUMNS)]
-    for r in rows:
-        lines.append(",".join(cell(x) for x in (
-            r.n, r.side, r.opened, r.entry_px, r.closed, r.exit_px, r.qty, r.notional, r.held / pd.Timedelta(hours=1),
-            r.fees, r.funding, r.pnl, r.pnl_pct, r.ret, r.reason, r.equity_after, r.drawdown)))
+    lines += [",".join(_cell(x) for x in _fields(r)) for r in rows]
+    return "\n".join(lines) + "\n"
+
+
+def oos_trades_csv(windows: list[tuple[pd.Timestamp, pd.Timestamp, list[TradeRow]]]) -> str:
+    """Every test window's trades (OOS_COLUMNS), window by window: when it starts trading (the close before its first
+    bar), its last bar's close, and its rows. A window's run also lists any trade it held from before that start, and
+    any still open at its end: both are marked counted "no", as the sheet doesn't count them."""
+    lines = [",".join(OOS_COLUMNS)]
+    for k, (first, last, rows) in enumerate(windows, 1):
+        for r in rows:
+            counted = r.closed is not None and r.opened >= _naive(first)
+            lines.append(",".join(_cell(x) for x in (k, _naive(first), _naive(last), "yes" if counted else "no",
+                                                     *_fields(r))))
     return "\n".join(lines) + "\n"
 
 

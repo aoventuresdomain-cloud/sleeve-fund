@@ -164,4 +164,52 @@ def run_store_basket(req, store=None, out_dir: Path | None = None, history=None)
         n += 1
         out = out.with_name(f"{stem}-{n}.md")
     out.write_text(bk.render(study, opened), encoding="utf-8")
+    write_beside(study, out)
     return out
+
+
+def _test_day(ts: pd.Timestamp, bar: pd.Timedelta, windows) -> bool:
+    """Whether a fill at `ts` follows a decision on a test day: the bar it follows is the last to close at or before
+    it, and that bar's day is the day it closes after (bars close on the UTC grid of their length)."""
+    t = pd.Timestamp(ts)
+    t = t.tz_localize("UTC") if t.tzinfo is None else t
+    day = (t.floor(bar) - bar).date()
+    return any(a <= day <= b for a, b in windows)
+
+
+def write_beside(study, sheet: Path) -> None:
+    """M1 item 9 (PM 30 Oct, accuracy check 2): beside a basket sheet, every leg's trades as its own record booked
+    them (basket-trades.csv, each marked whether it opened on a test day), the pooled book's test days (pooled.csv:
+    each asset's net P&L, the fund's equity at the day before's close and the pooled return), and the figures the
+    sheet states (.results.json "check"), for scripts/recompute_sheet.py to rebuild from these files alone."""
+    import json
+
+    from sleeve_fund.research import periods
+    from sleeve_fund.research.metrics import daily_closes
+    from sleeve_fund.research.run import results_path
+
+    base, windows = study.base, study.windows
+    lines, counts = [",".join(("asset", "leg", "test_day", *periods.CSV_COLUMNS))], {}
+    for leg, (asset, bar) in study.legs.items():
+        rows = periods.trade_rows(base.run.legs[leg])
+        for r in rows:
+            on = _test_day(r.opened, bar, windows)
+            counts[asset] = counts.get(asset, 0) + (on and r.closed is not None)
+            lines.append(",".join(periods._cell(x) for x in (asset, leg, "yes" if on else "no", *periods._fields(r))))
+    sheet.with_name(f"{sheet.stem}-basket-trades.csv").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    book = daily_closes(base.run.book)
+    before = bk.equity_before(book, base.pnl.index, float(base.run.book.iloc[0]))
+    cols = list(base.pnl.columns)
+    out = [",".join(("date", *(f"pnl_{c}" for c in cols), "equity_before", "pooled_return"))]
+    for t, row in base.pnl.iterrows():
+        out.append(",".join((f"{(t - pd.Timedelta(1, 'ns')):%Y-%m-%d}", *(repr(float(row[c])) for c in cols),
+                             repr(float(before[t])), repr(float(base.returns[t])))))
+    sheet.with_name(f"{sheet.stem}-pooled.csv").write_text("\n".join(out) + "\n", encoding="utf-8")
+
+    check = {"basket": {
+        "net": base.net, "max_drawdown": -bk.worst_drawdown(base.returns), "sharpe": bk._sharpe(base.returns.to_numpy()),
+        "days": int(len(base.returns)), "annualise_days": 365,
+        "assets": {a: {"pnl": float(base.pnl[a].sum()), "trades": int(counts.get(a, 0))} for a in cols}}}
+    path = results_path(sheet)
+    path.write_text(json.dumps({"check": check}, indent=1, sort_keys=True, default=float), encoding="utf-8")

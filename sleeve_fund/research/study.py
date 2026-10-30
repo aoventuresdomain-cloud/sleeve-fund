@@ -25,7 +25,7 @@ from sleeve_fund import funding
 from sleeve_fund.instruments import FeeSchedule, pair_of, pct, taker_slippage
 from sleeve_fund import markets, risk
 from sleeve_fund.markets import PERP
-from sleeve_fund.research import equal_exposure, placebo, regime_split
+from sleeve_fund.research import equal_exposure, periods, placebo, regime_split
 from sleeve_fund.research.ledger import GAP_STAGE, IdeaLedger, opened_words
 from sleeve_fund.research.random_entry import (RandomEntryResult, RandomSideResult, Trade, random_entry,
                                                random_entry_filled, random_side, random_side_filled)
@@ -148,6 +148,10 @@ class Fold:
     # The sum over the test window's bars of |position notional / equity| (flat bars 0): its time-weighted gross
     # exposure is this over window_bars (strength_report, Advisor G5-DW5 Q2).
     gross_exposure: float = 0.0
+    # M1 item 9 (PM 30 Oct): the window's own trade list (periods.trade_rows of its run, every trip it booked, one still
+    # open at its end marked there) and when it starts trading, for the test-window trade list and its recompute.
+    trade_rows: list = field(default_factory=list, repr=False)
+    trade_from: pd.Timestamp | None = None
     # RANDOM-ENTRY: each counted trip as the engine booked it, {"opened", "closed", "side", "ret" (pnl after fees,
     # fills and funding over its entry notional), "exit_ratio" (exit over entry notional)}, for the strategy's side
     # of random entry; and (the counted trips' pnl, the window's equity change less its carried trips', the
@@ -1044,6 +1048,8 @@ def run_study(
                 trip_charges=_trip_charges(window_trips, test_idx[0] - bar, absorbed),
                 trip_sizes=_trip_sizes(window_trips, test_idx[0] - bar, run.fills, run.decisions),
                 gross_exposure=_gross_exposure(run.exposure, test_idx[0], test_idx[-1]),
+                trade_rows=periods.trade_rows(run),
+                trade_from=test_idx[0] - bar,
                 **_trip_reconcile(booked, _flat_until(run, test_idx[0] - bar), test_idx[0] - bar, test_idx[-1],
                                   _trip_charges(window_trips, test_idx[0] - bar, absorbed), run.decisions),
             ),

@@ -345,19 +345,24 @@ def run_store_study(req: StudyRequest, store=None, progress=None, ledger_path: P
     return out
 
 
-BESIDE = ("trades.csv", "equity.csv", "equity.svg")  # R-15: what sits beside a sheet as <stem>-<kind>, all it may
+# R-15: what sits beside a sheet as <stem>-<kind>, all it may; M1 item 9 (PM 30 Oct) adds the test windows' trades
+# and, beside a basket's sheet, its legs' trades and the pooled book's test days (basket_run.write_beside).
+BESIDE = ("trades.csv", "equity.csv", "equity.svg", "oos-trades.csv", "basket-trades.csv", "pooled.csv")
 
 
 def write_beside(result, sheet: Path) -> None:
-    """R-15: the sheet's every trade, its daily equity and buy-and-hold's, and their curve, beside it, never trimmed."""
+    """R-15: the sheet's every trade, its daily equity and buy-and-hold's, and their curve, beside it, never trimmed;
+    and every test window's trades as its own run booked them (M1 item 9), what out-of-sample stands on."""
     from sleeve_fund.research import periods
 
     eq, hold = periods.scored(result)
     files = {"trades.csv": periods.trades_csv(periods.trade_rows(result.full_period)),
              "equity.csv": periods.equity_csv(eq, hold),
-             "equity.svg": periods.equity_svg(eq, hold, f"{sheet.stem}: equity, Strategy and buy and hold")}
-    for kind in BESIDE:
-        sheet.with_name(f"{sheet.stem}-{kind}").write_text(files[kind], encoding="utf-8")
+             "equity.svg": periods.equity_svg(eq, hold, f"{sheet.stem}: equity, Strategy and buy and hold"),
+             "oos-trades.csv": periods.oos_trades_csv([(f.trade_from, f.test_end, f.trade_rows)
+                                                       for f in result.folds if f.trade_from is not None])}
+    for kind, text in files.items():
+        sheet.with_name(f"{sheet.stem}-{kind}").write_text(text, encoding="utf-8")
 
 
 def results_path(sheet: Path) -> Path:
@@ -419,8 +424,29 @@ def write_results(result, sheet: Path) -> Path:
 
     fields = None if d is None else {k: plain(v) for k, v in d.items()}
     path = results_path(sheet)
-    path.write_text(json.dumps({"double_fees": fields}, indent=1, sort_keys=True), encoding="utf-8")
+    path.write_text(json.dumps({"double_fees": fields, "check": check_figures(result)}, indent=1, sort_keys=True),
+                    encoding="utf-8")
     return path
+
+
+def check_figures(result) -> dict:
+    """M1 item 9 (PM 30 Oct, accuracy check 2): the figures the sheet states, as the study computed them, for
+    scripts/recompute_sheet.py to rebuild from the files beside the sheet alone: the full period's start, end and
+    closed trades (trades.csv), and out of sample its return, worst drop, Sharpe, days and counted trades, in all and
+    per test window (oos-trades.csv, .oos-returns.csv). A window that sat flat untraded has no trade list."""
+    from sleeve_fund.research.metrics import summary
+
+    eq = result.full_period.equity
+    oos = summary(result.oos_returns) if len(result.oos_returns.dropna()) >= 2 else {}
+    return {
+        "full_period": {"start_equity": float(eq.iloc[0]), "end_equity": float(eq.iloc[-1]),
+                        "trades": int(result.trade_stats["trades"])},
+        "oos": {"total_return": oos.get("total_return"), "max_drawdown": oos.get("max_drawdown"),
+                "sharpe": oos.get("sharpe"), "days": oos.get("days", 0), "trades": int(result.oos_trades),
+                "windows": [{"window": k, "from": f.trade_from.isoformat(), "to": f.test_end.isoformat(),
+                             "total_return": f.test.get("total_return"), "trades": int(f.test_trades)}
+                            for k, f in enumerate((f for f in result.folds if f.trade_from is not None), 1)]},
+    }
 
 
 def seed(ledger: Path | None = None, tearsheets: Path | None = None) -> None:

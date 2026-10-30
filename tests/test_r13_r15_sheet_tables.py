@@ -121,7 +121,7 @@ def test_the_files_beside_a_sheet(tmp_path, perp_venue):
     out.parent.mkdir()
     write_beside(r, out)
     names = sorted(p.name for p in out.parent.iterdir())
-    assert names == ["qr_x-equity.csv", "qr_x-equity.svg", "qr_x-trades.csv"]
+    assert names == ["qr_x-equity.csv", "qr_x-equity.svg", "qr_x-oos-trades.csv", "qr_x-trades.csv"]
     svg = (out.parent / "qr_x-equity.svg").read_text()
     assert svg.startswith('<svg xmlns="http://www.w3.org/2000/svg" viewBox=') and "<script" not in svg
     assert periods.equity_svg(r.full_period.equity, r.full_period_benchmark.equity, "<b>&") .count("&lt;b&gt;&amp;") == 2
