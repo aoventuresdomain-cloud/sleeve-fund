@@ -50,3 +50,19 @@ def test_the_table_prints_and_says_why_baseline_filled_is_nought(tmp_path, capfd
     out = capfd.readouterr().out
     assert "| BTC | 6 | 6 | 0 | 0 |" in out and "| ETH | no rates stored |" in out
     assert "0 by construction" in out
+
+
+def test_a_hole_just_before_a_change_counts_on_the_interval_before_it_and_is_listed(tmp_path, capfd):
+    start = pd.Timestamp("2024-01-01", tz="UTC")
+    eight = [start + 8 * H * k for k in range(15)]
+    four = [eight[-1] + 4 * H * k for k in range(1, 31)]
+    del eight[-2]  # the last 8-hourly settlement but one is missed, right at the change to 4-hourly
+    _store(tmp_path, eight + four)
+    end = four[-1].normalize() - pd.Timedelta(days=1)
+    c = funding_counts.counts("BINANCE", "BTC/USDT", start, end, tmp_path)
+    kept = [t for t in eight + four if t < end + pd.Timedelta(days=1)]
+    assert (c["venue_sourced"], c["missing"]) == (len(kept), 1)  # one 8-hourly settlement, not three 4-hourly (CR F1)
+    assert c["holes_across_a_change"] == [(eight[-2], eight[-1])]
+    funding_counts.main(["--venue", "BINANCE", "--pairs", "BTC/USDT", "--start", "2024-01-01",
+                         "--end", f"{end:%Y-%m-%d}", "--root", str(tmp_path)])
+    assert "spans an interval change; its missing settlements are counted on the interval before it" in capfd.readouterr().out

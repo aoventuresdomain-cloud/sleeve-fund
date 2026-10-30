@@ -1388,9 +1388,10 @@ def run_study(
         result.notes.append(
             f"Funding rate decile: {counts['funding_no_rate']:,} of {len(research):,} decision candles had no usable "
             "stored funding rate (the latest due settlement missing, or too few in its window), so no entry gated on "
-            "it could open on them: a missing rate is never assumed. Apart from those, "
-            f"{counts.get('funding_top_decile', 0):,} read the top decile (90% or more of the trailing window's rates "
-            "strictly below the latest). Only rates settled strictly before each candle's close are read.")
+            "it could open on them: a missing rate is never assumed. "
+            + (f"Apart from those, {counts['funding_top_decile']:,} read the top decile (90% or more of the trailing "
+               "window's rates strictly below the latest). " if "funding_top_decile" in counts else "")
+            + "Only rates settled strictly before each candle's close are read.")
     if "vol_skipped" in counts:  # R-07
         vol = default_params.get("vol_target_size") or {}
         result.notes.append(

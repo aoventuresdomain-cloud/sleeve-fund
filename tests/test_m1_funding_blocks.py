@@ -32,6 +32,8 @@ def test_the_z_score_is_the_distance_from_the_windows_mean_in_sample_deviations(
     assert funding_zscore_of(w, 5.0) == pytest.approx(2.0 / sd)
     assert funding_zscore_of(w, 3.0) == 0.0
     assert funding_zscore_of([0.0001] * 9, 0.0001) is None  # a window that doesn't vary has no z-score
+    noise = [0.0001] * 8 + [0.0001 + 1e-16]  # differs only by float rounding: still no z-score (CR on #336, F3)
+    assert funding_zscore_of(noise, noise[-1]) is None
 
 
 def test_the_percentile_is_the_share_strictly_below_and_ties_count_as_not_below():
@@ -128,6 +130,17 @@ def test_only_a_percentile_at_or_above_90_is_counted_as_top():
         b = _block(FundingPercentile, times, rates)
         b.update_ohlcv(0, 0, 0, 1.0, 0, ts_ns=times[-1] + 4 * H)
         assert b.top_decile == top
+    n = len(times)  # a 10-day window reads all n: the latest ties the top tenth, so exactly 90% sit below it
+    b = _block(FundingPercentile, times, [0.0] * (n - n // 10) + [1.0] * (n // 10), window_days=10)
+    b.update_ohlcv(0, 0, 0, 1.0, 0, ts_ns=times[-1] + 4 * H)
+    assert (b.value, b.top_decile) == (90.0, 1)  # at 90 counts (CR on #336, F2)
+
+
+def test_a_z_score_far_above_its_window_counts_no_top_decile():
+    times = _settlements(days=40)[:-1]  # a z-score of 10 needs over 100 rates in its window
+    b = _block(FundingZScore, times, [0.0001 * (1 + i % 2) for i in range(len(times) - 1)] + [0.05], window_days=40)
+    b.update_ohlcv(0, 0, 0, 1.0, 0, ts_ns=times[-1] + 4 * H)
+    assert b.value >= 10 and b.top_decile == 0  # the decile's count would read 10 and up as top (CR on #336, F2)
 
 
 @pytest.mark.parametrize("kind,cls", KINDS)

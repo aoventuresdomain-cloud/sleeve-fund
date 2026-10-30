@@ -197,7 +197,8 @@ def funding_zscore_of(window, latest: float) -> float | None:
     """How many sample standard deviations `latest` sits from the mean of `window` (the rates it sits in, itself
     included); None when they don't vary."""
     n = len(window)
-    if n < 2 or max(window) == min(window):  # one repeated rate: its deviation is only rounding, so no value
+    hi, lo = max(window), min(window)
+    if n < 2 or hi - lo <= 1e-9 * max(abs(hi), abs(lo)):  # one repeated rate, up to float noise: no value
         return None
     mean = sum(float(r) for r in window) / n
     sd = math.sqrt(sum((float(r) - mean) ** 2 for r in window) / (n - 1))
