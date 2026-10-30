@@ -5,6 +5,7 @@ round's count prints in one line, all read off the trials register."""
 from __future__ import annotations
 
 import hashlib
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -25,13 +26,15 @@ def _list(tmp_path: Path, block: str = BLOCK) -> Path:
 
 
 class _Register:
-    """The trials register's counts, by idea: what rounds.used reads."""
+    """The trials register's counted rows, by idea: n distinct variants for an idea counted n."""
 
     def __init__(self, by_idea: dict):
         self.by_idea = by_idea
 
-    def counts(self, idea):
-        return {"evaluations": self.by_idea.get(idea, 0)}
+    def _counted(self, idea=None):
+        ideas = self.by_idea if idea is None else {idea: self.by_idea.get(idea, 0)}
+        return [{"definition_hash": f"{i}-{k}", "code_version": "c", "dataset": "d", "definition_name": "x",
+                 "settings": "{}"} for i, n in ideas.items() for k in range(n)]
 
 
 def test_a_list_names_its_round_and_puts_every_row_in_one_family(tmp_path):
@@ -64,9 +67,47 @@ def test_a_half_written_round_is_refused_in_words(tmp_path, block, words):
         rounds.round_of(text, [n for n, _, _ in rescore.rows_of(text)])
 
 
-def test_a_familys_tries_are_its_rows_ideas_counted_evaluations():
+def test_a_familys_tries_are_its_rows_ideas_counted_variants():
     reg = _Register({"i1": 2, "i2": 5, "other": 9})
     assert rounds.used(reg, {"i1", "i2", None}) == 7
+
+
+START, END = datetime(2024, 1, 1, tzinfo=timezone.utc), datetime(2026, 4, 30, tzinfo=timezone.utc)
+
+
+def _real_register(tmp_path):
+    from sleeve_fund.research.trials import TrialsRegister
+    from sleeve_fund.store import Store
+
+    return TrialsRegister(Store(f"sqlite:///{tmp_path}/t.db"))
+
+
+def test_one_studys_several_register_rows_are_one_try(tmp_path):
+    reg = _real_register(tmp_path)
+    params = rescore.request("qr01_trend_ema_long", 240, "binance", "BTC/USDT").params
+    idea = idea_of(params, None)
+    for _ in range(3):  # one study: its sensitivity row and a wf_train row per fold, as study.log writes them
+        reg.record(definition_hash="d1", idea_hash=idea, name="qr01_trend_ema_long", family="trend", settings=params,
+                   dataset="BINANCE:BTC/USDT:240", stage="in_sample", source="study", sharpe=0.1, data_start=START,
+                   data_end=END)
+    assert reg.counts(idea)["evaluations"] == 3 and rounds.used(reg, {idea}) == 1  # CR M1 on #337
+    reg.record(definition_hash="d1", idea_hash=idea, name="qr01_trend_ema_long", family="trend", settings=params,
+               dataset="BINANCE:ETH/USDT:240", stage="in_sample", source="study", sharpe=0.1, data_start=START,
+               data_end=END)
+    assert rounds.used(reg, {idea}) == 2  # the same definition on another asset is another try
+
+
+def test_a_basket_try_counts_in_the_family_of_the_definition_it_ran(tmp_path):
+    from sleeve_fund.research import basket as bk
+
+    reg = _real_register(tmp_path)
+    a = rescore.request("qr01_trend_ema_long", 240, "binance", "BTC/USDT").params
+    b = rescore.request("qr01c_trend_donchian_long", 240, "binance", "BTC/USDT").params
+    basket = bk.Basket("trend basket", "rules", a, (), "2024-01-01")
+    bk.record_try(reg, basket, "BINANCE:BTC/USDT,ETH/USDT,SOL/USDT:240", START, END)
+    assert reg.counts(idea_of(a, None))["evaluations"] == 0  # filed under the "rules" model's idea, as baskets are
+    assert rounds.used(reg, {idea_of(a, None)}) == 1  # but counted as its definition's family's try (CR M2 on #337)
+    assert rounds.used(reg, {idea_of(b, None)}) == 0  # and in no other family's
 
 
 def _ideas_of(text: str) -> dict:

@@ -11,10 +11,15 @@ A study list (configs/studies/) becomes a round with a block of common settings 
 
 Its rows are the round's registered tries, fixed before anything runs, and the list's SHA-256 names exactly that list:
 any edit to it (a row added, a setting changed, a date moved) is a new hash on every sheet after it. Every row is in
-exactly one family. A try is one evaluation in the register (one study of one definition on one asset, or one basket),
-counted under its definition's idea (study.idea_of), so a family's tries are every counted evaluation of its rows'
-ideas, ever, earlier rounds' included: never fewer than were really tried. A row is refused before it runs once its
-family has used its budget.
+exactly one family. A try is one variant in the register (one definition, code and dataset: one study of one
+definition on one asset, or one basket), counted under its definition's idea (study.idea_of), so a family's tries are
+every counted variant of its rows' ideas, ever, earlier rounds' included: never fewer than were really tried, and the
+same N the deflated Sharpe ratio uses. A row is refused before it runs once its family has used its budget. The hash
+covers the list's whole text, its prose included, so even a reworded caveat is a new list.
+
+The budget is enforced here, by the study list runner (python -m sleeve_fund.research.rescore) only: a study started
+from the Research page on one of the round's definitions spends the family's budget (it is in the register) but is
+not refused there.
 
 A family's earlier tries under other definitions (different ideas, so not under its rows' in the register) can be stated
 once on a "Prior tries" line, as the Advisor counts them (30 Oct: family B's 13 earlier reversal studies count in its
@@ -24,6 +29,7 @@ round's own tries, round 0 and its improve rounds, counted off the register."""
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from dataclasses import dataclass, field
 
@@ -105,8 +111,25 @@ def round_of(text: str, rows: list[int]) -> Round | None:
 
 
 def used(register, ideas) -> int:
-    """The counted evaluations of these ideas in the trials register: a family's tries so far."""
-    return sum(register.counts(i)["evaluations"] for i in set(ideas) if i is not None)
+    """A family's tries so far, off the trials register: its ideas' distinct variants (definition, code, dataset), the
+    N the deflated Sharpe ratio is judged by, so one study's several rows (its sensitivity row and each fold's) are one
+    try (CR M1 on #337). A basket is recorded under its model's idea ("rules" for every rule-builder definition), so a
+    basket try counts here by the idea of the definition it ran (its settings' params), never in another family's
+    (CR M2 on #337)."""
+    from sleeve_fund.research.study import idea_of
+    from sleeve_fund.research.trials import _variant
+
+    ideas = {i for i in ideas if i is not None}
+    rows = [t for i in ideas for t in register._counted(i)]
+    for t in register._counted():
+        if str(t["definition_name"]).startswith("basket:"):
+            try:  # the register keeps settings as JSON text
+                params = json.loads(t["settings"] or "{}").get("params")
+            except (TypeError, ValueError, AttributeError):
+                params = None
+            if idea_of(params if isinstance(params, dict) else None, None) in ideas:
+                rows.append(t)
+    return len({_variant(t) for t in rows})
 
 
 def try_line(r: Round, row: int, family_used: int) -> str:

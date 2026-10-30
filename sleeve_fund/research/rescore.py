@@ -232,10 +232,12 @@ def main(argv: list[str] | None = None, run=None, journal=None) -> int:
         ideas = {}  # family -> the ideas its rows count under, every row of the list's, not only those picked
         if rnd is not None:
             from sleeve_fund.research.study import idea_of
+            from sleeve_fund.research.trials import legacy_idea_hash
 
             for n, name, minutes in listed:
-                params = request(name, minutes, args.venue, args.pair, pinned, continuous, market.get(n)).params
-                ideas.setdefault(rnd.family_of(n), set()).add(idea_of(params, None))
+                r = request(name, minutes, args.venue, args.pair, pinned, continuous, market.get(n))
+                # a hand-coded model counts under its name, as its studies and baskets record it
+                ideas.setdefault(rnd.family_of(n), set()).add(idea_of(r.params, None) or legacy_idea_hash(r.strategy))
     except (OSError, ValueError) as exc:
         print(f"refused: {exc}")
         return 2
