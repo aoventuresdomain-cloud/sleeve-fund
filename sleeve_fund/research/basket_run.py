@@ -78,7 +78,7 @@ def _minutes(history, venue: str, pair: str, first: date, last: date) -> pd.Data
     return minute
 
 
-def run_store_basket(req, store=None, out_dir: Path | None = None, history=None) -> Path:
+def run_store_basket(req, store=None, out_dir: Path | None = None, history=None, notes: tuple[str, ...] = ()) -> Path:
     """The request's asset list as one basket study (research.basket.basket_study) on the venue's stored history;
     writes its sheet and returns its path. Needs the journal: the basket's try is counted in its trials register."""
     from sleeve_fund.fees import resolve as resolve_fees
@@ -163,7 +163,10 @@ def run_store_basket(req, store=None, out_dir: Path | None = None, history=None)
     while out.exists():  # two runs in the same second
         n += 1
         out = out.with_name(f"{stem}-{n}.md")
-    out.write_text(bk.render(study, opened), encoding="utf-8")
+    text = bk.render(study, opened)
+    if notes:  # the study list's caveats (its round's try line, M1 item 4), as a single study's sheet carries them
+        text = text.rstrip("\n") + "\n\n## Notes\n\n" + "".join(f"- {n}\n" for n in notes)
+    out.write_text(text, encoding="utf-8")
     write_beside(study, out)
     return out
 

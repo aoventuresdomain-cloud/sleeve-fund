@@ -24,6 +24,7 @@ import re
 import sys
 from pathlib import Path
 
+from sleeve_fund.research import rounds
 from sleeve_fund.research.pinned import parse as parse_pinned
 from sleeve_fund.venues import RESEARCH_VENUE
 
@@ -211,7 +212,9 @@ def main(argv: list[str] | None = None, run=None, journal=None) -> int:
         pinned = parse_pinned(text)  # B-37: a list that pins no dates is refused before anything runs
         if pinned.holdout_days != HOLDOUT_DAYS:
             raise ValueError(f"the list pins a {pinned.holdout_days}-day holdout, not {HOLDOUT_DAYS}")
-        rows = pick(rows_of(text), args.rows)
+        listed = rows_of(text)
+        rnd = rounds.round_of(text, [n for n, _, _ in listed])  # M1 items 4-6: None for a list that names no round
+        rows = pick(listed, args.rows)
         continuous = CONTINUOUS_LINE.search(text) is not None
         market = markets_of(text)
         confirming = confirming_of(text)
@@ -219,6 +222,13 @@ def main(argv: list[str] | None = None, run=None, journal=None) -> int:
                                   confirming)) for n, name, minutes in rows]
         for _, _, req in reqs:
             req.validate()
+        ideas = {}  # family -> the ideas its rows count under, every row of the list's, not only those picked
+        if rnd is not None:
+            from sleeve_fund.research.study import idea_of
+
+            for n, name, minutes in listed:
+                params = request(name, minutes, args.venue, args.pair, pinned, continuous, market.get(n)).params
+                ideas.setdefault(rnd.family_of(n), set()).add(idea_of(params, None))
     except (OSError, ValueError) as exc:
         print(f"refused: {exc}")
         return 2
@@ -230,9 +240,13 @@ def main(argv: list[str] | None = None, run=None, journal=None) -> int:
         print(("one try per basket" if "size_scale" not in confirming else "not new tries") + ": fund guards " + ("on" if confirming.get("fund_guards", True) else
               "OFF (research only)") + (f", size scale {confirming['size_scale']:g}" if "size_scale" in confirming
                                          else ""))
+    if rnd is not None:
+        print(f"round {rnd.name}, study list SHA-256 {rnd.sha256}: {len(rnd.rows)} registered tries, a budget of "
+              f"{rnd.budget} tries per family")
     if args.dry_run:
         for n, name, req in reqs:
-            print(f"row {n:>2} {name}: checked{_minute_check(req)}")
+            place = f", registered try {rnd.place(n)[0]} of {len(rnd.rows)} in family {rnd.family_of(n)}" if rnd else ""
+            print(f"row {n:>2} {name}: checked{_minute_check(req)}{place}")
         print(f"dry run: {len(reqs)} checked, 0 run")
         return 0
     if run is None:
@@ -241,8 +255,21 @@ def main(argv: list[str] | None = None, run=None, journal=None) -> int:
         from sleeve_fund.__main__ import _journal as journal
     store = journal()
     ok = failed = 0
-    extra = {"notes": (TRIES_BY_HAND,)} if args.tries_by_hand else {}
+    extra = {"notes": (TRIES_BY_HAND,)} if args.tries_by_hand and rnd is None else {}
+    register = None
+    if rnd is not None:
+        from sleeve_fund.research.trials import TrialsRegister
+
+        register = TrialsRegister(store)
     for n, name, req in reqs:
+        if rnd is not None:
+            family = rnd.family_of(n)
+            so_far = rounds.used(register, ideas[family])
+            if so_far >= rnd.budget:  # M1 item 5: refused before it runs, and counted as a failed row
+                failed += 1
+                print(f"row {n:>2} {name}: REFUSED, family {family} has used {so_far} of its {rnd.budget} tries")
+                continue
+            extra = {"notes": (rounds.try_line(rnd, n, so_far),)}
         try:
             sheet = run(req, store=store, **extra)
         except Exception as exc:  # noqa: BLE001 - one row's failure never stops the rest; its class only (public log)
@@ -253,6 +280,8 @@ def main(argv: list[str] | None = None, run=None, journal=None) -> int:
         ok += 1
         print(f"row {n:>2} {name}: ran" + (f", sheet {sheet.stem}" if isinstance(sheet, Path) else ""))
     print(f"done: {ok} ran, {failed} failed; results on the Research page")
+    if rnd is not None:  # M1 item 6: the round in one line, off the register
+        print(rounds.summary(rnd, {f: rounds.used(register, i) for f, i in ideas.items()}))
     return 1 if failed else 0
 
 
