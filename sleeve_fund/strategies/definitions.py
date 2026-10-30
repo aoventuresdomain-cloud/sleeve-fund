@@ -234,11 +234,22 @@ class FundingZScore(FundingDecile):
 
 class FundingPercentile(FundingDecile):
     """M1 item 1 (PM 30 Oct, studies only): the latest settled funding rate's percentile rank, 0 to 100, in its trailing
-    `window_days` days (funding_percentile_of), read as the decile reads its window. `top_decile` counts its readings
-    at or above 90."""
+    `window_days` days (funding_percentile_of), read as the decile reads its window. `pct` (its value) is that rank,
+    `rate` the latest settled rate itself, per settlement interval, so a rule can gate an extreme rank on the rate's
+    sign or size. `top_decile` counts its readings at or above 90."""
+
+    OUTPUTS = ("pct", "rate")
 
     def _of(self, window) -> float:
-        return funding_percentile_of(window, float(window[-1]))
+        self._rate = float(window[-1])
+        return funding_percentile_of(window, self._rate)
+
+    def _outputs(self) -> dict:
+        return {"pct": self._value, "rate": self._rate}
+
+    def reset(self) -> None:
+        super().reset()
+        self._rate = 0.0
 
     def update_raw(self, close: float, ts_ns: int) -> None:
         top = self.top_decile

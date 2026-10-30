@@ -103,6 +103,23 @@ def test_the_values_read_are_the_trailing_windows():
     assert p.value == pytest.approx(funding_percentile_of(window, 0.0004))
 
 
+def test_the_percentile_block_reads_its_rank_as_pct_and_the_latest_rate_beside_it():
+    times = _settlements(days=20)
+    rates = [0.0001 * (1 + i % 4) for i in range(len(times))]
+    rates[-1] = -0.0002
+    p = _block(FundingPercentile, times, rates)
+    assert p.values == {"pct": None, "rate": None}  # nothing before it reads
+    p.update_ohlcv(0, 0, 0, 1.0, 0, ts_ns=times[-1] + 4 * H)
+    assert p.values == {"pct": p.value, "rate": -0.0002} and p.value == 0.0
+    defn = {"version": 1, "reason": "a fixture", "blocks": {"fr": {"kind": "funding_percentile", "window_days": 90}},
+            "long": {"entry": {"all": [{"left": "fr.pct", "op": "<=", "right": 10},
+                                       {"left": "fr.rate", "op": "<", "right": 0}]},
+                     "exit": {"left": "fr.pct", "op": ">=", "right": 50}}}
+    check_definition(defn)
+    with pytest.raises(ValueError, match="has no output 'value'"):
+        check_definition({**defn, "long": {**defn["long"], "exit": {"left": "fr.value", "op": ">=", "right": 50}}})
+
+
 def test_only_a_percentile_at_or_above_90_is_counted_as_top():
     times = _settlements()[:-1]
     high = [0.0] * (len(times) - 1) + [0.5]
