@@ -225,7 +225,8 @@ def trades_csv(rows: list[TradeRow]) -> str:
 
 def oos_trades_csv(windows: list[tuple[pd.Timestamp, pd.Timestamp, list[TradeRow]]]) -> str:
     """Every test window's trades (OOS_COLUMNS), window by window: when it starts trading (the close before its first
-    bar), its last bar's close, and its rows."""
+    bar), its last bar's close, and its rows. A window's run also lists any trade it held from before that start, and
+    any still open at its end: both are marked counted "no", as the sheet doesn't count them."""
     lines = [",".join(OOS_COLUMNS)]
     for k, (first, last, rows) in enumerate(windows, 1):
         for r in rows:

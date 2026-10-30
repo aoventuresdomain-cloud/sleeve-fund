@@ -13,7 +13,8 @@ What it rebuilds:
   window's return from its own trades, its counted trades, and their compounded return and total against the
   sheet's out-of-sample figures; the out-of-sample return, worst drop and Sharpe from its daily returns.
 - basket: each day's pooled return from the assets' P&L over the fund's equity the day before; the pooled net, worst
-  drop and Sharpe; each asset's P&L and its trades opened on test days."""
+  drop and Sharpe; each asset's P&L and its trades opened on test days, checked as the files against the stated
+  figures only (both are written from the same rows)."""
 
 from __future__ import annotations
 
@@ -127,9 +128,11 @@ def check_basket(sheet: Path, stated: dict, c: Check) -> None:
     c.same("pooled: Sharpe", sharpe(pooled, stated["annualise_days"]), stated["sharpe"])
     trades = _rows(sheet.with_name(f"{sheet.stem}-basket-trades.csv"))
     for a in assets:
-        c.same(f"{a}: P&L on the test days", sum(_num(d[f"pnl_{a}"]) for d in days), stated["assets"][a]["pnl"],
-               MONEY_TOL)
-        c.same(f"{a}: closed trades opened on a test day",
+        # These two compare the files with the stated figures, which are written from the same rows (CR on #335): a
+        # wrong day attribution would pass them. The pooled lines above are the reconcile.
+        c.same(f"{a}: P&L on the test days (file against stated)", sum(_num(d[f"pnl_{a}"]) for d in days),
+               stated["assets"][a]["pnl"], MONEY_TOL)
+        c.same(f"{a}: closed trades opened on a test day (file against stated)",
                sum(1 for t in trades if t["asset"] == a and t["test_day"] == "yes" and t["exit_time"]),
                stated["assets"][a]["trades"])
 

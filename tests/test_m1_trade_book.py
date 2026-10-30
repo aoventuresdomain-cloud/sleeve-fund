@@ -10,6 +10,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 from sleeve_fund.research import periods
@@ -121,3 +122,41 @@ def test_a_baskets_legs_and_pooled_days_sit_beside_its_sheet_and_recompute(ran):
 def test_the_dashboard_may_serve_each_new_file_by_its_exact_name():
     assert set(BESIDE) == {"trades.csv", "equity.csv", "equity.svg", "oos-trades.csv", "basket-trades.csv",
                            "pooled.csv"}
+
+
+@pytest.mark.parametrize("ts, minutes, test", [
+    ("2025-02-01 00:00", 1440, False),  # the window's first-day 00:00 close ends the day before's daily bar
+    ("2025-02-02 00:00", 1440, True),  # the next close: the first test day's bar
+    ("2025-02-02 00:00:30", 1440, True),  # a fill 30s after that close follows the same bar
+    ("2025-02-01 00:00:30", 1440, False),
+    ("2025-02-01 00:00", 60, False),  # an hourly bar closing at 00:00 is the day before's last
+    ("2025-02-01 01:00", 60, True),
+    ("2025-02-01 00:00", 240, False),
+    ("2025-03-03 00:00", 1440, True),  # the window's last day's bar closes the next midnight
+    ("2025-03-04 00:00", 1440, False),
+])
+def test_a_basket_fill_belongs_to_the_day_of_the_bar_it_follows(ts, minutes, test):
+    from datetime import date
+
+    from sleeve_fund.research.basket_run import _test_day
+
+    windows = ((date(2025, 2, 1), date(2025, 3, 2)),)
+    assert _test_day(pd.Timestamp(ts, tz="UTC"), pd.Timedelta(minutes=minutes), windows) is test
+
+
+def test_a_trade_still_open_at_its_windows_end_is_listed_but_not_counted(written):
+    import dataclasses
+
+    r, sheet = written
+    traded = [f for f in r.folds if f.trade_from is not None and f.trade_rows]
+    f = traded[0]
+    closed = [x for x in f.trade_rows if x.closed is not None and x.opened >= periods._naive(f.trade_from)]
+    assert closed
+    still_open = dataclasses.replace(closed[-1], closed=None, exit_px=None)
+    rows = _csv_text(periods.oos_trades_csv([(f.trade_from, f.trade_from, [*f.trade_rows, still_open])]))
+    assert rows[-1]["counted"] == "no" and rows[-1]["exit_time"] == ""
+    assert sum(x["counted"] == "yes" for x in rows) == f.test_trades  # as the sheet counts: closed trades only
+
+
+def _csv_text(text: str) -> list[dict]:
+    return list(csv.DictReader(io.StringIO(text)))
