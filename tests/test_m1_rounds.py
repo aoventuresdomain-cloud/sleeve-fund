@@ -5,6 +5,7 @@ round's count prints in one line, all read off the trials register."""
 from __future__ import annotations
 
 import hashlib
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -144,6 +145,9 @@ def test_each_sheet_says_which_registered_try_it_is_and_a_spent_family_is_refuse
                     "trials register before this one); the family had used 2 of its 3 tries before this one (trials "
                     "register).")
     assert "row  2 " in out and "REFUSED, family A has used 3 of its 3 tries" in out
+    lines = out.splitlines()  # a refused row has its memory line too (CR F1 on #339)
+    refused = next(i for i, line in enumerate(lines) if "REFUSED, family A" in line)
+    assert re.fullmatch(r"    peak memory so far: \d+ MB( \(largest child process \d+ MB\))?", lines[refused + 1])
     assert "registered try 11 of 21, family B try 1 (0 in the trials register before this one); the family had used 0 of its 3 tries" in seen[1][1][0]
     assert f"round next-1, study list SHA-256 {sha}: 21 registered tries, a budget of 3 tries per family" in out
     assert out.rstrip().splitlines()[-1] == (f"Round next-1 (study list SHA-256 {sha[:12]}), 21 registered tries: "
@@ -156,7 +160,7 @@ def test_a_dry_run_shows_each_rows_place_and_runs_nothing(tmp_path, capfd):
     assert rescore.main([str(path), "--rows", "12", "--dry-run"], run=lambda *a, **k: called.append(1),
                         journal=lambda: None) == 0
     out = capfd.readouterr().out
-    assert not called and "registered try 12 of 21 in family B" in out
+    assert not called and "registered try 12 of 21 in the round, family B" in out
 
 
 def test_a_list_without_a_round_runs_as_before_with_the_hand_count_note(tmp_path):
