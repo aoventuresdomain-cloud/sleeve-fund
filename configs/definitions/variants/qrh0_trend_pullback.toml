@@ -1,0 +1,56 @@
+# Next round, family H (counted as family B try 15), round 0 (31 Oct 2026, Quant Researcher; Advisor cleared 31 Oct
+# 05:56 UTC): research/quant-researcher/next-round/defs/qrh0_trend_pullback.toml exactly, content hash 2161c99b4cf29d08.
+# Pre-registration: research/quant-researcher/next-round/prereg-family-h-trend-pullback-31oct.md. Decision candle: 4h.
+version = 1
+name = "qrh0-trend-pullback"
+title = "Trend Pullback (4h) · Long and Short · daily 200 SMA gate"
+reason = """Inside an established trend (close above the daily 200-day SMA for longs, below it for shorts), a sharp
+short move against it (4h RSI(2) below 10 for longs, above 90 for shorts) is usually forced or emotional flow, and
+the side that takes it is paid for liquidity as price resumes. Out when RSI(2) recovers (above 70 long, below 30
+short), the close is back across its 5-candle SMA, or after 10 candles; 2.5 ATR(14) stop. qr02's settings, fixed
+before any run; no take-profit. Held at 1x."""
+
+[blocks.trend]
+kind = "sma"
+period = 200
+timeframe = "1d"
+
+[blocks.rsi]
+kind = "rsi"
+period = 2
+
+[blocks.sma5]
+kind = "sma"
+period = 5
+
+[blocks.atr]
+kind = "atr"
+period = 14
+
+[long]
+entry = { all = [
+    { left = "close", op = ">", right = "trend" },
+    { left = "rsi", op = "<", right = 10 },
+] }
+exit = { any = [
+    { left = "rsi", op = ">", right = 70 },
+    { left = "close", op = ">", right = "sma5" },
+] }
+
+[short]
+entry = { all = [
+    { left = "close", op = "<", right = "trend" },
+    { left = "rsi", op = ">", right = 90 },
+] }
+exit = { any = [
+    { left = "rsi", op = "<", right = 30 },
+    { left = "close", op = "<", right = "sma5" },
+] }
+
+[exits.long]
+stop = { level = { sub = ["close", { mul = [2.5, "atr"] }] } }
+time_stop = { bars = 10 }
+
+[exits.short]
+stop = { level = { add = ["close", { mul = [2.5, "atr"] }] } }
+time_stop = { bars = 10 }
