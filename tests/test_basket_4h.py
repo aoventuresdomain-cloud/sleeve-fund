@@ -165,9 +165,9 @@ def ran(tmp_path_factory):
         specs.append(list(legs))
         return real_run(legs, *a, **k)
 
-    def spy_render(study, opened=None):
+    def spy_render(study, opened=None, **kw):
         studies.append(study)
-        return real_render(study, opened)
+        return real_render(study, opened, **kw)
 
     mp.setattr(bk, "run_portfolio", spy_run)
     mp.setattr(bk, "render", spy_render)

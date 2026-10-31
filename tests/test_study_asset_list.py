@@ -347,6 +347,26 @@ def test_a_rule_basket_is_judged_on_draws_filled_on_the_pooled_book(filled):
     assert "Without SOL" not in text  # no SOL in this basket
 
 
+def test_the_holdout_row_and_close_priced_row_read_what_is_true(filled):
+    """Advisor, B0's ruling 31 Oct: a sealed run never reads "already viewed" unless an earlier study holds a lock, and
+    the close-priced row says how it prices and gives the book's filled Sharpe beside it."""
+    study, _ = filled
+    holdout_row = lambda text: next(x for x in text.splitlines() if x.startswith("| Locked holdout"))
+    sealed = bk.render(study)
+    assert "already viewed" not in sealed and "sealed: opened once, as its own final step |" in holdout_row(sealed)
+    assert "already viewed on BTC by an earlier study, so paper is the forward test" in holdout_row(
+        bk.render(study, viewed=("BTC",)))
+    row = next(x for x in sealed.splitlines() if x.startswith("| Random entries, close-priced | "))
+    assert (f"trips at decision closes, no stop fills, against the book's filled Sharpe "
+            f"{bk._sharpe(study.base.returns.to_numpy()):.2f} |") in row
+
+
+@pytest.mark.parametrize("name, coin", [("SOLUSDT-PERP", "SOL"), ("SOL", "SOL"), ("ETHUSDC-PERP", "ETH"),
+                                        ("XBTUSD", "XBT"), ("USDT", "USDT")])
+def test_a_perps_symbol_is_its_coin(name, coin):
+    assert bk.base_asset(name) == coin  # so a perp basket with SOL gets its Without SOL line (Researcher, B0)
+
+
 def test_a_two_asset_basket_registers_exactly_one_try(filled):
     study, reg = filled
     rows = [t for t in reg._counted(bk.idea_hash(study.basket)) if str(t["definition_name"]).startswith("basket:")]

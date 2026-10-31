@@ -245,6 +245,10 @@ def test_b38n_the_study_counts_one_try_and_its_left_out_run_none(ran):
     r, _, register = ran
     assert (r.tries, r.configuration) == (1, 1)
     assert configurations(register, trials.legacy_idea_hash("rsi_cross")) == {bk.basket_key(_basket())}
+    row = next(t for t in register._counted(bk.idea_hash(_basket())) if t["definition_hash"] == bk.basket_key(_basket()))
+    # the book's Sharpe, as the sheet gives it, never the close-priced comparison's (Advisor, B0's ruling 31 Oct)
+    assert row["sharpe"] == pytest.approx(bk._sharpe(r.base.returns.to_numpy()))
+    assert row["sharpe"] != pytest.approx(r.random.sharpe)
 
 
 def test_b38o_the_holdout_stays_sealed_until_its_own_step_which_marks_every_asset_used(ran):

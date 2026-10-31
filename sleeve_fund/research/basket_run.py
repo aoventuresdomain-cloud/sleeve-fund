@@ -154,9 +154,11 @@ def run_store_basket(req, store=None, out_dir: Path | None = None, history=None,
     study = bk.basket_study(basket, tests, research_end, register=TrialsRegister(store), dataset=dataset,
                             warm_days=warm, filled=True, profile=bk.PORTFOLIO if req.fund_guards else bk.UNGUARDED,
                             scale=req.size_scale, counted=req.size_scale is None)
+    locks = HoldoutLocks(store)  # the seal as it stands before this study's own look, for the holdout row's words
+    viewed = tuple(a for a in basket.names if locks.lock(bk.idea_hash(basket), a) is not None)
     opened = None
     if req.use_holdout:
-        opened = bk.open_holdout(study, holdout, HoldoutLocks(store), warm_days=warm)
+        opened = bk.open_holdout(study, holdout, locks, warm_days=warm)
     stem = f"{label}_{dataset}_{datetime.now(timezone.utc):%Y%m%d-%H%M%S}"
     out = (out_dir or TEARSHEETS) / f"{stem}.md"
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -164,7 +166,10 @@ def run_store_basket(req, store=None, out_dir: Path | None = None, history=None,
     while out.exists():  # two runs in the same second
         n += 1
         out = out.with_name(f"{stem}-{n}.md")
-    text = bk.render(study, opened)
+    from sleeve_fund.research.rounds import is_try_line
+
+    text = bk.render(study, opened, round_try=next((n for n in notes if is_try_line(n)), None),
+                     viewed=viewed)
     if notes:  # the study list's caveats (its round's try line, M1 item 4), as a single study's sheet carries them
         text = text.rstrip("\n") + "\n\n## Notes\n\n" + "".join(f"- {n}\n" for n in notes)
     out.write_text(text, encoding="utf-8")

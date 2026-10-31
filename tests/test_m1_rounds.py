@@ -186,6 +186,24 @@ def test_a_basket_sheet_carries_the_lists_notes(monkeypatch, tmp_path):
     assert out.read_text().rstrip().endswith("## Notes\n\n- Round next-1: registered try 1 of 2.")
 
 
+def test_a_basket_sheets_tries_line_gives_its_rounds_count(monkeypatch, tmp_path):
+    """The basket counter files every definition-built basket under one model ("try 2 of 20 for rules's family" on
+    B0's sheet), so a sheet with its round's try line gives that line as its Tries line instead (QD 31 Oct)."""
+    from test_study_asset_list import _History, _req
+
+    from sleeve_fund.research import run as run_mod
+    from sleeve_fund.store import Store
+
+    line = ("Round next-1 (study list SHA-256 0123456789ab): registered try 12 of 21, family B try 14 (13 stated before "
+            "the round, 0 in the trials register before this one); the family had used 0 of its 3 tries before this one "
+            "(trials register).")
+    assert rounds.is_try_line(line) and not rounds.is_try_line("Round next-1: registered try 1 of 2.")
+    out = run_mod.run_store_study(_req(), store=Store(f"sqlite:///{tmp_path}/t.db"), out_dir=tmp_path / "sheets",
+                                  history=_History(), notes=(line,))
+    text = out.read_text()
+    assert f"**Tries:** {line}" in text and " of 20 for " not in text
+
+
 def test_a_lists_pinned_dates_set_its_walk_forward_and_holdout_lengths():
     from sleeve_fund.research.pinned import parse
 
