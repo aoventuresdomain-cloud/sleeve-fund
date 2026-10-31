@@ -55,6 +55,9 @@ def test_n_is_the_larger_count_and_the_spread_is_the_pinned_rows(tmp_path):
     lines = fd.report(r)
     assert lines[0] == "family B: N 14 (stated 14, register 4) FLAG: the counts differ"
     assert "funding stand-ins 12%" in lines[1] and lines[-1].startswith("deflated Sharpe probability ")
+    # 485 days: the no-skill error, sqrt(365/484) = 0.87 a year, is above the rows' spread (0.33)
+    assert r.binding[0] == "the no-skill error 1/sqrt(T-1)" and r.binding[1] == pytest.approx((365 / 484) ** 0.5)
+    assert lines[-2] == "spread bound: the no-skill error 1/sqrt(T-1), 0.87 a year"
 
 
 def test_the_register_count_wins_when_it_is_larger(tmp_path):
@@ -72,11 +75,24 @@ def test_below_three_rows_the_spread_is_floored_at_half_a_year(tmp_path):
     assert r.floored
     floored = deflated_sharpe_probability(long, r.n, [0.31, 0.44], spread_floor=0.5)
     assert r.dsr == pytest.approx(floored) and floored < deflated_sharpe_probability(long, r.n, [0.31, 0.44])
-    assert "floored at 0.5 a year (fewer than 3)" in fd.report(r)[-2]
+    assert "floored at 0.5 a year (fewer than 3)" in fd.report(r)[-3]
+    assert r.binding == ("the 0.5 floor", 0.5)  # 3000 days: 0.35 a year of error, a rows' spread of 0.09
     # On the round's 485 test days 1/sqrt(T) is 0.87 a year already, so the 0.5 floor changes nothing there
     short = _returns()
     assert deflated_sharpe_probability(short, 14, [0.31, 0.44], spread_floor=0.5) == pytest.approx(
         deflated_sharpe_probability(short, 14, [0.31, 0.44]))
+
+
+def test_a_wide_spread_of_rows_binds_and_is_said(tmp_path):
+    reg = trials.TrialsRegister(Store(f"sqlite:///{tmp_path}/t.db"))
+    pins = []
+    for k, s in enumerate((-2.1, 0.2, 2.4)):
+        rid = reg.record(definition_hash=f"{k + 1}" * 16, idea_hash=IDEAS[k], name=f"w{k}", family="rules",
+                         settings={}, dataset="d", stage="in_sample", source="study", sharpe=s)
+        pins.append(f"{f'{k + 1}' * 16}/{rid}")
+    r = fd.compute(reg, _text(", ".join(pins)), "B", _returns(), {IDEAS[0]})
+    assert r.binding[0] == "the valid-fill rows' spread" and r.binding[1] == pytest.approx(np.std([-2.1, 0.2, 2.4],
+                                                                                                    ddof=1))
 
 
 @pytest.mark.parametrize("pin, words", [

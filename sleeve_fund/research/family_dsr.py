@@ -34,10 +34,11 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from sleeve_fund.research import rounds, trials
-from sleeve_fund.research.metrics import deflated_sharpe_probability
+from sleeve_fund.research.metrics import PERIODS_PER_YEAR, deflated_sharpe_probability
 
 SPREAD_FLOOR = 0.5  # a year, below MIN_ROWS valid-fill rows (B's clearance, 30 Oct)
 MIN_ROWS = 3
@@ -93,6 +94,8 @@ class Result:
     spread_rows: tuple  # (trials id, definition hash, Sharpe, stand-in %)
     floored: bool
     dsr: float
+    binding: tuple = ("", math.nan)  # (which bound set the spread, its value a year): Advisor 31 Oct, shown
+
 
     @property
     def n(self) -> int:
@@ -142,7 +145,20 @@ def compute(register: trials.TrialsRegister, text: str, family: str, returns: pd
     floored = len(sharpes) < MIN_ROWS
     dsr = deflated_sharpe_probability(returns, max(n_stated, n_register, 1), sharpes,
                                       spread_floor=SPREAD_FLOOR if floored else None)
-    return Result(family, n_stated, n_register, rows, floored, dsr)
+    return Result(family, n_stated, n_register, rows, floored, dsr, binding(returns, sharpes, floored))
+
+
+def binding(returns: pd.Series, sharpes: list, floored: bool) -> tuple:
+    """Which of the spread's bounds is the largest, and its value a year, as deflated_sharpe_probability takes it:
+    the valid-fill rows' measured spread (2 rows or more), the no-skill error 1/sqrt(T-1), and the 0.5 floor (below
+    3 rows). The Advisor (31 Oct): the reader sees why the hurdle is where it is."""
+    year = math.sqrt(PERIODS_PER_YEAR)
+    bounds = [("the no-skill error 1/sqrt(T-1)", year / math.sqrt(max(len(returns.dropna()) - 1, 1)))]
+    if len(sharpes) > 1:
+        bounds.append(("the valid-fill rows' spread", float(np.std(sharpes, ddof=1))))
+    if floored:
+        bounds.append((f"the {SPREAD_FLOOR} floor", SPREAD_FLOOR))
+    return max(bounds, key=lambda b: b[1])
 
 
 def _rows(text: str) -> list:
@@ -168,6 +184,7 @@ def report(r: Result) -> list:
                      + (f", funding stand-ins {standins}%" if standins is not None else ""))
     lines.append(f"spread: {len(r.spread_rows)} valid-fill rows" + (f", floored at {SPREAD_FLOOR} a year (fewer than "
                                                                      f"{MIN_ROWS})" if r.floored else ""))
+    lines.append(f"spread bound: {r.binding[0]}, {r.binding[1]:.2f} a year")
     lines.append(f"deflated Sharpe probability {r.dsr:.4f}")
     return lines
 
