@@ -308,3 +308,43 @@ def test_a_runs_cut_of_its_minutes_is_a_view_never_a_copy():
     assert cut.exec_prices.index[0] == pd.Timestamp("2025-02-01 00:01", tz="UTC")
     assert cut.exec_prices.index[-1] == pd.Timestamp("2025-03-03", tz="UTC")
     assert np.shares_memory(cut.exec_prices["close"].to_numpy(), m["close"].to_numpy())
+
+
+def test_the_sheet_shows_1_minute_execution_fired_from_its_own_fill_times(ran):
+    """Check 1 (Advisor 31 Oct): a basket sheet says which bars it filled on and shows 1-minute execution fired, by
+    fill times off the 5-minute grid, counted here from the trade book written beside it."""
+    import csv
+
+    out, *_ = ran
+    with open(out.with_name(f"{out.stem}-basket-trades.csv"), newline="") as f:
+        stamps = [t for row in csv.DictReader(f) for t in (row["entry_time"], row["exit_time"]) if t]
+    off = sum(1 for t in stamps if pd.Timestamp(t).minute % 5 or pd.Timestamp(t).second)
+    line = next(x for x in out.read_text().splitlines() if x.startswith("**Fills:**"))
+    want = (f"1-minute execution fired: {off:,} of {len(stamps):,} fill times are off the 5-minute grid" if off
+            else f"not shown: none of {len(stamps):,} fill times")
+    assert line.startswith("**Fills:** 240-minute decision candles, filled on every asset's 1-minute bars; ")
+    assert want in line
+
+
+def test_a_sheet_whose_fills_all_sit_on_the_5_minute_grid_says_it_cant_show_them(monkeypatch):
+    from types import SimpleNamespace
+
+    from sleeve_fund.research import periods
+
+    asset = SimpleNamespace(bar_minutes=240, exec_minutes=1)
+    study = SimpleNamespace(basket=SimpleNamespace(assets=(asset, asset)),
+                            base=SimpleNamespace(run=SimpleNamespace(legs={"a": object()})))
+    rows = [SimpleNamespace(opened=pd.Timestamp("2025-02-01 04:00"), closed=pd.Timestamp("2025-02-01 09:05")),
+            SimpleNamespace(opened=pd.Timestamp("2025-02-02 08:00"), closed=None)]
+    monkeypatch.setattr(periods, "trade_rows", lambda run: rows)
+    assert bk.fills_line(study).endswith("not shown: none of 3 fill times is off the 5-minute grid, so the sheet "
+                                         "can't show the 1-minute bars filled anything coarser bars wouldn't")
+    rows[0].closed = pd.Timestamp("2025-02-01 09:15")  # a 15-minute mark is on the 5-minute grid too
+    assert "not shown" in bk.fills_line(study)
+    rows[0].closed = pd.Timestamp("2025-02-01 09:16")
+    assert bk.fills_line(study).endswith("1-minute execution fired: 1 of 3 fill times are off the 5-minute grid")
+    hourly = SimpleNamespace(bar_minutes=1440, exec_minutes=60)
+    study.basket = SimpleNamespace(assets=(hourly,))
+    assert bk.fills_line(study) == ("**Fills:** daily decision candles, filled on 60-minute bars, not 1-minute: what "
+                                    "traded first inside a bar is unknown, so a stop the bar traded through was "
+                                    "filled at its worst price")

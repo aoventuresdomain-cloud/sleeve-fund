@@ -884,6 +884,7 @@ def render(study: BasketStudy, holdout: Holdout | None = None, round_try: str | 
         f"**Basket verdict:** {head}", "",
         f"_{FIXED_LIST.format(date=b.universe_date)}_", "",
         *_run_lines(study),
+        fills_line(study), "",
         (f"**Tries:** {round_try}" if round_try and study.counted else
          f"**Tries:** {study.tries} (one per fixed basket and settings); this basket is try {study.configuration} of "
          f"{BUDGET_PER_IDEA} for {b.strategy}'s family" if study.counted else
@@ -989,6 +990,39 @@ def largest_share(run: PortfolioResult, windows) -> float:
     Strategy holds, over the book (a scaled run's share drifts above k as it makes money: Advisor 27 Oct)."""
     book = run.book[_oos(run.book.index, windows, pd.Timedelta(hours=1))]
     return float(((book - run.unallocated) / book).max()) if len(book) else math.nan
+
+
+OFF_GRID = 5  # minutes: research also fills on 5-, 15- and 60-minute bars (run.EXEC_STEPS), so only a fill time off
+# this grid shows 1-minute bars filled it (Advisor 31 Oct, check 1)
+
+
+def fills_line(study: BasketStudy) -> str:
+    """Check 1 (Advisor 31 Oct): the bars every leg filled on, and whether 1-minute execution fired, shown by fill
+    times off the 5-minute grid, which coarser bars can't give: the basket sheet's counterpart of a single study's
+    "Fills:" line."""
+    from sleeve_fund.research import periods
+
+    assets = study.basket.assets
+    bars = sorted({a.bar_minutes for a in assets})
+    candle = ", ".join("daily" if m == 1440 else f"{m}-minute" for m in bars)
+    exec_ = sorted({a.exec_minutes for a in assets})
+    if exec_ != [1]:
+        return (f"**Fills:** {candle} decision candles, filled on {', '.join(f'{m}-minute' for m in exec_)} bars, not "
+                "1-minute: what traded first inside a bar is unknown, so a stop the bar traded through was filled at "
+                "its worst price")
+    stamps = off = 0
+    for leg in study.base.run.legs.values():
+        for r in periods.trade_rows(leg):
+            for ts in (r.opened, r.closed):
+                if ts is None:
+                    continue
+                t = pd.Timestamp(ts)
+                stamps += 1
+                off += bool(t.second or t.microsecond or t.minute % OFF_GRID)
+    shown = (f"1-minute execution fired: {off:,} of {stamps:,} fill times are off the {OFF_GRID}-minute grid" if off
+             else f"not shown: none of {stamps:,} fill times is off the {OFF_GRID}-minute grid, so the sheet can't show "
+                  "the 1-minute bars filled anything coarser bars wouldn't")
+    return f"**Fills:** {candle} decision candles, filled on every asset's 1-minute bars; {shown}"
 
 
 def _run_lines(study: BasketStudy) -> list[str]:
