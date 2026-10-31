@@ -1,0 +1,95 @@
+name: family-dsr
+# FAMILY-DSR (Advisor, 31 Oct, on H0): a basket try's deflated Sharpe across its whole idea family, with N the larger
+# of the stated and the register's counts and the spread from the valid-fill rows the round file pins
+# (python -m sleeve_fund.research.family_dsr, which refuses while a pinned row is missing or not its variant's latest,
+# so a correction must be applied and pinned first). It only reads: the register and the sheet's pooled.csv. It shares
+# the study runs' concurrency group, so it never runs beside one. The report holds Sharpes and ids, so it is encrypted
+# on the runner to the project's key, as trials-export's; the public log shows the outcome's first word only, beside
+# the dispatch's own inputs (a list path, a family letter and a sheet stem; none is a figure). Run it by hand from main.
+on:
+  workflow_dispatch:
+    inputs:
+      list:
+        description: The round's study list, e.g. configs/studies/next-round-pinned-dates-list.md
+        required: true
+      family:
+        description: The family, e.g. B
+        required: true
+      sheet:
+        description: The try's tear sheet file stem, without .md
+        required: true
+concurrency: { group: study, cancel-in-progress: false }
+jobs:
+  dsr:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions: { contents: read }
+    if: ${{ vars.DEPLOY_ENABLED == 'true' && github.ref == 'refs/heads/main' }}
+    env:
+      USER_AT: ${{ vars.DEPLOY_USER || 'root' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Check the inputs
+        env:
+          LIST: ${{ inputs.list }}
+          FAMILY: ${{ inputs.family }}
+          SHEET: ${{ inputs.sheet }}
+        run: |
+          [[ "$LIST" =~ ^configs/studies/[A-Za-z0-9_][A-Za-z0-9_.-]{0,199}\.md$ && "$LIST" != *..* && -f "$LIST" ]] \
+            || { echo "list must be a study list under configs/studies/"; exit 1; }
+          [[ "$FAMILY" =~ ^[A-Za-z0-9]{1,16}$ ]] || { echo "family must be letters or digits"; exit 1; }
+          [[ "$SHEET" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,199}$ && "$SHEET" != *..* ]] \
+            || { echo "sheet must be a tear-sheet file stem: letters, digits, _ - . only, no / or .., at most 200"; exit 1; }
+      - name: Configure SSH
+        env:
+          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/id_deploy && chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts
+      - name: Work out the deflated Sharpe
+        env:
+          RUN_ID: ${{ github.run_id }}
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          LIST: ${{ inputs.list }}
+          FAMILY: ${{ inputs.family }}
+          SHEET: ${{ inputs.sheet }}
+        run: |
+          set -uo pipefail
+          umask 077
+          mkdir -p "$RUNNER_TEMP/plain"
+          code=0  # the runner's shell has -e: a refusal must still reach the encrypted report, so it is caught here
+          ssh -i ~/.ssh/id_deploy -o ServerAliveInterval=30 -o ServerAliveCountMax=10 "$USER_AT@$HOST" \
+            "cd /opt/sleeve-fund && sudo docker compose run --rm -T --no-deps --name family-dsr-$RUN_ID dashboard \
+              python -m sleeve_fund.research.family_dsr --list $LIST --family $FAMILY --sheet $SHEET" \
+            > "$RUNNER_TEMP/plain/report.txt" 2>&1 || code=$?
+          # The outcome's first word only (the last line: done, refused), never a figure or an id
+          echo "outcome: $(tail -n 1 "$RUNNER_TEMP/plain/report.txt" | grep -oE '^(done|refused)' || echo other), exit $code"
+          tar -czf "$RUNNER_TEMP/plain/sheet.tar.gz" -C "$RUNNER_TEMP/plain" report.txt
+          echo "$code" > "$RUNNER_TEMP/code"
+      - name: Encrypt
+        run: |
+          # As trials-export: a fresh random key encrypts the archive; the project's public key (RSA-OAEP, SHA-256) wraps it.
+          set -euo pipefail
+          umask 077
+          mkdir -p "$RUNNER_TEMP/out"
+          openssl rand -hex 32 > "$RUNNER_TEMP/plain/key.hex"
+          openssl enc -aes-256-cbc -pbkdf2 -salt -in "$RUNNER_TEMP/plain/sheet.tar.gz" -out "$RUNNER_TEMP/out/sheet.tar.gz.enc" -pass "file:$RUNNER_TEMP/plain/key.hex"
+          openssl pkeyutl -encrypt -pubin -inkey deploy/keys/sheet-export.pub.pem -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 -in "$RUNNER_TEMP/plain/key.hex" -out "$RUNNER_TEMP/out/key.bin.enc"
+          rm -rf -- "$RUNNER_TEMP/plain"
+          for f in "$RUNNER_TEMP"/out/*; do echo "$(basename "$f") $(stat -c %s "$f") bytes"; done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: family-dsr-${{ github.run_id }}
+          path: ${{ runner.temp }}/out/
+          retention-days: 3
+          if-no-files-found: error
+      - name: The script's outcome
+        run: exit "$(cat "$RUNNER_TEMP/code")"
+      - name: Clean up
+        if: always()
+        run: rm -rf -- "$RUNNER_TEMP/plain" "$RUNNER_TEMP/out" "$RUNNER_TEMP/code" ~/.ssh/id_deploy
