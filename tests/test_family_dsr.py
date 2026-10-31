@@ -235,9 +235,10 @@ def test_the_cli_reads_the_sheets_pooled_returns_and_refuses_in_words(tmp_path, 
     out = capfd.readouterr().out.strip().splitlines()
     assert out[0].startswith("list SHA-256 ") and out[1].startswith("family B: N ")
     assert f"  spread row {own} ({'4' * 16}): Sharpe 0.0500" in out and out[-1] == f"done: family B, sheet {stem}"
-    trades.write_text("asset,entry_time,exit_time\nA,2025-01-07T16:00:00,2025-01-08T12:00:00\n")  # on the grid only
-    assert fd.main(argv, store=reg.store, sheets=sheets) == 1
-    assert "1-minute execution isn't shown" in capfd.readouterr().out
+    for exit_ in ("2025-01-08T12:00:00", "2025-01-08T12:15:00"):  # on the 4h grid; inside the candle, on 15-minute bars
+        trades.write_text(f"asset,entry_time,exit_time\nA,2025-01-07T16:00:00,{exit_}\n")
+        assert fd.main(argv, store=reg.store, sheets=sheets) == 1
+        assert "1-minute execution isn't shown" in capfd.readouterr().out
     trades.write_text("asset,entry_time,exit_time\nA,2025-01-07T16:00:00,2025-01-08T11:39:00\n")
     assert fd.main(argv[:5] + ["h0_x_1"], store=reg.store, sheets=sheets) == 1  # not a basket sheet's stem
     assert capfd.readouterr().out.startswith("refused: h0_x_1 is not a basket sheet's stem")

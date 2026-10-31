@@ -19,8 +19,8 @@ exclude a row from a family whose signal isn't funding (Advisor, 31 Oct). An exc
   correction copies every field but its id, time, Sharpe and error), so every row of a pinned row's variant that is
   newer than it must itself be pinned, included or excluded with its reason, or the step refuses (Advisor and CR,
   31 Oct): a correction can't slip past as a re-run. A row pinned as included while another is marked as its
-  correction refuses too. The try being judged joins without a pin when its own sheet shows a fill inside a decision
-  candle (1-minute execution fired), and refuses otherwise. With fewer than 3 included rows, the spread is floored
+  correction refuses too. The try being judged joins without a pin when its own sheet shows a fill off the 15-minute
+  grid (1-minute execution fired), and refuses otherwise. With fewer than 3 included rows, the spread is floored
   at 0.5 a year. The report names the bound that set the spread, and every member variant left out, with why.
 
     python -m sleeve_fund.research.family_dsr --list configs/studies/LIST.md --family B --sheet STEM
@@ -298,20 +298,22 @@ def try_row(register: trials.TrialsRegister, stem: str) -> str:
     return rows[-1]["id"]
 
 
+COARSEST_FINE = 15  # minutes: a fill off this grid can only come from 1-minute bars (Advisor 31 Oct)
+
+
 def one_minute_fills(trades: Path, stem: str) -> bool:
     """Whether the try's own sheet shows 1-minute execution fired: an intraday basket (its dataset names its candle
-    length) with at least one fill stamped inside a decision candle, as only a fill on finer bars can be."""
+    length) with at least one fill stamped off the 15-minute grid. A fill merely inside a decision candle isn't
+    enough: a 4-hour rule filled on 15-minute bars has those too, and that is the coarse case (Advisor 31 Oct)."""
     m = STEM.fullmatch(stem)
-    minutes = re.search(r"-(\d+)m$", m["dataset"]) if m else None
-    if minutes is None:  # a daily basket fills on hourly bars
+    if m is None or re.search(r"-\d+m$", m["dataset"]) is None:  # a daily basket fills on hourly bars
         return False
-    step = int(minutes[1])
     with open(trades, newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
             for when in (row.get("entry_time"), row.get("exit_time")):
                 if when:
                     ts = pd.Timestamp(when)
-                    if ts.second or ts.microsecond or (ts.hour * 60 + ts.minute) % step:
+                    if ts.second or ts.microsecond or ts.minute % COARSEST_FINE:
                         return True
     return False
 
@@ -370,7 +372,7 @@ def main(argv=None, store=None, sheets: Path | None = None) -> int:
         folder = sheets or TEARSHEETS
         returns = pooled_returns(folder / f"{a.sheet}-pooled.csv")
         if not one_minute_fills(folder / f"{a.sheet}-basket-trades.csv", a.sheet):
-            raise ValueError(f"refused: the try's sheet shows no fill inside a decision candle, so 1-minute "
+            raise ValueError(f"refused: the try's sheet shows no fill off the {COARSEST_FINE}-minute grid, so 1-minute "
                              f"execution isn't shown and its row {own} can't join the spread")
         result = compute(register, text, a.family, returns, ideas, try_id=own)
     except (ValueError, OSError, KeyError) as exc:
