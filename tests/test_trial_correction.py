@@ -158,3 +158,10 @@ def test_the_whole_stem_must_be_the_trys(tmp_path):
     (tmp_path / f"{odd}.md").rename(tmp_path / f"{stem}x.md")  # nothing after the stamp either (CR F6 on #342)
     with pytest.raises(ValueError, match="is not qrb0_range_reversion_adx on"):
         tc.plan(reg, rid, tmp_path / f"{stem}x.md")
+
+
+def test_without_a_database_url_nothing_is_opened(monkeypatch, capfd):
+    """Run by hand with no journal configured, it refuses rather than open a default file (CR F7 on #342)."""
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    assert tc.main(["--row", "0123456789abcdef", "--sheet", "s"]) == 2
+    assert "refused: no DATABASE_URL" in capfd.readouterr().out
