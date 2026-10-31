@@ -155,3 +155,6 @@ def test_the_whole_stem_must_be_the_trys(tmp_path):
     (tmp_path / f"{stem}.md").rename(tmp_path / f"{odd}.md")
     with pytest.raises(ValueError, match="is not qrb0_range_reversion_adx on"):
         tc.plan(reg, rid, tmp_path / f"{odd}.md")
+    (tmp_path / f"{odd}.md").rename(tmp_path / f"{stem}x.md")  # nothing after the stamp either (CR F6 on #342)
+    with pytest.raises(ValueError, match="is not qrb0_range_reversion_adx on"):
+        tc.plan(reg, rid, tmp_path / f"{stem}x.md")
