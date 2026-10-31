@@ -254,7 +254,8 @@ def main(argv: list[str] | None = None, run=None, journal=None) -> int:
               f"{rnd.budget} tries per family")
     if args.dry_run:
         for n, name, req in reqs:
-            place = f", registered try {rnd.place(n)[0]} of {len(rnd.rows)} in family {rnd.family_of(n)}" if rnd else ""
+            place = (f", registered try {rnd.place(n)[0]} of {len(rnd.rows)} in the round, family {rnd.family_of(n)}"
+                     if rnd else "")
             print(f"row {n:>2} {name}: checked{_minute_check(req)}{place}")
         print(f"dry run: {len(reqs)} checked, 0 run")
         return 0
