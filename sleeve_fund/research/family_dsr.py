@@ -1,22 +1,27 @@
 """FAMILY-DSR (Advisor, 31 Oct 2026, on H0): a basket try's deflated Sharpe judged across its whole idea family, not
 only its own idea's rows.
 
-A round file pins each family's members and the rows its Sharpe spread may use:
+A round file pins each family's members and which of their register rows the Sharpe spread uses:
 
     - **Family members, B:** 66fb76f17c2a5ec3, 0e13cf32e1775235, ...
     - **Valid-fill rows, B:** 5f5556da26db40ba/0123456789abcdef (stand-ins 12%), ...
+    - **Excluded rows, B:** 5f5556da26db40ba/fedcba9876543210 (coarse re-run), ...
 
 Members are idea hashes (structural ideas, or a legacy ledger idea's). A valid-fill row is "definition hash / trials
 id" for a run whose sheet shows 1-minute execution fired (Advisor's check 1), chosen by hand from the sheets and pinned
 here, so the rule is written down and never inferred. The stand-in share is noted beside it: funding stand-ins don't
-exclude a row from a family whose signal isn't funding (Advisor, 31 Oct).
+exclude a row from a family whose signal isn't funding (Advisor, 31 Oct). An excluded row carries one of three reasons:
+"coarse re-run", "corrected by row <id>" (the correcting row is the one included) or "Sharpe unverified".
 
 - **N:** the larger of the stated count (the round's "Prior tries" line plus the round rows' tries in the register)
   and the register's (every distinct variant under the members), flagged when they differ.
-- **Spread:** one Sharpe per variant, its latest valid-fill row's. A pinned row must be its variant's latest counted
-  row: a newer one (a correction, a re-run) means the pin is stale and the step refuses, so a correction must be
-  applied and pinned before this runs (Advisor: no deflated Sharpe before the B0 and V5 corrections). With fewer than
-  3 valid-fill rows, the spread is floored at 0.5 a year.
+- **Spread:** one Sharpe per variant, from its included row. The register can't tell a correction from a re-run (a
+  correction copies every field but its id, time, Sharpe and error), so every row of a pinned row's variant that is
+  newer than it must itself be pinned, included or excluded with its reason, or the step refuses (Advisor and CR,
+  31 Oct): a correction can't slip past as a re-run. A row pinned as included while another is marked as its
+  correction refuses too. The try being judged joins without a pin when its own sheet shows a fill inside a decision
+  candle (1-minute execution fired), and refuses otherwise. With fewer than 3 included rows, the spread is floored
+  at 0.5 a year. The report names the bound that set the spread, and every member variant left out, with why.
 
     python -m sleeve_fund.research.family_dsr --list configs/studies/LIST.md --family B --sheet STEM
 
@@ -28,6 +33,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
+import json
 import math
 import re
 import sys
@@ -45,7 +52,12 @@ MIN_ROWS = 3
 HEX16 = r"[0-9a-f]{16}"
 MEMBERS_LINE = re.compile(r"^-\s*\*\*Family members, ([A-Za-z0-9]{1,16}):\*\*\s*(.+?)\s*$", re.MULTILINE)
 VALID_LINE = re.compile(r"^-\s*\*\*Valid-fill rows, ([A-Za-z0-9]{1,16}):\*\*\s*(.+?)\s*$", re.MULTILINE)
+EXCLUDED_LINE = re.compile(r"^-\s*\*\*Excluded rows, ([A-Za-z0-9]{1,16}):\*\*\s*(.+?)\s*$", re.MULTILINE)
 ENTRY = re.compile(rf"({HEX16})/({HEX16})(?:\s*\(stand-ins (\d{{1,3}})%\))?")
+XENTRY = re.compile(rf"({HEX16})/({HEX16})\s*\((coarse re-run|corrected by row ({HEX16})|Sharpe unverified)\)")
+UNVERIFIED = "Sharpe unverified"
+MIN_DAYS = 30  # deflated_sharpe_probability's own minimum; below it the step refuses rather than print nan
+STEM = re.compile(r"(?P<label>[A-Za-z0-9_.-]+?)_(?P<dataset>[a-z0-9]+-basket-[a-z0-9-]+?)_\d{8}-\d{6}(?:-\d+)?")
 
 
 @dataclass(frozen=True)
@@ -53,6 +65,7 @@ class Family:
     name: str
     members: tuple  # idea hashes
     valid: tuple  # (definition hash, trials id, stand-in share % or None)
+    excluded: tuple = ()  # (definition hash, trials id, reason, the correcting row's id or None)
 
 
 def families_of(text: str) -> dict:
@@ -80,9 +93,31 @@ def families_of(text: str) -> dict:
         if len({v[1] for v in valid}) != len(valid):
             raise ValueError(f"family {f} pins a trials id twice")
         out[f] = Family(f, out[f].members, valid)
-    if len(re.findall(r"^-\s*\*\*(Family members|Valid-fill rows)", text, re.MULTILINE | re.IGNORECASE)) != (
-            len(MEMBERS_LINE.findall(text)) + len(VALID_LINE.findall(text))):
-        raise ValueError("a family line reads - **Family members, B:** <hashes> or - **Valid-fill rows, B:** <rows>")
+    seen = set()
+    for f, spec in EXCLUDED_LINE.findall(text):
+        if f not in out:
+            raise ValueError(f"excluded rows are pinned for family {f}, whose members aren't")
+        if f in seen:
+            raise ValueError(f"family {f}'s excluded rows are listed twice")
+        seen.add(f)
+        entries = [XENTRY.fullmatch(p.strip()) for p in spec.split(",")]
+        if any(e is None for e in entries):
+            raise ValueError(f"family {f}'s excluded rows read <definition hash>/<trials id> (coarse re-run), "
+                             "(corrected by row <trials id>) or (Sharpe unverified)")
+        excluded = tuple((e[1], e[2], "corrected by row" if e[4] else e[3], e[4]) for e in entries)
+        ids = [v[1] for v in out[f].valid] + [x[1] for x in excluded]
+        if len(set(ids)) != len(ids):
+            for x in excluded:  # the named case first: an original kept in while its correction is marked
+                if x[3] and x[1] in {v[1] for v in out[f].valid}:
+                    raise ValueError(f"refused: row {x[1]} is pinned as included, but row {x[3]} is marked as its "
+                                     f"correction: include {x[3]} and exclude {x[1]}")
+            raise ValueError(f"family {f} pins a trials id twice")
+        out[f] = Family(f, out[f].members, out[f].valid, excluded)
+    if len(re.findall(r"^-\s*\*\*(Family members|Valid-fill rows|Excluded rows)", text,
+                      re.MULTILINE | re.IGNORECASE)) != (len(MEMBERS_LINE.findall(text)) + len(VALID_LINE.findall(text))
+                                                         + len(EXCLUDED_LINE.findall(text))):
+        raise ValueError("a family line reads - **Family members, B:** <hashes>, - **Valid-fill rows, B:** <rows> "
+                         "or - **Excluded rows, B:** <rows>")
     return out
 
 
@@ -95,57 +130,131 @@ class Result:
     floored: bool
     dsr: float
     binding: tuple = ("", math.nan)  # (which bound set the spread, its value a year): Advisor 31 Oct, shown
-
+    left_out: tuple = ()  # (what: a variant's latest row or a member idea, why): never ran, not valid-fill, ...
+    list_sha: str = ""  # the list the report read: the container's deployed copy can lag main (CR F3)
 
     @property
     def n(self) -> int:
         return max(self.n_stated, self.n_register)
 
 
-def spread_rows(register: trials.TrialsRegister, fam: Family) -> tuple:
-    """The pinned valid-fill rows as the register holds them, each its variant's latest counted row, one per variant."""
-    counted = register._counted()
+def _params_idea(t: dict) -> str | None:
+    """A basket row's idea: its definition's (its settings' params), as rounds.used counts it."""
+    from sleeve_fund.research.study import idea_of
+
+    if not str(t["definition_name"]).startswith("basket:"):
+        return None
+    try:  # the register keeps settings as JSON text
+        params = json.loads(t["settings"] or "{}").get("params")
+    except (TypeError, ValueError, AttributeError):
+        params = None
+    return idea_of(params if isinstance(params, dict) else None, None)
+
+
+def _member(t: dict, members) -> str | None:
+    """The member idea a counted row is a try of (rounds.used's rule), or None."""
+    if t["idea_hash"] in members:
+        return t["idea_hash"]
+    idea = _params_idea(t)
+    return idea if idea in members else None
+
+
+def spread_rows(register: trials.TrialsRegister, fam: Family, try_id: str | None = None) -> tuple:
+    """(the included rows as the register holds them, one per variant: (id, definition, Sharpe, stand-ins %); the
+    member variants and ideas left out, with why). try_id: the judged try's own row, included without a pin."""
+    counted = register._counted()  # oldest first
+    pos = {t["id"]: k for k, t in enumerate(counted)}
     by_id = {t["id"]: t for t in counted}
-    latest: dict = {}
-    for t in counted:  # trials() is oldest first
-        latest[trials._variant(t)] = t
-    out, variants = [], set()
-    for definition, row_id, standins in fam.valid:
+    included = list(fam.valid)
+    excluded = {x[1]: x for x in fam.excluded}
+    if try_id is not None:
+        if try_id in excluded:
+            raise ValueError(f"refused: the try's own row {try_id} is pinned as excluded")
+        if try_id not in {v[1] for v in included}:
+            if try_id not in by_id:
+                raise ValueError(f"refused: no counted row {try_id} for the try")
+            included.append((by_id[try_id]["definition_hash"], try_id, None))
+    pinned = [(d, i) for d, i, _ in included] + [(x[0], x[1]) for x in fam.excluded]
+    for definition, row_id in pinned:
         t = by_id.get(row_id)
         if t is None:
             raise ValueError(f"refused: no counted row {row_id} (a correction not yet applied?)")
         if t["definition_hash"] != definition:
             raise ValueError(f"refused: row {row_id} is definition {t['definition_hash']}, not {definition}")
-        if latest[trials._variant(t)]["id"] != row_id:
-            raise ValueError(f"refused: row {row_id} is not its variant's latest row ({latest[trials._variant(t)]['id']}"
-                             " is newer): re-pin the latest valid-fill row")
+        if _member(t, fam.members) is None:
+            raise ValueError(f"refused: row {row_id} is a try of none of family {fam.name}'s members")
+    in_ids = {i for _, i, _ in included}
+    for _, row_id, _, by in fam.excluded:
+        if by is None:
+            continue
+        if by not in in_ids:
+            raise ValueError(f"refused: row {row_id} is corrected by row {by}, which isn't included")
+        if trials._variant(by_id[by]) != trials._variant(by_id[row_id]) or pos[by] < pos[row_id]:
+            raise ValueError(f"refused: row {by} is not a newer row of row {row_id}'s variant, so can't correct it")
+    pinned_ids = in_ids | set(excluded)
+    for _, row_id in pinned:  # a newer row of a pinned row's variant may be its correction: it must be pinned too
+        v = trials._variant(by_id[row_id])
+        for t in counted[pos[row_id] + 1:]:
+            if trials._variant(t) == v and t["id"] not in pinned_ids:
+                raise ValueError(f"refused: row {t['id']} is newer than pinned row {row_id}, of its variant, and not "
+                                 "pinned: include it or exclude it (coarse re-run, corrected by row <id>, Sharpe "
+                                 "unverified)")
+    out, variants = [], set()
+    for definition, row_id, standins in included:
+        t = by_id[row_id]
         if trials._variant(t) in variants:
             raise ValueError(f"refused: row {row_id}'s variant is pinned twice")
         variants.add(trials._variant(t))
         if t["sharpe"] is None or not math.isfinite(t["sharpe"]):
             raise ValueError(f"refused: row {row_id} has no finite Sharpe")
         out.append((row_id, definition, float(t["sharpe"]), standins))
+    return tuple(out), _left_out(counted, fam, variants, excluded)
+
+
+def _left_out(counted: list, fam: Family, included: set, excluded: dict) -> tuple:
+    """Every member variant with no included row, and every member idea with no row at all (Advisor 31 Oct, (a))."""
+    rows: dict = {}
+    ran = set()
+    for t in counted:
+        idea = _member(t, fam.members)
+        if idea is not None:
+            ran.add(idea)
+            rows.setdefault(trials._variant(t), []).append(t)
+    out = [(f"idea {m}", "never ran") for m in fam.members if m not in ran]
+    for v, ts in rows.items():
+        if v in included:
+            continue
+        unverified = all(t["sharpe"] is None or not math.isfinite(t["sharpe"]) for t in ts) or any(
+            excluded.get(t["id"], (None, None, None))[2] == UNVERIFIED for t in ts)
+        out.append((f"row {ts[-1]['id']} ({v[0]})", UNVERIFIED if unverified else "not valid-fill"))
     return tuple(out)
 
 
-def compute(register: trials.TrialsRegister, text: str, family: str, returns: pd.Series, row_ideas: set) -> Result:
+def compute(register: trials.TrialsRegister, text: str, family: str, returns: pd.Series, row_ideas: set,
+            try_id: str | None = None) -> Result:
     """H0's (or any try's) deflated Sharpe across its family. row_ideas: the ideas the round's rows of this family
-    count under (rescore derives them as it runs), for the stated count."""
+    count under (rescore derives them as it runs), for the stated count. try_id: the try's own register row, which
+    joins the spread unpinned (main passes it only once its sheet shows 1-minute execution)."""
     fam = families_of(text).get(family)
     if fam is None:
         raise ValueError(f"refused: the list pins no members for family {family}")
-    if not fam.valid:
+    if not fam.valid and try_id is None:
         raise ValueError(f"refused: the list pins no valid-fill rows for family {family}")
+    if len(returns.dropna()) < MIN_DAYS:
+        raise ValueError(f"refused: {len(returns.dropna())} return days, under the {MIN_DAYS} a deflated Sharpe needs")
     rnd = rounds.round_of(text, [n for n in _rows(text)])
     prior = rnd.prior.get(family, 0) if rnd is not None else 0
     n_stated = prior + rounds.used(register, row_ideas)
     n_register = rounds.used(register, set(fam.members))
-    rows = spread_rows(register, fam)
+    rows, left_out = spread_rows(register, fam, try_id)
     sharpes = [s for _, _, s, _ in rows]
     floored = len(sharpes) < MIN_ROWS
     dsr = deflated_sharpe_probability(returns, max(n_stated, n_register, 1), sharpes,
                                       spread_floor=SPREAD_FLOOR if floored else None)
-    return Result(family, n_stated, n_register, rows, floored, dsr, binding(returns, sharpes, floored))
+    if not math.isfinite(dsr):
+        raise ValueError("refused: the deflated Sharpe is undefined on these returns (flat?)")
+    return Result(family, n_stated, n_register, rows, floored, dsr, binding(returns, sharpes, floored), left_out,
+                  hashlib.sha256(text.encode("utf-8")).hexdigest())
 
 
 def binding(returns: pd.Series, sharpes: list, floored: bool) -> tuple:
@@ -176,12 +285,45 @@ def pooled_returns(path: Path) -> pd.Series:
     return pd.Series([float(r["pooled_return"]) for r in rows], index=pd.to_datetime([r["date"] for r in rows]))
 
 
+def try_row(register: trials.TrialsRegister, stem: str) -> str:
+    """The register row of the basket try a sheet shows: its stem is <label>_<dataset>_<time> (basket_run), and the
+    try is the counted row basket_run recorded for that label on that dataset (the latest, if more than one)."""
+    m = STEM.fullmatch(stem)
+    if m is None:
+        raise ValueError(f"refused: {stem} is not a basket sheet's stem (<label>_<venue>-basket-..._<time>)")
+    rows = [t for t in register._counted() if t["definition_name"] == f"basket:{m['label']}"
+            and t["dataset"] == m["dataset"]]
+    if not rows:
+        raise ValueError(f"refused: no counted row for the try basket:{m['label']} on {m['dataset']}")
+    return rows[-1]["id"]
+
+
+def one_minute_fills(trades: Path, stem: str) -> bool:
+    """Whether the try's own sheet shows 1-minute execution fired: an intraday basket (its dataset names its candle
+    length) with at least one fill stamped inside a decision candle, as only a fill on finer bars can be."""
+    m = STEM.fullmatch(stem)
+    minutes = re.search(r"-(\d+)m$", m["dataset"]) if m else None
+    if minutes is None:  # a daily basket fills on hourly bars
+        return False
+    step = int(minutes[1])
+    with open(trades, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            for when in (row.get("entry_time"), row.get("exit_time")):
+                if when:
+                    ts = pd.Timestamp(when)
+                    if ts.second or ts.microsecond or (ts.hour * 60 + ts.minute) % step:
+                        return True
+    return False
+
+
 def report(r: Result) -> list:
-    lines = [f"family {r.family}: N {r.n} (stated {r.n_stated}, register {r.n_register})"
+    lines = [f"list SHA-256 {r.list_sha}", f"family {r.family}: N {r.n} (stated {r.n_stated}, register {r.n_register})"
              + (" FLAG: the counts differ" if r.n_stated != r.n_register else "")]
     for row_id, definition, sharpe, standins in r.spread_rows:
         lines.append(f"  spread row {row_id} ({definition}): Sharpe {sharpe:.4f}"
                      + (f", funding stand-ins {standins}%" if standins is not None else ""))
+    for what, why in r.left_out:
+        lines.append(f"  left out: {what}: {why}")
     lines.append(f"spread: {len(r.spread_rows)} valid-fill rows" + (f", floored at {SPREAD_FLOOR} a year (fewer than "
                                                                      f"{MIN_ROWS})" if r.floored else ""))
     lines.append(f"spread bound: {r.binding[0]}, {r.binding[1]:.2f} a year")
@@ -210,18 +352,27 @@ def main(argv=None, store=None, sheets: Path | None = None) -> int:
     from sleeve_fund.research.run import TEARSHEETS
     from sleeve_fund.research.study import idea_of
     from sleeve_fund.research.trials import legacy_idea_hash
+    from sleeve_fund.venues import RESEARCH_VENUE
 
     try:
         text = Path(a.list).read_text(encoding="utf-8")
         pinned = rescore.parse_pinned(text)
         rnd = rounds.round_of(text, _rows(text))
+        market = rescore.markets_of(text)  # a row's own market, as rescore runs it (CR F2)
         ideas = set()
         for n, name, minutes in rescore.rows_of(text):
             if rnd is not None and rnd.family_of(n) == a.family:
-                req = rescore.request(name, minutes, "binance", "BTC/USDT", pinned)
+                req = rescore.request(name, minutes, RESEARCH_VENUE.lower(), "BTC/USDT", pinned,  # rescore's default
+                                      market=market.get(n))
                 ideas.add(idea_of(req.params, None) or legacy_idea_hash(req.strategy))
-        returns = pooled_returns((sheets or TEARSHEETS) / f"{a.sheet}-pooled.csv")
-        result = compute(trials.TrialsRegister(store), text, a.family, returns, ideas)
+        register = trials.TrialsRegister(store)
+        own = try_row(register, a.sheet)
+        folder = sheets or TEARSHEETS
+        returns = pooled_returns(folder / f"{a.sheet}-pooled.csv")
+        if not one_minute_fills(folder / f"{a.sheet}-basket-trades.csv", a.sheet):
+            raise ValueError(f"refused: the try's sheet shows no fill inside a decision candle, so 1-minute "
+                             f"execution isn't shown and its row {own} can't join the spread")
+        result = compute(register, text, a.family, returns, ideas, try_id=own)
     except (ValueError, OSError, KeyError) as exc:
         print(exc if str(exc).startswith("refused:") else f"refused: {exc}")
         return 1

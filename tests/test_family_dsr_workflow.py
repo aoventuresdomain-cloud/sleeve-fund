@@ -70,3 +70,14 @@ def test_it_has_no_write_input_runs_beside_no_study_and_only_from_main():
     names = [s.get("name") or s["uses"] for s in job["steps"]]
     assert names.index("Encrypt") < names.index("actions/upload-artifact@v4") < names.index("The script's outcome")
     assert "sheet-export.pub.pem" in _step("Encrypt")["run"]
+
+
+def test_the_inputs_are_checked_on_the_runner_before_anything_runs(tmp_path):
+    def check(list_, family="B", sheet="h0_x_1"):
+        return subprocess.run(["bash", "-e", "-c", _step("Check the inputs")["run"]], capture_output=True, text=True,
+                              cwd=ROOT, check=False, env={"PATH": "/usr/bin:/bin", "LIST": list_, "FAMILY": family,
+                                                          "SHEET": sheet})
+    assert check(LIST).returncode == 0
+    assert check("configs/studies/no-such-list.md").returncode == 1  # well formed, but not in this checkout (CR F3)
+    assert check("configs/studies/../studies/x.md").returncode == 1
+    assert check(LIST, family="B;x").returncode == 1 and check(LIST, sheet="../x").returncode == 1

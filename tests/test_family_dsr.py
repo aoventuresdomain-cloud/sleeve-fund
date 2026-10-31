@@ -1,9 +1,12 @@
 """FAMILY-DSR (Advisor, 31 Oct 2026, on H0): a try's deflated Sharpe across its whole family. N is the larger of the
-stated and the register's counts, flagged when they differ; the spread is one Sharpe per pinned valid-fill row, each
-its variant's latest row, floored at 0.5 a year below 3 rows; a stale or missing pin refuses. Figures are synthetic."""
+stated and the register's counts, flagged when they differ; the spread is one Sharpe per included row, floored at 0.5
+a year below 3 rows; every row newer than a pin must itself be pinned, included or excluded with its reason; the try's
+own row joins when its sheet shows 1-minute fills; left-out variants are listed. Figures are synthetic."""
 
 from __future__ import annotations
 
+import hashlib
+import math
 from pathlib import Path
 
 import numpy as np
@@ -40,8 +43,13 @@ def _register(tmp_path):
     return reg, ids
 
 
-def _text(valid: str, members=IDEAS) -> str:
-    return ROUND + f"\n- **Family members, B:** {', '.join(members)}\n- **Valid-fill rows, B:** {valid}\n"
+def _text(valid: str, members=IDEAS, excluded: str = "") -> str:
+    return (ROUND + f"\n- **Family members, B:** {', '.join(members)}\n"
+            + (f"- **Valid-fill rows, B:** {valid}\n" if valid else "")
+            + (f"- **Excluded rows, B:** {excluded}\n" if excluded else ""))
+
+
+Z = "3" * 16
 
 
 def test_n_is_the_larger_count_and_the_spread_is_the_pinned_rows(tmp_path):
@@ -53,8 +61,11 @@ def test_n_is_the_larger_count_and_the_spread_is_the_pinned_rows(tmp_path):
     assert not r.floored
     assert r.dsr == pytest.approx(deflated_sharpe_probability(_returns(), 14, [0.31, -0.22, 0.12]))
     lines = fd.report(r)
-    assert lines[0] == "family B: N 14 (stated 14, register 4) FLAG: the counts differ"
-    assert "funding stand-ins 12%" in lines[1] and lines[-1].startswith("deflated Sharpe probability ")
+    assert lines[0] == f"list SHA-256 {hashlib.sha256(text.encode()).hexdigest()}"  # the list it read (CR F3)
+    assert lines[1] == "family B: N 14 (stated 14, register 4) FLAG: the counts differ"
+    assert "funding stand-ins 12%" in lines[2] and lines[-1].startswith("deflated Sharpe probability ")
+    assert r.left_out == ((f"row {ids['z1']} ({Z})", "not valid-fill"),)  # z's d1 variant: ran, not pinned
+    assert f"  left out: row {ids['z1']} ({Z}): not valid-fill" in lines
     # 485 days: the no-skill error, sqrt(365/484) = 0.87 a year, is above the rows' spread (0.33)
     assert r.binding[0] == "the no-skill error 1/sqrt(T-1)" and r.binding[1] == pytest.approx((365 / 484) ** 0.5)
     assert lines[-2] == "spread bound: the no-skill error 1/sqrt(T-1), 0.87 a year"
@@ -66,6 +77,10 @@ def test_the_register_count_wins_when_it_is_larger(tmp_path):
         "- **Prior tries, family B:** 13", "- **Prior tries, family B:** 2")
     r = fd.compute(reg, text, "B", _returns(), row_ideas={IDEAS[0]})
     assert (r.n_stated, r.n_register, r.n) == (3, 4, 4)
+    # the probability itself is judged at the larger N, not only the printed one (CR M1)
+    sharpes = [s for _, _, s, _ in r.spread_rows]
+    assert r.dsr == pytest.approx(deflated_sharpe_probability(_returns(), 4, sharpes))
+    assert r.dsr != pytest.approx(deflated_sharpe_probability(_returns(), 3, sharpes))
 
 
 def test_below_three_rows_the_spread_is_floored_at_half_a_year(tmp_path):
@@ -96,7 +111,7 @@ def test_a_wide_spread_of_rows_binds_and_is_said(tmp_path):
 
 
 @pytest.mark.parametrize("pin, words", [
-    ("{z}/{z2}", "is not its variant's latest row"),  # z2 has a newer row: a correction or re-run since the pin
+    ("{z}/{z2}", "is newer than pinned row"),  # z2 has a newer row, unpinned: it may be its correction
     ("{z}/" + "9" * 16, "no counted row"),  # a correction not yet applied
     ("{x}/{y1}", "is definition"),
     ("{z}/{z2b}, {z}/{z2b}", "pins a trials id twice"),
@@ -124,25 +139,112 @@ def test_the_round_list_as_committed_pins_no_family_yet():
     assert fd.families_of(ROUND) == {}  # pinned only once the rows are chosen from the sheets (Advisor 31 Oct)
 
 
+def test_a_newer_coarse_re_run_pinned_as_excluded_leaves_the_older_row_in(tmp_path):
+    reg, ids = _register(tmp_path)
+    text = _text(f"{'1' * 16}/{ids['x1']}, {Z}/{ids['z2']}", excluded=f"{Z}/{ids['z2b']} (coarse re-run)")
+    r = fd.compute(reg, text, "B", _returns(), {IDEAS[0]})
+    assert [s for _, _, s, _ in r.spread_rows] == [0.31, 0.47]
+
+
+def test_a_correction_is_included_and_its_original_excluded(tmp_path):
+    reg, ids = _register(tmp_path)
+    ok = _text(f"{Z}/{ids['z2b']}", excluded=f"{Z}/{ids['z2']} (corrected by row {ids['z2b']})")
+    assert [s for _, _, s, _ in fd.compute(reg, ok, "B", _returns(), {IDEAS[0]}).spread_rows] == [0.12]
+    # the original kept in while a newer row is marked as its correction: refused (Advisor and CR, 31 Oct)
+    backwards = _text(f"{Z}/{ids['z2']}", excluded=f"{Z}/{ids['z2']} (corrected by row {ids['z2b']})")
+    with pytest.raises(ValueError, match=f"row {ids['z2']} is pinned as included, but row {ids['z2b']} is marked"):
+        fd.compute(reg, backwards, "B", _returns(), {IDEAS[0]})
+    for valid, by, words in ((f"{'1' * 16}/{ids['x1']}", ids["z2b"], "which isn't included"),  # its correction left out
+                             (f"{Z}/{ids['z1']}", ids["z1"], "not a newer row")):  # another variant's, and older
+        with pytest.raises(ValueError, match=words):
+            fd.compute(reg, _text(valid, excluded=f"{Z}/{ids['z2']} (corrected by row {by})"), "B", _returns(),
+                       {IDEAS[0]})
+    # its own variant's, but older than the row it would correct
+    with pytest.raises(ValueError, match="not a newer row"):
+        fd.compute(reg, _text(f"{Z}/{ids['z2']}", excluded=f"{Z}/{ids['z2b']} (corrected by row {ids['z2']})"), "B",
+                   _returns(), {IDEAS[0]})
+
+
+def test_left_out_variants_and_ideas_are_listed_with_why(tmp_path):
+    reg, ids = _register(tmp_path)
+    never = "d" * 16
+    text = _text(f"{'1' * 16}/{ids['x1']}, {'2' * 16}/{ids['y1']}, {Z}/{ids['z1']}", members=(*IDEAS, never),
+                 excluded=f"{Z}/{ids['z2b']} (Sharpe unverified), {Z}/{ids['z2']} (coarse re-run)")
+    r = fd.compute(reg, text, "B", _returns(), {IDEAS[0]})
+    assert r.left_out == ((f"idea {never}", "never ran"), (f"row {ids['z2b']} ({Z})", "Sharpe unverified"))
+
+
+def test_a_row_of_no_member_is_refused(tmp_path):
+    reg, _ = _register(tmp_path)
+    foreign = reg.record(definition_hash="5" * 16, idea_hash="e" * 16, name="f", family="rules", settings={},
+                         dataset="d", stage="in_sample", source="study", sharpe=0.2)
+    with pytest.raises(ValueError, match="a try of none of family B's members"):
+        fd.compute(reg, _text(f"{'5' * 16}/{foreign}"), "B", _returns(), {IDEAS[0]})
+
+
+def test_the_try_joins_unpinned_and_refuses_when_excluded(tmp_path):
+    reg, ids = _register(tmp_path)
+    r = fd.compute(reg, _text(""), "B", _returns(), {IDEAS[0]}, try_id=ids["x1"])
+    assert [i for i, _, _, _ in r.spread_rows] == [ids["x1"]] and r.floored
+    with pytest.raises(ValueError, match="the try's own row .* is pinned as excluded"):
+        fd.compute(reg, _text("", excluded=f"{'1' * 16}/{ids['x1']} (coarse re-run)"), "B", _returns(), {IDEAS[0]},
+                   try_id=ids["x1"])
+
+
+def test_three_rows_on_a_long_window_are_not_floored(tmp_path):
+    reg, ids = _register(tmp_path)
+    long = _returns(n=3000)  # here the 0.5 floor would bind (0.35 a year of error, a rows' spread of 0.27)
+    r = fd.compute(reg, _text(f"{'1' * 16}/{ids['x1']}, {'2' * 16}/{ids['y1']}, {Z}/{ids['z2b']}"), "B", long,
+                   {IDEAS[0]})
+    sharpes = [0.31, -0.22, 0.12]
+    assert not r.floored and r.dsr == pytest.approx(deflated_sharpe_probability(long, r.n, sharpes))
+    assert r.dsr != pytest.approx(deflated_sharpe_probability(long, r.n, sharpes, spread_floor=0.5))
+
+
+def test_a_non_finite_sharpe_or_too_few_days_is_refused(tmp_path, monkeypatch):
+    reg, ids = _register(tmp_path)
+    text = _text(f"{'1' * 16}/{ids['x1']}")
+    with pytest.raises(ValueError, match="20 return days, under the 30"):  # the probability would be nan (CR F6)
+        fd.compute(reg, text, "B", _returns(n=20), {IDEAS[0]})
+    rows = reg._counted()
+    monkeypatch.setattr(reg, "_counted", lambda idea=None: [
+        {**t, "sharpe": math.nan} if t["id"] == ids["x1"] else t for t in rows if idea is None or t["idea_hash"] == idea])
+    with pytest.raises(ValueError, match="has no finite Sharpe"):  # the register writes None, but never trust it (F5)
+        fd.compute(reg, text, "B", _returns(), {IDEAS[0]})
+
+
 def test_the_cli_reads_the_sheets_pooled_returns_and_refuses_in_words(tmp_path, capfd, monkeypatch):
     reg, ids = _register(tmp_path)
+    data = "binance-basket-btc-eth-sol-usdt-store-240m"
+    own = reg.record(definition_hash="4" * 16, idea_hash=IDEAS[0], name="basket:qrx", family="rules", settings={},
+                     dataset=data, stage="in_sample", source="study", sharpe=0.05)
+    stem = f"qrx_{data}_20261031-104331"
     lst = tmp_path / "configs" / "studies" / "r.md"
     lst.parent.mkdir(parents=True)
-    lst.write_text(_text(f"{'1' * 16}/{ids['x1']}, {'2' * 16}/{ids['y1']}, {'3' * 16}/{ids['z2b']}"))
+    lst.write_text(_text(f"{'1' * 16}/{ids['x1']}, {'2' * 16}/{ids['y1']}, {Z}/{ids['z2b']}"))
     sheets = tmp_path / "sheets"
     sheets.mkdir()
     ret = _returns()
     pd.DataFrame({"date": ret.index.strftime("%Y-%m-%d"), "pooled_return": ret.values}).to_csv(
-        sheets / "h0_x_1-pooled.csv", index=False)
+        sheets / f"{stem}-pooled.csv", index=False)
+    trades = sheets / f"{stem}-basket-trades.csv"
+    trades.write_text("asset,entry_time,exit_time\nA,2025-01-07T16:00:00,2025-01-08T11:39:00\n")  # a stop's minute
     monkeypatch.chdir(tmp_path)
-    argv = ["--list", "configs/studies/r.md", "--family", "B", "--sheet", "h0_x_1"]
+    argv = ["--list", "configs/studies/r.md", "--family", "B", "--sheet", stem]
     assert fd.main(argv, store=reg.store, sheets=sheets) == 0
     out = capfd.readouterr().out.strip().splitlines()
-    assert out[0].startswith("family B: N ") and out[-1] == "done: family B, sheet h0_x_1"
+    assert out[0].startswith("list SHA-256 ") and out[1].startswith("family B: N ")
+    assert f"  spread row {own} ({'4' * 16}): Sharpe 0.0500" in out and out[-1] == f"done: family B, sheet {stem}"
+    trades.write_text("asset,entry_time,exit_time\nA,2025-01-07T16:00:00,2025-01-08T12:00:00\n")  # on the grid only
+    assert fd.main(argv, store=reg.store, sheets=sheets) == 1
+    assert "1-minute execution isn't shown" in capfd.readouterr().out
+    trades.write_text("asset,entry_time,exit_time\nA,2025-01-07T16:00:00,2025-01-08T11:39:00\n")
+    assert fd.main(argv[:5] + ["h0_x_1"], store=reg.store, sheets=sheets) == 1  # not a basket sheet's stem
+    assert capfd.readouterr().out.startswith("refused: h0_x_1 is not a basket sheet's stem")
     assert fd.main(argv[:3] + ["A"] + argv[4:], store=reg.store, sheets=sheets) == 1
     assert capfd.readouterr().out.strip() == "refused: the list pins no members for family A"
     assert fd.main(argv[:5] + ["../x"], store=reg.store, sheets=sheets) == 2
-    assert fd.main(["--list", "/etc/passwd", "--family", "B", "--sheet", "h0_x_1"], store=reg.store) == 2
+    assert fd.main(["--list", "/etc/passwd", "--family", "B", "--sheet", stem], store=reg.store) == 2
     capfd.readouterr()
     monkeypatch.delenv("DATABASE_URL", raising=False)
     assert fd.main(argv) == 2 and "no DATABASE_URL" in capfd.readouterr().out
