@@ -320,7 +320,8 @@ def test_the_sheet_shows_1_minute_execution_fired_from_its_own_fill_times(ran):
         stamps = [t for row in csv.DictReader(f) for t in (row["entry_time"], row["exit_time"]) if t]
     off = sum(1 for t in stamps if pd.Timestamp(t).minute % 5 or pd.Timestamp(t).second)
     line = next(x for x in out.read_text().splitlines() if x.startswith("**Fills:**"))
-    want = (f"1-minute execution fired: {off:,} of {len(stamps):,} fill times are off the 5-minute grid" if off
+    verb = "is" if off == 1 else "are"
+    want = (f"1-minute execution fired: {off:,} of {len(stamps):,} fill times {verb} off the 5-minute grid" if off
             else f"not shown: none of {len(stamps):,} fill times")
     assert line.startswith("**Fills:** 240-minute decision candles, filled on every asset's 1-minute bars; ")
     assert want in line
@@ -342,7 +343,9 @@ def test_a_sheet_whose_fills_all_sit_on_the_5_minute_grid_says_it_cant_show_them
     rows[0].closed = pd.Timestamp("2025-02-01 09:15")  # a 15-minute mark is on the 5-minute grid too
     assert "not shown" in bk.fills_line(study)
     rows[0].closed = pd.Timestamp("2025-02-01 09:16")
-    assert bk.fills_line(study).endswith("1-minute execution fired: 1 of 3 fill times are off the 5-minute grid")
+    assert bk.fills_line(study).endswith("1-minute execution fired: 1 of 3 fill times is off the 5-minute grid")
+    rows[1].opened = pd.Timestamp("2025-02-02 08:01")
+    assert bk.fills_line(study).endswith("1-minute execution fired: 2 of 3 fill times are off the 5-minute grid")
     hourly = SimpleNamespace(bar_minutes=1440, exec_minutes=60)
     study.basket = SimpleNamespace(assets=(hourly,))
     assert bk.fills_line(study) == ("**Fills:** daily decision candles, filled on 60-minute bars, not 1-minute: what "

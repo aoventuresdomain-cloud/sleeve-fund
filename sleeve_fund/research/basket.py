@@ -1019,7 +1019,8 @@ def fills_line(study: BasketStudy) -> str:
                 t = pd.Timestamp(ts)
                 stamps += 1
                 off += bool(t.second or t.microsecond or t.minute % OFF_GRID)
-    shown = (f"1-minute execution fired: {off:,} of {stamps:,} fill times are off the {OFF_GRID}-minute grid" if off
+    shown = (f"1-minute execution fired: {off:,} of {stamps:,} fill times {'is' if off == 1 else 'are'} off the "
+             f"{OFF_GRID}-minute grid" if off
              else f"not shown: none of {stamps:,} fill times is off the {OFF_GRID}-minute grid, so the sheet can't show "
                   "the 1-minute bars filled anything coarser bars wouldn't")
     return f"**Fills:** {candle} decision candles, filled on every asset's 1-minute bars; {shown}"
