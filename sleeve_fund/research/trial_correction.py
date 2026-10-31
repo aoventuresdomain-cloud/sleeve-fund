@@ -98,10 +98,13 @@ def main(argv=None, store=None, sheets: Path | None = None) -> int:
     if not re.fullmatch(r"[0-9a-f]{16}", a.row) or not re.fullmatch(r"[A-Za-z0-9._-]+", a.sheet) or ".." in a.sheet:
         print("refused: --row is a 16-character trials id and --sheet a plain file stem")
         return 2
-    if store is None:
-        from sleeve_fund.store import Store
+    if store is None:  # the research CLI's journal (allowlisted research, as rescore's): never a default file
+        from sleeve_fund.__main__ import _journal
 
-        store = Store()
+        store = _journal()
+        if store is None:
+            print("refused: no DATABASE_URL, so no journal to correct")
+            return 2
     from sleeve_fund.research.run import TEARSHEETS
 
     register = trials.TrialsRegister(store)
