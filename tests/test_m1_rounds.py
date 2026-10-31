@@ -204,6 +204,31 @@ def test_a_basket_sheets_tries_line_gives_its_rounds_count(monkeypatch, tmp_path
     assert f"**Tries:** {line}" in text and " of 20 for " not in text
 
 
+def test_a_sealed_basket_sheet_says_already_viewed_only_where_an_earlier_study_holds_the_lock(tmp_path):
+    """The holdout row reads the seal itself (CR M1 on #341): a lock an earlier study settled under the basket's idea
+    shows on its asset; a register with no lock shows a sealed holdout with nothing viewed."""
+    from test_study_asset_list import _History, _req
+
+    from sleeve_fund.research import run as run_mod
+    from sleeve_fund.research.holdout import HoldoutLocks
+    from sleeve_fund.research.trials import legacy_idea_hash
+    from sleeve_fund.store import Store
+
+    def holdout_row(store, out):
+        text = run_mod.run_store_study(_req(), store=store, out_dir=tmp_path / out, history=_History()).read_text()
+        return next(x for x in text.splitlines() if x.startswith("| Locked holdout"))
+
+    held = Store(f"sqlite:///{tmp_path}/held.db")
+    locks, idea = HoldoutLocks(held), legacy_idea_hash("rsi_cross")  # the basket's idea (basket.idea_hash)
+    assert locks.open(idea, "ETH", START, END)
+    locks.settle(idea, "ETH", None)
+    assert holdout_row(held, "held").endswith(
+        "sealed: opened once, as its own final step; already viewed on ETH by an earlier study, so paper is the "
+        "forward test |")
+    assert holdout_row(Store(f"sqlite:///{tmp_path}/clean.db"), "clean").endswith(
+        "sealed: opened once, as its own final step |")
+
+
 def test_a_lists_pinned_dates_set_its_walk_forward_and_holdout_lengths():
     from sleeve_fund.research.pinned import parse
 

@@ -361,6 +361,18 @@ def test_the_holdout_row_and_close_priced_row_read_what_is_true(filled):
             f"{bk._sharpe(study.base.returns.to_numpy()):.2f} |") in row
 
 
+def test_a_confirming_run_never_gives_a_rounds_try_line(filled):
+    """A run that records no try (counted False: a guarded run at a size scale) keeps "not a new try" even when its
+    notes carry the round's try line (CR F2 on #341)."""
+    from dataclasses import replace
+
+    study, _ = filled
+    line = "Round next-1 (study list SHA-256 0123456789ab): registered try 3 of 21, family A try 3"
+    tries = lambda text: next(x for x in text.splitlines() if x.startswith("**Tries:**"))
+    assert tries(bk.render(study, round_try=line)) == f"**Tries:** {line}"
+    assert "not a new try" in tries(bk.render(replace(study, counted=False), round_try=line))
+
+
 @pytest.mark.parametrize("name, coin", [("SOLUSDT-PERP", "SOL"), ("SOL", "SOL"), ("ETHUSDC-PERP", "ETH"),
                                         ("XBTUSD", "XBT"), ("USDT", "USDT")])
 def test_a_perps_symbol_is_its_coin(name, coin):
