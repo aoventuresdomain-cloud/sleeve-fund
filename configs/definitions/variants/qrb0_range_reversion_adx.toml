@@ -1,0 +1,43 @@
+# Next round, family B, round 0 (30 Oct 2026, Quant Researcher; Advisor cleared 30 Oct 15:07 UTC): the definition in
+# research/quant-researcher/next-round/prereg-family-b-range-reversion-30oct.md exactly. Decision candle: 1h.
+version = 1
+name = "qrb0-range-reversion-adx"
+title = "Range Reversion (1h) · Long and Short · low ADX"
+reason = """In a market with no trend (daily ADX(14) below 20), a 1-hour close outside the Bollinger(20, 2) band is
+more often noise than news, and taking the other side is paid as the price drifts back. Long on the cross below the
+lower band, short on the cross above the upper. Out after 20 candles (the average's length) or on a 2 ATR(14) stop;
+no take-profit, so the random-entry test can judge it. Settings are textbook defaults, fixed before any run. Held at 1x."""
+
+[blocks.bb]
+kind = "bollinger"
+period = 20
+k = 2.0
+
+[blocks.atr]
+kind = "atr"
+period = 14
+
+[blocks.adx]
+kind = "adx"
+period = 14
+timeframe = "1d"
+
+[long]
+entry = { all = [
+    { left = "adx", op = "<", right = 20 },
+    { left = "close", op = "crosses_below", right = "bb.lower" },
+] }
+
+[short]
+entry = { all = [
+    { left = "adx", op = "<", right = 20 },
+    { left = "close", op = "crosses_above", right = "bb.upper" },
+] }
+
+[exits.long]
+stop = { level = { sub = ["close", { mul = [2.0, "atr"] }] } }
+time_stop = { bars = 20 }
+
+[exits.short]
+stop = { level = { add = ["close", { mul = [2.0, "atr"] }] } }
+time_stop = { bars = 20 }

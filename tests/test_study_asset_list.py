@@ -46,7 +46,8 @@ def test_a_single_pair_request_is_unchanged():
     ({"pairs": ["BTC/USD", "ETH/USDT"]}, "different currencies"),
     ({"pairs": ["BTC/USD", "ETHUSD"]}, "should look like BTC/USDT"),
     ({"pair": "ETH/USD"}, "is not its list's first asset BTC/USD"),
-    ({"minutes": 60}, "daily or 4-hour bars only"),
+    ({"minutes": 15}, "daily, 4-hour or 1-hour bars only"),
+    ({"minutes": 60}, "a 1-hour asset list runs on a pinned list's dates only"),
     ({"minutes": 240}, "a 4-hour asset list runs on a pinned list's dates only"),
     ({"old_window_too": True, "score_window": "continuous"}, "without the placebo or the old window"),
 ])

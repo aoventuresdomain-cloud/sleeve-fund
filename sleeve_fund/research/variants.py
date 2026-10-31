@@ -41,6 +41,10 @@ PREREGISTERED = {
     "QR21_R1": {"parent": "qr21_trend_sma200_ls", "definition": "qr21_trend_sma200_ls_r1_slope", "params": {}},
     # Round 2 (Researcher 24 Oct, Advisor cleared): qr23 round 0 plus qr21 round 1's slope rule on its 50-day average.
     "QR23_R2": {"parent": "qr23_vma_band_sma50_ls", "definition": "qr23_vma_band_sma50_ls_r2_slope", "params": {}},
+    # The next round (PM approved the plan 30 Oct 14:57 UTC; Advisor cleared both pre-registrations 30 Oct 15:07 UTC,
+    # research/quant-researcher/next-round/): new families, so no parent and no placebo.
+    "QRA0_FUNDING_FADE": {"definition": "qra0_funding_fade", "params": {}},
+    "QRB0_RANGE_REVERSION_ADX": {"definition": "qrb0_range_reversion_adx", "params": {}},
 }
 
 

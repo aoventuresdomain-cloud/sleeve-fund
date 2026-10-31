@@ -1,0 +1,41 @@
+# Next round, family A, round 0 (30 Oct 2026, Quant Researcher; Advisor cleared 30 Oct 15:07 UTC): the rules of
+# research/quant-researcher/next-round/prereg-family-a-funding-fade-30oct.md, section 4, exactly. Decision candle: 4h.
+# Studies only: the funding percentile block is refused by paper and live.
+version = 1
+name = "qra0-funding-fade"
+title = "Funding Fade (4h) · Long and Short"
+reason = """When the latest settled funding rate is extreme for its own last 90 days, one side is crowded and paying to
+stay in; the fade takes the other side and is paid funding while it waits. Long when the rate ranks in the bottom
+tenth and is negative (shorts paying); short when it ranks in the top tenth and is at least 0.03% per 8 hours (three
+times the standard rate). Out when the rank is back to the middle, after 7 days, or on a 3 ATR(14) stop. No
+take-profit, so the random-entry test can judge it. Settings fixed before any run. Held at 1x."""
+
+[blocks.fr]
+kind = "funding_percentile"
+window_days = 90
+
+[blocks.atr]
+kind = "atr"
+period = 14
+
+[long]
+entry = { all = [
+    { left = "fr.pct", op = "<=", right = 10 },
+    { left = "fr.rate", op = "<", right = 0 },
+] }
+exit = { left = "fr.pct", op = ">=", right = 50 }
+
+[short]
+entry = { all = [
+    { left = "fr.pct", op = ">=", right = 90 },
+    { left = "fr.rate", op = ">=", right = 0.0003 },
+] }
+exit = { left = "fr.pct", op = "<=", right = 50 }
+
+[exits.long]
+stop = { level = { sub = ["close", { mul = [3.0, "atr"] }] } }
+time_stop = { minutes = 10080 }
+
+[exits.short]
+stop = { level = { add = ["close", { mul = [3.0, "atr"] }] } }
+time_stop = { minutes = 10080 }

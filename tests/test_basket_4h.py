@@ -65,15 +65,16 @@ def test_every_4h_bar_closing_on_a_test_day_is_out_of_sample_midnight_included()
     assert bk._ranges(idx, win, H4) == [(6, 17)]
 
 
-def test_a_4h_asset_list_runs_on_pinned_dates_only_and_on_4h_or_daily_bars():
+def test_a_4h_asset_list_runs_on_pinned_dates_only_and_on_daily_4h_or_1h_bars():
     req = run_mod.StudyRequest(strategy="rules", pair=PAIRS[0], pairs=PAIRS, venue="kraken", minutes=240,
                                train_days=30, test_days=30, holdout_days=8, params={"definition": DEFINITION},
                                pinned=_pins())
     req.validate()
     with pytest.raises(ValueError, match="pinned list's dates only"):
         run_mod.StudyRequest(**{**req.__dict__, "pinned": None}).validate()
-    with pytest.raises(ValueError, match="daily or 4-hour bars only"):
-        run_mod.StudyRequest(**{**req.__dict__, "minutes": 60}).validate()
+    run_mod.StudyRequest(**{**req.__dict__, "minutes": 60}).validate()  # the floor lifted to 1-hour (PM 30 Oct)
+    with pytest.raises(ValueError, match="daily, 4-hour or 1-hour bars only"):
+        run_mod.StudyRequest(**{**req.__dict__, "minutes": 15}).validate()
 
 
 # ---- 2. the joint draws -----------------------------------------------------------------------------------------
