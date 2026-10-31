@@ -43,7 +43,7 @@ def _register(tmp_path):
     return reg, ids
 
 
-HAND = " (hand-checked by QD: fill times off the 15-minute grid)"
+HAND = " (hand-checked by QD: fill times off the 5-minute grid)"
 
 
 def _checked(valid: str) -> str:
@@ -74,7 +74,7 @@ def test_n_is_the_larger_count_and_the_spread_is_the_pinned_rows(tmp_path):
     assert lines[0] == f"list SHA-256 {hashlib.sha256(text.encode()).hexdigest()}"  # the list it read (CR F3)
     assert lines[1] == "family B: N 14 (stated 14, register 4) FLAG: the counts differ"
     assert lines[2].endswith(", funding stand-ins 12%, 1-minute fills: hand-checked by QD (fill times off the "
-                             "15-minute grid)")
+                             "5-minute grid)")
     assert "funding stand-ins 12%" in lines[2] and lines[-1].startswith("deflated Sharpe probability ")
     assert r.left_out == ((f"row {ids['z1']} ({Z})", "not valid-fill"),)  # z's d1 variant: ran, not pinned
     assert f"  left out: row {ids['z1']} ({Z}): not valid-fill" in lines
@@ -177,6 +177,30 @@ def test_a_correction_is_included_and_its_original_excluded(tmp_path):
                    _returns(), {IDEAS[0]})
 
 
+def test_a_correction_must_be_of_the_same_variant_even_when_newer(tmp_path):
+    reg, ids = _register(tmp_path)
+    w = reg.record(definition_hash="7" * 16, idea_hash=IDEAS[0], name="w", family="rules", settings={},
+                   dataset="d1", stage="in_sample", source="study", sharpe=0.2)  # newer than z2, another variant
+    text = _text(f"{Z}/{ids['z2b']}, {'7' * 16}/{w}", excluded=f"{Z}/{ids['z2']} (corrected by row {w})")
+    with pytest.raises(ValueError, match=f"row {w} is not a newer row of row {ids['z2']}'s variant"):
+        fd.compute(reg, text, "B", _returns(), {IDEAS[0]})
+
+
+def test_flat_returns_refuse_rather_than_print_nan(tmp_path):
+    reg, ids = _register(tmp_path)
+    flat = pd.Series(0.0, index=pd.date_range("2025-01-01", periods=40, freq="D"))  # 40 days, no spread: nan
+    with pytest.raises(ValueError, match="the deflated Sharpe is undefined"):
+        fd.compute(reg, _text(f"{'1' * 16}/{ids['x1']}"), "B", flat, {IDEAS[0]})
+
+
+def test_only_an_intraday_sheet_off_the_5_minute_grid_shows_1_minute_fills(tmp_path):
+    trades = tmp_path / "t.csv"
+    trades.write_text("asset,entry_time,exit_time\nA,2025-01-07T16:00:00,2025-01-08T11:39:00\n")
+    data = "binance-basket-btc-eth-sol-usdt-store"
+    assert fd.one_minute_fills(trades, f"qrx_{data}-240m_20261031-104331")
+    assert not fd.one_minute_fills(trades, f"qrx_{data}_20261031-104331")  # a daily basket fills on hourly bars
+
+
 def test_left_out_variants_and_ideas_are_listed_with_why(tmp_path):
     reg, ids = _register(tmp_path)
     never = "d" * 16
@@ -196,7 +220,7 @@ def test_each_pin_names_its_sheet_or_a_hand_check_and_the_sheet_is_tested(tmp_pa
     seen = []
     r = fd.compute(reg, _text(pin), "B", _returns(), {IDEAS[0]}, sheet_ok=lambda s: seen.append(s) or True)
     assert seen == [stem] and fd.report(r)[2].endswith(f", 1-minute fills: sheet {stem}")
-    with pytest.raises(ValueError, match="shows no fill off the 15-minute grid"):
+    with pytest.raises(ValueError, match="shows no fill off the 5-minute grid"):
         fd.compute(reg, _text(pin), "B", _returns(), {IDEAS[0]}, sheet_ok=lambda s: False)
     with pytest.raises(ValueError, match="names neither its sheet nor who hand-checked"):
         fd.compute(reg, _text(f"{'4' * 16}/{row} (no-check)"), "B", _returns(), {IDEAS[0]})
@@ -284,11 +308,14 @@ def test_the_cli_reads_the_sheets_pooled_returns_and_refuses_in_words(tmp_path, 
     assert f"  spread row {pinned} ({'6' * 16}): Sharpe 0.0700, 1-minute fills: sheet {kept}" in (
         capfd.readouterr().out.splitlines())
     lst.write_text(_text(f"{'1' * 16}/{ids['x1']}, {'2' * 16}/{ids['y1']}, {Z}/{ids['z2b']}"))
-    for exit_ in ("2025-01-08T12:00:00", "2025-01-08T12:15:00"):  # on the 4h grid; inside the candle, on 15-minute bars
+    # on the 4h grid; then inside the candle, but on 5- or 15-minute bars (run.py's EXEC_STEPS fill on both)
+    for exit_ in ("2025-01-08T12:00:00", "2025-01-08T12:05:00", "2025-01-08T12:15:00"):
         trades.write_text(f"asset,entry_time,exit_time\nA,2025-01-07T16:00:00,{exit_}\n")
         assert fd.main(argv, store=reg.store, sheets=sheets) == 1
         assert "1-minute execution isn't shown" in capfd.readouterr().out
-    trades.write_text("asset,entry_time,exit_time\nA,2025-01-07T16:00:00,2025-01-08T11:39:00\n")
+    trades.write_text("asset,entry_time,exit_time\nA,2025-01-07T16:00:00,2025-01-08T12:07:00\n")  # off 5 minutes
+    assert fd.main(argv, store=reg.store, sheets=sheets) == 0
+    capfd.readouterr()
     assert fd.main(argv[:5] + ["h0_x_1"], store=reg.store, sheets=sheets) == 1  # not a basket sheet's stem
     assert capfd.readouterr().out.startswith("refused: h0_x_1 is not a basket sheet's stem")
     assert fd.main(argv[:3] + ["A"] + argv[4:], store=reg.store, sheets=sheets) == 1

@@ -5,7 +5,7 @@ A round file pins each family's members and which of their register rows the Sha
 
     - **Family members, B:** 66fb76f17c2a5ec3, 0e13cf32e1775235, ...
     - **Valid-fill rows, B:** 5f5556da26db40ba/0123456789abcdef (stand-ins 12%) (sheet STEM), ...
-      or .../<id> (hand-checked by Researcher: fill times off the 15-minute grid), when its sheet isn't kept
+      or .../<id> (hand-checked by Researcher: fill times off the 5-minute grid), when its sheet isn't kept
     - **Excluded rows, B:** 5f5556da26db40ba/fedcba9876543210 (coarse re-run), ...
 
 Members are idea hashes (structural ideas, or a legacy ledger idea's). A valid-fill row is "definition hash / trials
@@ -22,7 +22,7 @@ exclude a row from a family whose signal isn't funding (Advisor, 31 Oct). An exc
   correction copies every field but its id, time, Sharpe and error), so every row of a pinned row's variant that is
   newer than it must itself be pinned, included or excluded with its reason, or the step refuses (Advisor and CR,
   31 Oct): a correction can't slip past as a re-run. A row pinned as included while another is marked as its
-  correction refuses too. The try being judged joins without a pin when its own sheet shows a fill off the 15-minute
+  correction refuses too. The try being judged joins without a pin when its own sheet shows a fill off the 5-minute
   grid (1-minute execution fired), and refuses otherwise. With fewer than 3 included rows, the spread is floored
   at 0.5 a year. The report names the bound that set the spread, and every member variant left out, with why.
 
@@ -324,13 +324,13 @@ def try_row(register: trials.TrialsRegister, stem: str) -> str:
     return rows[-1]["id"]
 
 
-COARSEST_FINE = 15  # minutes: a fill off this grid can only come from 1-minute bars (Advisor 31 Oct)
+COARSEST_FINE = 5  # minutes: run.py's EXEC_STEPS fill on 5-minute bars too, so only a time off this grid is 1-minute
 
 
 def one_minute_fills(trades: Path, stem: str) -> bool:
     """Whether the try's own sheet shows 1-minute execution fired: an intraday basket (its dataset names its candle
-    length) with at least one fill stamped off the 15-minute grid. A fill merely inside a decision candle isn't
-    enough: a 4-hour rule filled on 15-minute bars has those too, and that is the coarse case (Advisor 31 Oct)."""
+    length) with at least one fill stamped off the 5-minute grid. A fill merely inside a decision candle isn't
+    enough: a 4-hour rule filled on 5- or 15-minute bars has those too, and that is the coarse case (Advisor 31 Oct)."""
     m = STEM.fullmatch(stem)
     if m is None or re.search(r"-\d+m$", m["dataset"]) is None:  # a daily basket fills on hourly bars
         return False
