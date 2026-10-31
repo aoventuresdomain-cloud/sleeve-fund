@@ -45,6 +45,9 @@ PREREGISTERED = {
     # research/quant-researcher/next-round/): new families, so no parent and no placebo.
     "QRA0_FUNDING_FADE": {"definition": "qra0_funding_fade", "params": {}},
     "QRB0_RANGE_REVERSION_ADX": {"definition": "qrb0_range_reversion_adx", "params": {}},
+    # Family H, pullback inside a trend (Advisor cleared 31 Oct 05:56 UTC as family B try 15; same folder): a new idea,
+    # so no parent and no placebo.
+    "QRH0_TREND_PULLBACK": {"definition": "qrh0_trend_pullback", "params": {}},
 }
 
 

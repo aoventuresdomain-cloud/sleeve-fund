@@ -50,12 +50,13 @@ def test_family_b_is_its_pre_registrations_toml_with_a_141_day_warm_up():
     assert continuous_warmup("rules", params, 60) * 60 / 1440 == 141
 
 
-def test_the_list_is_two_basket_rows_on_the_sealed_dates_with_the_holdout_locked():
+def test_the_list_is_three_basket_rows_on_the_sealed_dates_with_the_holdout_locked():
     text = LIST.read_text()
     p = parse(text)
     assert (p.data_start, p.research_end, p.holdout_start, p.holdout_end) == (
         date(2024, 1, 1), date(2026, 4, 30), date(2026, 5, 1), date(2026, 10, 30))
-    assert rescore.rows_of(text) == [(1, "qra0_funding_fade", 240), (2, "qrb0_range_reversion_adx", 60)]
+    assert rescore.rows_of(text) == [(1, "qra0_funding_fade", 240), (2, "qrb0_range_reversion_adx", 60),
+                                     (3, "qrh0_trend_pullback", 240)]  # H0 added 31 Oct
     for n, name, minutes in rescore.rows_of(text):
         req = rescore.request(name, minutes, "binance", "BTC/USDT,ETH/USDT,SOL/USDT", p)
         assert tuple(req.pairs) == ("BTC/USDT", "ETH/USDT", "SOL/USDT") and req.params["market"] == "perp"
@@ -68,11 +69,11 @@ def test_the_list_is_round_next_0_with_a_budget_of_6_and_bs_13_prior_tries():
 
     text = LIST.read_text()
     r = rounds.round_of(text, [n for n, _, _ in rescore.rows_of(text)])
-    assert (r.name, r.budget, r.families, r.prior) == ("next-0", 6, {"A": (1,), "B": (2,)}, {"B": 13})
+    assert (r.name, r.budget, r.families, r.prior) == ("next-0", 6, {"A": (1,), "B": (2, 3)}, {"B": 13})
     assert "family A try 1 " in rounds.try_line(r, 1, 0) and "family B try 14 " in rounds.try_line(r, 2, 0)
 
 
 def test_the_list_dry_runs(capfd):
     assert rescore.main([str(LIST), "--pair", "BTC/USDT,ETH/USDT,SOL/USDT", "--dry-run"], run=lambda *a, **k: None,
                         journal=lambda: None) == 0
-    assert "dry run: 2 checked, 0 run" in capfd.readouterr().out
+    assert "dry run: 3 checked, 0 run" in capfd.readouterr().out
