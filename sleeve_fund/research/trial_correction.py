@@ -95,7 +95,7 @@ def main(argv=None, store=None, sheets: Path | None = None) -> int:
     ap.add_argument("--sheet", required=True, help="its tear sheet's stem, in TEARSHEET_DIR")
     ap.add_argument("--apply", action="store_true", help="write the row (default: a dry run, nothing written)")
     a = ap.parse_args(argv)
-    if not re.fullmatch(r"[0-9a-f]{16}", a.row) or not re.fullmatch(r"[A-Za-z0-9._-]+", a.sheet):
+    if not re.fullmatch(r"[0-9a-f]{16}", a.row) or not re.fullmatch(r"[A-Za-z0-9._-]+", a.sheet) or ".." in a.sheet:
         print("refused: --row is a 16-character trials id and --sheet a plain file stem")
         return 2
     if store is None:

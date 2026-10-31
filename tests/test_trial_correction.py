@@ -89,6 +89,7 @@ def test_another_basket_or_a_non_basket_row_is_refused(tmp_path, capfd):
     with pytest.raises(ValueError, match="not a basket try"):
         tc.plan(reg, single, tmp_path / f"{other}.md")
     assert tc.main(["--row", "not-an-id", "--sheet", other], store=reg.store, sheets=tmp_path) == 2
+    assert tc.main(["--row", rid, "--sheet", ".."], store=reg.store, sheets=tmp_path) == 2  # never another folder
 
 
 def test_an_already_correct_row_is_refused(tmp_path):
