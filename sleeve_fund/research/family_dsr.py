@@ -4,12 +4,15 @@ only its own idea's rows.
 A round file pins each family's members and which of their register rows the Sharpe spread uses:
 
     - **Family members, B:** 66fb76f17c2a5ec3, 0e13cf32e1775235, ...
-    - **Valid-fill rows, B:** 5f5556da26db40ba/0123456789abcdef (stand-ins 12%), ...
+    - **Valid-fill rows, B:** 5f5556da26db40ba/0123456789abcdef (stand-ins 12%) (sheet STEM), ...
+      or .../<id> (hand-checked by Researcher: fill times off the 15-minute grid), when its sheet isn't kept
     - **Excluded rows, B:** 5f5556da26db40ba/fedcba9876543210 (coarse re-run), ...
 
 Members are idea hashes (structural ideas, or a legacy ledger idea's). A valid-fill row is "definition hash / trials
 id" for a run whose sheet shows 1-minute execution fired (Advisor's check 1), chosen by hand from the sheets and pinned
-here, so the rule is written down and never inferred. The stand-in share is noted beside it: funding stand-ins don't
+here, so the rule is written down and never inferred. Each pin carries its evidence: its sheet's stem, when the sheet
+is in the tear-sheet folder (the step runs the try's off-grid test on it), else who hand-checked it and on what; a pin
+with neither refuses, and the report says which each used (Advisor 31 Oct). The stand-in share is noted beside it: funding stand-ins don't
 exclude a row from a family whose signal isn't funding (Advisor, 31 Oct). An excluded row carries one of three reasons:
 "coarse re-run", "corrected by row <id>" (the correcting row is the one included) or "Sharpe unverified".
 
@@ -53,7 +56,8 @@ HEX16 = r"[0-9a-f]{16}"
 MEMBERS_LINE = re.compile(r"^-\s*\*\*Family members, ([A-Za-z0-9]{1,16}):\*\*\s*(.+?)\s*$", re.MULTILINE)
 VALID_LINE = re.compile(r"^-\s*\*\*Valid-fill rows, ([A-Za-z0-9]{1,16}):\*\*\s*(.+?)\s*$", re.MULTILINE)
 EXCLUDED_LINE = re.compile(r"^-\s*\*\*Excluded rows, ([A-Za-z0-9]{1,16}):\*\*\s*(.+?)\s*$", re.MULTILINE)
-ENTRY = re.compile(rf"({HEX16})/({HEX16})(?:\s*\(stand-ins (\d{{1,3}})%\))?")
+ENTRY = re.compile(rf"({HEX16})/({HEX16})(?:\s*\(stand-ins (\d{{1,3}})%\))?"
+                   r"(?:\s*\((?:sheet ([A-Za-z0-9_][A-Za-z0-9_.-]*)|hand-checked by ([^(),:]+): ([^(),]+))\))?")
 XENTRY = re.compile(rf"({HEX16})/({HEX16})\s*\((coarse re-run|corrected by row ({HEX16})|Sharpe unverified)\)")
 UNVERIFIED = "Sharpe unverified"
 MIN_DAYS = 30  # deflated_sharpe_probability's own minimum; below it the step refuses rather than print nan
@@ -64,7 +68,7 @@ STEM = re.compile(r"(?P<label>[A-Za-z0-9_.-]+?)_(?P<dataset>[a-z0-9]+-basket-[a-
 class Family:
     name: str
     members: tuple  # idea hashes
-    valid: tuple  # (definition hash, trials id, stand-in share % or None)
+    valid: tuple  # (definition hash, trials id, stand-in share % or None, how its 1-minute fills were checked)
     excluded: tuple = ()  # (definition hash, trials id, reason, the correcting row's id or None)
 
 
@@ -89,7 +93,9 @@ def families_of(text: str) -> dict:
         entries = [ENTRY.fullmatch(p) for p in parts]
         if any(e is None for e in entries):
             raise ValueError(f"family {f}'s valid-fill rows read <definition hash>/<trials id> (stand-ins N%)")
-        valid = tuple((e[1], e[2], None if e[3] is None else int(e[3])) for e in entries)
+        valid = tuple((e[1], e[2], None if e[3] is None else int(e[3]),
+                       ("sheet", e[4]) if e[4] else ("hand", e[5].strip(), e[6].strip()) if e[5] else None)
+                      for e in entries)
         if len({v[1] for v in valid}) != len(valid):
             raise ValueError(f"family {f} pins a trials id twice")
         out[f] = Family(f, out[f].members, valid)
@@ -126,7 +132,7 @@ class Result:
     family: str
     n_stated: int
     n_register: int
-    spread_rows: tuple  # (trials id, definition hash, Sharpe, stand-in %)
+    spread_rows: tuple  # (trials id, definition hash, Sharpe, stand-in %, how its 1-minute fills were checked)
     floored: bool
     dsr: float
     binding: tuple = ("", math.nan)  # (which bound set the spread, its value a year): Advisor 31 Oct, shown
@@ -159,9 +165,12 @@ def _member(t: dict, members) -> str | None:
     return idea if idea in members else None
 
 
-def spread_rows(register: trials.TrialsRegister, fam: Family, try_id: str | None = None) -> tuple:
-    """(the included rows as the register holds them, one per variant: (id, definition, Sharpe, stand-ins %); the
-    member variants and ideas left out, with why). try_id: the judged try's own row, included without a pin."""
+def spread_rows(register: trials.TrialsRegister, fam: Family, try_id: str | None = None,
+                sheet_ok=None) -> tuple:
+    """(the included rows as the register holds them, one per variant: (id, definition, Sharpe, stand-ins %, check);
+    the member variants and ideas left out, with why). try_id: the judged try's own row, included without a pin.
+    sheet_ok(stem): whether a pinned row's own sheet, in the tear-sheet folder, shows 1-minute fills (main's
+    one_minute_fills); a pin names that sheet, or says who hand-checked it and on what (Advisor 31 Oct)."""
     counted = register._counted()  # oldest first
     pos = {t["id"]: k for k, t in enumerate(counted)}
     by_id = {t["id"]: t for t in counted}
@@ -173,8 +182,8 @@ def spread_rows(register: trials.TrialsRegister, fam: Family, try_id: str | None
         if try_id not in {v[1] for v in included}:
             if try_id not in by_id:
                 raise ValueError(f"refused: no counted row {try_id} for the try")
-            included.append((by_id[try_id]["definition_hash"], try_id, None))
-    pinned = [(d, i) for d, i, _ in included] + [(x[0], x[1]) for x in fam.excluded]
+            included.append((by_id[try_id]["definition_hash"], try_id, None, ("own sheet",)))
+    pinned = [(d, i) for d, i, _, _ in included] + [(x[0], x[1]) for x in fam.excluded]
     for definition, row_id in pinned:
         t = by_id.get(row_id)
         if t is None:
@@ -183,7 +192,9 @@ def spread_rows(register: trials.TrialsRegister, fam: Family, try_id: str | None
             raise ValueError(f"refused: row {row_id} is definition {t['definition_hash']}, not {definition}")
         if _member(t, fam.members) is None:
             raise ValueError(f"refused: row {row_id} is a try of none of family {fam.name}'s members")
-    in_ids = {i for _, i, _ in included}
+    for definition, row_id, _, how in included:
+        _check_fills(by_id[row_id], how, sheet_ok)
+    in_ids = {i for _, i, _, _ in included}
     for _, row_id, _, by in fam.excluded:
         if by is None:
             continue
@@ -200,15 +211,30 @@ def spread_rows(register: trials.TrialsRegister, fam: Family, try_id: str | None
                                  "pinned: include it or exclude it (coarse re-run, corrected by row <id>, Sharpe "
                                  "unverified)")
     out, variants = [], set()
-    for definition, row_id, standins in included:
+    for definition, row_id, standins, how in included:
         t = by_id[row_id]
         if trials._variant(t) in variants:
             raise ValueError(f"refused: row {row_id}'s variant is pinned twice")
         variants.add(trials._variant(t))
         if t["sharpe"] is None or not math.isfinite(t["sharpe"]):
             raise ValueError(f"refused: row {row_id} has no finite Sharpe")
-        out.append((row_id, definition, float(t["sharpe"]), standins))
+        out.append((row_id, definition, float(t["sharpe"]), standins, how))
     return tuple(out), _left_out(counted, fam, variants, excluded)
+
+
+def _check_fills(t: dict, how, sheet_ok) -> None:
+    """A pin's 1-minute evidence: its own sheet, run through the same off-grid test as the try's, when the sheet is
+    kept; else a named hand check. Neither refuses."""
+    if how is None:
+        raise ValueError(f"refused: pin {t['id']} names neither its sheet nor who hand-checked its 1-minute fills")
+    if how[0] != "sheet":
+        return
+    m = STEM.fullmatch(how[1])
+    if (m is None or t["definition_name"] != f"basket:{m['label']}" or t["dataset"] != m["dataset"]):
+        raise ValueError(f"refused: sheet {how[1]} is not row {t['id']}'s basket sheet (a single study's row is "
+                         "hand-checked)")
+    if sheet_ok is None or not sheet_ok(how[1]):
+        raise ValueError(f"refused: row {t['id']}'s sheet {how[1]} shows no fill off the {COARSEST_FINE}-minute grid")
 
 
 def _left_out(counted: list, fam: Family, included: set, excluded: dict) -> tuple:
@@ -231,7 +257,7 @@ def _left_out(counted: list, fam: Family, included: set, excluded: dict) -> tupl
 
 
 def compute(register: trials.TrialsRegister, text: str, family: str, returns: pd.Series, row_ideas: set,
-            try_id: str | None = None) -> Result:
+            try_id: str | None = None, sheet_ok=None) -> Result:
     """H0's (or any try's) deflated Sharpe across its family. row_ideas: the ideas the round's rows of this family
     count under (rescore derives them as it runs), for the stated count. try_id: the try's own register row, which
     joins the spread unpinned (main passes it only once its sheet shows 1-minute execution)."""
@@ -246,8 +272,8 @@ def compute(register: trials.TrialsRegister, text: str, family: str, returns: pd
     prior = rnd.prior.get(family, 0) if rnd is not None else 0
     n_stated = prior + rounds.used(register, row_ideas)
     n_register = rounds.used(register, set(fam.members))
-    rows, left_out = spread_rows(register, fam, try_id)
-    sharpes = [s for _, _, s, _ in rows]
+    rows, left_out = spread_rows(register, fam, try_id, sheet_ok)
+    sharpes = [s for _, _, s, _, _ in rows]
     floored = len(sharpes) < MIN_ROWS
     dsr = deflated_sharpe_probability(returns, max(n_stated, n_register, 1), sharpes,
                                       spread_floor=SPREAD_FLOOR if floored else None)
@@ -318,12 +344,20 @@ def one_minute_fills(trades: Path, stem: str) -> bool:
     return False
 
 
+def _how(how) -> str:
+    if how[0] == "own sheet":
+        return "1-minute fills: the try's own sheet"
+    if how[0] == "sheet":
+        return f"1-minute fills: sheet {how[1]}"
+    return f"1-minute fills: hand-checked by {how[1]} ({how[2]})"
+
+
 def report(r: Result) -> list:
     lines = [f"list SHA-256 {r.list_sha}", f"family {r.family}: N {r.n} (stated {r.n_stated}, register {r.n_register})"
              + (" FLAG: the counts differ" if r.n_stated != r.n_register else "")]
-    for row_id, definition, sharpe, standins in r.spread_rows:
+    for row_id, definition, sharpe, standins, how in r.spread_rows:
         lines.append(f"  spread row {row_id} ({definition}): Sharpe {sharpe:.4f}"
-                     + (f", funding stand-ins {standins}%" if standins is not None else ""))
+                     + (f", funding stand-ins {standins}%" if standins is not None else "") + f", {_how(how)}")
     for what, why in r.left_out:
         lines.append(f"  left out: {what}: {why}")
     lines.append(f"spread: {len(r.spread_rows)} valid-fill rows" + (f", floored at {SPREAD_FLOOR} a year (fewer than "
@@ -374,7 +408,9 @@ def main(argv=None, store=None, sheets: Path | None = None) -> int:
         if not one_minute_fills(folder / f"{a.sheet}-basket-trades.csv", a.sheet):
             raise ValueError(f"refused: the try's sheet shows no fill off the {COARSEST_FINE}-minute grid, so 1-minute "
                              f"execution isn't shown and its row {own} can't join the spread")
-        result = compute(register, text, a.family, returns, ideas, try_id=own)
+        result = compute(register, text, a.family, returns, ideas, try_id=own, sheet_ok=lambda stem: (
+            folder / f"{stem}-basket-trades.csv").is_file() and one_minute_fills(folder / f"{stem}-basket-trades.csv",
+                                                                                    stem))
     except (ValueError, OSError, KeyError) as exc:
         print(exc if str(exc).startswith("refused:") else f"refused: {exc}")
         return 1

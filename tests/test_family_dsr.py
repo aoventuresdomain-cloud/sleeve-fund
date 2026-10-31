@@ -43,7 +43,17 @@ def _register(tmp_path):
     return reg, ids
 
 
+HAND = " (hand-checked by QD: fill times off the 15-minute grid)"
+
+
+def _checked(valid: str) -> str:
+    """Pins as most tests write them: each hand-checked unless it says how (a pin with no evidence refuses)."""
+    return ", ".join(p if "(sheet " in p or "(hand-checked" in p or "(no-check)" in p else p + HAND
+                     for p in valid.split(", ")).replace(" (no-check)", "") if valid else valid
+
+
 def _text(valid: str, members=IDEAS, excluded: str = "") -> str:
+    valid = _checked(valid)
     return (ROUND + f"\n- **Family members, B:** {', '.join(members)}\n"
             + (f"- **Valid-fill rows, B:** {valid}\n" if valid else "")
             + (f"- **Excluded rows, B:** {excluded}\n" if excluded else ""))
@@ -57,12 +67,14 @@ def test_n_is_the_larger_count_and_the_spread_is_the_pinned_rows(tmp_path):
     text = _text(f"{'1' * 16}/{ids['x1']} (stand-ins 12%), {'2' * 16}/{ids['y1']}, {'3' * 16}/{ids['z2b']}")
     r = fd.compute(reg, text, "B", _returns(), row_ideas={IDEAS[0]})
     assert (r.n_stated, r.n_register, r.n) == (13 + 1, 4, 14)  # 13 stated prior + 1 in the register; 4 variants
-    assert [s for _, _, s, _ in r.spread_rows] == [0.31, -0.22, 0.12] and r.spread_rows[0][3] == 12
+    assert [s for _, _, s, _, _ in r.spread_rows] == [0.31, -0.22, 0.12] and r.spread_rows[0][3] == 12
     assert not r.floored
     assert r.dsr == pytest.approx(deflated_sharpe_probability(_returns(), 14, [0.31, -0.22, 0.12]))
     lines = fd.report(r)
     assert lines[0] == f"list SHA-256 {hashlib.sha256(text.encode()).hexdigest()}"  # the list it read (CR F3)
     assert lines[1] == "family B: N 14 (stated 14, register 4) FLAG: the counts differ"
+    assert lines[2].endswith(", funding stand-ins 12%, 1-minute fills: hand-checked by QD (fill times off the "
+                             "15-minute grid)")
     assert "funding stand-ins 12%" in lines[2] and lines[-1].startswith("deflated Sharpe probability ")
     assert r.left_out == ((f"row {ids['z1']} ({Z})", "not valid-fill"),)  # z's d1 variant: ran, not pinned
     assert f"  left out: row {ids['z1']} ({Z}): not valid-fill" in lines
@@ -78,7 +90,7 @@ def test_the_register_count_wins_when_it_is_larger(tmp_path):
     r = fd.compute(reg, text, "B", _returns(), row_ideas={IDEAS[0]})
     assert (r.n_stated, r.n_register, r.n) == (3, 4, 4)
     # the probability itself is judged at the larger N, not only the printed one (CR M1)
-    sharpes = [s for _, _, s, _ in r.spread_rows]
+    sharpes = [s for _, _, s, _, _ in r.spread_rows]
     assert r.dsr == pytest.approx(deflated_sharpe_probability(_returns(), 4, sharpes))
     assert r.dsr != pytest.approx(deflated_sharpe_probability(_returns(), 3, sharpes))
 
@@ -143,13 +155,13 @@ def test_a_newer_coarse_re_run_pinned_as_excluded_leaves_the_older_row_in(tmp_pa
     reg, ids = _register(tmp_path)
     text = _text(f"{'1' * 16}/{ids['x1']}, {Z}/{ids['z2']}", excluded=f"{Z}/{ids['z2b']} (coarse re-run)")
     r = fd.compute(reg, text, "B", _returns(), {IDEAS[0]})
-    assert [s for _, _, s, _ in r.spread_rows] == [0.31, 0.47]
+    assert [s for _, _, s, _, _ in r.spread_rows] == [0.31, 0.47]
 
 
 def test_a_correction_is_included_and_its_original_excluded(tmp_path):
     reg, ids = _register(tmp_path)
     ok = _text(f"{Z}/{ids['z2b']}", excluded=f"{Z}/{ids['z2']} (corrected by row {ids['z2b']})")
-    assert [s for _, _, s, _ in fd.compute(reg, ok, "B", _returns(), {IDEAS[0]}).spread_rows] == [0.12]
+    assert [s for _, _, s, _, _ in fd.compute(reg, ok, "B", _returns(), {IDEAS[0]}).spread_rows] == [0.12]
     # the original kept in while a newer row is marked as its correction: refused (Advisor and CR, 31 Oct)
     backwards = _text(f"{Z}/{ids['z2']}", excluded=f"{Z}/{ids['z2']} (corrected by row {ids['z2b']})")
     with pytest.raises(ValueError, match=f"row {ids['z2']} is pinned as included, but row {ids['z2b']} is marked"):
@@ -174,6 +186,29 @@ def test_left_out_variants_and_ideas_are_listed_with_why(tmp_path):
     assert r.left_out == ((f"idea {never}", "never ran"), (f"row {ids['z2b']} ({Z})", "Sharpe unverified"))
 
 
+def test_each_pin_names_its_sheet_or_a_hand_check_and_the_sheet_is_tested(tmp_path):
+    reg, ids = _register(tmp_path)
+    data = "binance-basket-btc-eth-sol-usdt-store-240m"
+    row = reg.record(definition_hash="4" * 16, idea_hash=IDEAS[0], name="basket:qrx", family="rules", settings={},
+                     dataset=data, stage="in_sample", source="study", sharpe=0.05)
+    stem = f"qrx_{data}_20261031-104331"
+    pin = f"{'4' * 16}/{row} (sheet {stem})"
+    seen = []
+    r = fd.compute(reg, _text(pin), "B", _returns(), {IDEAS[0]}, sheet_ok=lambda s: seen.append(s) or True)
+    assert seen == [stem] and fd.report(r)[2].endswith(f", 1-minute fills: sheet {stem}")
+    with pytest.raises(ValueError, match="shows no fill off the 15-minute grid"):
+        fd.compute(reg, _text(pin), "B", _returns(), {IDEAS[0]}, sheet_ok=lambda s: False)
+    with pytest.raises(ValueError, match="names neither its sheet nor who hand-checked"):
+        fd.compute(reg, _text(f"{'4' * 16}/{row} (no-check)"), "B", _returns(), {IDEAS[0]})
+    for other in (f"qry_{data}_20261031-104331", f"qrx_{data[:-4]}60m_20261031-104331"):  # another basket; dataset
+        with pytest.raises(ValueError, match=f"sheet {other} is not row {row}'s basket sheet"):
+            fd.compute(reg, _text(f"{'4' * 16}/{row} (sheet {other})"), "B", _returns(), {IDEAS[0]},
+                       sheet_ok=lambda s: True)
+    with pytest.raises(ValueError, match="is not row .*'s basket sheet"):  # a single study's row: hand-checked only
+        fd.compute(reg, _text(f"{'1' * 16}/{ids['x1']} (sheet {stem})"), "B", _returns(), {IDEAS[0]},
+                   sheet_ok=lambda s: True)
+
+
 def test_a_row_of_no_member_is_refused(tmp_path):
     reg, _ = _register(tmp_path)
     foreign = reg.record(definition_hash="5" * 16, idea_hash="e" * 16, name="f", family="rules", settings={},
@@ -185,7 +220,7 @@ def test_a_row_of_no_member_is_refused(tmp_path):
 def test_the_try_joins_unpinned_and_refuses_when_excluded(tmp_path):
     reg, ids = _register(tmp_path)
     r = fd.compute(reg, _text(""), "B", _returns(), {IDEAS[0]}, try_id=ids["x1"])
-    assert [i for i, _, _, _ in r.spread_rows] == [ids["x1"]] and r.floored
+    assert [i for i, _, _, _, _ in r.spread_rows] == [ids["x1"]] and r.floored
     with pytest.raises(ValueError, match="the try's own row .* is pinned as excluded"):
         fd.compute(reg, _text("", excluded=f"{'1' * 16}/{ids['x1']} (coarse re-run)"), "B", _returns(), {IDEAS[0]},
                    try_id=ids["x1"])
@@ -234,7 +269,21 @@ def test_the_cli_reads_the_sheets_pooled_returns_and_refuses_in_words(tmp_path, 
     assert fd.main(argv, store=reg.store, sheets=sheets) == 0
     out = capfd.readouterr().out.strip().splitlines()
     assert out[0].startswith("list SHA-256 ") and out[1].startswith("family B: N ")
-    assert f"  spread row {own} ({'4' * 16}): Sharpe 0.0500" in out and out[-1] == f"done: family B, sheet {stem}"
+    assert f"  spread row {own} ({'4' * 16}): Sharpe 0.0500, 1-minute fills: the try's own sheet" in out
+    assert out[-1] == f"done: family B, sheet {stem}"
+    # a pin naming its kept sheet: main runs the same off-grid test on that sheet's trades
+    pinned = reg.record(definition_hash="6" * 16, idea_hash=IDEAS[1], name="basket:qry", family="rules", settings={},
+                        dataset=data, stage="in_sample", source="study", sharpe=0.07)
+    kept = f"qry_{data}_20261030-090000"
+    lst.write_text(_text(f"{'1' * 16}/{ids['x1']}, {'6' * 16}/{pinned} (sheet {kept})"))
+    assert fd.main(argv, store=reg.store, sheets=sheets) == 1  # its sheet isn't in the folder
+    assert f"row {pinned}'s sheet {kept} shows no fill off" in capfd.readouterr().out
+    (sheets / f"{kept}-basket-trades.csv").write_text("asset,entry_time,exit_time\nA,2025-02-01T04:00:00,"
+                                                      "2025-02-01T09:07:00\n")
+    assert fd.main(argv, store=reg.store, sheets=sheets) == 0
+    assert f"  spread row {pinned} ({'6' * 16}): Sharpe 0.0700, 1-minute fills: sheet {kept}" in (
+        capfd.readouterr().out.splitlines())
+    lst.write_text(_text(f"{'1' * 16}/{ids['x1']}, {'2' * 16}/{ids['y1']}, {Z}/{ids['z2b']}"))
     for exit_ in ("2025-01-08T12:00:00", "2025-01-08T12:15:00"):  # on the 4h grid; inside the candle, on 15-minute bars
         trades.write_text(f"asset,entry_time,exit_time\nA,2025-01-07T16:00:00,{exit_}\n")
         assert fd.main(argv, store=reg.store, sheets=sheets) == 1
