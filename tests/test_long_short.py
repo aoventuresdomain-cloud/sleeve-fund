@@ -917,6 +917,8 @@ def test_a_short_swing_stop_rests_at_the_highest_high(prices, instrument):
     entry_px, level = stops[0]["signal"]["entry_px"], stops[0]["signal"]["trigger"]
     assert level > entry_px and "above the" in stops[0]["reason"] and "highest high" in stops[0]["reason"]
     assert "lowest low" not in stops[0]["reason"]
+    stated = f"{level / entry_px - 1:.2%} above the {entry_px:,.6g} entry"  # to two places, as its exact level
+    assert stated in stops[0]["reason"], stops[0]["reason"]
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")

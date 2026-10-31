@@ -565,6 +565,16 @@ def _ranges(index: pd.DatetimeIndex, windows, bar: pd.Timedelta = DAY) -> list[t
     return out
 
 
+def base_asset(name: str) -> str:
+    """An asset's coin, its quote and contract taken off: "SOLUSDT-PERP" and "SOL" are both "SOL" (a perp's symbol has
+    no slash, so underlying() leaves it whole; the Researcher's B0 check, 31 Oct)."""
+    coin = name.upper().split("-")[0]
+    for quote in ("USDT", "USDC", "USD"):
+        if coin.endswith(quote) and len(coin) > len(quote):
+            return coin[: -len(quote)]
+    return coin
+
+
 def _sharpe(r: np.ndarray) -> float:
     sd = float(np.std(r, ddof=1)) if len(r) > 1 else 0.0
     return float(np.mean(r) / sd * math.sqrt(365)) if sd > 0 else math.nan
@@ -737,10 +747,10 @@ def basket_study(basket: Basket, windows, research_end: date, *, register: trial
     if filled:
         study.pooled = pooled_random(base, names, specs, basket.params, windows, capital, touched, draws, seed)
         study.hold = hold_bar(base, specs, basket.params, windows, capital)
-        if "SOL" in names_of:  # Advisor Q3: shown beside, its own re-run; never a condition or a try
-            rest = [a for a, n in zip(assets, names_of) if n != "SOL"]
+        if "SOL" in map(base_asset, names_of):  # Advisor Q3: shown beside, its own re-run; never a condition or a try
+            rest = [a for a, n in zip(assets, names_of) if base_asset(n) != "SOL"]
             m, rn, rs = measured(rest, None)
-            study.without_sol = {"assets": [n for n in names_of if n != "SOL"], "net": m.net,
+            study.without_sol = {"assets": [n for n in names_of if base_asset(n) != "SOL"], "net": m.net,
                                  "sharpe": _sharpe(m.returns.to_numpy()),
                                  "random": pooled_random(m, rn, rs, basket.params, windows, capital,
                                                          gate_touched(m.run, windows, {n: _bar(sp) for n, sp in zip(rn, rs)}),
@@ -751,11 +761,12 @@ def basket_study(basket: Basket, windows, research_end: date, *, register: trial
                 trips, book = r.reconciled
                 raise ValueError(f"refused: {name}'s pooled trips add to {trips:+.1%} against the book's {book:+.1%} "
                                  "over them: the trades and the book disagree, so no sheet and no try")
-    if counted:
+    if counted:  # the register's Sharpe is the book's, as the sheet gives it: never the close-priced comparison's,
+        # which prices trips at decision closes and never at their stop fills (Advisor, B0's ruling 31 Oct)
+        sharpe = _sharpe(base.returns.to_numpy())
         study.tries, study.configuration = record_try(
             register, basket, dataset, _since(first, warm_days, basket),
-            pd.Timestamp(last + timedelta(days=1), tz="UTC"),
-            None if math.isnan(study.random.sharpe) else study.random.sharpe)
+            pd.Timestamp(last + timedelta(days=1), tz="UTC"), None if math.isnan(sharpe) else sharpe)
     return study
 
 
@@ -835,8 +846,13 @@ def _pct(x: float) -> str:
     return "n/a" if x is None or (isinstance(x, float) and math.isnan(x)) else f"{x:+.1%}"
 
 
-def render(study: BasketStudy, holdout: Holdout | None = None) -> str:
-    """The basket's report. The verdict lines are the pooled run's; per-asset lines are diagnostic only."""
+def render(study: BasketStudy, holdout: Holdout | None = None, round_try: str | None = None,
+           viewed: tuple[str, ...] = ()) -> str:
+    """The basket's report. The verdict lines are the pooled run's; per-asset lines are diagnostic only. round_try:
+    the study list's round line for this try (rounds.try_line), which the Tries line then gives in place of the basket
+    counter's own, a count of every definition-built basket under one model (QD 31 Oct, B0's sheet). viewed: the
+    assets whose holdout lock an earlier study already holds, the holdout row's words read off the seal itself
+    (Advisor, B0's ruling 31 Oct: never "already viewed" on a sealed run)."""
     b, base = study.basket, study.base
     days = len(base.returns)
     v = verdict(study, holdout)
@@ -854,20 +870,22 @@ def render(study: BasketStudy, holdout: Holdout | None = None) -> str:
         random_rows = [f"| Beats random entries (95th percentile) | {random_words(study.random)} |"]
         left_random = random_words(lo.random) if lo.random is not None else None
         concentrated = "; concentrated: over half the net from one asset"
-        viewed = ""
     else:
         random_rows = [f"| Beats random entries, filled on the pooled book (95th percentile) | {pooled_words(pooled, study.random.seed)} |",
                        f"| Hold bar (long-only baskets) | {hold_words(study.hold)} |",
-                       f"| Random entries, close-priced | {close_priced_words(study.random)} |"]
+                       f"| Random entries, close-priced | {close_priced_words(study.random)}; {NO_STOP_FILLS}, "
+                       f"against the book's filled Sharpe {_sharpe(base.returns.to_numpy()):.2f} |"]
         left_random = close_priced_words(lo.random) if lo.random is not None else None
         concentrated = "; CONCENTRATED: over half the pooled profit from one asset"
-        viewed = "; holdout already viewed; paper is the forward test"
+    seen = (f"; already viewed on {', '.join(viewed)} by an earlier study, so paper is the forward test"
+            if viewed and holdout is None else "")
     lines = [
         f"# Basket study: {b.name} ({b.strategy} on {', '.join(b.names)})", "",
         f"**Basket verdict:** {head}", "",
         f"_{FIXED_LIST.format(date=b.universe_date)}_", "",
         *_run_lines(study),
-        (f"**Tries:** {study.tries} (one per fixed basket and settings); this basket is try {study.configuration} of "
+        (f"**Tries:** {round_try}" if round_try and study.counted else
+         f"**Tries:** {study.tries} (one per fixed basket and settings); this basket is try {study.configuration} of "
          f"{BUDGET_PER_IDEA} for {b.strategy}'s family" if study.counted else
          "**Tries:** not a new try: a confirming run of settings already counted (Advisor 27 Oct)"), "",
         *([LEGS_NOT_REBALANCED, ""] if pooled is not None else []),
@@ -884,7 +902,7 @@ def render(study: BasketStudy, holdout: Holdout | None = None) -> str:
         "| Locked holdout at the venue's fees | " + (
             "sealed: opened once, as its own final step" if holdout is None else
             f"{'PASS' if holdout.passed else 'FAIL'}, net {_pct(holdout.net)} ({holdout.period[0]} to "
-            f"{holdout.period[1]})") + viewed + " |", "",
+            f"{holdout.period[1]})") + seen + " |", "",
         f"The compliance tests trimmed or refused {study.gate[0]:,.2f} of {study.gate[1]:,.2f} intended entry notional "
         f"on the test days ({study.gate_touched:.1%} of entry notional, each intent once).", "",
         *_gate_lines(study),
@@ -1295,6 +1313,9 @@ def pooled_words(r, seed: int = 0) -> str:
             f"{r.gap_return * 100:+.2f} points of capital higher")
     verdict = "NOT JUDGED" if r.verdict in ("WEAK", NOT_JUDGED) else r.verdict
     return f"{MARGINAL}: {out}" if r.marginal else f"{verdict}: {out}"
+
+
+NO_STOP_FILLS = "trips at decision closes, no stop fills"
 
 
 def close_priced_words(r: RandomBeat) -> str:

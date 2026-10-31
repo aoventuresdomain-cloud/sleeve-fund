@@ -143,6 +143,11 @@ def try_line(r: Round, row: int, family_used: int) -> str:
             f"used {family_used} of its {r.budget} tries before this one (trials register).")
 
 
+def is_try_line(note: str) -> bool:
+    """Whether a sheet note is a round's try line (try_line's), which a basket sheet's Tries line then gives."""
+    return note.startswith("Round ") and ": registered try " in note and ", family " in note
+
+
 def summary(r: Round, used_by_family: dict) -> str:
     """The round in one line: each family's tries used of its budget, from the trials register."""
     parts = [f"family {f} {used_by_family.get(f, 0)} of {r.budget} tries"

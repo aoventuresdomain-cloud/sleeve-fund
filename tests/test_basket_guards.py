@@ -127,9 +127,9 @@ def _ran(tmp, **settings):
     mp = pytest.MonkeyPatch()
     real_render, real_run = bk.render, bk.run_portfolio
 
-    def spy_render(study, opened=None):
+    def spy_render(study, opened=None, **kw):
         studies.append(study)
-        return real_render(study, opened)
+        return real_render(study, opened, **kw)
 
     def spy_run(legs, profile, *a, **k):
         runs.append((list(legs), profile))

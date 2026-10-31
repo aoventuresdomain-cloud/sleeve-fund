@@ -217,11 +217,12 @@ def _ns(ts: datetime) -> int:
     return int(ts.timestamp()) * 1_000_000_000 + ts.microsecond * 1000
 
 
-def _from_entry(stop: float, side: int = 1) -> str:
+def _from_entry(stop: float, side: int = 1, places: int = 1) -> str:
     """A stop's distance in words: "2.0% below the entry" for a long ("above" for a short), or the other
-    way for a stop set from the market on a position already in profit."""
+    way for a stop set from the market on a position already in profit. places: the percentage's decimals (the
+    resting stop's line gives 2, beside its exact level, so 1.43% doesn't read as 1.4%)."""
     below = (stop >= 0) == (side > 0)
-    return f"{abs(stop):.1%} {'below' if below else 'above'} the entry"
+    return f"{abs(stop):.{places}%} {'below' if below else 'above'} the entry"
 
 
 def through_liquidation(side: int, price: float, liq: float | None) -> bool:
@@ -7224,7 +7225,7 @@ class LongFlatStrategy(Strategy):
                 exit_side, quantity, Price(level, self.instrument.price_precision),
                 TriggerType.LAST_PRICE if self._resting_stops() else TriggerType.DEFAULT,  # A1: as the watched stop
                 TimeInForce.GTC, self._margin, False, UUID4(), now), "stop_loss", "STOP",
-                f"Stop-loss: resting {exit_word} at {level:,.6g}, {_from_entry(stop, side).replace(' the entry', '')} "
+                f"Stop-loss: resting {exit_word} at {level:,.6g}, {_from_entry(stop, side, 2).replace(' the entry', '')} "
                 f"the {self._entry_px:,.6g} entry"
                 + (f" (set {self._stop_basis})" if cfg.stop_atr or cfg.stop_swing_bars else "")
                 + "; fills at that level, or the open if the price gaps through"
