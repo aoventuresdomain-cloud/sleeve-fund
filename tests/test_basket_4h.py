@@ -325,6 +325,10 @@ def test_the_sheet_shows_1_minute_execution_fired_from_its_own_fill_times(ran):
             else f"not shown: none of {len(stamps):,} fill times")
     assert line.startswith("**Fills:** 240-minute decision candles, filled on every asset's 1-minute bars; ")
     assert want in line
+    from sleeve_fund.research import family_dsr
+
+    # the family DSR reads this very sheet and its trade book, and must agree with the line (Advisor 31 Oct)
+    assert off and family_dsr.sheet_fills(out.parent, out.stem) == "its Fills line"
 
 
 def test_a_sheet_whose_fills_all_sit_on_the_5_minute_grid_says_it_cant_show_them(monkeypatch):

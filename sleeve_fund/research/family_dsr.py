@@ -11,7 +11,7 @@ A round file pins each family's members and which of their register rows the Sha
 Members are idea hashes (structural ideas, or a legacy ledger idea's). A valid-fill row is "definition hash / trials
 id" for a run whose sheet shows 1-minute execution fired (Advisor's check 1), chosen by hand from the sheets and pinned
 here, so the rule is written down and never inferred. Each pin carries its evidence: its sheet's stem, when the sheet
-is in the tear-sheet folder (the step runs the try's off-grid test on it), else who hand-checked it and on what; a pin
+is in the tear-sheet folder (the step reads it as it reads the try's), else who hand-checked it and on what; a pin
 with neither refuses, and the report says which each used (Advisor 31 Oct). The stand-in share is noted beside it: funding stand-ins don't
 exclude a row from a family whose signal isn't funding (Advisor, 31 Oct). An excluded row carries one of three reasons:
 "coarse re-run", "corrected by row <id>" (the correcting row is the one included) or "Sharpe unverified".
@@ -22,8 +22,9 @@ exclude a row from a family whose signal isn't funding (Advisor, 31 Oct). An exc
   correction copies every field but its id, time, Sharpe and error), so every row of a pinned row's variant that is
   newer than it must itself be pinned, included or excluded with its reason, or the step refuses (Advisor and CR,
   31 Oct): a correction can't slip past as a re-run. A row pinned as included while another is marked as its
-  correction refuses too. The try being judged joins without a pin when its own sheet shows a fill off the 5-minute
-  grid (1-minute execution fired), and refuses otherwise. With fewer than 3 included rows, the spread is floored
+  correction refuses too. The try being judged joins without a pin when its own sheet shows 1-minute execution
+  fired, and refuses otherwise. A sheet shows it by its Fills line, checked against its trade book's fill times; a
+  sheet older than that line, by a fill off the 5-minute grid (Advisor 31 Oct). With fewer than 3 included rows, the spread is floored
   at 0.5 a year. The report names the bound that set the spread, and every member variant left out, with why.
 
     python -m sleeve_fund.research.family_dsr --list configs/studies/LIST.md --family B --sheet STEM
@@ -42,6 +43,7 @@ import math
 import re
 import sys
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -166,11 +168,12 @@ def _member(t: dict, members) -> str | None:
 
 
 def spread_rows(register: trials.TrialsRegister, fam: Family, try_id: str | None = None,
-                sheet_ok=None) -> tuple:
+                sheet_ok=None, try_fills: str | None = None) -> tuple:
     """(the included rows as the register holds them, one per variant: (id, definition, Sharpe, stand-ins %, check);
     the member variants and ideas left out, with why). try_id: the judged try's own row, included without a pin.
-    sheet_ok(stem): whether a pinned row's own sheet, in the tear-sheet folder, shows 1-minute fills (main's
-    one_minute_fills); a pin names that sheet, or says who hand-checked it and on what (Advisor 31 Oct)."""
+    sheet_ok(stem): how a pinned row's own sheet, in the tear-sheet folder, shows 1-minute fills, falsy when it
+    doesn't (main's sheet_fills); a pin names that sheet, or says who hand-checked it and on what (Advisor 31 Oct).
+    try_fills: how the try's own sheet showed them, for the report."""
     counted = register._counted()  # oldest first
     pos = {t["id"]: k for k, t in enumerate(counted)}
     by_id = {t["id"]: t for t in counted}
@@ -182,7 +185,8 @@ def spread_rows(register: trials.TrialsRegister, fam: Family, try_id: str | None
         if try_id not in {v[1] for v in included}:
             if try_id not in by_id:
                 raise ValueError(f"refused: no counted row {try_id} for the try")
-            included.append((by_id[try_id]["definition_hash"], try_id, None, ("own sheet",)))
+            included.append((by_id[try_id]["definition_hash"], try_id, None,
+                             ("own sheet", try_fills) if try_fills else ("own sheet",)))
     pinned = [(d, i) for d, i, _, _ in included] + [(x[0], x[1]) for x in fam.excluded]
     for definition, row_id in pinned:
         t = by_id.get(row_id)
@@ -192,8 +196,7 @@ def spread_rows(register: trials.TrialsRegister, fam: Family, try_id: str | None
             raise ValueError(f"refused: row {row_id} is definition {t['definition_hash']}, not {definition}")
         if _member(t, fam.members) is None:
             raise ValueError(f"refused: row {row_id} is a try of none of family {fam.name}'s members")
-    for definition, row_id, _, how in included:
-        _check_fills(by_id[row_id], how, sheet_ok)
+    included = [(d, i, s, _check_fills(by_id[i], how, sheet_ok)) for d, i, s, how in included]
     in_ids = {i for _, i, _, _ in included}
     for _, row_id, _, by in fam.excluded:
         if by is None:
@@ -222,19 +225,22 @@ def spread_rows(register: trials.TrialsRegister, fam: Family, try_id: str | None
     return tuple(out), _left_out(counted, fam, variants, excluded)
 
 
-def _check_fills(t: dict, how, sheet_ok) -> None:
+def _check_fills(t: dict, how, sheet_ok) -> tuple:
     """A pin's 1-minute evidence: its own sheet, run through the same off-grid test as the try's, when the sheet is
     kept; else a named hand check. Neither refuses."""
     if how is None:
         raise ValueError(f"refused: pin {t['id']} names neither its sheet nor who hand-checked its 1-minute fills")
     if how[0] != "sheet":
-        return
+        return how
     m = STEM.fullmatch(how[1])
     if (m is None or t["definition_name"] != f"basket:{m['label']}" or t["dataset"] != m["dataset"]):
         raise ValueError(f"refused: sheet {how[1]} is not row {t['id']}'s basket sheet (a single study's row is "
                          "hand-checked)")
-    if sheet_ok is None or not sheet_ok(how[1]):
-        raise ValueError(f"refused: row {t['id']}'s sheet {how[1]} shows no fill off the {COARSEST_FINE}-minute grid")
+    method = sheet_ok(how[1]) if sheet_ok is not None else None
+    if not method:
+        raise ValueError(f"refused: row {t['id']}'s sheet {how[1]} doesn't show 1-minute execution fired (no Fills "
+                         f"line saying so, and no fill off the {COARSEST_FINE}-minute grid)")
+    return (*how[:2], method) if isinstance(method, str) else how
 
 
 def _left_out(counted: list, fam: Family, included: set, excluded: dict) -> tuple:
@@ -257,7 +263,7 @@ def _left_out(counted: list, fam: Family, included: set, excluded: dict) -> tupl
 
 
 def compute(register: trials.TrialsRegister, text: str, family: str, returns: pd.Series, row_ideas: set,
-            try_id: str | None = None, sheet_ok=None) -> Result:
+            try_id: str | None = None, sheet_ok=None, try_fills: str | None = None) -> Result:
     """H0's (or any try's) deflated Sharpe across its family. row_ideas: the ideas the round's rows of this family
     count under (rescore derives them as it runs), for the stated count. try_id: the try's own register row, which
     joins the spread unpinned (main passes it only once its sheet shows 1-minute execution)."""
@@ -272,7 +278,7 @@ def compute(register: trials.TrialsRegister, text: str, family: str, returns: pd
     prior = rnd.prior.get(family, 0) if rnd is not None else 0
     n_stated = prior + rounds.used(register, row_ideas)
     n_register = rounds.used(register, set(fam.members))
-    rows, left_out = spread_rows(register, fam, try_id, sheet_ok)
+    rows, left_out = spread_rows(register, fam, try_id, sheet_ok, try_fills)
     sharpes = [s for _, _, s, _, _ in rows]
     floored = len(sharpes) < MIN_ROWS
     dsr = deflated_sharpe_probability(returns, max(n_stated, n_register, 1), sharpes,
@@ -344,11 +350,33 @@ def one_minute_fills(trades: Path, stem: str) -> bool:
     return False
 
 
+FILLS = "**Fills:**"
+FIRED = "1-minute execution fired:"
+
+
+def sheet_fills(folder: Path, stem: str) -> str | None:
+    """How a basket sheet in folder shows 1-minute execution fired, or None when it doesn't. Its own Fills line is
+    the test (Advisor 31 Oct: the header first, off-grid fill times the fallback), and is checked against its fill
+    times when its trade book is kept: a header the trades contradict is refused, not believed. A sheet written
+    before the line existed falls back to the off-grid test on its trade book alone."""
+    sheet, trades = folder / f"{stem}.md", folder / f"{stem}-basket-trades.csv"
+    line = None
+    if sheet.is_file():
+        line = next((x for x in sheet.read_text(encoding="utf-8").splitlines() if x.startswith(FILLS)), None)
+    if line is None:
+        return "its fill times (no Fills line)" if trades.is_file() and one_minute_fills(trades, stem) else None
+    fired = FIRED in line
+    if trades.is_file() and one_minute_fills(trades, stem) != fired:
+        raise ValueError(f"refused: sheet {stem}'s Fills line says 1-minute execution {'fired' if fired else 'did not'}"
+                         f", but its trade book has {'no' if fired else 'a'} fill off the {COARSEST_FINE}-minute grid")
+    return "its Fills line" if fired else None
+
+
 def _how(how) -> str:
     if how[0] == "own sheet":
-        return "1-minute fills: the try's own sheet"
+        return "1-minute fills: the try's own sheet" + (f", {how[1]}" if len(how) > 1 else "")
     if how[0] == "sheet":
-        return f"1-minute fills: sheet {how[1]}"
+        return f"1-minute fills: sheet {how[1]}" + (f", {how[2]}" if len(how) > 2 else "")
     return f"1-minute fills: hand-checked by {how[1]} ({how[2]})"
 
 
@@ -405,12 +433,13 @@ def main(argv=None, store=None, sheets: Path | None = None) -> int:
         own = try_row(register, a.sheet)
         folder = sheets or TEARSHEETS
         returns = pooled_returns(folder / f"{a.sheet}-pooled.csv")
-        if not one_minute_fills(folder / f"{a.sheet}-basket-trades.csv", a.sheet):
-            raise ValueError(f"refused: the try's sheet shows no fill off the {COARSEST_FINE}-minute grid, so 1-minute "
-                             f"execution isn't shown and its row {own} can't join the spread")
-        result = compute(register, text, a.family, returns, ideas, try_id=own, sheet_ok=lambda stem: (
-            folder / f"{stem}-basket-trades.csv").is_file() and one_minute_fills(folder / f"{stem}-basket-trades.csv",
-                                                                                    stem))
+        try_fills = sheet_fills(folder, a.sheet)
+        if try_fills is None:
+            raise ValueError(f"refused: the try's sheet doesn't show 1-minute execution fired (no Fills line saying so,"
+                             f" and no fill off the {COARSEST_FINE}-minute grid), so its row {own} can't join the "
+                             "spread")
+        result = compute(register, text, a.family, returns, ideas, try_id=own,
+                         sheet_ok=partial(sheet_fills, folder), try_fills=try_fills)
     except (ValueError, OSError, KeyError) as exc:
         print(exc if str(exc).startswith("refused:") else f"refused: {exc}")
         return 1
