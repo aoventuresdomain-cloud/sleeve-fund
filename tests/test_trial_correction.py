@@ -98,3 +98,60 @@ def test_an_already_correct_row_is_refused(tmp_path):
     (tmp_path / f"{stem}.results.json").write_text(json.dumps({"check": {"basket": {"sharpe": 1.80}}}))
     with pytest.raises(ValueError, match="already 1.8"):
         tc.plan(reg, rid, tmp_path / f"{stem}.md")
+
+
+def test_a_failed_row_is_never_corrected(tmp_path):
+    """A failed count (n_uncertain) has no Sharpe in the spread; a correction would give it one (CR M1a on #342)."""
+    reg, _, _ = _register(tmp_path)
+    row = {**trials.trial_row(definition_hash="k2", idea_hash=trials.legacy_idea_hash("rules"), name=f"basket:{LABEL}",
+                              family="rules", settings={}, dataset=DATASET, stage="in_sample", source="study",
+                              sharpe=None), "status": "failed", "error": "count failed"}
+    reg.store.add_trials([row])
+    with pytest.raises(ValueError, match="is failed/single, not ok/single"):
+        tc.plan(reg, row["id"], tmp_path / f"{_sheet(tmp_path)}.md")
+
+
+def test_a_ledger_without_a_finite_sharpe_is_refused(tmp_path):
+    """results.json writes NaN for a basket of under 2 test days; it never reaches the register (CR M1b on #342)."""
+    reg, rid, _ = _register(tmp_path)
+    stem = _sheet(tmp_path)
+    (tmp_path / f"{stem}.results.json").write_text(json.dumps({"check": {"basket": {"sharpe": float("nan")}}}))
+    with pytest.raises(ValueError, match="gives no finite book Sharpe"):
+        tc.plan(reg, rid, tmp_path / f"{stem}.md")
+
+
+def test_a_sheet_with_two_hold_lines_is_refused(tmp_path):
+    reg, rid, _ = _register(tmp_path)  # CR M1c on #342: which of two would be the book's is a guess
+    line = "| Hold bar (long-only baskets) | pooled Sharpe 1.21 (net +409.7%) |"
+    with pytest.raises(ValueError, match="2 hold-bar Sharpe lines, not one"):
+        tc.plan(reg, rid, tmp_path / f"{_sheet(tmp_path, ledger=False, hold=line + chr(10) + line)}.md")
+
+
+def test_anything_but_the_evaluation_count_moving_after_the_write_fails_the_run(tmp_path, capfd, monkeypatch):
+    """The post-write check is the only alarm once the row is in (CR M1d on #342)."""
+    reg, rid, _ = _register(tmp_path)
+    stem = _sheet(tmp_path)
+    answers = iter(["one setting", "another"])
+    monkeypatch.setattr(trials.TrialsRegister, "no_selection", lambda self, idea: next(answers))
+    assert tc.main(["--row", rid, "--sheet", stem, "--apply"], store=reg.store, sheets=tmp_path) == 1
+    assert "CHECK FAILED: no_selection or the spread moved" in capfd.readouterr().out
+
+
+def test_a_copied_by_year_is_reset_never_carried(tmp_path, monkeypatch):
+    """by_year would hold the close-priced run's per-year figures, so the correcting row has none (CR F2 on #342)."""
+    reg, rid, _ = _register(tmp_path)
+    real = trials.TrialsRegister._counted
+    monkeypatch.setattr(trials.TrialsRegister, "_counted",
+                        lambda self, idea=None: [{**t, "by_year": '{"2025": 1.9}'} for t in real(self, idea)])
+    _, fixed, _ = tc.plan(reg, rid, tmp_path / f"{_sheet(tmp_path)}.md")
+    assert fixed["by_year"] is None
+
+
+def test_the_whole_stem_must_be_the_trys(tmp_path):
+    """Label, dataset and stamp, nothing between (CR F4 on #342)."""
+    reg, rid, _ = _register(tmp_path)
+    stem = _sheet(tmp_path)
+    odd = stem.replace(f"{DATASET}_", f"{DATASET}_x_")
+    (tmp_path / f"{stem}.md").rename(tmp_path / f"{odd}.md")
+    with pytest.raises(ValueError, match="is not qrb0_range_reversion_adx on"):
+        tc.plan(reg, rid, tmp_path / f"{odd}.md")

@@ -6,7 +6,8 @@ name: trial-correct
 # A dry run unless apply is ticked: the dry run reads only. With apply it is a write to the live database, run only on
 # the HoE's dispatch with the PM's word for that row. It shares the study runs' concurrency group, so it never runs
 # beside one. The report holds Sharpes and ids, so it is encrypted on the runner to the project's key, as
-# trials-export's; the public log shows the outcome's first word and byte counts only. Run it by hand from main.
+# trials-export's; the public log shows the outcome's first word and byte counts only, beside the dispatch's own
+# inputs (the row id and sheet stem, as sheet-export shows its stem; neither is a figure). Run it by hand from main.
 # After an apply: append the decrypted report's "trail:" line to research/accuracy-checks/trials-corrections.md
 # in the project folder (the register can't mark a correction, and its Sharpes and ids stay out of this public repo).
 on:

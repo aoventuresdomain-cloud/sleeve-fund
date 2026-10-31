@@ -30,7 +30,6 @@ from sleeve_fund.research import trials
 # A sheet is written within this long of its study's try row (the row first, as basket_study records it): a later
 # re-run of the same basket writes another sheet under the same label and dataset, never another row
 SHEET_WITHIN = timedelta(hours=4)
-_STAMP = re.compile(r"_(\d{8}-\d{6})(?:-\d+)?$")
 _HOLD_LINE = re.compile(r"^\| Hold bar \(long-only baskets\) \| pooled Sharpe (-?\d+\.\d+) \(net ", re.M)
 LEDGER, SHEET_ONLY = "the sheet's daily ledger (results.json)", "from the sheet, no ledger"
 
@@ -63,8 +62,9 @@ def plan(register: trials.TrialsRegister, row_id: str, sheet_md: Path) -> tuple[
     if len(same) != 1:
         raise ValueError(f"refused: {len(same)} counted rows have this basket key, not one (already corrected?)")
     label, dataset = original["definition_name"][len("basket:"):], original["dataset"]
-    stamp = _STAMP.search(sheet_md.stem)
-    if not sheet_md.stem.startswith(f"{label}_{dataset}_") or stamp is None:
+    # the whole stem, as basket_run names a sheet (label_dataset_stamp, -N for a second in the same second)
+    stamp = re.fullmatch(rf"{re.escape(label)}_{re.escape(dataset)}_(\d{{8}}-\d{{6}})(?:-\d+)?", sheet_md.stem)
+    if stamp is None:
         raise ValueError(f"refused: the sheet {sheet_md.stem} is not {label} on {dataset}")
     written = datetime.strptime(stamp.group(1), "%Y%m%d-%H%M%S").replace(tzinfo=timezone.utc)
     created = trials._aware(original["created_at"])
