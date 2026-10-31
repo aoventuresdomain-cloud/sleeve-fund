@@ -14,7 +14,7 @@ from sleeve_fund.research.study import idea_of
 from sleeve_fund.store import Store
 
 LABEL, DATASET = "qrb0_range_reversion_adx", "binance-basket-btc-eth-sol-usdt-store-60m"
-BOOK = -1.6689877
+BOOK = -0.4317
 
 
 def _register(tmp_path):
@@ -25,12 +25,12 @@ def _register(tmp_path):
     start, end = datetime(2024, 1, 1, tzinfo=timezone.utc), datetime(2026, 5, 1, tzinfo=timezone.utc)
     rid = reg.record(definition_hash="k1", idea_hash=trials.legacy_idea_hash("rules"), name=f"basket:{LABEL}",
                      family="rules", settings={"basket": ["BTC", "ETH", "SOL"], "params": params, "parent": "p"},
-                     dataset=DATASET, stage="in_sample", source="study", sharpe=1.80, data_start=start, data_end=end)
+                     dataset=DATASET, stage="in_sample", source="study", sharpe=0.62, data_start=start, data_end=end)
     return reg, rid, idea_of(params, None)
 
 
 def _sheet(tmp_path, ledger=True, after=timedelta(minutes=30), hold="| Hold bar (long-only baskets) | pooled Sharpe "
-           "1.21 (net +409.7%, CAGR +72.1%) against ...|"):
+           "0.37 (net +12.3%, CAGR +4.5%) against ...|"):
     stem = f"{LABEL}_{DATASET}_{datetime.now(timezone.utc) + after:%Y%m%d-%H%M%S}"
     (tmp_path / f"{stem}.md").write_text(f"# Basket study\n\n{hold}\n", encoding="utf-8")
     if ledger:
@@ -47,13 +47,13 @@ def test_a_dry_run_writes_nothing_and_apply_adds_one_row_of_the_same_variant(tmp
     assert "dry run: nothing written" in capfd.readouterr().out and len(reg._counted()) == 1
     assert tc.main(["--row", rid, "--sheet", stem, "--apply"], store=reg.store, sheets=tmp_path) == 0
     out = capfd.readouterr().out
-    assert "CHECK FAILED" not in out and f"Sharpe 1.8 -> {BOOK} (the sheet's daily ledger (results.json))" in out
+    assert "CHECK FAILED" not in out and f"Sharpe 0.62 -> {BOOK} (the sheet's daily ledger (results.json))" in out
     after = (reg.counts(idea), reg.no_selection(idea), rounds.used(reg, {family_idea}))
     assert after[0]["variants"] == before[0]["variants"] == 1 and after[0]["evaluations"] == 2
     assert after[1] == before[1] and after[2] == before[2] == 1  # no_selection and the round's tries don't move
     assert reg.sharpes(idea) == [pytest.approx(BOOK)]  # the variant's latest row: the book's Sharpe
     original = next(t for t in reg._counted() if t["id"] == rid)
-    assert original["sharpe"] == pytest.approx(1.80)  # write-once: the wrong row stays, read past
+    assert original["sharpe"] == pytest.approx(0.62)  # write-once: the wrong row stays, read past
     # a second correction of the same try is refused: two rows have the key now
     assert tc.main(["--row", rid, "--sheet", stem, "--apply"], store=reg.store, sheets=tmp_path) == 1
     assert "2 counted rows have this basket key" in capfd.readouterr().out
@@ -62,7 +62,7 @@ def test_a_dry_run_writes_nothing_and_apply_adds_one_row_of_the_same_variant(tmp
 def test_without_a_ledger_the_sheets_printed_book_sharpe_is_used_and_said(tmp_path):
     reg, rid, _ = _register(tmp_path)
     original, fixed, source = tc.plan(reg, rid, tmp_path / f"{_sheet(tmp_path, ledger=False)}.md")
-    assert fixed["sharpe"] == 1.21 and source == tc.SHEET_ONLY
+    assert fixed["sharpe"] == 0.37 and source == tc.SHEET_ONLY
     assert trials._variant(fixed) == trials._variant(original) and fixed["id"] != original["id"]
     assert fixed["code_version"] == original["code_version"]  # the original's, not today's code
 
@@ -95,8 +95,8 @@ def test_another_basket_or_a_non_basket_row_is_refused(tmp_path, capfd):
 def test_an_already_correct_row_is_refused(tmp_path):
     reg, rid, _ = _register(tmp_path)
     stem = _sheet(tmp_path)
-    (tmp_path / f"{stem}.results.json").write_text(json.dumps({"check": {"basket": {"sharpe": 1.80}}}))
-    with pytest.raises(ValueError, match="already 1.8"):
+    (tmp_path / f"{stem}.results.json").write_text(json.dumps({"check": {"basket": {"sharpe": 0.62}}}))
+    with pytest.raises(ValueError, match="already 0.62"):
         tc.plan(reg, rid, tmp_path / f"{stem}.md")
 
 
@@ -122,7 +122,7 @@ def test_a_ledger_without_a_finite_sharpe_is_refused(tmp_path):
 
 def test_a_sheet_with_two_hold_lines_is_refused(tmp_path):
     reg, rid, _ = _register(tmp_path)  # CR M1c on #342: which of two would be the book's is a guess
-    line = "| Hold bar (long-only baskets) | pooled Sharpe 1.21 (net +409.7%) |"
+    line = "| Hold bar (long-only baskets) | pooled Sharpe 0.37 (net +12.3%) |"
     with pytest.raises(ValueError, match="2 hold-bar Sharpe lines, not one"):
         tc.plan(reg, rid, tmp_path / f"{_sheet(tmp_path, ledger=False, hold=line + chr(10) + line)}.md")
 

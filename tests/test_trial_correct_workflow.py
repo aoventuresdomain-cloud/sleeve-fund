@@ -43,12 +43,12 @@ def _run(tmp_path, apply: str, report: str, code: int = 0):
 
 
 def test_a_dry_run_runs_the_module_without_apply_and_logs_no_figure(tmp_path):
-    res, argv = _run(tmp_path, "", f'original: {{"id": "{ROW}", "sharpe": 1.8}}\ndry run: nothing written\n')
+    res, argv = _run(tmp_path, "", f'original: {{"id": "{ROW}", "sharpe": 0.62}}\ndry run: nothing written\n')
     assert res.returncode == 0, res.stderr
     assert argv[:7] == ["docker", "compose", "run", "--rm", "-T", "--no-deps", "--name"]
     assert argv[8:] == ["dashboard", "python", "-m", "sleeve_fund.research.trial_correction", "--row", ROW,
                         "--sheet", "b0_x_1"]
-    assert "outcome: dry, exit 0" in res.stdout and ROW not in res.stdout and "1.8" not in res.stdout
+    assert "outcome: dry, exit 0" in res.stdout and ROW not in res.stdout and "0.62" not in res.stdout
     assert (tmp_path / "code").read_text().strip() == "0" and (tmp_path / "plain" / "sheet.tar.gz").exists()
 
 
