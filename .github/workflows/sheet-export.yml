@@ -49,7 +49,8 @@ jobs:
           SHEET: ${{ inputs.sheet }}
         run: |
           # The sheet and what run.py writes beside it (write_results, write_returns, write_oos_returns,
-          # write_beside), those that exist; regular files only, never a link. Read only: tar to stdout.
+          # write_beside, basket_run.write_beside: run.BESIDE), those that exist, so scripts/recompute_sheet.py can
+          # rebuild it here (M1 item 9); regular files only, never a link. Read only: tar to stdout.
           set -euo pipefail
           umask 077
           mkdir -p "$RUNNER_TEMP/plain"
@@ -60,7 +61,8 @@ jobs:
               [ -f \"\$SHEET.md\" ] && [ ! -L \"\$SHEET.md\" ] || { echo \"no such sheet\" >&2; exit 3; }
               set --
               for f in \"\$SHEET.md\" \"\$SHEET.results.json\" \"\$SHEET.returns.csv\" \"\$SHEET.oos-returns.csv\" \
-                       \"\$SHEET-trades.csv\" \"\$SHEET-equity.csv\" \"\$SHEET-equity.svg\"; do
+                       \"\$SHEET-trades.csv\" \"\$SHEET-equity.csv\" \"\$SHEET-equity.svg\" \"\$SHEET-oos-trades.csv\" \
+                       \"\$SHEET-basket-trades.csv\" \"\$SHEET-pooled.csv\"; do
                 [ -f \"\$f\" ] && [ ! -L \"\$f\" ] && set -- \"\$@\" \"\$f\"
               done
               tar -czf - -- \"\$@\"'" > "$RUNNER_TEMP/plain/sheet.tar.gz"
@@ -69,6 +71,7 @@ jobs:
             case "$mode" in -*) ;; *) echo "::error::not a regular file in the archive"; exit 1;; esac
             case "$name" in
               "$SHEET.md"|"$SHEET.results.json"|"$SHEET.returns.csv"|"$SHEET.oos-returns.csv"|"$SHEET-trades.csv"|"$SHEET-equity.csv"|"$SHEET-equity.svg") ;;
+              "$SHEET-oos-trades.csv"|"$SHEET-basket-trades.csv"|"$SHEET-pooled.csv") ;;
               *) echo "::error::unexpected name in the archive"; exit 1;;
             esac
             echo "$name $size bytes"

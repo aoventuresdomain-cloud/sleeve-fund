@@ -277,6 +277,7 @@ def main(argv: list[str] | None = None, run=None, journal=None) -> int:
             if so_far >= rnd.budget:  # M1 item 5: refused before it runs, and counted as a failed row
                 failed += 1
                 print(f"row {n:>2} {name}: REFUSED, family {family} has used {so_far} of its {rnd.budget} tries")
+                print(peak_memory_line())
                 continue
             extra = {"notes": (rounds.try_line(rnd, n, so_far),)}
         try:
@@ -285,13 +286,27 @@ def main(argv: list[str] | None = None, run=None, journal=None) -> int:
             failed += 1
             note = refusal_note(n, name, args, exc)
             print(f"row {n:>2} {name}: FAILED ({type(exc).__name__})" + (f", note {note}" if note else ""))
+            print(peak_memory_line())
             continue
         ok += 1
         print(f"row {n:>2} {name}: ran" + (f", sheet {sheet.stem}" if isinstance(sheet, Path) else ""))
+        print(peak_memory_line())
     print(f"done: {ok} ran, {failed} failed; results on the Research page")
+    print(peak_memory_line("run"))
     if rnd is not None:  # M1 item 6: the round in one line, off the register
         print(rounds.summary(rnd, {f: rounds.used(register, i) for f, i in ideas.items()}))
     return 1 if failed else 0
+
+
+def peak_memory_line(what: str = "so far") -> str:
+    """HoE 31 Oct (B0 watched): the process's peak resident memory, under each row and once at the end, so a study's
+    footprint shows in the public log against the dashboard's mem_limit without a shell on the box. Rows run in this
+    process; any child processes' largest peak is shown too. Linux reports ru_maxrss in KB."""
+    import resource
+
+    own = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+    kids = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss / 1024
+    return f"    peak memory {what}: {own:.0f} MB" + (f" (largest child process {kids:.0f} MB)" if kids >= 1 else "")
 
 
 if __name__ == "__main__":

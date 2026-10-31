@@ -70,6 +70,27 @@ def test_the_log_prints_counts_and_ran_or_failed_only(capfd, tmp_path):
     assert "1.234" not in out and "0.055" not in out and "example.com" not in out and "Sharpe" not in out
 
 
+def test_each_row_and_the_end_print_the_peak_memory_in_mb(capfd, tmp_path):
+    """HoE 31 Oct: B0's footprint is watched from the public log, so under every row, ran or failed, and once at the
+    end, the process's peak resident memory is printed in MB, and nothing else is added."""
+    import re
+
+    def run(req, store=None):
+        if req.label == "qr02_dip_short":
+            raise ValueError("no")
+        return tmp_path / f"{req.label}.md"
+
+    rescore.main([str(LIST), "--rows", "1-8"], run=run, journal=lambda: None)
+    lines = capfd.readouterr().out.splitlines()
+    rows = [i for i, line in enumerate(lines) if re.match(r"row +\d+ ", line)]
+    assert len(rows) == 8
+    for i in rows:
+        assert re.fullmatch(r"    peak memory so far: \d+ MB( \(largest child process \d+ MB\))?", lines[i + 1])
+    end = lines.index(next(line for line in lines if line.startswith("done: ")))
+    m = re.fullmatch(r"    peak memory run: (\d+) MB( \(largest child process \d+ MB\))?", lines[end + 1])
+    assert m and 10 < int(m[1]) < 100_000  # a Python process with the engine imported, in MB rather than KB
+
+
 def test_a_dry_run_runs_nothing(capfd):
     called = []
     assert rescore.main([str(LIST), "--dry-run"], run=lambda *a, **k: called.append(1), journal=lambda: None) == 0
