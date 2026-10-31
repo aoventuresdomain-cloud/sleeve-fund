@@ -353,7 +353,13 @@ def test_a_sheets_fills_line_is_the_test_checked_against_its_trade_book(tmp_path
     on = "asset,entry_time,exit_time\nA,2025-01-07T16:00:00,2025-01-08T12:05:00\n"
     assert fd.sheet_fills(tmp_path, stem) is None  # neither kept
     sheet.write_text(f"# qrx\n\n{FIRED_LINE}\n")
-    assert fd.sheet_fills(tmp_path, stem) == "its Fills line"  # the header alone, its trade book not kept
+    with pytest.raises(ValueError, match="Fills line has no trade book beside it to check it against; pin its row as "
+                                         "hand-checked instead"):
+        fd.sheet_fills(tmp_path, stem)  # the header alone is never believed (Advisor 31 Oct, CR F1)
+    sheet.write_text(f"# qrx\n\n{NOT_SHOWN}\n")
+    with pytest.raises(ValueError, match="Fills line has no trade book beside it"):
+        fd.sheet_fills(tmp_path, stem)
+    sheet.write_text(f"# qrx\n\n{FIRED_LINE}\n")
     trades.write_text(off)
     assert fd.sheet_fills(tmp_path, stem) == "its Fills line"  # the header, and its trades agree
     for line in (NOT_SHOWN, COARSE):
@@ -391,17 +397,25 @@ def test_the_cli_reads_the_try_and_pins_by_their_fills_lines(tmp_path, capfd, mo
     ret = _returns()
     pd.DataFrame({"date": ret.index.strftime("%Y-%m-%d"), "pooled_return": ret.values}).to_csv(
         sheets / f"{stem}-pooled.csv", index=False)
+    off = "asset,entry_time,exit_time\nA,2025-01-07T16:00:00,2025-01-08T12:07:00\n"
+    on = "asset,entry_time,exit_time\nA,2025-01-07T16:00:00,2025-01-08T12:05:00\n"
     (sheets / f"{stem}.md").write_text(f"# qrx\n\n{FIRED_LINE}\n")
     (sheets / f"{kept}.md").write_text(f"# qry\n\n{NOT_SHOWN}\n")
+    (sheets / f"{kept}-basket-trades.csv").write_text(on)
     monkeypatch.chdir(tmp_path)
     argv = ["--list", "configs/studies/r.md", "--family", "B", "--sheet", stem]
+    assert fd.main(argv, store=reg.store, sheets=sheets) == 1  # the try's header has no trade book beside it
+    assert f"refused: sheet {stem}'s Fills line has no trade book beside it" in capfd.readouterr().out
+    (sheets / f"{stem}-basket-trades.csv").write_text(off)
     assert fd.main(argv, store=reg.store, sheets=sheets) == 1  # the pin's header says not shown
     assert f"row {pinned}'s sheet {kept} doesn't show 1-minute execution fired" in capfd.readouterr().out
     (sheets / f"{kept}.md").write_text(f"# qry\n\n{FIRED_LINE}\n")
+    (sheets / f"{kept}-basket-trades.csv").write_text(off)
     assert fd.main(argv, store=reg.store, sheets=sheets) == 0
     out = capfd.readouterr().out.splitlines()
     assert any(x.endswith("1-minute fills: the try's own sheet, its Fills line") for x in out)
     assert f"  spread row {pinned} ({'6' * 16}): Sharpe 0.0700, 1-minute fills: sheet {kept}, its Fills line" in out
     (sheets / f"{stem}.md").write_text(f"# qrx\n\n{COARSE}\n")  # the try's own header: coarse fills, refused
+    (sheets / f"{stem}-basket-trades.csv").write_text(on)
     assert fd.main(argv, store=reg.store, sheets=sheets) == 1
     assert "the try's sheet doesn't show 1-minute execution fired" in capfd.readouterr().out

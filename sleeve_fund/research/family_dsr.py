@@ -356,17 +356,21 @@ FIRED = "1-minute execution fired:"
 
 def sheet_fills(folder: Path, stem: str) -> str | None:
     """How a basket sheet in folder shows 1-minute execution fired, or None when it doesn't. Its own Fills line is
-    the test (Advisor 31 Oct: the header first, off-grid fill times the fallback), and is checked against its fill
-    times when its trade book is kept: a header the trades contradict is refused, not believed. A sheet written
-    before the line existed falls back to the off-grid test on its trade book alone."""
+    the test (Advisor 31 Oct: the header first, off-grid fill times the fallback), and counts only with its trade
+    book beside it and matching it: a header the trades contradict, or with no trade book, is refused, not believed
+    (a sheet whose trade book is gone is pinned as hand-checked instead). A sheet written before the line existed
+    falls back to the off-grid test on its trade book alone."""
     sheet, trades = folder / f"{stem}.md", folder / f"{stem}-basket-trades.csv"
     line = None
     if sheet.is_file():
         line = next((x for x in sheet.read_text(encoding="utf-8").splitlines() if x.startswith(FILLS)), None)
     if line is None:
         return "its fill times (no Fills line)" if trades.is_file() and one_minute_fills(trades, stem) else None
+    if not trades.is_file():
+        raise ValueError(f"refused: sheet {stem}'s Fills line has no trade book beside it to check it against; pin "
+                         "its row as hand-checked instead")
     fired = FIRED in line
-    if trades.is_file() and one_minute_fills(trades, stem) != fired:
+    if one_minute_fills(trades, stem) != fired:
         raise ValueError(f"refused: sheet {stem}'s Fills line says 1-minute execution {'fired' if fired else 'did not'}"
                          f", but its trade book has {'no' if fired else 'a'} fill off the {COARSEST_FINE}-minute grid")
     return "its Fills line" if fired else None
