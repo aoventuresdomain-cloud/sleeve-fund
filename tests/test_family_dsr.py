@@ -302,8 +302,13 @@ def test_the_cli_reads_the_sheets_pooled_returns_and_refuses_in_words(tmp_path, 
     lst.write_text(_text(f"{'1' * 16}/{ids['x1']}, {'6' * 16}/{pinned} (sheet {kept})"))
     assert fd.main(argv, store=reg.store, sheets=sheets) == 1  # its sheet isn't in the folder
     assert f"row {pinned}'s sheet {kept} shows no fill off" in capfd.readouterr().out
+    for coarse in ("12:05", "12:15"):  # the pinned sheet's fills on the 5-minute grid: not shown, refused
+        (sheets / f"{kept}-basket-trades.csv").write_text(f"asset,entry_time,exit_time\nA,2025-02-01T04:00:00,"
+                                                          f"2025-02-01T{coarse}:00\n")
+        assert fd.main(argv, store=reg.store, sheets=sheets) == 1
+        assert f"row {pinned}'s sheet {kept} shows no fill off the 5-minute grid" in capfd.readouterr().out
     (sheets / f"{kept}-basket-trades.csv").write_text("asset,entry_time,exit_time\nA,2025-02-01T04:00:00,"
-                                                      "2025-02-01T09:07:00\n")
+                                                      "2025-02-01T12:07:00\n")
     assert fd.main(argv, store=reg.store, sheets=sheets) == 0
     assert f"  spread row {pinned} ({'6' * 16}): Sharpe 0.0700, 1-minute fills: sheet {kept}" in (
         capfd.readouterr().out.splitlines())
