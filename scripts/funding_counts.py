@@ -24,7 +24,8 @@ STEM-basket-trades.csv in TEARSHEET_DIR): CHECK8_SAMPLE of them, seeded, at leas
 close when the book has one (those closes coincide with a settlement). For each, the settlement its fr.rate should
 have read is re-derived from the stored rates with plain pandas, not by the block: the latest believable one stamped
 before the 4-hour decision close less MATCH, and the latest due. An entry fails when there is none, or when the trade
-book's fr.rate is not that settlement's stored rate (a rate stamped at the close itself, read too early, fails here).
+book's fr.rate is not that settlement's stored rate (a rate stamped at the close itself, read too early, fails here),
+or when it filled more than FILL_LAG after its close, so which close it was decided on is unknown.
 The log shows PASS or FAIL and the counts only."""
 
 from __future__ import annotations
@@ -141,6 +142,7 @@ def gate_counts(venue: str, pair: str, start: pd.Timestamp, end: pd.Timestamp, r
 
 CHECK8_SAMPLE = 12
 CHECK8_SEED = 20261101
+FILL_LAG = pd.Timedelta(minutes=5)  # an entry filled later than this after its close fails check 8
 
 
 def _signal(values: str, key: str) -> float | None:
@@ -150,11 +152,15 @@ def _signal(values: str, key: str) -> float | None:
     return None if m is None else float(m.group(1))
 
 
-def _close(entry_time: str) -> pd.Timestamp:
-    """The 4-hour close an entry was decided on: it fills at the open of the minute after, so the latest 4-hour
-    boundary at or before its fill."""
+def _fill(entry_time: str) -> pd.Timestamp:
     t = pd.Timestamp(entry_time)
-    return (t.tz_localize("UTC") if t.tzinfo is None else t.tz_convert("UTC")).floor(BAR)
+    return t.tz_localize("UTC") if t.tzinfo is None else t.tz_convert("UTC")
+
+
+def _close(entry_time: str) -> pd.Timestamp:
+    """The 4-hour close an entry was decided on: it fills at market at the open of the minute after (maker orders are
+    off), so the latest 4-hour boundary at or before its fill."""
+    return _fill(entry_time).floor(BAR)
 
 
 def check8(venue: str, trades, root=None, quote: str = "USDT", block: str = "fr") -> dict:
@@ -190,7 +196,8 @@ def check8(venue: str, trades, root=None, quote: str = "USDT", block: str = "fr"
         before = s[s.index < close - funding.MATCH]
         fr = _signal(r.get("entry_signal_values", ""), f"{block}.rate")
         due = len(before) and close - before.index[-1] <= interval + funding.MATCH
-        failed += not (due and fr is not None and float(before.iloc[-1]) == fr)
+        late = _fill(r["entry_time"]) - close > FILL_LAG  # not filled just after a close: which one is unknown
+        failed += late or not (due and fr is not None and float(before.iloc[-1]) == fr)
     return {"sampled": len(picked), "on_settlement": sum(_close(r["entry_time"]).hour % 8 == 0 for r in picked),
             "failed": failed}
 
