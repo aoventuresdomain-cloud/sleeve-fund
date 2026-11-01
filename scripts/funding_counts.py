@@ -142,7 +142,7 @@ def gate_counts(venue: str, pair: str, start: pd.Timestamp, end: pd.Timestamp, r
 
 CHECK8_SAMPLE = 12
 CHECK8_SEED = 20261101
-FILL_LAG = pd.Timedelta(minutes=5)  # an entry filled later than this after its close fails check 8
+FILL_LAG = pd.Timedelta(minutes=1)  # an entry filled later than this after its close fails check 8
 
 
 def _signal(values: str, key: str) -> float | None:

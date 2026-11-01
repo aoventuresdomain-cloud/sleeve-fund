@@ -189,10 +189,10 @@ def test_check_8_passes_when_each_entry_read_the_settlement_before_its_close_and
     assert funding_counts.check8("BINANCE", book, tmp_path / "h") == {"sampled": 1, "on_settlement": 0, "failed": 1}
     _book(book, [("BTC", gone[0].ceil("4h") + 4 * H + pd.Timedelta(minutes=1), rows[59][1])])  # a stale rate read
     assert funding_counts.check8("BINANCE", book, tmp_path / "h") == {"sampled": 1, "on_settlement": 0, "failed": 1}
-    late = [("BTC", closes[1] + pd.Timedelta(minutes=6), right(closes[1]))]  # the right rate, but filled 6 min late
+    late = [("BTC", closes[1] + pd.Timedelta(minutes=2), right(closes[1]))]  # the right rate, but filled a minute late
     _book(book, late)
     assert funding_counts.check8("BINANCE", book, tmp_path / "h") == {"sampled": 1, "on_settlement": 0, "failed": 1}
-    _book(book, [("BTC", closes[1] + pd.Timedelta(minutes=5), right(closes[1]))])  # 5 min: still its close's
+    _book(book, [("BTC", closes[1] + pd.Timedelta(minutes=1), right(closes[1]))])  # the minute after: its close's
     assert funding_counts.check8("BINANCE", book, tmp_path / "h") == {"sampled": 1, "on_settlement": 0, "failed": 0}
     _book(book, good)
     monkeypatch.setenv("TEARSHEET_DIR", str(book.parent))
