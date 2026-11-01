@@ -17,7 +17,15 @@ With --gate (Advisor's check on A0's short gate, 1 Nov), a second table: per pai
 window at or above GATE_RATE per 8 hours (funding.believable ones only, as the blocks read them), and how many of
 those the funding_percentile block itself reads at GATE_PCT or above at the next 4-hour close: the block is fed the
 same (times, rates, interval) the runner hands it (runner.funding_decile_source), the interval from the venue's
-schedule. Counts only: the log never shows a rate, a price or a time."""
+schedule. Counts only: the log never shows a rate, a price or a time.
+
+With --check8 STEM (Advisor's check 8, settled funding only), a sample of that basket sheet's entries (its
+STEM-basket-trades.csv in TEARSHEET_DIR): CHECK8_SAMPLE of them, seeded, at least one decided on a 00, 08 or 16 UTC
+close when the book has one (those closes coincide with a settlement). For each, the settlement its fr.rate should
+have read is re-derived from the stored rates with plain pandas, not by the block: the latest believable one stamped
+before the 4-hour decision close less MATCH, and the latest due. An entry fails when there is none, or when the trade
+book's fr.rate is not that settlement's stored rate (a rate stamped at the close itself, read too early, fails here).
+The log shows PASS or FAIL and the counts only."""
 
 from __future__ import annotations
 
@@ -120,6 +128,61 @@ def gate_counts(venue: str, pair: str, start: pd.Timestamp, end: pd.Timestamp, r
     return out
 
 
+CHECK8_SAMPLE = 12
+CHECK8_SEED = 20261101
+
+
+def _signal(values: str, key: str) -> float | None:
+    import re
+
+    m = re.search(rf"(?:^|;\s*){re.escape(key)}=([^;]+)", values or "")
+    return None if m is None else float(m.group(1))
+
+
+def _close(entry_time: str) -> pd.Timestamp:
+    """The 4-hour close an entry was decided on: it fills at the open of the minute after, so the latest 4-hour
+    boundary at or before its fill."""
+    t = pd.Timestamp(entry_time)
+    return (t.tz_localize("UTC") if t.tzinfo is None else t.tz_convert("UTC")).floor(BAR)
+
+
+def check8(venue: str, trades, root=None, quote: str = "USDT", block: str = "fr") -> dict:
+    """{sampled, on_settlement, failed} over a seeded sample of the trade book's entries (see the module's note)."""
+    import csv
+    import random
+
+    from sleeve_fund.markets import funding_interval
+    from sleeve_fund.venues import venue as venue_profile
+
+    interval = pd.Timedelta(funding_interval(venue_profile(venue).funding_hours))
+    with open(trades, newline="", encoding="utf-8") as f:
+        rows = [r for r in csv.DictReader(f) if r.get("entry_time")]
+    on = [r for r in rows if _close(r["entry_time"]).hour % 8 == 0]
+    off = [r for r in rows if _close(r["entry_time"]).hour % 8]
+    rng = random.Random(CHECK8_SEED)
+    k = min(len(on), max(1, CHECK8_SAMPLE // 2)) if on else 0
+    picked = rng.sample(on, k)
+    picked += rng.sample(off, min(len(off), CHECK8_SAMPLE - k))
+    if len(picked) < CHECK8_SAMPLE:
+        picked += rng.sample([r for r in on if r not in picked], min(len(on) - k, CHECK8_SAMPLE - len(picked)))
+    stored: dict = {}
+    failed = 0
+    for r in picked:
+        asset = r["asset"].strip()
+        pair = asset if "/" in asset else f"{asset.upper()}/{quote}"
+        if pair not in stored:
+            s = funding.rates(venue, pair, root)
+            cap = funding.cap_of(venue, pair)
+            stored[pair] = s[[funding.believable(x, cap) for x in s.to_numpy()]]
+        s, close = stored[pair], _close(r["entry_time"])
+        before = s[s.index < close - funding.MATCH]
+        fr = _signal(r.get("entry_signal_values", ""), f"{block}.rate")
+        due = len(before) and close - before.index[-1] <= interval + funding.MATCH
+        failed += not (due and fr is not None and float(before.iloc[-1]) == fr)
+    return {"sampled": len(picked), "on_settlement": sum(_close(r["entry_time"]).hour % 8 == 0 for r in picked),
+            "failed": failed}
+
+
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--venue", required=True)
@@ -127,9 +190,18 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--start", required=True, help="first UTC day, e.g. 2024-01-01")
     ap.add_argument("--end", required=True, help="last UTC day, included, e.g. 2026-10-30")
     ap.add_argument("--root", default=None, help="history folder (default HISTORY_DIR or data/history)")
+    ap.add_argument("--check8", default=None, metavar="STEM", help="also run check 8 on that basket sheet's trade "
+                    "book (STEM-basket-trades.csv in TEARSHEET_DIR)")
     ap.add_argument("--gate", action="store_true", help="also count A0's short gate (rates at or above "
                     f"{GATE_RATE} per 8 hours, and those read at fr.pct {GATE_PCT:.0f} or above)")
     a = ap.parse_args(argv)
+    import re
+
+    from sleeve_fund.research.family_dsr import STEM
+
+    if a.check8 is not None and (not STEM.fullmatch(a.check8) or not re.fullmatch(r"[A-Za-z0-9._-]+", a.check8)):
+        print("--check8 takes a basket sheet's stem")
+        return 2
     start, end = pd.Timestamp(a.start, tz="UTC"), pd.Timestamp(a.end, tz="UTC")
     if end < start:
         print("the window runs backwards")
@@ -163,6 +235,21 @@ def main(argv: list[str]) -> int:
             g = gate_counts(a.venue, pair.strip(), start, end, a.root)
             print(f"| {pair.strip().split('/')[0].upper()} | {g['high']} | {g['read']} | {g['at_pct']} | "
                   f"{g['no_value']} | {g['other_read']} |")
+    if a.check8 is not None:
+        import os
+        from pathlib import Path
+
+        trades = Path(os.environ.get("TEARSHEET_DIR", "research/tearsheets")) / f"{a.check8}-basket-trades.csv"
+        if not trades.is_file():
+            print("\ncheck 8: not run, the sheet's trade book isn't in TEARSHEET_DIR")
+            return 2
+        c = check8(a.venue, trades, a.root)
+        print(f"\ncheck 8 (settled funding only): {c['sampled']} entries sampled, {c['on_settlement']} on a 00, 08 or "
+              "16 UTC close")
+        print("check 8: FAIL (no entries in the trade book)" if not c["sampled"] else
+              "check 8: PASS" if not c["failed"] else f"check 8: FAIL ({c['failed']} of {c['sampled']})")
+        if c["failed"] or not c["sampled"]:
+            return 1
     return 2 if empty else 0
 
 

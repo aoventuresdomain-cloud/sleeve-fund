@@ -147,3 +147,60 @@ def test_without_the_gate_flag_the_table_is_unchanged(tmp_path, capfd):
     funding_counts.main(["--venue", "BINANCE", "--pairs", "BTC/USDT", "--start", "2024-01-01", "--end", "2024-01-02",
                          "--root", str(tmp_path)])
     assert "Short gate" not in capfd.readouterr().out
+
+
+def _book(path: Path, entries: list) -> None:
+    lines = ["asset,leg,test_day,trade,side,entry_time,entry_signal_values"]
+    lines += [f"{a},{a.lower()},yes,{n},short,{t:%Y-%m-%dT%H:%M:%S},fr.pct=95.0; fr.rate={r!r}"
+              for n, (a, t, r) in enumerate(entries)]
+    path.write_text("\n".join(lines) + "\n")
+
+
+def test_check_8_passes_when_each_entry_read_the_settlement_before_its_close_and_fails_on_the_closes_own(
+        tmp_path, capfd, monkeypatch):
+    """Advisor's check 8 (settled funding only): the trade book's fr.rate must be the latest believable settlement
+    stamped before the decision close less a minute. A rate stamped at the close itself is the next one's."""
+    t0 = pd.Timestamp("2024-01-01", tz="UTC") - pd.Timedelta(seconds=30.5)  # stamped early: still the hour's own
+    rows = [(t0 + 8 * H * k, 0.0001 + 1e-6 * k) for k in range(3 * 30)]
+    rows[40] = (rows[40][0], 0.06)  # day 13 08:00, beyond the cap: not believed, never a rate a rule reads
+    gone = rows.pop(60)  # day 20 00:00 missing: the entry after it can't read day 19 16:00's as the latest due
+    _rates(tmp_path / "h", "BTC/USDT", rows)
+    rate = dict(rows)
+    stamps = [t for t, _ in rows]
+
+    def right(close):
+        return [rate[t] for t in stamps if t < close - pd.Timedelta(minutes=1) and abs(rate[t]) <= 0.05][-1]
+
+    closes = [pd.Timestamp("2024-01-05", tz="UTC") + 4 * H * k for k in range(24)]  # half of them 00, 08 or 16
+    good = [("BTC", c + pd.Timedelta(minutes=1), right(c)) for c in closes]
+    book = tmp_path / "s" / "qra0_x_binance-basket-btc-eth-sol-usdt-store-240m_20261101-165919-basket-trades.csv"
+    book.parent.mkdir()
+    _book(book, good)
+    c = funding_counts.check8("BINANCE", book, tmp_path / "h")
+    assert c == {"sampled": 12, "on_settlement": 6, "failed": 0}
+    early = [("BTC", c + pd.Timedelta(minutes=1), rate[next(t for t in stamps if t > c - pd.Timedelta(minutes=1))])
+             for c in closes if c.hour % 8 == 0]  # each read the settlement at its own close: look-ahead
+    off = [g for g in good if (g[1] - pd.Timedelta(minutes=1)).hour % 8]
+    _book(book, off + early)
+    c = funding_counts.check8("BINANCE", book, tmp_path / "h")
+    assert c == {"sampled": 12, "on_settlement": 6, "failed": 6}  # every 00, 08 or 16 one read too early
+    _book(book, [("BTC", stamps[40].ceil("4h") + 4 * H + pd.Timedelta(minutes=1), 0.06)])  # read the unbelievable
+    assert funding_counts.check8("BINANCE", book, tmp_path / "h") == {"sampled": 1, "on_settlement": 0, "failed": 1}
+    _book(book, [("BTC", gone[0].ceil("4h") + 4 * H + pd.Timedelta(minutes=1), rows[59][1])])  # a stale rate read
+    assert funding_counts.check8("BINANCE", book, tmp_path / "h") == {"sampled": 1, "on_settlement": 0, "failed": 1}
+    _book(book, good)
+    monkeypatch.setenv("TEARSHEET_DIR", str(book.parent))
+    stem = book.name.removesuffix("-basket-trades.csv")
+    args = ["--venue", "BINANCE", "--pairs", "BTC/USDT", "--start", "2024-01-01", "--end", "2024-01-30", "--root",
+            str(tmp_path / "h")]
+    assert funding_counts.main(args + ["--check8", stem]) == 0
+    out = capfd.readouterr().out
+    assert "check 8: PASS" in out and "12 entries sampled, 6 on a 00, 08 or 16 UTC close" in out
+    tail = out[out.index("check 8 (settled"):]
+    assert "0.0" not in tail and "2024" not in tail  # counts only: no rate, no time
+    _book(book, off + early)
+    assert funding_counts.main(args + ["--check8", stem]) == 1
+    assert "check 8: FAIL (6 of 12)" in capfd.readouterr().out
+    assert funding_counts.main(args + ["--check8", "../etc/passwd"]) == 2
+    assert funding_counts.main(args + ["--check8", stem.replace("240m", "60m")]) == 2  # no such sheet
+    assert "isn't in TEARSHEET_DIR" in capfd.readouterr().out
