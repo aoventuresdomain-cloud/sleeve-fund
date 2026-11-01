@@ -121,6 +121,7 @@ def test_the_short_gate_counts_rates_at_the_line_and_the_blocks_own_reading_at_t
     del rates[at(190)]
     rates[early] = 0.0005
     rates[at(195)] = 0.06  # beyond the cap: not believed, so neither counted nor in any window
+    rates[at(201)] = 0.0004  # after the window's last day: never counted (CR on #348, M1)
     rows = sorted(rates.items())
     _rates(tmp_path, "BTC/USDT", rows)
     rows = [(u, x) for u, x in rows if abs(x) <= 0.05]  # what the blocks read (funding.believable)
@@ -204,3 +205,38 @@ def test_check_8_passes_when_each_entry_read_the_settlement_before_its_close_and
     assert funding_counts.main(args + ["--check8", "../etc/passwd"]) == 2
     assert funding_counts.main(args + ["--check8", stem.replace("240m", "60m")]) == 2  # no such sheet
     assert "isn't in TEARSHEET_DIR" in capfd.readouterr().out
+
+
+
+def test_the_gate_line_is_per_8_hours_on_a_4_hourly_schedule(tmp_path, monkeypatch):
+    """CR on #348, F1: a rate per settlement is scaled to 8 hours before it meets the line, so on a 4-hourly
+    schedule 0.00016 (0.00032 per 8 hours) is at the line and 0.00014 (0.00028) is not."""
+    from dataclasses import replace
+
+    from sleeve_fund import venues
+
+    monkeypatch.setitem(venues.VENUES, "BINANCE", replace(venues.VENUES["BINANCE"], funding_hours=(0, 4, 8, 12, 16, 20)))
+    t0 = pd.Timestamp("2024-01-01", tz="UTC") + pd.Timedelta(milliseconds=500)
+    rates = {t0 + 4 * H * k: 0.00001 for k in range(6 * 120)}
+    rates[t0 + 4 * H * (6 * 100)] = 0.00016
+    rates[t0 + 4 * H * (6 * 101)] = 0.00014
+    _rates(tmp_path, "BTC/USDT", sorted(rates.items()))
+    g = funding_counts.gate_counts("BINANCE", "BTC/USDT", pd.Timestamp("2024-01-01", tz="UTC"),
+                                   pd.Timestamp("2024-04-29", tz="UTC"), tmp_path)
+    assert g["high"] == 1 and g["read"] == 1 and g["at_pct"] == 1
+
+
+def test_both_counts_refuse_if_the_blocks_read_rule_changes(tmp_path, monkeypatch):
+    """CR on #348, F2: the read rule here is the blocks' with FUNDING_AT_CLOSE off; if it flips, refuse."""
+    import pytest
+
+    from sleeve_fund.strategies import definitions
+
+    monkeypatch.setattr(definitions, "FUNDING_AT_CLOSE", True)
+    with pytest.raises(SystemExit, match="FUNDING_AT_CLOSE"):
+        funding_counts.gate_counts("BINANCE", "BTC/USDT", pd.Timestamp("2024-01-01", tz="UTC"),
+                                   pd.Timestamp("2024-01-02", tz="UTC"), tmp_path)
+    book = tmp_path / "b.csv"
+    _book(book, [])
+    with pytest.raises(SystemExit, match="FUNDING_AT_CLOSE"):
+        funding_counts.check8("BINANCE", book, tmp_path)

@@ -90,6 +90,16 @@ def counts(venue: str, pair: str, start: pd.Timestamp, end: pd.Timestamp, root=N
             "possible_holes": possible, "holes_across_a_change": across}
 
 
+def _reads_before_the_close() -> None:
+    """Both counts read a settlement as the funding blocks do with FUNDING_AT_CLOSE off: only one stamped before the
+    close less MATCH (CR on #348, F2). Should that flag change, refuse rather than count by another rule."""
+    from sleeve_fund.strategies import definitions
+
+    if definitions.FUNDING_AT_CLOSE:
+        raise SystemExit("refused: the funding blocks now read the close's own settlement (FUNDING_AT_CLOSE); "
+                         "this script's read rule needs updating first")
+
+
 def gate_counts(venue: str, pair: str, start: pd.Timestamp, end: pd.Timestamp, root=None) -> dict:
     """{high, read, at_pct, no_value, other_read} for settlements on [start, end + 1 day): high counts the believable
     stored rates at or above GATE_RATE per 8 hours; of those, read counts the ones the block reads as its latest rate
@@ -100,6 +110,7 @@ def gate_counts(venue: str, pair: str, start: pd.Timestamp, end: pd.Timestamp, r
     from sleeve_fund.strategies.definitions import FundingPercentile
     from sleeve_fund.venues import venue as venue_profile
 
+    _reads_before_the_close()
     s = funding.rates(venue, pair, root)
     cap = funding.cap_of(venue, pair)
     s = s[[funding.believable(r, cap) for r in s.to_numpy()]]
@@ -154,6 +165,7 @@ def check8(venue: str, trades, root=None, quote: str = "USDT", block: str = "fr"
     from sleeve_fund.markets import funding_interval
     from sleeve_fund.venues import venue as venue_profile
 
+    _reads_before_the_close()
     interval = pd.Timedelta(funding_interval(venue_profile(venue).funding_hours))
     with open(trades, newline="", encoding="utf-8") as f:
         rows = [r for r in csv.DictReader(f) if r.get("entry_time")]
