@@ -11,16 +11,28 @@ costs side charges the baseline for each missing settlement, which is the missin
 venue's schedule as the kept rates show it: every kept one, every one inside a hole (funding.gaps), and every one
 between the window's edges and the first or last kept rate. An interval change the rates alone can't tell from a hole
 (funding.interval_changes) is listed as a possible hole, not counted; a hole across a change is counted on the
-interval before it and listed beside the table, since the change may sit inside it."""
+interval before it and listed beside the table, since the change may sit inside it.
+
+With --gate (Advisor's check on A0's short gate, 1 Nov), a second table: per pair, the stored settled rates in the
+window at or above GATE_RATE per 8 hours (funding.believable ones only, as the blocks read them), and how many of
+those the funding_percentile block itself reads at GATE_PCT or above at the next 4-hour close: the block is fed the
+same (times, rates, interval) the runner hands it (runner.funding_decile_source), the interval from the venue's
+schedule. Counts only: the log never shows a rate, a price or a time."""
 
 from __future__ import annotations
 
 import argparse
 import sys
 
+import numpy as np
 import pandas as pd
 
 from sleeve_fund import funding
+
+GATE_RATE = 0.0003  # per 8 hours: A0's short gate (pre-registration, family A)
+GATE_PCT = 90.0  # fr.pct at or above this
+GATE_WINDOW_DAYS = 90  # the block's trailing window, as A0 runs it
+BAR = pd.Timedelta(hours=4)  # A0's decision candles
 
 
 def counts(venue: str, pair: str, start: pd.Timestamp, end: pd.Timestamp, root=None) -> dict:
@@ -70,6 +82,44 @@ def counts(venue: str, pair: str, start: pd.Timestamp, end: pd.Timestamp, root=N
             "possible_holes": possible, "holes_across_a_change": across}
 
 
+def gate_counts(venue: str, pair: str, start: pd.Timestamp, end: pd.Timestamp, root=None) -> dict:
+    """{high, read, at_pct, no_value, other_read} for settlements on [start, end + 1 day): high counts the believable
+    stored rates at or above GATE_RATE per 8 hours; of those, read counts the ones the block reads as its latest rate
+    at the next 4-hour close (the first close the rule may read it at: stamped before that close less MATCH), at_pct
+    those it reads at GATE_PCT or above, no_value those it gives no value for there (the latest due rate missing or
+    the window under coverage), other_read those whose next close reads a later rate instead (a shorter interval)."""
+    from sleeve_fund.markets import funding_interval
+    from sleeve_fund.strategies.definitions import FundingPercentile
+    from sleeve_fund.venues import venue as venue_profile
+
+    s = funding.rates(venue, pair, root)
+    cap = funding.cap_of(venue, pair)
+    s = s[[funding.believable(r, cap) for r in s.to_numpy()]]
+    interval = pd.Timedelta(funding_interval(venue_profile(venue).funding_hours))
+    out = {"high": 0, "read": 0, "at_pct": 0, "no_value": 0, "other_read": 0}
+    if not len(s):
+        return out
+    times, rates = s.index.as_unit("ns").asi8.copy(), s.to_numpy(dtype=float).copy()
+    block = FundingPercentile(window_days=GATE_WINDOW_DAYS)
+    block.source = (times, rates, int(interval.value))
+    scale = pd.Timedelta(hours=8) / interval  # a rate per interval, as a rate per 8 hours
+    until = end + pd.Timedelta(days=1)
+    for t, r in s.items():
+        if not (start <= t < until) or r * scale < GATE_RATE:
+            continue
+        out["high"] += 1
+        close = (t + funding.MATCH).floor(BAR) + BAR  # the first 4-hour close with t before it less MATCH
+        block.update_raw(0.0, int(close.value))
+        if not block.initialized:
+            out["no_value"] += 1
+        elif int(np.searchsorted(times, int((close - funding.MATCH).value))) - 1 != int(np.searchsorted(times, t.value)):
+            out["other_read"] += 1
+        else:
+            out["read"] += 1
+            out["at_pct"] += block._outputs()["pct"] >= GATE_PCT
+    return out
+
+
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--venue", required=True)
@@ -77,6 +127,8 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--start", required=True, help="first UTC day, e.g. 2024-01-01")
     ap.add_argument("--end", required=True, help="last UTC day, included, e.g. 2026-10-30")
     ap.add_argument("--root", default=None, help="history folder (default HISTORY_DIR or data/history)")
+    ap.add_argument("--gate", action="store_true", help="also count A0's short gate (rates at or above "
+                    f"{GATE_RATE} per 8 hours, and those read at fr.pct {GATE_PCT:.0f} or above)")
     a = ap.parse_args(argv)
     start, end = pd.Timestamp(a.start, tz="UTC"), pd.Timestamp(a.end, tz="UTC")
     if end < start:
@@ -101,6 +153,16 @@ def main(argv: list[str]) -> int:
           "construction. The costs side charges the baseline for each missing settlement.")
     if notes:
         print("\n" + "\n".join(notes))
+    if a.gate:
+        print(f"\nShort gate: believable stored rates at or above {GATE_RATE} per 8 hours, and those the "
+              f"funding_percentile block ({GATE_WINDOW_DAYS}-day window) reads at {GATE_PCT:.0f} or above at the "
+              "next 4-hour close\n")
+        print("| Asset | At or above the rate | Read at the next close | Of those, fr.pct at or above "
+              f"{GATE_PCT:.0f} | No value there | A later rate read there |\n|---|---|---|---|---|---|")
+        for pair in a.pairs.split(","):
+            g = gate_counts(a.venue, pair.strip(), start, end, a.root)
+            print(f"| {pair.strip().split('/')[0].upper()} | {g['high']} | {g['read']} | {g['at_pct']} | "
+                  f"{g['no_value']} | {g['other_read']} |")
     return 2 if empty else 0
 
 

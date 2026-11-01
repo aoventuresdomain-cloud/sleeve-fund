@@ -24,7 +24,7 @@ def _step(name):
     return next(s for s in _job()["steps"] if s.get("name") == name)
 
 
-def _count(tmp_path, start="2024-01-01", end="2026-10-30"):
+def _count(tmp_path, start="2024-01-01", end="2026-10-30", gate=None):
     """Runs "Count the settlements" with ssh standing in: the fake ssh hands its remote line to a shell where sudo
     writes each argument it gets, NUL-ended, to argv.txt, and what it reads on stdin to stdin.txt."""
     bin_ = tmp_path / "bin"
@@ -38,7 +38,7 @@ def _count(tmp_path, start="2024-01-01", end="2026-10-30"):
     res = subprocess.run(["bash", "-e", "-c", _step("Count the settlements")["run"]], capture_output=True, text=True,
                          cwd=ROOT, check=False,
                          env={"PATH": f"{bin_}:/usr/bin:/bin", "USER_AT": "u", "HOST": "h", "HOME": str(tmp_path),
-                              "RUN_ID": "7", "START": start, "END": end})
+                              "RUN_ID": "7", "START": start, "END": end, **({} if gate is None else {"GATE": gate})})
     argv = (tmp_path / "argv.txt").read_text().split("\0")[:-1] if (tmp_path / "argv.txt").exists() else []
     return res, argv
 
@@ -73,3 +73,22 @@ def test_it_runs_by_hand_from_main_with_deploys_on_and_reads_only():
     assert job["if"] == "${{ vars.DEPLOY_ENABLED == 'true' && github.ref == 'refs/heads/main' }}"
     assert job["permissions"] == {"contents": "read"}
     assert "actions/upload-artifact@v4" not in WF.read_text()  # nothing leaves the run but the log's counts
+
+
+def test_the_gate_tick_adds_only_the_gate_flag_and_anything_else_is_refused(tmp_path):
+    """A0's short-gate counts (Advisor, 1 Nov): the tick box adds --gate to the same one container; the step passes
+    nothing else on, so the environment can't carry other arguments to the server."""
+    assert _step("Count the settlements")["env"]["GATE"] == "${{ inputs.gate && '--gate' || '' }}"
+    assert yaml.safe_load(WF.read_text())[True]["workflow_dispatch"]["inputs"]["gate"]["type"] == "boolean"
+    assert yaml.safe_load(WF.read_text())[True]["workflow_dispatch"]["inputs"]["gate"]["default"] is False
+    head = ["dashboard", "python", "-", "--venue", "BINANCE", "--pairs", "BTC/USDT,ETH/USDT,SOL/USDT", "--start",
+            "2024-01-01", "--end", "2026-10-30"]
+    for n, (gate, tail) in enumerate((("--gate", ["--gate"]), ("", []))):
+        (tmp_path / str(n)).mkdir()
+        res, argv = _count(tmp_path / str(n), gate=gate)
+        assert res.returncode == 0, res.stderr
+        assert argv[8:] == head + tail
+    for n, bad in enumerate(("--root /", "--gate --root /", "x")):
+        (tmp_path / f"bad{n}").mkdir()
+        res, argv = _count(tmp_path / f"bad{n}", gate=bad)
+        assert res.returncode == 1 and "gate is a tick box" in res.stdout and argv == []

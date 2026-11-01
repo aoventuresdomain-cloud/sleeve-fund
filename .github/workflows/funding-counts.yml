@@ -4,7 +4,8 @@ name: funding-counts
 # stdin to a one-off container of the dashboard's image, where the history is mounted read-only. Read-only: it reads
 # the stored funding files and nothing else (no venue, no database), and writes nothing. BTC, ETH and SOL only (PM
 # 30 Oct). The repository is public, so the log shows counts and the times of holes only, never a rate or a price.
-# Run it by hand from main. Same secrets and variable as sheet-export.
+# With "gate" ticked it also prints the short-gate counts for A0 (Advisor, 1 Nov): counts only. Run it by hand from
+# main. Same secrets and variable as sheet-export.
 on:
   workflow_dispatch:
     inputs:
@@ -16,6 +17,10 @@ on:
         description: Last UTC day, included, YYYY-MM-DD
         required: true
         default: "2026-10-30"
+      gate:
+        description: Also count A0's short gate (rates at or above 0.0003 per 8 hours, and those read at fr.pct 90+)
+        type: boolean
+        default: false
 concurrency: { group: funding-counts, cancel-in-progress: false }
 jobs:
   counts:
@@ -52,11 +57,13 @@ jobs:
           HOST: ${{ secrets.DEPLOY_HOST }}
           START: ${{ inputs.start }}
           END: ${{ inputs.end }}
+          GATE: ${{ inputs.gate && '--gate' || '' }}
         run: |
           # The script from this commit, on stdin: the image carries the package, not scripts/.
           set -euo pipefail
+          [[ -z "${GATE:-}" || "${GATE:-}" == "--gate" ]] || { echo "gate is a tick box"; exit 1; }
           ssh -i ~/.ssh/id_deploy -o ServerAliveInterval=30 -o ServerAliveCountMax=10 "$USER_AT@$HOST" \
-            "cd /opt/sleeve-fund && sudo docker compose run --rm -T --no-deps --name funding-counts-$RUN_ID dashboard python - --venue BINANCE --pairs BTC/USDT,ETH/USDT,SOL/USDT --start $START --end $END" \
+            "cd /opt/sleeve-fund && sudo docker compose run --rm -T --no-deps --name funding-counts-$RUN_ID dashboard python - --venue BINANCE --pairs BTC/USDT,ETH/USDT,SOL/USDT --start $START --end $END ${GATE:-}" \
             < scripts/funding_counts.py
       - name: Clean up
         if: always()
