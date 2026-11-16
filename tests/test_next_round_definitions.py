@@ -50,13 +50,33 @@ def test_family_b_is_its_pre_registrations_toml_with_a_141_day_warm_up():
     assert continuous_warmup("rules", params, 60) * 60 / 1440 == 141
 
 
-def test_the_list_is_three_basket_rows_on_the_sealed_dates_with_the_holdout_locked():
+def test_family_c_ranks_the_three_weekly_and_holds_rank_1_long_and_rank_3_short_off_the_fund():
+    from sleeve_fund.research import basket
+
+    d = _defn("QRC0_RELATIVE_STRENGTH")
+    check_definition(d, bar_minutes=240)
+    assert d["blocks"] == {"rs": {"kind": "relative_strength_rank", "lookback_days": 28}}
+    monday = [{"left": {"time": "weekday"}, "op": "<=", "right": 0}, {"left": {"time": "hour"}, "op": "<=", "right": 0}]
+    assert d["long"] == {"entry": {"all": [{"left": "rs.rank", "op": "<=", "right": 1}, *monday]},
+                         "exit": {"left": "rs.rank", "op": ">=", "right": 2}, "reverse": True}
+    assert d["short"] == {"entry": {"all": [{"left": "rs.rank", "op": ">=", "right": 3}, *monday]},
+                          "exit": {"left": "rs.rank", "op": "<=", "right": 2}, "reverse": True}
+    assert "exits" not in d  # no stops and no take-profit (section 3)
+    params = {**to_params(d, "BINANCE"), "market": "perp", "allow_short": True,
+              **PREREGISTERED["QRC0_RELATIVE_STRENGTH"]["params"]}
+    assert study_only_uses(params)  # paper and live refuse it until a further PM yes
+    assert basket.rank_book(params) and params["position_cap_pct"] == 0.5  # 0.5x a leg, 1x gross (Advisor Q2)
+    assert continuous_warmup("rules", params, 240) * 240 / 1440 <= 36  # 28 days and a week, inside 2024
+
+
+def test_the_list_is_four_basket_rows_on_the_sealed_dates_with_the_holdout_locked():
     text = LIST.read_text()
     p = parse(text)
     assert (p.data_start, p.research_end, p.holdout_start, p.holdout_end) == (
         date(2024, 1, 1), date(2026, 4, 30), date(2026, 5, 1), date(2026, 10, 30))
     assert rescore.rows_of(text) == [(1, "qra0_funding_fade", 240), (2, "qrb0_range_reversion_adx", 60),
-                                     (3, "qrh0_trend_pullback", 240)]  # H0 added 31 Oct
+                                     (3, "qrh0_trend_pullback", 240),  # H0 added 31 Oct
+                                     (4, "qrc0_relative_strength", 240)]  # C0 added 16 Nov
     for n, name, minutes in rescore.rows_of(text):
         req = rescore.request(name, minutes, "binance", "BTC/USDT,ETH/USDT,SOL/USDT", p)
         assert tuple(req.pairs) == ("BTC/USDT", "ETH/USDT", "SOL/USDT") and req.params["market"] == "perp"
@@ -69,11 +89,11 @@ def test_the_list_is_round_next_0_with_a_budget_of_6_and_bs_13_prior_tries():
 
     text = LIST.read_text()
     r = rounds.round_of(text, [n for n, _, _ in rescore.rows_of(text)])
-    assert (r.name, r.budget, r.families, r.prior) == ("next-0", 6, {"A": (1,), "B": (2, 3)}, {"B": 13})
+    assert (r.name, r.budget, r.families, r.prior) == ("next-0", 6, {"A": (1,), "B": (2, 3), "C": (4,)}, {"B": 13})
     assert "family A try 1 " in rounds.try_line(r, 1, 0) and "family B try 14 " in rounds.try_line(r, 2, 0)
 
 
 def test_the_list_dry_runs(capfd):
     assert rescore.main([str(LIST), "--pair", "BTC/USDT,ETH/USDT,SOL/USDT", "--dry-run"], run=lambda *a, **k: None,
                         journal=lambda: None) == 0
-    assert "dry run: 3 checked, 0 run" in capfd.readouterr().out
+    assert "dry run: 4 checked, 0 run" in capfd.readouterr().out

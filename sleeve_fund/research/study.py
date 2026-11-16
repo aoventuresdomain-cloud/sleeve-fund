@@ -603,7 +603,7 @@ RECURSIVE_LENGTHS = {"ema": ("period",), "atr": ("period",), "rsi": ("period",),
 def time_warmup_minutes(kind: str, settings: dict) -> int | None:
     """The minutes a block warms up over when its warm-up is in time rather than candles (Advisor 21 Oct): a calendar
     period or session (warmup_minutes), a day-anchored VWAP's one day, the funding decile's trailing window_days of
-    settlements. None for a block that warms up over candles."""
+    settlements, a relative strength rank's lookback and a week. None for a block that warms up over candles."""
     from sleeve_fund.strategies.definitions import BUILDER_BLOCKS, FUNDING_BLOCKS
     from sleeve_fund.strategies.timeframes import DAY_MINUTES
 
@@ -614,6 +614,8 @@ def time_warmup_minutes(kind: str, settings: dict) -> int | None:
         return DAY_MINUTES
     if kind in FUNDING_BLOCKS:
         return int(settings["window_days"]) * DAY_MINUTES
+    if kind == "relative_strength_rank":  # family C: the basket's closes it reads, lookback and a week
+        return int(cls.ranking_warmup_minutes(settings))
     return None
 
 

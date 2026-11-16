@@ -23,6 +23,7 @@ from sleeve_fund.strategies.definitions import (
     check_definition,
     is_weekly_decision,
     relative_strength_ranks,
+    to_params,
 )
 
 ORDER = ("BTC", "ETH", "SOL")
@@ -238,10 +239,19 @@ def test_it_is_a_studies_only_block_with_no_timeframe_or_input():
 
 
 def test_it_warms_up_over_its_lookback_and_a_week():
-    assert RelativeStrengthRank.warmup_minutes({}) == 35 * 1440
+    assert RelativeStrengthRank.ranking_warmup_minutes({}) == 35 * 1440
     assert block_warmup("relative_strength_rank", {"lookback_days": 28}, 240) == 35 * 6 + 1
     assert block_warmup("relative_strength_rank", {"lookback_days": 14}, 1440) == 21 + 1
     assert DAY_NS == 86_400 * 10**9
+
+
+def test_a_long_lookback_passes_the_check_with_or_without_the_candle_size():
+    # the block is fed no candles, so its lookback is no candle warm-up: a check that doesn't know the candle (as
+    # to_params runs it) must not count 35 days as 1-minute candles against MAX_WARMUP_BARS
+    for days in (28, 365):
+        defn = {**WEEKLY_LONG, "blocks": {"rs": {"kind": "relative_strength_rank", "lookback_days": days}}}
+        assert check_definition(defn).warmup[None] == 0 and check_definition(defn, bar_minutes=240).warmup[None] == 0
+        assert to_params(defn, "BINANCE")["definition"]["blocks"]["rs"]["lookback_days"] == days
 
 
 # ---- 6. only a basket hands it closes ---------------------------------------------------------------------------
