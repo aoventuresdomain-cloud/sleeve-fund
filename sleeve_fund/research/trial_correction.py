@@ -68,7 +68,9 @@ def plan(register: trials.TrialsRegister, row_id: str, sheet_md: Path) -> tuple[
         raise ValueError(f"refused: the sheet {sheet_md.stem} is not {label} on {dataset}")
     written = datetime.strptime(stamp.group(1), "%Y%m%d-%H%M%S").replace(tzinfo=timezone.utc)
     created = trials._aware(original["created_at"])
-    if not created <= written <= created + SHEET_WITHIN:
+    # the stem's stamp is whole seconds and the row's carries microseconds: a sheet stamped in the row's own second
+    # is this try's (B0, 16 Nov: row 05:48:32.746, sheet 05:48:32)
+    if not created.replace(microsecond=0) <= written <= created + SHEET_WITHIN:
         raise ValueError(f"refused: the sheet was written {written:%d %b %H:%M}, not within {SHEET_WITHIN} after the "
                          f"row ({created:%d %b %H:%M}): it is another run's sheet")
     sharpe, source = target(sheet_md)
