@@ -113,8 +113,9 @@ class PairNull:
 
     @property
     def beats(self) -> bool:
-        """The bar for the four: 95% of draws after real fees."""
-        return self.judged and self.net_percentile >= BAR
+        """The bar for the four (pre-registration rev 3; Advisor 17 Nov): 95% of draws both before fees and after real
+        fees, on the same draws; a draw that ties the book counts against it."""
+        return self.judged and self.net_percentile >= BAR and self.pre_percentile >= BAR
 
     @property
     def killed(self) -> bool:
@@ -263,9 +264,9 @@ def null_words(r: PairNull | None) -> str:
         return f"NOT JUDGED: {r.why_not}"
     trips, book = r.reconciled or (r.strategy_net, r.strategy_net)
     out = (f"after real fees the book's {r.strategy_net:+.1%} of the fund's capital beats {r.net_percentile:.0f}% of "
-           f"{r.draws:,} random long/short assignments (median {r.median_net:+.1%}; bar {BAR:.0f}%); before fees "
-           f"{r.strategy_pre:+.1%} beats {r.pre_percentile:.0f}% (median {r.median_pre:+.1%}; below "
-           f"{PRE_FEE_KILL:.0f}% is round-0 kill 2); {r.change_weeks} change weeks kept fixed, each re-drawing the "
+           f"{r.draws:,} random long/short assignments (median {r.median_net:+.1%}); before fees "
+           f"{r.strategy_pre:+.1%} beats {r.pre_percentile:.0f}% (median {r.median_pre:+.1%}); the bar is {BAR:.0f}% "
+           f"on both, a tie counting against the book, and below {PRE_FEE_KILL:.0f}% before fees is round-0 kill 2; {r.change_weeks} change weeks kept fixed, each re-drawing the "
            f"ordered pair from 6; legs opened: the book {r.strategy_legs}, the mean draw {r.mean_draw_legs:.1f}; "
            f"{r.skipped_weeks} unranked Mondays held by both; seed {r.seed}; the model's book adds to {trips:+.1%} "
            f"against the engine's {book:+.1%}")
@@ -276,6 +277,6 @@ def null_words(r: PairNull | None) -> str:
                 f"on {', '.join(r.baseline_dates)}")
     if r.unreconciled:
         return f"NOT JUDGED: {out} (more than {RECONCILE_PP * 100:.1f} points apart)"
-    if r.killed:  # fails the book whatever the after-fee share (CR #356)
-        return f"BELOW THE BAR (round-0 kill 2: below {PRE_FEE_KILL:.0f}% before fees): {out}"
+    if r.killed:  # fails the book whatever the after-fee share (CR #356; Advisor 17 Nov)
+        return f"KILLED (round 0, kill 2: random below {PRE_FEE_KILL:.0f}% before fees): {out}"
     return f"{'ABOVE THE BAR' if r.beats else 'BELOW THE BAR'}: {out}"  # the list allows no PASS wording

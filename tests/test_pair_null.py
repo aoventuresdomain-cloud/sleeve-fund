@@ -273,15 +273,20 @@ def test_round_0_kill_2_fails_the_verdict_even_above_the_after_fee_bar():
     lo = bk.LeftOut("SOL", 0.9, True, None, not_applicable=bk.TWO_NAME_RANK)
     loose = {"double_fees": SimpleNamespace(passed=True), "left_out": lo, "hold": None, "pooled": None}
     killed = _null(96.0, 85.0)
-    assert killed.beats and killed.killed
+    assert killed.killed and not killed.beats and killed.net_percentile >= pn.BAR  # clears after fees, still killed
     assert bk.verdict(SimpleNamespace(**loose, pair=killed), None) == "FAIL"
     assert bk.verdict(SimpleNamespace(**loose, pair=killed), SimpleNamespace(passed=True)) == "FAIL"
-    assert pn.null_words(killed).startswith("BELOW THE BAR (round-0 kill 2: below 90% before fees)")
-    assert bk.verdict(SimpleNamespace(**loose, pair=_null(96.0, 90.0)), None) == "NOT YET"  # 90 is not below 90
+    assert pn.null_words(killed).startswith("KILLED (round 0, kill 2: random below 90% before fees)")
+    between = _null(96.0, 92.0)  # 90 to 95 before fees: not killed, but it can't pass
+    assert not between.killed and not between.beats
+    assert bk.verdict(SimpleNamespace(**loose, pair=between), None) == "FAIL"
+    assert pn.null_words(between).startswith("BELOW THE BAR: ")
+    assert bk.verdict(SimpleNamespace(**loose, pair=_null(95.0, 95.0)), None) == "NOT YET"
 
 
-def test_the_bar_is_95_after_fees_at_the_boundary():
+def test_the_bar_is_95_both_before_and_after_fees_at_the_boundary():
     assert _null(95.0, 99.0).beats and not _null(94.9, 99.0).beats
+    assert _null(99.0, 95.0).beats and not _null(99.0, 94.9).beats
     assert not _null(99.0, 90.0).killed and _null(99.0, 89.9).killed
 
 

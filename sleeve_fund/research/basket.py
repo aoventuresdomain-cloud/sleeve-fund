@@ -936,7 +936,7 @@ def verdict(study: BasketStudy, holdout: Holdout | None) -> str:
     (it can't pass then); NOT YET while the holdout is sealed."""
     pooled, hold, pair = getattr(study, "pooled", None), getattr(study, "hold", None), getattr(study, "pair", None)
     if pair is not None:  # a rank book: its random long/short assignment decides; no hold bar with a short side
-        # below the bar after fees, or round-0 kill 2 (below 90% before fees) even when above it after (CR #356)
+        # below the bar (95% before and after fees), or round-0 kill 2 (below 90% before fees) (CR #356; Advisor 17 Nov)
         random_failed, judged, held = pair.judged and (not pair.beats or pair.killed), pair.judged, True
     elif pooled is not None:  # STUDY-ASSET-LIST: the filled pooled comparison decides; the hold bar once it is proven
         random_failed, judged = pooled.verdict == "FAIL", pooled.verdict == "PASS"
