@@ -78,6 +78,23 @@ def test_a_sheet_that_isnt_this_trys_is_refused(tmp_path, kw, words):
         tc.plan(reg, rid, tmp_path / f"{_sheet(tmp_path, **kw)}.md")
 
 
+def test_a_sheet_stamped_in_the_rows_own_second_is_this_trys(tmp_path):
+    """16 Nov, B0's dry run: the row was created at hh:mm:ss.746 and its sheet stamped hh:mm:ss (whole seconds), so
+    the sheet read as written before its row and was refused. The row's own second counts; the second before doesn't."""
+    reg, rid, _ = _register(tmp_path)
+    created = trials._aware(next(t for t in reg._counted() if t["id"] == rid)["created_at"])
+    for at, ok in ((created.replace(microsecond=0), True), (created.replace(microsecond=0) - timedelta(seconds=1),
+                                                            False)):
+        stem = f"{LABEL}_{DATASET}_{at:%Y%m%d-%H%M%S}"
+        (tmp_path / f"{stem}.md").write_text("# Basket study\n", encoding="utf-8")
+        (tmp_path / f"{stem}.results.json").write_text(json.dumps({"check": {"basket": {"sharpe": BOOK}}}))
+        if ok:
+            assert tc.plan(reg, rid, tmp_path / f"{stem}.md")[1]["sharpe"] == BOOK
+        else:
+            with pytest.raises(ValueError, match="another run's sheet"):
+                tc.plan(reg, rid, tmp_path / f"{stem}.md")
+
+
 def test_another_basket_or_a_non_basket_row_is_refused(tmp_path, capfd):
     reg, rid, _ = _register(tmp_path)
     other = f"other_{DATASET}_{datetime.now(timezone.utc):%Y%m%d-%H%M%S}"

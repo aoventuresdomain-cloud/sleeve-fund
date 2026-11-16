@@ -20,6 +20,32 @@ STOPPED = [("dip_buy", PERP),  # its model's default ATR stop
            ("rsi_cross", {**PERP, "stop_swing_bars": 10})]
 
 
+_ENTRY = {"entry": {"left": "close", "op": ">", "right": 0}, "exit": {"left": "close", "op": "<", "right": 0}}
+_STOP = {"level": {"sub": ["close", {"mul": [3.0, "atr"]}]}}
+
+
+def _rules(exits: dict, short: bool = False) -> dict:
+    defn = {"version": 1, "name": "x", "blocks": {"atr": {"kind": "atr", "period": 14}}, "long": _ENTRY, "exits": exits}
+    return {"market": "perp", "definition": {**defn, **({"short": _ENTRY} if short else {})}}
+
+
+def test_a_definitions_fixed_stop_on_every_side_counts_as_placed_and_a_trail_or_time_stop_doesnt():
+    """Advisor, 16 Nov (V5 on paper at 2x): a rules definition's `stop` level is watched on every trade, as a
+    stop_atr setting's is, so it counts. A trail, a time stop, or a stop on only one of the sides it trades doesn't."""
+    for params in (_rules({"long": {"stop": _STOP}}), _rules({"stop": _STOP}, short=True),
+                   _rules({"long": {"stop": _STOP}, "short": {"stop": _STOP}}, short=True)):
+        assert places_stop("rules", params)
+        check_perp_stop("rules", {**params, "max_leverage": 2}, "aggressive")
+    for params in (_rules({"long": {"trail": _STOP}}), _rules({"long": {"time_stop": {"bars": 6}}}),
+                   _rules({"long": {"stop": _STOP}}, short=True), _rules({}), {"market": "perp", "definition": None},
+                   {"market": "perp", "definition": {"exits": {"stop": _STOP}}}):
+        assert not places_stop("rules", params)
+        with pytest.raises(ValueError, match="places no stop"):
+            check_perp_stop("rules", {**params, "max_leverage": 2}, "aggressive")
+    # A definition is the rules strategy's alone: a stray one with a stop on another model places nothing.
+    assert not places_stop("rsi_pullback", {**_rules({"stop": _STOP}), "market": "perp"})
+
+
 @pytest.mark.parametrize("strategy, params", STOPLESS)
 @pytest.mark.parametrize("profile", ["balanced", "aggressive"])
 def test_a_stopless_model_on_a_perp_is_refused_above_1x_in_words(strategy, params, profile):
