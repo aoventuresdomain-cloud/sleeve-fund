@@ -168,6 +168,7 @@ class BasketStudy:
     unguarded_entries: dict = field(default_factory=dict)  # a guarded scaled run: its legs' intents, guards off
     equal: Any = None  # a rank book's EqualMoney on its base run (family C), else None
     unranked: list = field(default_factory=list)  # a rank book's Mondays it couldn't rank, as ISO dates (Advisor 16 Nov)
+    pair: Any = None  # a rank book's random long/short assignment (pair_null.PairNull), with filled=True
 
     @property
     def gate_touched(self) -> float:
@@ -840,6 +841,8 @@ def basket_study(basket: Basket, windows, research_end: date, *, register: trial
             study.unguarded_entries[asset] = study.unguarded_entries.get(asset, 0) + 1
     if filled:
         study.pooled = pooled_random(base, names, specs, basket.params, windows, capital, touched, draws, seed)
+        if equal is not None:  # family C's null (pre-registration, section 6): the random-entry draws are not a pair's
+            study.pair = rank_null(base, names, specs, basket.params, windows, capital, study.unranked, draws, seed)
         study.hold = hold_bar(base, specs, basket.params, windows, capital)
         if "SOL" in map(base_asset, names_of):  # Advisor Q3: shown beside, its own re-run; never a condition or a try
             rest = [a for a, n in zip(assets, names_of) if base_asset(n) != "SOL"]
@@ -965,7 +968,10 @@ def render(study: BasketStudy, holdout: Holdout | None = None, round_try: str | 
         left_random = random_words(lo.random) if lo.random is not None else None
         concentrated = "; concentrated: over half the net from one asset"
     else:
-        random_rows = [f"| Beats random entries, filled on the pooled book (95th percentile) | {pooled_words(pooled, study.random.seed)} |",
+        pooled_cell = (f"not this book's null: a rank book is judged on its random long/short assignment, below "
+                       f"({pooled_words(pooled, study.random.seed)})" if study.equal is not None
+                       else pooled_words(pooled, study.random.seed))
+        random_rows = [f"| Beats random entries, filled on the pooled book (95th percentile) | {pooled_cell} |",
                        f"| Hold bar (long-only baskets) | {hold_words(study.hold)} |",
                        f"| Random entries, close-priced | {close_priced_words(study.random)}; {NO_STOP_FILLS}, "
                        f"against the book's filled Sharpe {_sharpe(base.returns.to_numpy()):.2f} |"]
@@ -1027,7 +1033,47 @@ def _equal_lines(study: BasketStudy) -> list[str]:
     return [(f"**Equal money at entry:** {'PASS' if e.passed else 'FAIL'}: {e.entries} entries, each at {share:g}x the "
              "fund it was sized off; those opened on one close sized off the same fund and together at most 1x of it. "
              "No leg is topped up while held, so a held leg's notional drifts with its price until it changes."), "",
-            *_unranked_lines(study)]
+            *_unranked_lines(study), *_pair_lines(study)]
+
+
+def _pair_lines(study: BasketStudy) -> list[str]:
+    """A rank book's random long/short assignment (pre-registration, section 6), when the study filled its draws."""
+    from sleeve_fund.research.pair_null import null_words
+
+    if study.pair is None:
+        return []
+    return [f"**Random long/short assignment:** {null_words(study.pair)}", ""]
+
+
+def rank_null(m: Measured, names, specs, params: dict, windows, capital: float, unranked: list[str],
+              draws: int = DRAWS, seed: int = 0):
+    """Family C's null on the base run: each asset's execution bars, fee, half spread and funding settlements as the
+    engine charged them, its legs' trips as the Strategy's states, the leg notional at each change week its share of
+    the book then, and the engine book's move over the same span for the reconcile."""
+    from sleeve_fund.research.pair_null import PairAsset, pair_null, strategy_states
+    from sleeve_fund.research.study import _settlement_rates
+
+    first = pd.Timestamp(windows[0][0], tz="UTC")
+    end = pd.Timestamp(windows[-1][1] + timedelta(days=1), tz="UTC")
+    assets, trips = [], {}
+    for i, (n, s) in enumerate(zip(names, specs)):
+        leg = m.run.legs[n]
+        trips[i] = trades(fills_to_rows(leg.fills), leg.shorts, leg.funding, open_trip=True) \
+            if leg.fills is not None and not leg.fills.empty else []
+        ex = s.exec_prices
+        idx = ex.index if ex.index.tz is not None else ex.index.tz_localize("UTC")
+        taker = float(base_fees(s.instrument, params).taker) if s.fees is None else float(s.fees.taker)
+        rates = _settlement_rates(params, s.instrument, pd.concat([s.warmup_prices, s.prices])) or (None, None, None)
+        assets.append(PairAsset(underlying(s.instrument), idx.as_unit("ns").asi8.copy(),
+                                ex["open"].to_numpy(dtype=float), ex["close"].to_numpy(dtype=float),
+                                int(pd.Timedelta(minutes=s.exec_minutes).value), taker, _half_spread(s.instrument, params),
+                                *rates))
+    change, states = strategy_states(trips, first, end)
+    share, book = float(params["position_cap_pct"]), m.run.book
+    notional = [share * float(book.asof(pd.Timestamp(t, tz="UTC"))) for t in change]
+    move = float(book.asof(end) - book.asof(pd.Timestamp(change[0], tz="UTC"))) if change else None
+    skipped = sum(1 for d in unranked if first.date() <= date.fromisoformat(d) < end.date())
+    return pair_null(assets, change, states, end.value, notional, capital, draws, seed, move, skipped)
 
 
 def _unranked_lines(study: BasketStudy) -> list[str]:
