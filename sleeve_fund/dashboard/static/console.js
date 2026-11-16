@@ -1072,7 +1072,7 @@ window.Console = (() => {
       const opt = $("strategy").selectedOptions[0];
       // A test model is created stopped (A-19): every copy of the submit button (the wizard's too) says so.
       form.querySelectorAll("button[data-label]").forEach((b) => {
-        b.textContent = opt && opt.dataset.prefill ? b.dataset.testLabel : b.dataset.label;
+        b.textContent = opt && (opt.dataset.prefill || opt.dataset.stopped) ? b.dataset.testLabel : b.dataset.label;
       });
       // A G1 pass holds for the instrument and bar length it was tested on, nothing else.
       const minutes = {MINUTE: 1, HOUR: 60, DAY: 1440};
