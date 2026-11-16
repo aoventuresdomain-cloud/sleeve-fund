@@ -24,7 +24,7 @@ from sleeve_fund.data import bar_minutes
 from sleeve_fund.instruments import target_on_tick
 from sleeve_fund.strategies.base import MAX_STOP, MIN_STOP, IdeaSpec, LongFlatConfig, LongFlatStrategy
 from sleeve_fund.strategies.definitions import (CATALOGUE, DAY_NS, LEVEL_EXITS, Checked, Compiled, Env, FundingDecile,
-                                                FundingZScore, block_value, check_definition, definition_hash,
+                                                FundingZScore, RelativeStrengthRank, block_value, check_definition, definition_hash,
                                                 load_definition_file, side_exits, timeframe_label, to_params)
 from sleeve_fund.strategies.timeframes import MINUTE_NS
 
@@ -232,6 +232,10 @@ class Rules(LongFlatStrategy):
         """R-06: the definition's funding rate decile blocks, which the runner hands their stored rates."""
         return [b for b in self.rules.blocks.values() if isinstance(b, FundingDecile)]
 
+    def rank_blocks(self) -> list:
+        """Family C: the definition's relative strength rank blocks, which a basket's run hands its assets' closes."""
+        return [b for b in self.rules.blocks.values() if isinstance(b, RelativeStrengthRank)]
+
     def rule_counts(self) -> dict:
         """For the sheet: candles a funding rate decile had no rate on and read its top decile on (R-06, counted apart),
         entries vol sizing skipped (R-07)."""
@@ -241,6 +245,9 @@ class Rules(LongFlatStrategy):
             tops = [b.top_decile for b in self.funding_blocks() if not isinstance(b, FundingZScore)]
             if tops:  # a z-score has no top decile to count (CR on #336, F4)
                 out["funding_top_decile"] = max(tops)
+        if self.rank_blocks():
+            out["rank_weeks"] = max(b.weeks for b in self.rank_blocks())
+            out["rank_no_rank"] = max(b.no_rank for b in self.rank_blocks())
         if self.c.vol_target_size:
             out["vol_skipped"] = self.vol_skipped
         return out
