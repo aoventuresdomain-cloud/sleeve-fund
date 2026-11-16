@@ -77,7 +77,20 @@ def places_stop(strategy: str, params: dict | None) -> bool:
     except (ImportError, AttributeError):
         defaults = {}
     merged = {**defaults, **(params or {})}
-    return any((merged.get(k) or 0) > 0 for k in STOP_KEYS)
+    return any((merged.get(k) or 0) > 0 for k in STOP_KEYS) or definition_stops(merged.get("definition"))
+
+
+def definition_stops(defn) -> bool:
+    """A rules definition whose exits carry a fixed `stop` level on every side it trades (Advisor, 16 Nov): paper
+    turns it into the same stop it watches on every trade as a stop_atr setting's (rules._plan_exits ->
+    base._check_exits), so it is a placed stop here too. A `trail` level or a time stop is not."""
+    if not isinstance(defn, dict):
+        return False
+    sides = [side for side in ("long", "short") if defn.get(side)]
+    exits = defn.get("exits") or {}
+    if not sides or not isinstance(exits, dict):
+        return False
+    return all("stop" in exits or "stop" in (exits.get(side) or {}) for side in sides)
 
 
 def check_perp_stop(strategy: str, params: dict | None, risk_profile: str) -> None:
