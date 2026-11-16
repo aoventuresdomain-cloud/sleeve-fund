@@ -240,3 +240,15 @@ def test_the_sheet_lists_every_unranked_monday_and_one_in_the_test_days_leaves_c
 def test_the_runs_unranked_mondays_are_its_warm_ups_first_four(ran):
     _, run = ran
     assert bk.unranked_dates(run) == ["2024-01-08", "2024-01-15", "2024-01-22", "2024-01-29"]
+
+
+def test_a_rank_baskets_study_carries_its_runs_unranked_mondays_to_the_sheet(tmp_path):
+    # CR #354: the wiring from the run to the sheet, so check 7's condition can't silently read "none"
+    from test_b38_basket_study import ASSETS, CAPITAL, RESEARCH_END, WINDOWS, _register
+
+    basket = bk.Basket("rs", "rules", dict(PARAMS), ASSETS, "2026-11-16")
+    study = bk.basket_study(basket, WINDOWS, RESEARCH_END, register=_register(tmp_path), dataset="syn",
+                            capital=CAPITAL, profile=bk.UNGUARDED, warm_days=40, ladder=False)
+    assert study.unranked and study.unranked == bk.unranked_dates(study.base.run)
+    assert study.equal is not None and study.equal.passed
+    assert any(line.startswith("**Unranked Mondays:** ") for line in bk.render(study).splitlines())
