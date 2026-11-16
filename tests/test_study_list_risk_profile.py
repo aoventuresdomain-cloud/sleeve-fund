@@ -144,3 +144,37 @@ def test_the_profile_stays_out_of_the_baskets_key():
     a = bk.Basket("k", "rules", {"definition": DEFINITION}, (), "2025-01-02")
     assert bk.basket_key(replace(a, risk_profile="aggressive")) == bk.basket_key(a)
 
+
+
+# ---- 4. a profile alone (CR 16 Nov): never a try, fitness only, and never on an unguarded run ----------------------
+
+@pytest.fixture(scope="module")
+def profile_only(tmp_path_factory):
+    from test_basket_4h import _req
+
+    tmp = tmp_path_factory.mktemp("profile-only")
+    return _ran(tmp, risk_profile="aggressive", params={**_req().params, OWN_LEVERAGE: 2.0})  # guards on, no scale
+
+
+def test_a_profile_alone_is_never_a_try_and_its_sheet_says_fitness_only(profile_only):
+    sheet, store, study, runs = profile_only
+    assert not study.counted and study.tries == 0
+    assert trials.TrialsRegister(store)._counted(trials.legacy_idea_hash("rules")) == []
+    assert "**Basket verdict:** FITNESS ONLY: a guarded run under the aggressive risk profile" in sheet
+    assert "**Run:** fund guards on, as paper: fitness only" in sheet
+    assert "**Tries:** not a new try: a benchmark under paper's risk caps, never counted" in sheet
+    assert "already counted" not in sheet
+    assert runs and all(profile is PORTFOLIO for _, profile in runs)
+
+
+def test_a_risk_profile_is_refused_on_an_unguarded_run(tmp_path, capfd):
+    from test_basket_4h import _req
+
+    with pytest.raises(ValueError, match="fund guards on"):
+        replace(_req(), fund_guards=False, risk_profile="aggressive").validate()
+    text = V5_LIST.read_text(encoding="utf-8").replace("- **Fund guards:** on", "- **Fund guards:** off")
+    listed = tmp_path / "v5-unguarded-aggressive.md"
+    listed.write_text(text + RISK_LINES, encoding="utf-8")
+    assert rescore.main([str(listed), "--venue", "binance", "--pair", "BTC/USDT,ETH/USDT", "--dry-run"]) == 2
+    assert "refused: a risk profile runs with the fund guards on" in capfd.readouterr().out
+    replace(_req(), fund_guards=False).validate()  # the unguarded try without a profile, as before

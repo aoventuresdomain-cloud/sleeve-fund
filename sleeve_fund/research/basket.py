@@ -895,6 +895,8 @@ def render(study: BasketStudy, holdout: Holdout | None = None, round_try: str | 
         (f"**Tries:** {round_try}" if round_try and study.counted else
          f"**Tries:** {study.tries} (one per fixed basket and settings); this basket is try {study.configuration} of "
          f"{BUDGET_PER_IDEA} for {b.strategy}'s family" if study.counted else
+         "**Tries:** not a new try: a benchmark under paper's risk caps, never counted (HoE 16 Nov)"
+         if b.risk_profile is not None else
          "**Tries:** not a new try: a confirming run of settings already counted (Advisor 27 Oct)"), "",
         *([LEGS_NOT_REBALANCED, ""] if pooled is not None else []),
         *_held_lines(study),
