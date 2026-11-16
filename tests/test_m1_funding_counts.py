@@ -248,6 +248,42 @@ def test_the_unfiltered_view_counts_what_the_filter_drops_and_answers_the_top_ra
     assert (g["high"], g["raw_high"], g["over_cap"], g["not_a_number"], g["top_below"]) == (0, 0, 1, 1, True)
 
 
+def test_the_unfiltered_views_edges_at_the_cap_the_line_and_the_window(tmp_path, monkeypatch):
+    """CR on #349, F1: a rate exactly at the cap is kept; a kept rate above the line outside the window doesn't make
+    the window's top; a top exactly at the line is not under it; on a 4-hourly schedule the unfiltered count is per
+    8 hours too."""
+    from dataclasses import replace
+
+    from sleeve_fund import funding, venues
+
+    cap = funding.cap_of("BINANCE", "BTC/USDT")
+    t0 = pd.Timestamp("2024-01-01", tz="UTC")
+    rows = [(t0 + 8 * H * k, 0.0001) for k in range(30)]
+    rows[3] = (rows[3][0], 0.001)  # day 1, above the line but before the window
+    _rates(tmp_path / "w", "BTC/USDT", rows)
+    g = funding_counts.gate_counts("BINANCE", "BTC/USDT", t0 + pd.Timedelta(days=2), t0 + pd.Timedelta(days=9),
+                                   tmp_path / "w")
+    assert (g["raw_high"], g["top_below"]) == (0, True)  # outside the window: never the window's top
+    rows[3] = (rows[3][0], 0.0001)
+    rows[9] = (rows[9][0], cap)  # day 3, inside the window, exactly at the cap: believable, so kept
+    _rates(tmp_path / "a", "BTC/USDT", rows)
+    g = funding_counts.gate_counts("BINANCE", "BTC/USDT", t0 + pd.Timedelta(days=2), t0 + pd.Timedelta(days=9),
+                                   tmp_path / "a")
+    assert (g["over_cap"], g["high"], g["top_below"]) == (0, 1, False)
+    rows[9] = (rows[9][0], 0.0001)
+    rows[10] = (rows[10][0], funding_counts.GATE_RATE)  # the window's top exactly at the line
+    _rates(tmp_path / "b", "BTC/USDT", rows)
+    g = funding_counts.gate_counts("BINANCE", "BTC/USDT", t0 + pd.Timedelta(days=2), t0 + pd.Timedelta(days=9),
+                                   tmp_path / "b")
+    assert (g["raw_high"], g["top_below"]) == (1, False)
+    monkeypatch.setitem(venues.VENUES, "BINANCE", replace(venues.VENUES["BINANCE"], funding_hours=(0, 4, 8, 12, 16, 20)))
+    four = [(t0 + 4 * H * k, 0.0001) for k in range(60)]
+    four[20] = (four[20][0], 0.00016)  # 0.00032 per 8 hours: at the line only once scaled
+    _rates(tmp_path / "c", "BTC/USDT", four)
+    g = funding_counts.gate_counts("BINANCE", "BTC/USDT", t0, t0 + pd.Timedelta(days=9), tmp_path / "c")
+    assert (g["raw_high"], g["top_below"]) == (1, False)
+
+
 def test_the_gate_line_is_per_8_hours_on_a_4_hourly_schedule(tmp_path, monkeypatch):
     """CR on #348, F1: a rate per settlement is scaled to 8 hours before it meets the line, so on a 4-hourly
     schedule 0.00016 (0.00032 per 8 hours) is at the line and 0.00014 (0.00028) is not."""
