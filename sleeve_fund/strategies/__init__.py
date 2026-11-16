@@ -77,7 +77,9 @@ def places_stop(strategy: str, params: dict | None) -> bool:
     except (ImportError, AttributeError):
         defaults = {}
     merged = {**defaults, **(params or {})}
-    return any((merged.get(k) or 0) > 0 for k in STOP_KEYS) or definition_stops(merged.get("definition"))
+    placed = any((merged.get(k) or 0) > 0 for k in STOP_KEYS)
+    # Only the rules strategy trades a definition; a stray one on any other strategy is refused at start anyway.
+    return placed or (strategy == "rules" and definition_stops(merged.get("definition")))
 
 
 def definition_stops(defn) -> bool:

@@ -37,10 +37,13 @@ def test_a_definitions_fixed_stop_on_every_side_counts_as_placed_and_a_trail_or_
         assert places_stop("rules", params)
         check_perp_stop("rules", {**params, "max_leverage": 2}, "aggressive")
     for params in (_rules({"long": {"trail": _STOP}}), _rules({"long": {"time_stop": {"bars": 6}}}),
-                   _rules({"long": {"stop": _STOP}}, short=True), _rules({}), {"market": "perp", "definition": None}):
+                   _rules({"long": {"stop": _STOP}}, short=True), _rules({}), {"market": "perp", "definition": None},
+                   {"market": "perp", "definition": {"exits": {"stop": _STOP}}}):
         assert not places_stop("rules", params)
         with pytest.raises(ValueError, match="places no stop"):
             check_perp_stop("rules", {**params, "max_leverage": 2}, "aggressive")
+    # A definition is the rules strategy's alone: a stray one with a stop on another model places nothing.
+    assert not places_stop("rsi_pullback", {**_rules({"stop": _STOP}), "market": "perp"})
 
 
 @pytest.mark.parametrize("strategy, params", STOPLESS)
