@@ -166,6 +166,8 @@ class BasketStudy:
     intents: list = field(default_factory=list)  # the base run's Intents on the test days (Advisor 28 Oct)
     legs: dict = field(default_factory=dict)  # leg name -> (asset, bar length)
     unguarded_entries: dict = field(default_factory=dict)  # a guarded scaled run: its legs' intents, guards off
+    equal: Any = None  # a rank book's EqualMoney on its base run (family C), else None
+    unranked: list = field(default_factory=list)  # a rank book's Mondays it couldn't rank, as ISO dates (Advisor 16 Nov)
 
     @property
     def gate_touched(self) -> float:
@@ -232,6 +234,9 @@ def _run(basket: Basket, assets: list[BasketAsset], first: date, last: date, fee
     and the fund keeps the rest as cash no Strategy holds, so each entry is scale x the leg's current equity (it
     compounds as the unscaled leg does) and the book is (1 - scale) x capital + scale x the unscaled one (Advisor 27
     Oct, check 2a); None: as before."""
+    if scale is not None and rank_book(basket.params):
+        raise ValueError("a basket ranking its assets sizes every leg off the fund at its own fixed share: it takes no "
+                         "size scale")
     share = 1.0 if scale is None else scale
     data = [_cut(a, first, last, warm_days) for a in assets]
     if len(data) > 1:
@@ -242,12 +247,91 @@ def _run(basket: Basket, assets: list[BasketAsset], first: date, last: date, fee
                      capital=capital * share / len(data), fees=fees)
              for n, d, a in zip(names, data, assets)]
     return run_portfolio(specs, profile, unallocated=capital * (1 - share),
-                         fund_sized=not own_sized(profile, scale)), names, specs
+                         fund_sized=not own_sized(profile, scale, basket.params)), names, specs
 
 
-def own_sized(profile: PortfolioProfile, scale: float | None) -> bool:
-    """Guards off or at a size scale, every leg sizes off its own account (_run), never the fund."""
-    return scale is not None or profile == UNGUARDED
+def own_sized(profile: PortfolioProfile, scale: float | None, params: dict | None = None) -> bool:
+    """Guards off or at a size scale, every leg sizes off its own account (_run), never the fund; a rank book
+    (rank_book) always sizes off the fund."""
+    return (scale is not None or profile == UNGUARDED) and not rank_book(params)
+
+
+# Family C (pre-registration, section 3; Advisor Q2, 16 Nov): a basket ranking its assets against each other holds equal
+# money at entry, each leg at most RANK_LEG_MAX of the fund, so its two legs together never open above 1x gross.
+RANK_LEG_MAX = 0.5
+RANK_BOOK_NEEDS = (f"a basket ranking its assets sizes every leg at a fixed share of the fund: set position_cap_pct, "
+                   f"at most {RANK_LEG_MAX:g}")
+
+
+def rank_book(params: dict | None) -> bool:
+    """Whether a basket's legs rank its assets against each other (a relative strength rank block): such a basket
+    always sizes every entry off the fund's book, guards on or off, so a long and a short opened on one close hold
+    equal money (HoE 16 Nov, option 1). Only the block makes a basket one: nothing else can switch this on. Refused
+    (RANK_BOOK_NEEDS) without a fixed share of the fund of at most RANK_LEG_MAX a leg."""
+    blocks = ((params or {}).get("definition") or {}).get("blocks") or {}
+    if not any(isinstance(b, dict) and b.get("kind") == "relative_strength_rank" for b in blocks.values()):
+        return False
+    share = params.get("position_cap_pct")
+    if share is None or not 0 < float(share) <= RANK_LEG_MAX:
+        raise ValueError(RANK_BOOK_NEEDS)
+    return True
+
+
+@dataclass
+class EqualMoney:
+    """A rank book's entries checked against its sizing (family C): each opened at its share of the fund it was sized
+    off, to the cent, and any opened together on one close sized off the same fund, together at most 1x of it."""
+
+    entries: int = 0
+    off_share: int = 0  # not sized by the share of the fund, or not to the cent (CENT_ROUNDING)
+    unequal: int = 0  # closes where entries opened together were sized off different funds or differ in size
+    over_gross: int = 0  # closes whose entries together come to more than the fund they were sized off
+
+    @property
+    def passed(self) -> bool:
+        return self.entries > 0 and not (self.off_share or self.unequal or self.over_gross)
+
+
+def entry_close(order_id: str, signal: dict) -> pd.Timestamp:
+    """The close an entry was decided on: its signal's bar, or for a flip's new leg (opened once the old one's close
+    fills, so its signal carries no bar) its order id's time, to the minute: the engine names an order
+    O-YYYYMMDD-HHMMSS-..., stamped when it is sent."""
+    bar = (signal.get("bar") or {}).get("close_ts")
+    if bar is not None:
+        return pd.Timestamp(bar)
+    stamp = "-".join(str(order_id).split("-")[1:3])
+    return pd.Timestamp(pd.to_datetime(stamp, format="%Y%m%d-%H%M%S"), tz="UTC").floor("min")
+
+
+CENT_ROUNDING = 0.0101  # budget and fund are each journaled to the cent: half a cent each, and float noise
+
+
+def unranked_dates(run: PortfolioResult) -> list[str]:
+    """Every Monday any leg's rank block couldn't rank, as ISO dates, once each, in order."""
+    return sorted({d for r in run.legs.values() for d in (r.rule_counts or {}).get("rank_unranked", [])})
+
+
+def equal_money(run: PortfolioResult, share: float) -> EqualMoney:
+    """EqualMoney over every entry the run's legs opened (equal money at entry, family C)."""
+    out, by_close = EqualMoney(), {}
+    for leg in run.legs.values():
+        for oid, d in (leg.decisions or {}).items():
+            if d.get("intent") != "entry":
+                continue
+            sig = d.get("signal") or {}
+            out.entries += 1
+            fund, budget = sig.get("sized_off_fund"), sig.get("budget")
+            if (fund is None or sig.get("sized_by") != "risk profile cap"
+                    or abs(float(budget) - share * float(fund)) > CENT_ROUNDING):
+                out.off_share += 1
+            by_close.setdefault(entry_close(oid, sig), []).append((fund, budget))
+    for opened in by_close.values():
+        if len(opened) > 1 and (len({f for f, _ in opened}) > 1 or len({b for _, b in opened}) > 1):
+            out.unequal += 1
+        fund = opened[0][0]
+        if fund is not None and sum(float(b) for _, b in opened) > float(fund) + CENT_ROUNDING:
+            out.over_gross += 1
+    return out
 
 
 def _gross(run: PortfolioResult) -> pd.Series | None:
@@ -696,7 +780,7 @@ def basket_study(basket: Basket, windows, research_end: date, *, register: trial
     assets = list(basket.assets)
     names_of = basket.names
 
-    own = own_sized(profile, scale)
+    own = own_sized(profile, scale, basket.params)
 
     def measured(subset, fees):
         run, names, specs = _run(basket, subset, first, last, fees, capital, profile, warm_days, scale)
@@ -706,6 +790,13 @@ def basket_study(basket: Basket, windows, research_end: date, *, register: trial
 
     base, names, specs = measured(assets, None)
     base.passed = base.net > 0
+    equal = None
+    if rank_book(basket.params):  # family C: equal money at entry, checked on the run itself before anything else
+        equal = equal_money(base.run, float(basket.params["position_cap_pct"]))
+        if not equal.passed:
+            raise ValueError(f"refused: equal money at entry failed ({equal.entries} entries: {equal.off_share} not at "
+                             f"their share of the fund, {equal.unequal} closes unequal, {equal.over_gross} closes over "
+                             "1x gross), so no sheet and no try")
     bars = {n: _bar(sp) for n, sp in zip(names, specs)}
     touched = gate_touched(base.run, windows, bars)
     twice_fees = {str(a.instrument.id): doubled(base_fees(a.instrument, basket.params)) for a in assets}
@@ -733,6 +824,9 @@ def basket_study(basket: Basket, windows, research_end: date, *, register: trial
         ladder=rungs, breakeven=ladder_breakeven(rungs) if rungs else (None, "not tested"),
         asset_breakeven={a: ladder_breakeven(r) for a, r in per_asset.items() if r})
     study.key = basket_key(basket)
+    study.equal = equal
+    if equal is not None:
+        study.unranked = unranked_dates(base.run)
     study.unguarded, study.size_scale, study.counted = profile == UNGUARDED, scale, counted
     if own:
         by_leg = held_peaks(base.run)
@@ -891,6 +985,7 @@ def render(study: BasketStudy, holdout: Holdout | None = None, round_try: str | 
          "**Tries:** not a new try: a confirming run of settings already counted (Advisor 27 Oct)"), "",
         *([LEGS_NOT_REBALANCED, ""] if pooled is not None else []),
         *_held_lines(study),
+        *_equal_lines(study),
         f"Out-of-sample: {study.windows[0][0]} to {study.windows[-1][1]}, {days} days, one fund run of the whole "
         f"basket at the venue's fees: net {_pct(base.net)}.", "",
         "| Condition | Result |", "| --- | --- |",
@@ -923,6 +1018,30 @@ def render(study: BasketStudy, holdout: Holdout | None = None, round_try: str | 
 
 
 # Advisor 27 Oct (check 2b): the basket's convention, beside a pool worked by hand
+def _equal_lines(study: BasketStudy) -> list[str]:
+    """A rank book's equal-money check (family C), else nothing."""
+    e = study.equal
+    if e is None:
+        return []
+    share = float(study.basket.params["position_cap_pct"])
+    return [(f"**Equal money at entry:** {'PASS' if e.passed else 'FAIL'}: {e.entries} entries, each at {share:g}x the "
+             "fund it was sized off; those opened on one close sized off the same fund and together at most 1x of it. "
+             "No leg is topped up while held, so a held leg's notional drifts with its price until it changes."), "",
+            *_unranked_lines(study)]
+
+
+def _unranked_lines(study: BasketStudy) -> list[str]:
+    """A rank book's Mondays with no ranking, by date (Advisor 16 Nov): the legs were held through each. One inside the
+    test days is an accuracy check 7 item, not verified until explained; the warm-up's are only counted."""
+    first, last = study.windows[0][0], study.windows[-1][1] + timedelta(days=1)  # a Monday close on the last day's end
+    inside = [d for d in study.unranked if first <= date.fromisoformat(d) <= last]
+    warm = len(study.unranked) - len(inside)
+    if not inside:
+        return [f"**Unranked Mondays:** none in the test days ({warm} in the warm-up, before it had its lookback).", ""]
+    return [f"**Unranked Mondays:** {len(inside)} in the test days, legs held through each: {', '.join(inside)} "
+            f"({warm} in the warm-up). Accuracy check 7: not verified until each is explained.", ""]
+
+
 def _gate_lines(study: BasketStudy) -> list[str]:
     """What the compliance tests did to the base run's entry and add intents on the test days (Advisor 28 Oct): per
     asset, intents taken, refused, trimmed and delayed, the notional each test touched, and the drawdown halt's and the

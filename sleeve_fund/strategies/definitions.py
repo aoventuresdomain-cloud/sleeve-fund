@@ -288,8 +288,9 @@ class RelativeStrengthRank(Block):
     it never reads a value there.
 
     A week where any asset has no close at the decision time or at lookback_days before it gives no value, so no rule
-    reading it holds that week (an exit reading it doesn't either: the leg is held), and is counted in `no_rank`; the
-    ranking before it is kept for the next tie. `weeks` counts the weeks it ranked."""
+    reading it holds that week (an exit reading it doesn't either: the leg is held, Advisor 16 Nov), and is counted in
+    `no_rank` with its date in `unranked`; so is a week whose score isn't finite (a close of 0 or less lookback_days
+    back). The ranking before it is kept for the next tie. `weeks` counts the weeks it ranked."""
 
     SETTINGS = (Setting("lookback_days", int, 28, min=7, max=365),)
     OUTPUTS = ("rank", "score")
@@ -301,7 +302,7 @@ class RelativeStrengthRank(Block):
 
     def reset(self) -> None:
         self._value, self._score, self._ready, self._last = 0.0, 0.0, False, None
-        self.no_rank, self.weeks = 0, 0
+        self.no_rank, self.weeks, self.unranked = 0, 0, []
 
     def update_raw(self, close: float, ts_ns: int) -> None:
         import numpy as np
@@ -310,7 +311,7 @@ class RelativeStrengthRank(Block):
             return  # inside the week: the ranking made at its start stands
         self._ready = False
         if self.source is None:
-            self.no_rank += 1
+            self._unranked(ts_ns)
             return
         own, closes, order = self.source
         scores = {}
@@ -320,13 +321,21 @@ class RelativeStrengthRank(Block):
             for t in (int(ts_ns), int(ts_ns) - self.lookback_days * DAY_NS):
                 i = int(np.searchsorted(times, t))
                 if i == len(times) or int(times[i]) != t:  # no close at that exact time: never a nearby one
-                    self.no_rank += 1
+                    self._unranked(ts_ns)
                     return
                 at.append(float(values[i]))
+            if not (math.isfinite(at[0]) and math.isfinite(at[1]) and at[1] > 0):  # no score to sort (CR #350, F1)
+                self._unranked(ts_ns)
+                return
             scores[asset] = at[0] / at[1] - 1.0
         ranks = relative_strength_ranks(scores, self._last, tuple(order))
         self._last, self._value, self._score, self._ready = ranks, float(ranks[own]), scores[own], True
         self.weeks += 1
+
+    def _unranked(self, ts_ns: int) -> None:
+        """A Monday it couldn't rank: counted, and its date kept for the sheet (Advisor 16 Nov)."""
+        self.no_rank += 1
+        self.unranked.append(datetime.fromtimestamp(int(ts_ns) / 1e9, tz=timezone.utc).date().isoformat())
 
     def update_ohlcv(self, open_, high, low, close, volume, ts_ns=None) -> None:
         if ts_ns is None:

@@ -2843,6 +2843,8 @@ class LongFlatStrategy(Strategy):
         self._noted.discard("buy_skipped")
         signal = {**values, "close": close, "side": _side_word(side), "sized_by": size_by,
                   "budget": round(float(budget), 2), **self._fund_at_entry(base)}
+        if self.fund_equity is not None:  # a fund-sized run's base, for its equal-money check (family C)
+            signal["sized_off_fund"] = round(float(base), 2)
         if strength_words:
             signal["strength"] = strength_words
             if self._strength_f is not None:  # G5 research side: the size factor, the same field in every engine
