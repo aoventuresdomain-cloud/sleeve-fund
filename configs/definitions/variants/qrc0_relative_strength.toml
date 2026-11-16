@@ -10,8 +10,8 @@ reason = """Over weeks, money flows toward the large assets that have risen fast
 relative performance persists for a while. Each Monday 00:00 UTC the three are ranked on their close over the close
 28 daily candles earlier, minus 1; a tie keeps the current holding. Long rank 1 and short rank 3 in equal money, rank
 2 flat. A leg is held while its asset keeps its rank and closed only when it changes, with the new leg opened on the
-same close (reverse). No stops, no take-profit, no other filters. Held at 1x gross. Decided on 4h candles: the one
-closing at Monday 00:00 UTC is the daily close at that instant, and entries are gated to it by weekday and hour."""
+same close (reverse). No stops, no take-profit, no other filters. Held at 1x gross. 4h decision candles; the rank is
+read at the Monday 00:00 UTC close, which coincides with the daily close."""
 
 [blocks.rs]
 kind = "relative_strength_rank"
