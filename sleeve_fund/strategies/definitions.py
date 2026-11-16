@@ -258,15 +258,109 @@ class FundingPercentile(FundingDecile):
         self.top_decile = top + (self._ready and self._value >= 90.0)
 
 
-# Blocks a study may run but paper and live refuse on Start until the PM approves them (R-06, M1 item 1).
+# Family C (PM 16 Nov 21:06 UTC, backtest only; pre-registration research/quant-researcher/next-round/
+# prereg-family-c-relative-strength-16nov.md): each week, at the close at Monday 00:00 UTC, the basket's assets ranked
+# by their return over the trailing lookback_days of closes. Completed candles only: the close at the decision time
+# itself and the one lookback_days before it, never a later one.
+WEEK_NS = 7 * DAY_NS
+MONDAY_OFFSET_NS = 4 * DAY_NS  # 1970-01-01 was a Thursday: Monday 00:00 UTC sits 4 days past a multiple of a week
+
+
+def is_weekly_decision(ts_ns: int) -> bool:
+    """Whether a candle closing at ts_ns closes at Monday 00:00 UTC, the start of the UTC week."""
+    return (int(ts_ns) - MONDAY_OFFSET_NS) % WEEK_NS == 0
+
+
+def relative_strength_ranks(scores: dict, previous: dict | None, order: tuple) -> dict:
+    """Each asset's rank by score, 1 the highest. A tie keeps the order the tied assets held at the last ranking
+    (so the current holding stays, as the pre-registration fixes), and with none, the basket's listed order."""
+    last = previous or {}
+    keyed = sorted(order, key=lambda a: (-scores[a], last.get(a, len(order) + 1), order.index(a)))
+    return {a: n for n, a in enumerate(keyed, start=1)}
+
+
+class RelativeStrengthRank(Block):
+    """Family C, studies only: this asset's rank among the basket's assets, 1 the strongest, by each one's return over
+    the trailing `lookback_days`: the close of the candle closing at the decision time over the close lookback_days
+    before it, less 1. It ranks at each close at Monday 00:00 UTC only (is_weekly_decision) and holds that ranking
+    through the week, so a rule reading it acts on closed weeks alone. The basket's run hands it `source` = (this
+    asset's name, {asset: (close times ns, closes)}, the basket's assets in listed order); a single run never does, so
+    it never reads a value there.
+
+    A week where any asset has no close at the decision time or at lookback_days before it gives no value, so no rule
+    reading it holds that week (an exit reading it doesn't either: the leg is held), and is counted in `no_rank`; the
+    ranking before it is kept for the next tie. `weeks` counts the weeks it ranked."""
+
+    SETTINGS = (Setting("lookback_days", int, 28, min=7, max=365),)
+    OUTPUTS = ("rank", "score")
+
+    def __init__(self, lookback_days: int = 28) -> None:
+        self.lookback_days = int(lookback_days)
+        self.source = None
+        self.reset()
+
+    def reset(self) -> None:
+        self._value, self._score, self._ready, self._last = 0.0, 0.0, False, None
+        self.no_rank, self.weeks = 0, 0
+
+    def update_raw(self, close: float, ts_ns: int) -> None:
+        import numpy as np
+
+        if not is_weekly_decision(ts_ns):
+            return  # inside the week: the ranking made at its start stands
+        self._ready = False
+        if self.source is None:
+            self.no_rank += 1
+            return
+        own, closes, order = self.source
+        scores = {}
+        for asset in order:
+            times, values = closes[asset]
+            at = []
+            for t in (int(ts_ns), int(ts_ns) - self.lookback_days * DAY_NS):
+                i = int(np.searchsorted(times, t))
+                if i == len(times) or int(times[i]) != t:  # no close at that exact time: never a nearby one
+                    self.no_rank += 1
+                    return
+                at.append(float(values[i]))
+            scores[asset] = at[0] / at[1] - 1.0
+        ranks = relative_strength_ranks(scores, self._last, tuple(order))
+        self._last, self._value, self._score, self._ready = ranks, float(ranks[own]), scores[own], True
+        self.weeks += 1
+
+    def update_ohlcv(self, open_, high, low, close, volume, ts_ns=None) -> None:
+        if ts_ns is None:
+            raise ValueError("the relative strength rank needs each candle's close time")
+        self.update_raw(close, ts_ns)
+
+    @property
+    def initialized(self) -> bool:
+        return self._ready
+
+    def _outputs(self) -> dict:
+        return {"rank": self._value, "score": self._score}
+
+    @warmup
+    def warmup_bars(cls, s) -> int:
+        return 0  # its history is the source's closes, not candles fed to it
+
+    @classmethod
+    def warmup_minutes(cls, settings: dict) -> int:
+        """Minutes before it first ranks, at most: its lookback, then up to a week to the first Monday close."""
+        return (cls.check_settings(settings)["lookback_days"] + 7) * DAY_MINUTES
+
+
+# Blocks a study may run but paper and live refuse on Start until the PM approves them (R-06, M1 item 1; family C).
 STUDY_ONLY_BLOCKS = {"funding_decile": "the funding rate decile block",
                      "funding_zscore": "the funding rate z-score block",
-                     "funding_percentile": "the funding rate percentile block"}
+                     "funding_percentile": "the funding rate percentile block",
+                     "relative_strength_rank": "the relative strength rank block"}
 FUNDING_BLOCKS = ("funding_decile", "funding_zscore", "funding_percentile")  # each reads the stored settled rates
 
 # The blocks a definition builds, by name: the library's, with channels counted as the rule builder defines them.
 BUILDER_BLOCKS = {**BLOCKS, "donchian": ClosedChannel, "funding_decile": FundingDecile,
-                  "funding_zscore": FundingZScore, "funding_percentile": FundingPercentile}
+                  "funding_zscore": FundingZScore, "funding_percentile": FundingPercentile,
+                  "relative_strength_rank": RelativeStrengthRank}
 
 
 # What the builder offers for each block, by its name in BLOCKS. ATR is Wilder's; the simple average of true ranges
@@ -281,6 +375,7 @@ CATALOGUE = {
     "funding_decile": "Funding rate decile (studies only)",
     "funding_zscore": "Funding rate z-score (studies only)",
     "funding_percentile": "Funding rate percentile (studies only)",
+    "relative_strength_rank": "Relative strength rank across the basket (studies only)",
 }
 _ID = re.compile(r"^[a-z_][a-z0-9_]*$")
 _TIMEFRAME = re.compile(r"^(\d+)(m|h|d)$")

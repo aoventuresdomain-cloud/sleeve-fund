@@ -37,7 +37,8 @@ import pandas as pd
 
 from sleeve_fund.research.random_entry import BAR, CLOSE_PRICED, DRAWS
 from sleeve_fund.strategies.base import MAX_STOP, MIN_STOP
-from sleeve_fund.strategies.definitions import (Compiled, Confirm, Env, FirstTouch, FundingDecile, Group, Setup,
+from sleeve_fund.strategies.definitions import (Compiled, Confirm, Env, FirstTouch, FundingDecile, Group,
+                                                RelativeStrengthRank, Setup,
                                                 check_definition)
 from sleeve_fund.strategies.timeframes import MINUTE_NS
 
@@ -175,6 +176,10 @@ def fast_path(definition: dict, prices: pd.DataFrame, bar_minutes: int, trade_fr
 
     checked = check_definition(definition, bar_minutes=bar_minutes)
     rules = Compiled(checked)
+    if any(isinstance(b, RelativeStrengthRank) for b in rules.blocks.values()):
+        from sleeve_fund.research.portfolio_run import RANK_NEEDS
+
+        raise ValueError(RANK_NEEDS)  # one asset's bars alone: nothing to rank it against
     for b in rules.blocks.values():
         if isinstance(b, FundingDecile):
             b.source = funding

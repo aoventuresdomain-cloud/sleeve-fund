@@ -239,6 +239,10 @@ def run_backtest(
     legs = []
     try:
         legs.append(add_leg(engine, plan))
+        if getattr(legs[0].strategy, "rank_blocks", None) and legs[0].strategy.rank_blocks():
+            from sleeve_fund.research.portfolio_run import RANK_NEEDS
+
+            raise ValueError(RANK_NEEDS)  # one asset alone: nothing to rank it against
         feed_legs(engine, legs)
         return leg_result(engine, legs[0])
     finally:

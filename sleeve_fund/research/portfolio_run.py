@@ -201,6 +201,36 @@ def _check(specs: list[LegSpec]) -> None:
                              f"{before or pd.Timedelta(0)}")
 
 
+RANK_NEEDS = "the relative strength rank block ranks a basket's assets against each other, so it needs 2 or more"
+
+
+def rank_closes(specs: list[LegSpec]) -> dict:
+    """Family C: each leg's decision-bar closes, warm-up and window together, by close time, as a relative strength
+    rank reads them: {leg name: (close times ns, closes)}, sorted. Only bars the run itself is fed, so a rank can never
+    read a close the run hasn't reached."""
+    out = {}
+    for s in specs:
+        bars = pd.concat([s.warmup_prices, s.prices]) if len(s.warmup_prices) else s.prices
+        bars = bars[~bars.index.duplicated(keep="last")].sort_index()
+        idx = bars.index if bars.index.tz is not None else bars.index.tz_localize("UTC")
+        out[s.name] = (idx.as_unit("ns").asi8.copy(), bars["close"].to_numpy(dtype=float).copy())
+    return out
+
+
+def hand_ranks(specs: list[LegSpec], strategies: list) -> None:
+    """Hands every relative strength rank block its leg's name, every leg's closes and the legs' order (Family C); a
+    run of one leg is refused (RANK_NEEDS)."""
+    ranked = [(spec, st) for spec, st in zip(specs, strategies) if getattr(st, "rank_blocks", None) and st.rank_blocks()]
+    if not ranked:
+        return
+    if len(specs) < 2:
+        raise ValueError(RANK_NEEDS)
+    closes, order = rank_closes(specs), tuple(s.name for s in specs)
+    for spec, st in ranked:
+        for block in st.rank_blocks():
+            block.source = (spec.name, closes, order)
+
+
 def run_portfolio(specs: list[LegSpec], profile: PortfolioProfile = PORTFOLIO, unallocated: float = 0.0,
                   log_level: str = "ERROR", netting: bool = False, regime: Weighting | None = None,
                   fund_sized: bool = False) -> PortfolioResult:
@@ -293,6 +323,7 @@ def run_portfolio(specs: list[LegSpec], profile: PortfolioProfile = PORTFOLIO, u
             clone = clone_instrument(spec.instrument, clone_venue(spec.instrument.id.venue, n))
             join = lambda s, name=spec.name: s.join_portfolio(batch, name)  # noqa: E731
             legs.append(add_leg(engine, plan, clone, before_add=join, order_id_tag=f"{n:03d}"))
+        hand_ranks(specs, [leg.strategy for leg in legs])
         if fund_sized:
             last["book"] = (float(sum(s.capital for s in specs)) + float(unallocated), [])  # before the first read
             for leg in legs:
