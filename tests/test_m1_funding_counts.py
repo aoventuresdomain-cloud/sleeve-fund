@@ -127,17 +127,22 @@ def test_the_short_gate_counts_rates_at_the_line_and_the_blocks_own_reading_at_t
     rows = [(u, x) for u, x in rows if abs(x) <= 0.05]  # what the blocks read (funding.believable)
     start, end = pd.Timestamp("2024-01-01", tz="UTC"), pd.Timestamp("2024-07-18", tz="UTC")
     g = funding_counts.gate_counts("BINANCE", "BTC/USDT", start, end, tmp_path)
+    view = {k: g.pop(k) for k in ("raw_high", "over_cap", "not_a_number", "top_below")}
     assert g == _expected(rows, start, end + pd.Timedelta(days=1))
+    # Advisor, 16 Nov: unfiltered, day 195's 0.06 is at the line too, and the filter's one drop in the window
+    assert view == {"raw_high": g["high"] + 1, "over_cap": 1, "not_a_number": 0, "top_below": False}
     assert g["high"] == 1 + 1 + 1 + 40 + 1 + 1 + 1 and g["no_value"] == 1 and g["other_read"] == 1
     assert g["read"] == g["high"] - 2 and 2 <= g["at_pct"] < g["read"]
     later = pd.Timestamp("2024-05-02", tz="UTC")  # the window's start is honoured: days 30, 120 and 121 fall out
     late = funding_counts.gate_counts("BINANCE", "BTC/USDT", later, end, tmp_path)
+    late = {k: v for k, v in late.items() if k not in view}
     assert late == _expected(rows, later, end + pd.Timedelta(days=1)) and late["high"] == g["high"] - 3
     assert funding_counts.main(["--venue", "BINANCE", "--pairs", "BTC/USDT,ETH/USDT", "--start", "2024-01-01",
                                 "--end", "2024-07-18", "--root", str(tmp_path), "--gate"]) == 2  # ETH: none stored
     out = capfd.readouterr().out
     assert (f"| BTC | {g['high']} | {g['read']} | {g['at_pct']} | {g['no_value']} | {g['other_read']} |") in out
     assert "| ETH | 0 | 0 | 0 | 0 | 0 |" in out
+    assert f"| BTC | {g['high'] + 1} | 1 | 0 | no |" in out and "| ETH | 0 | 0 | 0 | no rates |" in out
     gate_table = out[out.index("Short gate"):]
     assert "0.0" not in gate_table.split("\n", 3)[-1] and ":" not in gate_table.split("\n", 3)[-1]  # counts only
 
@@ -229,6 +234,18 @@ def test_check_8_reads_the_store_under_the_pair_whatever_form_the_book_writes_an
     _book(book, [("ETHUSDT-PERP", t0 + 3 * 24 * H + pd.Timedelta(minutes=1), 0.0001)])
     with pytest.raises(SystemExit, match="ETH/USDT"):
         funding_counts.check8("BINANCE", book, tmp_path / "h")
+
+
+def test_the_unfiltered_view_counts_what_the_filter_drops_and_answers_the_top_rate_as_yes_or_no(tmp_path):
+    """Advisor, 16 Nov: a rate the believability filter drops can't hide from the gate count, and no rate is
+    printed: the highest kept one is only said to be under the line or not."""
+    t0 = pd.Timestamp("2024-01-01", tz="UTC")
+    rows = [(t0 + 8 * H * k, 0.0001) for k in range(30)]
+    rows[5] = (rows[5][0], float("nan"))
+    rows[6] = (rows[6][0], -0.07)
+    _rates(tmp_path, "BTC/USDT", rows)
+    g = funding_counts.gate_counts("BINANCE", "BTC/USDT", t0, t0 + pd.Timedelta(days=9), tmp_path)
+    assert (g["high"], g["raw_high"], g["over_cap"], g["not_a_number"], g["top_below"]) == (0, 0, 1, 1, True)
 
 
 def test_the_gate_line_is_per_8_hours_on_a_4_hourly_schedule(tmp_path, monkeypatch):
