@@ -55,7 +55,7 @@ Row 2 needs no build. Row 3 (added 31 Oct after B closed at round 0; Advisor cle
 research/quant-researcher/next-round/prereg-family-h-trend-pullback-31oct.md at 05:56 UTC) needs no build. Each row
 is dispatched on its own with `--rows N`. No PASS or "edge found" wording.
 Row 4 (added 16 Nov; PM yes to the build 16 Nov 21:06 UTC; Advisor cleared
-research/quant-researcher/next-round/prereg-family-c-relative-strength-16nov.md rev 2) is family C try 1. It waits for
+research/quant-researcher/next-round/prereg-family-c-relative-strength-16nov.md rev 3) is family C try 1. It waits for
 the pair null (build C d) and is not dispatched until that merges. Its warm-up is 35 days (the 28-day score plus a
 week), inside 2024; one book, sized off the fund at 0.5x a leg.
 

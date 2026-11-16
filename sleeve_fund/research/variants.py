@@ -48,8 +48,8 @@ PREREGISTERED = {
     # Family H, pullback inside a trend (Advisor cleared 31 Oct 05:56 UTC as family B try 15; same folder): a new idea,
     # so no parent and no placebo.
     "QRH0_TREND_PULLBACK": {"definition": "qrh0_trend_pullback", "params": {}},
-    # Family C, relative strength across BTC, ETH and SOL (PM yes 16 Nov 21:06 UTC; Advisor cleared rev 2 16 Nov; same
-    # folder): a new family, so no parent and no placebo. 0.5x of the fund a leg, 1x gross (Advisor Q2), which makes
+    # Family C, relative strength across BTC, ETH and SOL (PM yes 16 Nov 21:06 UTC; Advisor cleared, rev 3 frozen
+    # 17 Nov; same folder): a new family, so no parent and no placebo. 0.5x of the fund a leg, 1x gross (Advisor Q2), which makes
     # it a rank book sized off the fund.
     "QRC0_RELATIVE_STRENGTH": {"definition": "qrc0_relative_strength", "params": {"position_cap_pct": 0.5}},
 }

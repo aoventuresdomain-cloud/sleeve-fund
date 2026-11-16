@@ -97,3 +97,24 @@ def test_the_list_dry_runs(capfd):
     assert rescore.main([str(LIST), "--pair", "BTC/USDT,ETH/USDT,SOL/USDT", "--dry-run"], run=lambda *a, **k: None,
                         journal=lambda: None) == 0
     assert "dry run: 4 checked, 0 run" in capfd.readouterr().out
+
+
+def test_family_c_opens_legs_only_at_the_monday_close_even_from_a_mid_week_start():
+    # Advisor 17 Nov: a flat window start (or any flat) can't open a leg mid-week; the entries are gated to the Monday
+    # 00:00 UTC decision by weekday and hour
+    from test_rank_legs import LOOSE
+    from test_relative_strength_rank import _legs
+
+    from sleeve_fund.research import basket as bk
+    from sleeve_fund.research.portfolio_run import LegSpec, run_portfolio
+
+    d = _defn("QRC0_RELATIVE_STRENGTH")
+    params = {"definition": d, "market": "perp", "allow_short": True, **PREREGISTERED["QRC0_RELATIVE_STRENGTH"]["params"]}
+    specs = [LegSpec(**{**s.__dict__, "params": dict(params)}) for s in _legs(days=160)]
+    first = specs[0].prices.index[0]
+    assert first.weekday() not in (0, 1)  # the window's first close is mid-week
+    run = run_portfolio(specs, LOOSE, fund_sized=True)
+    opened = [bk.entry_close(oid, dec["signal"]) for leg in run.legs.values() for oid, dec in leg.decisions.items()
+              if dec.get("intent") == "entry"]
+    assert len(opened) > 4
+    assert all((t.weekday(), t.hour, t.minute) == (0, 0, 0) for t in opened), sorted(set(opened))
