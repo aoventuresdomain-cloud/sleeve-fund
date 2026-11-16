@@ -259,3 +259,55 @@ def test_a_rank_baskets_study_carries_the_null_and_attribution_and_runs_no_two_n
                  "**Without SOL:** not applicable", "**Random long/short assignment:** ", "**Attribution** ",
                  "not this book's null"):
         assert line in sheet, line
+
+
+# ---- CR #356 ------------------------------------------------------------------------------------------------------
+
+def _null(net_pct: float, pre_pct: float) -> pn.PairNull:
+    return pn.PairNull(1_000, 0, 5, 0.10, 0.12, net_pct, pre_pct, 0.0, 0.0, 4, 8.0)
+
+
+def test_round_0_kill_2_fails_the_verdict_even_above_the_after_fee_bar():
+    from sleeve_fund.research import basket as bk
+
+    lo = bk.LeftOut("SOL", 0.9, True, None, not_applicable=bk.TWO_NAME_RANK)
+    loose = {"double_fees": SimpleNamespace(passed=True), "left_out": lo, "hold": None, "pooled": None}
+    killed = _null(96.0, 85.0)
+    assert killed.beats and killed.killed
+    assert bk.verdict(SimpleNamespace(**loose, pair=killed), None) == "FAIL"
+    assert bk.verdict(SimpleNamespace(**loose, pair=killed), SimpleNamespace(passed=True)) == "FAIL"
+    assert pn.null_words(killed).startswith("BELOW THE BAR (round-0 kill 2: below 90% before fees)")
+    assert bk.verdict(SimpleNamespace(**loose, pair=_null(96.0, 90.0)), None) == "NOT YET"  # 90 is not below 90
+
+
+def test_the_bar_is_95_after_fees_at_the_boundary():
+    assert _null(95.0, 99.0).beats and not _null(94.9, 99.0).beats
+    assert not _null(99.0, 90.0).killed and _null(99.0, 89.9).killed
+
+
+def test_a_draw_that_ties_the_book_is_not_beaten():
+    assets, change, end = _trend(4)
+    flat = [pn.PairAsset(x.name, x.close_ns, np.full(len(x.opens), 100.0), np.full(len(x.closes), 100.0), MIN,
+                         0.0, 0.0) for x in assets]
+    r = pn.pair_null(flat, change[0], change, [(None, None)] + [(0, 2)] * 4, end, [1_000.0] * 5, 10_000.0)
+    assert r.strategy_net == 0.0 and r.net_percentile == 0.0 and r.pre_percentile == 0.0  # every draw ties
+
+
+def test_a_change_at_the_windows_end_is_not_a_change_week():
+    trips = {0: [{"opened": T0 + pd.Timedelta(minutes=1), "closed": T0 + WK * 2 + pd.Timedelta(minutes=1), "side": 1}]}
+    change, states = pn.strategy_states(trips, T0, T0 + WK * 2)
+    assert change == [T0.value] and states == [(None, None), (0, None)]
+
+
+def test_only_unranked_mondays_inside_the_window_are_counted(ran):
+    from sleeve_fund.research import basket as bk
+
+    specs, run = ran
+    params = dict(specs[0].params)
+    first, last = (specs[0].prices.index[30] - pd.Timedelta(days=1)).date(), \
+        (specs[0].prices.index[-1] - pd.Timedelta(days=1)).date()
+    inside = str(first + pd.Timedelta(days=7))
+    outside = [str(first - pd.Timedelta(days=7)), str(last + pd.Timedelta(days=7))]
+    r = bk.rank_null(SimpleNamespace(run=run), [s.name for s in specs], specs, params, ((first, last),), 30_000.0,
+                     [inside, *outside])
+    assert r.skipped_weeks == 1

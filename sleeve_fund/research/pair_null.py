@@ -276,5 +276,6 @@ def null_words(r: PairNull | None) -> str:
                 f"on {', '.join(r.baseline_dates)}")
     if r.unreconciled:
         return f"NOT JUDGED: {out} (more than {RECONCILE_PP * 100:.1f} points apart)"
-    verdict = "ABOVE THE BAR" if r.beats else "BELOW THE BAR"  # the list allows no PASS wording
-    return f"{verdict}{' (round-0 kill 2)' if r.killed else ''}: {out}"
+    if r.killed:  # fails the book whatever the after-fee share (CR #356)
+        return f"BELOW THE BAR (round-0 kill 2: below {PRE_FEE_KILL:.0f}% before fees): {out}"
+    return f"{'ABOVE THE BAR' if r.beats else 'BELOW THE BAR'}: {out}"  # the list allows no PASS wording
