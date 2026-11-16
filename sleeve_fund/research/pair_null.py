@@ -9,7 +9,8 @@ Both sides are priced by the same model, so the comparison is like with like: a 
 execution bar opening at or after its Monday close, at the leg notional the Strategy sized at that change week, and
 pays half the spread and the taker fee on each side, plus funding at each settlement it is held over; a leg kept
 across a change week is not re-traded; a leg still open at the window's end is marked at the last close, unpaid.
-Legs carried into the window are valued from the first change week's open, for the Strategy and every draw alike.
+Legs carried into the window are valued unpaid from its first bar's open and held by every draw to the first change
+week, so the null covers the same window as the verdict (Advisor 16 Nov ~23:55 UK).
 Pre-fee is the same with the taker fee at 0 (spread and funding still charged, as round-0 kill 1 reads "before
 fees"). The model's Strategy P&L is reconciled against the engine's book over the same span (RECONCILE_PP)."""
 
@@ -17,7 +18,7 @@ from __future__ import annotations
 
 import itertools
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
@@ -69,12 +70,13 @@ class PairAsset:
         return float(sum(-(1 if base[i] else side) * self.settle_rates[i] * self.close_at(int(self.settle_ns[i]))
                          for i in range(lo, hi)))
 
-    def baseline_in(self, after_ns: int, upto_ns: int) -> int:
-        if self.settle_baseline is None or not len(self.settle_ns):
-            return 0
+    def baseline_in(self, after_ns: int, upto_ns: int) -> list[int]:
+        """The times of the settlements in (after, upto] with no stored rate, charged at the baseline."""
+        if self.settle_baseline is None or self.settle_ns is None or not len(self.settle_ns):
+            return []
         lo = int(np.searchsorted(self.settle_ns, after_ns, side="right"))
         hi = int(np.searchsorted(self.settle_ns, upto_ns, side="right"))
-        return int(np.asarray(self.settle_baseline[lo:hi], dtype=bool).sum())
+        return [int(self.settle_ns[i]) for i in range(lo, hi) if self.settle_baseline[i]]
 
 
 @dataclass
@@ -97,6 +99,9 @@ class PairNull:
     baseline_settlements: int = 0
     skipped_weeks: int = 0  # unranked Mondays inside the span: a HOLD for the Strategy and every draw
     why_not: str = ""
+    carried: int = 0  # legs the Strategy held into the window, valued from its first bar for every side alike
+    baseline_dates: tuple = ()  # the UTC days of the baseline settlements, in order
+    attribution: dict = field(default_factory=dict)  # (asset, "long" or "short") -> the book's net, over capital
 
     @property
     def unreconciled(self) -> bool:
@@ -137,23 +142,22 @@ def _runs(states: list[tuple]) -> list[tuple[int, int, int, int]]:
 
 
 class _Pricer:
-    """Leg P&L under the model, cached by (asset, side, first state, end state, fee on)."""
+    """Leg P&L under the model, cached by (asset, side, first state, end state, fee on). times: the window's start,
+    each change week, the window's end; state i is held from times[i] to times[i + 1]."""
 
-    def __init__(self, assets: list[PairAsset], times: list[int], notional: np.ndarray):
-        self.assets, self.times, self.notional, self.cache = assets, times, notional, {}
+    def __init__(self, assets: list[PairAsset], times: list[int], notional: np.ndarray, carried: dict | None = None):
+        self.assets, self.times, self.notional, self.carried, self.cache = assets, times, notional, carried or {}, {}
 
     def leg(self, asset: int, side: int, a: int, b: int, fees: bool) -> float:
         key = (asset, side, a, b, fees)
         if key in self.cache:
             return self.cache[key]
         x, t = self.assets[asset], self.times
-        k = len(t) - 1  # t[k] is the span's end
-        carried, entry_t = a == 0, t[max(a - 1, 0)]
-        size = self.notional[max(a - 1, 0)]
+        carried, at_end = a == 0, b == len(t) - 1
+        entry_t, exit_t = t[a], t[b]
         entry = x.open_at(entry_t) * (1 if carried else 1 + side * x.half)
-        qty = size / entry
-        exit_t = t[b - 1] if b - 1 < k else t[k]
-        at_end = b - 1 >= k
+        # a carried leg at what the engine held at the window's first bar, when given: it was sized when it opened
+        qty = (self.carried.get((asset, side)) if carried and (asset, side) in self.carried else self.notional[a]) / entry
         out_px = x.close_at(exit_t) if at_end else x.open_at(exit_t) * (1 - side * x.half)
         fee = x.taker if fees else 0.0
         cost = (0.0 if carried else fee * qty * entry) + (0.0 if at_end else fee * qty * out_px)
@@ -167,25 +171,30 @@ class _Pricer:
                 sum(1 for _, _, i, _ in runs if i > 0))
 
 
-def pair_null(assets: list[PairAsset], change_ns: list[int], states: list[tuple], end_ns: int, notional, capital: float,
-              draws: int = DRAWS, seed: int = 0, book_move: float | None = None, skipped: int = 0) -> PairNull:
-    """The Strategy's books against `draws` random assignments. change_ns: its change weeks in order; states: k + 1
-    (long index, short index) pairs, states[0] carried into the span and states[i] held from change_ns[i - 1];
-    notional: the leg notional the Strategy sized at each change week; book_move: the engine book's P&L over the span,
-    for the reconcile."""
+def pair_null(assets: list[PairAsset], start_ns: int, change_ns: list[int], states: list[tuple], end_ns: int,
+              notional, capital: float, draws: int = DRAWS, seed: int = 0, book_move: float | None = None,
+              skipped: int = 0, carried: dict | None = None) -> PairNull:
+    """The Strategy's book against `draws` random assignments over the window [start, end). change_ns: its change
+    weeks in order; states: k + 1 (long index, short index) pairs, states[0] what it held from the window's first bar
+    (carried in, valued unpaid from that bar's open, and held by every draw to the first change week) and states[i]
+    from change_ns[i - 1]; notional: the leg notional at the start and at each change week (the Strategy's share of
+    its book then, for every draw alike); carried: {(asset index, side): notional} the engine held at the window's first
+    bar, which a carried leg keeps in place of states[0]'s share; book_move: the engine book's P&L over the window, for
+    the reconcile."""
     if draws < DRAWS:
         raise ValueError(f"refused: the random check draws at least {DRAWS:,} times, not {draws:,}")
     if len(assets) != 3:
         raise ValueError(f"the random long/short assignment draws from three assets' 6 orderings, not {len(assets)}")
     k = len(change_ns)
-    if len(states) != k + 1 or len(notional) < k:
-        raise ValueError("a state before the first change week and one per change week, with a notional each")
+    if len(states) != k + 1 or len(notional) != k + 1:
+        raise ValueError("a state and a notional at the window's start and at each change week")
     if k == 0:
         return PairNull(draws, seed, 0, 0.0, 0.0, math.nan, math.nan, 0.0, 0.0, 0, 0.0, why_not="no change weeks",
                         skipped_weeks=skipped)
-    if list(change_ns) != sorted(set(change_ns)) or end_ns <= change_ns[-1]:
-        raise ValueError("change weeks are distinct, in order, and before the span's end")
-    pricer = _Pricer(assets, [*map(int, change_ns), int(end_ns)], np.asarray(notional, dtype=float))
+    times = [int(start_ns), *map(int, change_ns), int(end_ns)]
+    if times[1:] != sorted(set(times[1:])) or times[0] > times[1]:  # a window may start on a change week's close
+        raise ValueError("the change weeks are distinct and in order, inside the window")
+    pricer = _Pricer(assets, times, np.asarray(notional, dtype=float), carried)
     net, legs = pricer.book(states, True)
     pre, _ = pricer.book(states, False)
     rng = np.random.default_rng(seed)
@@ -194,13 +203,19 @@ def pair_null(assets: list[PairAsset], change_ns: list[int], states: list[tuple]
         drawn = [states[0], *(ORDERINGS[i] for i in rng.integers(len(ORDERINGS), size=k))]
         nets[d], draw_legs[d] = pricer.book(drawn, True)
         pres[d], _ = pricer.book(drawn, False)
-    first = int(change_ns[0])
-    baseline = sum(x.baseline_in(first, int(end_ns)) for x in assets)
+    baseline = sorted(t for x in assets for t in x.baseline_in(int(start_ns), int(end_ns)))
+    attribution: dict = {}
+    for a, side, i, j in _runs(states):
+        key = (assets[a].name, "long" if side > 0 else "short")
+        attribution[key] = attribution.get(key, 0.0) + pricer.leg(a, side, i, j, True) / capital
     return PairNull(draws, seed, k, net / capital, pre / capital, float((nets < net).mean() * 100),
                     float((pres < pre).mean() * 100), float(np.median(nets)) / capital,
                     float(np.median(pres)) / capital, legs, float(draw_legs.mean()),
                     reconciled=None if book_move is None else (net / capital, book_move / capital),
-                    baseline_settlements=baseline, skipped_weeks=skipped)
+                    baseline_settlements=len(baseline), skipped_weeks=skipped,
+                    carried=sum(x is not None for x in states[0]),
+                    baseline_dates=tuple(dict.fromkeys(str(pd.Timestamp(t, tz="UTC").date()) for t in baseline)),
+                    attribution=attribution)
 
 
 def week_of(ts: pd.Timestamp) -> pd.Timestamp:
@@ -212,7 +227,7 @@ def week_of(ts: pd.Timestamp) -> pd.Timestamp:
 
 def strategy_states(trips: dict[int, list[dict]], start: pd.Timestamp, end: pd.Timestamp) -> tuple[list[int], list]:
     """The Strategy's change weeks inside [start, end) and its states, from each asset's trips ({asset index: trips
-    with opened, closed (None while open) and side}): states[0] is what it held going into the first change week."""
+    with opened, closed (None while open) and side}): states[0] is what it held at the window's first bar."""
     events = set()
     for rows in trips.values():
         for t in rows:
@@ -237,9 +252,7 @@ def strategy_states(trips: dict[int, list[dict]], start: pd.Timestamp, end: pd.T
                         short = asset
         return long, short
 
-    if not weeks:
-        return [], [held(start, True)]
-    return [w.value for w in weeks], [held(weeks[0], True), *(held(w, False) for w in weeks)]
+    return [w.value for w in weeks], [held(start, True), *(held(w, False) for w in weeks)]
 
 
 def null_words(r: PairNull | None) -> str:
@@ -256,8 +269,11 @@ def null_words(r: PairNull | None) -> str:
            f"ordered pair from 6; legs opened: the book {r.strategy_legs}, the mean draw {r.mean_draw_legs:.1f}; "
            f"{r.skipped_weeks} unranked Mondays held by both; seed {r.seed}; the model's book adds to {trips:+.1%} "
            f"against the engine's {book:+.1%}")
+    out += (f"; {r.carried} legs carried in, valued unpaid from the window's first bar for the book and every draw"
+            if r.carried else "; the window opened flat, so no leg was carried in")
     if r.baseline_settlements:
-        out += f"; {r.baseline_settlements} funding settlements at the baseline rate, not stored"
+        out += (f"; {r.baseline_settlements} funding settlements at the baseline rate, not stored, paid by both sides, "
+                f"on {', '.join(r.baseline_dates)}")
     if r.unreconciled:
         return f"NOT JUDGED: {out} (more than {RECONCILE_PP * 100:.1f} points apart)"
     verdict = "ABOVE THE BAR" if r.beats else "BELOW THE BAR"  # the list allows no PASS wording
