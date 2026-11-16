@@ -100,11 +100,51 @@ def test_a_bad_leverage_cap_is_refused(c, store, bad):  # noqa: F811
     assert not any(s.name.startswith("v5-paper") for s in store.sleeves())
 
 
+def _committed(key: str) -> str:
+    """The form's value for a committed definition: its key and its venue-free content hash."""
+    from sleeve_fund.dashboard.app import _committed_definitions
+
+    return f"{key}@{_committed_definitions()[key]['hash']}"
+
+
+STOPLESS = "qr01c_trend_donchian_long"  # a long side with no fixed stop level: no placed stop on a perp
+TWO_SIDED = "variants/qr21_trend_sma200_ls"  # a long and a short side
+
+
 def test_a_definition_that_places_no_stop_is_held_to_1x_on_a_perp_as_any_model_is(c, store):  # noqa: F811
-    assert "places no stop" in _error(_post(c, max_leverage="2"))  # check_perp_stop, unchanged
-    r = _post(c)  # no cap given: held at 1x, as the form holds every stopless model on a perp
+    from sleeve_fund.strategies import definition_stops
+
+    assert not definition_stops(load_definition_file(definition_path(STOPLESS)))
+    stopless = _committed(STOPLESS)
+    assert "places no stop" in _error(_post(c, definition=stopless, max_leverage="2"))  # check_perp_stop, unchanged
+    r = _post(c, definition=stopless)  # no cap given: held at 1x, as the form holds every stopless model on a perp
     assert r.headers["location"] == "/sleeves/v5-paper", r.headers.get("location")
     assert store.sleeve("v5-paper").params["max_leverage"] == 1
+
+
+def test_a_definition_with_a_fixed_stop_takes_a_cap_above_1x_on_a_perp(c, store):  # noqa: F811
+    r = _post(c, max_leverage="2")  # V5's fixed stop level counts as a placed stop
+    assert r.headers["location"] == "/sleeves/v5-paper", r.headers.get("location")
+    assert store.sleeve("v5-paper").params["max_leverage"] == 2
+    r = _post(c, name="v5-uncapped")  # and no 1x is set for it when no cap is given
+    assert r.headers["location"] == "/sleeves/v5-uncapped", r.headers.get("location")
+    assert "max_leverage" not in store.sleeve("v5-uncapped").params
+
+
+def test_a_two_sided_definition_trades_its_short_side_as_the_study_did(c, store):  # noqa: F811
+    r = _post(c, definition=_committed(TWO_SIDED))
+    assert r.headers["location"] == "/sleeves/v5-paper", r.headers.get("location")
+    s = store.sleeve("v5-paper")
+    assert "short" in s.params["definition"] and s.params["allow_short"] is True
+
+
+def test_a_definition_that_fails_its_check_is_not_offered(monkeypatch, tmp_path):
+    from sleeve_fund.dashboard import app as app_mod
+
+    (tmp_path / "good.toml").write_bytes(definition_path(V5).read_bytes())
+    (tmp_path / "broken.toml").write_text('version = 1\nname = "broken"\n', encoding="utf-8")
+    monkeypatch.setattr(app_mod, "DEFINITIONS_DIR", tmp_path)
+    assert list(app_mod._committed_definitions()) == ["good"]
 
 
 def test_another_model_ignores_the_definition_field_and_takes_the_leverage_cap(c, store):  # noqa: F811
