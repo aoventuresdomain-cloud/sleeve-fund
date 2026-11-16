@@ -173,7 +173,7 @@ def test_check_8_passes_when_each_entry_read_the_settlement_before_its_close_and
         return [rate[t] for t in stamps if t < close - pd.Timedelta(minutes=1) and abs(rate[t]) <= 0.05][-1]
 
     closes = [pd.Timestamp("2024-01-05", tz="UTC") + 4 * H * k for k in range(24)]  # half of them 00, 08 or 16
-    good = [("BTC", c + pd.Timedelta(minutes=1), right(c)) for c in closes]
+    good = [("BTCUSDT-PERP", c + pd.Timedelta(minutes=1), right(c)) for c in closes]  # as a basket book writes it
     book = tmp_path / "s" / "qra0_x_binance-basket-btc-eth-sol-usdt-store-240m_20261101-165919-basket-trades.csv"
     book.parent.mkdir()
     _book(book, good)
@@ -214,6 +214,21 @@ def test_check_8_passes_when_each_entry_read_the_settlement_before_its_close_and
     assert funding_counts.main(args + ["--check8", "h0_x_1"]) == 2
     assert "takes a basket sheet's stem" in capfd.readouterr().out
 
+
+
+def test_check_8_reads_the_store_under_the_pair_whatever_form_the_book_writes_and_refuses_an_unstored_one(tmp_path):
+    """16 Nov: a basket book writes "BTCUSDT-PERP", which check 8 looked up as "BTCUSDT-PERP/USDT", found nothing and
+    crashed. Every form names the same pair; an asset with no stored rates refuses by name."""
+    import pytest
+
+    assert {funding_counts._pair(a) for a in ("BTCUSDT-PERP", "btcusdt-perp", "BTC", "BTC/USDT", "BTCUSDT")} == {
+        "BTC/USDT"}
+    t0 = pd.Timestamp("2024-01-01", tz="UTC")
+    _rates(tmp_path / "h", "BTC/USDT", [(t0 + 8 * H * k, 0.0001) for k in range(30)])
+    book = tmp_path / "b.csv"
+    _book(book, [("ETHUSDT-PERP", t0 + 3 * 24 * H + pd.Timedelta(minutes=1), 0.0001)])
+    with pytest.raises(SystemExit, match="ETH/USDT"):
+        funding_counts.check8("BINANCE", book, tmp_path / "h")
 
 
 def test_the_gate_line_is_per_8_hours_on_a_4_hourly_schedule(tmp_path, monkeypatch):

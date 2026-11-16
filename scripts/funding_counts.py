@@ -163,6 +163,18 @@ def _close(entry_time: str) -> pd.Timestamp:
     return _fill(entry_time).floor(BAR)
 
 
+def _pair(asset: str, quote: str = "USDT") -> str:
+    """A trade book's asset as the funding store names its pair: a basket book writes the instrument
+    ("BTCUSDT-PERP"), a hand-made one may write the coin ("BTC") or the pair ("BTC/USDT")."""
+    a = asset.strip().upper()
+    if "/" in a:
+        return a
+    a = a.removesuffix("-PERP")
+    if a.endswith(quote) and len(a) > len(quote):
+        a = a[: -len(quote)]
+    return f"{a}/{quote}"
+
+
 def check8(venue: str, trades, root=None, quote: str = "USDT", block: str = "fr") -> dict:
     """{sampled, on_settlement, failed} over a seeded sample of the trade book's entries (see the module's note)."""
     import csv
@@ -186,10 +198,11 @@ def check8(venue: str, trades, root=None, quote: str = "USDT", block: str = "fr"
     stored: dict = {}
     failed = 0
     for r in picked:
-        asset = r["asset"].strip()
-        pair = asset if "/" in asset else f"{asset.upper()}/{quote}"
+        pair = _pair(r["asset"], quote)
         if pair not in stored:
             s = funding.rates(venue, pair, root)
+            if not len(s):
+                raise SystemExit(f"check 8: no funding rates stored for a pair in the trade book ({pair})")
             cap = funding.cap_of(venue, pair)
             stored[pair] = s[[funding.believable(x, cap) for x in s.to_numpy()]]
         s, close = stored[pair], _close(r["entry_time"])
