@@ -55,6 +55,11 @@ CONTINUOUS_LINE = re.compile(r"^-\s*\*\*Scoring window:\*\*\s*continuous\b", re.
 # (its edge verdict, counted once); "Size scale: 0.55" sizes every leg at that share of its size (never a try).
 FUND_GUARDS_LINE = re.compile(r"^-\s*\*\*Fund guards:\*\*\s*(on|off)\b", re.M | re.I)
 SIZE_SCALE_LINE = re.compile(r"^-\s*\*\*Size scale:\*\*\s*(\d*\.?\d+)\s*$", re.M | re.I)
+# HoE 16 Nov (V5's paper benchmark): "Risk profile: aggressive" runs every leg under that profile's caps, as paper does,
+# and "Leverage cap: 2x" lowers its leverage cap as a Strategy's own max_leverage does (B-35 a); never a try. A list
+# without them runs as before: no risk profile (1x, uncapped and unguarded).
+RISK_PROFILE_LINE = re.compile(r"^-\s*\*\*Risk profile:\*\*\s*([a-z]+)\s*$", re.M | re.I)
+LEVERAGE_CAP_LINE = re.compile(r"^-\s*\*\*Leverage cap:\*\*\s*(\d*\.?\d+)\s*x?\s*$", re.M | re.I)
 PAIRS = r"[A-Z0-9]{1,16}/[A-Z0-9]{1,16}(,[A-Z0-9]{1,16}/[A-Z0-9]{1,16}){0,3}"  # one instrument, or a list of up to 4
 OLD_WINDOW_TOO = frozenset({
     "qr01_trend_ema_long", "qr01_trend_ema_short", "qr01b_trend_multispeed_long", "qr01b_trend_multispeed_short",
@@ -120,11 +125,36 @@ def confirming_of(text: str) -> dict:
     return out
 
 
+def risk_of(text: str) -> dict:
+    """The list's risk settings (HoE 16 Nov): {"risk_profile": name} and {"max_leverage": x} when it names them, {}
+    when it names neither (the list runs as before, risk profile none). A leverage cap only lowers a named profile's
+    cap, so one without a profile, or above the profile's own, is refused rather than read as something else."""
+    from sleeve_fund import risk
+
+    out: dict = {}
+    if (m := RISK_PROFILE_LINE.search(text)) is not None:
+        out["risk_profile"] = risk.profile(m[1].lower()).name  # raises on an unknown name
+    elif re.search(r"^-\s*\*\*Risk profile:\*\*", text, re.M | re.I):
+        raise ValueError("the list's risk profile line names no profile")
+    if (m := LEVERAGE_CAP_LINE.search(text)) is not None:
+        cap = float(m[1])
+        risk.check_own_leverage(cap)
+        if "risk_profile" not in out:
+            raise ValueError("a leverage cap lowers a risk profile's cap: the list names no risk profile")
+        if cap > risk.profile(out["risk_profile"]).max_leverage:
+            raise ValueError(f"a leverage cap of {cap:g}x is above the {out['risk_profile']} profile's own")
+        out[risk.OWN_LEVERAGE] = cap
+    elif re.search(r"^-\s*\*\*Leverage cap:\*\*", text, re.M | re.I):
+        raise ValueError("the list's leverage cap line isn't a number of times, like 2x")
+    return out
+
+
 def request(name: str, minutes: int, venue: str, pair: str, pinned=None, continuous: bool = False,
-            market: str | None = None, confirming: dict | None = None):
+            market: str | None = None, confirming: dict | None = None, risk: dict | None = None):
     """The store study one row runs: rules, its definition's params, perp (or the row's market), the locked holdout,
     on the list's pinned dates (B-37), scored continuously after a warm-up when the list says so (R-11). pair: one
-    instrument, or several joined by commas (STUDY-ASSET-LIST), run as one basket."""
+    instrument, or several joined by commas (STUDY-ASSET-LIST), run as one basket. risk: risk_of's settings, the
+    profile on the request and its leverage cap in the params as a Strategy's own; None or {}: no risk profile."""
     from sleeve_fund.research.run import StudyRequest
     from sleeve_fund.strategies.definitions import load_definition_file, to_params
 
@@ -138,12 +168,17 @@ def request(name: str, minutes: int, venue: str, pair: str, pinned=None, continu
     params = {**to_params(defn, venue.upper()), "market": "perp", **(variant["params"] if variant else {})}
     if "short" in defn:
         params["allow_short"] = True
+    risk = dict(risk or {})
+    profile = risk.pop("risk_profile", None)
+    params.update(risk)  # the leverage cap, as a Strategy's own max_leverage
+    pairs = pair.split(",") if "," in pair else None
+    if profile is not None and pairs is None:  # a single study's runs are counted tries; the benchmark is a basket's
+        raise ValueError("a risk profile and leverage cap are an asset list's settings only")
     parent = (load_definition_file(definition_path(variant["parent"]))
               if continuous and variant and variant.get("placebo") else None)  # R-24
-    pairs = pair.split(",") if "," in pair else None
     train, test, holdout = fold_days(pinned) if pinned is not None else (TRAIN_DAYS, TEST_DAYS, HOLDOUT_DAYS)
     return StudyRequest(strategy="rules", pair=pairs[0] if pairs else pair, pairs=pairs, venue=venue, minutes=minutes,
-                        risk_profile=None, train_days=train, test_days=test, holdout_days=holdout, use_holdout=False,
+                        risk_profile=profile, train_days=train, test_days=test, holdout_days=holdout, use_holdout=False,
                         params=params, label=name, pinned=pinned, placebo_parent=parent, market=market,
                         **(confirming or {}),
                         **({"score_window": "continuous", "old_window_too": name in OLD_WINDOW_TOO and not pairs}
@@ -225,8 +260,9 @@ def main(argv: list[str] | None = None, run=None, journal=None) -> int:
         continuous = CONTINUOUS_LINE.search(text) is not None
         market = markets_of(text)
         confirming = confirming_of(text)
+        risk = risk_of(text)
         reqs = [(n, name, request(name, minutes, args.venue, args.pair, pinned, continuous, market.get(n),
-                                  confirming)) for n, name, minutes in rows]
+                                  confirming, risk)) for n, name, minutes in rows]
         for _, _, req in reqs:
             req.validate()
         ideas = {}  # family -> the ideas its rows count under, every row of the list's, not only those picked
@@ -246,9 +282,14 @@ def main(argv: list[str] | None = None, run=None, journal=None) -> int:
         req.validate()
     print(f"{len(reqs)} studies on the list's settings (holdout locked)")
     if confirming:
-        print(("one try per basket" if "size_scale" not in confirming else "not new tries") + ": fund guards " + ("on" if confirming.get("fund_guards", True) else
-              "OFF (research only)") + (f", size scale {confirming['size_scale']:g}" if "size_scale" in confirming
-                                         else ""))
+        print(("one try per basket" if "size_scale" not in confirming and not risk else "not new tries")
+              + ": fund guards " + ("on" if confirming.get("fund_guards", True) else "OFF (research only)")
+              + (f", size scale {confirming['size_scale']:g}" if "size_scale" in confirming else ""))
+    if risk:
+        from sleeve_fund.risk import OWN_LEVERAGE
+
+        print(f"not new tries: every leg under the {risk['risk_profile']} risk profile, as paper"
+              + (f", leverage cap {risk[OWN_LEVERAGE]:g}x" if OWN_LEVERAGE in risk else ""))
     if rnd is not None:
         print(f"round {rnd.name}, study list SHA-256 {rnd.sha256}: {len(rnd.rows)} registered tries, a budget of "
               f"{rnd.budget} tries per family")
