@@ -101,6 +101,23 @@ def _reads_before_the_close() -> None:
                          "this script's read rule needs updating first")
 
 
+def raw_view(raw: pd.Series, kept: pd.Series, cap: float, scale: float, start, until) -> dict:
+    """Advisor, 16 Nov: the gate count before the believability filter, so a rate the filter dropped can't hide.
+    raw_high: stored rates in the window at or above the line, filter or not (an unreadable value can't be); dropped
+    the window's rates the filter left out, split into over_cap and not_a_number (the runner's funding source drops
+    the same ones, so the Strategy never saw them either); top_below: whether the highest kept rate in the window is
+    under the line, answered yes or no so no rate reaches the public log."""
+    if not len(raw):  # nothing stored: an empty series has no time index to cut
+        return {"raw_high": 0, "over_cap": 0, "not_a_number": 0, "top_below": None}
+    win = raw[(raw.index >= start) & (raw.index < until)]
+    vals = pd.to_numeric(win, errors="coerce").to_numpy(dtype=float)
+    finite = np.isfinite(vals)
+    kept_win = kept[(kept.index >= start) & (kept.index < until)]
+    return {"raw_high": int((vals[finite] * scale >= GATE_RATE).sum()),
+            "over_cap": int((np.abs(vals[finite]) > cap).sum()), "not_a_number": int((~finite).sum()),
+            "top_below": None if not len(kept_win) else bool(float(kept_win.max()) * scale < GATE_RATE)}
+
+
 def gate_counts(venue: str, pair: str, start: pd.Timestamp, end: pd.Timestamp, root=None) -> dict:
     """{high, read, at_pct, no_value, other_read} for settlements on [start, end + 1 day): high counts the believable
     stored rates at or above GATE_RATE per 8 hours; of those, read counts the ones the block reads as its latest rate
@@ -112,18 +129,19 @@ def gate_counts(venue: str, pair: str, start: pd.Timestamp, end: pd.Timestamp, r
     from sleeve_fund.venues import venue as venue_profile
 
     _reads_before_the_close()
-    s = funding.rates(venue, pair, root)
+    raw = funding.rates(venue, pair, root)
     cap = funding.cap_of(venue, pair)
-    s = s[[funding.believable(r, cap) for r in s.to_numpy()]]
+    s = raw[[funding.believable(r, cap) for r in raw.to_numpy()]]
     interval = pd.Timedelta(funding_interval(venue_profile(venue).funding_hours))
-    out = {"high": 0, "read": 0, "at_pct": 0, "no_value": 0, "other_read": 0}
+    scale = pd.Timedelta(hours=8) / interval  # a rate per interval, as a rate per 8 hours
+    until = end + pd.Timedelta(days=1)
+    out = {"high": 0, "read": 0, "at_pct": 0, "no_value": 0, "other_read": 0, **raw_view(raw, s, cap, scale, start,
+                                                                                         until)}
     if not len(s):
         return out
     times, rates = s.index.as_unit("ns").asi8.copy(), s.to_numpy(dtype=float).copy()
     block = FundingPercentile(window_days=GATE_WINDOW_DAYS)
     block.source = (times, rates, int(interval.value))
-    scale = pd.Timedelta(hours=8) / interval  # a rate per interval, as a rate per 8 hours
-    until = end + pd.Timedelta(days=1)
     for t, r in s.items():
         if not (start <= t < until) or r * scale < GATE_RATE:
             continue
@@ -163,6 +181,18 @@ def _close(entry_time: str) -> pd.Timestamp:
     return _fill(entry_time).floor(BAR)
 
 
+def _pair(asset: str, quote: str = "USDT") -> str:
+    """A trade book's asset as the funding store names its pair: a basket book writes the instrument
+    ("BTCUSDT-PERP"), a hand-made one may write the coin ("BTC") or the pair ("BTC/USDT")."""
+    a = asset.strip().upper()
+    if "/" in a:
+        return a
+    a = a.removesuffix("-PERP")
+    if a.endswith(quote) and len(a) > len(quote):
+        a = a[: -len(quote)]
+    return f"{a}/{quote}"
+
+
 def check8(venue: str, trades, root=None, quote: str = "USDT", block: str = "fr") -> dict:
     """{sampled, on_settlement, failed} over a seeded sample of the trade book's entries (see the module's note)."""
     import csv
@@ -186,10 +216,11 @@ def check8(venue: str, trades, root=None, quote: str = "USDT", block: str = "fr"
     stored: dict = {}
     failed = 0
     for r in picked:
-        asset = r["asset"].strip()
-        pair = asset if "/" in asset else f"{asset.upper()}/{quote}"
+        pair = _pair(r["asset"], quote)
         if pair not in stored:
             s = funding.rates(venue, pair, root)
+            if not len(s):
+                raise SystemExit(f"check 8: no funding rates stored for a pair in the trade book ({pair})")
             cap = funding.cap_of(venue, pair)
             stored[pair] = s[[funding.believable(x, cap) for x in s.to_numpy()]]
         s, close = stored[pair], _close(r["entry_time"])
@@ -250,10 +281,18 @@ def main(argv: list[str]) -> int:
               "next 4-hour close\n")
         print("| Asset | At or above the rate | Read at the next close | Of those, fr.pct at or above "
               f"{GATE_PCT:.0f} | No value there | A later rate read there |\n|---|---|---|---|---|---|")
+        views = []
         for pair in a.pairs.split(","):
             g = gate_counts(a.venue, pair.strip(), start, end, a.root)
             print(f"| {pair.strip().split('/')[0].upper()} | {g['high']} | {g['read']} | {g['at_pct']} | "
                   f"{g['no_value']} | {g['other_read']} |")
+            views.append((pair.strip().split("/")[0].upper(), g))
+        print("\nBefore the believability filter (the Strategy's funding source applies the same filter)\n")
+        print("| Asset | At or above the rate, unfiltered | Dropped, over the cap | Dropped, not a number | "
+              "Highest kept rate under the line |\n|---|---|---|---|---|")
+        for asset, g in views:
+            top = "no rates" if g["top_below"] is None else ("yes" if g["top_below"] else "no")
+            print(f"| {asset} | {g['raw_high']} | {g['over_cap']} | {g['not_a_number']} | {top} |")
     if a.check8 is not None:
         import os
         from pathlib import Path
