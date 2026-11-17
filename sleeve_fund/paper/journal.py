@@ -314,6 +314,11 @@ class MemoryJournal:
 
     # --- into the real journal ---------------------------------------------------------
 
+    def thin_marks(self) -> None:
+        """Save only the marks a thinned run keeps (marks_to_keep), however few were taken: a run ticking its quiet
+        minutes only where a mark is kept (QUIET-TICKS) saves what it would have with every minute ticked."""
+        self._thinned = True
+
     def marks_to_keep(self) -> list[dict]:
         """Equity marks worth saving: every mark of a short run; the last of each hour (or, past
         90 days, of each day) of a long one, which is what the screens chart anyway. The first and

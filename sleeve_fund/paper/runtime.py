@@ -571,6 +571,9 @@ class SleeveRuntime:
 
     def __init__(self, store: Store, sleeve_name: str, now=utcnow, tick_seconds: int = 30) -> None:
         self.tick_seconds = tick_seconds
+        # QUIET-TICKS (HoE 17 Nov): a backtest's last execution bar, set by the runner on a long run fed minutes, while
+        # a flat minute with nothing working may skip its full tick (LongFlatStrategy._exec_tick_due); None ticks all.
+        self.quiet_ticks_to: int | None = None
         # The engine's figures are floats: it reads the journal's exact figures (DA-9) as floats and writes through
         # the one boundary that makes them exact (EngineJournal).
         self.store = EngineJournal(store)
