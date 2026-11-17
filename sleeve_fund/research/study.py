@@ -1401,6 +1401,12 @@ def run_study(
             f"{vol.get('lookback_days', 0)} days of daily closes at each entry: never above the size or caps it would "
             f"otherwise have, set at entry and not rebalanced. {counts['vol_skipped']:,} entries were skipped for "
             "want of the daily closes to read it.")
+    if "day_limit_blocked" in counts:  # qrt1: [limits] entries_per_utc_day
+        result.notes.append(
+            f"At most {counts['day_limit']} entr{'y' if counts['day_limit'] == 1 else 'ies'} per UTC day "
+            f"([limits] entries_per_utc_day), a stop-out or target included: an entry rule held on "
+            f"{counts['day_limit_blocked']:,} decision candles across {counts['day_limit_blocked_days']:,} days after "
+            "the day's limit was reached, and opened nothing there.")
     if spec.name == "rules" and len(full_default.exposure):  # R-07: what V3/V4 are judged against the parent at
         result.notes.append(f"Average gross exposure over the research period: "
                             f"{float(full_default.exposure.abs().mean()):.1%} of equity.")

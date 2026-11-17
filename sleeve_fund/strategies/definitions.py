@@ -34,6 +34,11 @@ ratchet never loosens; exit_at_level = {level, rest = "previous_close"} follows 
 the next candle at the level as set at the close before it, never at the candle's own (Independent Quant Advisor,
 6 Oct 16:40 and 16:43).
 
+Limits: [limits] entries_per_utc_day = N opens at most N legs, long and short together, on decision candles closing in
+one UTC day (a candle closing at 00:00 counts to the day it opens; qrt1's "one trade per asset per UTC day"). It holds
+after a stop or target closed the leg inside the day, so no same-day re-entry; the candles an entry rule held on but
+the limit kept flat are counted for the sheet (Rules.rule_counts). Left out, entries are not limited.
+
 check_definition() refuses a definition with the reason; compile() turns a checked one into the rules the `rules`
 model evaluates (sleeve_fund.strategies.rules)."""
 
@@ -65,7 +70,7 @@ TIMES = ("hour", "weekday", "day_of_month", "days_to_month_end")
 # The values a time operand can take (G3): a rule comparing one with a number outside them is refused.
 TIME_RANGE = {"hour": (0, 23), "weekday": (0, 6), "day_of_month": (1, 31), "days_to_month_end": (0, 30)}
 SINCE_ENTRY = {"max_since_entry": max, "min_since_entry": min}
-TOP_KEYS = ("version", "name", "title", "reason", "blocks", "long", "short", "exits", "costs")
+TOP_KEYS = ("version", "name", "title", "reason", "blocks", "long", "short", "exits", "costs", "limits")
 LEVEL_EXITS = ("stop", "trail", "exit_at_level")
 SIDE_EXITS = ("time_stop", *LEVEL_EXITS, "take_profit")  # what [exits.long] and [exits.short] may hold (G1)
 MAX_TAKE_PROFIT_R = 50  # as take_profit_r's cap: a multiple of R
@@ -534,6 +539,7 @@ def check_definition(defn: dict, bar_spec: str | None = None, bar_minutes: int |
     _check_exits(defn.get("exits") or {}, blocks, bar_minutes, uses_prev,
                  sides=[side for side in ("long", "short") if side in defn])
     _check_costs(defn.get("costs") or {}, defn)
+    _check_limits(defn.get("limits", {}))
     warmup: dict = {None: 0}
     longest: dict = {}
     for bid in order:
@@ -921,6 +927,14 @@ def _check_costs(costs: dict, defn: dict) -> None:
         raise ValueError("breakout_slippage_bp is charged on a side marked breakout = true, and none is")
 
 
+def _check_limits(limits) -> None:
+    if not isinstance(limits, dict) or not set(limits) <= {"entries_per_utc_day"}:
+        raise ValueError("limits takes entries_per_utc_day")
+    n = limits.get("entries_per_utc_day", 1)
+    if isinstance(n, bool) or not isinstance(n, int) or not 1 <= n <= 24:
+        raise ValueError("entries_per_utc_day is a whole number of entries, 1 to 24")
+
+
 # --- evaluating a checked definition -------------------------------------------------------------------------------
 
 def uses_first_touch(defn) -> bool:
@@ -987,6 +1001,8 @@ class Compiled:
         self.exits = {sign: self._exits(side_exits(defn.get("exits"), name)) for sign, name in ((1, "long"), (-1, "short"))
                       if name in defn}
         self.slippage_bp = float((defn.get("costs") or {}).get("breakout_slippage_bp", 0) or 0)
+        # [limits] entries_per_utc_day: the legs that may open on decision candles closing in one UTC day; 0, no limit
+        self.entries_per_day = int((defn.get("limits") or {}).get("entries_per_utc_day", 0))
 
     def _exits(self, exits: dict) -> dict:
         ts = exits.get("time_stop") or {}

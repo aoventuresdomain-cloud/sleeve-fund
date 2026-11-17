@@ -227,6 +227,11 @@ class Rules(LongFlatStrategy):
         vol = config.vol_target_size
         self._days: deque = deque(maxlen=vol["lookback_days"] + 2 if vol else 1)
         self.vol_skipped = 0  # entries skipped for want of the volatility to size them on
+        # [limits] entries_per_utc_day: (UTC day number, legs opened on it), and the candles and days an entry rule
+        # held on but the limit kept the strategy flat, for the sheet
+        self._day_entries: tuple[int | None, int] = (None, 0)
+        self.day_limit_blocked = 0
+        self._day_limit_days: set[int] = set()
 
     def funding_blocks(self) -> list:
         """R-06: the definition's funding rate decile blocks, which the runner hands their stored rates."""
@@ -238,7 +243,7 @@ class Rules(LongFlatStrategy):
 
     def rule_counts(self) -> dict:
         """For the sheet: candles a funding rate decile had no rate on and read its top decile on (R-06, counted apart),
-        entries vol sizing skipped (R-07)."""
+        entries vol sizing skipped (R-07), and the candles and days [limits] entries_per_utc_day kept an entry out."""
         out = {}
         if self.funding_blocks():
             out["funding_no_rate"] = max(b.no_rate for b in self.funding_blocks())
@@ -251,6 +256,10 @@ class Rules(LongFlatStrategy):
             out["rank_unranked"] = sorted({d for b in self.rank_blocks() for d in b.unranked})
         if self.c.vol_target_size:
             out["vol_skipped"] = self.vol_skipped
+        if self.rules.entries_per_day:
+            out["day_limit"] = self.rules.entries_per_day
+            out["day_limit_blocked"] = self.day_limit_blocked
+            out["day_limit_blocked_days"] = len(self._day_limit_days)
         return out
 
     def _extra_size_limit(self, limits: dict, base: float) -> str | None | bool:
@@ -297,6 +306,8 @@ class Rules(LongFlatStrategy):
         # held from the next decision would come out late after missing candles, lengthening the hold (5.2); that
         # is only the fallback when the journal has no entry for the position.
         self._leg, self._held, self._leg_ts = side, held, self._resume_entry_ns
+        if self._resume_entry_ns is not None:  # the open leg counts to its own day's limit
+            self._day_entries = (self._resume_entry_ns // DAY_NS, 1)
 
     def _unsettled(self) -> bool:
         return False  # every value its rules read has settled (block_value), or the rule doesn't hold
@@ -401,9 +412,14 @@ class Rules(LongFlatStrategy):
             if side is not None and ended and (sign == ended or not side["reverse"]):
                 continue
             if side is not None and side["entry"].test(env) and env.ts not in self.c.blocked_entries:
+                if self._day_full(env.ts):
+                    break  # the day's limit: neither side opens on this candle
                 armed = [s.armed_at for s in self.rules.setups if s.armed_at is not None]
                 side["entry"].consume()
                 self._leg, self._held, self._leg_ts = sign, 0, env.ts
+                if self.rules.entries_per_day:
+                    day, n = self._day_entries
+                    self._day_entries = (env.ts // DAY_NS, n + 1 if day == env.ts // DAY_NS else 1)
                 self.rules.start_leg(env)
                 fired.append((f"{word[sign]}.entry", f"the {word[sign]} entry rule holds"))
                 values = self._lineage(fired, armed)
@@ -414,6 +430,17 @@ class Rules(LongFlatStrategy):
                 return self._leg
         self._why = ("; ".join(w for _, w in fired), self._lineage(fired)) if fired else None
         return self._leg
+
+    def _day_full(self, ts: int) -> bool:
+        """[limits] entries_per_utc_day: whether the UTC day the candle closing at ts counts to has had its legs. A
+        held entry it keeps out is counted, by candle and by day."""
+        limit = self.rules.entries_per_day
+        day, n = self._day_entries
+        if not limit or day != ts // DAY_NS or n < limit:
+            return False
+        self.day_limit_blocked += 1
+        self._day_limit_days.add(day)
+        return True
 
     def exit_leg_closed(self) -> None:
         """A stop or target closed the position inside the candle: the leg ends with it, and the entry rules are
