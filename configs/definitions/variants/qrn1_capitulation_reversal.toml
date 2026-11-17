@@ -1,0 +1,70 @@
+version = 1
+name = "qrn1-capitulation-reversal"
+title = "Capitulation Rebound / Blow-off Fade (daily signal, 4h candles) · Long and Short"
+reason = """At the 00:00 UTC close, a forced-flow day (the day's range at least 2 daily ATR(14), its volume at least twice
+its 20-day average) that closed in the bottom fifth of its range inside a long-term uptrend (above the daily SMA200) is
+bought; the mirror, closing in the top fifth inside a downtrend, is sold. Out after 3 days (18 four-hour candles) or
+on a 2 ATR stop. Differs from qr10 (BTC long-only, body >= 2 ATR14, no regime, exit above the prior high): range not
+body, close position in the range, SMA200 regime, both sides, three assets, time exit only. At 00:00 the candle close is the daily close. ATR(14), not 20, so it settles within the training year (HoE 17 Nov); the range trigger uses the prior 14 days' ATR (lag 1), excluding the signal day. Fixed before any run. 1x."""
+
+# Pre-run parameter change: ATR(20) to ATR(14) for warm-up (Advisor 17 Nov).
+[blocks.atr]
+kind = "atr"
+period = 14
+timeframe = "1d"
+
+# Trigger ATR: the prior 14 days only, excluding the signal day (Advisor 17 Nov). Stops keep atr, frozen at entry.
+[blocks.atrp]
+kind = "lag"
+period = 1
+timeframe = "1d"
+input = "atr"
+
+[blocks.rv]
+kind = "relative_volume"
+period = 20
+timeframe = "1d"
+
+[blocks.trend]
+kind = "sma"
+period = 200
+timeframe = "1d"
+
+# The day that just closed: 1-day rolling max/min of the 1d candle (prior_period is a day stale at 00:00, HoE 17 Nov).
+[blocks.dh]
+kind = "rolling_max"
+period = 1
+timeframe = "1d"
+input = "high"
+
+[blocks.dl]
+kind = "rolling_min"
+period = 1
+timeframe = "1d"
+input = "low"
+
+[long]
+entry = { all = [
+    { left = { time = "hour" }, op = "<=", right = 0 },
+    { left = { sub = ["dh", "dl"] }, op = ">=", right = { mul = [2, "atrp"] } },
+    { left = "rv", op = ">=", right = 2 },
+    { left = "close", op = "<=", right = { add = ["dl", { mul = [0.2, { sub = ["dh", "dl"] }] }] } },
+    { left = "close", op = ">", right = "trend" },
+] }
+
+[short]
+entry = { all = [
+    { left = { time = "hour" }, op = "<=", right = 0 },
+    { left = { sub = ["dh", "dl"] }, op = ">=", right = { mul = [2, "atrp"] } },
+    { left = "rv", op = ">=", right = 2 },
+    { left = "close", op = ">=", right = { sub = ["dh", { mul = [0.2, { sub = ["dh", "dl"] }] }] } },
+    { left = "close", op = "<", right = "trend" },
+] }
+
+[exits.long]
+stop = { level = { sub = ["close", { mul = [2, "atr"] }] } }
+time_stop = { bars = 18 }
+
+[exits.short]
+stop = { level = { add = ["close", { mul = [2, "atr"] }] } }
+time_stop = { bars = 18 }
