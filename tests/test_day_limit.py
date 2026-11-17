@@ -10,6 +10,7 @@ import copy
 from collections import Counter
 from types import SimpleNamespace
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -187,3 +188,32 @@ def test_a_leg_opened_and_refused_on_the_runs_last_candle_is_counted_at_the_end(
     r.decisions, r._opened_with = {"o-1": {"intent": "entry"}}, 0  # this time its entry order went out
     r.day_limit_unsent = 0
     assert Rules.rule_counts(r)["day_limit_unsent"] == 0
+
+
+def _hours(days=4):
+    idx = pd.date_range("2025-10-03 01:00", periods=days * 24, freq="1h", tz="UTC")
+    c = 100 + np.arange(len(idx)) * 0.01
+    return pd.DataFrame({"open": c, "high": c + 0.05, "low": c - 0.05, "close": c, "volume": 1e3}, index=idx)
+
+
+def _hour_is(h):
+    return {"all": [{"left": {"time": "hour"}, "op": ">=", "right": h}, {"left": {"time": "hour"}, "op": "<=", "right": h}]}
+
+
+@pytest.mark.parametrize("limit", [None, 1])
+def test_an_entry_the_day_limit_blocks_is_dropped_not_carried_into_the_next_day(instrument, limit):
+    """Advisor (CR #360 F2): a Confirm whose event held at 23:00 on a day already traded is spent there. Unlimited, it
+    opens at 23:00; limited, it does not open at 00:00 the next day either, though its confirm still holds within its
+    window, and the next leg waits for a fresh event at 02:00."""
+    d = {"version": 1, "reason": "A test case, written before it is run.",
+         "long": {"entry": {"event": {"any": [_hour_is(2), _hour_is(23)]}, "confirm": {"left": "close", "op": ">",
+                                                                                     "right": 0}, "within": 3}},
+         "exits": {"time_stop": {"minutes": 60}}}
+    if limit:
+        d["limits"] = {"entries_per_utc_day": limit}
+    res = run_backtest("rules", _hours(), instrument, params=to_params(d), bar_minutes=60, half_spread=0)
+    hours = sorted({pd.Timestamp(x["signal"]["bar"]["close_ts"]).hour for x in res.decisions.values()
+                    if x["intent"] == "entry"})
+    assert hours == ([2] if limit else [2, 23])
+    if limit:
+        assert res.rule_counts["day_limit_blocked_days"] >= 2

@@ -418,13 +418,18 @@ class Rules(LongFlatStrategy):
             # candle never reaches here: the position's exit lock decides.
             ended = self._leg
             self._leg = 0
+        blocked = False  # the day's limit kept an entry out on this candle
         for sign in (1, -1):
             side = self.rules.sides.get(sign)
             if side is not None and ended and (sign == ended or not side["reverse"]):
                 continue
             if side is not None and side["entry"].test(env) and env.ts not in self.c.blocked_entries:
-                if self._day_full(env.ts):
-                    break  # the day's limit: neither side opens on this candle
+                if self._day_full(env.ts, counted=blocked):
+                    # The day's limit: nothing opens on this candle, and the entry that held is spent, dropped not
+                    # deferred, so an event, confirm or setup can't carry it into the next day (Advisor, CR #360 F2).
+                    side["entry"].consume()
+                    blocked = True
+                    continue
                 armed = [s.armed_at for s in self.rules.setups if s.armed_at is not None]
                 side["entry"].consume()
                 self._leg, self._held, self._leg_ts = sign, 0, env.ts
@@ -453,7 +458,7 @@ class Rules(LongFlatStrategy):
             self.day_limit_unsent += self._entry_orders() == self._opened_with
             self._opened_with = None
 
-    def _day_full(self, ts: int) -> bool:
+    def _day_full(self, ts: int, counted: bool = False) -> bool:
         """[limits] entries_per_utc_day: whether the UTC day the candle closing at ts counts to has had its legs. A
         held entry it keeps out is counted, by candle and by day.
 
@@ -464,8 +469,9 @@ class Rules(LongFlatStrategy):
         day, n = self._day_entries
         if not limit or day != ts // DAY_NS or n < limit:
             return False
-        self.day_limit_blocked += 1
-        self._day_limit_days.add(day)
+        if not counted:  # once a candle, whichever sides held
+            self.day_limit_blocked += 1
+            self._day_limit_days.add(day)
         return True
 
     def exit_leg_closed(self) -> None:
