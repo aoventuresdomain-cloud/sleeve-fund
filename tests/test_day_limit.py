@@ -217,3 +217,33 @@ def test_an_entry_the_day_limit_blocks_is_dropped_not_carried_into_the_next_day(
     assert hours == ([2] if limit else [2, 23])
     if limit:
         assert res.rule_counts["day_limit_blocked_days"] >= 2
+
+
+def test_a_candle_both_sides_hold_on_in_a_full_day_drops_both_and_counts_once(instrument):
+    """CR #363 M1: long and short Confirms whose events both hold at 23:00 on a day the 02:00 long already used up.
+    Both are spent there (neither opens at 00:00 the next day, though each confirm still holds within its window),
+    and the candle counts once to day_limit_blocked: each 23:00 is one blocked candle and one asset-day."""
+    def side(event):
+        return {"entry": {"event": event, "confirm": {"left": "close", "op": ">", "right": 0}, "within": 3}}
+
+    d = {"version": 1, "reason": "A test case, written before it is run.",
+         "long": side({"any": [_hour_is(2), _hour_is(23)]}), "short": side(_hour_is(23)),
+         "exits": {"time_stop": {"minutes": 60}}}
+    runs = {}
+    for limit in (None, 1):
+        dd = {**copy.deepcopy(d), **({"limits": {"entries_per_utc_day": limit}} if limit else {})}
+        runs[limit] = run_backtest("rules", _hours(), instrument, params={**to_params(dd), **PERP}, bar_minutes=60,
+                                   half_spread=0)
+
+    def entries(res):
+        return sorted((pd.Timestamp(x["signal"]["bar"]["close_ts"]), x["signal"]["side"]) for x in
+                      res.decisions.values() if x["intent"] == "entry")
+
+    # Unlimited, the 23:00 long opens and the short's confirm, still within its window, opens it at 01:00 the next day.
+    unlimited = entries(runs[None])
+    assert (23, "long") in {(t.hour, s) for t, s in unlimited} and (1, "short") in {(t.hour, s) for t, s in unlimited}
+    limited = entries(runs[1])
+    assert {(t.hour, s) for t, s in limited} == {(2, "long")}  # neither 23:00 side carried into the next day
+    days = len({t.floor("1D") for t, _ in limited})
+    counts = runs[1].rule_counts
+    assert days == 4 and counts["day_limit_blocked"] == days and counts["day_limit_blocked_days"] == days
