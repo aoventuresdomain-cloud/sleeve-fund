@@ -54,7 +54,7 @@ from sleeve_fund.research import run as study_run
 from sleeve_fund.research.ledger import IdeaLedger, opened_words
 from sleeve_fund.research.holdout import HoldoutLocks
 from sleeve_fund.research.trials import TrialsRegister
-from sleeve_fund.risk import OWN_LEVERAGE, PROFILES, leverage_cap, own_leverage
+from sleeve_fund.risk import OWN_LEVERAGE, PROFILES, check_own_leverage, leverage_cap, own_leverage
 from sleeve_fund.store import (
     BACKTEST_PREFIX,
     HALT_FLATTEN,
@@ -624,7 +624,7 @@ def create_app(store: Store | None = None) -> FastAPI:
                 raise ValueError("account: live accounts are locked until G2 is approved; choose a paper account")
             trial, uncounted = _trial(_strategy_trial_metrics, st(), cfg, strategy, params, cfg.risk_profile,
                                       fallback={"strategy": strategy, "params": params, "source": "strategy"})
-            stopped = {"desired_state": "stopped"} if strategy in TEST_PREFILL else {}
+            stopped = {"desired_state": "stopped"} if strategy in TEST_PREFILL or strategy in CREATED_STOPPED else {}
             if others:  # fund-held, 0 own capital, one quote currency, a leg row each, in one transaction, or none
                 rows = _saved("strategy", st().create_legs, name=name, strategy=strategy, bar_spec=cfg.bar_spec,
                               assets=instruments, params=params, starting_balance=cfg.starting_balance,
@@ -2699,8 +2699,63 @@ MODEL_BAR = {"donchian": "1-DAY-LAST-EXTERNAL"}
 MODEL_BAR_WORDS = {"donchian": "The Donchian ensemble decides on daily candles"}  # the model's own refusal
 
 
+# PAPER-FROM-DEFINITION (HoE 16 Nov): the New Strategy form may pick a committed rule-builder definition, by its file
+# under configs/definitions/ (variants/ included), its name and its content hash. Only files found there are offered and
+# taken: what the form posts is looked up among them, never read as a path. Created stopped, like a test model, so the
+# PM starts it from its page, with every Start check.
+DEFINITIONS_DIR = Path(__file__).resolve().parents[2] / "configs" / "definitions"
+CREATED_STOPPED = {"rules"}
+
+
+def _committed_definitions() -> dict[str, dict]:
+    """Each definition file the form offers, by its key (its path under DEFINITIONS_DIR, no suffix): its name, title
+    and venue-free content hash. A file that fails its own check isn't offered."""
+    from sleeve_fund.strategies.definitions import (
+        check_definition,
+        definition_hash,
+        load_definition_file,
+    )
+
+    out = {}
+    for path in sorted(DEFINITIONS_DIR.glob("**/*.toml")):
+        try:
+            defn = load_definition_file(path)
+            check_definition(defn)
+        except (ValueError, OSError):
+            continue
+        key = path.relative_to(DEFINITIONS_DIR).with_suffix("").as_posix()
+        out[key] = {"key": key, "name": str(defn.get("name") or path.stem), "title": str(defn.get("title") or ""),
+                    "hash": definition_hash(defn), "path": path}
+    return out
+
+
+def _definition_params(form, venue: str) -> dict:
+    """The `rules` params for the definition the form picked, as `key@hash`: the file reloaded, refused if its content
+    hash is no longer the one the form showed (it changed after the form was opened), then copied in as a study does
+    (to_params on the venue, allow_short when it has a short side)."""
+    from sleeve_fund.strategies.definitions import (
+        definition_hash,
+        load_definition_file,
+        to_params,
+    )
+
+    key, _, shown = str(form.get("definition", "")).strip().partition("@")
+    found = _committed_definitions().get(key)
+    if not key or found is None:
+        raise ValueError("definition: choose one of the committed definitions")
+    defn = load_definition_file(found["path"])
+    if (now := definition_hash(defn)) != shown:
+        raise ValueError(f"definition: {found['name']} has changed since the form showed it ({shown or 'no hash'}, now "
+                         f"{now}); open the form again and check it")
+    params = to_params(defn, venue)
+    if "short" in defn:
+        params["allow_short"] = True
+    return params
+
+
 def _strategy_choices(tests: bool = False) -> list[dict]:
-    """The models the form offers: the listed Strategies, and with `tests` the test models (group "Test")."""
+    """The models the form offers: the listed Strategies, and with `tests` the test models (group "Test") and the
+    rule builder over the committed definitions (group "Definitions")."""
     import importlib
 
     out = []
@@ -2718,6 +2773,11 @@ def _strategy_choices(tests: bool = False) -> list[dict]:
                     # and one sized by weight is refused on a perpetual (check_perp_sizing): offered there, greyed
                     "perp_refused": PERP_WEIGHT_REFUSAL if REGISTRY[name][0].weight_sized(spec.default_params or {})
                     else None, "bar": MODEL_BAR.get(name), "bar_words": MODEL_BAR_WORDS.get(name)})
+    if tests and "rules" in REGISTRY:
+        out.append({"name": "rules", "idea": _idea("rules"), "params": {}, "family": "rule-builder",
+                    "tpl": "", "defaults": {}, "group": "Definitions", "prefill": None,
+                    "fields": (), "stopped": True, "definitions": list(_committed_definitions().values()),
+                    "stopless_max": STOPLESS_MAX_LEVERAGE, "perp_refused": None, "bar": None, "bar_words": None})
     return out
 
 
@@ -2862,6 +2922,10 @@ def _form_params(form, strategy: str) -> dict:
             params[key] = round(share / 100, 6)
             if params[key] <= 0:  # too small to store: refuse it here, not when the PM starts it
                 raise ValueError(f"{key.replace('_', ' ')}: a % of fund equity above 0 and at most 100")
+    if strategy == "rules":  # PAPER-FROM-DEFINITION: the committed definition picked, never typed-in settings
+        if params:
+            raise ValueError(f"{', '.join(sorted(params))}: a definition carries its own settings")
+        params = _definition_params(form, _venue_name(form.get("venue")))
     hours = float(params["run_for_hours"]) if "run_for_hours" in params else None
     if hours is not None and not (math.isfinite(hours) and hours > 0):  # F-A19-2: "inf" is no number of hours
         raise ValueError("run for hours: more than 0, or leave it empty to run until stopped")
@@ -2908,6 +2972,13 @@ def _form_params(form, strategy: str) -> dict:
             params["maker_wait_minutes"] = int(str(form.get("maker_wait_minutes", "")).strip() or 15)
         except ValueError:
             raise ValueError("go to market after: a whole number of minutes") from None
+    if raw := str(form.get(OWN_LEVERAGE, "")).strip():  # the Strategy's own leverage cap (B-35 (a)), optional
+        try:
+            lev = float(raw)
+        except ValueError:
+            raise ValueError("leverage cap: a number of times, at least 1x, or leave it empty") from None
+        check_own_leverage(lev)
+        params[OWN_LEVERAGE] = int(lev) if lev.is_integer() else lev
     # B-35 (a), the PM's "a stop, or 1x": a model that places no stop is held at 1x on a perpetual by its own leverage
     # cap (risk.OWN_LEVERAGE, a number), under the risk profile the PM picked, which stays as picked.
     if market != markets.SPOT and strategy in REGISTRY and not places_stop(strategy, params):

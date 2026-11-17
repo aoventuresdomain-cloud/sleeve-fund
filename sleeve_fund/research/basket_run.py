@@ -148,12 +148,13 @@ def run_store_basket(req, store=None, out_dir: Path | None = None, history=None,
         assets.append(bk.BasketAsset(instrument, prices, minute, bar_minutes=req.minutes, exec_minutes=1))
     label = req.label or spec.name
     universe = f"{datetime.now(timezone.utc):%Y-%m-%d}" if req.pinned is None else str(req.pinned.data_start)
-    basket = bk.Basket(label, req.strategy, params, tuple(assets), universe)
+    basket = bk.Basket(label, req.strategy, params, tuple(assets), universe, risk_profile=req.risk_profile)
     dataset = dataset_name(profile.name, req.pairs, req.minutes)
-    # Advisor 27 Oct: the unguarded run is the try (counted once, as any basket); a size scale's run is never one
+    # Advisor 27 Oct: the unguarded run is the try (counted once, as any basket); a size scale's run is never one, nor
+    # a run under a risk profile (HoE 16 Nov: paper's benchmark)
     study = bk.basket_study(basket, tests, research_end, register=TrialsRegister(store), dataset=dataset,
                             warm_days=warm, filled=True, profile=bk.PORTFOLIO if req.fund_guards else bk.UNGUARDED,
-                            scale=req.size_scale, counted=req.size_scale is None)
+                            scale=req.size_scale, counted=req.size_scale is None and req.risk_profile is None)
     locks = HoldoutLocks(store)  # the seal as it stands before this study's own look, for the holdout row's words
     viewed = tuple(a for a in basket.names if locks.lock(bk.idea_hash(basket), a) is not None)
     opened = None

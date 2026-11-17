@@ -132,6 +132,11 @@ class StudyRequest:
                 raise ValueError("the fund guards switch and a size scale are an asset list's settings only")
             if self.use_holdout:
                 raise ValueError("a confirming run keeps the holdout locked")
+        if self.pairs is not None and self.risk_profile is not None and not self.fund_guards:
+            # HoE 16 Nov (CR): a list's risk profile is paper's benchmark, never a try; the unguarded run is the try,
+            # so the two never share a run
+            raise ValueError("a risk profile runs with the fund guards on: an unguarded run is the try, and a run "
+                             "under a profile is never one")
         if self.size_scale is not None and (isinstance(self.size_scale, bool)
                                             or not isinstance(self.size_scale, (int, float))
                                             or not 0 < self.size_scale <= 1):
