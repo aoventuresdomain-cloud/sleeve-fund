@@ -147,6 +147,10 @@ class Words:
             return f"{name}({int(p)}{simple}){fed}{_on(lab)}"
         if kind == "relative_volume":
             return f"volume as a multiple of its {_per(p, tf)} average"
+        if kind == "illiq_percentile":
+            if output == "value":
+                return "the day's illiquidity (|return| ÷ dollar volume)"
+            return f"the illiquidity percentile (|return| ÷ dollar volume, against its last {candles(p, tf)})"
         if kind == "bollinger":
             what = {"mid": "the middle Bollinger band", "upper": "the upper Bollinger band",
                     "lower": "the lower Bollinger band", "width": "the Bollinger band width",
