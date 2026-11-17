@@ -62,12 +62,12 @@ def test_a_rank_basket_runs_fund_sized_with_the_guards_off_and_refuses_a_size_sc
     monkeypatch.setattr(bk, "leg_names", lambda name, insts: [f"l{i}" for i in range(len(insts))])
     assets = [SimpleNamespace(instrument=i, exec_minutes=60, bar_minutes=1440) for i in range(3)]
     for params, want in ((PARAMS, True), ({"definition": {**BOOK, "blocks": {}}}, False)):
-        basket = SimpleNamespace(name="b", strategy="rules", params=params)
+        basket = SimpleNamespace(name="b", strategy="rules", params=params, risk_profile=None)
         with pytest.raises(RuntimeError):
             bk._run(basket, assets, None, None, None, 30_000.0, bk.UNGUARDED, 0)
         assert seen["fund_sized"] is want
     with pytest.raises(ValueError, match="takes no size scale"):
-        bk._run(SimpleNamespace(name="b", strategy="rules", params=PARAMS), assets, None, None, None, 30_000.0,
+        bk._run(SimpleNamespace(name="b", strategy="rules", params=PARAMS, risk_profile=None), assets, None, None, None, 30_000.0,
                 bk.PORTFOLIO, 0, scale=0.5)
 
 
