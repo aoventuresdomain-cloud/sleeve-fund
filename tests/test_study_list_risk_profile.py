@@ -19,8 +19,11 @@ from sleeve_fund.research import rescore, trials
 from sleeve_fund.risk import OWN_LEVERAGE, PORTFOLIO
 
 ROOT = Path(__file__).resolve().parents[1]
-LISTS = sorted((ROOT / "configs" / "studies").glob("*.md"))
 V5_LIST = ROOT / "configs" / "studies" / "qr01b-v5-basket-guarded-btc-eth-list.md"
+V5_2X_LIST = ROOT / "configs" / "studies" / "qr01b-v5-basket-guarded-btc-eth-2x-list.md"
+# Every list but the ones that name a risk profile on purpose (V5's paper benchmark, HoE 16 Nov), pinned below.
+PROFILED = {V5_2X_LIST}
+LISTS = sorted(set((ROOT / "configs" / "studies").glob("*.md")) - PROFILED)
 RISK_LINES = "- **Risk profile:** aggressive\n- **Leverage cap:** 2x\n"
 
 
@@ -100,6 +103,20 @@ def test_the_v5_list_with_the_two_lines_dry_runs_at_the_profile_and_cap_and_neve
     listed = tmp_path / "v5-aggressive-2x.md"
     listed.write_text(text, encoding="utf-8")
     assert rescore.main([str(listed), "--venue", "binance", "--pair", "BTC/USDT,ETH/USDT", "--dry-run"]) == 0
+    out = capfd.readouterr().out
+    assert "not new tries: every leg under the aggressive risk profile, as paper, leverage cap 2x" in out
+    assert "dry run: 1 checked, 0 run" in out
+
+
+def test_the_committed_v5_2x_list_differs_from_the_reference_only_in_its_risk_lines_and_dry_runs_at_them(capfd):
+    """V5's paper benchmark (HoE 16 Nov): the 30 Oct reference list with the two risk lines, nothing else changed in
+    what runs, and never a try."""
+    ref, two = V5_LIST.read_text(encoding="utf-8"), V5_2X_LIST.read_text(encoding="utf-8")
+    assert rescore.risk_of(two) == {"risk_profile": "aggressive", OWN_LEVERAGE: 2.0}
+    assert rescore.rows_of(two) == rescore.rows_of(ref) and rescore.parse_pinned(two) == rescore.parse_pinned(ref)
+    for line in ("- **Fund guards:** on", "- **Size scale:** 0.346", "Fees per side:** 0% and 0.055%"):
+        assert line in two and line in ref
+    assert rescore.main([str(V5_2X_LIST), "--venue", "binance", "--pair", "BTC/USDT,ETH/USDT", "--dry-run"]) == 0
     out = capfd.readouterr().out
     assert "not new tries: every leg under the aggressive risk profile, as paper, leverage cap 2x" in out
     assert "dry run: 1 checked, 0 run" in out
