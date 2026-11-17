@@ -144,7 +144,8 @@ def test_only_the_study_container_mounts_the_research_configs_read_only():
     assert sorted(mounts) == [("/opt/sleeve-research/$SHA/definitions", "/app/configs/definitions", "ro"),
                               ("/opt/sleeve-research/$SHA/studies", "/app/configs/studies", "ro")]
     run = study.split("- name: Run the list", 1)[1]
-    assert "sudo docker compose run --rm -T --no-deps --name study-$RUN_ID $MOUNTS dashboard" in run
+    assert 'RUN="run --rm -T --no-deps --name study-s$SLOT-$RUN_ID $MOUNTS dashboard ' in run
+    assert "sudo docker compose $RUN" in run and "sudo docker compose \\$files -f \\$f $RUN" in run
     for wf in sorted((ROOT / ".github" / "workflows").glob("*.yml")):
         if wf != STUDY:
             assert "/opt/sleeve-research" not in wf.read_text(), f"{wf.name} must not see the research configs"
