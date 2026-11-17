@@ -154,7 +154,8 @@ def run_store_basket(req, store=None, out_dir: Path | None = None, history=None,
     # a run under a risk profile (HoE 16 Nov: paper's benchmark)
     study = bk.basket_study(basket, tests, research_end, register=TrialsRegister(store), dataset=dataset,
                             warm_days=warm, filled=True, profile=bk.PORTFOLIO if req.fund_guards else bk.UNGUARDED,
-                            scale=req.size_scale, counted=req.size_scale is None and req.risk_profile is None)
+                            scale=req.size_scale, counted=req.size_scale is None and req.risk_profile is None,
+                            fast=True)  # STUDY-SPEED (Advisor 17 Nov): the screen and the 4-rung cost ladder
     locks = HoldoutLocks(store)  # the seal as it stands before this study's own look, for the holdout row's words
     viewed = tuple(a for a in basket.names if locks.lock(bk.idea_hash(basket), a) is not None)
     opened = None

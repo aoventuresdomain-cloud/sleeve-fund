@@ -136,6 +136,9 @@ def _ran(tmp, **settings):
         return real_run(legs, profile, *a, **k)
 
     mp.setattr(bk, "render", spy_render)
+    # these runs reach the full study's own parts (draws, guards, sheet lines) on a small synthetic basket,
+    # which a store study's screen stops at its 0-fee rung (tests/test_study_speed.py pins the screen)
+    mp.setattr(bk, "SCREEN_BEFORE_FEES", False)
     mp.setattr(bk, "run_portfolio", spy_run)
     try:
         out = run_mod.run_store_study(replace(_req(), **settings), store=store, out_dir=tmp / "sheets",
