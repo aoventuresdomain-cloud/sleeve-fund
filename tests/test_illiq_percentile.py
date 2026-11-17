@@ -103,3 +103,12 @@ def test_a_daily_backtest_enters_on_the_rank_the_block_gives_by_hand(instrument)
     for sig in entries:
         assert sig["blocks"]["il.pct"] >= 90
         assert sig["blocks"]["il.pct"] == pytest.approx(at_close[round(sig["bar"]["c"], 2)])
+
+
+def test_a_non_finite_reading_is_no_reading():
+    """CR #362 F1: a NaN reaching the reading (never through update_raw, which refuses a non-finite input) gives none,
+    so nothing non-finite ever enters the window."""
+    assert illiq_of(100.0, 110.0, float("nan")) is None and illiq_of(float("nan"), 110.0, 5.0) is None
+    assert illiq_of(100.0, 110.0, float("inf")) is None
+    with pytest.raises(ValueError, match="finite"):
+        IlliqPercentile(period=20).update_ohlcv(1.0, 1.0, 1.0, 1.0, float("nan"))

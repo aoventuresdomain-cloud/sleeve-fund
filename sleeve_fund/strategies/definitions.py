@@ -271,9 +271,10 @@ def illiq_of(prev_close: float, close: float, volume: float) -> float | None:
     """Amihud's illiquidity of one candle: |close / prev_close - 1| / (volume x close), the absolute return per unit
     of quote (dollar) volume. None when it can't be read: no previous close above 0, or no dollar volume."""
     dollar = volume * close
-    if prev_close <= 0 or dollar <= 0:
+    if not prev_close > 0 or not (dollar > 0 and math.isfinite(dollar)):  # a NaN or inf: no reading (CR #362 F1)
         return None
-    return abs(close / prev_close - 1) / dollar
+    x = abs(close / prev_close - 1) / dollar
+    return x if math.isfinite(x) else None
 
 
 class IlliqPercentile(Block):
@@ -336,6 +337,69 @@ class IlliqPercentile(Block):
         if minutes != DAY_MINUTES:
             raise ValueError(f"the illiquidity percentile reads daily candles: give it timeframe = \"1d\" (it would be "
                              f"fed {timeframe_label(minutes)} candles)")
+
+
+def return_zscore_of(prior: list | tuple, ret: float) -> float | None:
+    """ret over the sample standard deviation (ddof 1) of `prior`, the returns before it, ret itself never among them;
+    no mean subtracted. None when they don't vary."""
+    n = len(prior)
+    mean = sum(prior) / n
+    sd = math.sqrt(sum((r - mean) ** 2 for r in prior) / (n - 1))
+    return ret / sd if sd > 0 and math.isfinite(sd) else None
+
+
+class ReturnZScore(Block):
+    """N5 (Advisor 17 Nov, studies only): the candle's simple close-to-close return over the sample standard deviation
+    of the `period` returns before it: z = r_t / sd(r_t-period ... r_t-1), ddof 1, no mean subtracted, the current
+    return excluded from the sd (lag 1, as qrn1's and qrn4's triggers). `z` is that, `ret` the return r_t itself. On
+    timeframe = "1d", daily returns.
+
+    No value until `period` earlier returns exist, so period + 2 closes; none on a candle whose earlier returns don't
+    vary (sd 0), counted in `flat`, or whose previous close isn't above 0. Each return still joins the window."""
+
+    SETTINGS = (Setting("period", int, 20, min=2, max=1000),)
+    OUTPUTS = ("z", "ret")
+
+    def __init__(self, period: int = 20) -> None:
+        self.period = int(period)
+        self.reset()
+
+    def reset(self) -> None:
+        self._prior: deque = deque(maxlen=self.period)
+        self._prev: float | None = None
+        self._ready = False
+        self._z = self._ret = 0.0
+        self.flat = 0
+
+    def update_raw(self, close: float) -> None:
+        prev, self._prev = self._prev, float(close)
+        if prev is None:
+            return
+        if not prev > 0:
+            self._ready = False
+            return
+        ret = float(close) / prev - 1
+        z = return_zscore_of(self._prior, ret) if len(self._prior) == self.period else None
+        if len(self._prior) == self.period and z is None:
+            self.flat += 1
+        self._ready = z is not None
+        if self._ready:
+            self._z, self._ret = z, ret
+        self._prior.append(ret)  # after: the return just read is in the next candle's window, never its own
+
+    def update_ohlcv(self, open_, high, low, close, volume, ts_ns=None) -> None:
+        self.update_raw(close)
+
+    @property
+    def initialized(self) -> bool:
+        return self._ready
+
+    def _outputs(self) -> dict:
+        return {"z": self._z, "ret": self._ret}
+
+    @warmup
+    def warmup_bars(cls, s) -> int:
+        return s["period"] + 2
 
 
 def is_weekly_decision(ts_ns: int) -> bool:
@@ -439,13 +503,15 @@ STUDY_ONLY_BLOCKS = {"funding_decile": "the funding rate decile block",
                      "funding_zscore": "the funding rate z-score block",
                      "funding_percentile": "the funding rate percentile block",
                      "relative_strength_rank": "the relative strength rank block",
-                     "illiq_percentile": "the illiquidity percentile block"}
+                     "illiq_percentile": "the illiquidity percentile block",
+                     "return_zscore": "the return z-score block"}
 FUNDING_BLOCKS = ("funding_decile", "funding_zscore", "funding_percentile")  # each reads the stored settled rates
 
 # The blocks a definition builds, by name: the library's, with channels counted as the rule builder defines them.
 BUILDER_BLOCKS = {**BLOCKS, "donchian": ClosedChannel, "funding_decile": FundingDecile,
                   "funding_zscore": FundingZScore, "funding_percentile": FundingPercentile,
-                  "relative_strength_rank": RelativeStrengthRank, "illiq_percentile": IlliqPercentile}
+                  "relative_strength_rank": RelativeStrengthRank, "illiq_percentile": IlliqPercentile,
+                  "return_zscore": ReturnZScore}
 
 
 # What the builder offers for each block, by its name in BLOCKS. ATR is Wilder's; the simple average of true ranges
@@ -462,6 +528,7 @@ CATALOGUE = {
     "funding_percentile": "Funding rate percentile (studies only)",
     "relative_strength_rank": "Relative strength rank across the basket (studies only)",
     "illiq_percentile": "Illiquidity (Amihud) percentile (studies only)",
+    "return_zscore": "Return z-score against the prior returns (studies only)",
 }
 _ID = re.compile(r"^[a-z_][a-z0-9_]*$")
 _TIMEFRAME = re.compile(r"^(\d+)(m|h|d)$")
