@@ -75,6 +75,10 @@ class Basket:
     params: dict
     assets: tuple[BasketAsset, ...]
     universe_date: str  # when the fixed list was chosen (the fixed-list warning)
+    # HoE 16 Nov: every leg runs under this risk profile's caps, as paper does (LegSpec.risk_profile), its leverage cap
+    # lowered by the params' max_leverage; None (as before): no risk profile. Never in basket_key: such a run is never
+    # a try (run_store_basket), as a size scale's isn't.
+    risk_profile: str | None = None
 
     @property
     def names(self) -> list[str]:
@@ -252,7 +256,7 @@ def _run(basket: Basket, assets: list[BasketAsset], first: date, last: date, fee
     names = leg_names(basket.name, [d.instrument for d in data])
     specs = [LegSpec(n, basket.strategy, d.instrument, d.prices, d.exec_prices, d.warmup_prices,
                      exec_minutes=a.exec_minutes, bar_minutes=a.bar_minutes, params=dict(basket.params),
-                     capital=capital * share / len(data), fees=fees)
+                     capital=capital * share / len(data), fees=fees, risk_profile=basket.risk_profile)
              for n, d, a in zip(names, data, assets)]
     return run_portfolio(specs, profile, unallocated=capital * (1 - share),
                          fund_sized=not own_sized(profile, scale, basket.params)), names, specs
@@ -976,6 +980,9 @@ def render(study: BasketStudy, holdout: Holdout | None = None, round_try: str | 
     if study.size_scale is not None and not study.unguarded:
         head = (f"FITNESS ONLY: a guarded run with every leg at {study.size_scale:g} of its size; the edge "
                 f"verdict is the unguarded run's (this run's own would read {v})")
+    elif b.risk_profile is not None and not study.unguarded:
+        head = (f"FITNESS ONLY: a guarded run under the {b.risk_profile} risk profile; the edge verdict is the "
+                f"unguarded run's (this run's own would read {v})")
     lo = study.left_out
     if pooled is None:
         random_rows = [f"| Beats random entries (95th percentile) | {random_words(study.random)} |"]
@@ -1002,6 +1009,8 @@ def render(study: BasketStudy, holdout: Holdout | None = None, round_try: str | 
         (f"**Tries:** {round_try}" if round_try and study.counted else
          f"**Tries:** {study.tries} (one per fixed basket and settings); this basket is try {study.configuration} of "
          f"{BUDGET_PER_IDEA} for {b.strategy}'s family" if study.counted else
+         "**Tries:** not a new try: a benchmark under paper's risk caps, never counted (HoE 16 Nov)"
+         if b.risk_profile is not None else
          "**Tries:** not a new try: a confirming run of settings already counted (Advisor 27 Oct)"), "",
         *([LEGS_NOT_REBALANCED, ""] if pooled is not None else []),
         *_held_lines(study),
@@ -1247,6 +1256,16 @@ def fills_line(study: BasketStudy) -> str:
     return f"**Fills:** {candle} decision candles, filled on every asset's 1-minute bars; {shown}"
 
 
+def _risk_words(basket: Basket) -> str:
+    """HoE 16 Nov: the risk profile every leg ran under and its leverage cap, as paper margins it; "" for none."""
+    if basket.risk_profile is None:
+        return ""
+    from sleeve_fund import risk
+
+    lev = risk.capped_leverage(risk.profile(basket.risk_profile), basket.params)
+    return f"; every leg under the {basket.risk_profile} risk profile, as paper, margined at up to {lev:g}x"
+
+
 def _run_lines(study: BasketStudy) -> list[str]:
     """What kind of run the sheet is, for a confirming run (Advisor 27 Oct), with the drawdown its k is set from (the
     unguarded run) or the drawdown in fund terms and the Strategy's largest share of the book (the scaled run);
@@ -1258,10 +1277,12 @@ def _run_lines(study: BasketStudy) -> list[str]:
     elif study.size_scale is not None:
         words = (f"**Run:** fund guards on, as paper, every leg at {study.size_scale:g} of its size (its account "
                  f"holds {study.size_scale:g} of its even share, the rest the fund's idle cash): fitness only")
+    elif study.basket.risk_profile is not None:
+        words = "**Run:** fund guards on, as paper: fitness only"
     else:
         return []
     words += (f"; every leg at {study.size_scale:g} of its size" if study.unguarded
-              and study.size_scale is not None else "") + "."
+              and study.size_scale is not None else "") + _risk_words(study.basket) + "."
     if study.size_scale is None:
         figures = (f"**Pooled worst drawdown:** {dd:.2%} (daily closes, out of sample); a size scale k = 10% / this "
                    "sets the guarded run")

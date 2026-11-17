@@ -34,14 +34,19 @@
 
 {% macro strategy_fields(strategies, chosen, g1, pre) %}
 <div class="field"><label for="strategy">Model</label>
-  {% macro opt(st) %}<option value="{{ st.name }}" {{ 'selected' if st.name == chosen }} data-g1="{{ g1.get(st.name) or '' }}"{% if st.stopless_max %} data-stopless-max="{{ '%g'|format(st.stopless_max) }}"{% endif %}{% if st.perp_refused %} data-perp-refused="{{ st.perp_refused }}"{% endif %}{% if st.bar %} data-bar="{{ st.bar }}" data-bar-words="{{ st.bar_words }}"{% endif %}{% if st.prefill %} data-prefill="{{ st.prefill|tojson|forceescape }}"{% endif %}>{{ st.name|replace('_', ' ') }} ({{ st.family }})</option>{% endmacro %}
+  {% macro opt(st) %}<option value="{{ st.name }}" {{ 'selected' if st.name == chosen }} data-g1="{{ g1.get(st.name) or '' }}"{% if st.stopless_max %} data-stopless-max="{{ '%g'|format(st.stopless_max) }}"{% endif %}{% if st.perp_refused %} data-perp-refused="{{ st.perp_refused }}"{% endif %}{% if st.bar %} data-bar="{{ st.bar }}" data-bar-words="{{ st.bar_words }}"{% endif %}{% if st.prefill %} data-prefill="{{ st.prefill|tojson|forceescape }}"{% endif %}{% if st.stopped %} data-stopped="1"{% endif %}>{{ 'a committed definition' if st.definitions is defined else st.name|replace('_', ' ') }} ({{ st.family }})</option>{% endmacro %}
   {% set tests = strategies|selectattr('group', 'equalto', 'Test')|list %}
-  <select name="strategy" id="strategy">{% if tests %}<optgroup label="Strategies">{% endif %}{% for st in strategies if st.group != 'Test' %}{{ opt(st) }}{% endfor %}{% if tests %}</optgroup>
-    <optgroup label="Test">{% for st in tests %}{{ opt(st) }}{% endfor %}</optgroup>{% endif %}</select>
+  {% set defs = strategies|selectattr('group', 'equalto', 'Definitions')|list %}
+  <select name="strategy" id="strategy">{% if tests or defs %}<optgroup label="Strategies">{% endif %}{% for st in strategies if st.group not in ('Test', 'Definitions') %}{{ opt(st) }}{% endfor %}{% if tests or defs %}</optgroup>{% endif %}
+    {% if defs %}<optgroup label="Definitions">{% for st in defs %}{{ opt(st) }}{% endfor %}</optgroup>{% endif %}
+    {% if tests %}<optgroup label="Test">{% for st in tests %}{{ opt(st) }}{% endfor %}</optgroup>{% endif %}</select>
   <p class="warnbox" id="model-refused" role="alert" hidden></p></div>
 {% for st in strategies %}
 <div class="params" data-strategy="{{ st.name }}">
-  <p class="muted" style="margin:8px 0"><span class="desc" data-tpl="{{ st.tpl }}" data-defaults="{{ st.defaults|tojson|forceescape }}">{{ st.idea }}</span> <a href="/strategies/{{ st.name }}">Details and evidence</a></p>
+  <p class="muted" style="margin:8px 0"><span class="desc" data-tpl="{{ st.tpl }}" data-defaults="{{ st.defaults|tojson|forceescape }}">{{ st.idea }}</span>{% if st.definitions is not defined %} <a href="/strategies/{{ st.name }}">Details and evidence</a>{% endif %}</p>
+  {% if st.definitions is defined %}{# PAPER-FROM-DEFINITION: a committed file, by name and content hash; posted as key@hash #}
+  <div class="field"><label for="definition">Definition</label><select id="definition" name="definition">{% for d in st.definitions %}{% set v = d.key ~ '@' ~ d.hash %}<option value="{{ v }}" {{ 'selected' if v == pre.get('definition') }}>{{ d.name }}{% if d.title %}: {{ d.title }}{% endif %} ({{ d.hash }})</option>{% endfor %}</select>
+  <p class="hint">As committed under configs/definitions, with its content hash. Its settings are the file's own. Created stopped: start it from its own page, where every Start check runs.</p></div>{% endif %}
   {% if st.fields %}<div class="grid2">{% for k, label, placeholder, hint in st.fields %}{% set fname = 'p_' ~ st.name ~ '__' ~ k %}<div class="field"><label for="p-{{ st.name }}-{{ k }}">{{ label }}</label><input id="p-{{ st.name }}-{{ k }}" name="{{ fname }}" value="{{ pre.get(fname, '') }}" placeholder="{{ placeholder }}" inputmode="decimal"><p class="hint">{{ hint }}</p></div>{% endfor %}</div>
   <p class="hint">A test Strategy is created stopped: start it from its own page when you are ready. It trades inside the fund, sized from the fund's equity, with every compliance test.</p>{% endif %}
   {% if st.params %}<div class="grid2">{% for k, v in st.params.items() %}{% set fname = 'p_' ~ st.name ~ '__' ~ k %}<div class="field"><label for="p-{{ st.name }}-{{ k }}">{{ k|replace('_', ' ')|capitalize }}</label><input id="p-{{ st.name }}-{{ k }}" name="{{ fname }}" value="{{ pre.get(fname, v) }}" inputmode="decimal"></div>{% endfor %}</div>{% endif %}
