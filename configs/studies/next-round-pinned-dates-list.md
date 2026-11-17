@@ -26,6 +26,7 @@ Backtest studies only: no fund, Strategy, demo or paper change. Dispatched with 
 - **Budget per family:** 6 tries
 - **Family A:** rows 1
 - **Family B:** rows 2, 3
+- **Family C:** rows 4
 - **Prior tries, family B:** 13
 
 ## Pinned dates
@@ -47,11 +48,16 @@ Every row reads these days only, whatever day it runs (B-37). UTC calendar days;
 | 1 | qra0_funding_fade | A, funding-rate fade (needs build 1) | 4h |
 | 2 | qrb0_range_reversion_adx | B, range mean-reversion | 1h |
 | 3 | qrh0_trend_pullback | H, pullback inside a trend (counted in B) | 4h |
+| 4 | qrc0_relative_strength | C, relative strength across the three (needs builds C a to d) | 4h |
 
 Row 1 waits for build 1 (funding rate and percentile-rank block) and the funding counts in its pre-registration.
 Row 2 needs no build. Row 3 (added 31 Oct after B closed at round 0; Advisor cleared
 research/quant-researcher/next-round/prereg-family-h-trend-pullback-31oct.md at 05:56 UTC) needs no build. Each row
 is dispatched on its own with `--rows N`. No PASS or "edge found" wording.
+Row 4 (added 16 Nov; PM yes to the build 16 Nov 21:06 UTC; Advisor cleared
+research/quant-researcher/next-round/prereg-family-c-relative-strength-16nov.md rev 3) is family C try 1. It waits for
+the pair null (build C d) and is not dispatched until that merges. Its warm-up is 35 days (the 28-day score plus a
+week), inside 2024; one book, sized off the fund at 0.5x a leg.
 
 ## Checks for the Quant Developer before the first dry run
 

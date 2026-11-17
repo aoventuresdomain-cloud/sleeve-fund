@@ -1,0 +1,37 @@
+# Next round, family C (relative strength across BTC, ETH and SOL), round 0 (16 Nov 2026; PM yes to the build 16 Nov
+# 21:06 UTC; Advisor cleared rev 1 16 Nov ~21:30 UK and rev 2 ~22:35 UK; frozen at rev 3, 17 Nov). Pre-registration:
+# research/quant-researcher/next-round/prereg-family-c-relative-strength-16nov.md, rev 3. Decision candle: 4h, so the
+# first fill is the first 1-minute bar opening at or after Monday 00:00 UTC (section 2), never inside the decision
+# candle. Sized at 0.5x of the fund a leg (1x gross) by the variant's position_cap_pct (Advisor Q2), off the fund book.
+version = 1
+name = "qrc0-relative-strength"
+title = "Relative Strength (weekly) · Long the strongest, short the weakest · 28-day score"
+reason = """Over weeks, money flows toward the large assets that have risen fastest and away from the laggards, so
+relative performance persists for a while. Each Monday 00:00 UTC the three are ranked on their close over the close
+28 daily candles earlier, minus 1; a tie keeps the current holding. Long rank 1 and short rank 3 in equal money, rank
+2 flat. A leg is held while its asset keeps its rank and closed only when it changes, with the new leg opened on the
+same close (reverse). No stops, no take-profit, no other filters. Held at 1x gross. 4h decision candles; the rank is
+read at the Monday 00:00 UTC close, which coincides with the daily close."""
+
+[blocks.rs]
+kind = "relative_strength_rank"
+lookback_days = 28
+
+# The Monday 00:00 UTC close: the 4h candle that closes at midnight starting a Monday.
+[long]
+entry = { all = [
+    { left = "rs.rank", op = "<=", right = 1 },
+    { left = { time = "weekday" }, op = "<=", right = 0 },
+    { left = { time = "hour" }, op = "<=", right = 0 },
+] }
+exit = { left = "rs.rank", op = ">=", right = 2 }
+reverse = true
+
+[short]
+entry = { all = [
+    { left = "rs.rank", op = ">=", right = 3 },
+    { left = { time = "weekday" }, op = "<=", right = 0 },
+    { left = { time = "hour" }, op = "<=", right = 0 },
+] }
+exit = { left = "rs.rank", op = "<=", right = 2 }
+reverse = true

@@ -354,8 +354,11 @@ class RelativeStrengthRank(Block):
         return 0  # its history is the source's closes, not candles fed to it
 
     @classmethod
-    def warmup_minutes(cls, settings: dict) -> int:
-        """Minutes before it first ranks, at most: its lookback, then up to a week to the first Monday close."""
+    def ranking_warmup_minutes(cls, settings: dict) -> int:
+        """Minutes of the basket's closes it reads before it first ranks, at most: its lookback, then up to a week to
+        the first Monday close. Not named warmup_minutes: those are the candles fed to the block itself, which the
+        definition check counts in 1-minute candles when it doesn't know the candle and caps at MAX_WARMUP_BARS, and
+        this block is fed none (warmup_bars 0). A study loads it through time_warmup_minutes."""
         return (cls.check_settings(settings)["lookback_days"] + 7) * DAY_MINUTES
 
 
