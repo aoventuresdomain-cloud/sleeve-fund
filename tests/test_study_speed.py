@@ -283,8 +283,22 @@ def test_the_real_fee_rung_is_its_own_flat_run_when_the_base_run_made_a_maker_fi
     _dirs(tmp_path)
     monkeypatch.setattr(bk, "_maker_filled", lambda m: True)
     fast, runs, _, _ = _studied(tmp_path, _basket(params=CROSSES), True)
-    assert runs.count((0.002, 0.002)) == 1 and runs[0] is None
+    assert runs.count((0.002, 0.002)) == 1 and runs[0] is None and fast.real_rung == "run"
+    assert "real-fee rung: run)" in bk.render(fast)
     monkeypatch.setattr(bk, "_maker_filled", lambda m: False)
     (tmp_path / "again" / "fast").mkdir(parents=True)
     again, runs2, _, _ = _studied(tmp_path / "again", _basket(params=CROSSES), True)
     assert runs2.count((0.002, 0.002)) == 0 and dict(again.ladder)[0.002] == again.base.net
+    assert again.real_rung == "base reused" and "real-fee rung: base reused)" in bk.render(again)
+
+
+def test_a_maker_fill_is_a_fill_on_the_passive_side_of_any_leg():
+    import pandas as pd
+    from types import SimpleNamespace as NS
+
+    def run(*sides):
+        legs = {f"L{i}": NS(fills=pd.DataFrame({"liquidity_side": list(s)})) for i, s in enumerate(sides)}
+        return NS(run=NS(legs=legs))
+    assert bk._maker_filled(run(["TAKER"], ["TAKER", "MAKER"]))
+    assert not bk._maker_filled(run(["TAKER"], ["TAKER", "NO_LIQUIDITY_SIDE"]))
+    assert not bk._maker_filled(NS(run=NS(legs={"L": NS(fills=None)})))

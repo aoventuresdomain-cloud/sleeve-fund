@@ -183,6 +183,7 @@ class BasketStudy:
     unranked: list = field(default_factory=list)  # a rank book's Mondays it couldn't rank, as ISO dates (Advisor 16 Nov)
     screened: str = ""  # fast: why it was screened out (a FAIL), so nothing past its 0-fee rung was run; "" if not
     fast: bool = False  # its cost ladder is the four rungs (FAST_LADDER), not COST_LADDER's nine
+    real_rung: str = ""  # fast survivor (Advisor 18:22): "base reused" or "run", how its venue's-fee rung was made
     trades: int = 0  # screened: the base run's test-window trades (test_trades)
     gross_edge: float = math.nan  # screened: the 0-fee run's mean return per test-window trade on its notional
     asset_ladder: dict = field(default_factory=dict)  # asset -> [(fee per side, its net on its share of the fund)]
@@ -891,6 +892,7 @@ def basket_study(basket: Basket, windows, research_end: date, *, register: trial
                               gate_touched(out.run, windows, {n: _bar(sp) for n, sp in zip(out_names, out_specs)}),
                               draws, seed)
     breakeven, beyond = (None, "not tested"), "> top rung"
+    real_rung = ""
     if ladder and fast:
         # Advisor 17 Nov: four rungs. The base run is the venue's-fee rung, at its taker fee per side; a stress rung
         # at one fee on every fill is the doubled run itself when the venue charges one fee on every fill.
@@ -898,7 +900,9 @@ def basket_study(basket: Basket, windows, research_end: date, *, register: trial
         for f in FAST_RUNGS[1:]:
             rung(f)
         # CR F1 on #365: the base run is one flat fee only when the venue charges one, or it made no maker fill
-        rung(float(real.taker), base if real.maker == real.taker or not _maker_filled(base) else None)
+        reuse = real.maker == real.taker or not _maker_filled(base)
+        rung(float(real.taker), base if reuse else None)
+        real_rung = "base reused" if reuse else "run"
         rung(stress, twice if real.maker == real.taker else None)
         breakeven, beyond = ladder_breakeven(rungs, f"> {stress:.2%}"), f"> {stress:.2%}"
     elif ladder:
@@ -912,7 +916,7 @@ def basket_study(basket: Basket, windows, research_end: date, *, register: trial
         random_beat(base, names, specs, basket.params, windows, capital, touched, draws, seed), touched,
         ladder=sorted(rungs), breakeven=breakeven,
         asset_breakeven={a: ladder_breakeven(r, beyond) for a, r in per_asset.items() if r})
-    study.fast, study.asset_ladder = fast, per_asset
+    study.fast, study.asset_ladder, study.real_rung = fast, per_asset, real_rung
     _finish(study, basket, base, names, names_of, bars, windows, equal, own, profile, scale, counted)
     if scale is not None and profile != UNGUARDED:  # Advisor 28 Oct: the same legs' entries with the guards off
         free, _, _ = _run(basket, assets, first, last, None, capital, UNGUARDED, warm_days, scale)
@@ -1104,7 +1108,8 @@ def render(study: BasketStudy, holdout: Holdout | None = None, round_try: str | 
         f"on the test days ({study.gate_touched:.1%} of entry notional, each intent once).", "",
         *_gate_lines(study),
         f"**Pooled break-even fee:** {study.breakeven[1]} (one fee per side on every fill, "
-        + (f"interpolated between real runs on the {FAST_LADDER}: {_rungs_words(study.ladder)})"
+        + (f"interpolated between real runs on the {FAST_LADDER}: {_rungs_words(study.ladder)}; real-fee rung: "
+           f"{getattr(study, 'real_rung', '') or 'not run'})"
            if getattr(study, "fast", False) else "real runs on the cost ladder)"), "",
         *_without_sol_lines(study),
         "## Per asset (diagnostic only, never a verdict)", "",
