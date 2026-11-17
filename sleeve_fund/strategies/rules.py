@@ -332,6 +332,10 @@ class Rules(LongFlatStrategy):
         self._feed.update_ohlcv(o, h, lo, c, v, bar.ts_event)
         env.ohlcv, env.ts, env.bar = (o, h, lo, c, v), int(bar.ts_event), env.bar + 1
         if self.c.vol_target_size:  # a candle belongs to the UTC day its close falls in (00:00 ends the old one)
+            # The day this close describes. Actions take the day they happen in (entries, fills, day limits, per-day
+            # trade counts): a candle closing at 00:00 fills after it, so it is the new UTC day, ts // DAY_NS.
+            # Measurements take the day they describe (vol sizing, daily returns, ATR, completed candles): a 00:00
+            # close ends the old day, (ts - 1) // DAY_NS (Advisor 17 Nov).
             day = (env.ts - 1) // DAY_NS
             if self._days and self._days[-1][0] == day:
                 self._days.pop()
@@ -451,7 +455,11 @@ class Rules(LongFlatStrategy):
 
     def _day_full(self, ts: int) -> bool:
         """[limits] entries_per_utc_day: whether the UTC day the candle closing at ts counts to has had its legs. A
-        held entry it keeps out is counted, by candle and by day."""
+        held entry it keeps out is counted, by candle and by day.
+
+        Actions take the day they happen in (entries, fills, day limits, per-day trade counts): a candle closing at 00:00
+        fills after it, so it is the new UTC day, ts // DAY_NS. Measurements take the day they describe (vol sizing,
+        daily returns, ATR, completed candles): a 00:00 close ends the old day, (ts - 1) // DAY_NS (Advisor 17 Nov)."""
         limit = self.rules.entries_per_day
         day, n = self._day_entries
         if not limit or day != ts // DAY_NS or n < limit:
