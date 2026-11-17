@@ -174,3 +174,16 @@ def test_paper_and_live_refuse_a_day_limit_until_a_restart_can_rebuild_the_days_
     with pytest.raises(ValueError, match="per-day entry limit"):
         check_study_only("rules", params)
     assert study_only_uses(to_params(DEFN)) == []
+
+
+def test_a_leg_opened_and_refused_on_the_runs_last_candle_is_counted_at_the_end():
+    """CR #360 F4: the leg the rules opened on the last candle has no next candle to be checked on; rule_counts checks
+    it, so one that sent no entry order is still counted."""
+    r = _rules(1, None, 0)
+    r.funding_blocks, r.rank_blocks = list, list
+    r.c, r.decisions, r.day_limit_unsent = SimpleNamespace(vol_target_size=None), {}, 0
+    r._opened_with = 0  # opened with no entry orders yet, and none followed
+    assert Rules.rule_counts(r)["day_limit_unsent"] == 1
+    r.decisions, r._opened_with = {"o-1": {"intent": "entry"}}, 0  # this time its entry order went out
+    r.day_limit_unsent = 0
+    assert Rules.rule_counts(r)["day_limit_unsent"] == 0
