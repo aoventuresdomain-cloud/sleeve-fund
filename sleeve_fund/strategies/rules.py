@@ -248,6 +248,7 @@ class Rules(LongFlatStrategy):
         if self.rank_blocks():
             out["rank_weeks"] = max(b.weeks for b in self.rank_blocks())
             out["rank_no_rank"] = max(b.no_rank for b in self.rank_blocks())
+            out["rank_unranked"] = sorted({d for b in self.rank_blocks() for d in b.unranked})
         if self.c.vol_target_size:
             out["vol_skipped"] = self.vol_skipped
         return out

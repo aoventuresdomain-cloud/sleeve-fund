@@ -139,7 +139,7 @@ def test_a_week_missing_any_assets_close_has_no_value_and_is_counted(gap):
         assert got[0] is not None and got[1] == got[0]
         assert got[2] is None and got[3] is None  # that week reads nothing, for every asset, not only SOL
         assert got[4] == _feed(_block(own, closes), [t3])[0]  # ranks again the week after
-        assert (b.weeks, b.no_rank) == (2, 1)
+        assert (b.weeks, b.no_rank, b.unranked) == (2, 1, [t2.date().isoformat()])
 
 
 def test_after_a_missing_week_a_tie_falls_back_to_the_ranking_before_it():
@@ -154,10 +154,21 @@ def test_after_a_missing_week_a_tie_falls_back_to_the_ranking_before_it():
         assert _feed(_block(own, holed), [t1, t2, t3])[2][0] == first[own]
 
 
+@pytest.mark.parametrize("bad", [0.0, -1.0, float("inf")])
+def test_a_week_whose_score_isnt_finite_has_no_value_and_is_dated(bad):
+    closes = _closes()
+    t1, t2 = MONDAY + 5 * 7 * D, MONDAY + 6 * 7 * D
+    holed = {a: s.copy() for a, s in closes.items()}
+    holed["BTC"][t2 - 28 * D] = bad
+    b = _block("ETH", holed)
+    assert _feed(b, [t1, t2])[1] is None
+    assert (b.weeks, b.no_rank, b.unranked) == (1, 1, [t2.date().isoformat()])
+
+
 def test_with_no_source_it_never_reads_and_counts_every_week():
     b = RelativeStrengthRank()
     assert _feed(b, [MONDAY, MONDAY + D, MONDAY + 7 * D]) == [None, None, None]
-    assert (b.weeks, b.no_rank) == (0, 2)
+    assert (b.weeks, b.no_rank, b.unranked) == (0, 2, ["2024-01-08", "2024-01-15"])
 
 
 # ---- 4. alignment -----------------------------------------------------------------------------------------------
@@ -312,4 +323,6 @@ def test_a_baskets_run_hands_every_leg_the_same_closes_and_its_entries_follow_th
     assert len(want) >= 3 and entries == want  # every entry on a Monday close, by the asset ranked first there
     weeks = sum(1 for t in pd.concat([specs[0].warmup_prices, specs[0].prices]).index if is_weekly_decision(t.value))
     for s in specs:  # the four Mondays in the first 28 days of history can't rank; every later one does
-        assert run.legs[s.name].rule_counts == {"rank_weeks": weeks - 4, "rank_no_rank": 4}
+        assert run.legs[s.name].rule_counts == {"rank_weeks": weeks - 4, "rank_no_rank": 4,
+                                                "rank_unranked": ["2024-01-08", "2024-01-15", "2024-01-22",
+                                                                  "2024-01-29"]}
