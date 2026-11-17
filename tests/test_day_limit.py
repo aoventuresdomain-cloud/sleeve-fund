@@ -112,6 +112,7 @@ def _rules(limit, day, n):
     r = Rules.__new__(Rules)
     r.rules = SimpleNamespace(entries_per_day=limit)
     r._day_entries, r.day_limit_blocked, r._day_limit_days = (day, n), 0, set()
+    r._resume_entry_ns = None
     return r
 
 
@@ -123,3 +124,41 @@ def test_a_candle_closing_at_midnight_counts_to_the_day_it_opens():
     assert not r._day_full(midnight)  # the 00:00 close is the next day's
     assert (r.day_limit_blocked, r._day_limit_days) == (1, {day})
     assert not _rules(2, day, 1)._day_full(midnight - 1) and not _rules(0, day, 5)._day_full(midnight - 1)
+
+
+def test_a_resumed_leg_uses_up_its_own_day():
+    """CR #360 M1: after a paper restart with a leg open, that leg counts to its entry's day, so a rule holding after
+    it closes opens nothing more that day, and opens again the next."""
+    day = pd.Timestamp("2026-01-02", tz="UTC").value // DAY_NS
+    r = _rules(1, None, 0)
+    r._resume_entry_ns = day * DAY_NS + 3 * 3_600 * 10**9
+    Rules.resume_leg(r, 1, 2)
+    assert r._day_entries == (day, 1)
+    assert r._day_full(day * DAY_NS + 20 * 3_600 * 10**9)
+    assert not r._day_full((day + 1) * DAY_NS + 3_600 * 10**9)
+
+
+def test_a_leg_the_rules_open_but_no_entry_order_follows_is_counted(instrument, monkeypatch):
+    """Advisor on CR #360 F3: legs the rules opened that the risk layer (or sizing, or a hold) then refused still use
+    up their day; they are counted, 0 on the normal path."""
+    stopless = {**_limited(1), "exits": {"time_stop": {"minutes": 240}}}
+    plain = _run(stopless, instrument)
+    assert len(plain.fills) and plain.rule_counts["day_limit_unsent"] == 0  # every leg sent its entry
+    # the first leg held back (its stop not ready on the run's first candles): that day is spent, and counted
+    assert _run(_limited(1), instrument).rule_counts["day_limit_unsent"] == 1
+    monkeypatch.setattr(Rules, "_open", lambda self, *a, **k: None)  # every entry refused
+    res = _run(_limited(1), instrument)
+    days = len(pd.date_range(_walk(6000).index[0].floor("1D"), _walk(6000).index[-1], freq="1D"))
+    assert res.fills.empty and 0 < res.rule_counts["day_limit_unsent"] <= days
+
+
+def test_the_sheet_leads_with_asset_days_and_never_reads_candles_as_trades():
+    from sleeve_fund.research.study import day_limit_note
+
+    note = day_limit_note({"day_limit": 1, "day_limit_blocked": 37, "day_limit_blocked_days": 9,
+                           "day_limit_unsent": 0})
+    assert note.index("Asset-days with at least one blocked re-entry: 9") < note.index(
+        "Candles on which the entry rule held after the day's leg: 37 (candles, not trades)")
+    assert note.endswith("Rules-opened legs refused by risk: 0.")
+    assert "goes to the Advisor" in day_limit_note({"day_limit": 1, "day_limit_blocked": 0,
+                                                    "day_limit_blocked_days": 0, "day_limit_unsent": 2})

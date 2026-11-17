@@ -1402,11 +1402,7 @@ def run_study(
             f"otherwise have, set at entry and not rebalanced. {counts['vol_skipped']:,} entries were skipped for "
             "want of the daily closes to read it.")
     if "day_limit_blocked" in counts:  # qrt1: [limits] entries_per_utc_day
-        result.notes.append(
-            f"At most {counts['day_limit']} entr{'y' if counts['day_limit'] == 1 else 'ies'} per UTC day "
-            f"([limits] entries_per_utc_day), a stop-out or target included: an entry rule held on "
-            f"{counts['day_limit_blocked']:,} decision candles across {counts['day_limit_blocked_days']:,} days after "
-            "the day's limit was reached, and opened nothing there.")
+        result.notes.append(day_limit_note(counts))
     if spec.name == "rules" and len(full_default.exposure):  # R-07: what V3/V4 are judged against the parent at
         result.notes.append(f"Average gross exposure over the research period: "
                             f"{float(full_default.exposure.abs().mean()):.1%} of equity.")
@@ -2292,3 +2288,16 @@ def _exit_words(exits: dict) -> str:
     if "risk_per_trade" in exits:
         words.append(f"each trade sized to lose {exits['risk_per_trade']:.1%} of equity at the stop")
     return ", ".join(words)
+
+
+def day_limit_note(counts: dict) -> str:
+    """The sheet's line for [limits] entries_per_utc_day (qrt1; Advisor on CR #360 F3, 17 Nov): asset-days with a
+    blocked re-entry first, then the candles behind them, which are never a trade count, and the legs the rules opened
+    that the risk layer (or sizing, or a hold) refused, which still used up their day."""
+    n = counts["day_limit"]
+    unsent = counts["day_limit_unsent"]
+    return (f"At most {n} entr{'y' if n == 1 else 'ies'} per asset per UTC day ([limits] entries_per_utc_day), a "
+            f"stop-out included. Asset-days with at least one blocked re-entry: {counts['day_limit_blocked_days']:,}. "
+            f"Candles on which the entry rule held after the day's leg: {counts['day_limit_blocked']:,} (candles, not "
+            f"trades). Rules-opened legs refused by risk: {unsent:,}"
+            + (" (not 0: this result goes to the Advisor before anyone reads it)." if unsent else "."))

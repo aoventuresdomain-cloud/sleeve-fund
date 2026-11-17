@@ -232,6 +232,10 @@ class Rules(LongFlatStrategy):
         self._day_entries: tuple[int | None, int] = (None, 0)
         self.day_limit_blocked = 0
         self._day_limit_days: set[int] = set()
+        # Legs the rules opened that sent no entry order on their candle (refused by sizing, risk or a hold): each
+        # still used up its day (CR on #360). The entry orders counted when the latest leg opened, until it is checked.
+        self.day_limit_unsent = 0
+        self._opened_with: int | None = None
 
     def funding_blocks(self) -> list:
         """R-06: the definition's funding rate decile blocks, which the runner hands their stored rates."""
@@ -257,7 +261,9 @@ class Rules(LongFlatStrategy):
         if self.c.vol_target_size:
             out["vol_skipped"] = self.vol_skipped
         if self.rules.entries_per_day:
+            self._check_opened()
             out["day_limit"] = self.rules.entries_per_day
+            out["day_limit_unsent"] = self.day_limit_unsent
             out["day_limit_blocked"] = self.day_limit_blocked
             out["day_limit_blocked_days"] = len(self._day_limit_days)
         return out
@@ -381,6 +387,7 @@ class Rules(LongFlatStrategy):
 
     def want_side(self, bar: Bar) -> int | None:
         env, word = self.env, {1: "long", -1: "short"}
+        self._check_opened()
         fired, ended = [], 0
         if self._leg:
             step = bar_minutes(self._cfg.bar_type) * MINUTE_NS
@@ -420,6 +427,7 @@ class Rules(LongFlatStrategy):
                 if self.rules.entries_per_day:
                     day, n = self._day_entries
                     self._day_entries = (env.ts // DAY_NS, n + 1 if day == env.ts // DAY_NS else 1)
+                    self._opened_with = self._entry_orders()
                 self.rules.start_leg(env)
                 fired.append((f"{word[sign]}.entry", f"the {word[sign]} entry rule holds"))
                 values = self._lineage(fired, armed)
@@ -430,6 +438,16 @@ class Rules(LongFlatStrategy):
                 return self._leg
         self._why = ("; ".join(w for _, w in fired), self._lineage(fired)) if fired else None
         return self._leg
+
+    def _entry_orders(self) -> int:
+        return sum(1 for d in self.decisions.values() if d.get("intent") == "entry")
+
+    def _check_opened(self) -> None:
+        """[limits]: whether the leg the rules opened on the last candle sent its entry order there; one that didn't
+        (sizing, the risk layer or a hold refused it) still used up its day, and is counted."""
+        if self._opened_with is not None:
+            self.day_limit_unsent += self._entry_orders() == self._opened_with
+            self._opened_with = None
 
     def _day_full(self, ts: int) -> bool:
         """[limits] entries_per_utc_day: whether the UTC day the candle closing at ts counts to has had its legs. A
