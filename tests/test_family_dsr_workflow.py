@@ -46,6 +46,8 @@ def test_it_runs_only_the_module_and_logs_no_figure(tmp_path):
     res, argv = _run(tmp_path, "family B: N 15 (stated 15, register 15)\ndeflated Sharpe probability 0.4321\n"
                                "done: family B, sheet h0_x_1\n")
     assert res.returncode == 0, res.stderr
+    assert argv[:6] == ["flock", "-x", "-n", "-E", "75", "/run/lock/sleeve-register.lock"]  # CR #358 F1
+    argv = argv[6:]
     assert argv[:7] == ["docker", "compose", "run", "--rm", "-T", "--no-deps", "--name"]
     assert argv[8:] == ["dashboard", "python", "-m", "sleeve_fund.research.family_dsr", "--list", LIST, "--family",
                         "B", "--sheet", "h0_x_1"]

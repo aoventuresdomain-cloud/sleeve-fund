@@ -75,9 +75,12 @@ jobs:
           mkdir -p "$RUNNER_TEMP/plain"
           code=0  # the runner's shell has -e: a refusal must still reach the encrypted report, so it is caught here
           ssh -i ~/.ssh/id_deploy -o ServerAliveInterval=30 -o ServerAliveCountMax=10 "$USER_AT@$HOST" \
-            "cd /opt/sleeve-fund && sudo docker compose run --rm -T --no-deps --name family-dsr-$RUN_ID dashboard \
+            "cd /opt/sleeve-fund && sudo flock -x -n -E 75 /run/lock/sleeve-register.lock docker compose run --rm -T --no-deps --name family-dsr-$RUN_ID dashboard \
               python -m sleeve_fund.research.family_dsr --list $LIST --family $FAMILY --sheet $SHEET" \
             > "$RUNNER_TEMP/plain/report.txt" 2>&1 || code=$?
+          # The register lock (CR #358 F1): held exclusive here, shared by each study list, so this never runs beside
+          # one even if a study started after the guard above looked; flock exits 75 before docker is called.
+          [ "$code" != 75 ] || echo "::error::the register lock is held: a study list is running, so nothing ran"
           # The outcome's first word only (the last line: done, refused), never a figure or an id
           echo "outcome: $(tail -n 1 "$RUNNER_TEMP/plain/report.txt" | grep -oE '^(done|refused)' || echo other), exit $code"
           tar -czf "$RUNNER_TEMP/plain/sheet.tar.gz" -C "$RUNNER_TEMP/plain" report.txt

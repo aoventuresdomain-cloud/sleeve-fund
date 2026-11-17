@@ -130,19 +130,26 @@ jobs:
           SHA: ${{ github.sha }}
         run: |
           # Root-owned (rsync as root, no owner kept), links never copied, outside /opt/sleeve-fund; the newest 5
-          # commits' copies are kept, older ones pruned.
+          # commits' copies are kept, older ones pruned, except a copy a running study container still mounts (the
+          # other slot's run may have started on an older commit). If docker cannot be asked, nothing is pruned.
           ssh -i ~/.ssh/id_deploy "$USER_AT@$HOST" "sudo mkdir -p /opt/sleeve-research/$SHA && sudo chmod 755 /opt/sleeve-research"
           rsync -r --delete --no-links --chmod=D755,F644 --rsync-path="sudo rsync" -e "ssh -i ~/.ssh/id_deploy" \
             staged/ "$USER_AT@$HOST":/opt/sleeve-research/$SHA/
           ssh -i ~/.ssh/id_deploy "$USER_AT@$HOST" \
-            "sudo touch /opt/sleeve-research/$SHA && cd /opt/sleeve-research && ls -1t | grep -E '^[0-9a-f]{40}\$' | tail -n +6 | xargs -r sudo rm -rf --"
+            "sudo touch /opt/sleeve-research/$SHA && cd /opt/sleeve-research && ids=\$(sudo docker ps -q --filter name=study-) && keep=\$(printf '%s\\n' \$ids | xargs -r sudo docker inspect --format '{{range .Mounts}}{{.Source}} {{end}}' | grep -oE '/opt/sleeve-research/[0-9a-f]{40}' | cut -d/ -f4 | sort -u | paste -sd'|' -) && ls -1t | grep -E '^[0-9a-f]{40}\$' | tail -n +6 | grep -vxE \"\${keep:-none}\" | xargs -r sudo rm -rf --"
       - name: Refuse to stack a second study list on this slot
         # A one-off container can outlive its job (an SSH drop, a cancelled run), so a run still going on this slot is
         # shown and this job stops rather than start another beside it. Each slot's container is named
         # study-s<slot>-<run id>; one named study-<run id> is from before slots, and holds every slot until it ends.
+        # Each run is labelled sleeve.study=<list>:<rows, or all>:<run or dry>, so a list already running on the other
+        # slot is not started again on rows it covers: that would write its trials twice. A dry run writes nothing, so
+        # it is never refused for this and never holds a list (CR #358 F2).
         env:
           HOST: ${{ secrets.DEPLOY_HOST }}
           SLOT: ${{ inputs.slot }}
+          LIST: ${{ inputs.list }}
+          ROWS: ${{ inputs.rows }}
+          DRY: ${{ inputs.dry_run }}
         run: |
           running=$(ssh -i ~/.ssh/id_deploy "$USER_AT@$HOST" 'sudo docker ps --filter name=study- --format "{{.Names}} {{.Status}}"')
           mine=$(printf '%s\n' "$running" | grep -E "^study-(s$SLOT-)?[0-9]+ " || true)
@@ -152,6 +159,19 @@ jobs:
           if [ -n "$held" ]; then echo "a register job is running:"; echo "$held"; exit 1; fi
           others=$(printf '%s\n' "$running" | grep -E "^study-s[0-9]+-[0-9]+ " || true)
           if [ -n "$others" ]; then echo "running on another slot, left alone:"; echo "$others"; fi
+          [ "$DRY" != true ] || exit 0
+          rows_of() { if [ -z "$1" ] || [ "$1" = all ]; then echo all; return; fi
+                      local r; for r in ${1//,/ }; do if [[ $r == *-* ]]; then seq "${r%-*}" "${r#*-}"; else echo "$r"; fi; done | sort -u; }
+          want=$(rows_of "$ROWS")
+          labels=$(ssh -i ~/.ssh/id_deploy "$USER_AT@$HOST" 'sudo docker ps --filter label=sleeve.study --format "{{.Label \"sleeve.study\"}} {{.Names}}"')
+          while read -r label name; do
+            IFS=: read -r list rows mode <<<"$label"
+            [ "$list" = "$LIST" ] && [ "$mode" = run ] || continue
+            have=$(rows_of "$rows")
+            if [ "$want" = all ] || [ "$have" = all ] || [ -n "$(comm -12 <(echo "$want") <(echo "$have"))" ]; then
+              echo "$LIST is already running on rows ${rows} in $name: run other rows, or wait for it"; exit 1
+            fi
+          done <<<"$labels"
       - name: Run the list
         env:
           RUN_ID: ${{ github.run_id }}
@@ -164,6 +184,8 @@ jobs:
           FROM: ${{ inputs.configs_from }}
           SHA: ${{ github.sha }}
           SLOT: ${{ inputs.slot }}
+          ROWSET: ${{ inputs.rows }}
+          MODE: ${{ inputs.dry_run && 'dry' || 'run' }}
           CPUS: ${{ vars.STUDY_CPUS }}
           MEMORY: ${{ vars.STUDY_MEMORY }}
         run: |
@@ -175,9 +197,13 @@ jobs:
           else
             echo "research configs from the deployed image"
           fi
-          RUN="run --rm -T --no-deps --name study-s$SLOT-$RUN_ID $MOUNTS dashboard python -u -m sleeve_fund.research.rescore configs/studies/$LIST $ROWS --venue $VENUE --pair $PAIR $DRY $TRIES"
+          # The register lock (CR #358 F1): studies hold it shared, so the two slots run together, and a trial
+          # correction or family DSR takes it exclusive, so neither starts while the other holds it, whatever the
+          # docker ps guards saw a moment before. flock exits 75 when it is held, before docker is called.
+          LOCK="sudo flock -s -n -E 75 /run/lock/sleeve-register.lock"
+          RUN="run --rm -T --no-deps --name study-s$SLOT-$RUN_ID -l 'sleeve.study=$LIST:${ROWSET:-all}:$MODE' $MOUNTS dashboard python -u -m sleeve_fund.research.rescore configs/studies/$LIST $ROWS --venue $VENUE --pair $PAIR $DRY $TRIES"
           if [ -z "$CPUS$MEMORY" ]; then
-            REMOTE="cd /opt/sleeve-fund && sudo docker compose $RUN"
+            REMOTE="cd /opt/sleeve-fund && $LOCK docker compose $RUN"
           else
             # Caps from the repo variables STUDY_CPUS (e.g. 2 or 1.5) and STUDY_MEMORY (e.g. 6g), so two slots share
             # the server. docker compose run takes no --cpus or --memory, so they go in a one-run override file for the
@@ -189,6 +215,9 @@ jobs:
             [ -n "$CPUS" ] && CAPS="cpus: '$CPUS'"
             [ -n "$MEMORY" ] && CAPS="${CAPS:+$CAPS, }mem_limit: $MEMORY, memswap_limit: $MEMORY"
             echo "capped: ${CAPS}"
-            REMOTE="cd /opt/sleeve-fund && f=\$(mktemp) && printf '%s\\n' \"{services: {dashboard: {$CAPS}}}\" > \$f && files='-f docker-compose.yml' && { [ ! -f docker-compose.override.yml ] || files=\"\$files -f docker-compose.override.yml\"; } && sudo docker compose \$files -f \$f $RUN; rc=\$?; rm -f \$f; exit \$rc"
+            REMOTE="cd /opt/sleeve-fund && f=\$(mktemp) && printf '%s\\n' \"{services: {dashboard: {$CAPS}}}\" > \$f && files='-f docker-compose.yml' && { [ ! -f docker-compose.override.yml ] || files=\"\$files -f docker-compose.override.yml\"; } && $LOCK docker compose \$files -f \$f $RUN; rc=\$?; rm -f \$f; exit \$rc"
           fi
-          ssh -i ~/.ssh/id_deploy -o ServerAliveInterval=30 -o ServerAliveCountMax=10 "$USER_AT@$HOST" "$REMOTE"
+          ssh -i ~/.ssh/id_deploy -o ServerAliveInterval=30 -o ServerAliveCountMax=10 "$USER_AT@$HOST" "$REMOTE" || {
+            rc=$?
+            [ "$rc" != 75 ] || echo "::error::the register lock is held: a trial correction or family DSR is running, so nothing ran"
+            exit "$rc"; }
