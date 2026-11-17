@@ -48,6 +48,22 @@ PREREGISTERED = {
     # Family H, pullback inside a trend (Advisor cleared 31 Oct 05:56 UTC as family B try 15; same folder): a new idea,
     # so no parent and no placebo.
     "QRH0_TREND_PULLBACK": {"definition": "qrh0_trend_pullback", "params": {}},
+    # Family H improve items (PM reopened H 16 Nov 21:06 UTC; Advisor cleared items 1-5, 7, 8 and P1 16 Nov ~22:10 UK,
+    # same folder): each one change from H0, run alone against H0 (configs/studies/family-h-improve-list.md). No placebo.
+    "QRH1_TREND_PULLBACK_TS6": {"definition": "qrh1_trend_pullback_ts6", "params": {}},
+    "QRH2_TREND_PULLBACK_RUNNERS": {"definition": "qrh2_trend_pullback_runners", "params": {}},
+    "QRH3_TREND_PULLBACK_STOP15": {"definition": "qrh3_trend_pullback_stop15", "params": {}},
+    "QRH4_TREND_PULLBACK_SMA100": {"definition": "qrh4_trend_pullback_sma100", "params": {}},
+    "QRH5_TREND_PULLBACK_STOP35": {"definition": "qrh5_trend_pullback_stop35", "params": {}},
+    "QRH7_TREND_PULLBACK_SHORT_ONLY": {"definition": "qrh7_trend_pullback_short_only", "params": {}},
+    "QRH8_TREND_PULLBACK_RSI595": {"definition": "qrh8_trend_pullback_rsi595", "params": {}},
+    "QRHP1_TREND_PULLBACK_BREAK_FILTER": {"definition": "qrhp1_trend_pullback_break_filter", "params": {}},
+    # Idea batch N1-N4 (Advisor cleared 17 Nov ~08:15 UK with pre-run implementation fixes, no try spent;
+    # research/quant-researcher/next-round/idea-batch-17nov.md): new ideas, so no parent and no placebo.
+    "QRN1_CAPITULATION_REVERSAL": {"definition": "qrn1_capitulation_reversal", "params": {}},
+    "QRN2_SHORT_TREND_SLEEVE": {"definition": "qrn2_short_trend_sleeve", "params": {}},
+    "QRN3_WEEKEND_FADE": {"definition": "qrn3_weekend_fade", "params": {}},
+    "QRN4_WIDE_RANGE_CONTINUATION": {"definition": "qrn4_wide_range_continuation", "params": {}},
     # Family C, relative strength across BTC, ETH and SOL (PM yes 16 Nov 21:06 UTC; Advisor cleared, rev 3 frozen
     # 17 Nov; same folder): a new family, so no parent and no placebo. 0.5x of the fund a leg, 1x gross (Advisor Q2), which makes
     # it a rank book sized off the fund.
