@@ -279,4 +279,6 @@ def null_words(r: PairNull | None) -> str:
         return f"NOT JUDGED: {out} (more than {RECONCILE_PP * 100:.1f} points apart)"
     if r.killed:  # fails the book whatever the after-fee share (CR #356; Advisor 17 Nov)
         return f"KILLED (round 0, kill 2: random below {PRE_FEE_KILL:.0f}% before fees): {out}"
+    if r.judged and r.pre_percentile < BAR:  # Advisor 17 Nov ~01:15 UK: 90 to 95% before fees, improvable
+        return f"BELOW THE BAR (random {PRE_FEE_KILL:.0f}-{BAR:.0f}% before fees): {out}"
     return f"{'ABOVE THE BAR' if r.beats else 'BELOW THE BAR'}: {out}"  # the list allows no PASS wording

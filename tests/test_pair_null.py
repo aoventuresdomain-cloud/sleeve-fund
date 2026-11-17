@@ -280,7 +280,10 @@ def test_round_0_kill_2_fails_the_verdict_even_above_the_after_fee_bar():
     between = _null(96.0, 92.0)  # 90 to 95 before fees: not killed, but it can't pass
     assert not between.killed and not between.beats
     assert bk.verdict(SimpleNamespace(**loose, pair=between), None) == "FAIL"
-    assert pn.null_words(between).startswith("BELOW THE BAR: ")
+    assert pn.null_words(between).startswith("BELOW THE BAR (random 90-95% before fees): ")
+    assert pn.null_words(_null(94.9, 99.0)).startswith("BELOW THE BAR: ")  # after fees short of 95
+    assert pn.null_words(_null(96.0, 94.9)).startswith("BELOW THE BAR (random 90-95% before fees): ")
+    assert pn.null_words(_null(96.0, 95.0)).startswith("ABOVE THE BAR: ") and not _null(96.0, 94.9).beats
     assert bk.verdict(SimpleNamespace(**loose, pair=_null(95.0, 95.0)), None) == "NOT YET"
 
 
