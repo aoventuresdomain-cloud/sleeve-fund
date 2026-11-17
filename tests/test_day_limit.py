@@ -162,3 +162,15 @@ def test_the_sheet_leads_with_asset_days_and_never_reads_candles_as_trades():
     assert note.endswith("Rules-opened legs refused by risk: 0.")
     assert "goes to the Advisor" in day_limit_note({"day_limit": 1, "day_limit_blocked": 0,
                                                     "day_limit_blocked_days": 0, "day_limit_unsent": 2})
+
+
+def test_paper_and_live_refuse_a_day_limit_until_a_restart_can_rebuild_the_days_count():
+    """CR #360 F1: a flat strategy restarted after a same-day stop-out doesn't know the day is spent, so Start refuses
+    [limits] as it does a studies-only block; studies run it."""
+    from sleeve_fund.strategies import check_study_only, study_only_uses
+
+    params = to_params(_limited(1))
+    assert study_only_uses(params) == ["a per-day entry limit ([limits] entries_per_utc_day)"]
+    with pytest.raises(ValueError, match="per-day entry limit"):
+        check_study_only("rules", params)
+    assert study_only_uses(to_params(DEFN)) == []
