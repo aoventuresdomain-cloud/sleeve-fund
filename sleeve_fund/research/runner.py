@@ -359,7 +359,11 @@ def plan_run(strategy_name, prices, instrument, params=None, starting_capital=10
         if fine and exec_minutes < bar_minutes and (end_ns - start_ns) // exec_ns > QUIET_TICKS_FROM:
             # QUIET-TICKS (HoE 17 Nov): a run long enough that every minute ticked would be thinned to an hour's last
             # mark skips the full tick on a flat, quiet minute; its saved marks are thinned the same way.
-            runtime.quiet_ticks_to = end_ns
+            # The hours' last bars are read off the data, never predicted: a gap at :59 makes :58 the hour's last mark
+            # (CR #361 M1). Past 90 days the journal keeps a day's last mark, always one of these.
+            ns = first.index.as_unit("ns").asi8
+            hour = ns // 3_600_000_000_000
+            runtime.quiet_marks = frozenset(ns[np.r_[hour[1:] != hour[:-1], True]].tolist())
             runtime.store.thin_marks()
 
     if runtime is not None:

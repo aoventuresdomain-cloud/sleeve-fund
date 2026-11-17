@@ -105,13 +105,73 @@ def test_a_long_profiled_run_comes_out_the_same_with_its_quiet_minutes_left_unti
     assert n_every >= len(m) and n_quiet < n_every / 2  # the quiet minutes did go unticked
 
 
-def test_a_guarded_basket_comes_out_the_same(monkeypatch, ticks):
-    """Two profiled legs in one engine under the fund's limits, one trimmed by its gross cap: the gate's decisions,
-    the fund's book and each leg's record are the same either way."""
+@pytest.mark.parametrize("days, drop", [(90, ("10:59", "23:59")), (100, ("23:59",))])
+def test_gaps_at_an_hours_last_minute_keep_the_same_marks(monkeypatch, ticks, days, drop):
+    """CR #361 M1: where the data lacks an hour's :59 the hour's last mark is :58, and past 90 days a day's is the
+    last bar before a missing 23:59; the quiet run ticks the data's own last bar of each hour, so its kept marks are
+    the same."""
+    m = _minutes(2, days=days)
+    m = m[~m.index.strftime("%H:%M").isin(drop)]
+
+    def run():
+        return run_backtest("trend_filter", _daily(m), ETH, starting_capital=10_000, exec_prices=m, exec_minutes=1,
+                            risk_profile="conservative", bar_minutes=1440, half_spread=0.0, params=dict(PARAMS))
+
+    (quiet, n_quiet), (every, n_every) = _both(monkeypatch, ticks, run)
+    _assert_same(quiet, every)
+    kept = {k["ts"].strftime("%H:%M") for k in quiet.journal.marks_to_keep()}
+    assert ("10:58" in kept) is (days <= 90) and "23:58" in kept and not kept & set(drop)
+    assert (quiet.equity.index[-1] - quiet.equity.index[0]).days > 90 or days <= 90
+    assert n_quiet < n_every / 2
+
+
+def test_an_order_sent_on_a_quiet_minute_ticks_the_next(monkeypatch):
+    """A quiet minute is flat with nothing working, so nothing can fill on it; were this strategy to send an order
+    there, the next minute ticks (LongFlatStrategy._on_exec_bar). Pinned by sending a stand-in one."""
+    m = _minutes(2, days=12)
+    seen, real_tick = [], LongFlatStrategy._on_tick
+
+    def tick(self, *a, **k):
+        seen.append(self.clock.timestamp_ns())
+        return real_tick(self, *a, **k)
+
+    def run():
+        seen.clear()
+        return run_backtest("trend_filter", _daily(m), ETH, starting_capital=10_000, exec_prices=m, exec_minutes=1,
+                            risk_profile="conservative", bar_minutes=1440, half_spread=0.0, params=dict(PARAMS))
+
+    monkeypatch.setattr(LongFlatStrategy, "_on_tick", tick)
+    run()
+    ticked, minute = set(seen), 60_000_000_000
+    t = next(int(x) for x in m.index.as_unit("ns").asi8[3000:] if {x, x + minute, x - minute}.isdisjoint(ticked))
+    real_target = LongFlatStrategy._bar_target
+    from nautilus_trader.model import ClientOrderId
+
+    stand_in = ClientOrderId("O-STAND-IN")  # no such order: cache.order() finds none, so nothing else reads it
+
+    def target(self, bar):
+        now = self.clock.timestamp_ns()
+        if now == t:
+            self._sent.append(stand_in)
+        elif now == t + minute and stand_in in self._sent:
+            self._sent.remove(stand_in)
+        return real_target(self, bar)
+
+    monkeypatch.setattr(LongFlatStrategy, "_bar_target", target)
+    run()
+    assert t + minute in seen and t not in seen
+
+
+@pytest.mark.parametrize("brakes", [False, True])
+def test_a_guarded_basket_comes_out_the_same(monkeypatch, ticks, brakes):
+    """Two profiled legs in one engine under the fund's limits, one trimmed by its gross cap, and (brakes) the fund's
+    drawdown and daily-loss brakes tight enough to fire: the gate's decisions, the fund's book and each leg's record
+    are the same either way."""
     from sleeve_fund.research.portfolio_run import LegSpec, run_portfolio
     from sleeve_fund.risk import PortfolioProfile
 
-    tight = PortfolioProfile(gross=0.3, net_instrument=100, margin=100, open_risk=100, drawdown=0.99, daily_loss=0.99)
+    loss = 0.02 if brakes else 0.99
+    tight = PortfolioProfile(gross=0.3, net_instrument=100, margin=100, open_risk=100, drawdown=loss, daily_loss=loss)
     legs = []
     for name, seed in (("a", 2), ("b", 7)):
         m = _minutes(seed, days=60)
@@ -125,7 +185,8 @@ def test_a_guarded_basket_comes_out_the_same(monkeypatch, ticks):
     strip = [{k: v for k, v in d.items() if k != "order_id"} for d in quiet.decisions]
     assert strip == [{k: v for k, v in d.items() if k != "order_id"} for d in every.decisions]
     assert quiet.refusals == every.refusals and quiet.halt == every.halt and quiet.pauses == every.pauses
-    assert any(d["outcome"] == "trimmed" for d in quiet.decisions)  # the gross cap bit
+    assert brakes or any(d["outcome"] == "trimmed" for d in quiet.decisions)  # the gross cap bit
+    assert bool(quiet.halt or quiet.pauses) is brakes  # tight, a fund brake fired (and stopped the trading early)
     for name in ("a", "b"):
         _assert_same(quiet.legs[name], every.legs[name])
     assert n_quiet < n_every / 2
@@ -138,11 +199,11 @@ def test_a_short_run_or_one_on_its_own_bars_ticks_every_bar(monkeypatch):
     m = _minutes(2, days=8)
     short = runner.plan_run("trend_filter", _daily(m), ETH, dict(PARAMS), exec_prices=m, exec_minutes=1,
                             risk_profile="conservative", bar_minutes=1440)
-    assert short.runtime.quiet_ticks_to is None
+    assert short.runtime.quiet_marks is None
     long_ = _minutes(2, days=12)
     plan = runner.plan_run("trend_filter", _daily(long_), ETH, dict(PARAMS), exec_prices=long_, exec_minutes=1,
                            risk_profile="conservative", bar_minutes=1440)
-    assert plan.runtime.quiet_ticks_to == plan.end_ns and plan.runtime.store._thinned
+    assert plan.runtime.quiet_marks and max(plan.runtime.quiet_marks) == plan.end_ns and plan.runtime.store._thinned
     bars_only = runner.plan_run("trend_filter", _daily(long_), ETH, dict(PARAMS), risk_profile="conservative",
                                 bar_minutes=1440)
-    assert bars_only.runtime.quiet_ticks_to is None
+    assert bars_only.runtime.quiet_marks is None

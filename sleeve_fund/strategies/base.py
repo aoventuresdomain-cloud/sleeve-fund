@@ -694,7 +694,6 @@ class LongFlatStrategy(Strategy):
         self._bid = self._ask = None  # the venue's best quotes (paper and live, and replayed quotes)
         self.recorder = None  # sleeve_fund.paper.recorder.Recorder, when a paper run is being recorded
         self._last_tick_ns = 0
-        self._last_exec_ns = 0  # the latest execution bar's close, ticked or not (QUIET-TICKS)
         self._live_at_exec = True  # whether the book was live after the latest execution bar (QUIET-TICKS)
         self._reconcile_next: tuple = (None, 0)  # (runtime.last_reconciled, the next reconcile due in ns)
         self._mark_warned = False
@@ -1409,18 +1408,19 @@ class LongFlatStrategy(Strategy):
         quiet = now != self._last_tick_ns and not self._exec_tick_due(now)  # the decision bar here may have ticked
         if not quiet and now != self._last_tick_ns:
             self._on_tick()
-        self._last_exec_ns = now
         self._bar_target(bar)
         self._rest_risk_stop()
-        if self._quiet_end() is not None:
-            # A quiet minute was flat with nothing working (_exec_tick_due); only an order sent since makes it live.
+        if self._quiet_marks() is not None:
+            # A quiet minute was flat with nothing working (_exec_tick_due), so nothing could fill on it: only an order
+            # this strategy sent since makes it live, and it ticks the next minute.
             self._live_at_exec = bool(self._sent) if quiet else self._book_live()
 
-    def _quiet_end(self) -> int | None:
-        """QUIET-TICKS (HoE 17 Nov): the run's last execution bar when this backtest may skip the full tick on a quiet
-        minute (SleeveRuntime.quiet_ticks_to, set by the runner), else None: every minute ticks."""
+    def _quiet_marks(self) -> frozenset | None:
+        """QUIET-TICKS (HoE 17 Nov): when this backtest may skip the full tick on a quiet minute, the bars it still
+        ticks for their kept mark (SleeveRuntime.quiet_marks, set by the runner from its data), else None: every
+        minute ticks."""
         rt = self.runtime
-        return None if rt is None or not rt.backtest or self.pair is not None else rt.quiet_ticks_to
+        return None if rt is None or not rt.backtest or self.pair is not None else rt.quiet_marks
 
     def _book_live(self) -> bool:
         """Whether anything a tick acts on is live: a position, or an order working or owed. Flat, a halt or a pause
@@ -1436,18 +1436,17 @@ class LongFlatStrategy(Strategy):
 
     def _exec_tick_due(self, now: int) -> bool:
         """QUIET-TICKS: an execution bar's full tick (mark, guard, funding, reconcile) runs every minute while the
-        book is live, and on the minute after it last was. Flat with nothing working, a tick there changes nothing
-        but the mark's price and benchmark, so it runs only where a mark is kept or a clock acts: the last minute of
-        each hour (MemoryJournal keeps an hour's last mark), on a perp the first too (funding settles on the hour, as
-        it would be marked flat), a decision close, a reconcile due, and the run's last bar. Fills, orders, funding,
-        events and the kept marks come out as they do with every minute ticked (tests/test_quiet_ticks.py)."""
-        end = self._quiet_end()
-        if end is None or self._live_at_exec:
+        book is live, and on the minute after it last was. Flat with nothing working, nothing can fill and a tick
+        changes nothing but the mark (equity is constant: no breach, pause or halt can come of it; CR #361), so it
+        runs only where a mark is kept or a clock acts: the data's last bar of each hour (MemoryJournal keeps an hour's
+        last mark, a day's past 90 days; the run's last bar is one), a decision close, and a reconcile due. Fills,
+        orders, funding, events and the kept marks come out as they do with every minute ticked, gaps in the data
+        included (tests/test_quiet_ticks.py)."""
+        marks = self._quiet_marks()
+        if marks is None or self._live_at_exec:
             return True
-        hour, step = 3_600_000_000_000, max(now - self._last_exec_ns, 60_000_000_000) if self._last_exec_ns else 0
-        return ((now + step) % hour == 0 or (self._margin and now % hour == 0)
-                or now % (self.runtime.tick_seconds * 1_000_000_000) == 0
-                or now >= end or self._book_live() or self._reconcile_due_at(now))
+        return (now in marks or now % (self.runtime.tick_seconds * 1_000_000_000) == 0
+                or self._reconcile_due_at(now))
 
     def _reconcile_due_at(self, now: int) -> bool:
         """SleeveRuntime.reconcile_due at the engine's time `now`, in nanoseconds: read once a minute, so the
@@ -1513,9 +1512,7 @@ class LongFlatStrategy(Strategy):
         if self.runtime is None:
             return
         now = self.clock.timestamp_ns()
-        # QUIET-TICKS: a quiet minute left unticked still counts as ticked here, as it did when every minute ticked.
-        last = max(self._last_tick_ns, self._last_exec_ns) if self._quiet_end() is not None else self._last_tick_ns
-        if now - last >= self.runtime.tick_seconds * 1_000_000_000:
+        if now - self._last_tick_ns >= self.runtime.tick_seconds * 1_000_000_000:
             self._on_tick()
 
     def update_indicators(self, bar: Bar) -> None:
