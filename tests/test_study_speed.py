@@ -13,6 +13,7 @@ which every store basket study runs. Done when:
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 
 import pytest
 from test_b38_basket_study import (
@@ -203,7 +204,7 @@ def test_a_survivor_is_judged_as_the_full_study_judges_it_and_its_sheet_differs_
 # ---- 4. a store study runs fast ---------------------------------------------------------------------------------
 
 def test_a_store_basket_study_is_screened_and_writes_its_fail_sheet(tmp_path):
-    """The study lists' path (research.basket_run, as rescore runs it): a 4-hour list losing before fees on 1-minute
+    """The study lists' path (research.basket_run, as rescore runs it): a 4-hour list with too few trades on 1-minute
     fills is screened out after its two runs, its sheet and its trade files written, its try counted."""
     from test_basket_4h import _History, _req
 
@@ -220,8 +221,70 @@ def test_a_store_basket_study_is_screened_and_writes_its_fail_sheet(tmp_path):
         mp.undo()
     assert len(runs) == 2 and runs[0][0].fees is None and float(runs[1][0].fees.taker) == 0.0
     text = out.read_text(encoding="utf-8")
-    assert "**Basket verdict:** FAIL (loses before fees)" in text
+    assert "**Basket verdict:** FAIL (fewer than 40 test-window trades)" in text
     assert out.with_name(f"{out.stem}-basket-trades.csv").exists() and out.with_name(f"{out.stem}-pooled.csv").exists()
     rows = [t for t in trials.TrialsRegister(store)._counted(trials.legacy_idea_hash("rules"))
             if str(t["definition_name"]).startswith("basket:")]
     assert len(rows) == 1
+
+
+# ---- 5. CR on #365: M1, F1, F2 ----------------------------------------------------------------------------------
+
+def test_a_screened_store_study_still_refuses_trips_that_disagree_with_the_book(tmp_path):
+    """CR M1: an own-sized run (guards off, as the edge verdict's) refuses, with no sheet and no try, when the pooled
+    trips and the book disagree; a study screened out before its draws checks the same thing first."""
+    from test_basket_4h import _History, _req
+
+    from sleeve_fund.research import run as run_mod
+    from sleeve_fund.store import Store
+
+    mp = pytest.MonkeyPatch()
+    mp.setattr(bk, "pooled_legs", lambda *a, **k: ([], (0.05, 0.0), ""))
+    try:
+        store = Store(f"sqlite:///{tmp_path}/t.db")
+        with pytest.raises(ValueError, match="the trades and the book disagree, so no sheet and no try"):
+            run_mod.run_store_study(replace(_req(), fund_guards=False), store=store, out_dir=tmp_path / "sheets",
+                                    history=_History())
+    finally:
+        mp.undo()
+    assert trials.TrialsRegister(store)._counted(trials.legacy_idea_hash("rules")) == []
+    assert not (tmp_path / "sheets").exists() or not list((tmp_path / "sheets").glob("*.md"))
+
+
+def test_a_basket_that_never_trades_reads_as_too_few_trades_and_a_zero_net_is_a_loss_before_fees(tmp_path, monkeypatch):
+    """CR F2: the trade count is judged first; at exactly 0 before fees, nothing can pass after them."""
+    _dirs(tmp_path)
+    monkeypatch.setattr(bk, "test_trades", lambda m, bars, windows: [])
+    none, _, _, _ = _studied(tmp_path, _basket(), True, min_trades=40)
+    assert none.screened == "fewer than 40 test-window trades"
+    (tmp_path / "zero").mkdir()
+    monkeypatch.setattr(bk, "test_trades", lambda m, bars, windows: [object()] * 40)
+    monkeypatch.setattr(bk, "gross_edge", lambda zero, bars, windows: 0.0)
+    real_run, real_measure, fees = bk._run, bk._measure, []
+
+    def run(basket, assets, first, last, f, *a, **k):
+        fees.append(f)
+        return real_run(basket, assets, first, last, f, *a, **k)
+
+    def measure(*a, **k):  # the 0-fee rung's net exactly 0: a flat book before fees
+        m = real_measure(*a, **k)
+        if fees[-1] is not None and float(fees[-1].taker) == 0.0:
+            m.net = 0.0
+        return m
+    monkeypatch.setattr(bk, "_run", run)
+    monkeypatch.setattr(bk, "_measure", measure)
+    study = bk.basket_study(_basket(), WINDOWS, RESEARCH_END, register=_register(tmp_path / "zero"), dataset="syn",
+                            capital=CAPITAL, profile=LOOSE, warm_days=40, fast=True)
+    assert study.ladder == [(0.0, 0.0)] and study.screened == "loses before fees"
+
+
+def test_the_real_fee_rung_is_its_own_flat_run_when_the_base_run_made_a_maker_fill(tmp_path, monkeypatch):
+    """CR F1: on a venue whose maker fee differs, a base run with any passive fill is not one flat fee."""
+    _dirs(tmp_path)
+    monkeypatch.setattr(bk, "_maker_filled", lambda m: True)
+    fast, runs, _, _ = _studied(tmp_path, _basket(params=CROSSES), True)
+    assert runs.count((0.002, 0.002)) == 1 and runs[0] is None
+    monkeypatch.setattr(bk, "_maker_filled", lambda m: False)
+    (tmp_path / "again" / "fast").mkdir(parents=True)
+    again, runs2, _, _ = _studied(tmp_path / "again", _basket(params=CROSSES), True)
+    assert runs2.count((0.002, 0.002)) == 0 and dict(again.ladder)[0.002] == again.base.net

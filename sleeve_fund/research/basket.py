@@ -38,7 +38,7 @@ from sleeve_fund.research.holdout import HoldoutLocks
 from sleeve_fund.research.metrics import daily_closes, fills_to_rows, trades
 from sleeve_fund.research.multi_asset import FIXED_LIST, AssetData, check_assets, leg_names, underlying
 from sleeve_fund.research.portfolio_run import LegSpec, PortfolioResult, run_portfolio
-from sleeve_fund.research.random_entry import BAR, DRAWS, HELD_BACK_MAX, Trade, _random_entries
+from sleeve_fund.research.random_entry import BAR, DRAWS, HELD_BACK_MAX, RECONCILE_PP, Trade, _random_entries
 from sleeve_fund.research.candidates import BUDGET_PER_IDEA, configurations
 from sleeve_fund.research.study import COST_LADDER, _between, doubled
 from sleeve_fund.risk import PORTFOLIO, PortfolioProfile
@@ -574,6 +574,12 @@ def ladder_breakeven(rungs: list[tuple[float, float]], beyond: str = "> top rung
     return None, "> top rung"  # unreachable: the bottom rung is above 0 and the top isn't
 
 
+def _maker_filled(m: Measured) -> bool:
+    """Whether any leg of the run had a fill on the passive side (the venue's maker fee may have applied to it)."""
+    return any(leg.fills is not None and not leg.fills.empty and "liquidity_side" in leg.fills.columns
+               and (leg.fills["liquidity_side"].astype(str) == "MAKER").any() for leg in m.run.legs.values())
+
+
 def test_trades(m: Measured, bars: dict, windows) -> list:
     """The run's closed trips opened on a test day, every leg's, as the sheet's trade files count them (each leg's
     own record, periods.trade_rows; basket_run._test_day)."""
@@ -858,9 +864,15 @@ def basket_study(basket: Basket, windows, research_end: date, *, register: trial
     zero = rung(0.0) if fast else None
     if zero is not None:
         counted_trades = test_trades(base, bars, windows)
-        why = ("loses before fees" if zero.net <= 0 else
-               f"fewer than {MIN_TRADES} test-window trades" if len(counted_trades) < MIN_TRADES else None)
+        # the trade count first, so a basket that never trades (net exactly 0) reads as too few trades
+        why = (f"fewer than {MIN_TRADES} test-window trades" if len(counted_trades) < MIN_TRADES else
+               "loses before fees" if zero.net <= 0 else None)
         if why and counted and SCREEN_BEFORE_FEES:  # STUDY-SPEED: no condition can pass, or too few trades to judge
+            if own and filled:  # CR M1 on #365: the full study's trips-against-book refusal holds here too
+                _, (trips, book), _ = pooled_legs(base, names, specs, basket.params, windows, capital)
+                if not abs(trips - book) <= RECONCILE_PP:
+                    raise ValueError(f"refused: the basket's pooled trips add to {trips:+.1%} against the book's "
+                                     f"{book:+.1%} over them: the trades and the book disagree, so no sheet and no try")
             study = BasketStudy(basket, windows, research_end, base, None, None, None, touched, ladder=rungs,
                                 breakeven=ladder_breakeven(rungs, "not run: screened out"),
                                 asset_breakeven={a: ladder_breakeven(r, "not run: screened out")
@@ -885,7 +897,8 @@ def basket_study(basket: Basket, windows, research_end: date, *, register: trial
         stress = 2 * float(real.taker)
         for f in FAST_RUNGS[1:]:
             rung(f)
-        rung(float(real.taker), base)
+        # CR F1 on #365: the base run is one flat fee only when the venue charges one, or it made no maker fill
+        rung(float(real.taker), base if real.maker == real.taker or not _maker_filled(base) else None)
         rung(stress, twice if real.maker == real.taker else None)
         breakeven, beyond = ladder_breakeven(rungs, f"> {stress:.2%}"), f"> {stress:.2%}"
     elif ladder:
