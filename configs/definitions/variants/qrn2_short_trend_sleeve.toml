@@ -1,6 +1,6 @@
 version = 1
 name = "qrn2-short-trend-sleeve"
-title = "Short-side Trend Sleeve (daily signal, 4h candles) · Short only"
+title = "Short-side Trend (daily signal, 4h candles) · Short only"
 reason = """Proposed after a falling test window. The half of the market V5 (long-only) sits out: at the 00:00 UTC
 close, short a close below the prior 20-day low while the close is below the daily SMA200 and the SMA50 is below the
 SMA200; usually paid funding while short. Out at a 00:00 close back above the daily SMA20; 3 daily ATR(14) stop.
