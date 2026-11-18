@@ -1,0 +1,53 @@
+version = 1
+name = "qrm1-tsmom-20d"
+title = "Time-series Momentum, 20 days (daily signal, 4h candles) · Long and Short"
+reason = """Returns over the past few weeks tend to continue over the next few in these markets (time-series momentum:
+slow-moving capital, trend-following flows and under-reaction to news). At the 00:00 UTC close, long when the close is
+above the close about 20 days earlier and above the daily SMA50; short when it is below both. Out at a 00:00 close
+where the 20-day return has changed sign, or on a 3 daily ATR(14) stop. Both sides, multi-day holds. Trend family; daily
+return correlation to V5 is printed (above 0.5 it doesn't count as a separate Strategy). Fixed before any run. Sizing on
+the study list: vol_target_size = { annual = 0.40, lookback_days = 30 } (lag-1, capped at 1x)."""
+
+[blocks.c20]
+kind = "lag"
+period = 20
+timeframe = "1d"
+input = "close"
+
+[blocks.sma50]
+kind = "sma"
+period = 50
+timeframe = "1d"
+
+[blocks.atr]
+kind = "atr"
+period = 14
+timeframe = "1d"
+
+[long]
+entry = { all = [
+    { left = { time = "hour" }, op = "<=", right = 0 },
+    { left = "close", op = ">", right = "c20" },
+    { left = "close", op = ">", right = "sma50" },
+] }
+exit = { all = [
+    { left = { time = "hour" }, op = "<=", right = 0 },
+    { left = "close", op = "<", right = "c20" },
+] }
+
+[short]
+entry = { all = [
+    { left = { time = "hour" }, op = "<=", right = 0 },
+    { left = "close", op = "<", right = "c20" },
+    { left = "close", op = "<", right = "sma50" },
+] }
+exit = { all = [
+    { left = { time = "hour" }, op = "<=", right = 0 },
+    { left = "close", op = ">", right = "c20" },
+] }
+
+[exits.long]
+stop = { level = { sub = ["close", { mul = [3, "atr"] }] } }
+
+[exits.short]
+stop = { level = { add = ["close", { mul = [3, "atr"] }] } }

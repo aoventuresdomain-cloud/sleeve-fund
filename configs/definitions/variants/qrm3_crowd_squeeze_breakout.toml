@@ -1,0 +1,74 @@
+version = 1
+name = "qrm3-crowd-squeeze-breakout"
+title = "Crowded-side Squeeze (daily signal, 4h candles) · Long and Short"
+reason = """When funding is low for its own last 90 days (shorts crowded and paying) and price still breaks out above
+the prior 10-day high, the crowded shorts are being forced to cover, and the squeeze tends to run for days; the mirror
+(funding high, longs crowded, a break below the prior 10-day low) is a long liquidation. This trades WITH price against
+the crowd, the opposite of family A's fade, which traded funding alone. At the 00:00 UTC close: long when the funding
+percentile is 20 or below and the close is above the prior 10-day high; short when it is 80 or above and the close is
+below the prior 10-day low. Out at a 00:00 close back through the prior 10-day midpoint, after 10 days (60 candles), or
+on a 2.5 daily ATR(14) stop. Positioning family (Advisor to rule whether it joins A). Studies only (funding block).
+Fixed before any run. Sizing on the study list: vol_target_size = { annual = 0.40, lookback_days = 30 } (lag-1, capped
+at 1x)."""
+
+[blocks.fr]
+kind = "funding_percentile"
+window_days = 90
+
+[blocks.atr]
+kind = "atr"
+period = 14
+timeframe = "1d"
+
+[blocks.dc]
+kind = "donchian"
+period = 10
+timeframe = "1d"
+
+[blocks.dcu]
+kind = "lag"
+period = 1
+timeframe = "1d"
+input = "dc.upper"
+
+[blocks.dcl]
+kind = "lag"
+period = 1
+timeframe = "1d"
+input = "dc.lower"
+
+[blocks.dcm]
+kind = "lag"
+period = 1
+timeframe = "1d"
+input = "dc.mid"
+
+[long]
+entry = { all = [
+    { left = { time = "hour" }, op = "<=", right = 0 },
+    { left = "fr.pct", op = "<=", right = 20 },
+    { left = "close", op = ">", right = "dcu" },
+] }
+exit = { all = [
+    { left = { time = "hour" }, op = "<=", right = 0 },
+    { left = "close", op = "<", right = "dcm" },
+] }
+
+[short]
+entry = { all = [
+    { left = { time = "hour" }, op = "<=", right = 0 },
+    { left = "fr.pct", op = ">=", right = 80 },
+    { left = "close", op = "<", right = "dcl" },
+] }
+exit = { all = [
+    { left = { time = "hour" }, op = "<=", right = 0 },
+    { left = "close", op = ">", right = "dcm" },
+] }
+
+[exits.long]
+stop = { level = { sub = ["close", { mul = [2.5, "atr"] }] } }
+time_stop = { bars = 60 }
+
+[exits.short]
+stop = { level = { add = ["close", { mul = [2.5, "atr"] }] } }
+time_stop = { bars = 60 }

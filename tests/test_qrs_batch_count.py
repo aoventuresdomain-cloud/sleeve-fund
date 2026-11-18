@@ -88,10 +88,10 @@ def test_the_count_runs_every_row_on_the_train_window_and_writes_nothing(capfd):
     history = _History({p: _bars(seed=i) for i, p in enumerate(PAIRS.split(","))})
 
     def no_run(*a, **k):
-        raise AssertionError("a signal count runs no study and opens no journal")
+        raise AssertionError("a signal count runs no study")
 
     code = rescore.main([str(LIST), "--venue", "binance", "--pair", PAIRS, "--count-signals"], run=no_run,
-                        journal=no_run, history=history)
+                        journal=lambda: None, history=history)
     out = capfd.readouterr().out
     assert code == 0, out
     for i, name in enumerate(ROWS, 1):
@@ -109,3 +109,10 @@ def test_the_count_runs_every_row_on_the_train_window_and_writes_nothing(capfd):
     assert int(re.search(r"; ([\d,]+) in all", s1).group(1).replace(",", "")) > 0
     s4_exits = next(line for line in out.splitlines() if line.startswith("row  4 ") and "exit-rule exits" in line)
     assert int(re.search(r"(\d+) of (\d+)", s4_exits).group(2)) > 0
+    # GROSS-EDGE: the same 2024 run's closed trades, counted (their edge never printed), and both checks' verdicts
+    for i, name in enumerate(ROWS, 1):
+        assert f"row {i:>2} {name}: pre-check pooled edge before fees at least 25 bps a trade: " in out
+        assert f"row {i:>2} {name}: pre-check edge before fees positive on at least 2 of 3 assets: " in out
+    s1_edge = next(line for line in out.splitlines() if line.startswith("row  1 ") and "edge before fees: closed" in line)
+    assert int(re.search(r"; ([\d,]+) in all", s1_edge).group(1).replace(",", "")) > 0
+    assert not re.search(r"-?\d+(\.\d+)? ?bps(?! a trade)", out)  # no edge figure in the public log

@@ -299,13 +299,17 @@ def main(argv: list[str] | None = None, run=None, journal=None, history=None) ->
     if args.dry_run or args.count_signals:
         if args.count_signals:
             from sleeve_fund.research.signal_count import count_signals
+
+            if journal is None:
+                from sleeve_fund.__main__ import _journal as journal
+            spread_store = journal()  # read for the measured spreads only (None off the server: the assumption)
         for n, name, req in reqs:
             place = (f", registered try {rnd.place(n)[0]} of {len(rnd.rows)} in the round, family {rnd.family_of(n)}"
                      if rnd else "")
             print(f"row {n:>2} {name}: checked{_minute_check(req)}{place}")
             if args.count_signals:  # SIGNAL-COUNT: the train window only, never a test or holdout bar
                 try:
-                    counted = count_signals(req, history=history)  # no journal: the published fees
+                    counted = count_signals(req, history=history, store=spread_store)
                 except Exception as exc:  # noqa: BLE001 - one row's count never stops the rest; its class only
                     print(f"row {n:>2} {name}: signal count FAILED ({type(exc).__name__})")  # its class only (public log)
                     continue

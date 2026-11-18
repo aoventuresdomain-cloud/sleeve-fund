@@ -3,25 +3,38 @@ definition enters on each asset over the TRAIN window only, so the at-least-60-e
 one-asset pre-checks are read before any try is spent.
 
 It never reads a bar on or after the first test day (nor the holdout): each asset's stored bars are cut to the pinned
-data start to the day before the first fold's test start, and each asset runs alone on them, unguarded, at the venue's
-published research fees and no spread. Nothing is journaled, registered or written: no try, no sheet.
+data start to the day before the first fold's test start, and each asset runs alone on them, unguarded, at no fee,
+charged the half-spread its studies charge (the measured series, the venue's assumption before its first measurement)
+and its funding. An entry and its exit don't depend on the fee; its size against the uncut size does only through the
+fee term in the leverage cap, within about 0.1% of the size (CR F1 on #372). The journal is read for the spreads only:
+nothing is journaled, registered or written, no try, no sheet.
 
 The expected count over the test window is the train count pro-rated by days, counting only the days after the
 definition's own warm-up (the engine decides nothing before its blocks have settled, so a long warm-up would otherwise
 understate the rate). It is an estimate: a strategy whose entries depend on the regime can trade more or less often
-after the train year. Prints counts, sizes and dates only, never a return or a fill price (public log)."""
+after the train year.
+
+EDGE BEFORE FEES (HoE 18 Nov; the Advisor's rulings at 16:41 and 17:10): the same run's closed trades, each one's P&L
+at no fee, after the half-spread and funding (the sheets' "before fees" line), over its entry notional in bps, per
+asset and pooled, from the trades decided on or after the definition's first decided day (a trade still open at the
+train window's end is left out: the engine closes nothing at the end of a run). Two pre-checks read them: the pooled
+mean at least 25 bps a trade, and a positive mean on at least 2 assets. Prints counts, sizes, dates and the checks' verdicts
+only, never a return, an edge figure or a fill price (public log): the figures stay in the result (gross_bps,
+pooled_bps) for a private channel."""
 
 from __future__ import annotations
 
 import statistics
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import UTC, date, timedelta
 
 import pandas as pd
 
 MIN_EXPECTED = 60  # the Advisor's pre-check: at least 60 expected trades over the test window, all assets together
 MAX_ASSET_SHARE = 0.5  # and at most half of them from one asset
 FIRST_SHOWN = 3  # the first entries printed with their times (the Advisor's spot check of when a rule fires)
+MIN_GROSS_BPS = 25.0  # the Advisor's pre-check (17:10): at least 25 bps a trade before fees, pooled
+MIN_POSITIVE_ASSETS = 2  # and a positive gross edge on at least 2 of the assets
 
 
 @dataclass
@@ -32,6 +45,8 @@ class AssetCount:
     rule_exits: int = 0  # exits by the definition's exit rule
     rule_exits_next_day: int = 0  # of those, on a later UTC day than their entry (a day-anchored block reset between)
     vol_skipped: int = 0  # entries skipped for want of the daily closes to read the volatility on
+    gross_bps: list = field(default_factory=list)  # each closed trade's P&L before fees, bps of its entry notional
+    spread: str = ""  # "measured" or "assumed": the half-spread its run was charged
 
 
 @dataclass(frozen=True)
@@ -66,6 +81,25 @@ class SignalCount:
 
     def share(self, pair: str) -> float:
         return self.entries[pair] / self.total if self.total else 0.0
+
+    def gross_bps(self, pair: str) -> float | None:
+        """The asset's mean gross edge a closed trade, in bps of its entry notional; None with no closed trade."""
+        xs = self.assets[pair].gross_bps
+        return sum(xs) / len(xs) if xs else None
+
+    @property
+    def gross_trades(self) -> int:
+        return sum(len(a.gross_bps) for a in self.assets.values())
+
+    @property
+    def pooled_bps(self) -> float | None:
+        """Every asset's closed trades together: their mean gross edge, in bps of entry notional."""
+        xs = [x for a in self.assets.values() for x in a.gross_bps]
+        return sum(xs) / len(xs) if xs else None
+
+    @property
+    def positive_assets(self) -> list[str]:
+        return [p for p in self.assets if (self.gross_bps(p) or 0.0) > 0]
 
     @property
     def top(self) -> tuple[str, float]:
@@ -105,6 +139,20 @@ class SignalCount:
             out.append(f"sizing to {self.vol_target['annual']:.0%} a year over {self.vol_target['lookback_days']} days "
                        f"(size against the uncut size; capped = the target didn't cut it): {sizes}"
                        + (f"; {skipped:,} entries skipped for want of the daily closes" if skipped else ""))
+        trades = ", ".join(f"{name(p)} {len(a.gross_bps):,}" for p, a in self.assets.items())
+        spreads = ", ".join(f"{name(p)} {a.spread or 'none'}" for p, a in self.assets.items())
+        pooled = self.pooled_bps
+        positive = self.positive_assets
+        out += [(f"edge before fees: closed trades decided from the decided day, those open at the train window's end "
+                 f"left out; each one's P&L at 0 fees, after the half-spread the studies charge ({spreads}) and "
+                 f"funding, over its entry notional (figures not printed: public log): {trades}; "
+                 f"{self.gross_trades:,} in all"),
+                (f"pre-check pooled edge before fees at least {MIN_GROSS_BPS:g} bps a trade: "
+                 f"{'PASS' if pooled is not None and pooled >= MIN_GROSS_BPS else 'FAIL'}"
+                 + ("" if pooled is not None else " (no closed trade)")),
+                (f"pre-check edge before fees positive on at least {MIN_POSITIVE_ASSETS} of {len(self.assets)} assets: "
+                 f"{'PASS' if len(positive) >= MIN_POSITIVE_ASSETS else 'FAIL'} "
+                 f"(positive: {', '.join(name(p) for p in positive) or 'none'})")]
         return out
 
 
@@ -168,11 +216,52 @@ def tally(decisions: dict, vol_on: bool, decided_first: date | None = None) -> A
     return out
 
 
-def count_signals(req, history=None, store=None, backtest=None) -> SignalCount:
-    """Each asset of the request run alone over the train window; its entries counted."""
-    from sleeve_fund.fees import resolve as resolve_fees
+def gross_bps(fills, decided_first: date | None, decisions: dict | None = None,
+              funding: list | None = None) -> list[float]:
+    """Each closed trade's P&L over its entry notional in bps, for the trades decided on or after decided_first. The
+    run is at no fee and its fills carry the half-spread; its funding payments are booked to the trades here (the
+    fills carry none), so this is the edge before fees. A trade's day is its entry decision's close, as tally reads
+    an entry's (CR F2 on #372), else its first fill's day."""
+    from sleeve_fund.research.metrics import fills_to_rows, trades
+
+    if fills is None or len(fills) == 0 or decided_first is None:
+        return []
+    out = []
+    for t in trades(fills_to_rows(fills), shorts=True, funding=funding or None):
+        bar = (((decisions or {}).get(str(t.get("entry_order"))) or {}).get("signal") or {}).get("bar") or {}
+        if bar.get("close_ts") is not None:
+            day = _utc_day(pd.Timestamp(bar["close_ts"]))
+        else:
+            opened = pd.Timestamp(t["opened"])
+            day = (opened.tz_localize("UTC") if opened.tzinfo is None else opened).tz_convert("UTC").date()
+        if t["closed"] is not None and t["cost"] and day >= decided_first:
+            out.append(t["pnl"] / t["cost"] * 1e4)
+    return out
+
+
+def spread_words(spread, first: date, last: date) -> str:
+    """Which half-spread the train window was charged: "measured", "assumed" (the venue's assumption, every
+    measurement after the window or none) or "assumed, then measured" (the first measurement inside it)."""
+    from datetime import datetime
+
+    def ns(d: date) -> int:
+        return int(pd.Timestamp(datetime(d.year, d.month, d.day, tzinfo=UTC)).value)
+
+    froms = [at for at, _ in spread.points]
+    if not froms or froms[0] >= ns(last + timedelta(days=1)):
+        return "assumed"
+    return "measured" if froms[0] <= ns(first) else "assumed, then measured"
+
+
+def count_signals(req, history=None, backtest=None, store=None) -> SignalCount:
+    """Each asset of the request run alone over the train window, at no fee and the half-spread its studies charge;
+    its entries and its trades' edge before fees counted. store: the journal, read for the measured spreads only
+    (None: the venue's assumption)."""
+    from decimal import Decimal
+
+    from sleeve_fund import spreads
     from sleeve_fund.history import HistoryStore
-    from sleeve_fund.instruments import history_price_decimals
+    from sleeve_fund.instruments import FeeSchedule, history_price_decimals
     from sleeve_fund.research.pinned import day_of
     from sleeve_fund.research.run import spec_of, study_market
     from sleeve_fund.strategies import REGISTRY
@@ -188,7 +277,7 @@ def count_signals(req, history=None, store=None, backtest=None) -> SignalCount:
     vol = params.get("vol_target_size")
     settle = REGISTRY[req.strategy][0].warmup_needed(params, req.minutes)  # as the engine holds its decisions back
     first, last = train_window(req.pinned)
-    runs, decided = {}, None
+    runs, decided, charged = {}, None, {}
     for pair in req.pairs or [req.pair]:
         try:
             prices = train_bars(history.read(profile.name, pair, req.minutes), req.pinned)
@@ -200,13 +289,18 @@ def count_signals(req, history=None, store=None, backtest=None) -> SignalCount:
             at = day_of(prices.index[settle], pd.Timedelta(minutes=req.minutes))
             decided = at if decided is None else max(decided, at)
         base, quote = pair.split("/")
-        fees = resolve_fees(profile.name, store, instrument=pair)
-        instrument = profile.instrument(base, quote, fees=fees.fees,
+        instrument = profile.instrument(base, quote, fees=FeeSchedule(maker=Decimal(0), taker=Decimal(0)),
                                         price_precision=history_price_decimals(prices["close"]))
-        runs[pair] = backtest(req.strategy, prices, instrument, params=params, bar_minutes=req.minutes, half_spread=0)
+        spread = spreads.series(profile.name, pair, store)  # as run_store_study charges it
+        charged[pair] = spread_words(spread, first, last)
+        runs[pair] = backtest(req.strategy, prices, instrument, params=params, bar_minutes=req.minutes,
+                              half_spread=spread)
     assets = {}
     for pair, res in runs.items():  # counted from the one first day every asset could decide on
         assets[pair] = tally(res.decisions, vol is not None, decided) if decided else AssetCount()
         assets[pair].vol_skipped = int((getattr(res, "rule_counts", None) or {}).get("vol_skipped", 0))
+        assets[pair].gross_bps = gross_bps(getattr(res, "fills", None), decided, res.decisions,
+                                           getattr(res, "funding", None))
+        assets[pair].spread = charged[pair]
     return SignalCount(train_first=first, train_last=last, decided_first=decided, test_days=days_tested(req.pinned),
                        assets=assets, vol_target=vol)
