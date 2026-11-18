@@ -81,13 +81,11 @@ PREREGISTERED = {
                                      "params": {"vol_target_size": BATCH_VOL}},
     "QRS4_VWAP_RANGE_REVERSION_4H_FB125": {"definition": "qrs4_vwap_range_reversion_4h_fb125",
                                            "params": {"vol_target_size": BATCH_VOL}},
-    # H improve row (Advisor 18 Nov 16:41): H1's definition unchanged, sized to the batch's volatility target on the
-    # study list. Its basket key carries the params, so it is a new variant of H1's idea, never a re-run of H1's try.
-    "QRH1_TREND_PULLBACK_TS6_VOL": {"definition": "qrh1_trend_pullback_ts6", "params": {"vol_target_size": BATCH_VOL}},
     # Multi-day batch M1-M3 (Researcher 18 Nov, research/quant-researcher/next-round/idea-batch-18nov-b.md): the 2024
-    # signal count and gross-edge pre-checks first, as the S batch, each sized to the batch's volatility target. M2 waits
-    # for a daily ATR(50) that settles inside the train year.
+    # signal count and gross-edge pre-checks first, as the S batch, each sized to the batch's volatility target.
     "QRM1_TSMOM_20D": {"definition": "qrm1_tsmom_20d", "params": {"vol_target_size": BATCH_VOL}},
+    "QRM2_CALM_REGIME_BREAKOUT": {"definition": "qrm2_calm_regime_breakout",
+                                  "params": {"vol_target_size": BATCH_VOL}},
     "QRM3_CROWD_SQUEEZE_BREAKOUT": {"definition": "qrm3_crowd_squeeze_breakout",
                                     "params": {"vol_target_size": BATCH_VOL}},
 }

@@ -4,7 +4,7 @@ each asset alone, writes nothing and spends no try. Figures in fixtures are synt
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import UTC, date
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -42,6 +42,20 @@ def _bars(minutes=240, first="2024-01-01", last="2026-10-31", seed=0):
     o = np.r_[c[0], c[:-1]]
     hi, lo = np.maximum(o, c) * 1.004, np.minimum(o, c) * 0.996
     return pd.DataFrame({"open": o, "high": hi, "low": lo, "close": c, "volume": 1e9}, index=idx)
+
+
+class SpreadsOnly:
+    """The journal as the count may use it: its spread measurements read, anything else refused."""
+
+    def __init__(self, rows=None):
+        self.rows, self.reads = rows or {}, []
+
+    def spread_series(self, venue, instrument):
+        self.reads.append((venue, instrument))
+        return self.rows.get(instrument, [])
+
+    def __getattr__(self, name):
+        raise AssertionError(f"the signal count only reads spreads from the journal, not {name}")
 
 
 class _History:
@@ -90,7 +104,8 @@ def test_each_asset_runs_alone_on_its_train_bars_and_its_entries_are_counted():
 
     def backtest(strategy, prices, instrument, params, bar_minutes, half_spread):
         seen[instrument.id.symbol.value] = prices
-        assert (float(instrument.maker_fee), float(instrument.taker_fee), half_spread) == (0, 0, 0)  # no fee or spread
+        assert (float(instrument.maker_fee), float(instrument.taker_fee)) == (0, 0)  # no fee
+        assert half_spread.points == () and half_spread.assumed.half_spread == 0.0001  # no store: the assumption
         n = {"BTC": 30, "ETH": 12, "SOL": 5}[instrument.id.symbol.value.split("USDT")[0]]
         ds = {f"e{i}": _entry(f"2024-09-{1 + i % 28:02d}T12:00:00+00:00") for i in range(n)}
         return SimpleNamespace(decisions=ds | {"x": {"intent": "liquidation"}}, rule_counts={})
@@ -115,11 +130,12 @@ def test_each_asset_runs_alone_on_its_train_bars_and_its_entries_are_counted():
                         "2024-09-01 12:00 UTC ETH long")
     assert lines[5] == "exit-rule exits on a later UTC day than their entry: 0 of 0"
     # no volatility target on H0: no sizing line; the fake runs filled nothing, so no closed trade to read
-    assert lines[6] == ("gross edge: closed trades opened from the decided day, those open at the train window's end "
-                        "left out; each one's P&L at 0 fees, no spread and before funding, over its entry notional "
-                        "(figures not printed: public log): BTC 0, ETH 0, SOL 0; 0 in all")
-    assert lines[7] == "pre-check pooled gross edge at least 15 bps a trade: FAIL (no closed trade)"
-    assert lines[8] == "pre-check gross edge positive on at least 2 of 3 assets: FAIL (positive: none)"
+    assert lines[6] == ("edge before fees: closed trades decided from the decided day, those open at the train "
+                        "window's end left out; each one's P&L at 0 fees, after the half-spread the studies charge "
+                        "(BTC assumed, ETH assumed, SOL assumed) and funding, over its entry notional (figures not "
+                        "printed: public log): BTC 0, ETH 0, SOL 0; 0 in all")
+    assert lines[7] == "pre-check pooled edge before fees at least 25 bps a trade: FAIL (no closed trade)"
+    assert lines[8] == "pre-check edge before fees positive on at least 2 of 3 assets: FAIL (positive: none)"
     assert len(lines) == 9
 
 
@@ -197,14 +213,16 @@ def test_the_dry_run_prints_the_counts_and_runs_nothing(capfd):
     def no_run(*a, **k):
         raise AssertionError("a signal count runs no study")
 
+    journal = SpreadsOnly()
     code = rescore.main([str(LIST), "--venue", "binance", "--pair", PAIRS, "--count-signals"], run=no_run,
-                        journal=no_run, history=history)
+                        journal=lambda: journal, history=history)
     out = capfd.readouterr().out
     assert code == 0
     assert "row  1 qrh0_trend_pullback: train window 2024-01-01 to 2024-12-31 (366 days), decided from 2024-07-20 " in out
     assert "row  1 qrh0_trend_pullback: pre-check at least 60 expected trades: " in out
     assert "dry run: 1 checked, 0 run, train-window signals counted (no try)" in out
     assert {m for _, m in history.reads} == {240}  # the decision candles only: no minute bars
+    assert journal.reads == [("BINANCE", "BTC/USDT"), ("BINANCE", "ETH/USDT"), ("BINANCE", "SOL/USDT")]  # the journal read for the spreads only, nothing written
 
 
 def test_without_the_flag_the_dry_run_is_as_before(capfd):
@@ -231,16 +249,17 @@ def _gross(per_asset: dict) -> SignalCount:
 
 
 @pytest.mark.parametrize("per_asset, pooled, spread", [
-    ({"BTC/USDT": [15.0, 15.0], "ETH/USDT": [15.0], "SOL/USDT": [15.0]}, "PASS", "PASS"),  # exactly 15: enough
-    ({"BTC/USDT": [14.9], "ETH/USDT": [15.0], "SOL/USDT": [15.0]}, "FAIL", "PASS"),  # 14.97 pooled
-    ({"BTC/USDT": [90.0], "ETH/USDT": [-10.0], "SOL/USDT": [-10.0]}, "PASS", "FAIL"),  # one asset carries it
-    ({"BTC/USDT": [40.0], "ETH/USDT": [0.0], "SOL/USDT": [10.0]}, "PASS", "PASS"),  # zero is not positive
-    ({"BTC/USDT": [40.0], "ETH/USDT": [], "SOL/USDT": [-1.0]}, "PASS", "FAIL"),  # no closed trade is not positive
+    ({"BTC/USDT": [25.0, 25.0], "ETH/USDT": [25.0], "SOL/USDT": [25.0]}, "PASS", "PASS"),  # exactly 25: enough
+    ({"BTC/USDT": [24.9], "ETH/USDT": [25.0], "SOL/USDT": [25.0]}, "FAIL", "PASS"),  # 24.97 pooled
+    ({"BTC/USDT": [120.0], "ETH/USDT": [-10.0], "SOL/USDT": [-10.0]}, "PASS", "FAIL"),  # one asset carries it
+    ({"BTC/USDT": [60.0], "ETH/USDT": [0.0], "SOL/USDT": [20.0]}, "PASS", "PASS"),  # zero is not positive
+    ({"BTC/USDT": [60.0], "ETH/USDT": [], "SOL/USDT": [-1.0]}, "PASS", "FAIL"),  # no closed trade is not positive
 ])
 def test_the_gross_edge_pre_checks_read_the_pooled_mean_and_the_positive_assets(per_asset, pooled, spread):
     lines = _gross(per_asset).lines()
-    assert f"pre-check pooled gross edge at least 15 bps a trade: {pooled}" in lines
-    assert any(line.startswith(f"pre-check gross edge positive on at least 2 of 3 assets: {spread} ") for line in lines)
+    assert f"pre-check pooled edge before fees at least 25 bps a trade: {pooled}" in lines
+    assert any(line.startswith(f"pre-check edge before fees positive on at least 2 of 3 assets: {spread} ")
+               for line in lines)
 
 
 def test_no_edge_figure_is_printed():
@@ -271,3 +290,35 @@ def test_gross_edge_is_each_closed_trades_pnl_over_its_entry_notional_from_the_d
                     ("BUY", 1, 100.0, "2024-12-31 20:00")])  # still open at the window's end: out
     assert gross_bps(fills, date(2024, 7, 20)) == pytest.approx([50.0, -50.0])
     assert gross_bps(fills, None) == [] and gross_bps(None, date(2024, 1, 1)) == []
+
+
+def test_the_trade_day_is_its_entry_decisions_and_funding_is_booked_to_it():
+    """CR F2 on #372: a trade decided at the 00:00 close ending the day before the decided day fills on it, and is left
+    out, as tally leaves its entry out; a funding payment while it is held counts against it."""
+    from sleeve_fund.research.signal_count import gross_bps
+
+    fills = _fills([("BUY", 1, 100.0, "2024-07-20 00:01"), ("SELL", 1, 101.0, "2024-07-21 04:00"),
+                    ("BUY", 1, 100.0, "2024-07-22 04:01"), ("SELL", 1, 101.0, "2024-07-23 04:00")])
+    decisions = {"O-0": {"intent": "entry", "signal": {"bar": {"close_ts": "2024-07-20T00:00:00+00:00"}}},
+                 "O-2": {"intent": "entry", "signal": {"bar": {"close_ts": "2024-07-22T04:00:00+00:00"}}}}
+    funding = [{"ts": pd.Timestamp("2024-07-22 16:00", tz="UTC").to_pydatetime(), "amount": -0.2}]
+    assert gross_bps(fills, date(2024, 7, 20), decisions) == pytest.approx([100.0])
+    assert gross_bps(fills, date(2024, 7, 20), decisions, funding) == pytest.approx([80.0])
+    assert gross_bps(fills, date(2024, 7, 20)) == pytest.approx([100.0, 100.0])  # by fill day without decisions
+
+
+def test_the_spread_charged_is_named_by_whether_a_measurement_covered_the_window():
+    from datetime import datetime
+
+    from sleeve_fund import spreads
+    from sleeve_fund.research.signal_count import spread_words
+
+    def series(*days):
+        rows = [{"measured_at": datetime(*d, tzinfo=UTC), "half_spread": 0.0001, "samples": 10} for d in days]
+        return spreads.series("binance", "BTC/USDT", SpreadsOnly({"BTC/USDT": rows}))
+
+    first, last = date(2024, 1, 1), date(2024, 12, 31)
+    assert spread_words(series(), first, last) == "assumed"
+    assert spread_words(series((2025, 3, 1)), first, last) == "assumed"
+    assert spread_words(series((2023, 12, 1)), first, last) == "measured"
+    assert spread_words(series((2024, 6, 1)), first, last) == "assumed, then measured"

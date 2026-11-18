@@ -1,20 +1,21 @@
-# Multi-day batch M1 and M3: the 2024 signal count and gross edge, not a try (18 Nov 2026, QD)
+# Multi-day batch M1 to M3: the 2024 signal count and gross edge, not a try (18 Nov 2026, QD)
 
 Purpose: the Advisor's pre-checks before the Researcher's multi-day batch (research/quant-researcher/next-round/
 idea-batch-18nov-b.md) is listed for tries: each definition's entries per asset over the 2024 train window only,
 expected test trades pro-rated (at least 60), no asset over half the signals, the first entries' times, each asset's
-median size and share capped under the volatility target, and the gross edge of 2024's closed trades before fees and
-funding (at least 15 bps a trade pooled, positive on at least 2 of 3 assets; verdicts only). M2 joins once its daily
-ATR(50) settles inside the train year: a Wilder ATR(50) needs 1,000 daily candles.
+median size and share capped under the volatility target, and the edge of 2024's closed trades before fees (after the
+half-spread and funding; at least 25 bps a trade pooled, positive on at least 2 of 3 assets; verdicts only). M2's regime pair is the
+simple-average daily ATR(5) and ATR(50) (the Researcher's pre-run fix), so it decides inside the train year.
 
 **Count only.** Dispatch with `dry_run` and `count_signals` on, `--pair BTC/USDT,ETH/USDT,SOL/USDT`. The count reads no
-bar on or after 2025-01-01, runs each asset alone at no fee and no spread, writes no sheet and records no try. A size
+bar on or after 2025-01-01, runs each asset alone at no fee (the studies' half-spread and funding still charged), writes no sheet and records no try. A size
 scale is set so that a run dispatched without the dry run by mistake still records no try.
 
 ## Common settings
 
 - **Instrument:** BTC, ETH and SOL perpetuals (`market = "perp"`, long and short), on the stored history. No other asset.
-- **Fees per side:** none in the count (0%, no spread): the gross edge is before fees.
+- **Fees per side:** none in the count (0%). Half the measured spread is charged as in the studies (the venue's
+  assumption where none is stored; the count prints which), and funding is booked: the edge is before fees only.
 - **Sizing:** `vol_target_size = { annual = 0.40, lookback_days = 30 }` on every row (variants.py), lag-1 daily
   volatility, capped at 1x.
 - **Holdout:** sealed, 2026-05-01 to 2026-10-30. `--use-holdout` is never passed.
@@ -41,4 +42,5 @@ Every row reads these days only, whatever day it runs (B-37). UTC calendar days;
 | # | Definition | Idea | Candle |
 | --- | --- | --- | --- |
 | 1 | qrm1_tsmom_20d | M1, time-series momentum over 20 days | 4h |
-| 2 | qrm3_crowd_squeeze_breakout | M3, crowded-side squeeze (funding block: studies only) | 4h |
+| 2 | qrm2_calm_regime_breakout | M2, calm-regime breakout (simple-average daily ATRs) | 4h |
+| 3 | qrm3_crowd_squeeze_breakout | M3, crowded-side squeeze (funding block: studies only) | 4h |

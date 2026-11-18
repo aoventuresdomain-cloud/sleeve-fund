@@ -1,0 +1,79 @@
+version = 1
+name = "qrm2-calm-regime-breakout"
+title = "Calm-regime Breakout (daily signal, 4h candles) · Long and Short"
+reason = """Volatility clusters and mean-reverts: when the last week's daily range is below its 50-day norm, the market is
+coiled, and a break of the prior 10-day range out of that calm tends to start a multi-day move as volatility expands.
+At the 00:00 UTC close, with the simple-average daily ATR(5) below the simple-average daily ATR(50), long on a close above the prior 10-day high, short on a
+close below the prior 10-day low. Out at a 00:00 close back through the prior 10-day midpoint, after 15 days (90
+candles), or on a 2 daily ATR(14) stop. Volatility-regime family. Fixed before any run. Sizing on the study list:
+vol_target_size = { annual = 0.40, lookback_days = 30 } (lag-1, capped at 1x)."""
+
+[blocks.atr5]
+kind = "atr_sma"
+period = 5
+timeframe = "1d"
+
+# Simple-average ATR for the regime pair: Wilder ATR(50) needs ~1,000 daily candles to settle (QD, 18 Nov). Pre-run change, no try spent.
+[blocks.atr50]
+kind = "atr_sma"
+period = 50
+timeframe = "1d"
+
+[blocks.atr]
+kind = "atr"
+period = 14
+timeframe = "1d"
+
+[blocks.dc]
+kind = "donchian"
+period = 10
+timeframe = "1d"
+
+# The 1d Donchian includes the day that just closed: lag it one day for the PRIOR 10 days (HoE 17 Nov).
+[blocks.dcu]
+kind = "lag"
+period = 1
+timeframe = "1d"
+input = "dc.upper"
+
+[blocks.dcl]
+kind = "lag"
+period = 1
+timeframe = "1d"
+input = "dc.lower"
+
+[blocks.dcm]
+kind = "lag"
+period = 1
+timeframe = "1d"
+input = "dc.mid"
+
+[long]
+entry = { all = [
+    { left = { time = "hour" }, op = "<=", right = 0 },
+    { left = "atr5", op = "<", right = "atr50" },
+    { left = "close", op = ">", right = "dcu" },
+] }
+exit = { all = [
+    { left = { time = "hour" }, op = "<=", right = 0 },
+    { left = "close", op = "<", right = "dcm" },
+] }
+
+[short]
+entry = { all = [
+    { left = { time = "hour" }, op = "<=", right = 0 },
+    { left = "atr5", op = "<", right = "atr50" },
+    { left = "close", op = "<", right = "dcl" },
+] }
+exit = { all = [
+    { left = { time = "hour" }, op = "<=", right = 0 },
+    { left = "close", op = ">", right = "dcm" },
+] }
+
+[exits.long]
+stop = { level = { sub = ["close", { mul = [2, "atr"] }] } }
+time_stop = { bars = 90 }
+
+[exits.short]
+stop = { level = { add = ["close", { mul = [2, "atr"] }] } }
+time_stop = { bars = 90 }
