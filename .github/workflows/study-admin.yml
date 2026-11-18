@@ -5,19 +5,32 @@ name: study-admin
 #     containers running, with their live use. Changes nothing.
 #   stop: stops the one container named exactly study-<run_id>, with 60 seconds' grace. It never removes, prunes or
 #     touches any other container, and it refuses a run_id that is not digits.
+#   names (PM yes 18 Nov 16:54 UTC, one listing for last night's rows 5-8): read-only. Prints the file names, and only
+#     the names, of the tear sheets whose stem starts with prefix and was written on day (YYYYMMDD, or two days
+#     as YYYYMMDD,YYYYMMDD for a run over midnight), at most 40. A
+#     one-off dashboard container lists TEARSHEET_DIR; nothing is opened, written or read beyond the directory listing.
+#     Each use needs the PM's word, as for the other server reads.
 # stop needs the PM's word for each use: one dispatch per approval, for the run id the PM approved.
 # Nothing here reads a result, a secret or a figure from the research data; the log is public.
 on:
   workflow_dispatch:
     inputs:
       action:
-        description: check (read-only) or stop (one study container; needs the PM's word for each use)
+        description: check (read-only), stop (one study container) or names (tear-sheet names); stop and names need the PM's word for each use
         type: choice
-        options: [check, stop]
+        options: [check, stop, names]
         required: true
         default: check
       run_id:
         description: For stop only, the study run's id (digits); the container stopped is study-<run_id>
+        required: false
+        default: ""
+      prefix:
+        description: For names only, the start of the definition name (lower-case letters, digits, _), e.g. qrh
+        required: false
+        default: ""
+      day:
+        description: For names only, the day the sheets were written, YYYYMMDD or YYYYMMDD,YYYYMMDD (UTC)
         required: false
         default: ""
 # One admin chore at a time.
@@ -35,11 +48,16 @@ jobs:
         env:
           ACTION: ${{ inputs.action }}
           RUN_ID: ${{ inputs.run_id }}
+          PREFIX: ${{ inputs.prefix }}
+          DAY: ${{ inputs.day }}
         run: |
           case "$ACTION" in
             check) ;;
             stop) [[ "$RUN_ID" =~ ^[0-9]{6,20}$ ]] || { echo "run_id must be the study run's id, 6 to 20 digits"; exit 1; } ;;
-            *) echo "action must be check or stop"; exit 1 ;;
+            names)
+              [[ "$PREFIX" =~ ^[a-z][a-z0-9_]{1,59}$ ]] || { echo "prefix must be 2 to 60 lower-case letters, digits or _"; exit 1; }
+              [[ "$DAY" =~ ^20[0-9]{6}(,20[0-9]{6})?$ ]] || { echo "day must be YYYYMMDD or YYYYMMDD,YYYYMMDD"; exit 1; } ;;
+            *) echo "action must be check, stop or names"; exit 1 ;;
           esac
       - name: Configure SSH
         env:
@@ -70,3 +88,18 @@ jobs:
             echo before:; sudo docker ps --filter name=study- --format '{{.Names}} {{.Status}}'
             sudo docker stop -t 60 study-$RUN_ID
             echo after:; sudo docker ps --filter name=study- --format '{{.Names}} {{.Status}}'"
+      - name: List tear-sheet names
+        if: inputs.action == 'names'
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          PREFIX: ${{ inputs.prefix }}
+          DAY: ${{ inputs.day }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          # Checked again where it is used: both go into the remote line.
+          [[ "$PREFIX" =~ ^[a-z][a-z0-9_]{1,59}$ && "$DAY" =~ ^20[0-9]{6}(,20[0-9]{6})?$ && "$RUN_ID" =~ ^[0-9]{1,20}$ ]] || exit 1
+          DAYS="${DAY/,/|}"
+          ssh -i ~/.ssh/id_deploy "$USER_AT@$HOST" \
+            "cd /opt/sleeve-fund && sudo docker compose run --rm -T --no-deps --name study-admin-names-$RUN_ID dashboard sh -c '
+              cd \"\$TEARSHEET_DIR\" || exit 2
+              ls -1 | grep -E \"^${PREFIX}[a-z0-9_.-]*_(${DAYS})-[0-9]{6}[.]md\$\" | sort | head -n 40 || true'"

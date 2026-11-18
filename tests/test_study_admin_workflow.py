@@ -92,7 +92,7 @@ def test_it_runs_by_hand_from_main_with_deploys_on_one_at_a_time_and_checks_noth
     wf = _wf()
     assert set(wf[True]) == {"workflow_dispatch"}  # yaml reads the key `on` as True
     inputs = wf[True]["workflow_dispatch"]["inputs"]
-    assert inputs["action"]["options"] == ["check", "stop"] and inputs["action"]["default"] == "check"
+    assert inputs["action"]["options"] == ["check", "stop", "names"] and inputs["action"]["default"] == "check"
     assert wf["concurrency"] == {"group": "study-admin"}
     job = wf["jobs"]["admin"]
     assert job["if"] == "${{ vars.DEPLOY_ENABLED == 'true' && github.ref == 'refs/heads/main' }}"
@@ -100,4 +100,76 @@ def test_it_runs_by_hand_from_main_with_deploys_on_one_at_a_time_and_checks_noth
     assert not any("uses" in s for s in job["steps"])  # no checkout, no other action
     assert _step("Check the server")["if"] == "inputs.action == 'check'"
     assert _step("Stop the study container")["if"] == "inputs.action == 'stop'"
+    assert _step("List tear-sheet names")["if"] == "inputs.action == 'names'"
     assert "needs the PM's word for each use" in WF.read_text()
+
+
+# names (PM yes 18 Nov 16:54 UTC): the file names of tear sheets by definition prefix and day, nothing else.
+SHEETS = ["qrh5_trend_pullback_stop35_basket-240m_20261117-231502.md",
+          "qrh7_trend_pullback_short_only_basket-240m_20261118-000917.md",
+          "qrh7_trend_pullback_short_only_basket-240m_20261118-000917_trades.csv",
+          "qrh1_trend_pullback_ts6_basket-240m_20261116-182615.md",
+          "qrn1_daily_breakout_basket-240m_20261118-101638.md",
+          "notes.txt"]
+
+
+def _names(tmp_path, prefix, day):
+    sheets = tmp_path / "sheets"
+    sheets.mkdir()
+    for n in SHEETS:
+        (sheets / n).write_text("contents never printed")
+    bin_ = tmp_path / "bin"
+    bin_.mkdir()
+    log = tmp_path / "docker.txt"
+    (bin_ / "sudo").write_text('#!/bin/bash\nexec "$@"\n')
+    # docker compose run ... dashboard sh -c SCRIPT: log the arguments, then run SCRIPT as the container would.
+    (bin_ / "docker").write_text(f'#!/bin/bash\nprintf "%s\\0" "$@" >> {log}\nprintf "\\036" >> {log}\n'
+                                 f'TEARSHEET_DIR={sheets} exec sh -c "${{@: -1}}"\n')
+    (bin_ / "ssh").write_text(f'#!/bin/bash\nfor a; do last="$a"; done\nlast="${{last//\\/opt\\/sleeve-fund/{tmp_path}}}"\nPATH={bin_}:/usr/bin:/bin bash -c "$last"\n')
+    for f in bin_.iterdir():
+        f.chmod(0o755)
+    res = subprocess.run(["bash", "-e", "-c", _step("List tear-sheet names")["run"]], capture_output=True, text=True,
+                         check=False, env={"PATH": f"{bin_}:/usr/bin:/bin", "USER_AT": "u", "HOST": "h",
+                                           "HOME": str(tmp_path), "PREFIX": prefix, "DAY": day, "RUN_ID": "4242"})
+    # one call per record: NUL-ended arguments then a record separator (the script argument has newlines of its own)
+    calls = [rec.split("\0")[:-1] for rec in log.read_text().split("\036") if rec] if log.exists() else []
+    return res, calls
+
+
+def test_names_prints_only_matching_sheet_names_over_two_days(tmp_path):
+    res, calls = _names(tmp_path, "qrh", "20261117,20261118")
+    assert res.returncode == 0, res.stderr
+    assert res.stdout.split() == [SHEETS[0], SHEETS[1]]
+    assert "contents never printed" not in res.stdout
+    assert len(calls) == 1 and calls[0][:7] == ["compose", "run", "--rm", "-T", "--no-deps", "--name",
+                                                  "study-admin-names-4242"]
+    assert calls[0][7:9] == ["dashboard", "sh"]
+
+
+def test_names_one_day(tmp_path):
+    res, _ = _names(tmp_path, "qrh", "20261117")
+    assert res.returncode == 0 and res.stdout.split() == [SHEETS[0]]
+
+
+def test_names_with_nothing_found_still_succeeds(tmp_path):
+    res, _ = _names(tmp_path, "qrz", "20261117")
+    assert res.returncode == 0 and res.stdout.strip() == ""
+
+
+@pytest.mark.parametrize("prefix,day", [("", "20261117"), ("q", "20261117"), ("QRH", "20261117"), ("qrh;ls", "20261117"),
+                                        ("qrh*", "20261117"), ("qrh", ""), ("qrh", "2026111"), ("qrh", "20261117;x"),
+                                        ("qrh", "20261117,20261118,20261119"), ("qrh", "20261117|.*"),
+                                        ("qr h", "20261117"), ("qrh", "20261117\n")])
+def test_names_refuses_bad_inputs_before_the_server(tmp_path, prefix, day):
+    checked = subprocess.run(["bash", "-e", "-c", _step("Check the inputs")["run"]], capture_output=True, text=True,
+                             check=False, env={"PATH": "/usr/bin:/bin", "ACTION": "names", "RUN_ID": "",
+                                               "PREFIX": prefix, "DAY": day})
+    assert checked.returncode == 1
+    res, calls = _names(tmp_path, prefix, day)  # and again where it is used
+    assert res.returncode != 0 and calls == []
+
+
+def test_names_only_lists():
+    text = _step("List tear-sheet names")["run"]
+    assert "ls -1" in text
+    assert not any(w in text for w in (" cat ", " rm", "prune", "kill", "stop", "tar ", "cp ", "mv ", "> "))
