@@ -13,6 +13,8 @@ from sleeve_fund.store import Store
 T0 = datetime(2026, 10, 19, 6, 0, tzinfo=UTC)  # 07:00 UK (BST)
 HOOK = "https://hooks.example.com/services/T0/B0/token"
 PING = "https://hc-ping.example.com/uuid-token"
+# Noon UK, clear of the 08:00 UK digest, for forwarder tests that would otherwise step on the real clock.
+NOON = datetime(2026, 1, 14, 12, 0, tzinfo=UTC)
 
 
 def _kinds(store, kind):
@@ -40,7 +42,8 @@ def test_1b_with_both_set_it_passes_and_names_the_hosts_never_the_token():
 def test_1c_a_stale_heartbeat_restart_reaches_the_pm_chat_as_an_error():
     """Pinned as main has it: the supervisor journals heartbeat_stale at error, and the forwarder sends it."""
     store, sent = Store.in_memory(), []
-    fwd = Forwarder(store, environ={"ALERT_WEBHOOK_URL": HOOK}, send=lambda url, text: sent.append(text))
+    fwd = Forwarder(store, environ={"ALERT_WEBHOOK_URL": HOOK}, send=lambda url, text: sent.append(text),
+                    now=lambda: NOON)
     store.event("s1", "error", "heartbeat_stale", "no heartbeat for 3 minutes; restarting")
     fwd.step()
     assert len(sent) == 1 and "[error] s1: no heartbeat for 3 minutes; restarting" in sent[0]
