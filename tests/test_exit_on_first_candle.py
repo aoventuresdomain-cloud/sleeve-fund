@@ -56,9 +56,44 @@ def test_an_exit_on_the_first_candle_after_the_entry_fills_on_it(instrument, mon
     monkeypatch.setattr(LongFlatStrategy, "modify_order", watched)
     params = {**to_params(_definition(side, how)), "market": "perp", "allow_short": side == "short"}
     res = run_backtest("rules", _bars(volume), instrument, params=params, bar_minutes=240, half_spread=0)
+    assert not res.handler_errors
     trips = _trips(res)
     assert len(trips) >= 20
     for opened, closed in trips:
         assert opened.hour == 0 and closed - opened == pd.Timedelta(hours=4), (opened, closed)
+    # No orphan stop (Advisor): the stop and its resize are cancelled with the close, so nothing but entries and their
+    # exits ever fills, every exit closes the whole position, and the book is flat until the next entry
+    assert {res.decisions[o]["intent"] for o in res.fills.index} == {"entry", "exit"}
+    signed = res.fills["filled_qty"].astype(float).where(res.fills["side"] == ("BUY" if side == "long" else "SELL"),
+                                                         -res.fills["filled_qty"].astype(float))
+    held = signed.groupby(res.fills["ts_last"]).sum().sort_index().cumsum()
+    assert all(abs(held[closed]) < 1e-9 for _, closed in trips)  # (a last entry may still be open at the data's end)
+    flat = res.exposure[[t for t in res.exposure.index if t.hour not in (0, 4)]]
+    assert (flat.abs() < 1e-12).all()
     if volume < 1e6:  # the case that waited: the stop resized at the bar the exit is decided on
         assert any(t.hour == 4 for t in resized)
+    else:  # full fills: no resize, so the change can't touch them (each trip as before, on the same candles)
+        assert resized == []
+
+
+@pytest.mark.parametrize("backtest, resting_stops, status, busy", [
+    (True, False, "PENDING_UPDATE", False),  # the backtest's stop being resized: not busy
+    (False, True, "PENDING_UPDATE", False),  # paper with resting stops on (A1): the same
+    (False, False, "PENDING_UPDATE", True),  # paper's default has no resting stop: as before
+    (True, False, "PENDING_CANCEL", True),  # a cancel in flight: a close is under way, still busy
+    (True, False, "SUBMITTED", True),  # a stop not yet at the venue: still busy
+])
+def test_only_a_resting_stop_loss_being_resized_is_not_waited_on(backtest, resting_stops, status, busy):
+    from types import SimpleNamespace
+
+    from nautilus_trader.model import OrderStatus, OrderType
+
+    order = SimpleNamespace(client_order_id="S1", status=getattr(OrderStatus, status), is_closed=False,
+                            order_type=OrderType.STOP_MARKET)
+    strat = SimpleNamespace(
+        _risk_stop_id=None, strategy_id="S", _unsent=list, _backtest=backtest,
+        _resting_stops=lambda: resting_stops, _target_order=lambda o: False,
+        cache=SimpleNamespace(orders_inflight=lambda **k: [order]), decisions={"S1": {"intent": "stop_loss"}})
+    assert LongFlatStrategy._busy(strat) is busy
+    strat.decisions["S1"]["intent"] = "exit"  # any other order being changed still holds the decision
+    assert LongFlatStrategy._busy(strat) is True

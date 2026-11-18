@@ -5022,10 +5022,11 @@ class LongFlatStrategy(Strategy):
     def _busy(self) -> bool:
         """An order is on its way to the venue or being changed there, so the last decision is still being
         carried out. The backtest's risk stop doesn't count: it is re-priced on most bars, just before the
-        decision, and counting its update stopped a perp backtest from ever deciding again. Nor does the backtest's
-        resting stop-loss while it is being resized: an entry that fills in slices at one moment has its stop resized
-        at the next bar, just before the decision (_resize_if_due), and counting that update held an exit decided on
-        the first candle after the entry back by a candle. A close decided then cancels the stop first (_sell_all)."""
+        decision, and counting its update stopped a perp backtest from ever deciding again. Nor does a resting
+        stop-loss (the backtest's, or paper's with resting stops on) while it is being resized: an entry that fills in
+        slices has its stop resized at the next bar, just before the decision (_resize_if_due), and counting that
+        update held an exit decided on the first candle after the entry back by a candle. A close decided then
+        cancels the stop, its resize with it, before it sells (_sell_all)."""
         risk_stop = self._risk_stop_id
 
         def counts(o) -> bool:
@@ -5034,8 +5035,9 @@ class LongFlatStrategy(Strategy):
             return str(o.client_order_id) != risk_stop and not (
                 o.status in (OrderStatus.INITIALIZED, OrderStatus.SUBMITTED, OrderStatus.PENDING_UPDATE)
                 and self._target_order(o)) and not (
-                self._backtest and o.status == OrderStatus.PENDING_UPDATE
-                and self.decisions.get(str(o.client_order_id), {}).get("intent") == "stop_loss")
+                o.status == OrderStatus.PENDING_UPDATE
+                and self.decisions.get(str(o.client_order_id), {}).get("intent") == "stop_loss"
+                and (self._backtest or self._resting_stops()))
 
         return (any(counts(o) for o in self.cache.orders_inflight(strategy_id=self.strategy_id))
                 or any(counts(o) for o in self._unsent()))
