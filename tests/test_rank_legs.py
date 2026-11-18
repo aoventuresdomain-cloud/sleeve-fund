@@ -184,7 +184,7 @@ def test_the_sheet_carries_the_check_and_says_held_legs_drift():
     from datetime import date
 
     study = SimpleNamespace(equal=bk.EqualMoney(entries=12), basket=SimpleNamespace(params=PARAMS),
-                            windows=((date(2024, 3, 1), date(2024, 6, 30)),), unranked=[])
+                            windows=((date(2024, 3, 1), date(2024, 6, 30)),), unranked=[], pair=None)
     line = bk._equal_lines(study)[0]
     assert line.startswith("**Equal money at entry:** PASS: 12 entries, each at 0.5x the fund")
     assert "drifts with its price" in line
@@ -233,7 +233,7 @@ def test_the_sheet_lists_every_unranked_monday_and_one_in_the_test_days_leaves_c
     study.unranked = ["2024-01-08"]
     assert bk._unranked_lines(study)[0].startswith("**Unranked Mondays:** none in the test days (1 in the warm-up")
     study = SimpleNamespace(equal=bk.EqualMoney(entries=2), basket=SimpleNamespace(params=PARAMS), windows=study.windows,
-                            unranked=[])
+                            unranked=[], pair=None)
     assert bk._equal_lines(study)[2].startswith("**Unranked Mondays:** none")
 
 

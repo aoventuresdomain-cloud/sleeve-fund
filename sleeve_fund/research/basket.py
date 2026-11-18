@@ -123,16 +123,23 @@ class LeftOut:
     asset: str
     share: float  # its part of the pooled out-of-sample net P&L
     concentrated: bool
-    run: Measured
+    run: Measured | None
     random: RandomBeat | None = None  # on the reduced universe: information only
+    not_applicable: str = ""  # why it wasn't re-run (a rank book: TWO_NAME_RANK); it then blocks nothing
 
     @property
     def net(self) -> float:
-        return self.run.net
+        return math.nan if self.run is None else self.run.net
 
     @property
     def passed(self) -> bool:
-        return self.run.net > 0
+        return bool(self.not_applicable) or self.run.net > 0
+
+
+# Advisor 16 Nov ~23:55 UK: a rank book's two-asset re-runs (best asset left out, without SOL) rank only 1 and 2, so
+# they never short; they are not run, and descriptive attribution on the base run stands in their place.
+TWO_NAME_RANK = "not applicable: a 2-name rank book never shorts"
+ONE_ASSET_FLAG = 0.8  # one asset's share of the book's net above which the sheet flags it (and one side's)
 
 
 @dataclass
@@ -181,6 +188,7 @@ class BasketStudy:
     unguarded_entries: dict = field(default_factory=dict)  # a guarded scaled run: its legs' intents, guards off
     equal: Any = None  # a rank book's EqualMoney on its base run (family C), else None
     unranked: list = field(default_factory=list)  # a rank book's Mondays it couldn't rank, as ISO dates (Advisor 16 Nov)
+    pair: Any = None  # a rank book's random long/short assignment (pair_null.PairNull), with filled=True
     screened: str = ""  # fast: why it was screened out (a FAIL), so nothing past its 0-fee rung was run; "" if not
     fast: bool = False  # its cost ladder is the four rungs (FAST_LADDER), not COST_LADDER's nine
     real_rung: str = ""  # fast survivor (Advisor 18:22): "base reused" or "run", how its venue's-fee rung was made
@@ -885,12 +893,15 @@ def basket_study(basket: Basket, windows, research_end: date, *, register: trial
     twice, _, _ = measured(assets, doubled(real))
     twice.passed = twice.net > 0
     top, share, concentrated = top_contributor(base.pnl.sum())
-    rest = [a for a, n in zip(assets, names_of) if n != top]
-    out, out_names, out_specs = measured(rest, None)
-    left = LeftOut(top, share, concentrated, out)
-    left.random = random_beat(out, out_names, out_specs, basket.params, windows, capital,
-                              gate_touched(out.run, windows, {n: _bar(sp) for n, sp in zip(out_names, out_specs)}),
-                              draws, seed)
+    if equal is not None:
+        left = LeftOut(top, share, concentrated, None, not_applicable=TWO_NAME_RANK)
+    else:
+        rest = [a for a, n in zip(assets, names_of) if n != top]
+        out, out_names, out_specs = measured(rest, None)
+        left = LeftOut(top, share, concentrated, out)
+        left.random = random_beat(out, out_names, out_specs, basket.params, windows, capital,
+                                  gate_touched(out.run, windows, {n: _bar(sp) for n, sp in zip(out_names, out_specs)}),
+                                  draws, seed)
     breakeven, beyond = (None, "not tested"), "> top rung"
     real_rung = ""
     if ladder and fast:
@@ -925,8 +936,11 @@ def basket_study(basket: Basket, windows, research_end: date, *, register: trial
             study.unguarded_entries[asset] = study.unguarded_entries.get(asset, 0) + 1
     if filled:
         study.pooled = pooled_random(base, names, specs, basket.params, windows, capital, touched, draws, seed)
+        if equal is not None:  # family C's null (pre-registration, section 6): the random-entry draws are not a pair's
+            study.pair = rank_null(base, names, specs, basket.params, windows, capital, study.unranked, draws, seed)
         study.hold = hold_bar(base, specs, basket.params, windows, capital)
-        if "SOL" in map(base_asset, names_of):  # Advisor Q3: shown beside, its own re-run; never a condition or a try
+        if "SOL" in map(base_asset, names_of) and equal is None:  # Advisor Q3: shown beside, its own re-run; never a
+            # condition or a try (not a rank book's: TWO_NAME_RANK)
             rest = [a for a, n in zip(assets, names_of) if base_asset(n) != "SOL"]
             m, rn, rs = measured(rest, None)
             study.without_sol = {"assets": [n for n in names_of if base_asset(n) != "SOL"], "net": m.net,
@@ -1029,8 +1043,11 @@ def verdict(study: BasketStudy, holdout: Holdout | None) -> str:
     (it can't pass then); NOT YET while the holdout is sealed. Screened out (fast: it loses before fees), FAIL."""
     if getattr(study, "screened", False):
         return "FAIL"
-    pooled, hold = getattr(study, "pooled", None), getattr(study, "hold", None)
-    if pooled is not None:  # STUDY-ASSET-LIST: the filled pooled comparison decides; the hold bar once it is proven
+    pooled, hold, pair = getattr(study, "pooled", None), getattr(study, "hold", None), getattr(study, "pair", None)
+    if pair is not None:  # a rank book: its random long/short assignment decides; no hold bar with a short side
+        # below the bar (95% before and after fees), or round-0 kill 2 (below 90% before fees) (CR #356; Advisor 17 Nov)
+        random_failed, judged, held = pair.judged and (not pair.beats or pair.killed), pair.judged, True
+    elif pooled is not None:  # STUDY-ASSET-LIST: the filled pooled comparison decides; the hold bar once it is proven
         random_failed, judged = pooled.verdict == "FAIL", pooled.verdict == "PASS"
         held = hold is None or (BH102_LIVE and hold.beats)
         random_failed = random_failed or (hold is not None and BH102_LIVE and not hold.beats)
@@ -1073,7 +1090,10 @@ def render(study: BasketStudy, holdout: Holdout | None = None, round_try: str | 
         left_random = random_words(lo.random) if lo.random is not None else None
         concentrated = "; concentrated: over half the net from one asset"
     else:
-        random_rows = [f"| Beats random entries, filled on the pooled book (95th percentile) | {pooled_words(pooled, study.random.seed)} |",
+        pooled_cell = (f"not this book's null: a rank book is judged on its random long/short assignment, below "
+                       f"({pooled_words(pooled, study.random.seed)})" if study.equal is not None
+                       else pooled_words(pooled, study.random.seed))
+        random_rows = [f"| Beats random entries, filled on the pooled book (95th percentile) | {pooled_cell} |",
                        f"| Hold bar (long-only baskets) | {hold_words(study.hold)} |",
                        f"| Random entries, close-priced | {close_priced_words(study.random)}; {NO_STOP_FILLS}, "
                        f"against the book's filled Sharpe {_sharpe(base.returns.to_numpy()):.2f} |"]
@@ -1097,6 +1117,7 @@ def render(study: BasketStudy, holdout: Holdout | None = None, round_try: str | 
         *random_rows,
         f"| Net above 0 at 2x the venue's fees | {'PASS' if study.double_fees.passed else 'FAIL'}, net "
         f"{_pct(study.double_fees.net)} |",
+        f"| Best asset left out | {lo.not_applicable} |" if lo.not_applicable else
         f"| Best asset left out ({lo.asset}, {lo.share:.0%} of the pooled net) | {'PASS' if lo.passed else 'FAIL'}, "
         f"net {_pct(lo.net)}{concentrated if lo.concentrated else ''}"
         f"{'; info, without it: ' + left_random if left_random is not None else ''} |",
@@ -1207,7 +1228,88 @@ def _equal_lines(study: BasketStudy) -> list[str]:
     return [(f"**Equal money at entry:** {'PASS' if e.passed else 'FAIL'}: {e.entries} entries, each at {share:g}x the "
              "fund it was sized off; those opened on one close sized off the same fund and together at most 1x of it. "
              "No leg is topped up while held, so a held leg's notional drifts with its price until it changes."), "",
-            *_unranked_lines(study)]
+            *_unranked_lines(study), *_pair_lines(study)]
+
+
+def _pair_lines(study: BasketStudy) -> list[str]:
+    """A rank book's random long/short assignment (pre-registration, section 6), when the study filled its draws."""
+    from sleeve_fund.research.pair_null import null_words
+
+    if study.pair is None:
+        return []
+    return [f"**Random long/short assignment:** {null_words(study.pair)}", "", *attribution_lines(study.pair)]
+
+
+def attribution_lines(r) -> list[str]:
+    """A rank book's net by asset and leg, on the null's model of its own book (reconciled with the engine's), in place
+    of the two-asset re-runs (Advisor 16 Nov ~23:55 UK): the SOL legs' share of the net, one asset over ONE_ASSET_FLAG
+    of it flagged, and the long and short split, flagged one-sided over ONE_ASSET_FLAG (pre-registration, section 7)."""
+    if not r.attribution:
+        return []
+    net = sum(r.attribution.values())
+    names = list(dict.fromkeys(a for a, _ in r.attribution))
+    cells = [f"{a} long {_pct(r.attribution.get((a, 'long'), 0.0))}, short {_pct(r.attribution.get((a, 'short'), 0.0))}"
+             for a in names]
+    by_asset = {a: sum(v for (b, _), v in r.attribution.items() if b == a) for a in names}
+    sides = {s: sum(v for (_, t), v in r.attribution.items() if t == s) for s in ("long", "short")}
+
+    def share(x: float) -> str:
+        return f"{x / net:.0%}" if net else "n/a (net 0)"
+
+    sol = next((a for a in names if base_asset(a) == "SOL"), None)
+    top = max(by_asset, key=lambda a: by_asset[a] / net if net else 0.0)
+    one_asset = bool(net) and by_asset[top] / net > ONE_ASSET_FLAG
+    one_side = bool(net) and max(sides.values()) / net > ONE_ASSET_FLAG
+    return [f"**Attribution** (descriptive, no re-run; over the fund's capital, net {_pct(net)}): {'; '.join(cells)}. "
+            f"SOL legs' share of net: {share(by_asset[sol]) if sol else 'no SOL leg'}. Largest asset share: {top} "
+            f"{share(by_asset[top])}{'; ONE ASSET over 80% of the net' if one_asset else ''}. Long legs "
+            f"{_pct(sides['long'])} ({share(sides['long'])}), short legs {_pct(sides['short'])} "
+            f"({share(sides['short'])}){'; ONE-SIDED: over 80% from one side' if one_side else ''}.", ""]
+
+
+def rank_null(m: Measured, names, specs, params: dict, windows, capital: float, unranked: list[str],
+              draws: int = DRAWS, seed: int = 0):
+    """Family C's null on the base run: each asset's execution bars, fee, half spread and funding settlements as the
+    engine charged them, its legs' trips as the Strategy's states (from the window's first bar), the leg notional at the
+    window's start and each change week its share of the book then, and the engine book's move over the same window
+    for the reconcile."""
+    from sleeve_fund.research.pair_null import PairAsset, pair_null, strategy_states
+    from sleeve_fund.research.study import _settlement_rates
+
+    first = pd.Timestamp(windows[0][0], tz="UTC")
+    end = pd.Timestamp(windows[-1][1] + timedelta(days=1), tz="UTC")
+    assets, trips = [], {}
+    for i, (n, s) in enumerate(zip(names, specs)):
+        leg = m.run.legs[n]
+        trips[i] = trades(fills_to_rows(leg.fills), leg.shorts, leg.funding, open_trip=True) \
+            if leg.fills is not None and not leg.fills.empty else []
+        ex = s.exec_prices
+        idx = ex.index if ex.index.tz is not None else ex.index.tz_localize("UTC")
+        taker = float(base_fees(s.instrument, params).taker) if s.fees is None else float(s.fees.taker)
+        rates = _settlement_rates(params, s.instrument, pd.concat([s.warmup_prices, s.prices])) or (None, None, None)
+        assets.append(PairAsset(underlying(s.instrument), idx.as_unit("ns").asi8.copy(),
+                                ex["open"].to_numpy(dtype=float), ex["close"].to_numpy(dtype=float),
+                                int(pd.Timedelta(minutes=s.exec_minutes).value), taker, _half_spread(s.instrument, params),
+                                *rates))
+    change, states = strategy_states(trips, first, end)
+    share, book = float(params["position_cap_pct"]), m.run.book
+
+    def equity(t: pd.Timestamp) -> float:  # the book at t; before its first mark, the capital it opened with
+        return capital if t < book.index[0] else float(book.asof(t))
+
+    at = [first, *(pd.Timestamp(t, tz="UTC") for t in change)]
+    notional = [share * equity(t) for t in at]
+    skipped = sum(1 for d in unranked if first.date() <= date.fromisoformat(d) < end.date())
+    carried = {}  # a leg held into the window keeps the notional the engine held at its first bar
+    for slot, side in ((0, 1), (1, -1)):
+        i = states[0][slot]
+        r = m.run.legs[names[i]] if i is not None else None
+        if r is not None and r.exposure is not None and len(r.exposure):
+            held = (r.exposure * r.equity).sort_index()
+            if held.index[0] <= first:
+                carried[(i, side)] = abs(float(held.asof(first)))
+    return pair_null(assets, first.value, change, states, end.value, notional, capital, draws, seed,
+                     equity(end) - equity(first), skipped, carried)
 
 
 def _unranked_lines(study: BasketStudy) -> list[str]:
@@ -1675,6 +1777,8 @@ def close_priced_words(r: RandomBeat) -> str:
 
 
 def _without_sol_lines(study: BasketStudy) -> list[str]:
+    if getattr(study, "equal", None) is not None:
+        return [f"**Without SOL:** {TWO_NAME_RANK}; the SOL legs' share of the net is under Attribution.", ""]
     w = getattr(study, "without_sol", None)
     if not w:
         return []

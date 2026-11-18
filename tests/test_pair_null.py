@@ -1,0 +1,321 @@
+"""Family C, step (d) (pre-registration, section 6, rev 2; Advisor 16 Nov): the random long/short assignment. Done when:
+
+1. a leg is priced as the engine charges it: the open of the first execution bar at or after its Monday close, half
+   the spread and the taker fee each side, funding at each settlement held over (a long pays, a short receives), a
+   leg kept across a change week traded once, a leg open at the end marked unpaid, a carried leg valued unpaid;
+2. the draws keep the Strategy's change weeks and its carried state, re-draw the ordered pair from the 6, are seeded,
+   and the share beaten is read after fees and before (fee 0, spread and funding kept);
+3. the Strategy's states come from its trips, a flip on one close included;
+4. on a real rank book's run the model's P&L reconciles with the engine's book, carried legs in or a flat start, and
+   the sheet carries the line in place of the random-entry verdict, with no PASS wording;
+5. a rank book's two-name re-runs are not applicable, attribution by asset and leg stands in their place, and its
+   verdict reads the null (Advisor 16 Nov ~23:55 UK)."""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from sleeve_fund.research import pair_null as pn
+
+MIN = pd.Timedelta(minutes=1).value
+T0 = pd.Timestamp("2025-01-06", tz="UTC")  # a Monday
+WK = pd.Timedelta(days=7)
+
+
+def _asset(name: str, opens, taker=0.0, half=0.0, settle=None, rates=None, baseline=None) -> pn.PairAsset:
+    """Minute bars from T0, one per step, each closing a minute after it opens; the close is the next open."""
+    opens = np.asarray(opens, dtype=float)
+    close_ns = np.array([(T0 + pd.Timedelta(minutes=i + 1)).value for i in range(len(opens))], dtype=np.int64)
+    closes = np.concatenate([opens[1:], opens[-1:]])
+    return pn.PairAsset(name, close_ns, opens, closes, MIN, taker, half,
+                        None if settle is None else np.asarray(settle, dtype=np.int64),
+                        None if rates is None else np.asarray(rates, dtype=float),
+                        None if baseline is None else np.asarray(baseline, dtype=bool))
+
+
+def _t(i: int) -> int:
+    return (T0 + pd.Timedelta(minutes=i)).value
+
+
+# ---- 1. pricing ---------------------------------------------------------------------------------------------------
+
+def test_a_new_long_and_short_pay_spread_and_fees_each_side_and_end_marked_unpaid():
+    a = _asset("A", [100, 110, 120, 130], taker=0.001, half=0.0005)
+    b = _asset("B", [100, 90, 80, 70], taker=0.001, half=0.0005)
+    c = _asset("C", [100, 100, 100, 100])
+    p = pn._Pricer([a, b, c], [_t(0), _t(1), _t(2), _t(3)], np.array([1_000.0] * 3))
+    # long A opened at t1 (open 110, +half), closed at t2 (open 120, -half), fees both sides
+    entry, out = 110 * 1.0005, 120 * 0.9995
+    q = 1_000 / entry
+    assert p.leg(0, 1, 1, 2, True) == pytest.approx(q * (out - entry) - 0.001 * q * (entry + out))
+    assert p.leg(0, 1, 1, 2, False) == pytest.approx(q * (out - entry))  # pre-fee keeps the spread
+    # short B opened at t2 (open 80, -half) and still open at the end, marked at the last close by t3 (70), unpaid
+    entry = 80 * (1 - 0.0005)
+    q = 1_000 / entry
+    assert p.leg(1, -1, 2, 3, True) == pytest.approx(-q * (70 - entry) - 0.001 * q * entry)
+
+
+def test_a_carried_leg_is_valued_unpaid_from_the_windows_first_bar_and_pays_only_its_exit():
+    a = _asset("A", [100, 110, 120, 130], taker=0.001, half=0.0005)
+    p = pn._Pricer([a, a, a], [_t(1), _t(2), _t(3)], np.array([1_000.0, 1_000.0]))  # the window opens at t1
+    q = 1_000 / 110
+    assert p.leg(0, 1, 0, 1, True) == pytest.approx(q * (120 * 0.9995 - 110) - 0.001 * q * 120 * 0.9995)
+
+
+def test_funding_a_long_pays_a_short_receives_over_settlements_held():
+    s = [_t(1), _t(2), _t(5)]  # at t1 the leg isn't open yet; t2 held; t5 after the close
+    a = _asset("A", [100] * 6, settle=s, rates=[0.01, 0.01, 0.01], baseline=[False, True, False])
+    p = pn._Pricer([a, a, a], [_t(0), _t(1), _t(3), _t(4)], np.array([1_000.0] * 4))
+    a.settle_baseline[:] = [False, False, False]  # stored rates: a long pays, a short receives
+    assert p.leg(0, 1, 1, 2, True) == pytest.approx(-10 * 0.01 * 100)
+    assert p.leg(0, -1, 1, 2, True) == pytest.approx(10 * 0.01 * 100)
+    a.settle_baseline[:] = [False, True, False]  # t2's is the baseline (none stored): both sides pay it
+    p.cache.clear()
+    assert p.leg(0, 1, 1, 2, True) == p.leg(0, -1, 1, 2, True) == pytest.approx(-10 * 0.01 * 100)
+    assert a.baseline_in(_t(1), _t(4)) == [_t(2)]
+
+
+def test_a_leg_kept_across_a_change_week_is_traded_once():
+    a = _asset("A", [100, 100, 100, 100, 100], taker=0.01)
+    b, c = _asset("B", [100] * 5), _asset("C", [100] * 5)
+    p = pn._Pricer([a, b, c], [_t(0), _t(1), _t(2), _t(3), _t(4)], np.array([1_000.0] * 4))
+    kept, legs = p.book([(None, None), (0, 1), (0, 2), (0, 1)], True)
+    assert kept == pytest.approx(-10.0) and legs == 4  # A long: one entry fee, open at the end; short legs free
+    assert pn._runs([(None, None), (0, 1), (0, 2), (0, 1)]) == [(0, 1, 1, 4), (1, -1, 1, 2), (2, -1, 2, 3),
+                                                               (1, -1, 3, 4)]
+
+
+def test_no_execution_bar_after_a_change_week_is_refused():
+    a = _asset("A", [100, 101])
+    with pytest.raises(ValueError, match="no execution bar opens"):
+        a.open_at(_t(2))
+
+
+# ---- 2. the draws -------------------------------------------------------------------------------------------------
+
+def _trend(k: int = 30):
+    """Three assets over k weeks of one bar a week: A rises, C falls, B is flat."""
+    n = k + 2
+    bars = [np.array([100 * (1.02 ** i) for i in range(n)]), np.full(n, 100.0), np.array([100 * (0.98 ** i)
+                                                                                          for i in range(n)])]
+    out = []
+    for name, o in zip("ABC", bars):
+        close_ns = np.array([(T0 + WK * i + pd.Timedelta(minutes=1)).value for i in range(n)], dtype=np.int64)
+        out.append(pn.PairAsset(name, close_ns, o, o, MIN, 0.00055, 0.0002))
+    return out, [(T0 + WK * i).value for i in range(k)], (T0 + WK * k).value
+
+
+def test_the_right_pair_every_week_beats_nearly_every_draw_and_the_wrong_one_almost_none():
+    assets, change, end = _trend()
+    k = len(change)
+    best = pn.pair_null(assets, change[0], change, [(None, None)] + [(0, 2)] * k, end, [1_000.0] * (k + 1), 10_000.0)
+    worst = pn.pair_null(assets, change[0], change, [(None, None)] + [(2, 0)] * k, end, [1_000.0] * (k + 1),
+                          10_000.0)
+    assert best.net_percentile > 99 and best.beats and not best.killed and best.strategy_legs == 2
+    assert worst.net_percentile < 1 and not worst.beats and worst.killed
+    assert best.change_weeks == k and best.mean_draw_legs > best.strategy_legs  # draws re-trade at each change week
+
+
+def test_draws_are_seeded_keep_the_carried_state_and_refuse_too_few_or_not_three():
+    assets, change, end = _trend(8)
+    states = [(1, 2)] + [(0, 2)] * 8
+    a = pn.pair_null(assets, change[0], change, states, end, [1_000.0] * 9, 10_000.0, seed=0)
+    b = pn.pair_null(assets, change[0], change, states, end, [1_000.0] * 9, 10_000.0, seed=0)
+    c = pn.pair_null(assets, change[0], change, states, end, [1_000.0] * 9, 10_000.0, seed=1)
+    assert (a.net_percentile, a.median_net) == (b.net_percentile, b.median_net)
+    assert (a.median_net, a.mean_draw_legs) != (c.median_net, c.mean_draw_legs)
+    assert a.pre_percentile >= 0 and a.strategy_pre > a.strategy_net  # before fees: the fee only
+    with pytest.raises(ValueError, match="at least 1,000"):
+        pn.pair_null(assets, change[0], change, states, end, [1_000.0] * 9, 10_000.0, draws=999)
+    with pytest.raises(ValueError, match="three assets"):
+        pn.pair_null(assets[:2], change[0], change, states, end, [1_000.0] * 9, 10_000.0)
+    assert len(pn.ORDERINGS) == 6 and len(set(pn.ORDERINGS)) == 6 and all(lo != sh for lo, sh in pn.ORDERINGS)
+    none = pn.pair_null(assets, change[0], [], [(None, None)], end, [1_000.0], 10_000.0)
+    assert not none.judged and pn.null_words(none).startswith("NOT JUDGED")
+
+
+# ---- 3. the Strategy's states -------------------------------------------------------------------------------------
+
+def test_states_come_from_trips_with_a_flip_on_one_close_and_a_carried_leg():
+    def m(w, minutes=1):
+        return T0 + WK * w + pd.Timedelta(minutes=minutes)
+
+    trips = {0: [{"opened": m(-2), "closed": m(1), "side": 1}, {"opened": m(1, 2), "closed": None, "side": -1}],
+             1: [{"opened": m(-2), "closed": m(3), "side": -1}],
+             2: [{"opened": m(1), "closed": None, "side": 1}, ]}
+    change, states = pn.strategy_states(trips, T0, T0 + WK * 10)
+    assert change == [(T0 + WK).value, (T0 + WK * 3).value]
+    assert states == [(0, 1), (2, 1), (2, 0)]
+    assert pn.week_of(pd.Timestamp("2025-01-12 23:59", tz="UTC")) == pd.Timestamp("2025-01-06", tz="UTC")
+
+
+# ---- 4. on a rank book's run --------------------------------------------------------------------------------------
+
+@pytest.fixture(scope="module")
+def ran():
+    from test_rank_legs import ran as legs_run
+
+    return legs_run.__wrapped__()
+
+
+def test_on_a_rank_books_run_the_model_reconciles_with_the_engine_and_the_sheet_says_so(ran):
+    from sleeve_fund.research import basket as bk
+
+    specs, run = ran
+    params = dict(specs[0].params)
+    window = ((specs[0].prices.index[30] - pd.Timedelta(days=1)).date(),
+              (specs[0].prices.index[-1] - pd.Timedelta(days=1)).date())
+    r = bk.rank_null(SimpleNamespace(run=run), [s.name for s in specs], specs, params, (window,), 30_000.0, [])
+    assert r.change_weeks > 3 and r.strategy_legs > 0
+    model, book = r.reconciled
+    assert abs(model - book) <= pn.RECONCILE_PP, (model, book)
+    words = pn.null_words(r)
+    assert "PASS" not in words and "random long/short assignments" in words and "seed 0" in words
+    study = SimpleNamespace(pair=r)
+    assert bk._pair_lines(study)[0].startswith("**Random long/short assignment:** ")
+    assert bk._pair_lines(SimpleNamespace(pair=None)) == []
+    flat = ((specs[0].prices.index[0] - pd.Timedelta(days=1)).date(), window[1])  # the run's first day: flat
+    r = bk.rank_null(SimpleNamespace(run=run), [s.name for s in specs], specs, params, (flat,), 30_000.0, [])
+    assert r.carried == 0 and "the window opened flat" in pn.null_words(r)
+    assert abs(r.reconciled[0] - r.reconciled[1]) <= pn.RECONCILE_PP, r.reconciled
+
+
+def test_an_unreconciled_model_is_not_judged():
+    r = pn.PairNull(1_000, 0, 5, 0.10, 0.12, 99.0, 99.0, 0.0, 0.0, 4, 8.0, reconciled=(0.10, 0.02))
+    assert r.unreconciled and not r.judged and not r.beats and not r.killed
+    assert pn.null_words(r).startswith("NOT JUDGED")
+
+
+def test_every_draw_holds_the_carried_pair_to_the_first_change_week():
+    # prices move only before the first change week, so the carried stretch is the whole difference: every draw
+    # matches the book exactly there, and nothing after it can separate them
+    n = 6
+    moves = [np.array([100, 120] + [130] * (n - 2), dtype=float), np.full(n, 100.0),
+             np.array([100, 80] + [70] * (n - 2), dtype=float)]
+    assets = []
+    for name, o in zip("ABC", moves):
+        close_ns = np.array([(T0 + WK * i + pd.Timedelta(minutes=1)).value for i in range(n)], dtype=np.int64)
+        assets.append(pn.PairAsset(name, close_ns, o, o, MIN, 0.0, 0.0))
+    change, end = [(T0 + WK * i).value for i in (2, 3)], (T0 + WK * 4).value
+    r = pn.pair_null(assets, T0.value, change, [(0, 2), (0, 2), (0, 2)], end, [1_000.0] * 3, 10_000.0)
+    assert r.carried == 2 and r.median_net == pytest.approx(r.strategy_net) and r.strategy_net > 0
+    assert "2 legs carried in, valued unpaid from the window's first bar" in pn.null_words(r)
+
+
+def test_the_book_is_attributed_by_asset_and_leg_with_the_sol_share_and_both_flags():
+    from sleeve_fund.research import basket as bk
+
+    r = pn.PairNull(1_000, 0, 5, 0.10, 0.12, 99.0, 99.0, 0.0, 0.0, 4, 8.0,
+                    attribution={("BTC", "long"): 0.01, ("SOL", "short"): 0.085, ("SOL", "long"): 0.005})
+    line = bk.attribution_lines(r)[0]
+    assert "BTC long +1.0%, short +0.0%; SOL long +0.5%, short +8.5%" in line
+    assert "SOL legs' share of net: 90%" in line and "ONE ASSET over 80%" in line and "ONE-SIDED" in line
+    even = pn.PairNull(1_000, 0, 5, 0.10, 0.12, 99.0, 99.0, 0.0, 0.0, 4, 8.0,
+                       attribution={("BTC", "long"): 0.05, ("ETH", "short"): 0.05})
+    line = bk.attribution_lines(even)[0]
+    assert "no SOL leg" in line and "ONE ASSET" not in line and "ONE-SIDED" not in line
+
+
+def test_a_rank_books_two_name_rows_are_not_applicable_and_its_verdict_is_the_null():
+    from sleeve_fund.research import basket as bk
+
+    lo = bk.LeftOut("SOL", 0.9, True, None, not_applicable=bk.TWO_NAME_RANK)
+    assert lo.passed and np.isnan(lo.net)
+    assert bk._without_sol_lines(SimpleNamespace(equal=object()))[0].startswith(
+        "**Without SOL:** not applicable: a 2-name rank book never shorts")
+    beaten = pn.PairNull(1_000, 0, 5, 0.10, 0.12, 99.0, 99.0, 0.0, 0.0, 4, 8.0)
+    below = pn.PairNull(1_000, 0, 5, 0.10, 0.12, 60.0, 99.0, 0.0, 0.0, 4, 8.0)
+    loose = SimpleNamespace(double_fees=SimpleNamespace(passed=True), left_out=lo, hold=None,
+                            pooled=SimpleNamespace(verdict="FAIL"))
+    assert bk.verdict(SimpleNamespace(**loose.__dict__, pair=beaten), None) == "NOT YET"  # the pooled FAIL ignored
+    assert bk.verdict(SimpleNamespace(**loose.__dict__, pair=below), None) == "FAIL"
+    unjudged = pn.PairNull(1_000, 0, 5, 0.10, 0.12, 99.0, 99.0, 0.0, 0.0, 4, 8.0, reconciled=(0.1, 0.0))
+    assert bk.verdict(SimpleNamespace(**loose.__dict__, pair=unjudged), None) == "NOT JUDGED"
+
+
+def test_a_rank_baskets_study_carries_the_null_and_attribution_and_runs_no_two_name_re_run(tmp_path, monkeypatch):
+    from test_b38_basket_study import ASSETS, CAPITAL, RESEARCH_END, WINDOWS, _register
+    from test_rank_legs import PARAMS
+
+    from sleeve_fund.research import basket as bk
+
+    basket = bk.Basket("rs", "rules", dict(PARAMS), ASSETS, "2026-11-16")
+    runs = []
+    real = bk._run
+    monkeypatch.setattr(bk, "_run", lambda b, subset, *a, **k: runs.append(len(subset)) or real(b, subset, *a, **k))
+    study = bk.basket_study(basket, WINDOWS, RESEARCH_END, register=_register(tmp_path), dataset="syn",
+                            capital=CAPITAL, profile=bk.UNGUARDED, warm_days=40, ladder=False, filled=True)
+    assert set(runs) == {3}  # no two-asset re-run: left out and without SOL are not applicable
+    assert study.left_out.not_applicable == bk.TWO_NAME_RANK and study.without_sol is None
+    r = study.pair
+    assert r is not None and r.change_weeks > 3 and r.carried == 0, r
+    assert abs(r.reconciled[0] - r.reconciled[1]) <= pn.RECONCILE_PP, r.reconciled
+    sheet = bk.render(study)
+    for line in ("| Best asset left out | not applicable: a 2-name rank book never shorts |",
+                 "**Without SOL:** not applicable", "**Random long/short assignment:** ", "**Attribution** ",
+                 "not this book's null"):
+        assert line in sheet, line
+
+
+# ---- CR #356 ------------------------------------------------------------------------------------------------------
+
+def _null(net_pct: float, pre_pct: float) -> pn.PairNull:
+    return pn.PairNull(1_000, 0, 5, 0.10, 0.12, net_pct, pre_pct, 0.0, 0.0, 4, 8.0)
+
+
+def test_round_0_kill_2_fails_the_verdict_even_above_the_after_fee_bar():
+    from sleeve_fund.research import basket as bk
+
+    lo = bk.LeftOut("SOL", 0.9, True, None, not_applicable=bk.TWO_NAME_RANK)
+    loose = {"double_fees": SimpleNamespace(passed=True), "left_out": lo, "hold": None, "pooled": None}
+    killed = _null(96.0, 85.0)
+    assert killed.killed and not killed.beats and killed.net_percentile >= pn.BAR  # clears after fees, still killed
+    assert bk.verdict(SimpleNamespace(**loose, pair=killed), None) == "FAIL"
+    assert bk.verdict(SimpleNamespace(**loose, pair=killed), SimpleNamespace(passed=True)) == "FAIL"
+    assert pn.null_words(killed).startswith("KILLED (round 0, kill 2: random below 90% before fees)")
+    between = _null(96.0, 92.0)  # 90 to 95 before fees: not killed, but it can't pass
+    assert not between.killed and not between.beats
+    assert bk.verdict(SimpleNamespace(**loose, pair=between), None) == "FAIL"
+    assert pn.null_words(between).startswith("BELOW THE BAR (random 90-95% before fees): ")
+    assert pn.null_words(_null(94.9, 99.0)).startswith("BELOW THE BAR: ")  # after fees short of 95
+    assert pn.null_words(_null(96.0, 94.9)).startswith("BELOW THE BAR (random 90-95% before fees): ")
+    assert pn.null_words(_null(96.0, 95.0)).startswith("ABOVE THE BAR: ") and not _null(96.0, 94.9).beats
+    assert bk.verdict(SimpleNamespace(**loose, pair=_null(95.0, 95.0)), None) == "NOT YET"
+
+
+def test_the_bar_is_95_both_before_and_after_fees_at_the_boundary():
+    assert _null(95.0, 99.0).beats and not _null(94.9, 99.0).beats
+    assert _null(99.0, 95.0).beats and not _null(99.0, 94.9).beats
+    assert not _null(99.0, 90.0).killed and _null(99.0, 89.9).killed
+
+
+def test_a_draw_that_ties_the_book_is_not_beaten():
+    assets, change, end = _trend(4)
+    flat = [pn.PairAsset(x.name, x.close_ns, np.full(len(x.opens), 100.0), np.full(len(x.closes), 100.0), MIN,
+                         0.0, 0.0) for x in assets]
+    r = pn.pair_null(flat, change[0], change, [(None, None)] + [(0, 2)] * 4, end, [1_000.0] * 5, 10_000.0)
+    assert r.strategy_net == 0.0 and r.net_percentile == 0.0 and r.pre_percentile == 0.0  # every draw ties
+
+
+def test_a_change_at_the_windows_end_is_not_a_change_week():
+    trips = {0: [{"opened": T0 + pd.Timedelta(minutes=1), "closed": T0 + WK * 2 + pd.Timedelta(minutes=1), "side": 1}]}
+    change, states = pn.strategy_states(trips, T0, T0 + WK * 2)
+    assert change == [T0.value] and states == [(None, None), (0, None)]
+
+
+def test_only_unranked_mondays_inside_the_window_are_counted(ran):
+    from sleeve_fund.research import basket as bk
+
+    specs, run = ran
+    params = dict(specs[0].params)
+    first, last = (specs[0].prices.index[30] - pd.Timedelta(days=1)).date(), \
+        (specs[0].prices.index[-1] - pd.Timedelta(days=1)).date()
+    inside = str(first + pd.Timedelta(days=7))
+    outside = [str(first - pd.Timedelta(days=7)), str(last + pd.Timedelta(days=7))]
+    r = bk.rank_null(SimpleNamespace(run=run), [s.name for s in specs], specs, params, ((first, last),), 30_000.0,
+                     [inside, *outside])
+    assert r.skipped_weeks == 1
