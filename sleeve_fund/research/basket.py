@@ -23,6 +23,7 @@ count (one per fixed basket and settings, each also one of its model's 20 config
 from __future__ import annotations
 
 import math
+import statistics
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from functools import partial
@@ -1111,6 +1112,7 @@ def render(study: BasketStudy, holdout: Holdout | None = None, round_try: str | 
         *([LEGS_NOT_REBALANCED, ""] if pooled is not None else []),
         *_held_lines(study),
         *_equal_lines(study),
+        *_vol_lines(study),
         f"Out-of-sample: {study.windows[0][0]} to {study.windows[-1][1]}, {days} days, one fund run of the whole "
         f"basket at the venue's fees: net {_pct(base.net)}.", "",
         "| Condition | Result |", "| --- | --- |",
@@ -1190,6 +1192,7 @@ def _render_screened(study: BasketStudy, round_try: str | None) -> str:
         fills_line(study), "",
         _tries_line(study, round_try), "",
         *_equal_lines(study),
+        *_vol_lines(study),
         (f"Out-of-sample: {study.windows[0][0]} to {study.windows[-1][1]}, {len(base.returns)} days, one fund run of "
          f"the whole basket: {study.trades} test-window trades; net {_pct(zero)} before fees (0% a side) and "
          f"{_pct(base.net)} at the venue's fees; gross edge {_pct_fine(study.gross_edge)} per trade before fees."), "",
@@ -1229,6 +1232,56 @@ def _equal_lines(study: BasketStudy) -> list[str]:
              "fund it was sized off; those opened on one close sized off the same fund and together at most 1x of it. "
              "No leg is topped up while held, so a held leg's notional drifts with its price until it changes."), "",
             *_unranked_lines(study), *_pair_lines(study)]
+
+
+@dataclass(frozen=True)
+class VolSizes:
+    """One asset's test-window entries under a volatility target (R-07, batch 18 Nov): each entry's size against the
+    size it would otherwise have had (vol_factor: 1 when the target didn't cut it), how many the target didn't cut
+    (sized at the 1x cap or another limit), and the entries skipped for want of the daily closes, the whole run."""
+
+    sizes: tuple[float, ...]
+    capped: int
+    skipped: int
+
+
+def vol_sizes(run: PortfolioResult, windows, names: dict | None = None) -> dict[str, VolSizes]:
+    """VolSizes by asset over the entries decided on the test days. names: leg name -> asset (the study's legs)."""
+    from sleeve_fund.strategies.rules import VOL_SIZE_LIMIT
+
+    out = {}
+    for leg, res in run.legs.items():
+        sizes, capped = [], 0
+        for oid, d in (res.decisions or {}).items():
+            if d.get("intent") != "entry":
+                continue
+            sig = d.get("signal") or {}
+            day = (entry_close(oid, sig) - pd.Timedelta(1, "ns")).date()
+            if not any(a <= day <= b for a, b in windows):
+                continue
+            sizes.append(float(sig.get("vol_factor", 1.0)))
+            capped += sig.get("sized_by") != VOL_SIZE_LIMIT
+        asset = (names or {}).get(leg, leg)
+        out[asset] = VolSizes(tuple(sizes), capped, int((res.rule_counts or {}).get("vol_skipped", 0)))
+    return out
+
+
+def _vol_lines(study: BasketStudy) -> list[str]:
+    """The volatility target's line (R-07), with each asset's median size and the share the target didn't cut, on the
+    test-window entries; nothing when the basket doesn't size to one."""
+    vol = (study.basket.params or {}).get("vol_target_size")
+    if not vol:
+        return []
+    names = {leg: v[0] for leg, v in (study.legs or {}).items()}
+    by = vol_sizes(study.base.run, study.windows, names)
+    per = "; ".join(f"{a} {len(v.sizes)} entries, median size {statistics.median(v.sizes):.2f}x, capped "
+                    f"{v.capped / len(v.sizes):.0%}" if v.sizes else f"{a} no entries" for a, v in by.items())
+    skipped = sum(v.skipped for v in by.values())
+    return [(f"**Volatility target:** entries sized to {float(vol['annual']):.0%} a year of volatility over "
+             f"{int(vol['lookback_days'])} days of daily closes (lag 1), capped at 1x, set at entry and not rebalanced. "
+             f"Test-window entries by asset (size against the uncut size; capped = the target didn't cut it): {per}."
+             + (f" Over the whole run, warm-up and train days included, {skipped:,} entries were skipped for "
+                "want of the daily closes." if skipped else "")), ""]
 
 
 def _pair_lines(study: BasketStudy) -> list[str]:
