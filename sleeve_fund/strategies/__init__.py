@@ -46,6 +46,8 @@ def study_only_uses(params: dict | None) -> list[str]:
     blocks = (params.get("definition") or {}).get("blocks") or {}
     found = sorted({STUDY_ONLY_BLOCKS[b["kind"]] for b in blocks.values()
                     if isinstance(b, dict) and b.get("kind") in STUDY_ONLY_BLOCKS})
+    if (params.get("definition") or {}).get("limits"):  # CR #360 F1: a restart can't yet rebuild today's count
+        found.append("a per-day entry limit ([limits] entries_per_utc_day)")
     if params.get("vol_target_size") is not None:
         found.append("sizing to a target volatility (vol_target_size)")
     if params.get("blocked_entries"):

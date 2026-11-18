@@ -1,0 +1,53 @@
+version = 1
+name = "qrh8-trend-pullback-rsi595"
+title = "Trend Pullback (4h) · Long and Short · daily 200 SMA gate · RSI 5/95"
+reason = """Inside an established trend (close above the daily 200-day SMA for longs, below it for shorts), a sharp
+short move against it (4h RSI(2) below 10 for longs, above 90 for shorts) is usually forced or emotional flow, and
+the side that takes it is paid for liquidity as price resumes. Out when RSI(2) recovers (above 70 long, below 30
+short), the close is back across its 5-candle SMA, or after 10 candles; 2.5 ATR(14) stop. qr02's settings except
+entries at RSI(2) below 5 / above 95: H item 8; an approximate check of H0's book found the entries it keeps lost money; no take-profit. Held at 1x."""
+
+[blocks.trend]
+kind = "sma"
+period = 200
+timeframe = "1d"
+
+[blocks.rsi]
+kind = "rsi"
+period = 2
+
+[blocks.sma5]
+kind = "sma"
+period = 5
+
+[blocks.atr]
+kind = "atr"
+period = 14
+
+[long]
+entry = { all = [
+    { left = "close", op = ">", right = "trend" },
+    { left = "rsi", op = "<", right = 5 },
+] }
+exit = { any = [
+    { left = "rsi", op = ">", right = 70 },
+    { left = "close", op = ">", right = "sma5" },
+] }
+
+[short]
+entry = { all = [
+    { left = "close", op = "<", right = "trend" },
+    { left = "rsi", op = ">", right = 95 },
+] }
+exit = { any = [
+    { left = "rsi", op = "<", right = 30 },
+    { left = "close", op = "<", right = "sma5" },
+] }
+
+[exits.long]
+stop = { level = { sub = ["close", { mul = [2.5, "atr"] }] } }
+time_stop = { bars = 10 }
+
+[exits.short]
+stop = { level = { add = ["close", { mul = [2.5, "atr"] }] } }
+time_stop = { bars = 10 }

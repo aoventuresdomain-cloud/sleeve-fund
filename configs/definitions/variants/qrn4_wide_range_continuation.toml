@@ -1,0 +1,87 @@
+version = 1
+name = "qrn4-wide-range-continuation"
+title = "Wide-range Bar Continuation (daily signal, 4h candles) · Long and Short"
+reason = """At the 00:00 UTC close, a day at least 2 daily ATR(14) wide that closed in its outer quarter and through the
+prior 20-day high (long) or low (short) marks new information that slower capital follows for days. Stop 1 ATR beyond
+the day's far end; out at a 00:00 close across the daily SMA10 against the trade or after 20 days (120 candles).
+A filtered Donchian breakout (trend). At 00:00 the candle close is the daily close. ATR(14), not 20, so it settles within the training year (pre-run parameter change, Advisor 17 Nov); the range trigger uses the prior 14 days' ATR (lag 1). Fixed before any run. Held at 1x."""
+
+# Pre-run parameter change: ATR(20) to ATR(14) for warm-up (Advisor 17 Nov).
+[blocks.atr]
+kind = "atr"
+period = 14
+timeframe = "1d"
+
+# Trigger ATR: the prior 14 days only, excluding the signal day (Advisor 17 Nov). Stops keep atr, frozen at entry.
+[blocks.atrp]
+kind = "lag"
+period = 1
+timeframe = "1d"
+input = "atr"
+
+[blocks.dc]
+kind = "donchian"
+period = 20
+timeframe = "1d"
+
+[blocks.sma10]
+kind = "sma"
+period = 10
+timeframe = "1d"
+
+# Yesterday's channel (the 1d Donchian includes the day just closed) and the just-closed day's high/low (HoE 17 Nov).
+[blocks.dcu]
+kind = "lag"
+period = 1
+timeframe = "1d"
+input = "dc.upper"
+
+[blocks.dcl]
+kind = "lag"
+period = 1
+timeframe = "1d"
+input = "dc.lower"
+
+[blocks.dh]
+kind = "rolling_max"
+period = 1
+timeframe = "1d"
+input = "high"
+
+[blocks.dl]
+kind = "rolling_min"
+period = 1
+timeframe = "1d"
+input = "low"
+
+[long]
+entry = { all = [
+    { left = { time = "hour" }, op = "<=", right = 0 },
+    { left = { sub = ["dh", "dl"] }, op = ">=", right = { mul = [2, "atrp"] } },
+    { left = "close", op = ">=", right = { sub = ["dh", { mul = [0.25, { sub = ["dh", "dl"] }] }] } },
+    { left = "close", op = ">", right = "dcu" },
+] }
+exit = { all = [
+    { left = { time = "hour" }, op = "<=", right = 0 },
+    { left = "close", op = "<", right = "sma10" },
+] }
+
+[short]
+entry = { all = [
+    { left = { time = "hour" }, op = "<=", right = 0 },
+    { left = { sub = ["dh", "dl"] }, op = ">=", right = { mul = [2, "atrp"] } },
+    { left = "close", op = "<=", right = { add = ["dl", { mul = [0.25, { sub = ["dh", "dl"] }] }] } },
+    { left = "close", op = "<", right = "dcl" },
+] }
+exit = { all = [
+    { left = { time = "hour" }, op = "<=", right = 0 },
+    { left = "close", op = ">", right = "sma10" },
+] }
+
+[exits.long]
+stop = { level = { sub = ["dl", "atr"] } }
+time_stop = { bars = 120 }
+
+[exits.short]
+stop = { level = { add = ["dh", "atr"] } }
+time_stop = { bars = 120 }

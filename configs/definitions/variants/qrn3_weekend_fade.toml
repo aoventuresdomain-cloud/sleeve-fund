@@ -1,0 +1,39 @@
+version = 1
+name = "qrn3-weekend-fade"
+title = "Weekend-move Fade (Monday 00:00 UTC, 4h candles) · Long and Short"
+reason = """Only at the 4h candle closing Monday 00:00 UTC: a weekend move (this close over the daily close two days
+earlier, Saturday 00:00) of at least one daily ATR(14) is faded: short after a rise, long after a fall, held to the
+Wednesday 00:00 UTC close (12 four-hour candles); 1.5 ATR stop. Weekend books are thin and weekday flows are absent,
+so thin-book moves should partly revert. E's one pre-named effect. Fixed before any run. Held at 1x."""
+
+[blocks.atr]
+kind = "atr"
+period = 14
+timeframe = "1d"
+
+[blocks.fri]
+kind = "lag"
+period = 2
+timeframe = "1d"
+
+[long]
+entry = { all = [
+    { left = { time = "weekday" }, op = "<=", right = 0 },
+    { left = { time = "hour" }, op = "<=", right = 0 },
+    { left = { sub = ["close", "fri"] }, op = "<=", right = { mul = [-1, "atr"] } },
+] }
+
+[short]
+entry = { all = [
+    { left = { time = "weekday" }, op = "<=", right = 0 },
+    { left = { time = "hour" }, op = "<=", right = 0 },
+    { left = { sub = ["close", "fri"] }, op = ">=", right = "atr" },
+] }
+
+[exits.long]
+stop = { level = { sub = ["close", { mul = [1.5, "atr"] }] } }
+time_stop = { bars = 12 }
+
+[exits.short]
+stop = { level = { add = ["close", { mul = [1.5, "atr"] }] } }
+time_stop = { bars = 12 }

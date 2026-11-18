@@ -1,0 +1,72 @@
+name: study-admin
+# STUDY-ADMIN (HoE 17 Nov): two hand-run chores on the paper server's one-off study containers (study.yml names
+# each one study-<run id>), which no other workflow can do.
+#   check (the default): read-only. Prints the server's size (CPUs, memory, disk on / and /opt) and the study
+#     containers running, with their live use. Changes nothing.
+#   stop: stops the one container named exactly study-<run_id>, with 60 seconds' grace. It never removes, prunes or
+#     touches any other container, and it refuses a run_id that is not digits.
+# stop needs the PM's word for each use: one dispatch per approval, for the run id the PM approved.
+# Nothing here reads a result, a secret or a figure from the research data; the log is public.
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: check (read-only) or stop (one study container; needs the PM's word for each use)
+        type: choice
+        options: [check, stop]
+        required: true
+        default: check
+      run_id:
+        description: For stop only, the study run's id (digits); the container stopped is study-<run_id>
+        required: false
+        default: ""
+# One admin chore at a time.
+concurrency: { group: study-admin }
+jobs:
+  admin:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions: { contents: read }
+    if: ${{ vars.DEPLOY_ENABLED == 'true' && github.ref == 'refs/heads/main' }}
+    env:
+      USER_AT: ${{ vars.DEPLOY_USER || 'root' }}
+    steps:
+      - name: Check the inputs
+        env:
+          ACTION: ${{ inputs.action }}
+          RUN_ID: ${{ inputs.run_id }}
+        run: |
+          case "$ACTION" in
+            check) ;;
+            stop) [[ "$RUN_ID" =~ ^[0-9]{6,20}$ ]] || { echo "run_id must be the study run's id, 6 to 20 digits"; exit 1; } ;;
+            *) echo "action must be check or stop"; exit 1 ;;
+          esac
+      - name: Configure SSH
+        env:
+          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/id_deploy && chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts
+      - name: Check the server
+        if: inputs.action == 'check'
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          ssh -i ~/.ssh/id_deploy "$USER_AT@$HOST" '
+            echo "cpus: $(nproc)"; free -m; df -h / /opt
+            echo "study containers:"; sudo docker ps --filter name=study- --format "{{.Names}} {{.Status}} {{.RunningFor}}"
+            ids=$(sudo docker ps -q --filter name=study-)
+            if [ -n "$ids" ]; then sudo docker stats --no-stream $ids; else echo "none running"; fi'
+      - name: Stop the study container
+        if: inputs.action == 'stop'
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          RUN_ID: ${{ inputs.run_id }}
+        run: |
+          [[ "$RUN_ID" =~ ^[0-9]{6,20}$ ]] || exit 1  # checked again where it is used
+          ssh -i ~/.ssh/id_deploy "$USER_AT@$HOST" "set -e
+            echo before:; sudo docker ps --filter name=study- --format '{{.Names}} {{.Status}}'
+            sudo docker stop -t 60 study-$RUN_ID
+            echo after:; sudo docker ps --filter name=study- --format '{{.Names}} {{.Status}}'"

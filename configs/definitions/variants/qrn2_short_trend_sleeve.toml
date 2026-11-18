@@ -1,0 +1,54 @@
+version = 1
+name = "qrn2-short-trend-sleeve"
+title = "Short-side Trend (daily signal, 4h candles) · Short only"
+reason = """Proposed after a falling test window. The half of the market V5 (long-only) sits out: at the 00:00 UTC
+close, short a close below the prior 20-day low while the close is below the daily SMA200 and the SMA50 is below the
+SMA200; usually paid funding while short. Out at a 00:00 close back above the daily SMA20; 3 daily ATR(14) stop.
+Fixed before any run. Held at 1x."""
+
+[blocks.dc]
+kind = "donchian"
+period = 20
+timeframe = "1d"
+
+# Yesterday's channel: the 1d Donchian includes the day just closed, so lag it one day (HoE 17 Nov).
+[blocks.dcl]
+kind = "lag"
+period = 1
+timeframe = "1d"
+input = "dc.lower"
+
+[blocks.sma20]
+kind = "sma"
+period = 20
+timeframe = "1d"
+
+[blocks.sma50]
+kind = "sma"
+period = 50
+timeframe = "1d"
+
+[blocks.sma200]
+kind = "sma"
+period = 200
+timeframe = "1d"
+
+[blocks.atr]
+kind = "atr"
+period = 14
+timeframe = "1d"
+
+[short]
+entry = { all = [
+    { left = { time = "hour" }, op = "<=", right = 0 },
+    { left = "close", op = "<", right = "dcl" },
+    { left = "close", op = "<", right = "sma200" },
+    { left = "sma50", op = "<", right = "sma200" },
+] }
+exit = { all = [
+    { left = { time = "hour" }, op = "<=", right = 0 },
+    { left = "close", op = ">", right = "sma20" },
+] }
+
+[exits.short]
+stop = { level = { add = ["close", { mul = [3, "atr"] }] } }

@@ -694,6 +694,8 @@ class LongFlatStrategy(Strategy):
         self._bid = self._ask = None  # the venue's best quotes (paper and live, and replayed quotes)
         self.recorder = None  # sleeve_fund.paper.recorder.Recorder, when a paper run is being recorded
         self._last_tick_ns = 0
+        self._live_at_exec = True  # whether the book was live after the latest execution bar (QUIET-TICKS)
+        self._reconcile_next: tuple = (None, 0)  # (runtime.last_reconciled, the next reconcile due in ns)
         self._mark_warned = False
         self._entry_px = None  # average entry price of the open position
         self._opened_seq = -1  # backtests: the venue's bar (fee_model.bar_seq) the last entry or add filled in
@@ -1402,10 +1404,61 @@ class LongFlatStrategy(Strategy):
                 return
         if self._margin:
             self._intrabar_guard(bar)
-        if self.clock.timestamp_ns() != self._last_tick_ns:  # the decision bar at this time may have ticked
+        now = self.clock.timestamp_ns()
+        quiet = now != self._last_tick_ns and not self._exec_tick_due(now)  # the decision bar here may have ticked
+        if not quiet and now != self._last_tick_ns:
             self._on_tick()
         self._bar_target(bar)
         self._rest_risk_stop()
+        if self._quiet_marks() is not None:
+            # A quiet minute was flat with nothing working (_exec_tick_due), so nothing could fill on it: only an order
+            # this strategy sent since makes it live, and it ticks the next minute.
+            self._live_at_exec = bool(self._sent) if quiet else self._book_live()
+
+    def _quiet_marks(self) -> frozenset | None:
+        """QUIET-TICKS (HoE 17 Nov): when this backtest may skip the full tick on a quiet minute, the bars it still
+        ticks for their kept mark (SleeveRuntime.quiet_marks, set by the runner from its data), else None: every
+        minute ticks."""
+        rt = self.runtime
+        return None if rt is None or not rt.backtest or self.pair is not None else rt.quiet_marks
+
+    def _book_live(self) -> bool:
+        """Whether anything a tick acts on is live: a position, or an order working or owed. Flat, a halt or a pause
+        gives a tick nothing to do (a backtest lifts a daily pause at its next entry check, SleeveRuntime.tick)."""
+        iid, cache = self._cfg.instrument_id, self.cache
+        # Counts, not the orders themselves: this runs on every minute. An order closed without waiting on it
+        # (_working's B-14) or one already sent still reads live here, which only ticks a minute more.
+        return bool(cache.positions_open_count(instrument_id=iid)
+                    or cache.orders_open_count(instrument_id=iid, strategy_id=self.strategy_id)
+                    or cache.orders_inflight_count(instrument_id=iid, strategy_id=self.strategy_id)
+                    or self._sent or self._pending_exit is not None or self._flip is not None
+                    or self._restore is not None)
+
+    def _exec_tick_due(self, now: int) -> bool:
+        """QUIET-TICKS: an execution bar's full tick (mark, guard, funding, reconcile) runs every minute while the
+        book is live, and on the minute after it last was. Flat with nothing working, nothing can fill and a tick
+        changes nothing but the mark (equity is constant: no breach, pause or halt can come of it; CR #361), so it
+        runs only where a mark is kept or a clock acts: the data's last bar of each hour (MemoryJournal keeps an hour's
+        last mark, a day's past 90 days; the run's last bar is one), a decision close, and a reconcile due. Fills,
+        orders, funding, events and the kept marks come out as they do with every minute ticked, gaps in the data
+        included (tests/test_quiet_ticks.py)."""
+        marks = self._quiet_marks()
+        if marks is None or self._live_at_exec:
+            return True
+        return (now in marks or now % (self.runtime.tick_seconds * 1_000_000_000) == 0
+                or self._reconcile_due_at(now))
+
+    def _reconcile_due_at(self, now: int) -> bool:
+        """SleeveRuntime.reconcile_due at the engine's time `now`, in nanoseconds: read once a minute, so the
+        next due time is kept rather than built from a datetime each time."""
+        last = self.runtime.last_reconciled
+        if last is None:
+            return True
+        if self._reconcile_next[0] is not last:
+            from sleeve_fund.paper.runtime import RECONCILE_EVERY
+
+            self._reconcile_next = (last, round((last + RECONCILE_EVERY).timestamp() * 1e6) * 1000)  # whole seconds
+        return now >= self._reconcile_next[1]
 
     def _exit_backstop(self, bar: Bar) -> None:
         """B43-PRECISION 3(b): an exit (any closing intent) still open at the close of its EXIT_UNFILLED_BARS-th bar
