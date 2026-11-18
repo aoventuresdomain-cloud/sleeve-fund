@@ -143,8 +143,10 @@ def _utc_day(ts: pd.Timestamp) -> date:
     return (ts - pd.Timedelta(1, "ns")).tz_convert("UTC").date()  # a candle closing at 00:00 ends the old day
 
 
-def tally(decisions: dict, vol_on: bool) -> AssetCount:
-    """One asset's entries, sizes and exit-rule exits from a backtest's decisions, in the order they were made."""
+def tally(decisions: dict, vol_on: bool, decided_first: date | None = None) -> AssetCount:
+    """One asset's entries, sizes and exit-rule exits from a backtest's decisions, in the order they were made. Only
+    entries on or after decided_first count (CR F1 on #368): a rule whose own blocks settled before the definition's
+    longest warm-up can enter earlier, and the count is pro-rated over the days from decided_first."""
     from sleeve_fund.strategies.rules import VOL_SIZE_LIMIT
 
     out, entered = AssetCount(), None
@@ -152,6 +154,9 @@ def tally(decisions: dict, vol_on: bool) -> AssetCount:
         sig = d.get("signal") or {}
         if d.get("intent") == "entry":
             entered = pd.Timestamp(sig["bar"]["close_ts"])
+            if decided_first is not None and _utc_day(entered) < decided_first:
+                entered = None  # before the counted days: neither it nor its exit is counted
+                continue
             out.entries.append((entered, sig.get("side") or str(sig.get("rule", "long")).split(".")[0]))
             if vol_on:
                 out.sizes.append(float(sig.get("vol_factor", 1.0)))
@@ -183,7 +188,7 @@ def count_signals(req, history=None, store=None, backtest=None) -> SignalCount:
     vol = params.get("vol_target_size")
     settle = REGISTRY[req.strategy][0].warmup_needed(params, req.minutes)  # as the engine holds its decisions back
     first, last = train_window(req.pinned)
-    assets, decided = {}, None
+    runs, decided = {}, None
     for pair in req.pairs or [req.pair]:
         try:
             prices = train_bars(history.read(profile.name, pair, req.minutes), req.pinned)
@@ -198,8 +203,10 @@ def count_signals(req, history=None, store=None, backtest=None) -> SignalCount:
         fees = resolve_fees(profile.name, store, instrument=pair)
         instrument = profile.instrument(base, quote, fees=fees.fees,
                                         price_precision=history_price_decimals(prices["close"]))
-        res = backtest(req.strategy, prices, instrument, params=params, bar_minutes=req.minutes, half_spread=0)
-        assets[pair] = tally(res.decisions, vol is not None)
+        runs[pair] = backtest(req.strategy, prices, instrument, params=params, bar_minutes=req.minutes, half_spread=0)
+    assets = {}
+    for pair, res in runs.items():  # counted from the one first day every asset could decide on
+        assets[pair] = tally(res.decisions, vol is not None, decided) if decided else AssetCount()
         assets[pair].vol_skipped = int((getattr(res, "rule_counts", None) or {}).get("vol_skipped", 0))
     return SignalCount(train_first=first, train_last=last, decided_first=decided, test_days=days_tested(req.pinned),
                        assets=assets, vol_target=vol)

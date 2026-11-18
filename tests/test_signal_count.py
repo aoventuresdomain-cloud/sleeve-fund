@@ -155,6 +155,16 @@ def test_an_exit_rule_exit_on_a_later_utc_day_is_counted_as_after_a_reset():
     assert len(got.entries) == 4 and got.rule_exits == 3 and got.rule_exits_next_day == 1
 
 
+def test_only_entries_from_the_first_counted_day_are_counted():
+    """CR F1 on #368: a rule whose own blocks settle before the definition's longest warm-up can enter earlier; such an
+    entry, and its exit, fall outside the days the count is pro-rated over."""
+    decisions = {"a": _entry("2024-05-20T12:00:00+00:00"), "b": _exit("2024-05-21T04:00:00+00:00"),
+                 "c": _entry("2024-05-21T04:00:00+00:00"), "d": _exit("2024-05-21T08:00:00+00:00")}
+    got = tally(decisions, vol_on=False, decided_first=date(2024, 5, 21))
+    assert [ts.isoformat() for ts, _ in got.entries] == ["2024-05-21T04:00:00+00:00"] and got.rule_exits == 1
+    assert len(tally(decisions, vol_on=False).entries) == 2
+
+
 def test_with_a_volatility_target_each_assets_median_size_and_share_capped_are_printed():
     from sleeve_fund.strategies.rules import VOL_SIZE_LIMIT
 

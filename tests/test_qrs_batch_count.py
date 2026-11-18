@@ -15,7 +15,11 @@ import pytest
 from sleeve_fund.research import rescore, rounds
 from sleeve_fund.research.pinned import parse
 from sleeve_fund.research.variants import BATCH_VOL, PREREGISTERED, definition_path
-from sleeve_fund.strategies.definitions import check_definition, load_definition_file
+from sleeve_fund.strategies.definitions import (
+    check_definition,
+    definition_hash,
+    load_definition_file,
+)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_signal_count import PAIRS, _bars, _History
@@ -23,7 +27,8 @@ from test_signal_count import PAIRS, _bars, _History
 ROOT = Path(__file__).resolve().parents[1]
 LIST = ROOT / "configs" / "studies" / "qrs-batch-count-list.md"
 # The Researcher's final raw sha256 values (idea-batch-18nov.md, FINAL for the count, Advisor ~10:56 UTC)
-FROZEN = {"qrs1_short_pullback_downtrend": "790c7cb45ca6fb9c5a0885b9792749bf3e69e784f656f0755f260c39b7504f63",
+FROZEN = {# qrs1: its reason reworded without H0's figures (CR M1 on #368, public repo); the reason is outside its hash
+          "qrs1_short_pullback_downtrend": "24b4759143eae46c3b2ccaa7823e1a76f6575233fc5b173bf0e87856950d606c",
           "qrs2_london_asia_range_fade": "d0ba96f92145be9629686382ef7b68c7c51a5812299ce1f757af3ac63c12f30b",
           "qrs3_shock_fade_4h": "30dbdfcadc5cc9497fe1371e2c87801ce7de777467e4e3bbf001d55a48bfd6a6",
           "qrs4_vwap_range_reversion_4h": "6ada6c15052213c391b6fbe25d54a3b2a35611d83d46621ff3333d2a85d1b5b1"}
@@ -35,6 +40,12 @@ ROWS = [*FROZEN, *FALLBACKS]
 @pytest.mark.parametrize("name", FROZEN)
 def test_each_definition_is_the_researchers_file_byte_for_byte(name):
     assert hashlib.sha256(definition_path(name).read_bytes()).hexdigest() == FROZEN[name]
+
+
+def test_the_reworded_reason_keeps_the_cleared_variant_and_carries_no_figure():
+    defn = load_definition_file(definition_path("qrs1_short_pullback_downtrend"))
+    assert definition_hash(defn) == "1d119165a8dfdd64"  # the hash of the Researcher's file as cleared
+    assert not re.search(r"\d+\.\d+ bps|\d,\d{3}|over \d+ trades", defn["reason"])
 
 
 @pytest.mark.parametrize("name", FALLBACKS)
@@ -93,3 +104,8 @@ def test_the_count_runs_every_row_on_the_train_window_and_writes_nothing(capfd):
     # S4's day VWAP holds its first decision 1,441 candles (sized for 1-minute bars): on 4h, to late August
     s4 = next(line for line in out.splitlines() if line.startswith("row  4 ") and "decided from" in line)
     assert "decided from 2024-08-2" in s4
+    # CR F2: the count reads the engine's decisions, so a change to their keys must not read as zero entries
+    s1 = next(line for line in out.splitlines() if line.startswith("row  1 ") and "in all" in line)
+    assert int(re.search(r"; ([\d,]+) in all", s1).group(1).replace(",", "")) > 0
+    s4_exits = next(line for line in out.splitlines() if line.startswith("row  4 ") and "exit-rule exits" in line)
+    assert int(re.search(r"(\d+) of (\d+)", s4_exits).group(2)) > 0

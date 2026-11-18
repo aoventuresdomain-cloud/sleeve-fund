@@ -4,8 +4,8 @@ title = "Short Pullback in a Confirmed Downtrend (4h) · Short only"
 reason = """Inside a confirmed daily downtrend (close below the daily SMA200 and the daily SMA50 below the SMA200), a sharp
 4h rally (RSI(2) above 90) is usually short-covering or forced buying into supply; the seller is paid as price resumes
 down. Out when RSI(2) drops below 30 or the close is back under its 5-candle SMA, after 10 candles, or on a 2.5 ATR(14)
-stop. H0's short side with a second, slower downtrend confirmation: chosen after seeing H0's trades (shorts made gross
-+3,842 over 327 trades, 36.5 bps a trade, positive on all three assets). Fixed before any run. Sizing on the study list: vol_target_size = { annual = 0.40, lookback_days = 30 } (lag-1, capped at 1x)."""
+stop. H0's short side with a second, slower downtrend confirmation: chosen after seeing H0's trades, where its short
+side was the stronger one. Fixed before any run. Sizing on the study list: vol_target_size = { annual = 0.40, lookback_days = 30 } (lag-1, capped at 1x)."""
 
 [blocks.trend]
 kind = "sma"
