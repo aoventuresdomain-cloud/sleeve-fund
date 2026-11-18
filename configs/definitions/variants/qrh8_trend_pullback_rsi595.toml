@@ -5,7 +5,7 @@ reason = """Inside an established trend (close above the daily 200-day SMA for l
 short move against it (4h RSI(2) below 10 for longs, above 90 for shorts) is usually forced or emotional flow, and
 the side that takes it is paid for liquidity as price resumes. Out when RSI(2) recovers (above 70 long, below 30
 short), the close is back across its 5-candle SMA, or after 10 candles; 2.5 ATR(14) stop. qr02's settings except
-entries at RSI(2) below 5 / above 95: H item 8; an approximate check of H0's book found the entries it keeps lost money; no take-profit. Held at 1x."""
+entries at RSI(2) below 5 / above 95: H item 8; labelled known to hurt from a review of H0's trades; no take-profit. Held at 1x."""
 
 [blocks.trend]
 kind = "sma"
