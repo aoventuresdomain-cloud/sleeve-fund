@@ -38,7 +38,7 @@ from sleeve_fund.research.holdout import HoldoutLocks
 from sleeve_fund.research.metrics import daily_closes, fills_to_rows, trades
 from sleeve_fund.research.multi_asset import FIXED_LIST, AssetData, check_assets, leg_names, underlying
 from sleeve_fund.research.portfolio_run import LegSpec, PortfolioResult, run_portfolio
-from sleeve_fund.research.random_entry import BAR, DRAWS, HELD_BACK_MAX, Trade, _random_entries
+from sleeve_fund.research.random_entry import BAR, DRAWS, HELD_BACK_MAX, RECONCILE_PP, Trade, _random_entries
 from sleeve_fund.research.candidates import BUDGET_PER_IDEA, configurations
 from sleeve_fund.research.study import COST_LADDER, _between, doubled
 from sleeve_fund.risk import PORTFOLIO, PortfolioProfile
@@ -52,6 +52,15 @@ GATE_TOUCH_CAP = 0.05  # Advisor fork 3: the ungated random benchmark is like-wi
 CONCENTRATED = 0.5  # the top asset's share of the pooled out-of-sample net P&L above which the basket is flagged
 GROSS_CAP = 1.01  # guards off or scaled: a leg's notional over its own account's equity as it opens, lot rounding apart
 NEXT = "next: 4-6 weeks paper"
+# STUDY-SPEED (PM 17 Nov: our own slowness, no bigger server; Advisor's ruling 17 Nov): basket_study(fast=True) runs
+# the 0-fee rung beside the base run first and stops at a FAIL when the basket loses before fees or makes fewer than
+# MIN_TRADES test-window trades; a survivor's cost ladder is four rungs, never COST_LADDER's nine: 0, 0.02% a side,
+# the base run at the venue's fees, and the stress line at twice the venue's taker fee (0.11% on a 0.055% venue).
+FAST_RUNGS = (0.0, 0.0002)
+FAST_LADDER = "cost ladder: 4 rungs (17 Nov)"
+MIN_TRADES = 40
+SCREEN_BEFORE_FEES = True  # fast and counted: stop at the 0-fee rung on a screen's FAIL (tests turn it off to reach
+# the full study's own parts on a small synthetic basket the screen would stop)
 DAY = pd.Timedelta(days=1)
 
 
@@ -145,9 +154,9 @@ class BasketStudy:
     windows: tuple[tuple[date, date], ...]
     research_end: date
     base: Measured
-    double_fees: Measured
-    left_out: LeftOut
-    random: RandomBeat
+    double_fees: Measured | None  # None, with left_out and random, when screened out (fast: loses before fees)
+    left_out: LeftOut | None
+    random: RandomBeat | None
     gate: tuple[float, float]  # (notional the compliance tests trimmed or refused, intended entry notional), test days
     ladder: list[tuple[float, float]] = field(default_factory=list)  # (fee per side, pooled net)
     breakeven: tuple[float | None, str] = (None, "not tested")
@@ -172,6 +181,12 @@ class BasketStudy:
     unguarded_entries: dict = field(default_factory=dict)  # a guarded scaled run: its legs' intents, guards off
     equal: Any = None  # a rank book's EqualMoney on its base run (family C), else None
     unranked: list = field(default_factory=list)  # a rank book's Mondays it couldn't rank, as ISO dates (Advisor 16 Nov)
+    screened: str = ""  # fast: why it was screened out (a FAIL), so nothing past its 0-fee rung was run; "" if not
+    fast: bool = False  # its cost ladder is the four rungs (FAST_LADDER), not COST_LADDER's nine
+    real_rung: str = ""  # fast survivor (Advisor 18:22): "base reused" or "run", how its venue's-fee rung was made
+    trades: int = 0  # screened: the base run's test-window trades (test_trades)
+    gross_edge: float = math.nan  # screened: the 0-fee run's mean return per test-window trade on its notional
+    asset_ladder: dict = field(default_factory=dict)  # asset -> [(fee per side, its net on its share of the fund)]
 
     @property
     def gate_touched(self) -> float:
@@ -544,20 +559,42 @@ def top_contributor(totals: pd.Series) -> tuple[str, float, bool]:
     return top, share, bool(share > CONCENTRATED)
 
 
-def ladder_breakeven(rungs: list[tuple[float, float]]) -> tuple[float | None, str]:
+def ladder_breakeven(rungs: list[tuple[float, float]], beyond: str = "> top rung") -> tuple[float | None, str]:
     """The fee per side at which the pooled out-of-sample net is 0, interpolating log(1 + return) between the two
-    rungs either side of it (study._between); "<0" when it loses even at the bottom rung, "> top rung" when it still
+    rungs either side of it (study._between); "<0" when it loses even at the bottom rung, `beyond` when it still
     makes money at the top. Never extrapolated."""
     rungs = sorted(rungs)
     if not rungs or rungs[0][1] <= 0:
         return None, "<0"
     if rungs[-1][1] > 0:
-        return None, "> top rung"
+        return None, beyond
     for (f0, r0), (f1, r1) in zip(rungs, rungs[1:]):
         if r0 > 0 >= r1:
             value = _between(f0, r0, f1, r1)
             return value, f"{value:.3%} per side"
     return None, "> top rung"  # unreachable: the bottom rung is above 0 and the top isn't
+
+
+def _maker_filled(m: Measured) -> bool:
+    """Whether any leg of the run had a fill on the passive side (the venue's maker fee may have applied to it)."""
+    return any(leg.fills is not None and not leg.fills.empty and "liquidity_side" in leg.fills.columns
+               and (leg.fills["liquidity_side"].astype(str) == "MAKER").any() for leg in m.run.legs.values())
+
+
+def test_trades(m: Measured, bars: dict, windows) -> list:
+    """The run's closed trips opened on a test day, every leg's, as the sheet's trade files count them (each leg's
+    own record, periods.trade_rows; basket_run._test_day)."""
+    from sleeve_fund.research import periods
+    from sleeve_fund.research.basket_run import _test_day
+
+    return [r for leg, bar in bars.items() if leg in m.run.legs for r in periods.trade_rows(m.run.legs[leg])
+            if r.closed is not None and _test_day(r.opened, bar, windows)]
+
+
+def gross_edge(zero: Measured, bars: dict, windows) -> float:
+    """The 0-fee run's mean return per test-window trade on its notional: the edge each trade has before costs."""
+    rows = test_trades(zero, bars, windows)
+    return float(np.mean([r.ret for r in rows])) if rows else math.nan
 
 
 def trade_pnl(closes: np.ndarray, trips: list[TradeAt], cost_per_side: float) -> np.ndarray:
@@ -771,12 +808,18 @@ def _created(t: dict) -> pd.Timestamp:
 def basket_study(basket: Basket, windows, research_end: date, *, register: trials.TrialsRegister, dataset: str,
                  capital: float = 10_000.0, profile: PortfolioProfile = PORTFOLIO, warm_days: int = 200,
                  ladder: bool = True, draws: int = DRAWS, seed: int = 0, filled: bool = False,
-                 scale: float | None = None, counted: bool = True) -> BasketStudy:
+                 scale: float | None = None, counted: bool = True, fast: bool = False) -> BasketStudy:
     """The basket's study over the walk-forward's test windows ((first day, last day), in order), never reading a bar
     after research_end. Its holdout stays sealed: open_holdout is the separate final step. filled: a study request's
     asset list (STUDY-ASSET-LIST): random entry judged filled on the pooled book, the hold bar, and without SOL.
     scale: every leg at that share of its unscaled size (_run). counted False: a confirming run (Advisor 27 Oct, the
-    guarded run at a size scale), whose settings are counted by their unguarded run, so it records no try."""
+    guarded run at a size scale), whose settings are counted by their unguarded run, so it records no try.
+    fast (STUDY-SPEED): the 0-fee rung is run beside the base run first, and a counted basket that loses before fees is
+    a FAIL screened out there, its try counted, with nothing else run (a confirming or benchmark run, never a try,
+    still runs whole: its fitness lines are its point). A counted basket with fewer than MIN_TRADES test-window trades
+    is screened out the same way. A survivor's cost ladder is four rungs (Advisor 17 Nov, FAST_LADDER): 0, 0.02%, the
+    venue's fee (the base run) and the stress rung at twice it, the break-even fee interpolated between the two that
+    bracket it, or "> " the stress rung. Every condition is judged as without it."""
     windows = tuple(tuple(w) for w in windows)
     if not windows or windows[-1][1] > research_end:
         raise ValueError(f"the test windows must end by the research end {research_end}")
@@ -803,10 +846,43 @@ def basket_study(basket: Basket, windows, research_end: date, *, register: trial
                              "1x gross), so no sheet and no try")
     bars = {n: _bar(sp) for n, sp in zip(names, specs)}
     touched = gate_touched(base.run, windows, bars)
-    twice_fees = {str(a.instrument.id): doubled(base_fees(a.instrument, basket.params)) for a in assets}
-    if len({(f.maker, f.taker) for f in twice_fees.values()}) != 1:
+    real_fees = {str(a.instrument.id): base_fees(a.instrument, basket.params) for a in assets}
+    if len({(f.maker, f.taker) for f in real_fees.values()}) != 1:
         raise ValueError("the basket's assets pay different fees: a leg's own doubled fees aren't supported yet")
-    twice, _, _ = measured(assets, next(iter(twice_fees.values())))
+    rungs, per_asset = [], {a: [] for a in names_of}
+
+    def rung(fee: float, m: Measured | None = None) -> Measured:
+        """The rung at `fee` per side on every fill, a real run of it unless `m` is that run already; each asset's
+        net on its share of the fund is kept for its own line."""
+        if m is None:
+            m, _, _ = measured(assets, FeeSchedule(maker=_dec(fee), taker=_dec(fee)))
+        rungs.append((fee, m.net))
+        for a in names_of:
+            per_asset[a].append((fee, float(m.pnl[a].sum()) / (capital / len(assets))))
+        return m
+
+    real = next(iter(real_fees.values()))
+    zero = rung(0.0) if fast else None
+    if zero is not None:
+        counted_trades = test_trades(base, bars, windows)
+        # the trade count first, so a basket that never trades (net exactly 0) reads as too few trades
+        why = (f"fewer than {MIN_TRADES} test-window trades" if len(counted_trades) < MIN_TRADES else
+               "loses before fees" if zero.net <= 0 else None)
+        if why and counted and SCREEN_BEFORE_FEES:  # STUDY-SPEED: no condition can pass, or too few trades to judge
+            if own and filled:  # CR M1 on #365: the full study's trips-against-book refusal holds here too
+                _, (trips, book), _ = pooled_legs(base, names, specs, basket.params, windows, capital)
+                if not abs(trips - book) <= RECONCILE_PP:
+                    raise ValueError(f"refused: the basket's pooled trips add to {trips:+.1%} against the book's "
+                                     f"{book:+.1%} over them: the trades and the book disagree, so no sheet and no try")
+            study = BasketStudy(basket, windows, research_end, base, None, None, None, touched, ladder=rungs,
+                                breakeven=ladder_breakeven(rungs, "not run: screened out"),
+                                asset_breakeven={a: ladder_breakeven(r, "not run: screened out")
+                                                 for a, r in per_asset.items()})
+            study.screened, study.fast, study.asset_ladder = why, True, per_asset
+            study.trades, study.gross_edge = len(counted_trades), gross_edge(zero, bars, windows)
+            return _finish(study, basket, base, names, names_of, bars, windows, equal, own, profile, scale, counted,
+                           register, dataset, first, last, warm_days)
+    twice, _, _ = measured(assets, doubled(real))
     twice.passed = twice.net > 0
     top, share, concentrated = top_contributor(base.pnl.sum())
     rest = [a for a, n in zip(assets, names_of) if n != top]
@@ -815,28 +891,33 @@ def basket_study(basket: Basket, windows, research_end: date, *, register: trial
     left.random = random_beat(out, out_names, out_specs, basket.params, windows, capital,
                               gate_touched(out.run, windows, {n: _bar(sp) for n, sp in zip(out_names, out_specs)}),
                               draws, seed)
-    rungs, per_asset = [], {a: [] for a in names_of}
-    if ladder:
+    breakeven, beyond = (None, "not tested"), "> top rung"
+    real_rung = ""
+    if ladder and fast:
+        # Advisor 17 Nov: four rungs. The base run is the venue's-fee rung, at its taker fee per side; a stress rung
+        # at one fee on every fill is the doubled run itself when the venue charges one fee on every fill.
+        stress = 2 * float(real.taker)
+        for f in FAST_RUNGS[1:]:
+            rung(f)
+        # CR F1 on #365: the base run is one flat fee only when the venue charges one, or it made no maker fill
+        reuse = real.maker == real.taker or not _maker_filled(base)
+        rung(float(real.taker), base if reuse else None)
+        real_rung = "base reused" if reuse else "run"
+        rung(stress, twice if real.maker == real.taker else None)
+        breakeven, beyond = ladder_breakeven(rungs, f"> {stress:.2%}"), f"> {stress:.2%}"
+    elif ladder:
         for f in COST_LADDER:
-            m, _, _ = measured(assets, FeeSchedule(maker=_dec(f), taker=_dec(f)))
-            rungs.append((f, m.net))
-            for a in names_of:
-                per_asset[a].append((f, float(m.pnl[a].sum()) / (capital / len(assets))))
+            rung(f)
+        breakeven = ladder_breakeven(rungs)
+    elif fast:
+        rungs, per_asset = [], {a: [] for a in names_of}  # no ladder asked for: the screen's rung is no ladder line
     study = BasketStudy(
         basket, windows, research_end, base, twice, left,
         random_beat(base, names, specs, basket.params, windows, capital, touched, draws, seed), touched,
-        ladder=rungs, breakeven=ladder_breakeven(rungs) if rungs else (None, "not tested"),
-        asset_breakeven={a: ladder_breakeven(r) for a, r in per_asset.items() if r})
-    study.key = basket_key(basket)
-    study.equal = equal
-    if equal is not None:
-        study.unranked = unranked_dates(base.run)
-    study.unguarded, study.size_scale, study.counted = profile == UNGUARDED, scale, counted
-    if own:
-        by_leg = held_peaks(base.run)
-        study.held = {a: by_leg[n] for a, n in zip(names_of, names) if n in by_leg}
-    study.legs = {n: (a, bars[n]) for n, a in zip(names, names_of)}
-    study.intents = intents(base.run, windows, bars)
+        ladder=sorted(rungs), breakeven=breakeven,
+        asset_breakeven={a: ladder_breakeven(r, beyond) for a, r in per_asset.items() if r})
+    study.fast, study.asset_ladder, study.real_rung = fast, per_asset, real_rung
+    _finish(study, basket, base, names, names_of, bars, windows, equal, own, profile, scale, counted)
     if scale is not None and profile != UNGUARDED:  # Advisor 28 Oct: the same legs' entries with the guards off
         free, _, _ = _run(basket, assets, first, last, None, capital, UNGUARDED, warm_days, scale)
         for i in intents(free, windows, bars):
@@ -859,6 +940,28 @@ def basket_study(basket: Basket, windows, research_end: date, *, register: trial
                 trips, book = r.reconciled
                 raise ValueError(f"refused: {name}'s pooled trips add to {trips:+.1%} against the book's {book:+.1%} "
                                  "over them: the trades and the book disagree, so no sheet and no try")
+    return _count(study, basket, base, counted, register, dataset, first, last, warm_days)
+
+
+def _finish(study: BasketStudy, basket: Basket, base: Measured, names, names_of, bars, windows, equal, own: bool,
+            profile: PortfolioProfile, scale: float | None, counted: bool, *count) -> BasketStudy:
+    """What every basket study states about its base run, screened out or not; with `count` (register, dataset,
+    first, last, warm_days), its try counted too (_count)."""
+    study.key = basket_key(basket)
+    study.equal = equal
+    if equal is not None:
+        study.unranked = unranked_dates(base.run)
+    study.unguarded, study.size_scale, study.counted = profile == UNGUARDED, scale, counted
+    if own:
+        by_leg = held_peaks(base.run)
+        study.held = {a: by_leg[n] for a, n in zip(names_of, names) if n in by_leg}
+    study.legs = {n: (a, bars[n]) for n, a in zip(names, names_of)}
+    study.intents = intents(base.run, windows, bars)
+    return _count(study, basket, base, counted, *count) if count else study
+
+
+def _count(study: BasketStudy, basket: Basket, base: Measured, counted: bool, register, dataset: str, first: date,
+           last: date, warm_days: int) -> BasketStudy:
     if counted:  # the register's Sharpe is the book's, as the sheet gives it: never the close-priced comparison's,
         # which prices trips at decision closes and never at their stop fills (Advisor, B0's ruling 31 Oct)
         sharpe = _sharpe(base.returns.to_numpy())
@@ -923,7 +1026,9 @@ def open_holdout(study: BasketStudy, period: tuple[date, date], locks: HoldoutLo
 
 def verdict(study: BasketStudy, holdout: Holdout | None) -> str:
     """PASS only with all four. FAIL when one is judged and fails; NOT JUDGED when the random check couldn't be
-    (it can't pass then); NOT YET while the holdout is sealed."""
+    (it can't pass then); NOT YET while the holdout is sealed. Screened out (fast: it loses before fees), FAIL."""
+    if getattr(study, "screened", False):
+        return "FAIL"
     pooled, hold = getattr(study, "pooled", None), getattr(study, "hold", None)
     if pooled is not None:  # STUDY-ASSET-LIST: the filled pooled comparison decides; the hold bar once it is proven
         random_failed, judged = pooled.verdict == "FAIL", pooled.verdict == "PASS"
@@ -951,6 +1056,8 @@ def render(study: BasketStudy, holdout: Holdout | None = None, round_try: str | 
     counter's own, a count of every definition-built basket under one model (QD 31 Oct, B0's sheet). viewed: the
     assets whose holdout lock an earlier study already holds, the holdout row's words read off the seal itself
     (Advisor, B0's ruling 31 Oct: never "already viewed" on a sealed run)."""
+    if getattr(study, "screened", False):
+        return _render_screened(study, round_try)
     b, base = study.basket, study.base
     days = len(base.returns)
     v = verdict(study, holdout)
@@ -958,14 +1065,8 @@ def render(study: BasketStudy, holdout: Holdout | None = None, round_try: str | 
     not_judged = "NOT JUDGED: the random benchmark couldn't be judged, so the basket can't pass"
     if pooled is not None and pooled.verdict == "PASS" and study.hold is not None and not BH102_LIVE:
         not_judged = f"NOT JUDGED: the hold bar is {UNPROVEN}, so the basket can't pass yet"
-    head = {"NOT YET": "NOT YET: the locked holdout is sealed until its own final step",
-            "NOT JUDGED": not_judged, "PASS": "PASS", "FAIL": "FAIL"}[v]
-    if study.size_scale is not None and not study.unguarded:
-        head = (f"FITNESS ONLY: a guarded run with every leg at {study.size_scale:g} of its size; the edge "
-                f"verdict is the unguarded run's (this run's own would read {v})")
-    elif b.risk_profile is not None and not study.unguarded:
-        head = (f"FITNESS ONLY: a guarded run under the {b.risk_profile} risk profile; the edge verdict is the "
-                f"unguarded run's (this run's own would read {v})")
+    head = _fitness_head(study, {"NOT YET": "NOT YET: the locked holdout is sealed until its own final step",
+                                 "NOT JUDGED": not_judged, "PASS": "PASS", "FAIL": "FAIL"}[v], v)
     lo = study.left_out
     if pooled is None:
         random_rows = [f"| Beats random entries (95th percentile) | {random_words(study.random)} |"]
@@ -986,12 +1087,7 @@ def render(study: BasketStudy, holdout: Holdout | None = None, round_try: str | 
         f"_{FIXED_LIST.format(date=b.universe_date)}_", "",
         *_run_lines(study),
         fills_line(study), "",
-        (f"**Tries:** {round_try}" if round_try and study.counted else
-         f"**Tries:** {study.tries} (one per fixed basket and settings); this basket is try {study.configuration} of "
-         f"{BUDGET_PER_IDEA} for {b.strategy}'s family" if study.counted else
-         "**Tries:** not a new try: a benchmark under paper's risk caps, never counted (HoE 16 Nov)"
-         if b.risk_profile is not None else
-         "**Tries:** not a new try: a confirming run of settings already counted (Advisor 27 Oct)"), "",
+        _tries_line(study, round_try), "",
         *([LEGS_NOT_REBALANCED, ""] if pooled is not None else []),
         *_held_lines(study),
         *_equal_lines(study),
@@ -1011,8 +1107,10 @@ def render(study: BasketStudy, holdout: Holdout | None = None, round_try: str | 
         f"The compliance tests trimmed or refused {study.gate[0]:,.2f} of {study.gate[1]:,.2f} intended entry notional "
         f"on the test days ({study.gate_touched:.1%} of entry notional, each intent once).", "",
         *_gate_lines(study),
-        f"**Pooled break-even fee:** {study.breakeven[1]} (one fee per side on every fill, real runs on the cost "
-        "ladder)", "",
+        f"**Pooled break-even fee:** {study.breakeven[1]} (one fee per side on every fill, "
+        + (f"interpolated between real runs on the {FAST_LADDER}: {_rungs_words(study.ladder)}; real-fee rung: "
+           f"{getattr(study, 'real_rung', '') or 'not run'})"
+           if getattr(study, "fast", False) else "real runs on the cost ladder)"), "",
         *_without_sol_lines(study),
         "## Per asset (diagnostic only, never a verdict)", "",
         "| Asset | Out-of-sample net P&L | Share | Break-even fee |", "| --- | --- | --- | --- |",
@@ -1024,6 +1122,79 @@ def render(study: BasketStudy, holdout: Holdout | None = None, round_try: str | 
         lines.append(f"| {a} | {totals[a]:,.2f} | {totals[a] / whole if whole else math.nan:.0%} | {be} |")
     lines += ["", f"On a PASS, {NEXT}." if v != "PASS" else f"PASS, so {NEXT}.", ""]
     return "\n".join(lines)
+
+
+def _fitness_head(study: BasketStudy, head: str, v: str) -> str:
+    b = study.basket
+    if study.size_scale is not None and not study.unguarded:
+        return (f"FITNESS ONLY: a guarded run with every leg at {study.size_scale:g} of its size; the edge verdict is "
+                f"the unguarded run's (this run's own would read {v})")
+    if b.risk_profile is not None and not study.unguarded:
+        return (f"FITNESS ONLY: a guarded run under the {b.risk_profile} risk profile; the edge verdict is the "
+                f"unguarded run's (this run's own would read {v})")
+    return head
+
+
+def _tries_line(study: BasketStudy, round_try: str | None) -> str:
+    b = study.basket
+    if round_try and study.counted:
+        return f"**Tries:** {round_try}"
+    if study.counted:
+        return (f"**Tries:** {study.tries} (one per fixed basket and settings); this basket is try "
+                f"{study.configuration} of {BUDGET_PER_IDEA} for {b.strategy}'s family")
+    if b.risk_profile is not None:
+        return "**Tries:** not a new try: a benchmark under paper's risk caps, never counted (HoE 16 Nov)"
+    return "**Tries:** not a new try: a confirming run of settings already counted (Advisor 27 Oct)"
+
+
+def _rungs_words(rungs: list[tuple[float, float]]) -> str:
+    return ", ".join(f"{_pct(net)} at {fee:.4%}" for fee, net in sorted(rungs))
+
+
+def _render_screened(study: BasketStudy, round_try: str | None) -> str:
+    """STUDY-SPEED (Advisor 17 Nov): the sheet of a basket screened out on its base and 0-fee runs, for losing before
+    fees or for too few test-window trades to judge: its trade count, its net at no fee and at the venue's, its gross
+    edge per trade, what was not run and why, its try, and each asset's two lines. Nothing past the 0-fee rung ran."""
+    b, base = study.basket, study.base
+    zero = dict(study.ladder)[0.0]
+    totals, whole = base.pnl.sum(), float(base.pnl.sum().sum())
+    head = f"FAIL ({study.screened})"
+    why = ("it loses before fees, so no fee can make it pass" if study.screened == "loses before fees" else
+           f"it made {study.trades} trades in the test windows, under the {MIN_TRADES} a verdict needs")
+    lines = [
+        f"# Basket study: {b.name} ({b.strategy} on {', '.join(b.names)})", "",
+        f"**Basket verdict:** {_fitness_head(study, head, 'FAIL')}", "",
+        f"_{FIXED_LIST.format(date=b.universe_date)}_", "",
+        *_run_lines(study),
+        fills_line(study), "",
+        _tries_line(study, round_try), "",
+        *_equal_lines(study),
+        (f"Out-of-sample: {study.windows[0][0]} to {study.windows[-1][1]}, {len(base.returns)} days, one fund run of "
+         f"the whole basket: {study.trades} test-window trades; net {_pct(zero)} before fees (0% a side) and "
+         f"{_pct(base.net)} at the venue's fees; gross edge {_pct_fine(study.gross_edge)} per trade before fees."), "",
+        "| Condition | Result |", "| --- | --- |",
+        f"| Net above 0 before fees (0% a side) | {'FAIL' if zero <= 0 else 'PASS'}, net {_pct(zero)} |",
+        f"| At least {MIN_TRADES} test-window trades | {'FAIL' if study.trades < MIN_TRADES else 'PASS'}, "
+        f"{study.trades} |",
+        f"| Net at the venue's fees | net {_pct(base.net)} |", "",
+        (f"Screened out: {why}. The 2x fees run, the best asset left out, the random-entry draws, the hold bar, the "
+         "run without SOL and the rest of the cost ladder were not run (PM 17 Nov: study speed)."), "",
+        f"_{FAST_LADDER}: screened out after its 0-fee rung._", "",
+        (f"The compliance tests trimmed or refused {study.gate[0]:,.2f} of {study.gate[1]:,.2f} intended entry "
+         f"notional on the test days ({study.gate_touched:.1%} of entry notional, each intent once)."), "",
+        "## Per asset (diagnostic only, never a verdict)", "",
+        "| Asset | Out-of-sample net P&L at the venue's fees | Share | Before fees, on its share of the fund |",
+        "| --- | --- | --- | --- |",
+    ]
+    for a in base.assets:
+        before = dict(study.asset_ladder.get(a, [])).get(0.0)
+        lines.append(f"| {a} | {totals[a]:,.2f} | {totals[a] / whole if whole else math.nan:.0%} | {_pct(before)} |")
+    return "\n".join(lines + [""])
+
+
+def _pct_fine(x: float) -> str:
+    """A per-trade return, to a hundredth of a percent (a trade's edge is often a fraction of one)."""
+    return "n/a" if x is None or (isinstance(x, float) and math.isnan(x)) else f"{x:+.2%}"
 
 
 # Advisor 27 Oct (check 2b): the basket's convention, beside a pool worked by hand

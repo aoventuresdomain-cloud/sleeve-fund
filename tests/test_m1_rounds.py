@@ -204,9 +204,13 @@ def test_a_basket_sheets_tries_line_gives_its_rounds_count(monkeypatch, tmp_path
     assert f"**Tries:** {line}" in text and " of 20 for " not in text
 
 
-def test_a_sealed_basket_sheet_says_already_viewed_only_where_an_earlier_study_holds_the_lock(tmp_path):
+def test_a_sealed_basket_sheet_says_already_viewed_only_where_an_earlier_study_holds_the_lock(tmp_path, monkeypatch):
     """The holdout row reads the seal itself (CR M1 on #341): a lock an earlier study settled under the basket's idea
     shows on its asset; a register with no lock shows a sealed holdout with nothing viewed."""
+    from sleeve_fund.research import basket as bk
+
+    # the holdout row is the full study's (tests/test_study_speed.py pins the screen that would stop this basket)
+    monkeypatch.setattr(bk, "SCREEN_BEFORE_FEES", False)
     from test_study_asset_list import _History, _req
 
     from sleeve_fund.research import run as run_mod

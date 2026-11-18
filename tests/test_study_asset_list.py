@@ -112,7 +112,14 @@ def ran(tmp_path_factory):
     tmp = tmp_path_factory.mktemp("sal")
     store = Store(f"sqlite:///{tmp}/t.db")
     history = _History()
-    out = run_mod.run_store_study(_req(), store=store, out_dir=tmp / "sheets", history=history)
+    mp = pytest.MonkeyPatch()
+    # these runs reach the full study's own parts (draws, guards, sheet lines) on a small synthetic basket,
+    # which a store study's screen stops at its 0-fee rung (tests/test_study_speed.py pins the screen)
+    mp.setattr(bk, "SCREEN_BEFORE_FEES", False)
+    try:
+        out = run_mod.run_store_study(_req(), store=store, out_dir=tmp / "sheets", history=history)
+    finally:
+        mp.undo()
     return out, store, history, tmp
 
 
