@@ -322,3 +322,21 @@ def test_the_spread_charged_is_named_by_whether_a_measurement_covered_the_window
     assert spread_words(series((2025, 3, 1)), first, last) == "assumed"
     assert spread_words(series((2023, 12, 1)), first, last) == "measured"
     assert spread_words(series((2024, 6, 1)), first, last) == "assumed, then measured"
+    assert spread_words(series((2024, 12, 31, 12)), first, last) == "assumed, then measured"  # the window's last day
+    assert spread_words(series((2025, 1, 1)), first, last) == "assumed"  # the day after it
+
+
+@pytest.mark.parametrize("paid, pooled", [(0.0, "PASS"), (-0.1, "FAIL")])
+def test_the_count_hands_each_runs_funding_to_its_edge(paid, pooled):
+    """CR T1 and HoQA on #372: the run's own funding reaches the edge, so a payment while a trade is held can move it
+    under the bar. Each asset's one trade makes 30 bps before funding; a 0.1 payment on 100 of notional is 10 bps."""
+    bars = {p: _bars(seed=i) for i, p in enumerate(PAIRS.split(","))}
+
+    def backtest(strategy, prices, instrument, params, bar_minutes, half_spread):
+        fills = _fills([("BUY", 1, 100.0, "2024-09-01 12:01"), ("SELL", 1, 100.3, "2024-09-02 12:00")])
+        decisions = {"O-0": _entry("2024-09-01T12:00:00+00:00"), "O-1": {"intent": "exit", "signal": {}}}
+        funding = [{"ts": pd.Timestamp("2024-09-01 16:00", tz="UTC").to_pydatetime(), "amount": paid}]
+        return SimpleNamespace(decisions=decisions, rule_counts={}, fills=fills, funding=funding)
+
+    got = count_signals(_request(), history=_History(bars), backtest=backtest)
+    assert f"pre-check pooled edge before fees at least 25 bps a trade: {pooled}" in got.lines()
