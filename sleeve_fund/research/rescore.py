@@ -238,7 +238,7 @@ def refusal_note(n: int, name: str, args, exc: BaseException, out_dir: Path | No
         return None
 
 
-def main(argv: list[str] | None = None, run=None, journal=None) -> int:
+def main(argv: list[str] | None = None, run=None, journal=None, history=None) -> int:
     ap = argparse.ArgumentParser(prog="python -m sleeve_fund.research.rescore")
     ap.add_argument("list", help="the study list (markdown with a studies table)")
     ap.add_argument("--rows", default="", help="which rows, e.g. 1-8; all by default")
@@ -246,6 +246,9 @@ def main(argv: list[str] | None = None, run=None, journal=None) -> int:
     ap.add_argument("--pair", default="BTC/USDT",
                     help="the instrument, or a list run as one basket: BTC/USDT,ETH/USDT,SOL/USDT,XRP/USDT")
     ap.add_argument("--dry-run", action="store_true", help="check every row's definition and settings, run nothing")
+    ap.add_argument("--count-signals", action="store_true",
+                    help="a dry run that also counts each row's entries per asset over the train window only "
+                         "(no try, nothing written), for the expected-trades and one-asset pre-checks")
     ap.add_argument("--tries-by-hand", action="store_true", help=f"say on each sheet: {TRIES_BY_HAND}")
     args = ap.parse_args(argv)
     if not re.fullmatch(r"[a-z]{1,32}", args.venue) or not re.fullmatch(PAIRS, args.pair):
@@ -293,12 +296,23 @@ def main(argv: list[str] | None = None, run=None, journal=None) -> int:
     if rnd is not None:
         print(f"round {rnd.name}, study list SHA-256 {rnd.sha256}: {len(rnd.rows)} registered tries, a budget of "
               f"{rnd.budget} tries per family")
-    if args.dry_run:
+    if args.dry_run or args.count_signals:
+        if args.count_signals:
+            from sleeve_fund.research.signal_count import count_signals
         for n, name, req in reqs:
             place = (f", registered try {rnd.place(n)[0]} of {len(rnd.rows)} in the round, family {rnd.family_of(n)}"
                      if rnd else "")
             print(f"row {n:>2} {name}: checked{_minute_check(req)}{place}")
-        print(f"dry run: {len(reqs)} checked, 0 run")
+            if args.count_signals:  # SIGNAL-COUNT: the train window only, never a test or holdout bar
+                try:
+                    counted = count_signals(req, history=history)  # no journal: the published fees
+                except Exception as exc:  # noqa: BLE001 - one row's count never stops the rest; its class only
+                    print(f"row {n:>2} {name}: signal count FAILED ({type(exc).__name__}: {exc})")
+                    continue
+                for line in counted.lines():
+                    print(f"row {n:>2} {name}: {line}")
+        print(f"dry run: {len(reqs)} checked, 0 run" + (", train-window signals counted (no try)"
+                                                         if args.count_signals else ""))
         return 0
     if run is None:
         from sleeve_fund.research.run import run_store_study as run
