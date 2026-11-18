@@ -59,6 +59,9 @@ PREREGISTERED = {
     "QRH7_TREND_PULLBACK_SHORT_ONLY": {"definition": "qrh7_trend_pullback_short_only", "params": {}},
     "QRH8_TREND_PULLBACK_RSI595": {"definition": "qrh8_trend_pullback_rsi595", "params": {}},
     "QRHP1_TREND_PULLBACK_BREAK_FILTER": {"definition": "qrhp1_trend_pullback_break_filter", "params": {}},
+    # The H combination (Advisor 18 Nov 17:38, family B slot 24): H7's short side with H1's 6-candle time stop and P1's
+    # short-side break filter, nothing else. It runs only once the exit-delay fix is deployed and H0 is re-run on it.
+    "QRHC_TREND_PULLBACK_COMBINATION": {"definition": "qrhc_trend_pullback_combination", "params": {}},
     # Idea batch N1-N4 (Advisor cleared 17 Nov ~08:15 UK with pre-run implementation fixes, no try spent;
     # research/quant-researcher/next-round/idea-batch-17nov.md): new ideas, so no parent and no placebo.
     "QRN1_CAPITULATION_REVERSAL": {"definition": "qrn1_capitulation_reversal", "params": {}},

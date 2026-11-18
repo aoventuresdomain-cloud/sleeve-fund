@@ -1,0 +1,41 @@
+version = 1
+name = "qrhc-trend-pullback-combination"
+title = "Trend Pullback (4h) · Short only · daily 200 SMA gate · 6-candle time stop · break filter RSI 98"
+reason = """Inside an established downtrend (close below the daily 200-day SMA), a sharp short move against it (4h
+RSI(2) above 90) is usually forced or emotional flow, and the side that takes it is paid for liquidity as price
+resumes. Short only; entries skip RSI(2) above 98. Out when RSI(2) falls below 30, the close is back below its
+5-candle SMA, or after 6 candles (24 hours); 2.5 ATR(14) stop. qr02's settings with the kept H-round items combined
+by rule: short only (H7), 6-candle time stop (H1) and the short-side break filter (P1), all chosen after seeing the
+test months; no other changes; no take-profit. Held at 1x."""
+
+[blocks.trend]
+kind = "sma"
+period = 200
+timeframe = "1d"
+
+[blocks.rsi]
+kind = "rsi"
+period = 2
+
+[blocks.sma5]
+kind = "sma"
+period = 5
+
+[blocks.atr]
+kind = "atr"
+period = 14
+
+[short]
+entry = { all = [
+    { left = "close", op = "<", right = "trend" },
+    { left = "rsi", op = ">", right = 90 },
+    { left = "rsi", op = "<=", right = 98 },
+] }
+exit = { any = [
+    { left = "rsi", op = "<", right = 30 },
+    { left = "close", op = "<", right = "sma5" },
+] }
+
+[exits.short]
+stop = { level = { add = ["close", { mul = [2.5, "atr"] }] } }
+time_stop = { bars = 6 }
