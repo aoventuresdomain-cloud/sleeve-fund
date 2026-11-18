@@ -113,6 +113,6 @@ def test_the_count_runs_every_row_on_the_train_window_and_writes_nothing(capfd):
     for i, name in enumerate(ROWS, 1):
         assert f"row {i:>2} {name}: pre-check pooled gross edge at least 15 bps a trade: " in out
         assert f"row {i:>2} {name}: pre-check gross edge positive on at least 2 of 3 assets: " in out
-    s1_edge = next(line for line in out.splitlines() if line.startswith("row  1 ") and "gross edge, closed" in line)
+    s1_edge = next(line for line in out.splitlines() if line.startswith("row  1 ") and "gross edge: closed" in line)
     assert int(re.search(r"; ([\d,]+) in all", s1_edge).group(1).replace(",", "")) > 0
     assert not re.search(r"-?\d+(\.\d+)? ?bps(?! a trade)", out)  # no edge figure in the public log

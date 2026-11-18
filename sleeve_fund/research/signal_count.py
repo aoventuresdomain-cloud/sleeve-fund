@@ -138,8 +138,9 @@ class SignalCount:
         trades = ", ".join(f"{name(p)} {len(a.gross_bps):,}" for p, a in self.assets.items())
         pooled = self.pooled_bps
         positive = self.positive_assets
-        out += [(f"gross edge, closed trades from the decided day (P&L before fees and funding over entry notional, "
-                 f"no spread; figures not printed: public log): {trades}; {self.gross_trades:,} in all"),
+        out += [(f"gross edge: closed trades opened from the decided day, those open at the train window's end left out; "
+                 f"each one's P&L at 0 fees, no spread and before funding, over its entry notional (figures not "
+                 f"printed: public log): {trades}; {self.gross_trades:,} in all"),
                 (f"pre-check pooled gross edge at least {MIN_GROSS_BPS:g} bps a trade: "
                  f"{'PASS' if pooled is not None and pooled >= MIN_GROSS_BPS else 'FAIL'}"
                  + ("" if pooled is not None else " (no closed trade)")),

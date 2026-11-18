@@ -115,8 +115,9 @@ def test_each_asset_runs_alone_on_its_train_bars_and_its_entries_are_counted():
                         "2024-09-01 12:00 UTC ETH long")
     assert lines[5] == "exit-rule exits on a later UTC day than their entry: 0 of 0"
     # no volatility target on H0: no sizing line; the fake runs filled nothing, so no closed trade to read
-    assert lines[6] == ("gross edge, closed trades from the decided day (P&L before fees and funding over entry "
-                        "notional, no spread; figures not printed: public log): BTC 0, ETH 0, SOL 0; 0 in all")
+    assert lines[6] == ("gross edge: closed trades opened from the decided day, those open at the train window's end "
+                        "left out; each one's P&L at 0 fees, no spread and before funding, over its entry notional "
+                        "(figures not printed: public log): BTC 0, ETH 0, SOL 0; 0 in all")
     assert lines[7] == "pre-check pooled gross edge at least 15 bps a trade: FAIL (no closed trade)"
     assert lines[8] == "pre-check gross edge positive on at least 2 of 3 assets: FAIL (positive: none)"
     assert len(lines) == 9
