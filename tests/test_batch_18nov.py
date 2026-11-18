@@ -10,6 +10,8 @@ from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from sleeve_fund.research import basket as bk
 from sleeve_fund.research import rescore, rounds
 from sleeve_fund.research.pinned import parse
@@ -103,15 +105,18 @@ def test_the_sheet_prints_the_target_and_each_assets_median_size_and_capped_shar
     assert "BTC 3 entries, median size 0.70x, capped 33%" in line
     assert "ETH 1 entries, median size 1.00x, capped 100%" in line
     assert "SOL no entries" in line
-    assert "3 entries were skipped for want of the daily closes" in line
+    assert "Over the whole run, warm-up and train days included, 3 entries were skipped" in line
 
 
 def test_a_basket_without_a_volatility_target_prints_no_line():
     assert bk._vol_lines(_study({})) == []
 
 
-def test_a_real_basket_sized_to_the_target_prints_the_line_on_its_sheet(tmp_path):
-    """End to end on a synthetic basket: the engine's own entries carry their sizes, and the sheet reads them."""
+@pytest.mark.parametrize("screened", [False, True], ids=["full sheet", "screened sheet"])
+def test_a_real_basket_sized_to_the_target_prints_the_line_on_its_sheet(tmp_path, monkeypatch, screened):
+    """End to end on a synthetic basket: the engine's own entries carry their sizes, and the sheet reads them, on the
+    full sheet and on a fast study's screened one (CR F1 on #371: a row screened out before fees shows its sizing only
+    there). Screened here for too few trades, under a trade floor raised past the fixture's."""
     from test_b38_basket_study import CAPITAL, LOOSE, RESEARCH_END, _asset, _register
     from test_b38_basket_study import WINDOWS as SYN
 
@@ -122,8 +127,11 @@ def test_a_real_basket_sized_to_the_target_prints_the_line_on_its_sheet(tmp_path
                       "exit": {"left": "close", "op": "<", "right": "avg"}}}
     b = bk.Basket("v", "rules", {**to_params(trend), "vol_target_size": BATCH_VOL},
                   (_asset("BTC", 2, 0.03), _asset("ETH", 5, 0.03), _asset("SOL", 9, 0.03)), "2026-10-20")
+    if screened:
+        monkeypatch.setattr(bk, "MIN_TRADES", 10_000)
     r = bk.basket_study(b, SYN, RESEARCH_END, register=_register(tmp_path), dataset="syn", capital=CAPITAL,
-                        profile=LOOSE, warm_days=40)
+                        profile=LOOSE, warm_days=40, fast=screened)
+    assert bool(r.screened) is screened
     by = bk.vol_sizes(r.base.run, r.windows, {leg: v[0] for leg, v in r.legs.items()})
     assert set(by) == {"BTC", "ETH", "SOL"} and all(v.sizes for v in by.values())
     assert any(s < 1 for v in by.values() for s in v.sizes)  # volatile fixture: the target cuts entries

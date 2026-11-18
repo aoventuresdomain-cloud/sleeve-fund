@@ -1280,7 +1280,8 @@ def _vol_lines(study: BasketStudy) -> list[str]:
     return [(f"**Volatility target:** entries sized to {float(vol['annual']):.0%} a year of volatility over "
              f"{int(vol['lookback_days'])} days of daily closes (lag 1), capped at 1x, set at entry and not rebalanced. "
              f"Test-window entries by asset (size against the uncut size; capped = the target didn't cut it): {per}."
-             + (f" {skipped:,} entries were skipped for want of the daily closes." if skipped else "")), ""]
+             + (f" Over the whole run, warm-up and train days included, {skipped:,} entries were skipped for "
+                "want of the daily closes." if skipped else "")), ""]
 
 
 def _pair_lines(study: BasketStudy) -> list[str]:
