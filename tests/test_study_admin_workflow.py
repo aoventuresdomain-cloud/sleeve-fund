@@ -143,8 +143,9 @@ def test_names_prints_only_matching_sheet_names_over_two_days(tmp_path):
     assert res.stdout.split() == [SHEETS[0], SHEETS[1]]
     assert "contents never printed" not in res.stdout
     assert len(calls) == 1 and calls[0][:7] == ["compose", "run", "--rm", "-T", "--no-deps", "--name",
-                                                  "study-admin-names-4242"]
+                                                  "sheet-names-4242"]
     assert calls[0][7:9] == ["dashboard", "sh"]
+    assert not calls[0][6].startswith("study-")  # not caught by the study- filters in check, stop or the deploy guard
 
 
 def test_names_one_day(tmp_path):

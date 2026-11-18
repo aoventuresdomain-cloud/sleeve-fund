@@ -100,6 +100,6 @@ jobs:
           [[ "$PREFIX" =~ ^[a-z][a-z0-9_]{1,59}$ && "$DAY" =~ ^20[0-9]{6}(,20[0-9]{6})?$ && "$RUN_ID" =~ ^[0-9]{1,20}$ ]] || exit 1
           DAYS="${DAY/,/|}"
           ssh -i ~/.ssh/id_deploy "$USER_AT@$HOST" \
-            "cd /opt/sleeve-fund && sudo docker compose run --rm -T --no-deps --name study-admin-names-$RUN_ID dashboard sh -c '
+            "cd /opt/sleeve-fund && sudo docker compose run --rm -T --no-deps --name sheet-names-$RUN_ID dashboard sh -c '
               cd \"\$TEARSHEET_DIR\" || exit 2
               ls -1 | grep -E \"^${PREFIX}[a-z0-9_.-]*_(${DAYS})-[0-9]{6}[.]md\$\" | sort | head -n 40 || true'"
