@@ -1,0 +1,50 @@
+# S4's pre-registered fallback (its reason, Advisor 18 Nov): qrs4_vwap_range_reversion_4h with the stretch at 1.25 ATR
+# in place of 1.5, nothing else changed. Used only if S4's 2024 count is under 60 expected test trades.
+version = 1
+name = "qrs4-vwap-range-reversion-4h-fb125"
+title = "Day-VWAP Reversion in Quiet Markets (4h, 1.25 ATR fallback) · Long and Short"
+reason = """On a quiet day (daily ADX(14) below 20, no trend), a 4h close more than 1.5 ATR(14) below the day's
+volume-weighted average price is an overshoot by impatient sellers, and price tends to return to the day's fair value.
+The mirror above is sold. Decided only at the 08:00 to 20:00 UTC closes, so the day's VWAP has volume behind it. Out
+when the close reaches the day VWAP, after 3 candles, or on a 1 ATR stop. Fallback fixed now (Advisor 18 Nov): if the 2024 count puts expected test trades under 60, the stretch
+is 1.25 ATR, decided once on the count alone. Different from the shock fade: a cumulative
+stretch from fair value, gated on a range regime, not a one-candle shock. Fixed before any run. Sizing on the study list: vol_target_size = { annual = 0.40, lookback_days = 30 } (lag-1, capped at 1x)."""
+
+[blocks.vw]
+kind = "vwap"
+anchor = "day"
+
+[blocks.atr]
+kind = "atr"
+period = 14
+
+[blocks.adx]
+kind = "adx"
+period = 14
+timeframe = "1d"
+
+[long]
+entry = { all = [
+    { left = { time = "hour" }, op = ">=", right = 8 },
+    { left = { time = "hour" }, op = "<=", right = 20 },
+    { left = "adx", op = "<", right = 20 },
+    { left = "close", op = "<=", right = { sub = ["vw", { mul = [1.25, "atr"] }] } },
+] }
+exit = { left = "close", op = ">=", right = "vw" }
+
+[short]
+entry = { all = [
+    { left = { time = "hour" }, op = ">=", right = 8 },
+    { left = { time = "hour" }, op = "<=", right = 20 },
+    { left = "adx", op = "<", right = 20 },
+    { left = "close", op = ">=", right = { add = ["vw", { mul = [1.25, "atr"] }] } },
+] }
+exit = { left = "close", op = "<=", right = "vw" }
+
+[exits.long]
+stop = { level = { sub = ["close", "atr"] } }
+time_stop = { bars = 3 }
+
+[exits.short]
+stop = { level = { add = ["close", "atr"] } }
+time_stop = { bars = 3 }

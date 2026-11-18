@@ -1,0 +1,34 @@
+# S3's pre-registered fallback (its reason, Advisor 18 Nov): qrs3_shock_fade_4h with the shock threshold at 1.75 ATR
+# in place of 2, nothing else changed. Used only if S3's 2024 count is under 60 expected test trades.
+version = 1
+name = "qrs3-shock-fade-4h-fb175"
+title = "Shock Fade (4h, 1.75 ATR fallback) · Long and Short"
+reason = """A single 4h close-to-close move of at least 2 times the prior ATR(14) is usually a liquidation cascade or a burst
+of market orders, not new information. Once the forced flow is done, part of the move comes back. A shock down is bought
+and a shock up is sold. Out after 3 candles (12 h) or on a 1.5 ATR stop, using the ATR as of the candle before the shock.
+Fallback fixed now: if the train-year (2024) count puts expected test-window trades under 60, the threshold is 1.75 ATR,
+decided once on the count alone, before any P&L is seen. Fixed before any run. Sizing on the study list: vol_target_size = { annual = 0.40, lookback_days = 30 } (lag-1, capped at 1x)."""
+
+[blocks.atr]
+kind = "atr"
+period = 14
+
+# The ATR as of the previous candle, so the shock doesn't inflate its own yardstick.
+[blocks.atrp]
+kind = "lag"
+period = 1
+input = "atr"
+
+[long]
+entry = { left = { sub = ["close", { prev = "close" }] }, op = "<=", right = { mul = [-1.75, "atrp"] } }
+
+[short]
+entry = { left = { sub = ["close", { prev = "close" }] }, op = ">=", right = { mul = [1.75, "atrp"] } }
+
+[exits.long]
+stop = { level = { sub = ["close", { mul = [1.5, "atrp"] }] } }
+time_stop = { bars = 3 }
+
+[exits.short]
+stop = { level = { add = ["close", { mul = [1.5, "atrp"] }] } }
+time_stop = { bars = 3 }
