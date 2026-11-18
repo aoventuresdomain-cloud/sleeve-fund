@@ -1,0 +1,45 @@
+version = 1
+name = "qrs1-short-pullback-downtrend"
+title = "Short Pullback in a Confirmed Downtrend (4h) · Short only"
+reason = """Inside a confirmed daily downtrend (close below the daily SMA200 and the daily SMA50 below the SMA200), a sharp
+4h rally (RSI(2) above 90) is usually short-covering or forced buying into supply; the seller is paid as price resumes
+down. Out when RSI(2) drops below 30 or the close is back under its 5-candle SMA, after 10 candles, or on a 2.5 ATR(14)
+stop. H0's short side with a second, slower downtrend confirmation: chosen after reviewing H0's test-window trades
+by side. Fixed before any run. Sizing on the study list: vol_target_size = { annual = 0.40, lookback_days = 30 } (lag-1, capped at 1x)."""
+
+[blocks.trend]
+kind = "sma"
+period = 200
+timeframe = "1d"
+
+[blocks.sma50]
+kind = "sma"
+period = 50
+timeframe = "1d"
+
+[blocks.rsi]
+kind = "rsi"
+period = 2
+
+[blocks.sma5]
+kind = "sma"
+period = 5
+
+[blocks.atr]
+kind = "atr"
+period = 14
+
+[short]
+entry = { all = [
+    { left = "close", op = "<", right = "trend" },
+    { left = "sma50", op = "<", right = "trend" },
+    { left = "rsi", op = ">", right = 90 },
+] }
+exit = { any = [
+    { left = "rsi", op = "<", right = 30 },
+    { left = "close", op = "<", right = "sma5" },
+] }
+
+[exits.short]
+stop = { level = { add = ["close", { mul = [2.5, "atr"] }] } }
+time_stop = { bars = 10 }

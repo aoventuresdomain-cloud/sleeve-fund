@@ -1,0 +1,69 @@
+version = 1
+name = "qrs2-london-asia-range-fade"
+title = "London Fade of the Asia Range (4h) · Long and Short"
+reason = """The Asia range is the high and low of the two 4h candles from 00:00 to 08:00 UTC. If the 08:00-12:00 UTC candle
+(the first London candle, decided at its 12:00 close) trades above the Asia high but closes back below it, that is a
+failed break: stops above the range were taken and no buyer followed, so price tends to return into the range. It is
+sold, and the mirror below the Asia low is bought. Only on quiet days (daily ADX(14) below 25). Out after 2 candles
+(at the 20:00 close) or on a 1.5 ATR(14) stop. The 12:00 gate allows one decision a day; an
+outside candle that breaks both sides trades neither (Advisor 18 Nov). Family G (session-range fade,
+further-families-30oct.md), re-expressed on 4h candles because session_levels needs candles of 1h or less. Fixed before
+any run. Sizing on the study list: vol_target_size = { annual = 0.40, lookback_days = 30 } (lag-1, capped at 1x)."""
+
+# Asia range: max/min of the candles closing 04:00 and 08:00, read at the 12:00 close through a one-candle lag.
+[blocks.rmax]
+kind = "rolling_max"
+period = 2
+input = "high"
+
+[blocks.rmin]
+kind = "rolling_min"
+period = 2
+input = "low"
+
+[blocks.ahi]
+kind = "lag"
+period = 1
+input = "rmax"
+
+[blocks.alo]
+kind = "lag"
+period = 1
+input = "rmin"
+
+[blocks.adx]
+kind = "adx"
+period = 14
+timeframe = "1d"
+
+[blocks.atr]
+kind = "atr"
+period = 14
+
+[short]
+entry = { all = [
+    { left = { time = "hour" }, op = ">=", right = 12 },
+    { left = { time = "hour" }, op = "<=", right = 12 },
+    { left = "high", op = ">", right = "ahi" },
+    { left = "close", op = "<", right = "ahi" },
+    { left = "low", op = ">=", right = "alo" },
+    { left = "adx", op = "<", right = 25 },
+] }
+
+[long]
+entry = { all = [
+    { left = { time = "hour" }, op = ">=", right = 12 },
+    { left = { time = "hour" }, op = "<=", right = 12 },
+    { left = "low", op = "<", right = "alo" },
+    { left = "close", op = ">", right = "alo" },
+    { left = "high", op = "<=", right = "ahi" },
+    { left = "adx", op = "<", right = 25 },
+] }
+
+[exits.long]
+stop = { level = { sub = ["close", { mul = [1.5, "atr"] }] } }
+time_stop = { bars = 2 }
+
+[exits.short]
+stop = { level = { add = ["close", { mul = [1.5, "atr"] }] } }
+time_stop = { bars = 2 }

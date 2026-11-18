@@ -5,6 +5,8 @@ name: study
 # holdout stays locked: nothing here can open it. Writes research records only, never a Strategy, order, fill or
 # fund row. The log is public, so it shows counts and per-row ran/failed only; the results are read on the Research
 # page. Run it by hand from main: first with dry_run (the default), which checks every row and runs nothing.
+# count_signals (SIGNAL-COUNT) is a dry run that also counts each row's entries per asset over the train window
+# only, for the batch pre-checks: entry counts only in the log, no try, nothing written.
 # R-29: by default the run reads the research configs (configs/definitions/*.toml, the R-06/R-07 variants in
 # configs/definitions/variants/*.toml, configs/studies/*.md, nothing else) from main at the commit it was dispatched
 # on, not from the deployed image, so a merged definition runs without
@@ -35,6 +37,11 @@ on:
         type: boolean
         required: true
         default: true
+      count_signals:
+        description: With the dry run, count each row's entries per asset over the train window only (no try)
+        type: boolean
+        required: false
+        default: false
       configs_from:
         description: Research configs from main at this commit (main), or the deployed image's (image)
         type: choice
@@ -142,7 +149,7 @@ jobs:
           ROWS: ${{ inputs.rows && format('--rows {0}', inputs.rows) || '' }}
           VENUE: ${{ inputs.venue }}
           PAIR: ${{ inputs.pair }}
-          DRY: ${{ inputs.dry_run && '--dry-run' || '' }}
+          DRY: ${{ inputs.count_signals && '--count-signals' || (inputs.dry_run && '--dry-run' || '') }}
           FROM: ${{ inputs.configs_from }}
           SHA: ${{ github.sha }}
         run: |
