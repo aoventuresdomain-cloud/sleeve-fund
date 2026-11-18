@@ -110,13 +110,14 @@ SHEETS = ["qrh5_trend_pullback_stop35_basket-240m_20261117-231502.md",
           "qrh7_trend_pullback_short_only_basket-240m_20261118-000917_trades.csv",
           "qrh1_trend_pullback_ts6_basket-240m_20261116-182615.md",
           "qrn1_daily_breakout_basket-240m_20261118-101638.md",
+          "qrh5_trend_pullback_stop35_basket-240m_20261117-231502.md.bak",
           "notes.txt"]
 
 
-def _names(tmp_path, prefix, day):
+def _names(tmp_path, prefix, day, extra=()):
     sheets = tmp_path / "sheets"
     sheets.mkdir()
-    for n in SHEETS:
+    for n in [*SHEETS, *extra]:
         (sheets / n).write_text("contents never printed")
     bin_ = tmp_path / "bin"
     bin_.mkdir()
@@ -149,6 +150,12 @@ def test_names_prints_only_matching_sheet_names_over_two_days(tmp_path):
 def test_names_one_day(tmp_path):
     res, _ = _names(tmp_path, "qrh", "20261117")
     assert res.returncode == 0 and res.stdout.split() == [SHEETS[0]]
+
+
+def test_names_prints_at_most_40(tmp_path):
+    many = [f"qrx{i:02d}_basket-240m_20261117-0000{i:02d}.md" for i in range(45)]
+    res, _ = _names(tmp_path, "qrx", "20261117", extra=many)
+    assert res.returncode == 0 and res.stdout.split() == sorted(many)[:40]
 
 
 def test_names_with_nothing_found_still_succeeds(tmp_path):
