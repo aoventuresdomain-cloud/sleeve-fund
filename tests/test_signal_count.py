@@ -90,6 +90,7 @@ def test_each_asset_runs_alone_on_its_train_bars_and_its_entries_are_counted():
 
     def backtest(strategy, prices, instrument, params, bar_minutes, half_spread):
         seen[instrument.id.symbol.value] = prices
+        assert (float(instrument.maker_fee), float(instrument.taker_fee), half_spread) == (0, 0, 0)  # no fee or spread
         n = {"BTC": 30, "ETH": 12, "SOL": 5}[instrument.id.symbol.value.split("USDT")[0]]
         ds = {f"e{i}": _entry(f"2024-09-{1 + i % 28:02d}T12:00:00+00:00") for i in range(n)}
         return SimpleNamespace(decisions=ds | {"x": {"intent": "liquidation"}}, rule_counts={})
@@ -113,7 +114,12 @@ def test_each_asset_runs_alone_on_its_train_bars_and_its_entries_are_counted():
     assert lines[4] == ("first entries: 2024-09-01 12:00 UTC BTC long, 2024-09-01 12:00 UTC BTC long, "
                         "2024-09-01 12:00 UTC ETH long")
     assert lines[5] == "exit-rule exits on a later UTC day than their entry: 0 of 0"
-    assert len(lines) == 6  # no volatility target on H0: no sizing line
+    # no volatility target on H0: no sizing line; the fake runs filled nothing, so no closed trade to read
+    assert lines[6] == ("gross edge, closed trades from the decided day (P&L before fees and funding over entry "
+                        "notional, no spread; figures not printed: public log): BTC 0, ETH 0, SOL 0; 0 in all")
+    assert lines[7] == "pre-check pooled gross edge at least 15 bps a trade: FAIL (no closed trade)"
+    assert lines[8] == "pre-check gross edge positive on at least 2 of 3 assets: FAIL (positive: none)"
+    assert len(lines) == 9
 
 
 def _count(entries: dict, decided=date(2024, 1, 1), vol=None) -> SignalCount:
@@ -177,7 +183,7 @@ def test_with_a_volatility_target_each_assets_median_size_and_share_capped_are_p
     got = SignalCount(train_first=date(2024, 1, 1), train_last=date(2024, 12, 31), decided_first=date(2024, 3, 1),
                       test_days=485, assets={"BTC/USDT": btc, "ETH/USDT": AssetCount(), "SOL/USDT": sol},
                       vol_target={"annual": 0.4, "lookback_days": 30})
-    assert got.lines()[-1] == ("sizing to 40% a year over 30 days (size against the uncut size; capped = the target "
+    assert got.lines()[-4] == ("sizing to 40% a year over 30 days (size against the uncut size; capped = the target "
                                "didn't cut it): BTC median 1.00x, capped 67%, ETH no entries, SOL median 0.45x, "
                                "capped 0%; 2 entries skipped for want of the daily closes")
     assert "SOL short" in got.lines()[4]
@@ -215,3 +221,52 @@ def test_the_workflow_passes_the_flag_only_when_asked():
     text = (ROOT / ".github" / "workflows" / "study.yml").read_text()
     assert "      count_signals:\n" in text and "default: false" in text.split("count_signals:")[1].split("configs_from")[0]
     assert "DRY: ${{ inputs.count_signals && '--count-signals' || (inputs.dry_run && '--dry-run' || '') }}" in text
+
+
+def _gross(per_asset: dict) -> SignalCount:
+    assets = {p: AssetCount(gross_bps=list(xs)) for p, xs in per_asset.items()}
+    return SignalCount(train_first=date(2024, 1, 1), train_last=date(2024, 12, 31), decided_first=date(2024, 1, 1),
+                       test_days=485, assets=assets)
+
+
+@pytest.mark.parametrize("per_asset, pooled, spread", [
+    ({"BTC/USDT": [15.0, 15.0], "ETH/USDT": [15.0], "SOL/USDT": [15.0]}, "PASS", "PASS"),  # exactly 15: enough
+    ({"BTC/USDT": [14.9], "ETH/USDT": [15.0], "SOL/USDT": [15.0]}, "FAIL", "PASS"),  # 14.97 pooled
+    ({"BTC/USDT": [90.0], "ETH/USDT": [-10.0], "SOL/USDT": [-10.0]}, "PASS", "FAIL"),  # one asset carries it
+    ({"BTC/USDT": [40.0], "ETH/USDT": [0.0], "SOL/USDT": [10.0]}, "PASS", "PASS"),  # zero is not positive
+    ({"BTC/USDT": [40.0], "ETH/USDT": [], "SOL/USDT": [-1.0]}, "PASS", "FAIL"),  # no closed trade is not positive
+])
+def test_the_gross_edge_pre_checks_read_the_pooled_mean_and_the_positive_assets(per_asset, pooled, spread):
+    lines = _gross(per_asset).lines()
+    assert f"pre-check pooled gross edge at least 15 bps a trade: {pooled}" in lines
+    assert any(line.startswith(f"pre-check gross edge positive on at least 2 of 3 assets: {spread} ") for line in lines)
+
+
+def test_no_edge_figure_is_printed():
+    """The count prints to a public log: the checks' verdicts and trade counts only, never the bps themselves."""
+    got = _gross({"BTC/USDT": [123.4, 56.7], "ETH/USDT": [-8.9], "SOL/USDT": [42.0]})
+    text = "\n".join(got.lines())
+    assert got.pooled_bps == pytest.approx((123.4 + 56.7 - 8.9 + 42.0) / 4)
+    assert got.gross_bps("ETH/USDT") == pytest.approx(-8.9) and got.positive_assets == ["BTC/USDT", "SOL/USDT"]
+    for figure in ("123", "56.7", "8.9", "42", "53.3"):
+        assert figure not in text
+    assert "BTC 2, ETH 1, SOL 1; 4 in all" in text
+
+
+def _fills(rows):
+    """A fills report as run_backtest gives it: side, quantity, price, fee and time, by order id."""
+    return pd.DataFrame({"side": [r[0] for r in rows], "filled_qty": [r[1] for r in rows],
+                         "avg_px": [r[2] for r in rows], "commissions": [0.0] * len(rows),
+                         "ts_last": [pd.Timestamp(r[3], tz="UTC") for r in rows]},
+                        index=[f"O-{i}" for i in range(len(rows))])
+
+
+def test_gross_edge_is_each_closed_trades_pnl_over_its_entry_notional_from_the_decided_day():
+    from sleeve_fund.research.signal_count import gross_bps
+
+    fills = _fills([("BUY", 1, 100.0, "2024-02-01 04:00"), ("SELL", 1, 101.0, "2024-02-02 04:00"),  # before: out
+                    ("BUY", 1, 100.0, "2024-07-20 04:00"), ("SELL", 1, 100.5, "2024-07-21 04:00"),  # +50 bps
+                    ("SELL", 2, 200.0, "2024-08-01 04:00"), ("BUY", 2, 201.0, "2024-08-02 04:00"),  # short: -50 bps
+                    ("BUY", 1, 100.0, "2024-12-31 20:00")])  # still open at the window's end: out
+    assert gross_bps(fills, date(2024, 7, 20)) == pytest.approx([50.0, -50.0])
+    assert gross_bps(fills, None) == [] and gross_bps(None, date(2024, 1, 1)) == []

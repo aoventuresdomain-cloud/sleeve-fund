@@ -305,7 +305,7 @@ def main(argv: list[str] | None = None, run=None, journal=None, history=None) ->
             print(f"row {n:>2} {name}: checked{_minute_check(req)}{place}")
             if args.count_signals:  # SIGNAL-COUNT: the train window only, never a test or holdout bar
                 try:
-                    counted = count_signals(req, history=history)  # no journal: the published fees
+                    counted = count_signals(req, history=history)  # no journal: no fee, no spread
                 except Exception as exc:  # noqa: BLE001 - one row's count never stops the rest; its class only
                     print(f"row {n:>2} {name}: signal count FAILED ({type(exc).__name__})")  # its class only (public log)
                     continue
