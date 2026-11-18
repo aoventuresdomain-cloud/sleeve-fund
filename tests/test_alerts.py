@@ -1,10 +1,20 @@
 """Review rounds 2 to 5: no outbound alerts and no dead man's switch. The supervisor forwards the
 journal's warnings and errors to a webhook and pings an outside uptime monitor."""
 
+from datetime import datetime, timedelta
+
 from sleeve_fund.alerts import Forwarder, message
+from sleeve_fund.ops_health import UK
 from sleeve_fund.store import Store, utcnow
 
 URL = "https://hooks.example.com/services/T0/B0/token"
+# A fixed noon UK, well clear of the 08:00 UK digest: on the real clock these tests sent a digest too when run
+# between 08:00 and 08:02 UK (the first step after 08:00 with no digest_sent journaled).
+NOON = datetime(2026, 1, 14, 12, 0, tzinfo=UK)
+
+
+def _noon():
+    return NOON
 
 
 def _store():
@@ -15,7 +25,8 @@ def _store():
 
 def test_new_warnings_and_errors_go_out_in_one_message():
     store, sent = _store(), []
-    fwd = Forwarder(store, environ={"ALERT_WEBHOOK_URL": URL}, send=lambda url, text: sent.append((url, text)))
+    fwd = Forwarder(store, environ={"ALERT_WEBHOOK_URL": URL}, send=lambda url, text: sent.append((url, text)),
+                    now=_noon)
     fwd.step()
     assert sent == []
     store.event("btc", "warning", "stale_price", "No trade or quote for 5 minutes")
@@ -38,7 +49,7 @@ def test_a_failed_send_is_retried_and_said_once():
             raise OSError("unreachable")
         sent.append(text)
 
-    fwd = Forwarder(store, environ={"ALERT_WEBHOOK_URL": URL}, send=send)
+    fwd = Forwarder(store, environ={"ALERT_WEBHOOK_URL": URL}, send=send, now=_noon)
     store.event("btc", "error", "risk_halt", "drawdown 20%")
     fwd.step()
     fwd.step()
@@ -71,13 +82,31 @@ def test_alerts_raised_while_the_supervisor_was_down_still_go_out():
     supervisor was down was never sent. Each send journals how far it got; a restart picks up there."""
     store, sent = _store(), []
     env = {"ALERT_WEBHOOK_URL": URL}
-    fwd = Forwarder(store, environ=env, send=lambda url, text: sent.append(text))
+    fwd = Forwarder(store, environ=env, send=lambda url, text: sent.append(text), now=_noon)
     store.event("btc", "error", "risk_halt", "drawdown 20%")
     fwd.step()
     store.event("eth", "error", "feed_dead", "no market data for 15 minutes")  # supervisor down
-    Forwarder(store, environ=env, send=lambda url, text: sent.append(text)).step()
+    Forwarder(store, environ=env, send=lambda url, text: sent.append(text), now=_noon).step()
     assert len(sent) == 2 and "feed_dead" not in sent[0] and "no market data" in sent[1]
     assert "drawdown 20%" not in sent[1]  # nothing sent twice
+
+
+def test_a_step_at_0801_uk_sends_exactly_one_digest_beside_the_alerts():
+    """HoE, 18 Nov: main's tests failed when run between 08:00 and 08:02 UK, because the forwarder's digest fired on
+    the real clock. Pinned here: a first step at 08:01 UK with no digest_sent sends one digest and the alerts once,
+    and later steps that day send neither again."""
+    store, sent, clock = _store(), [], [datetime(2026, 1, 14, 8, 1, tzinfo=UK)]
+    fwd = Forwarder(store, environ={"ALERT_WEBHOOK_URL": URL}, send=lambda url, text: sent.append(text),
+                    now=lambda: clock[0])
+    store.event("btc", "error", "risk_halt", "drawdown 20%")
+    fwd.step()
+    (journaled,) = [e for e in store.events(limit=50) if e["kind"] == "digest_sent"]
+    assert sum("daily digest" in t for t in sent) == 1 and "2026-01-14" in journaled["message"]
+    assert len(sent) == 2 and sum("drawdown 20%" in t for t in sent) == 1
+    for minutes in (1, 2, 60):
+        clock[0] = datetime(2026, 1, 14, 8, 1, tzinfo=UK) + timedelta(minutes=minutes)
+        fwd.step()
+    assert len(sent) == 2
 
 
 def test_a_late_or_failed_backup_raises_an_alert_once(tmp_path):
@@ -177,7 +206,7 @@ def test_a_send_that_trickles_is_cut_off_and_reported(monkeypatch):
     threading.Thread(target=trickle, daemon=True).start()
     monkeypatch.setattr(alerts, "TOTAL", 1.0)
     store = _store()
-    fwd = Forwarder(store, environ={"ALERT_WEBHOOK_URL": f"http://127.0.0.1:{srv.getsockname()[1]}/hook"})
+    fwd = Forwarder(store, environ={"ALERT_WEBHOOK_URL": f"http://127.0.0.1:{srv.getsockname()[1]}/hook"}, now=_noon)
     store.event(None, "error", "supervisor_error", "boom")
     t0 = time.monotonic()
     fwd.step()
