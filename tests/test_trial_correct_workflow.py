@@ -45,6 +45,8 @@ def _run(tmp_path, apply: str, report: str, code: int = 0):
 def test_a_dry_run_runs_the_module_without_apply_and_logs_no_figure(tmp_path):
     res, argv = _run(tmp_path, "", f'original: {{"id": "{ROW}", "sharpe": 0.62}}\ndry run: nothing written\n')
     assert res.returncode == 0, res.stderr
+    assert argv[:6] == ["flock", "-x", "-n", "-E", "75", "/run/lock/sleeve-register.lock"]  # CR #358 F1
+    argv = argv[6:]
     assert argv[:7] == ["docker", "compose", "run", "--rm", "-T", "--no-deps", "--name"]
     assert argv[8:] == ["dashboard", "python", "-m", "sleeve_fund.research.trial_correction", "--row", ROW,
                         "--sheet", "b0_x_1"]

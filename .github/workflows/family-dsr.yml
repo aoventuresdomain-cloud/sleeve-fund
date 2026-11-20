@@ -2,10 +2,11 @@ name: family-dsr
 # FAMILY-DSR (Advisor, 31 Oct, on H0): a basket try's deflated Sharpe across its whole idea family, with N the larger
 # of the stated and the register's counts and the spread from the valid-fill rows the round file pins
 # (python -m sleeve_fund.research.family_dsr, which refuses while a pinned row is missing or not its variant's latest,
-# so a correction must be applied and pinned first). It only reads: the register and the sheet's pooled.csv. It shares
-# the study runs' concurrency group, so it never runs beside one. The report holds Sharpes and ids, so it is encrypted
-# on the runner to the project's key, as trials-export's; the public log shows the outcome's first word only, beside
-# the dispatch's own inputs (a list path, a family letter and a sheet stem; none is a figure). Run it by hand from main.
+# so a correction must be applied and pinned first). It only reads: the register and the sheet's pooled.csv. It keeps
+# the old study concurrency group and refuses while a study list's container runs, so it never runs beside one. The
+# report holds Sharpes and ids, so it is encrypted on the runner to the project's key, as trials-export's; the public
+# log shows the outcome's first word only, beside the dispatch's own inputs (a list path, a family letter and a sheet
+# stem; none is a figure). Run it by hand from main.
 on:
   workflow_dispatch:
     inputs:
@@ -51,6 +52,16 @@ jobs:
           install -m 700 -d ~/.ssh
           printf '%s\n' "$KEY" > ~/.ssh/id_deploy && chmod 600 ~/.ssh/id_deploy
           ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts
+      - name: Refuse to run beside a study list
+        # Study lists run in slots (study.yml), each its own concurrency group, so this workflow's "study" group no
+        # longer keeps it from one: a study container still running on the server stops this job instead, and
+        # study.yml refuses to start while this workflow's container runs.
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          running=$(ssh -i ~/.ssh/id_deploy "$USER_AT@$HOST" 'sudo docker ps --filter name=study- --format "{{.Names}} {{.Status}}"')
+          studies=$(printf '%s\n' "$running" | grep -E "^study-(s[0-9]+-)?[0-9]+ " || true)
+          if [ -n "$studies" ]; then echo "a study list is still running:"; echo "$studies"; exit 1; fi
       - name: Work out the deflated Sharpe
         env:
           RUN_ID: ${{ github.run_id }}
@@ -64,9 +75,12 @@ jobs:
           mkdir -p "$RUNNER_TEMP/plain"
           code=0  # the runner's shell has -e: a refusal must still reach the encrypted report, so it is caught here
           ssh -i ~/.ssh/id_deploy -o ServerAliveInterval=30 -o ServerAliveCountMax=10 "$USER_AT@$HOST" \
-            "cd /opt/sleeve-fund && sudo docker compose run --rm -T --no-deps --name family-dsr-$RUN_ID dashboard \
+            "cd /opt/sleeve-fund && sudo flock -x -n -E 75 /run/lock/sleeve-register.lock docker compose run --rm -T --no-deps --name family-dsr-$RUN_ID dashboard \
               python -m sleeve_fund.research.family_dsr --list $LIST --family $FAMILY --sheet $SHEET" \
             > "$RUNNER_TEMP/plain/report.txt" 2>&1 || code=$?
+          # The register lock (CR #358 F1): held exclusive here, shared by each study list, so this never runs beside
+          # one even if a study started after the guard above looked; flock exits 75 before docker is called.
+          [ "$code" != 75 ] || echo "::error::the register lock is held: a study list is running, so nothing ran"
           # The outcome's first word only (the last line: done, refused), never a figure or an id
           echo "outcome: $(tail -n 1 "$RUNNER_TEMP/plain/report.txt" | grep -oE '^(done|refused)' || echo other), exit $code"
           tar -czf "$RUNNER_TEMP/plain/sheet.tar.gz" -C "$RUNNER_TEMP/plain" report.txt

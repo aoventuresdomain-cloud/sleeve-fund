@@ -4,10 +4,11 @@ name: trial-correct
 # 0018), so the wrong row stays and one more row of the same variant carries the sheet's book Sharpe
 # (python -m sleeve_fund.research.trial_correction, which refuses unless the row and the sheet are one try's).
 # A dry run unless apply is ticked: the dry run reads only. With apply it is a write to the live database, run only on
-# the HoE's dispatch with the PM's word for that row. It shares the study runs' concurrency group, so it never runs
-# beside one. The report holds Sharpes and ids, so it is encrypted on the runner to the project's key, as
-# trials-export's; the public log shows the outcome's first word and byte counts only, beside the dispatch's own
-# inputs (the row id and sheet stem, as sheet-export shows its stem; neither is a figure). Run it by hand from main.
+# the HoE's dispatch with the PM's word for that row. It keeps the old study concurrency group and refuses while a
+# study list's container runs, so it never runs beside one. The report holds Sharpes and ids, so it is encrypted on
+# the runner to the project's key, as trials-export's; the public log shows the outcome's first word and byte counts
+# only, beside the dispatch's own inputs (the row id and sheet stem, as sheet-export shows its stem; neither is a
+# figure). Run it by hand from main.
 # After an apply: append the decrypted report's "trail:" line to research/accuracy-checks/trials-corrections.md
 # in the project folder (the register can't mark a correction, and its Sharpes and ids stay out of this public repo).
 on:
@@ -54,6 +55,16 @@ jobs:
           install -m 700 -d ~/.ssh
           printf '%s\n' "$KEY" > ~/.ssh/id_deploy && chmod 600 ~/.ssh/id_deploy
           ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts
+      - name: Refuse to run beside a study list
+        # Study lists run in slots (study.yml), each its own concurrency group, so this workflow's "study" group no
+        # longer keeps it from one: a study container still running on the server stops this job instead, and
+        # study.yml refuses to start while this workflow's container runs.
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          running=$(ssh -i ~/.ssh/id_deploy "$USER_AT@$HOST" 'sudo docker ps --filter name=study- --format "{{.Names}} {{.Status}}"')
+          studies=$(printf '%s\n' "$running" | grep -E "^study-(s[0-9]+-)?[0-9]+ " || true)
+          if [ -n "$studies" ]; then echo "a study list is still running:"; echo "$studies"; exit 1; fi
       - name: Correct the row
         env:
           RUN_ID: ${{ github.run_id }}
@@ -67,9 +78,12 @@ jobs:
           mkdir -p "$RUNNER_TEMP/plain"
           code=0  # the runner's shell has -e: a refusal must still reach the encrypted report, so it is caught here
           ssh -i ~/.ssh/id_deploy -o ServerAliveInterval=30 -o ServerAliveCountMax=10 "$USER_AT@$HOST" \
-            "cd /opt/sleeve-fund && sudo docker compose run --rm -T --no-deps --name trial-correct-$RUN_ID dashboard \
+            "cd /opt/sleeve-fund && sudo flock -x -n -E 75 /run/lock/sleeve-register.lock docker compose run --rm -T --no-deps --name trial-correct-$RUN_ID dashboard \
               python -m sleeve_fund.research.trial_correction --row $ROW --sheet $SHEET $APPLY" \
             > "$RUNNER_TEMP/plain/report.txt" 2>&1 || code=$?
+          # The register lock (CR #358 F1): held exclusive here, shared by each study list, so this never runs beside
+          # one even if a study started after the guard above looked; flock exits 75 before docker is called.
+          [ "$code" != 75 ] || echo "::error::the register lock is held: a study list is running, so nothing ran"
           # The outcome's first word only (the last line: dry, written, refused, CHECK), never a figure or an id
           echo "outcome: $(tail -n 1 "$RUNNER_TEMP/plain/report.txt" | grep -oE '^(dry|written|refused|CHECK|trail)' || echo other), exit $code"
           tar -czf "$RUNNER_TEMP/plain/sheet.tar.gz" -C "$RUNNER_TEMP/plain" report.txt
